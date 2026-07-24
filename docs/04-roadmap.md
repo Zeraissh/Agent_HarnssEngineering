@@ -99,10 +99,26 @@
 - [x] 索引永不漂移：list/indexBlock 实时派生，无 MEMORY.md 可失步
 - [x] 52 个单测全绿
 
+## v0.6 — OpenAI wire 协议（L0 第二实现）
+
+**目标**：P1（分层可替换）的终极检验——换掉整个 wire 协议，L1/L2/L3 零改动。
+
+**范围**
+- `src/model-client-openai.ts`：OpenAIModelClient + 双向翻译层（tool_result ↔ role:"tool"、tool_use ↔ tool_calls、is_error 降级前缀、finish_reason 映射、残缺 JSON 参数 fail-safe）
+- `src/provider.ts`：AGENT_PROVIDER 工厂（anthropic | openai），CLI 与 eval 共用，超时旋钮统一
+- 流式：手写 SSE 分片累积（文本 delta 旁路 + tool_calls 按 index 拼装）；`prompt_tokens_details.cached_tokens` / DeepSeek `prompt_cache_hit_tokens` 映射为 cache_read
+
+**验证 checklist**（2026-07-24 通过）
+- [x] 9 个翻译层单测（请求/响应双向、usage 拆分、残缺参数）；全套 61 测试绿
+- [x] 端到端（DeepSeek OpenAI 端点，同一 key）：5 轮任务含两次并行工具调用，往返翻译无误，答案独立核对正确
+- [x] 缓存统计贯通：cacheHit 81.3%（prompt_cache_hit_tokens 映射）
+- [x] 核心层零改动：diff 仅新增 L0 实现 + 工厂 + 宿主接线
+
 ## 更远（不承诺顺序）
 
+- **MCP 客户端接入**（McpToolAdapter：MCP tool → Tool 接口）——打开现成工具生态，是接入 STM32 调试等真实领域的前置
+- **Harness A/B 研究**：用 eval 量化各 harness 特性的收益（verifier 开关、compact 阈值、工具描述写法、跨模型/协议矩阵）；前置：eval 用例扩到 15–20 个
 - server-side compaction（beta）替换本地截断
-- Tool search / defer_loading（工具数量增长后）
 - 多 agent 编排（并行 fan-out + 汇总）
 - Anthropic 原生缓存断点补验（待 Anthropic key）
 

@@ -43,7 +43,9 @@ flowchart TB
 
 ## L0 — ModelClient
 
-**职责**：把 Messages API 收敛为一个稳定的内部接口，上层不直接接触 SDK 的请求构造细节。
+**职责**：把模型 API 收敛为一个稳定的内部接口，上层不直接接触 SDK 的请求构造细节。
+
+两个实现（v0.6 起）：**AnthropicModelClient**（Anthropic 官方及一切 Anthropic 兼容端点——DeepSeek/GLM/Kimi/Ollama）与 **OpenAIModelClient**（一切 chat-completions 端点）。后者是 P1 的终极检验：整个 wire 协议被替换，L1/L2/L3 零改动——harness 内部统一使用 Anthropic 形状（`ModelRequest`/`ModelTurn`），OpenAI 客户端在边界做双向翻译（tool_result 块 ↔ role:"tool" 消息、tool_use ↔ tool_calls、`is_error` 降级为内容前缀、finish_reason 映射）。选择由 `AGENT_PROVIDER` 环境变量驱动（`src/provider.ts` 工厂）。
 
 | 关注点 | 设计决策 |
 |---|---|

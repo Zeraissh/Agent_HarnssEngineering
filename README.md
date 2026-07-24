@@ -49,6 +49,12 @@ $env:AGENT_MODEL        = "qwen3.5:9b"
 $env:AGENT_MAX_TOKENS   = "4096"            # 掐断思考螺旋，快速失败
 $env:AGENT_TIMEOUT_MS   = "300000"; $env:AGENT_MAX_RETRIES = "0"
 
+# 或 OpenAI wire 协议（任何 chat-completions 端点；key 可与 Anthropic 协议复用）
+$env:AGENT_PROVIDER     = "openai"
+$env:OPENAI_BASE_URL    = "https://api.deepseek.com"   # 或 api.openai.com 等
+$env:OPENAI_API_KEY     = "sk-..."          # 缺省复用 ANTHROPIC_API_KEY
+$env:AGENT_MODEL        = "deepseek-chat"
+
 npm run cli -- "阅读 docs/ 下所有文档，生成 SUMMARY.md"          # 交互审批 y/n
 npm run cli -- --yes "……"                                        # 自动批准（CI）
 npm run cli -- --verify "……"                                     # 完成后 verifier 独立核查，未通过自动返工
@@ -63,7 +69,8 @@ npm test                                                          # 单元测试
 - **v0.3 ✅** — 上下文管理完整化：compact、缓存诊断、动态上下文注入
 - **v0.4 ✅** — verifier 子代理 + `runVerified` 编排 + `fetch_url` 领域工具试点 + 评估基线
 - **v0.5 ✅** — L5 跨会话记忆：`.agent-memory/` + 四个记忆工具 + 开局索引注入
-- **后续** — server-side compaction、多 agent 编排、tool search（见 [docs/04-roadmap.md](docs/04-roadmap.md)）
+- **v0.6 ✅** — OpenAI wire 协议：`AGENT_PROVIDER=openai` 接入一切 chat-completions 端点，核心层零改动
+- **后续** — MCP 工具接入、harness A/B 研究、server-side compaction（见 [docs/04-roadmap.md](docs/04-roadmap.md)）
 
 ## 技术基线
 

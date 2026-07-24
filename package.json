@@ -1,6 +1,6 @@
 {
   "name": "agent-harness",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "private": true,
   "type": "module",
   "description": "Harness engineering agent framework — hand-written agent loop on the Anthropic Messages API",
@@ -11,7 +11,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.90.0"
+    "@anthropic-ai/sdk": "^0.90.0",
+    "openai": "^6.42.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

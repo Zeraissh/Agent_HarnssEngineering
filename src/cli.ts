@@ -5,8 +5,11 @@
  *   --verify  完成后由 verifier 子代理独立核查，未通过自动返工一轮
  *
  * 环境变量：
+ *   AGENT_PROVIDER      anthropic（默认）| openai —— 选择 wire 协议
  *   ANTHROPIC_API_KEY   API 密钥（Anthropic 或第三方兼容端点的 key）
- *   ANTHROPIC_BASE_URL  可选，第三方 Anthropic 兼容端点（DeepSeek/GLM/Kimi 等）
+ *   ANTHROPIC_BASE_URL  可选，第三方 Anthropic 兼容端点（DeepSeek/GLM/Kimi/Ollama）
+ *   OPENAI_BASE_URL     provider=openai 时的端点（如 https://api.deepseek.com）
+ *   OPENAI_API_KEY      provider=openai 时的 key，缺省复用 ANTHROPIC_API_KEY
  *   AGENT_MODEL         可选，模型名，默认 claude-opus-4-8；
  *                       非 claude-* 模型自动进入 compat 模式（去掉 Claude 专属参数）
  *   AGENT_CONTEXT_LIMIT 可选，上下文 token 上限（触发 compact），默认 150000
@@ -17,11 +20,10 @@
  */
 import path from "node:path";
 import readline from "node:readline/promises";
-import Anthropic from "@anthropic-ai/sdk";
 import { AgentLoop } from "./loop.js";
 import { createMemoryTools, MemoryStore } from "./memory.js";
-import { AnthropicModelClient } from "./model-client.js";
 import { runVerified } from "./orchestrate.js";
+import { createModelClientFromEnv } from "./provider.js";
 import { bashTool } from "./tools/bash.js";
 import { fetchUrlTool } from "./tools/fetch-url.js";
 import { readFileTool } from "./tools/read-file.js";
@@ -54,11 +56,15 @@ async function main(): Promise<void> {
   }
 
   const model = process.env.AGENT_MODEL ?? "claude-opus-4-8";
-  const compat = !model.startsWith("claude");
+  const { client: resolvedClient, provider, compat } = createModelClientFromEnv(model);
   if (compat) {
+    const base =
+      provider === "openai"
+        ? (process.env.OPENAI_BASE_URL ?? "api.openai.com")
+        : (process.env.ANTHROPIC_BASE_URL ?? "");
     console.log(
       c.dim(
-        `compat mode: model=${model}${process.env.ANTHROPIC_BASE_URL ? ` via ${process.env.ANTHROPIC_BASE_URL}` : ""} (thinking/effort/cache_control disabled)`,
+        `compat mode [${provider}]: model=${model}${base ? ` via ${base}` : ""} (thinking/effort/cache_control disabled)`,
       ),
     );
   }
@@ -67,8 +73,6 @@ async function main(): Promise<void> {
     ? Number(process.env.AGENT_CONTEXT_LIMIT)
     : undefined;
   const maxTokens = process.env.AGENT_MAX_TOKENS ? Number(process.env.AGENT_MAX_TOKENS) : undefined;
-  const timeoutMs = process.env.AGENT_TIMEOUT_MS ? Number(process.env.AGENT_TIMEOUT_MS) : undefined;
-  const maxRetries = process.env.AGENT_MAX_RETRIES ? Number(process.env.AGENT_MAX_RETRIES) : undefined;
 
   // 跨会话记忆（L5）：默认 <cwd>/.agent-memory，可用 AGENT_MEMORY_DIR 覆盖
   const memory = new MemoryStore(
@@ -91,15 +95,7 @@ async function main(): Promise<void> {
       memory_index: await memory.indexBlock(),
     },
   };
-  const modelClient = new AnthropicModelClient(
-    model,
-    timeoutMs !== undefined || maxRetries !== undefined
-      ? new Anthropic({
-          ...(timeoutMs !== undefined ? { timeout: timeoutMs } : {}),
-          ...(maxRetries !== undefined ? { maxRetries } : {}),
-        })
-      : undefined,
-  );
+  const modelClient = resolvedClient;
 
   const rl = autoYes ? null : readline.createInterface({ input: process.stdin, output: process.stdout });
   let streamingText = false;
