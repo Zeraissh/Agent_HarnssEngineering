@@ -21,6 +21,7 @@
 import path from "node:path";
 import readline from "node:readline/promises";
 import { AgentLoop } from "./loop.js";
+import { connectMcpServers, loadMcpConfig } from "./mcp.js";
 import { createMemoryTools, MemoryStore } from "./memory.js";
 import { runVerified } from "./orchestrate.js";
 import { createModelClientFromEnv } from "./provider.js";
@@ -79,9 +80,27 @@ async function main(): Promise<void> {
     process.env.AGENT_MEMORY_DIR ?? path.join(process.cwd(), ".agent-memory"),
   );
 
+  // MCP 工具（可选）：./mcp.json 存在即连接，AGENT_MCP_CONFIG 覆盖路径
+  const mcpConfig = await loadMcpConfig(
+    process.env.AGENT_MCP_CONFIG ?? path.join(process.cwd(), "mcp.json"),
+  );
+  const mcp = mcpConfig ? await connectMcpServers(mcpConfig, (m) => console.warn(c.yellow(m))) : undefined;
+  if (mcp) {
+    for (const [server, count] of Object.entries(mcp.summary)) {
+      console.log(c.dim(`mcp: connected "${server}" (${count} tools)`));
+    }
+  }
+
   const config: AgentConfig = {
     systemPrompt: SYSTEM_PROMPT,
-    tools: [bashTool, fetchUrlTool, readFileTool, writeFileTool, ...createMemoryTools(memory)],
+    tools: [
+      bashTool,
+      fetchUrlTool,
+      readFileTool,
+      writeFileTool,
+      ...createMemoryTools(memory),
+      ...(mcp?.tools ?? []),
+    ],
     workdir: process.cwd(),
     compat,
     contextTokenLimit,
@@ -130,6 +149,7 @@ async function main(): Promise<void> {
     }
   }
   rl?.close();
+  await mcp?.close();
 
   async function renderEvent(event: TurnEvent): Promise<void> {
     switch (event.type) {

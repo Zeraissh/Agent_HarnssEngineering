@@ -127,6 +127,8 @@ sequenceDiagram
 
 **v0.2 内置工具**（最小集）：`bash`（自定义 schema 的普通工具，宿主本地执行，超时+输出截断）、`read_file`、`write_file`。遵循 P2：其余能力先走 bash，出现 gate/校验/渲染/并行需求时再晋升。
 
+**MCP 接入**（v0.7，`src/mcp.ts`）：任意 MCP server 的工具经 `adaptMcpTool` 适配为标准 `Tool`（名字加 `${server}__` 前缀），由 `mcp.json` 声明（command/args/env + per-server permission/parallelSafe/includeTools）。默认 "ask" + 串行——外部进程能力面未知，宿主审批兜底（P6）；`includeTools` 白名单控制工具面大小。isError 直接映射（P5）。首个落地：stm32-gdb-mcp 驱动 STM32L151 真机调试。
+
 **安全基线**：`write_file` / `bash` 默认 `permission: "ask"`；路径类输入一律 resolve 到规范形式并校验在工作目录内（拒绝 `..`、符号链接逃逸）。
 
 ---

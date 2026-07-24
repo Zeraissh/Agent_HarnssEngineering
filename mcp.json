@@ -1,0 +1,26 @@
+{
+  "servers": {
+    "stm32": {
+      "command": "D:/Work/MCP_Servers/stm32-gdb-mcp/.venv/Scripts/python.exe",
+      "args": ["-m", "mcp_server.server"],
+      "cwd": "D:/Work/MCP_Servers/stm32-gdb-mcp",
+      "env": {
+        "PYTHONPATH": "D:/Work/MCP_Servers/stm32-gdb-mcp/src",
+        "STM32_GDB_MCP_COMPACT": "1"
+      },
+      "permission": "auto",
+      "parallelSafe": false,
+      "includeTools": [
+        "suggest_server_args",
+        "start_debug_session",
+        "self_check",
+        "capture_state",
+        "read_memory",
+        "read_peripheral_register",
+        "halt_execution",
+        "reset_target",
+        "stop_debug_session"
+      ]
+    }
+  }
+}

@@ -114,9 +114,23 @@
 - [x] 缓存统计贯通：cacheHit 81.3%（prompt_cache_hit_tokens 映射）
 - [x] 核心层零改动：diff 仅新增 L0 实现 + 工厂 + 宿主接线
 
+## v0.7 — MCP 接入与 STM32 真机落地
+
+**目标**：一次适配打开整个 MCP 工具生态；完成首个真实领域场景（嵌入式调试）。
+
+**范围**
+- `src/mcp.ts`：`adaptMcpTool`（MCP tool → Tool，`${server}__` 前缀防撞名）+ `McpConnection`/`connectMcpServers`（stdio transport，单 server 失败不拖垮整体）+ `mcp.json` 配置（per-server permission/parallelSafe/includeTools）
+- 安全默认：permission "ask"、串行（外部进程能力面未知，P6）；信任 server 可配置放开
+- CLI：`./mcp.json` 存在即自动连接（`AGENT_MCP_CONFIG` 覆盖），run 结束统一断开
+- STM32 侧：插件 0.1.1 → 0.2.0（marketplace 更新）；开发副本 editable 安装刷新至 0.6.0；harness 直连开发副本（venv python + compact 模式 + 9 工具白名单）
+
+**验证 checklist**（2026-07-24 通过）
+- [x] 8 个适配层单测（前缀/schema 直通/权限默认/isError 映射/content 渲染/配置解析）；全套 69 测试绿
+- [x] 核心层零改动：MCP 接入 diff 仅新增 src/mcp.ts + CLI 接线
+- [x] **STM32L151 真机端到端**：deepseek-chat 驱动 harness，7 轮自主完成 suggest_server_args → start_debug_session → self_check（主动带 expected_family）→ capture_state → 写报告 → stop_debug_session；报告数据（CPUID 0x412fc230 / dev_id 0x427 / Cortex-M3 / STM32L151/152 Cat.3）与直连 MCP 的独立检查完全一致
+
 ## 更远（不承诺顺序）
 
-- **MCP 客户端接入**（McpToolAdapter：MCP tool → Tool 接口）——打开现成工具生态，是接入 STM32 调试等真实领域的前置
 - **Harness A/B 研究**：用 eval 量化各 harness 特性的收益（verifier 开关、compact 阈值、工具描述写法、跨模型/协议矩阵）；前置：eval 用例扩到 15–20 个
 - server-side compaction（beta）替换本地截断
 - 多 agent 编排（并行 fan-out + 汇总）

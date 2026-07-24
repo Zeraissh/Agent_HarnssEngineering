@@ -70,7 +70,8 @@ npm test                                                          # 单元测试
 - **v0.4 ✅** — verifier 子代理 + `runVerified` 编排 + `fetch_url` 领域工具试点 + 评估基线
 - **v0.5 ✅** — L5 跨会话记忆：`.agent-memory/` + 四个记忆工具 + 开局索引注入
 - **v0.6 ✅** — OpenAI wire 协议：`AGENT_PROVIDER=openai` 接入一切 chat-completions 端点，核心层零改动
-- **后续** — MCP 工具接入、harness A/B 研究、server-side compaction（见 [docs/04-roadmap.md](docs/04-roadmap.md)）
+- **v0.7 ✅** — MCP 工具接入（`mcp.json` 声明 server，自动适配为 Tool）+ STM32L151 真机调试端到端
+- **后续** — harness A/B 研究、server-side compaction、多 agent 编排（见 [docs/04-roadmap.md](docs/04-roadmap.md)）
 
 ## 技术基线
 
