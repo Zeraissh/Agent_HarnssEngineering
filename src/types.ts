@@ -1,0 +1,126 @@
+/**
+ * 核心类型定义 — 与 docs/03-interfaces.md 一一对应。
+ * 约定：wire 格式一律复用 SDK 导出类型，这里只定义 harness 自身的概念。
+ */
+import type Anthropic from "@anthropic-ai/sdk";
+
+// ---------------------------------------------------------------- L2: 工具契约
+
+/** JSON Schema 对象（工具输入约束），直接使用 SDK 的 InputSchema 形状 */
+export type JSONSchema = Anthropic.Tool.InputSchema;
+
+export interface ToolContext {
+  /** 工作目录（路径校验的根，所有文件类工具不得逃逸） */
+  workdir: string;
+  /** 本次调用的 tool_use_id，用于日志关联 */
+  toolUseId: string;
+  /** 取消信号：护栏触发或用户中断时，长时间运行的工具应尽快退出 */
+  signal: AbortSignal;
+}
+
+export interface ToolResult {
+  /** 回填给模型的内容。错误信息要写给模型看（可操作、指明修正方向） */
+  content: string;
+  /** true = 以 is_error: true 回传，模型据此调整策略；不会中断循环 */
+  isError?: boolean;
+}
+
+export interface Tool {
+  name: string;
+  /** 必须写清"何时调用"（触发条件），不只是"做什么" */
+  description: string;
+  inputSchema: JSONSchema;
+  /** auto = 直接执行；ask = 发 approval_request 事件，等宿主应答后执行 */
+  permission: "auto" | "ask";
+  /** true = 可与其他 parallelSafe 工具并发执行（典型：只读工具） */
+  parallelSafe: boolean;
+  execute(input: unknown, ctx: ToolContext): Promise<ToolResult>;
+}
+
+// ---------------------------------------------------------------- L0: 模型客户端
+
+export type Effort = "low" | "medium" | "high" | "xhigh";
+
+export interface ModelRequest {
+  system: Anthropic.TextBlockParam[];
+  messages: Anthropic.MessageParam[];
+  tools: Anthropic.Tool[];
+  maxTokens: number;
+  effort: Effort;
+}
+
+/** 归一化后的一次模型往返 */
+export interface ModelTurn {
+  message: Anthropic.Message;
+  stopReason: Anthropic.Message["stop_reason"];
+  usage: Anthropic.Usage;
+}
+
+export interface ModelClient {
+  /** 一律流式发送；text delta 通过 onDelta 旁路（仅供渲染），控制流只依赖最终 ModelTurn */
+  send(req: ModelRequest, onDelta?: (text: string) => void): Promise<ModelTurn>;
+}
+
+// ---------------------------------------------------------------- L1: 循环与事件
+
+export interface AgentConfig {
+  /** 默认 "claude-opus-4-8" */
+  model?: string;
+  /** 冻结；禁止含时间戳等易变内容 */
+  systemPrompt: string;
+  tools: Tool[];
+  /** 默认 "high" */
+  effort?: Effort;
+  /** 默认 64000（流式） */
+  maxTokens?: number;
+  /** 默认 50，硬护栏 */
+  maxTurns?: number;
+  /** 可选：整个 run 的累计 token 上限（input+cacheCreation+cacheRead+output） */
+  maxTokensBudget?: number;
+  workdir: string;
+  /**
+   * 第三方 Anthropic 兼容端点模式（DeepSeek/GLM/Kimi 等）：
+   * 去掉 Claude 专属参数（adaptive thinking / output_config.effort / cache_control）。
+   * 缺省时由宿主按模型名推断（非 claude-* 即 true）。
+   */
+  compat?: boolean;
+}
+
+export interface AggregateUsage {
+  /** 未缓存部分 */
+  inputTokens: number;
+  cacheCreationTokens: number;
+  cacheReadTokens: number;
+  outputTokens: number;
+  turns: number;
+  /** cacheRead / (input + cacheCreation + cacheRead)，无输入时为 0 */
+  cacheHitRatio: number;
+}
+
+export interface AgentRunResult {
+  stopReason: "completed" | "max_turns" | "budget_exhausted" | "refusal" | "error";
+  /** 完整会话历史（SDK 类型），可用于持久化或子代理接力 */
+  messages: Anthropic.MessageParam[];
+  usage: AggregateUsage;
+  /** stopReason = "error" 时的宿主级错误；工具错误不会出现在这里 */
+  error?: Error;
+}
+
+/** loop 对外发射的结构化事件——日志、UI、审批门都是它的消费者 */
+export type TurnEvent =
+  | { type: "turn_start"; turn: number }
+  | { type: "text_delta"; text: string }
+  | { type: "assistant_text"; text: string }
+  | { type: "tool_call"; toolUseId: string; name: string; input: unknown }
+  | { type: "tool_result"; toolUseId: string; result: ToolResult; durationMs: number }
+  | {
+      type: "approval_request";
+      toolUseId: string;
+      name: string;
+      input: unknown;
+      /** 宿主必须调用 respond 才能让 loop 继续；deny 时可附给模型的理由 */
+      respond: (decision: "allow" | "deny", reason?: string) => void;
+    }
+  | { type: "usage"; turn: number; usage: Anthropic.Usage }
+  | { type: "compaction"; droppedBlocks: number }
+  | { type: "done"; result: AgentRunResult };

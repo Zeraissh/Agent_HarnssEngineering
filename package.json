@@ -1,0 +1,21 @@
+{
+  "name": "agent-harness",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Harness engineering agent framework — hand-written agent loop on the Anthropic Messages API",
+  "scripts": {
+    "cli": "tsx src/cli.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.90.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}

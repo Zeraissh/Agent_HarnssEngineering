@@ -30,14 +30,16 @@
 
 **验收任务**（端到端）：`"阅读本仓库 docs/ 下的所有文档，在根目录生成一份 SUMMARY.md"` —— 要求 agent 自主完成 glob → 多文件读取（并行）→ 写文件。
 
-**验证 checklist**
-- [ ] 验收任务一次跑通，SUMMARY.md 内容正确
-- [ ] 第二轮起 `cache_read_input_tokens > 0`（缓存断点生效）
-- [ ] 单轮多个 tool_use 时：parallel-safe 工具确实并发（日志时间戳证明），结果合并在单条 user 消息
-- [ ] 工具抛异常时循环不中断，模型收到 `is_error: true` 并调整策略
-- [ ] 人为设置 `maxTurns: 2` 时，以 `max_turns` 停止且不再发请求
-- [ ] `pause_turn` 分支有单元测试覆盖（mock ModelClient 构造该 stop_reason）
-- [ ] AggregateUsage 三类 token 分开统计，总和与 API usage 对账一致
+**验证 checklist**（2026-07-24 通过；端到端经 DeepSeek Anthropic 兼容端点 + compat 模式）
+- [x] 验收任务一次跑通，SUMMARY.md 内容正确（6 轮，deepseek-chat）
+- [x] 第二轮起 `cache_read_input_tokens > 0`——compat 模式下由 DeepSeek 自动缓存提供（cacheHit 61.6%）；Anthropic 原生 cache_control 断点待有 Anthropic key 后补验
+- [x] 单轮多个 tool_use 时：parallel-safe 工具确实并发（验收 turn 4 单条消息 4 个 read_file 并发执行；另有单测计时证明），结果合并在单条 user 消息
+- [x] 工具抛异常时循环不中断，模型收到 `is_error: true` 并调整策略（验收 turn 1–3：Windows 上 `find`/POSIX 语法连败两次后模型自行改用 `dir` 成功）
+- [x] 人为设置 `maxTurns: 2` 时，以 `max_turns` 停止且不再发请求（单测）
+- [x] `pause_turn` 分支有单元测试覆盖（mock ModelClient 构造该 stop_reason）
+- [x] AggregateUsage 三类 token 分开统计，总和与 API usage 对账一致（单测 + 验收 run 汇总）
+
+**超出计划完成**：compat 模式（第三方 Anthropic 兼容端点支持，`AGENT_MODEL` 非 claude-* 自动降级 thinking/effort/cache_control）；审批门全链路已随 v0.2 落地（CLI y/n + `--yes`），原计划 v0.3。
 
 ---
 
