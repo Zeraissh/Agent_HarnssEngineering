@@ -1,7 +1,8 @@
 /**
  * CLI 宿主：事件流的一个消费者示例。
- * 用法：npx tsx src/cli.ts "任务描述" [--yes]
- *   --yes  自动批准所有审批请求（非交互环境/CI 用；交互终端下走 y/n 提示）
+ * 用法：npx tsx src/cli.ts "任务描述" [--yes] [--verify]
+ *   --yes     自动批准所有审批请求（非交互环境/CI 用；交互终端下走 y/n 提示）
+ *   --verify  完成后由 verifier 子代理独立核查，未通过自动返工一轮
  *
  * 环境变量：
  *   ANTHROPIC_API_KEY   API 密钥（Anthropic 或第三方兼容端点的 key）
@@ -13,10 +14,12 @@
 import readline from "node:readline/promises";
 import { AgentLoop } from "./loop.js";
 import { AnthropicModelClient } from "./model-client.js";
+import { runVerified } from "./orchestrate.js";
 import { bashTool } from "./tools/bash.js";
+import { fetchUrlTool } from "./tools/fetch-url.js";
 import { readFileTool } from "./tools/read-file.js";
 import { writeFileTool } from "./tools/write-file.js";
-import type { TurnEvent } from "./types.js";
+import type { AgentConfig, TurnEvent } from "./types.js";
 
 const c = {
   dim: (s: string) => `\x1b[2m${s}\x1b[0m`,
@@ -34,9 +37,10 @@ Keep file outputs clean and well-structured. Respond in the language the user us
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const autoYes = args.includes("--yes");
-  const task = args.filter((a) => a !== "--yes").join(" ").trim();
+  const withVerify = args.includes("--verify");
+  const task = args.filter((a) => !a.startsWith("--")).join(" ").trim();
   if (!task) {
-    console.error('Usage: npx tsx src/cli.ts "task description" [--yes]');
+    console.error('Usage: npx tsx src/cli.ts "task description" [--yes] [--verify]');
     process.exit(1);
   }
 
@@ -54,23 +58,21 @@ async function main(): Promise<void> {
     ? Number(process.env.AGENT_CONTEXT_LIMIT)
     : undefined;
 
-  const loop = new AgentLoop(
-    {
-      systemPrompt: SYSTEM_PROMPT,
-      tools: [bashTool, readFileTool, writeFileTool],
+  const config: AgentConfig = {
+    systemPrompt: SYSTEM_PROMPT,
+    tools: [bashTool, fetchUrlTool, readFileTool, writeFileTool],
+    workdir: process.cwd(),
+    compat,
+    contextTokenLimit,
+    // 易变信息走 messages 注入（P3），system prompt 保持字节冻结
+    dynamicContext: {
+      date: new Date().toISOString().slice(0, 10),
+      platform: process.platform,
+      shell: process.platform === "win32" ? "cmd.exe" : "/bin/sh",
       workdir: process.cwd(),
-      compat,
-      contextTokenLimit,
-      // 易变信息走 messages 注入（P3），system prompt 保持字节冻结
-      dynamicContext: {
-        date: new Date().toISOString().slice(0, 10),
-        platform: process.platform,
-        shell: process.platform === "win32" ? "cmd.exe" : "/bin/sh",
-        workdir: process.cwd(),
-      },
     },
-    new AnthropicModelClient(model),
-  );
+  };
+  const modelClient = new AnthropicModelClient(model);
 
   const rl = autoYes ? null : readline.createInterface({ input: process.stdin, output: process.stdout });
   let streamingText = false;
@@ -81,8 +83,28 @@ async function main(): Promise<void> {
     }
   };
 
-  for await (const event of loop.run(task)) {
-    await renderEvent(event);
+  if (withVerify) {
+    const outcome = await runVerified(config, modelClient, task, {
+      onEvent: async (source, event) => {
+        if (source === "verifier") {
+          if (event.type === "assistant_text") console.log(c.yellow(event.text));
+          return;
+        }
+        if (source === "rework" && event.type === "turn_start" && event.turn === 1) {
+          console.log(c.yellow("\n↺ 核查未通过，开始返工…"));
+        }
+        await renderEvent(event);
+      },
+    });
+    const v = outcome.verifications.at(-1)?.verdict;
+    const tag = outcome.finalPassed ? c.green("✔ 核查通过") : c.red("✘ 核查未通过");
+    console.log(`\n${tag}${outcome.reworks ? c.dim(`（返工 ${outcome.reworks} 轮）`) : ""}`);
+    if (v && !outcome.finalPassed) for (const issue of v.issues) console.log(c.red(`  - ${issue}`));
+  } else {
+    const loop = new AgentLoop(config, modelClient);
+    for await (const event of loop.run(task)) {
+      await renderEvent(event);
+    }
   }
   rl?.close();
 

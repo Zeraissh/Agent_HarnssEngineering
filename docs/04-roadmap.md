@@ -69,15 +69,18 @@
 **目标**：Verification 支柱落地；证明框架的领域无关性。
 
 **范围**
-- **Verifier subagent**：主 agent 完成后，用独立 ContextManager（干净上下文）+ 相同 system/tools 前缀起一个子 loop，输入 = 任务描述 + 主 agent 产出，输出 = 结构化核查结论；主 loop 根据结论决定返工
-- 子代理的缓存复用策略：与父级共享 tools/system 前缀，验证 cache_read 生效
-- **领域接入试点**：接入一个真实领域工具集（候选：STM32 调试 MCP 工具、或 web 检索）；验证只需新增 Tool 实现、零改动 L0/L1/L3
-- 评估雏形：固定 5 个任务用例，记录成功率 / 轮数 / token 成本，作为后续改动的回归基线
+- **Verifier subagent**（`src/verifier.ts`）：干净上下文 + 相同 system/tools 前缀起子 loop，输入 = 任务描述 + 执行者报告（不可信），输出 = JSON 裁决（fail-closed 解析）；内部自动 deny 一切审批 → 只读硬约束
+- **编排器**（`src/orchestrate.ts`）：`runVerified()` 主 run → 核查 → 携问题清单返工（默认 1 轮）；CLI `--verify` 接入
+- **领域接入试点**：`fetch_url` 网页抓取工具（https-only、去标签、默认 ask 审批）
+- 评估基线：`eval/cases.ts` 5 用例 + 程序化判定，`npm run eval` 生成回归报告
 
-**验证 checklist**
-- [ ] verifier 能抓出主 agent 的一个植入错误（构造测试用例）
-- [ ] 领域工具接入 diff 只涉及 `src/tools/`，核心层零改动
-- [ ] 5 用例基线报告生成，可重复运行
+**验证 checklist**（2026-07-24 通过）
+- [x] verifier 能抓出主 agent 的一个植入错误（`eval/verifier-demo.ts`：报告谎称写入 "harness ok"、实际文件是 "hello world"，verifier 2 轮内亲自读文件给出 passed=false 并准确指出差异）
+- [x] 领域工具接入 diff 只涉及 `src/tools/fetch-url.ts` + CLI 注册一行，L0/L1/L3 零改动（git diff 可查）；实弹测试：抓取 example.com 提取标题写盘成功
+- [x] 5 用例基线报告生成且可重复（`eval/baseline-report.md`：deepseek-chat 5/5 通过，2–4 轮/用例，总 token 1.5k–8.9k/用例）
+- [x] 编排链路单测覆盖：一次通过 / 返工后通过（问题清单进返工输入）/ 到达 maxReworks / 主 run 未完成跳过核查；verifier deny-只读、共享 system 前缀均有断言（44+10 共 54 个测试）
+
+**注**：子代理缓存复用在 compat 模式下由 DeepSeek 自动缓存体现（verifier run 自身 cacheR > 0）；Anthropic 原生断点的父子前缀命中验证仍待 Anthropic key。
 
 ---
 

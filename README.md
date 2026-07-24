@@ -29,15 +29,36 @@
 | [docs/03-interfaces.md](docs/03-interfaces.md) | 核心 TypeScript 接口定义（实现蓝本） |
 | [docs/04-roadmap.md](docs/04-roadmap.md) | v0.1 → v0.4 演进路线与每阶段验证 checklist |
 
-## 路线图摘要
+## 快速开始
 
-- **v0.1（当前）** — 设计文档：分层架构 + 接口契约定稿
-- **v0.2** — 最小可跑闭环：ModelClient + AgentLoop + 3 个内置工具，端到端完成一个真实小任务
-- **v0.3** — 上下文管理完整化：缓存命中可观测、权限审批门、CLI 事件渲染
-- **v0.4** — 验证子代理（verifier subagent）、领域工具接入（如 STM32 调试 MCP）
+```powershell
+npm install
+
+# Anthropic 官方（默认 claude-opus-4-8）
+$env:ANTHROPIC_API_KEY = "sk-ant-..."
+
+# 或任意 Anthropic 兼容端点（DeepSeek / 智谱 GLM / Moonshot Kimi）
+$env:ANTHROPIC_BASE_URL = "https://api.deepseek.com/anthropic"
+$env:ANTHROPIC_API_KEY  = "sk-..."
+$env:AGENT_MODEL        = "deepseek-chat"   # 非 claude-* 自动进入 compat 模式
+
+npm run cli -- "阅读 docs/ 下所有文档，生成 SUMMARY.md"          # 交互审批 y/n
+npm run cli -- --yes "……"                                        # 自动批准（CI）
+npm run cli -- --verify "……"                                     # 完成后 verifier 独立核查，未通过自动返工
+npm run eval                                                      # 跑 5 用例回归基线
+npm test                                                          # 单元测试
+```
+
+## 路线图
+
+- **v0.1 ✅** — 设计文档：分层架构 + 接口契约定稿
+- **v0.2 ✅** — 最小可跑闭环：ModelClient + AgentLoop + 3 个内置工具 + compat 模式（第三方兼容端点）
+- **v0.3 ✅** — 上下文管理完整化：compact、缓存诊断、动态上下文注入
+- **v0.4 ✅** — verifier 子代理 + `runVerified` 编排 + `fetch_url` 领域工具试点 + 评估基线
+- **后续** — L5 跨会话记忆、server-side compaction、多 agent 编排（见 [docs/04-roadmap.md](docs/04-roadmap.md)）
 
 ## 技术基线
 
-- 语言：TypeScript（Node.js）
+- 语言：TypeScript（Node.js ≥ 22）
 - SDK：`@anthropic-ai/sdk`（仅用其类型与 HTTP 客户端，agent loop 全部自研）
-- 默认模型：`claude-opus-4-8`，adaptive thinking，`output_config.effort` 可配
+- 默认模型：`claude-opus-4-8`，adaptive thinking，`output_config.effort` 可配；兼容任何说 Anthropic Messages API 的端点

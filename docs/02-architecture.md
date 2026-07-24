@@ -143,10 +143,15 @@ sequenceDiagram
 
 ---
 
-## L4 / L5 — 轮廓（不在 v0.1 详设范围）
+## L4 — Orchestration（v0.4 已落地首个用例）
 
-- **L4 Orchestration**：子代理 = 用独立 ContextManager + 相同 ModelClient 起一个新 AgentLoop。首个用例是 **verifier subagent**——用干净上下文核查主 agent 的产出（fresh-context 验证优于自我批评）。子代理复用父级的 system/tools 前缀以蹭缓存。
-- **L5 Memory**：文件式跨会话记忆（一个 `memory/` 目录 + 读写工具 + 索引文件）。等 v0.4 有真实使用场景后再设计细节。
+- **Verifier subagent**（`src/verifier.ts`）：子代理 = 复用父级 systemPrompt/tools 的全新 AgentLoop（请求前缀一致，蹭 tools/system 层缓存），但看不到主 agent 的会话历史——只拿到任务描述 + 执行者报告，必须亲自用工具核查实际产出（fresh-context 验证优于自我批评）。只读纪律是硬约束（P6）：verifier 内部对一切 approval_request 自动 deny 并回传理由，写类工具在其中永远执行不了。裁决为 JSON（`{passed, issues, summary}`），宽容解析、解析失败视为不通过（fail-closed）。
+- **编排器**（`src/orchestrate.ts`）：`runVerified()` = 主 run → 核查 → 未通过则把问题清单拼进返工输入再跑一轮（`maxReworks` 可配，默认 1）。宿主经 `onEvent(source, event)` 观察全过程，审批仍归宿主。
+- **评估基线**（`eval/`）：5 个固定用例 + 程序化判定，`npm run eval` 生成 `eval/baseline-report.md`（成功率/轮数/token 成本），作为 harness 改动的回归基准。
+
+## L5 — Memory（轮廓，未实现）
+
+文件式跨会话记忆（一个 `memory/` 目录 + 读写工具 + 索引文件）。等有真实使用场景后再设计细节。
 
 ---
 

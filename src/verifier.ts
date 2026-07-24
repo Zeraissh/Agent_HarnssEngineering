@@ -1,0 +1,120 @@
+/**
+ * L4 — Verifier subagent：用干净上下文核查主 agent 的产出。
+ *
+ * 设计要点（docs/02 L4 轮廓的落地）：
+ * - 子代理 = 一个全新的 AgentLoop，复用父级的 systemPrompt + tools —— 请求前缀
+ *   与父级一致，能蹭到 tools/system 层的缓存；
+ * - "干净上下文"：verifier 看不到主 agent 的会话历史，只看到任务描述 + 执行者
+ *   报告，必须自己动手核查实际产出 —— fresh-context 验证优于自我批评；
+ * - 只读纪律由硬约束兜底（P6）：verifier 内部对一切 approval_request 自动 deny，
+ *   permission="ask" 的写类工具在 verifier 里永远执行不了。
+ */
+import { AgentLoop } from "./loop.js";
+import type { AgentConfig, AggregateUsage, ModelClient } from "./types.js";
+
+export interface Verdict {
+  passed: boolean;
+  issues: string[];
+  summary: string;
+}
+
+export interface VerifyOptions {
+  /** 原始任务描述 */
+  task: string;
+  /** 主 agent 的完成报告（不可信输入——verifier 的职责就是不信它） */
+  executorReport: string;
+}
+
+export interface VerifyOutcome {
+  verdict: Verdict;
+  usage: AggregateUsage;
+  /** verifier 的原始最终输出（供审计） */
+  raw: string;
+}
+
+export async function runVerifier(
+  cfg: AgentConfig,
+  model: ModelClient,
+  opts: VerifyOptions,
+): Promise<VerifyOutcome> {
+  // 与父级同 system/tools（缓存前缀一致）；护栏收紧：核查不该比执行更贵
+  const loop = new AgentLoop({ ...cfg, maxTurns: Math.min(cfg.maxTurns ?? 50, 15) }, model);
+
+  let finalText = "";
+  let usage: AggregateUsage | undefined;
+
+  for await (const event of loop.run(buildVerifierPrompt(opts))) {
+    switch (event.type) {
+      case "assistant_text":
+        finalText = event.text; // 只留最后一条：契约要求最终消息为纯 JSON
+        break;
+      case "approval_request":
+        // 硬约束：verifier 只读。deny 理由回传模型，让它改用只读手段
+        event.respond("deny", "Verifier is read-only. Use read_file or read-only commands to inspect.");
+        break;
+      case "done":
+        usage = event.result.usage;
+        break;
+      default:
+        break;
+    }
+  }
+
+  return { verdict: parseVerdict(finalText), usage: usage!, raw: finalText };
+}
+
+function buildVerifierPrompt(opts: VerifyOptions): string {
+  return `你现在的角色是独立验证员（verifier）。另一个 agent 声称完成了下面的任务。你的职责是用干净的视角核查【实际产出】——不要相信执行报告本身，报告里的每一条声明都要用工具核实。
+
+<task>
+${opts.task}
+</task>
+
+<executor_report>
+${opts.executorReport}
+</executor_report>
+
+核查规则：
+1. 只读核查：用 read_file 或只读命令检查实际文件/状态；不要修改、创建或删除任何东西。
+2. 逐条核对任务要求与实际产出：文件是否存在、内容是否正确、有没有偷工减料或与报告不符之处。
+3. 数值类声明（行数、数量、统计结果）必须独立重新验证，不能照抄报告。
+
+你的最后一条消息必须只包含一个 JSON 对象（不要代码围栏、不要多余文字）：
+{"passed": true/false, "issues": ["发现的问题，每条一个字符串；通过则为空数组"], "summary": "一句话结论"}`;
+}
+
+/**
+ * 宽容解析：兼容 compat 模型的输出习惯（代码围栏、JSON 前后带说明文字）。
+ * 解析失败 = 不通过（fail-closed）——verifier 的输出不可解析本身就是问题。
+ */
+export function parseVerdict(text: string): Verdict {
+  const candidates: string[] = [];
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/g);
+  if (fenced) {
+    for (const f of fenced) candidates.push(f.replace(/```(?:json)?\s*|```/g, ""));
+  }
+  // 贪婪抓取最外层 {...}（verifier 契约是"最后一条消息只含 JSON"，这里兜底）
+  const braced = text.match(/\{[\s\S]*\}/);
+  if (braced) candidates.push(braced[0]);
+
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate) as Partial<Verdict>;
+      if (typeof parsed.passed === "boolean") {
+        return {
+          passed: parsed.passed,
+          issues: Array.isArray(parsed.issues) ? parsed.issues.map(String) : [],
+          summary: typeof parsed.summary === "string" ? parsed.summary : "",
+        };
+      }
+    } catch {
+      // 尝试下一个候选
+    }
+  }
+
+  return {
+    passed: false,
+    issues: ["verifier 输出无法解析为 JSON 裁决"],
+    summary: text.slice(0, 200) || "(空输出)",
+  };
+}

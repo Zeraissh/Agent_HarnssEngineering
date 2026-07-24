@@ -188,6 +188,41 @@ interface AgentLoop {
 
 ---
 
+## L4 — 验证与编排（v0.4）
+
+```ts
+interface Verdict {
+  passed: boolean;
+  issues: string[];   // 未通过时的问题清单（会拼进返工输入）
+  summary: string;
+}
+
+interface VerifyOutcome { verdict: Verdict; usage: AggregateUsage; raw: string; }
+
+/**
+ * 干净上下文核查：与父级同 system/tools（缓存前缀一致），不共享会话历史；
+ * 内部对一切 approval_request 自动 deny（verifier 只读，硬约束）；
+ * 裁决 JSON 宽容解析，解析失败 = 不通过（fail-closed）。
+ */
+function runVerifier(cfg: AgentConfig, model: ModelClient, opts: {
+  task: string;
+  executorReport: string;   // 不可信输入——verifier 的职责就是不信它
+}): Promise<VerifyOutcome>;
+
+/** 主 run → 核查 → 未通过带问题清单返工（默认最多 1 轮） */
+function runVerified(cfg: AgentConfig, model: ModelClient, task: string, opts?: {
+  maxReworks?: number;
+  onEvent?: (source: "main" | "rework" | "verifier", event: TurnEvent) => void | Promise<void>;
+}): Promise<{
+  main: AgentRunResult;
+  verifications: VerifyOutcome[];
+  reworks: number;
+  finalPassed: boolean;
+}>;
+```
+
+---
+
 ## 契约要点（实现必须遵守的行为语义）
 
 1. **完整 push assistant content**：每轮把 `ModelTurn.message.content` 原样加入历史——丢弃 tool_use / thinking 块会导致下一次请求 400 或行为退化。
