@@ -84,12 +84,27 @@
 
 ---
 
+## v0.5 — 跨会话记忆（L5）
+
+**目标**：agent 在会话之间保留并复用知识。
+
+**范围**
+- `src/memory.ts`：`MemoryStore`（一条记忆一个 .md 文件；索引不落盘，实时从首行提摘要）+ `createMemoryTools()` 四工具
+- 圈禁不变量：名字正则 + 路径校验 + 64KB 上限 → `memory_write` 得以 auto 权限（P2 晋升收益）
+- CLI 接入：`.agent-memory/` 默认目录（`AGENT_MEMORY_DIR` 覆盖）、`memory_index` 经 dynamicContext 注入、system 增加静态记忆纪律段
+
+**验证 checklist**（2026-07-24 通过）
+- [x] 跨进程闭环：会话 1 `memory_write` 保存部署端口 → 会话 2（全新进程）开局从注入索引发现记忆、`memory_read` 后写出正确答案 9944（独立核对）
+- [x] 圈禁不变量测试：`../` 逃逸、绝对路径、非 .md 名、64KB 超限全部被拒（8 个 MemoryStore/工具单测）
+- [x] 索引永不漂移：list/indexBlock 实时派生，无 MEMORY.md 可失步
+- [x] 52 个单测全绿
+
 ## 更远（不承诺顺序）
 
-- L5 Memory：跨会话文件式记忆目录 + 索引
 - server-side compaction（beta）替换本地截断
 - Tool search / defer_loading（工具数量增长后）
 - 多 agent 编排（并行 fan-out + 汇总）
+- Anthropic 原生缓存断点补验（待 Anthropic key）
 
 ---
 

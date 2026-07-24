@@ -55,7 +55,8 @@ npm test                                                          # 单元测试
 - **v0.2 ✅** — 最小可跑闭环：ModelClient + AgentLoop + 3 个内置工具 + compat 模式（第三方兼容端点）
 - **v0.3 ✅** — 上下文管理完整化：compact、缓存诊断、动态上下文注入
 - **v0.4 ✅** — verifier 子代理 + `runVerified` 编排 + `fetch_url` 领域工具试点 + 评估基线
-- **后续** — L5 跨会话记忆、server-side compaction、多 agent 编排（见 [docs/04-roadmap.md](docs/04-roadmap.md)）
+- **v0.5 ✅** — L5 跨会话记忆：`.agent-memory/` + 四个记忆工具 + 开局索引注入
+- **后续** — server-side compaction、多 agent 编排、tool search（见 [docs/04-roadmap.md](docs/04-roadmap.md)）
 
 ## 技术基线
 

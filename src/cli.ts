@@ -11,8 +11,10 @@
  *                       非 claude-* 模型自动进入 compat 模式（去掉 Claude 专属参数）
  *   AGENT_CONTEXT_LIMIT 可选，上下文 token 上限（触发 compact），默认 150000
  */
+import path from "node:path";
 import readline from "node:readline/promises";
 import { AgentLoop } from "./loop.js";
+import { createMemoryTools, MemoryStore } from "./memory.js";
 import { AnthropicModelClient } from "./model-client.js";
 import { runVerified } from "./orchestrate.js";
 import { bashTool } from "./tools/bash.js";
@@ -32,7 +34,9 @@ const c = {
 const SYSTEM_PROMPT = `You are a capable autonomous agent operating in a local working directory.
 Complete the user's task end to end using the available tools.
 Ground every claim of progress in an actual tool result. When the task is done, summarize what you did in one or two sentences.
-Keep file outputs clean and well-structured. Respond in the language the user used.`;
+Keep file outputs clean and well-structured. Respond in the language the user used.
+
+You have a persistent memory that survives across sessions. The current memory index is provided in the <context> block of the first message. Consult relevant memories (memory_read) before starting work. When you learn a durable fact, user preference, or lesson worth reusing — a correction you received, a project constant, an approach that worked — save it with memory_write (one fact per file, first line = summary). Update or delete memories that turn out to be wrong. Do not store transient task state or things already recorded in the repository.`;
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
@@ -58,9 +62,14 @@ async function main(): Promise<void> {
     ? Number(process.env.AGENT_CONTEXT_LIMIT)
     : undefined;
 
+  // 跨会话记忆（L5）：默认 <cwd>/.agent-memory，可用 AGENT_MEMORY_DIR 覆盖
+  const memory = new MemoryStore(
+    process.env.AGENT_MEMORY_DIR ?? path.join(process.cwd(), ".agent-memory"),
+  );
+
   const config: AgentConfig = {
     systemPrompt: SYSTEM_PROMPT,
-    tools: [bashTool, fetchUrlTool, readFileTool, writeFileTool],
+    tools: [bashTool, fetchUrlTool, readFileTool, writeFileTool, ...createMemoryTools(memory)],
     workdir: process.cwd(),
     compat,
     contextTokenLimit,
@@ -70,6 +79,7 @@ async function main(): Promise<void> {
       platform: process.platform,
       shell: process.platform === "win32" ? "cmd.exe" : "/bin/sh",
       workdir: process.cwd(),
+      memory_index: await memory.indexBlock(),
     },
   };
   const modelClient = new AnthropicModelClient(model);

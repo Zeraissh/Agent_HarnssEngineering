@@ -149,9 +149,17 @@ sequenceDiagram
 - **编排器**（`src/orchestrate.ts`）：`runVerified()` = 主 run → 核查 → 未通过则把问题清单拼进返工输入再跑一轮（`maxReworks` 可配，默认 1）。宿主经 `onEvent(source, event)` 观察全过程，审批仍归宿主。
 - **评估基线**（`eval/`）：5 个固定用例 + 程序化判定，`npm run eval` 生成 `eval/baseline-report.md`（成功率/轮数/token 成本），作为 harness 改动的回归基准。
 
-## L5 — Memory（轮廓，未实现）
+## L5 — Memory（v0.5 已实现）
 
-文件式跨会话记忆（一个 `memory/` 目录 + 读写工具 + 索引文件）。等有真实使用场景后再设计细节。
+文件式跨会话记忆（`src/memory.ts`）。三个关键设计决策：
+
+| 决策 | 理由 |
+|---|---|
+| **索引不落盘**：`memory_list` / `indexBlock()` 实时从每个文件首行提取摘要 | 不依赖模型自觉维护 MEMORY.md（P6：不变量靠 harness，不靠 prompt 纪律）——索引永不漂移 |
+| **专用工具 + auto 权限**：`memory_write` 写盘却不需要审批 | P2 晋升的正面案例：写操作被硬性圈禁在 memoryDir 内（名字正则 + 路径校验 + 64KB 上限），圈禁不变量使 auto 成立；通用 write_file 依然 ask |
+| **索引经 dynamicContext 注入** | 模型开局即知自己记得什么（否则记忆等于不存在）；易变信息进 messages 不进 system（P3） |
+
+工具面：`memory_list` / `memory_read`（parallelSafe）+ `memory_write` / `memory_delete`。一条记忆 = 一个 `.md` 文件，首行即摘要；记忆是"值得复用的事实/偏好/教训"，不是数据仓库（64KB 上限强制这一点）。CLI 默认目录 `<cwd>/.agent-memory`（`AGENT_MEMORY_DIR` 覆盖）。
 
 ---
 

@@ -223,6 +223,28 @@ function runVerified(cfg: AgentConfig, model: ModelClient, task: string, opts?: 
 
 ---
 
+## L5 — 跨会话记忆（v0.5）
+
+```ts
+interface MemoryEntry { name: string; summary: string; sizeBytes: number; }
+
+class MemoryStore {
+  constructor(readonly dir: string);
+  list(): Promise<MemoryEntry[]>;        // 摘要实时取自文件首行——索引不落盘、永不漂移
+  read(name: string): Promise<string>;
+  write(name: string, content: string): Promise<void>;  // 名字正则 + 圈禁校验 + 64KB 上限
+  delete(name: string): Promise<void>;
+  indexBlock(): Promise<string>;         // 注入 dynamicContext.memory_index 的索引文本
+}
+
+/** 工厂：memory_list / memory_read（parallelSafe）+ memory_write / memory_delete，全部 auto */
+function createMemoryTools(store: MemoryStore): Tool[];
+```
+
+宿主接入约定：`dynamicContext: { ..., memory_index: await store.indexBlock() }` + system prompt 中一段**静态**的记忆使用纪律（何时写、何时删、不存什么）。
+
+---
+
 ## 契约要点（实现必须遵守的行为语义）
 
 1. **完整 push assistant content**：每轮把 `ModelTurn.message.content` 原样加入历史——丢弃 tool_use / thinking 块会导致下一次请求 400 或行为退化。
