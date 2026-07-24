@@ -8,6 +8,7 @@
  *   ANTHROPIC_BASE_URL  可选，第三方 Anthropic 兼容端点（DeepSeek/GLM/Kimi 等）
  *   AGENT_MODEL         可选，模型名，默认 claude-opus-4-8；
  *                       非 claude-* 模型自动进入 compat 模式（去掉 Claude 专属参数）
+ *   AGENT_CONTEXT_LIMIT 可选，上下文 token 上限（触发 compact），默认 150000
  */
 import readline from "node:readline/promises";
 import { AgentLoop } from "./loop.js";
@@ -49,12 +50,24 @@ async function main(): Promise<void> {
     );
   }
 
+  const contextTokenLimit = process.env.AGENT_CONTEXT_LIMIT
+    ? Number(process.env.AGENT_CONTEXT_LIMIT)
+    : undefined;
+
   const loop = new AgentLoop(
     {
       systemPrompt: SYSTEM_PROMPT,
       tools: [bashTool, readFileTool, writeFileTool],
       workdir: process.cwd(),
       compat,
+      contextTokenLimit,
+      // 易变信息走 messages 注入（P3），system prompt 保持字节冻结
+      dynamicContext: {
+        date: new Date().toISOString().slice(0, 10),
+        platform: process.platform,
+        shell: process.platform === "win32" ? "cmd.exe" : "/bin/sh",
+        workdir: process.cwd(),
+      },
     },
     new AnthropicModelClient(model),
   );

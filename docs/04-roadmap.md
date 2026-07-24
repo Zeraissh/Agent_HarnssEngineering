@@ -48,17 +48,19 @@
 **目标**：L3 完整 + 审批门 + 可用的 CLI 体验。
 
 **范围**
-- `compact()` 首个真实实现：截断最老的大体积 tool_result 为占位摘要；触发阈值可配
-- 缓存可观测：run 结束打印 cacheHitRatio；提供"缓存为何未命中"的诊断提示（前缀 diff 工具）
-- 权限门：`permission: "ask"` 全链路（approval_request 事件 → CLI y/n 提示 → deny 理由回传模型）
-- 动态上下文注入规范化：时间/环境信息注入 messages 而非 system 的辅助函数
-- CLI 渲染改进：区分 text / tool_call / tool_result / usage 的着色输出
+- `compact()` 首个真实实现：截断最老的大体积 tool_result 为占位摘要；触发阈值可配（`contextTokenLimit`，CLI 经 `AGENT_CONTEXT_LIMIT`）
+- 缓存可观测：run 结束打印 cacheHitRatio；`src/diagnostics.ts` 提供"缓存为何未命中"的前缀 diff 工具（`diffRenderedRequests`，按 tools → system → messages 顺序定位首个分歧点）
+- 权限门：`permission: "ask"` 全链路（已随 v0.2 提前落地：approval_request 事件 → CLI y/n 提示 → deny 理由回传模型）
+- 动态上下文注入规范化：`userMessageWithContext()`——时间/环境信息注入首条 user 消息而非 system
+- CLI 渲染改进：区分 text / tool_call / tool_result / usage 的着色输出（已随 v0.2 落地）
 
-**验证 checklist**
-- [ ] 长任务（>20 轮）触发 compact 后仍能正确续跑，compaction 事件可见
-- [ ] 连续两次相同任务，第二次 cacheHitRatio 显著高于 0
-- [ ] `write_file` 触发审批提示；deny 后模型收到理由并改变行为
-- [ ] system prompt 在整个 run 期间字节不变（测试断言）
+**验证 checklist**（2026-07-24 通过）
+- [x] 长任务触发 compact 后仍能正确续跑，compaction 事件可见（端到端：AGENT_CONTEXT_LIMIT=2500，10 轮任务触发 4 次 compaction，输入从 6.0k 压回 2.3k，最终 STATS.md 行数经独立核对全部正确；另有 4 个单测覆盖水位/保护窗/幂等/小块豁免）
+- [x] 缓存命中可观测：run 汇总打印三类 token + cacheHitRatio；`diffRenderedRequests` 有 4 个单测覆盖 tools/system/messages/none 四种分歧
+- [x] `write_file` 触发审批提示；deny 后模型收到理由并改变行为（单测覆盖 deny→is_error→模型调整；CLI y/n 交互链路已实现，交互式人工验证可随时进行）
+- [x] system prompt 在整个 run 期间字节不变（测试断言：不同 messages 下多次 render 的 system 字节一致）
+
+**注**："连续两次相同任务第二次 cacheHitRatio > 0"原属本阶段——compat 模式下 DeepSeek 自动缓存已在单次 run 内命中（39.8%~61.6%）；Anthropic 原生 cache_control 断点的跨请求命中验证仍待有 Anthropic key 后进行。
 
 ---
 

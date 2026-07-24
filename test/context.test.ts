@@ -58,11 +58,12 @@ describe("DefaultContextManager.render", () => {
     expect(typeof req.messages[0]!.content).toBe("string");
   });
 
-  it("compact 返回新数组（v0.2 直通）", () => {
+  it("compact 返回新数组，低水位时内容等价（详细行为见 compact.test.ts）", () => {
     const m = mgr();
     const messages: Anthropic.MessageParam[] = [{ role: "user", content: "hi" }];
     const out = m.compact(messages);
-    expect(out).not.toBe(messages);
-    expect(out).toEqual(messages);
+    expect(out.messages).not.toBe(messages);
+    expect(out.messages).toEqual(messages);
+    expect(out.droppedBlocks).toBe(0);
   });
 });

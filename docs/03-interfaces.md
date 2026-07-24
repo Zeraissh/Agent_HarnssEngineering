@@ -87,22 +87,40 @@ interface ModelClient {
 ## L3 — 上下文管理
 
 ```ts
+interface CompactResult {
+  messages: Anthropic.MessageParam[];
+  /** 本次被置换为占位文本的 tool_result 块数；0 = 未压缩 */
+  droppedBlocks: number;
+}
+
 interface ContextManager {
   /** 冻结的 system prompt（构造后不可变） */
   readonly systemPrompt: string;
 
   /**
-   * 组装一次请求：放置缓存断点（system 尾块 + 最近 user 消息尾块），
-   * 注入动态上下文（追加在 messages 中，绝不改 system）。
+   * 组装一次请求：放置缓存断点（system 尾块 + 最近 user 消息尾块）。
+   * compat 模式（cacheBreakpoints=false）下不打任何标记。
    */
   render(messages: Anthropic.MessageParam[], tools: Anthropic.Tool[]): ModelRequest;
 
+  /** loop 每轮喂入实际 usage —— compact 的触发依据（上一轮 input+cacheW+cacheR） */
+  noteUsage(usage: Anthropic.Usage): void;
+
   /**
-   * 窗口逼近时的压缩策略位。v0.2 首个实现 = 保守截断旧 tool_result；
-   * 后续实现可切换 server-side compaction。约定：返回新数组，不原地修改。
+   * v0.3 实现：上一轮输入超过 contextTokenLimit 的 80% 时，把保护窗口
+   * （protectRecent，默认 6 条）之外的大体积 tool_result 内容置换为占位文本。
+   * 结构不变（tool_use_id 配对保持），幂等（已压缩块不重复计数）。
+   * loop 用返回值替换正史（一次性、确定性），保证后续请求前缀稳定不抖缓存。
+   * 后续版本可切换 server-side compaction。
    */
-  compact(messages: Anthropic.MessageParam[]): Anthropic.MessageParam[];
+  compact(messages: Anthropic.MessageParam[]): CompactResult;
 }
+
+/** 动态上下文注入规范（P3）：易变信息进首条 user 消息，绝不进 system */
+function userMessageWithContext(
+  userInput: string,
+  context: Record<string, string>,
+): Anthropic.MessageParam;
 ```
 
 ---
@@ -119,6 +137,9 @@ interface AgentConfig {
   maxTurns?: number;                      // 默认 50，硬护栏
   maxTokensBudget?: number;               // 可选：整个 run 的累计 token 上限
   workdir: string;
+  compat?: boolean;                       // 第三方 Anthropic 兼容端点：去掉 Claude 专属参数
+  contextTokenLimit?: number;             // 触发 compact 的上下文上限，默认 150000
+  dynamicContext?: Record<string, string>; // 易变信息（时间/环境）注入首条 user 消息
 }
 
 /** loop 对外发射的结构化事件——日志、UI、审批门都是它的消费者（原则 P4） */

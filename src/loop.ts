@@ -6,7 +6,7 @@
  * approval_request 事件挂起循环直到宿主调用 respond；最后一个事件恒为 done。
  */
 import type Anthropic from "@anthropic-ai/sdk";
-import { DefaultContextManager } from "./context.js";
+import { DefaultContextManager, userMessageWithContext } from "./context.js";
 import { classifyApiError } from "./model-client.js";
 import { ToolExecutor, ToolRegistry } from "./tools/registry.js";
 import type {
@@ -74,6 +74,7 @@ export class AgentLoop {
       maxTokens: cfg.maxTokens ?? DEFAULTS.maxTokens,
       effort: cfg.effort ?? DEFAULTS.effort,
       cacheBreakpoints: !cfg.compat,
+      contextTokenLimit: cfg.contextTokenLimit,
     });
     this.maxTurns = cfg.maxTurns ?? DEFAULTS.maxTurns;
     this.maxTokensBudget = cfg.maxTokensBudget;
@@ -90,7 +91,11 @@ export class AgentLoop {
     signal: AbortSignal,
     q: AsyncEventQueue<TurnEvent>,
   ): Promise<void> {
-    const messages: Anthropic.MessageParam[] = [{ role: "user", content: userInput }];
+    let messages: Anthropic.MessageParam[] = [
+      this.cfg.dynamicContext
+        ? userMessageWithContext(userInput, this.cfg.dynamicContext)
+        : { role: "user", content: userInput },
+    ];
     const usage: AggregateUsage = {
       inputTokens: 0,
       cacheCreationTokens: 0,
@@ -125,10 +130,14 @@ export class AgentLoop {
 
       q.push({ type: "turn_start", turn });
 
-      const request = this.context.render(
-        this.context.compact(messages),
-        this.registry.toApiTools(),
-      );
+      // 压缩替换正史（一次性、确定性），保证后续请求前缀稳定（见 context.ts 注释）
+      const compacted = this.context.compact(messages);
+      if (compacted.droppedBlocks > 0) {
+        messages = compacted.messages;
+        q.push({ type: "compaction", droppedBlocks: compacted.droppedBlocks });
+      }
+
+      const request = this.context.render(messages, this.registry.toApiTools());
 
       let modelTurn;
       try {
@@ -140,6 +149,7 @@ export class AgentLoop {
       }
 
       usage.turns = turn;
+      this.context.noteUsage(modelTurn.usage);
       usage.inputTokens += modelTurn.usage.input_tokens;
       usage.cacheCreationTokens += modelTurn.usage.cache_creation_input_tokens ?? 0;
       usage.cacheReadTokens += modelTurn.usage.cache_read_input_tokens ?? 0;

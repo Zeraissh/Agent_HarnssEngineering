@@ -84,6 +84,10 @@ export interface AgentConfig {
    * 缺省时由宿主按模型名推断（非 claude-* 即 true）。
    */
   compat?: boolean;
+  /** 上下文 token 上限（触发 compact 的依据，按上一轮实际输入衡量）。默认 150_000 */
+  contextTokenLimit?: number;
+  /** 动态上下文（时间/环境等易变信息）：注入首条 user 消息，绝不进 system（P3） */
+  dynamicContext?: Record<string, string>;
 }
 
 export interface AggregateUsage {

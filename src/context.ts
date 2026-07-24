@@ -15,13 +15,32 @@ export interface ContextConfig {
   effort: Effort;
   /** false = 不打 cache_control 标记（第三方兼容端点可能不支持）。默认 true */
   cacheBreakpoints?: boolean;
+  /** 上下文 token 上限（近似值，按上一轮实际输入衡量）。默认 150_000 */
+  contextTokenLimit?: number;
+  /** 压缩时保护最近 N 条消息不动。默认 6 */
+  protectRecent?: number;
 }
+
+export interface CompactResult {
+  messages: Anthropic.MessageParam[];
+  /** 本次被置换为占位文本的 tool_result 块数量；0 = 未压缩 */
+  droppedBlocks: number;
+}
+
+/** 触发压缩的水位：上一轮实际输入超过上限的 80% */
+const COMPACT_WATERMARK = 0.8;
+/** 小于该字符数的 tool_result 不值得压缩 */
+const MIN_COMPACTABLE_CHARS = 500;
 
 export class DefaultContextManager {
   readonly systemPrompt: string;
   private readonly maxTokens: number;
   private readonly effort: Effort;
   private readonly cacheBreakpoints: boolean;
+  private readonly contextTokenLimit: number;
+  private readonly protectRecent: number;
+  /** 上一轮的实际输入规模（input + cacheW + cacheR），是"上下文有多大"的唯一可靠信号 */
+  private lastInputTokens = 0;
 
   constructor(cfg: ContextConfig) {
     // 构造时冻结（P3）：此后任何路径都不得修改 system prompt
@@ -29,6 +48,16 @@ export class DefaultContextManager {
     this.maxTokens = cfg.maxTokens;
     this.effort = cfg.effort;
     this.cacheBreakpoints = cfg.cacheBreakpoints ?? true;
+    this.contextTokenLimit = cfg.contextTokenLimit ?? 150_000;
+    this.protectRecent = cfg.protectRecent ?? 6;
+  }
+
+  /** loop 每轮调用，喂入实际 usage —— compact 的触发依据 */
+  noteUsage(usage: Anthropic.Usage): void {
+    this.lastInputTokens =
+      usage.input_tokens +
+      (usage.cache_creation_input_tokens ?? 0) +
+      (usage.cache_read_input_tokens ?? 0);
   }
 
   /**
@@ -60,13 +89,65 @@ export class DefaultContextManager {
   }
 
   /**
-   * 窗口逼近时的压缩策略位。v0.2 = 直通（不压缩）；
-   * v0.3 实现"截断最老的大体积 tool_result"，后续可切 server-side compaction。
-   * 约定：返回新数组，不原地修改。
+   * v0.3 压缩策略：上一轮输入超过水位线时，把"保护窗口之外"的大体积
+   * tool_result 内容替换为占位文本。结构保持不变（每个 tool_use_id 仍有
+   * 对应 tool_result），只有内容被置换 —— 不会破坏 API 约束。
+   *
+   * 注意：loop 会用返回值**替换**正史（而非仅用于本次渲染）——压缩只发生一次、
+   * 结果确定，后续请求前缀保持稳定，避免每轮重压缩导致的缓存抖动。
    */
-  compact(messages: Anthropic.MessageParam[]): Anthropic.MessageParam[] {
-    return [...messages];
+  compact(messages: Anthropic.MessageParam[]): CompactResult {
+    if (this.lastInputTokens < this.contextTokenLimit * COMPACT_WATERMARK) {
+      return { messages: [...messages], droppedBlocks: 0 };
+    }
+
+    let dropped = 0;
+    const cutoff = Math.max(0, messages.length - this.protectRecent);
+    const out = messages.map((m, i) => {
+      if (i >= cutoff || typeof m.content === "string") return m;
+      let touched = false;
+      const blocks = m.content.map((b) => {
+        if (
+          b.type === "tool_result" &&
+          typeof b.content === "string" &&
+          b.content.length > MIN_COMPACTABLE_CHARS &&
+          !b.content.startsWith("[compacted]")
+        ) {
+          touched = true;
+          dropped += 1;
+          return {
+            ...b,
+            content: `[compacted] tool result elided to save context (${b.content.length} chars). Re-run the tool if you need this data again.`,
+          };
+        }
+        return b;
+      });
+      return touched ? { ...m, content: blocks } : m;
+    });
+
+    return { messages: out, droppedBlocks: dropped };
   }
+}
+
+/**
+ * 动态上下文注入规范（P3）：易变信息（时间、环境）以独立 text 块进 messages，
+ * 绝不写进 system prompt —— system 变一个字节，其后缓存全灭。
+ * 注入点在首条 user 消息，run 期间保持不变，因此 messages 前缀依然稳定。
+ */
+export function userMessageWithContext(
+  userInput: string,
+  context: Record<string, string>,
+): Anthropic.MessageParam {
+  const lines = Object.entries(context)
+    .map(([k, v]) => `${k}: ${v}`)
+    .join("\n");
+  return {
+    role: "user",
+    content: [
+      { type: "text", text: `<context>\n${lines}\n</context>` },
+      { type: "text", text: userInput },
+    ],
+  };
 }
 
 /** 在消息的最后一个可缓存块上打 cache_control 标记（浅拷贝，不动原对象） */
