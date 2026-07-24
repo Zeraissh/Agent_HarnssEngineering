@@ -56,7 +56,9 @@ export function classifyApiError(err: unknown): string {
   if (err instanceof Anthropic.AuthenticationError) return "认证失败：检查 ANTHROPIC_API_KEY 或运行 ant auth login";
   if (err instanceof Anthropic.RateLimitError) return "限流：SDK 重试已耗尽，请稍后再试";
   if (err instanceof Anthropic.NotFoundError) return "模型或端点不存在：检查 model 配置";
-  if (err instanceof Anthropic.APIConnectionError) return "网络错误：无法连接 Anthropic API";
+  if (err instanceof Anthropic.APIConnectionTimeoutError)
+    return "请求超时：模型在时限内未响应（本地慢速模型常见——调大 AGENT_TIMEOUT_MS，或检查服务端是否有排队/卡住的请求）";
+  if (err instanceof Anthropic.APIConnectionError) return "网络错误：无法连接 API 端点";
   if (err instanceof Anthropic.APIError) return `API 错误 ${err.status ?? "?"}: ${err.message}`;
   return err instanceof Error ? err.message : String(err);
 }

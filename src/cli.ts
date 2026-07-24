@@ -10,9 +10,14 @@
  *   AGENT_MODEL         可选，模型名，默认 claude-opus-4-8；
  *                       非 claude-* 模型自动进入 compat 模式（去掉 Claude 专属参数）
  *   AGENT_CONTEXT_LIMIT 可选，上下文 token 上限（触发 compact），默认 150000
+ *   AGENT_MAX_TOKENS    可选，单次响应输出上限，默认 64000。本地慢速模型建议调低
+ *                       （如 4096）以掐断思考螺旋——快速失败优于无限等待
+ *   AGENT_TIMEOUT_MS    可选，单请求超时毫秒数，默认 SDK 的 10 分钟
+ *   AGENT_MAX_RETRIES   可选，超时/5xx 重试次数，默认 SDK 的 2
  */
 import path from "node:path";
 import readline from "node:readline/promises";
+import Anthropic from "@anthropic-ai/sdk";
 import { AgentLoop } from "./loop.js";
 import { createMemoryTools, MemoryStore } from "./memory.js";
 import { AnthropicModelClient } from "./model-client.js";
@@ -61,6 +66,9 @@ async function main(): Promise<void> {
   const contextTokenLimit = process.env.AGENT_CONTEXT_LIMIT
     ? Number(process.env.AGENT_CONTEXT_LIMIT)
     : undefined;
+  const maxTokens = process.env.AGENT_MAX_TOKENS ? Number(process.env.AGENT_MAX_TOKENS) : undefined;
+  const timeoutMs = process.env.AGENT_TIMEOUT_MS ? Number(process.env.AGENT_TIMEOUT_MS) : undefined;
+  const maxRetries = process.env.AGENT_MAX_RETRIES ? Number(process.env.AGENT_MAX_RETRIES) : undefined;
 
   // 跨会话记忆（L5）：默认 <cwd>/.agent-memory，可用 AGENT_MEMORY_DIR 覆盖
   const memory = new MemoryStore(
@@ -73,6 +81,7 @@ async function main(): Promise<void> {
     workdir: process.cwd(),
     compat,
     contextTokenLimit,
+    maxTokens,
     // 易变信息走 messages 注入（P3），system prompt 保持字节冻结
     dynamicContext: {
       date: new Date().toISOString().slice(0, 10),
@@ -82,7 +91,15 @@ async function main(): Promise<void> {
       memory_index: await memory.indexBlock(),
     },
   };
-  const modelClient = new AnthropicModelClient(model);
+  const modelClient = new AnthropicModelClient(
+    model,
+    timeoutMs !== undefined || maxRetries !== undefined
+      ? new Anthropic({
+          ...(timeoutMs !== undefined ? { timeout: timeoutMs } : {}),
+          ...(maxRetries !== undefined ? { maxRetries } : {}),
+        })
+      : undefined,
+  );
 
   const rl = autoYes ? null : readline.createInterface({ input: process.stdin, output: process.stdout });
   let streamingText = false;

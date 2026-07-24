@@ -42,6 +42,13 @@ $env:ANTHROPIC_BASE_URL = "https://api.deepseek.com/anthropic"
 $env:ANTHROPIC_API_KEY  = "sk-..."
 $env:AGENT_MODEL        = "deepseek-chat"   # 非 claude-* 自动进入 compat 模式
 
+# 或本地 Ollama（v0.14+ 原生 Anthropic 兼容；本地慢速模型务必配超时与输出上限）
+$env:ANTHROPIC_BASE_URL = "http://localhost:11434"
+$env:ANTHROPIC_API_KEY  = "ollama"          # 任意值即可
+$env:AGENT_MODEL        = "qwen3.5:9b"
+$env:AGENT_MAX_TOKENS   = "4096"            # 掐断思考螺旋，快速失败
+$env:AGENT_TIMEOUT_MS   = "300000"; $env:AGENT_MAX_RETRIES = "0"
+
 npm run cli -- "阅读 docs/ 下所有文档，生成 SUMMARY.md"          # 交互审批 y/n
 npm run cli -- --yes "……"                                        # 自动批准（CI）
 npm run cli -- --verify "……"                                     # 完成后 verifier 独立核查，未通过自动返工

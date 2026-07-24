@@ -7,6 +7,7 @@
  */
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
+import Anthropic from "@anthropic-ai/sdk";
 import { AgentLoop } from "../src/loop.js";
 import { AnthropicModelClient } from "../src/model-client.js";
 import { bashTool } from "../src/tools/bash.js";
@@ -41,13 +42,24 @@ async function main(): Promise<void> {
     workdir,
     compat: !model.startsWith("claude"),
     maxTurns: 15,
+    maxTokens: process.env.AGENT_MAX_TOKENS ? Number(process.env.AGENT_MAX_TOKENS) : undefined,
     dynamicContext: {
       platform: process.platform,
       shell: process.platform === "win32" ? "cmd.exe" : "/bin/sh",
       workdir,
     },
   };
-  const client = new AnthropicModelClient(model);
+  const timeoutMs = process.env.AGENT_TIMEOUT_MS ? Number(process.env.AGENT_TIMEOUT_MS) : undefined;
+  const maxRetries = process.env.AGENT_MAX_RETRIES ? Number(process.env.AGENT_MAX_RETRIES) : undefined;
+  const client = new AnthropicModelClient(
+    model,
+    timeoutMs !== undefined || maxRetries !== undefined
+      ? new Anthropic({
+          ...(timeoutMs !== undefined ? { timeout: timeoutMs } : {}),
+          ...(maxRetries !== undefined ? { maxRetries } : {}),
+        })
+      : undefined,
+  );
 
   // 干净起跑：清空上一次的产出目录
   await rm(path.join(workdir, "eval-out"), { recursive: true, force: true });
@@ -61,7 +73,10 @@ async function main(): Promise<void> {
     const verdict =
       result.stopReason === "completed"
         ? await evalCase.check(workdir)
-        : { pass: false, note: `run 未完成: ${result.stopReason}` };
+        : {
+            pass: false,
+            note: `run 未完成: ${result.stopReason}${result.error ? ` — ${result.error.message}` : ""}`,
+          };
     const u = result.usage;
     records.push({
       id: evalCase.id,
