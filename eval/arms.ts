@@ -41,6 +41,18 @@ export function stripWhenToCall(tools: Tool[]): Tool[] {
   });
 }
 
+/**
+ * 工具使用策略提示（prompt-hint 臂的实验变量）：通用原则，不针对任何具体用例。
+ * 假设来源：hard-import-list 全灭的死因是逐文件 read_file 烧穿 15 轮上限，
+ * 而正解是一条 grep——如果一句策略提示能改变工具选择，这就是最便宜的 harness 特性。
+ */
+export const TOOL_STRATEGY_HINT = `
+
+Tool-use strategy:
+- Your turn budget is limited. For scanning, counting, or collecting across multiple files, prefer a single bulk command (grep/wc/awk/find over a directory) instead of reading files one by one — per-file reads burn turns linearly.
+- Before acting, ask: can 1-2 commands fetch ALL the raw data this task needs? If yes, do that first.
+- Before writing an output file, re-check every format constraint (separators, ordering, trailing bytes).`;
+
 export const ARMS: Arm[] = [
   {
     name: "baseline",
@@ -59,6 +71,18 @@ export const ARMS: Arm[] = [
     hypothesis: "工具描述砍掉 When-to-call 后，成功率/轮数是否变差",
     mode: "single",
     configure: (base) => ({ ...base, tools: stripWhenToCall(base.tools) }),
+  },
+  {
+    name: "prompt-hint",
+    hypothesis: "批量命令策略提示能否救活轮次预算耗尽型失败（对照 baseline 的 max_turns 全灭）",
+    mode: "single",
+    configure: (base) => ({ ...base, systemPrompt: base.systemPrompt + TOOL_STRATEGY_HINT }),
+  },
+  {
+    name: "budget-30",
+    hypothesis: "maxTurns 15→30：轮次预算是不是 import-list 失败的约束本身（对照 prompt-hint 无效）",
+    mode: "single",
+    configure: (base) => ({ ...base, maxTurns: 30 }),
   },
   {
     name: "verified-strict",

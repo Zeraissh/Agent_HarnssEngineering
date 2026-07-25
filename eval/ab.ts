@@ -98,11 +98,31 @@ async function main(): Promise<void> {
         );
         cell.turns += turns;
         cell.tokens += tokens;
+        // 评分策略（2026-07-25 改）：纯产物制——无论 stopReason 一律检查实际产物。
+        // 旧策略对 max_turns 直接判负，但 agent 可能在最后一轮已写出正确产物；
+        // 过程如何终止是过程指标（stopReason 单独留档），产物对错才是任务成败。
+        const artifact = await evalCase.check(workdir);
         const verdict =
-          result.stopReason === "completed" || result.stopReason === "max_tokens"
-            ? await evalCase.check(workdir)
-            : { pass: false, note: `run 未完成: ${result.stopReason}` };
+          result.stopReason === "completed"
+            ? artifact
+            : { ...artifact, note: `${artifact.note} [stopReason=${result.stopReason}]` };
         if (verdict.pass) cell.pass += 1;
+        // 完整 transcript 留档（诊断用）：不留就无法回答"为什么烧穿了轮次/token"
+        await mkdir(path.join(workdir, "eval", "transcripts"), { recursive: true });
+        await writeFile(
+          path.join(
+            workdir,
+            "eval",
+            "transcripts",
+            `${evalCase.id}__${arm.name}__rep${r + 1}__${Date.now()}.json`,
+          ),
+          JSON.stringify(
+            { case: evalCase.id, arm: arm.name, rep: r + 1, model, stopReason: result.stopReason, verdict, messages: result.messages },
+            null,
+            2,
+          ),
+          "utf8",
+        );
         // 逐 run 留档（诊断用）：裁决细节不落档，事后就只能靠 eval-out 遗留文件猜
         await appendFile(
           path.join(workdir, "eval", "ab-log.jsonl"),
