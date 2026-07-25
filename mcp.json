@@ -14,10 +14,14 @@
         "suggest_server_args",
         "start_debug_session",
         "self_check",
+        "halt_execution",
+        "load_symbols",
         "capture_state",
+        "reconstruct_fault_context",
+        "read_call_stack",
+        "read_variable",
         "read_memory",
         "read_peripheral_register",
-        "halt_execution",
         "reset_target",
         "stop_debug_session"
       ]

@@ -129,6 +129,10 @@
 - [x] 核心层零改动：MCP 接入 diff 仅新增 src/mcp.ts + CLI 接线
 - [x] **STM32L151 真机端到端**：deepseek-chat 驱动 harness，7 轮自主完成 suggest_server_args → start_debug_session → self_check（主动带 expected_family）→ capture_state → 写报告 → stop_debug_session；报告数据（CPUID 0x412fc230 / dev_id 0x427 / Cortex-M3 / STM32L151/152 Cat.3）与直连 MCP 的独立检查完全一致
 
+**真机故障定位（2026-07-25）**：植入除零 HardFault（`stm32l151_faultdemo`：main → app_init → process_config，`100 / g_divisor` with g_divisor=0，设 DIV_0_TRP）到 L151，让 **本地 qwen3.5:9b（Ollama, 262k 上下文）** 通过 harness+MCP 自主定位。9 轮约 2.5 分钟完成：suggest_server_args → start_debug_session → self_check → load_symbols → reconstruct_fault_context → read_call_stack → 写报告 → stop。诊断五项全对（UsageFault DIVBYZERO→HardFault / process_config main.c:27 / faulting PC 0x08000042 / 根因除零 / 调用链），与独立 objdump+CFSR 核对一致。证明：本地 9B 模型经此 harness 能自主完成真实硬件故障定位。
+- 现场发现：① 野指针写 0xCCCCCCCC 在 L151 外部设备区被静默丢弃、不触发故障——改除零才可靠；② SWD 自锁（固件低功耗/引脚重配 + 无 NRST）需物理上电复位抢连接救回。
+- **harness 短板（待改）**：首跑 `max_tokens=2048` 时模型报告太长被截断，而 loop 在 v0.2 把 max_tokens 当硬错误终止整轮——诊断其实已完成、仅报告没写成。应把 max_tokens 截断作为独立的非 error 终止态、保留已生成内容，而非丢弃整轮。
+
 ## 更远（不承诺顺序）
 
 - **Harness A/B 研究**：用 eval 量化各 harness 特性的收益（verifier 开关、compact 阈值、工具描述写法、跨模型/协议矩阵）；前置：eval 用例扩到 15–20 个
