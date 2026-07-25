@@ -10,7 +10,7 @@
  *   permission="ask" 的写类工具在 verifier 里永远执行不了。
  */
 import { AgentLoop } from "./loop.js";
-import type { AgentConfig, AggregateUsage, ModelClient } from "./types.js";
+import type { AgentConfig, AggregateUsage, ModelClient, TurnEvent } from "./types.js";
 
 export interface Verdict {
   passed: boolean;
@@ -41,6 +41,8 @@ export async function runVerifier(
   cfg: AgentConfig,
   model: ModelClient,
   opts: VerifyOptions,
+  /** 过程事件透传：让宿主看到 verifier 自己的工具调用/复核过程（可见性） */
+  onEvent?: (event: TurnEvent) => void | Promise<void>,
 ): Promise<VerifyOutcome> {
   // 与父级同 system/tools（缓存前缀一致）；护栏收紧：核查不该比执行更贵
   const loop = new AgentLoop({ ...cfg, maxTurns: Math.min(cfg.maxTurns ?? 50, 15) }, model);
@@ -49,6 +51,7 @@ export async function runVerifier(
   let usage: AggregateUsage | undefined;
 
   for await (const event of loop.run(buildVerifierPrompt(opts))) {
+    await onEvent?.(event);
     switch (event.type) {
       case "assistant_text":
         finalText = event.text; // 只留最后一条：契约要求最终消息为纯 JSON

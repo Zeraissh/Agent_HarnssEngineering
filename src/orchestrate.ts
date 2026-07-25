@@ -92,13 +92,22 @@ async function runVerifierWithEvents(
   opts: VerifiedRunOptions,
 ): Promise<VerifyOutcome> {
   const executorReport = lastAssistantText(main) || "(执行者没有留下文字报告)";
-  // verifier 的事件流由其内部 loop 产生；这里无法逐个转发（runVerifier 封装了消费），
-  // 简化为只上报裁决 —— v0.5 若需要 verifier 过程可视化，再把 onEvent 下沉进 runVerifier。
-  const outcome = await runVerifier(cfg, model, {
-    task,
-    executorReport,
-    ...(opts.verifyInstructions ? { verifyInstructions: opts.verifyInstructions } : {}),
-  });
+  // verifier 的过程事件（工具调用/复核）经 onEvent 下沉透出，宿主可见其独立核查过程；
+  // 但压掉 verifier 的最终 assistant_text（裁决 JSON 是内部契约，不直接展示给用户）。
+  const outcome = await runVerifier(
+    cfg,
+    model,
+    {
+      task,
+      executorReport,
+      ...(opts.verifyInstructions ? { verifyInstructions: opts.verifyInstructions } : {}),
+    },
+    (event) => {
+      if (event.type === "assistant_text" || event.type === "done") return;
+      return opts.onEvent?.("verifier", event);
+    },
+  );
+  // 最后单独上报一条人类可读的裁决摘要
   await opts.onEvent?.("verifier", {
     type: "assistant_text",
     text: `[verifier] passed=${outcome.verdict.passed} ${outcome.verdict.summary}`,

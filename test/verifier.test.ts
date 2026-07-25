@@ -65,6 +65,25 @@ describe("runVerifier", () => {
     await runVerifier({ ...baseConfig, tools: [] }, model, { task: "t", executorReport: "r" });
     expect(model.requests[0]!.system[0]!.text).toBe("shared frozen system");
   });
+
+  it("onEvent 透传 verifier 过程事件（工具调用可见）", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("tu_1", "probe", {})], "tool_use"),
+      fakeMessage([textBlock('{"passed": true, "issues": [], "summary": "ok"}')], "end_turn"),
+    ]);
+    const seen: string[] = [];
+    await runVerifier(
+      { ...baseConfig, tools: [makeTool({ name: "probe" })] },
+      model,
+      { task: "t", executorReport: "r" },
+      (e) => {
+        seen.push(e.type);
+      },
+    );
+    // verifier 自己的工具调用与结果都被透出
+    expect(seen).toContain("tool_call");
+    expect(seen).toContain("tool_result");
+  });
 });
 
 describe("runVerified（编排：执行 → 核查 → 返工）", () => {

@@ -40,6 +40,7 @@ const c = {
   green: (s: string) => `\x1b[32m${s}\x1b[0m`,
   yellow: (s: string) => `\x1b[33m${s}\x1b[0m`,
   red: (s: string) => `\x1b[31m${s}\x1b[0m`,
+  magenta: (s: string) => `\x1b[35m${s}\x1b[0m`,
 };
 
 const SYSTEM_PROMPT = `You are a capable autonomous agent operating in a local working directory.
@@ -138,12 +139,40 @@ async function main(): Promise<void> {
     }
   };
 
+  // verifier 过程渲染：洋红色 [verifier] 前缀，与主 agent 视觉区分
+  let verifierStarted = false;
+  const renderVerifierEvent = (event: TurnEvent) => {
+    if (!verifierStarted) {
+      endStreamLine();
+      console.log(c.magenta("\n╔══ verifier 独立复核（全新上下文，自己重读硬件）══"));
+      verifierStarted = true;
+    }
+    switch (event.type) {
+      case "tool_call":
+        console.log(
+          `${c.magenta("║ →")} ${event.name} ${c.dim(JSON.stringify(event.input))}`,
+        );
+        break;
+      case "tool_result": {
+        const head = (event.result.content.split("\n")[0] ?? "").slice(0, 100);
+        console.log(`${c.magenta("║")} ${event.result.isError ? c.red("✗") : c.green("✓")} ${c.dim(head)}`);
+        break;
+      }
+      case "assistant_text":
+        // 裁决摘要（orchestrate 单独补发的那条 [verifier] passed=...）
+        if (event.text.startsWith("[verifier]")) console.log(c.magenta(`╚══ ${event.text}`));
+        break;
+      default:
+        break;
+    }
+  };
+
   if (withVerify) {
     const outcome = await runVerified(config, modelClient, task, {
       ...(preset?.verifyInstructions ? { verifyInstructions: preset.verifyInstructions } : {}),
       onEvent: async (source, event) => {
         if (source === "verifier") {
-          if (event.type === "assistant_text") console.log(c.yellow(event.text));
+          renderVerifierEvent(event);
           return;
         }
         if (source === "rework" && event.type === "turn_start" && event.turn === 1) {
