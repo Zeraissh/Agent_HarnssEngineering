@@ -59,7 +59,18 @@ npm run cli -- "阅读 docs/ 下所有文档，生成 SUMMARY.md"          # 交
 npm run cli -- --yes "……"                                        # 自动批准（CI）
 npm run cli -- --verify "……"                                     # 完成后 verifier 独立核查，未通过自动返工
 npm run eval                                                      # 跑 5 用例回归基线
+npm run lab                                                       # A/B 实验向导：选端点/臂/用例，免拼环境变量
+npm run lab -- --last                                             # 重放上一次实验配置
 npm test                                                          # 单元测试
+```
+
+`--verify` 支持独立的核查模型（核查者应 ≥ 执行者强度，见 A/B 研究结论）：
+
+```powershell
+$env:AGENT_VERIFIER_MODEL    = "deepseek-v4-pro"                  # verifier 用的模型
+$env:AGENT_VERIFIER_BASE_URL = "https://api.deepseek.com/anthropic"  # 可选，独立端点
+$env:AGENT_VERIFIER_API_KEY  = "sk-..."                           # 可选，缺省沿用执行者
+npm run cli -- --verify "……"
 ```
 
 ## 路线图

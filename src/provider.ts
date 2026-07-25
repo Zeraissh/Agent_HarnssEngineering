@@ -21,8 +21,22 @@ export interface ResolvedProvider {
   compat: boolean;
 }
 
-export function createModelClientFromEnv(model: string): ResolvedProvider {
-  const provider = (process.env.AGENT_PROVIDER ?? "anthropic") as "anthropic" | "openai";
+/**
+ * 端点覆盖：用于在同一进程里创建指向不同端点的第二个客户端
+ * （如"执行者用本地 Ollama、verifier 用云端强模型"的跨强度核查实验）。
+ */
+export interface ProviderOverrides {
+  provider?: "anthropic" | "openai";
+  baseURL?: string;
+  apiKey?: string;
+}
+
+export function createModelClientFromEnv(
+  model: string,
+  overrides: ProviderOverrides = {},
+): ResolvedProvider {
+  const provider =
+    overrides.provider ?? ((process.env.AGENT_PROVIDER ?? "anthropic") as "anthropic" | "openai");
   const timeoutMs = process.env.AGENT_TIMEOUT_MS ? Number(process.env.AGENT_TIMEOUT_MS) : undefined;
   const maxRetries = process.env.AGENT_MAX_RETRIES ? Number(process.env.AGENT_MAX_RETRIES) : undefined;
 
@@ -31,21 +45,27 @@ export function createModelClientFromEnv(model: string): ResolvedProvider {
       provider,
       compat: true,
       client: new OpenAIModelClient(model, {
-        baseURL: process.env.OPENAI_BASE_URL,
-        apiKey: process.env.OPENAI_API_KEY ?? process.env.ANTHROPIC_API_KEY,
+        baseURL: overrides.baseURL ?? process.env.OPENAI_BASE_URL,
+        apiKey: overrides.apiKey ?? process.env.OPENAI_API_KEY ?? process.env.ANTHROPIC_API_KEY,
         timeoutMs,
         maxRetries,
       }),
     };
   }
 
-  const sdkClient =
-    timeoutMs !== undefined || maxRetries !== undefined
-      ? new Anthropic({
-          ...(timeoutMs !== undefined ? { timeout: timeoutMs } : {}),
-          ...(maxRetries !== undefined ? { maxRetries } : {}),
-        })
-      : undefined;
+  const needsCustomSdk =
+    timeoutMs !== undefined ||
+    maxRetries !== undefined ||
+    overrides.baseURL !== undefined ||
+    overrides.apiKey !== undefined;
+  const sdkClient = needsCustomSdk
+    ? new Anthropic({
+        ...(timeoutMs !== undefined ? { timeout: timeoutMs } : {}),
+        ...(maxRetries !== undefined ? { maxRetries } : {}),
+        ...(overrides.baseURL !== undefined ? { baseURL: overrides.baseURL } : {}),
+        ...(overrides.apiKey !== undefined ? { apiKey: overrides.apiKey } : {}),
+      })
+    : undefined;
 
   return {
     provider,

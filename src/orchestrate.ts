@@ -12,6 +12,13 @@ export interface VerifiedRunOptions {
   /** 领域验证指令：透传给 verifier，说明如何独立核查（如硬件场景自己连板重读） */
   verifyInstructions?: string;
   /**
+   * 独立的 verifier 模型（默认与执行者共用同一个 client）。
+   * A/B 研究结论：verifier 必须 ≥ 执行者强度，否则假阴性返工是净负——
+   * 这个口子就是为"弱执行者 + 强核查者"的正确形态开的。
+   * compat 随模型端点而定，与执行者的 compat 无关，因此需要一并指定。
+   */
+  verifierModel?: { client: ModelClient; compat?: boolean };
+  /**
    * 事件旁路：所有主/返工 run 的事件都转发给宿主（含 approval_request——审批
    * 仍是宿主的事）。verifier 的事件也转发，但其 approval 已在内部 deny，仅供观察。
    */
@@ -92,11 +99,16 @@ async function runVerifierWithEvents(
   opts: VerifiedRunOptions,
 ): Promise<VerifyOutcome> {
   const executorReport = lastAssistantText(main) || "(执行者没有留下文字报告)";
+  const verifierClient = opts.verifierModel?.client ?? model;
+  const verifierCfg =
+    opts.verifierModel && opts.verifierModel.compat !== undefined
+      ? { ...cfg, compat: opts.verifierModel.compat }
+      : cfg;
   // verifier 的过程事件（工具调用/复核）经 onEvent 下沉透出，宿主可见其独立核查过程；
   // 但压掉 verifier 的最终 assistant_text（裁决 JSON 是内部契约，不直接展示给用户）。
   const outcome = await runVerifier(
-    cfg,
-    model,
+    verifierCfg,
+    verifierClient,
     {
       task,
       executorReport,

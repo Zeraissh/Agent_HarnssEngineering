@@ -1,5 +1,13 @@
 # Harness A/B 对比报告
 
+> ⚠️ **勘误（2026-07-25 晚，详见 ab-report-strong.md）**：本报告完成后发现
+> trap-no-newline 与 trap-conditional 两个用例的 checker 存在行数口径 bug
+> （`split("\n")` vs `wc -l` 差 1，前者冤判正确答案、后者奇偶反转无解），这两个
+> 用例的全部数据与"字节级错误 verifier 抓不到"的结论**作废**。仍然有效的结论：
+> ① trap-h2-count（ground truth 无歧义）上弱 verifier 假阴性毁掉正确产物（2/2→0/2），
+> "verifier 必须 ≥ 执行者强度"的反面证据成立；② inclusive-range 的救回真实。
+> 修复用例后的对照实验（qwen 执行 + deepseek-v4-pro 强核查）见 ab-report-strong.md。
+
 - 日期：2026-07-25
 - 模型：`qwen3.5:9b`
 - 规模：4 用例 × 2 臂 × 2 次

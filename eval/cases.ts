@@ -217,11 +217,14 @@ export const cases: EvalCase[] = [
       const got = await readOut(workdir, "eval-out/exact.txt");
       if (got === undefined) return { pass: false, note: "exact.txt 未创建" };
       const src = (await readOut(workdir, "src/types.ts")) ?? "";
-      const lines = src.split("\n").length;
-      // 严格字节级匹配：必须恰好是数字，无任何尾随字符（换行/空格都算失败）
-      return got === String(lines)
-        ? { pass: true, note: `精确匹配无尾随字符 (${lines})` }
-        : { pass: false, note: `期望恰好 "${lines}"，实际 ${JSON.stringify(got.slice(0, 20))}（含尾随字符或数值错）` };
+      // 行数口径有歧义（wc -l 数换行符 vs 编辑器数段落，差 1）——这不是本陷阱要考的，
+      // 两种口径都接受；本陷阱只考字节纪律：数字之外不允许任何尾随字符。
+      // （2026-07-25 教训：曾只认 split 口径，把按 wc -l 答对且格式完美的 run 冤判为错）
+      const nSplit = src.split("\n").length;
+      const nWc = src.endsWith("\n") ? nSplit - 1 : nSplit;
+      return got === String(nSplit) || got === String(nWc)
+        ? { pass: true, note: `精确匹配无尾随字符 (${got})` }
+        : { pass: false, note: `期望恰好 "${nWc}" 或 "${nSplit}"，实际 ${JSON.stringify(got.slice(0, 20))}（含尾随字符或数值错）` };
     },
   },
   {
@@ -244,12 +247,14 @@ export const cases: EvalCase[] = [
     id: "trap-conditional",
     covers: "陷阱：多分支条件（奇偶 → 不同产出）",
     task:
-      "数一下 src/loop.ts 的总行数。如果行数是偶数，就在 eval-out/parity.txt 中写入 'even'（不含引号）；如果是奇数，就写入 src/loop.ts 中第一个以 'import' 开头的行的完整内容（原样，去掉首尾空白）。",
+      "用 wc -l 的口径（即换行符的个数）统计 src/loop.ts 的总行数。如果行数是偶数，就在 eval-out/parity.txt 中写入 'even'（不含引号）；如果是奇数，就写入 src/loop.ts 中第一个以 'import' 开头的行的完整内容（原样，去掉首尾空白）。",
     async check(workdir) {
       const got = await readOut(workdir, "eval-out/parity.txt");
       if (got === undefined) return { pass: false, note: "parity.txt 未创建" };
       const src = (await readOut(workdir, "src/loop.ts")) ?? "";
-      const lines = src.split("\n").length;
+      // 口径必须与任务文本一致（wc -l）：奇偶陷阱考的是分支执行，不是行数口径之争。
+      // （2026-07-25 教训：曾用 split 口径判定，与任务的自然理解差 1 行导致奇偶反转，全员冤判）
+      const lines = src.split("\n").length - (src.endsWith("\n") ? 1 : 0);
       const expected =
         lines % 2 === 0
           ? "even"

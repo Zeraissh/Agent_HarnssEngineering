@@ -3,4 +3,6 @@ dist/
 *.log
 .env
 eval-out/
+eval/lab-profiles.json
+eval/ab-log.jsonl
 .agent-memory/

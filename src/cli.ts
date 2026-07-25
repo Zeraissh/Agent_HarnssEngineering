@@ -12,6 +12,9 @@
  *   OPENAI_API_KEY      provider=openai 时的 key，缺省复用 ANTHROPIC_API_KEY
  *   AGENT_MODEL         可选，模型名，默认 claude-opus-4-8；
  *                       非 claude-* 模型自动进入 compat 模式（去掉 Claude 专属参数）
+ *   AGENT_VERIFIER_MODEL 可选，--verify 时 verifier 用的独立模型（应 ≥ 执行者强度）；
+ *                       配套 AGENT_VERIFIER_PROVIDER / _BASE_URL / _API_KEY 可指向
+ *                       不同端点，缺省沿用执行者的端点配置
  *   AGENT_PRESET        可选，预设名（如 stm32-debug）：覆盖 system prompt、
  *                       自动开启 verifier 核查、注入领域核查方法
  *   AGENT_CONTEXT_LIMIT 可选，上下文 token 上限（触发 compact），默认 150000
@@ -72,6 +75,25 @@ async function main(): Promise<void> {
 
   const model = process.env.AGENT_MODEL ?? "claude-opus-4-8";
   const { client: resolvedClient, provider, compat } = createModelClientFromEnv(model);
+
+  // --verify 时可选的独立 verifier 模型（核查者应 ≥ 执行者强度）
+  const verifierModelName = process.env.AGENT_VERIFIER_MODEL;
+  const verifierProvider = verifierModelName
+    ? createModelClientFromEnv(verifierModelName, {
+        ...(process.env.AGENT_VERIFIER_PROVIDER
+          ? { provider: process.env.AGENT_VERIFIER_PROVIDER as "anthropic" | "openai" }
+          : {}),
+        ...(process.env.AGENT_VERIFIER_BASE_URL
+          ? { baseURL: process.env.AGENT_VERIFIER_BASE_URL }
+          : {}),
+        ...(process.env.AGENT_VERIFIER_API_KEY
+          ? { apiKey: process.env.AGENT_VERIFIER_API_KEY }
+          : {}),
+      })
+    : undefined;
+  if (withVerify && verifierProvider) {
+    console.log(c.dim(`verifier model: ${verifierModelName}`));
+  }
   if (compat) {
     const base =
       provider === "openai"
@@ -170,6 +192,9 @@ async function main(): Promise<void> {
   if (withVerify) {
     const outcome = await runVerified(config, modelClient, task, {
       ...(preset?.verifyInstructions ? { verifyInstructions: preset.verifyInstructions } : {}),
+      ...(verifierProvider
+        ? { verifierModel: { client: verifierProvider.client, compat: verifierProvider.compat } }
+        : {}),
       onEvent: async (source, event) => {
         if (source === "verifier") {
           renderVerifierEvent(event);

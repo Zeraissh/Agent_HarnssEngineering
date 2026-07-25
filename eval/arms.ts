@@ -10,7 +10,24 @@ export interface Arm {
   hypothesis: string;
   mode: "single" | "verified";
   configure(base: AgentConfig): AgentConfig;
+  /** verified 模式的附加配置（实验变量） */
+  verify?: {
+    /** 附加核查指令，如保守裁决协议 */
+    instructions?: string;
+    /** true = 用 AB_VERIFIER_MODEL 指定的（更强）模型当 verifier；未设该 env 时此臂被跳过 */
+    strongModel?: boolean;
+  };
 }
+
+/**
+ * 保守裁决协议：针对"弱 verifier 净负"的主因——假阴性裁决触发破坏性返工。
+ * 三条对策：failed 必须带证据、数值不一致先怀疑自己、字节级检查用工具不用肉眼。
+ */
+export const STRICT_VERIFY_INSTRUCTIONS = `裁决纪律（保守核查协议）：
+1. 只有拿到【具体证据】才允许判 failed——期望值与实际值都必须是你亲自用工具重新获取的，且两者确实不一致。"我怀疑/可能/风格不佳"都不构成问题；拿不出证据一律判 passed。
+2. 数值/计数类声明：亲自重新推导，优先用与执行者不同的方法（grep -c、wc -l、脚本各算一遍）。你的结果与产出不一致时，先假设是你自己数错了，换一种方法再算一遍，两次都不一致才可判 failed。
+3. 字节级格式要求（如"末尾不能有换行"）：禁止肉眼判断，必须用 od -c 或等价命令查看文件末尾的实际字节再下结论。
+4. issues 每条必须写明三件事：期望什么、实际是什么、你用哪条命令得到的。写不全就不要列。`;
 
 /**
  * 把工具描述"精简"成只说做什么、不说何时调用——用来检验
@@ -42,6 +59,20 @@ export const ARMS: Arm[] = [
     hypothesis: "工具描述砍掉 When-to-call 后，成功率/轮数是否变差",
     mode: "single",
     configure: (base) => ({ ...base, tools: stripWhenToCall(base.tools) }),
+  },
+  {
+    name: "verified-strict",
+    hypothesis: "保守裁决协议（failed 必须带证据 + 字节级用工具查）能否消掉假阴性返工、保住真救回",
+    mode: "verified",
+    configure: (base) => base,
+    verify: { instructions: STRICT_VERIFY_INSTRUCTIONS },
+  },
+  {
+    name: "verified-strong",
+    hypothesis: "强 verifier 核查弱执行者（AB_VERIFIER_MODEL），假阴性是否消失、救回是否稳定",
+    mode: "verified",
+    configure: (base) => base,
+    verify: { strongModel: true },
   },
 ];
 
