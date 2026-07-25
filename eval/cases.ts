@@ -100,4 +100,96 @@ export const cases: EvalCase[] = [
         : { pass: false, note: `fallback 内容不符: ${JSON.stringify(fallback.slice(0, 50))}` };
     },
   },
+  {
+    id: "sum-numbers",
+    covers: "多步：生成数据 → 计算 → 写结果（算术准确性）",
+    task:
+      "在 eval-out/nums.txt 中写入 1 到 20 的整数（每行一个），然后计算这些数字的总和，把总和的纯数字写入 eval-out/sum.txt",
+    async check(workdir) {
+      const sum = await readOut(workdir, "eval-out/sum.txt");
+      if (sum === undefined) return { pass: false, note: "sum.txt 未创建" };
+      return Number(sum.trim()) === 210
+        ? { pass: true, note: "总和正确 (210)" }
+        : { pass: false, note: `报告 ${sum.trim()}，实际应为 210` };
+    },
+  },
+  {
+    id: "json-field",
+    covers: "结构化抽取（读 JSON 取字段）",
+    task: "读取 package.json，把其中 version 字段的值（纯版本号，不带引号）写入 eval-out/version.txt",
+    async check(workdir) {
+      const got = await readOut(workdir, "eval-out/version.txt");
+      if (got === undefined) return { pass: false, note: "version.txt 未创建" };
+      const pkg = JSON.parse((await readOut(workdir, "package.json"))!) as { version: string };
+      return got.trim() === pkg.version
+        ? { pass: true, note: `版本号正确 (${pkg.version})` }
+        : { pass: false, note: `报告 ${JSON.stringify(got.trim())}，实际 ${pkg.version}` };
+    },
+  },
+  {
+    id: "filter-lines",
+    covers: "精确过滤（数符合特定前缀的行）",
+    task:
+      '读取 docs/04-roadmap.md，统计其中以 "- [x]" 开头的行（已完成的 checklist 项）有多少条，把纯数字写入 eval-out/done-count.txt',
+    async check(workdir) {
+      const got = await readOut(workdir, "eval-out/done-count.txt");
+      if (got === undefined) return { pass: false, note: "done-count.txt 未创建" };
+      const md = (await readOut(workdir, "docs/04-roadmap.md")) ?? "";
+      const actual = md.split("\n").filter((l) => l.startsWith("- [x]")).length;
+      return Number(got.trim()) === actual
+        ? { pass: true, note: `过滤计数正确 (${actual})` }
+        : { pass: false, note: `报告 ${got.trim()}，实际 ${actual}` };
+    },
+  },
+  {
+    id: "combine-titles",
+    covers: "多文件合成（各取标题拼装，格式约束）",
+    task:
+      "分别读取 docs/01-philosophy.md 和 docs/02-architecture.md 的第一行标题（去掉开头的 # 号），写入 eval-out/titles.txt，格式为两行：第一行 '01: <标题>'，第二行 '02: <标题>'",
+    async check(workdir) {
+      const got = await readOut(workdir, "eval-out/titles.txt");
+      if (got === undefined) return { pass: false, note: "titles.txt 未创建" };
+      const title = (md: string) => (md.split("\n")[0] ?? "").replace(/^#+\s*/, "").trim();
+      const t1 = title((await readOut(workdir, "docs/01-philosophy.md")) ?? "");
+      const t2 = title((await readOut(workdir, "docs/02-architecture.md")) ?? "");
+      const ok1 = got.includes("01:") && got.includes(t1.slice(0, 6));
+      const ok2 = got.includes("02:") && got.includes(t2.slice(0, 6));
+      return ok1 && ok2
+        ? { pass: true, note: "两个标题格式正确" }
+        : { pass: false, note: `缺失: ${!ok1 ? "01标题 " : ""}${!ok2 ? "02标题" : ""}` };
+    },
+  },
+  {
+    id: "sort-filenames",
+    covers: "列举 + 排序（确定性输出）",
+    task:
+      "列出 src/tools/ 目录下所有 .ts 文件的文件名（不含路径），按字母顺序排序，用英文逗号连接成一行写入 eval-out/tools-sorted.txt",
+    async check(workdir) {
+      const got = await readOut(workdir, "eval-out/tools-sorted.txt");
+      if (got === undefined) return { pass: false, note: "tools-sorted.txt 未创建" };
+      const files = (await readdir(path.join(workdir, "src/tools")))
+        .filter((f) => f.endsWith(".ts"))
+        .sort();
+      const reported = got.trim().split(",").map((s) => s.trim()).filter(Boolean).sort();
+      const same = reported.length === files.length && reported.every((f, i) => f === files[i]);
+      return same
+        ? { pass: true, note: `文件名与排序均正确 (${files.length} 个)` }
+        : { pass: false, note: `报告 [${reported.join(",")}]，实际 [${files.join(",")}]` };
+    },
+  },
+  {
+    id: "count-interfaces",
+    covers: "代码自省（精确统计源码结构）",
+    task:
+      '读取 src/types.ts，统计其中以 "export interface" 开头的行有多少个（即导出的接口数量），把纯数字写入 eval-out/iface-count.txt',
+    async check(workdir) {
+      const got = await readOut(workdir, "eval-out/iface-count.txt");
+      if (got === undefined) return { pass: false, note: "iface-count.txt 未创建" };
+      const src = (await readOut(workdir, "src/types.ts")) ?? "";
+      const actual = src.split("\n").filter((l) => l.startsWith("export interface")).length;
+      return Number(got.trim()) === actual
+        ? { pass: true, note: `接口数正确 (${actual})` }
+        : { pass: false, note: `报告 ${got.trim()}，实际 ${actual}` };
+    },
+  },
 ];
