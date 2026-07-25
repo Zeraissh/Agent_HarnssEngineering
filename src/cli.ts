@@ -12,6 +12,8 @@
  *   OPENAI_API_KEY      provider=openai 时的 key，缺省复用 ANTHROPIC_API_KEY
  *   AGENT_MODEL         可选，模型名，默认 claude-opus-4-8；
  *                       非 claude-* 模型自动进入 compat 模式（去掉 Claude 专属参数）
+ *   AGENT_PRESET        可选，预设名（如 stm32-debug）：覆盖 system prompt、
+ *                       自动开启 verifier 核查、注入领域核查方法
  *   AGENT_CONTEXT_LIMIT 可选，上下文 token 上限（触发 compact），默认 150000
  *   AGENT_MAX_TOKENS    可选，单次响应输出上限，默认 64000。本地慢速模型建议调低
  *                       （如 4096）以掐断思考螺旋——快速失败优于无限等待
@@ -24,6 +26,7 @@ import { AgentLoop } from "./loop.js";
 import { connectMcpServers, loadMcpConfig } from "./mcp.js";
 import { createMemoryTools, MemoryStore } from "./memory.js";
 import { runVerified } from "./orchestrate.js";
+import { getPreset } from "./presets.js";
 import { createModelClientFromEnv } from "./provider.js";
 import { bashTool } from "./tools/bash.js";
 import { fetchUrlTool } from "./tools/fetch-url.js";
@@ -49,12 +52,22 @@ You have a persistent memory that survives across sessions. The current memory i
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const autoYes = args.includes("--yes");
-  const withVerify = args.includes("--verify");
   const task = args.filter((a) => !a.startsWith("--")).join(" ").trim();
   if (!task) {
     console.error('Usage: npx tsx src/cli.ts "task description" [--yes] [--verify]');
     process.exit(1);
   }
+
+  // 预设（可选）：覆盖 system prompt、验证策略、领域核查方法
+  const presetName = process.env.AGENT_PRESET;
+  const preset = presetName ? getPreset(presetName) : undefined;
+  if (presetName && !preset) {
+    console.error(`Unknown AGENT_PRESET "${presetName}". Available: stm32-debug`);
+    process.exit(1);
+  }
+  if (preset) console.log(c.dim(`preset: ${preset.name} (verify=${preset.verify})`));
+  // --verify 手动开启，或预设自动开启
+  const withVerify = args.includes("--verify") || preset?.verify === true;
 
   const model = process.env.AGENT_MODEL ?? "claude-opus-4-8";
   const { client: resolvedClient, provider, compat } = createModelClientFromEnv(model);
@@ -92,7 +105,7 @@ async function main(): Promise<void> {
   }
 
   const config: AgentConfig = {
-    systemPrompt: SYSTEM_PROMPT,
+    systemPrompt: preset?.systemPrompt ?? SYSTEM_PROMPT,
     tools: [
       bashTool,
       fetchUrlTool,
@@ -127,6 +140,7 @@ async function main(): Promise<void> {
 
   if (withVerify) {
     const outcome = await runVerified(config, modelClient, task, {
+      ...(preset?.verifyInstructions ? { verifyInstructions: preset.verifyInstructions } : {}),
       onEvent: async (source, event) => {
         if (source === "verifier") {
           if (event.type === "assistant_text") console.log(c.yellow(event.text));

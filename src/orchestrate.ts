@@ -9,6 +9,8 @@ import type { AgentConfig, AgentRunResult, ModelClient, TurnEvent } from "./type
 export interface VerifiedRunOptions {
   /** 核查未通过时的最大返工轮数。默认 1 */
   maxReworks?: number;
+  /** 领域验证指令：透传给 verifier，说明如何独立核查（如硬件场景自己连板重读） */
+  verifyInstructions?: string;
   /**
    * 事件旁路：所有主/返工 run 的事件都转发给宿主（含 approval_request——审批
    * 仍是宿主的事）。verifier 的事件也转发，但其 approval 已在内部 deny，仅供观察。
@@ -92,7 +94,11 @@ async function runVerifierWithEvents(
   const executorReport = lastAssistantText(main) || "(执行者没有留下文字报告)";
   // verifier 的事件流由其内部 loop 产生；这里无法逐个转发（runVerifier 封装了消费），
   // 简化为只上报裁决 —— v0.5 若需要 verifier 过程可视化，再把 onEvent 下沉进 runVerifier。
-  const outcome = await runVerifier(cfg, model, { task, executorReport });
+  const outcome = await runVerifier(cfg, model, {
+    task,
+    executorReport,
+    ...(opts.verifyInstructions ? { verifyInstructions: opts.verifyInstructions } : {}),
+  });
   await opts.onEvent?.("verifier", {
     type: "assistant_text",
     text: `[verifier] passed=${outcome.verdict.passed} ${outcome.verdict.summary}`,

@@ -23,6 +23,11 @@ export interface VerifyOptions {
   task: string;
   /** 主 agent 的完成报告（不可信输入——verifier 的职责就是不信它） */
   executorReport: string;
+  /**
+   * 领域验证指令（可选）：附加到 verifier 提示，说明"如何独立核查"。
+   * 例如硬件调试场景：让 verifier 自己连板、重读故障寄存器，而非只看文件。
+   */
+  verifyInstructions?: string;
 }
 
 export interface VerifyOutcome {
@@ -75,10 +80,10 @@ ${opts.executorReport}
 </executor_report>
 
 核查规则：
-1. 只读核查：用 read_file 或只读命令检查实际文件/状态；不要修改、创建或删除任何东西。
-2. 逐条核对任务要求与实际产出：文件是否存在、内容是否正确、有没有偷工减料或与报告不符之处。
-3. 数值类声明（行数、数量、统计结果）必须独立重新验证，不能照抄报告。
-
+1. 只读核查：用只读手段检查实际状态；不要修改、创建或删除任何东西（除了最终结论）。
+2. 逐条核对任务要求与实际产出：有没有偷工减料或与报告不符之处。
+3. 数值类声明（地址、寄存器值、行号、统计结果）必须独立重新获取，不能照抄报告。
+${opts.verifyInstructions ? `\n领域核查方法：\n${opts.verifyInstructions}\n` : ""}
 你的最后一条消息必须只包含一个 JSON 对象（不要代码围栏、不要多余文字）：
 {"passed": true/false, "issues": ["发现的问题，每条一个字符串；通过则为空数组"], "summary": "一句话结论"}`;
 }
