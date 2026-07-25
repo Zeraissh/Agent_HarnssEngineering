@@ -192,4 +192,71 @@ export const cases: EvalCase[] = [
         : { pass: false, note: `报告 ${got.trim()}，实际 ${actual}` };
     },
   },
+
+  // ————— 陷阱用例（trap-*）：瞄准模型爱犯的错，且可被独立复核抓到 —————
+  {
+    id: "trap-inclusive-range",
+    covers: "陷阱：栅栏错（含两端的区间计数）",
+    task:
+      "docs/04-roadmap.md 从第 10 行到第 20 行（包含第 10 行和第 20 行本身）之间一共有多少行？把纯数字写入 eval-out/range.txt",
+    async check(workdir) {
+      const got = await readOut(workdir, "eval-out/range.txt");
+      if (got === undefined) return { pass: false, note: "range.txt 未创建" };
+      // 含两端 = 20 - 10 + 1 = 11（典型 off-by-one 会答 10）
+      return Number(got.trim()) === 11
+        ? { pass: true, note: "含两端计数正确 (11)" }
+        : { pass: false, note: `报告 ${got.trim()}，正解 11（含两端）` };
+    },
+  },
+  {
+    id: "trap-no-newline",
+    covers: "陷阱：严格格式（无末尾换行、无多余字符）",
+    task:
+      "统计 src/types.ts 的总行数，把这个纯数字写入 eval-out/exact.txt。要求：文件内容必须【只有】这个数字本身，末尾不能有换行符，不能有任何空格、说明文字或其他字符。",
+    async check(workdir) {
+      const got = await readOut(workdir, "eval-out/exact.txt");
+      if (got === undefined) return { pass: false, note: "exact.txt 未创建" };
+      const src = (await readOut(workdir, "src/types.ts")) ?? "";
+      const lines = src.split("\n").length;
+      // 严格字节级匹配：必须恰好是数字，无任何尾随字符（换行/空格都算失败）
+      return got === String(lines)
+        ? { pass: true, note: `精确匹配无尾随字符 (${lines})` }
+        : { pass: false, note: `期望恰好 "${lines}"，实际 ${JSON.stringify(got.slice(0, 20))}（含尾随字符或数值错）` };
+    },
+  },
+  {
+    id: "trap-h2-count",
+    covers: "陷阱：干扰计数（严格前缀，排除更深层级）",
+    task:
+      "统计 README.md 中二级标题的数量——即严格以 '## '（两个井号加空格）开头的行。注意：三级标题 '### ' 和更深的都【不】算。把纯数字写入 eval-out/h2.txt",
+    async check(workdir) {
+      const got = await readOut(workdir, "eval-out/h2.txt");
+      if (got === undefined) return { pass: false, note: "h2.txt 未创建" };
+      const md = (await readOut(workdir, "README.md")) ?? "";
+      // 严格 '## ' 开头，但不能是 '### '（即第三个字符必须不是 #）
+      const actual = md.split("\n").filter((l) => l.startsWith("## ") && !l.startsWith("### ")).length;
+      return Number(got.trim()) === actual
+        ? { pass: true, note: `二级标题计数正确 (${actual})` }
+        : { pass: false, note: `报告 ${got.trim()}，实际 ${actual}（可能把 ### 也算进去了）` };
+    },
+  },
+  {
+    id: "trap-conditional",
+    covers: "陷阱：多分支条件（奇偶 → 不同产出）",
+    task:
+      "数一下 src/loop.ts 的总行数。如果行数是偶数，就在 eval-out/parity.txt 中写入 'even'（不含引号）；如果是奇数，就写入 src/loop.ts 中第一个以 'import' 开头的行的完整内容（原样，去掉首尾空白）。",
+    async check(workdir) {
+      const got = await readOut(workdir, "eval-out/parity.txt");
+      if (got === undefined) return { pass: false, note: "parity.txt 未创建" };
+      const src = (await readOut(workdir, "src/loop.ts")) ?? "";
+      const lines = src.split("\n").length;
+      const expected =
+        lines % 2 === 0
+          ? "even"
+          : (src.split("\n").find((l) => l.startsWith("import")) ?? "").trim();
+      return got.trim() === expected
+        ? { pass: true, note: `分支正确（${lines % 2 === 0 ? "偶" : "奇"}数, ${lines} 行）` }
+        : { pass: false, note: `期望 ${JSON.stringify(expected.slice(0, 40))}，实际 ${JSON.stringify(got.trim().slice(0, 40))}` };
+    },
+  },
 ];
