@@ -51,6 +51,35 @@ export class AnthropicModelClient implements ModelClient {
   }
 }
 
+/**
+ * 瞬时错误判定：loop 层决定"这次失败值不值得同轮重试"。
+ * 原则：网络抖动/超时/限流/服务端 5xx 是瞬时；认证/404/4xx 请求类错误重试无意义；
+ * 宿主主动 abort 绝不重试。非 Anthropic SDK 的错误（OpenAI 客户端/底层网络）按
+ * status 数字判，没有 status 的一律视为网络类瞬时错误。
+ */
+export function isTransientApiError(err: unknown): boolean {
+  if (err instanceof Anthropic.APIUserAbortError) return false;
+  if (
+    err instanceof Anthropic.AuthenticationError ||
+    err instanceof Anthropic.PermissionDeniedError ||
+    err instanceof Anthropic.NotFoundError ||
+    err instanceof Anthropic.BadRequestError ||
+    err instanceof Anthropic.UnprocessableEntityError
+  ) {
+    return false;
+  }
+  if (err instanceof Anthropic.RateLimitError || err instanceof Anthropic.APIConnectionError) {
+    return true; // 含 APIConnectionTimeoutError（其子类）
+  }
+  if (err instanceof Anthropic.APIError) {
+    const s = err.status;
+    return s === undefined || s >= 500 || s === 408 || s === 409 || s === 429;
+  }
+  const s = (err as { status?: unknown }).status;
+  if (typeof s === "number") return s >= 500 || s === 408 || s === 409 || s === 429;
+  return true;
+}
+
 /** 宿主级错误分类：loop 用它决定报错信息，不用字符串匹配 */
 export function classifyApiError(err: unknown): string {
   if (err instanceof Anthropic.AuthenticationError) return "认证失败：检查 ANTHROPIC_API_KEY 或运行 ant auth login";

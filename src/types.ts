@@ -86,6 +86,14 @@ export interface AgentConfig {
   compat?: boolean;
   /** 上下文 token 上限（触发 compact 的依据，按上一轮实际输入衡量）。默认 150_000 */
   contextTokenLimit?: number;
+  /**
+   * loop 层对瞬时 API 错误（网络/超时/429/5xx）的同轮重试次数，默认 1。
+   * 与 SDK 内置的 HTTP 重试是两层：SDK 耗尽后 loop 再兜一次，避免整个 run 因
+   * 一次抖动作废（A/B 实测：基建错误占 hard 套件失败的 1/3）。设 0 关闭。
+   */
+  errorRetries?: number;
+  /** 重试退避基数毫秒（第 n 次重试等 n×此值）。默认 1500；测试可设 0 */
+  errorRetryBackoffMs?: number;
   /** 动态上下文（时间/环境等易变信息）：注入首条 user 消息，绝不进 system（P3） */
   dynamicContext?: Record<string, string>;
 }
@@ -132,4 +140,5 @@ export type TurnEvent =
     }
   | { type: "usage"; turn: number; usage: Anthropic.Usage }
   | { type: "compaction"; droppedBlocks: number }
+  | { type: "api_retry"; turn: number; attempt: number; reason: string }
   | { type: "done"; result: AgentRunResult };

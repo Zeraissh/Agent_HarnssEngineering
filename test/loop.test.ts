@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type Anthropic from "@anthropic-ai/sdk";
 import { AgentLoop } from "../src/loop.js";
-import type { AgentRunResult, TurnEvent } from "../src/types.js";
+import type { AgentRunResult, ModelClient, ModelTurn, TurnEvent } from "../src/types.js";
 import { FakeModelClient, fakeMessage, makeTool, textBlock, toolUseBlock } from "./helpers.js";
 
 async function collect(events: AsyncIterable<TurnEvent>): Promise<{
@@ -221,5 +221,69 @@ describe("AgentLoop", () => {
     const { result } = await collect(loop.run("go"));
     expect(result.stopReason).toBe("budget_exhausted");
     expect(model.requests.length).toBeLessThanOrEqual(2);
+  });
+});
+
+describe("瞬时 API 错误的同轮重试", () => {
+  class FlakyClient implements ModelClient {
+    calls = 0;
+    constructor(
+      private readonly failures: number,
+      private readonly err: unknown,
+      private readonly message: Anthropic.Message,
+    ) {}
+    send(): Promise<ModelTurn> {
+      this.calls += 1;
+      if (this.calls <= this.failures) return Promise.reject(this.err);
+      return Promise.resolve({
+        message: this.message,
+        stopReason: this.message.stop_reason,
+        usage: this.message.usage,
+      });
+    }
+  }
+  const transient = () => Object.assign(new Error("upstream 503"), { status: 503 });
+
+  it("503 重试一次成功：产出 api_retry 事件，run 正常完成", async () => {
+    const model = new FlakyClient(1, transient(), fakeMessage([textBlock("ok")], "end_turn"));
+    const loop = new AgentLoop({ ...baseConfig, tools: [], errorRetryBackoffMs: 0 }, model);
+    const { events, result } = await collect(loop.run("t"));
+    expect(result.stopReason).toBe("completed");
+    expect(events.filter((e) => e.type === "api_retry")).toHaveLength(1);
+    expect(model.calls).toBe(2);
+  });
+
+  it("重试预算耗尽 → error 终止（errorRetries=1 共两次尝试）", async () => {
+    const model = new FlakyClient(99, transient(), fakeMessage([textBlock("ok")], "end_turn"));
+    const loop = new AgentLoop(
+      { ...baseConfig, tools: [], errorRetries: 1, errorRetryBackoffMs: 0 },
+      model,
+    );
+    const { result } = await collect(loop.run("t"));
+    expect(result.stopReason).toBe("error");
+    expect(model.calls).toBe(2);
+  });
+
+  it("非瞬时错误（401）不重试，立即终止", async () => {
+    const model = new FlakyClient(
+      99,
+      Object.assign(new Error("bad key"), { status: 401 }),
+      fakeMessage([textBlock("ok")], "end_turn"),
+    );
+    const loop = new AgentLoop({ ...baseConfig, tools: [], errorRetryBackoffMs: 0 }, model);
+    const { result } = await collect(loop.run("t"));
+    expect(result.stopReason).toBe("error");
+    expect(model.calls).toBe(1);
+  });
+
+  it("errorRetries=0 关闭重试", async () => {
+    const model = new FlakyClient(1, transient(), fakeMessage([textBlock("ok")], "end_turn"));
+    const loop = new AgentLoop(
+      { ...baseConfig, tools: [], errorRetries: 0, errorRetryBackoffMs: 0 },
+      model,
+    );
+    const { result } = await collect(loop.run("t"));
+    expect(result.stopReason).toBe("error");
+    expect(model.calls).toBe(1);
   });
 });

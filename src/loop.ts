@@ -7,7 +7,8 @@
  */
 import type Anthropic from "@anthropic-ai/sdk";
 import { DefaultContextManager, userMessageWithContext } from "./context.js";
-import { classifyApiError } from "./model-client.js";
+import { setTimeout as delay } from "node:timers/promises";
+import { classifyApiError, isTransientApiError } from "./model-client.js";
 import { ToolExecutor, ToolRegistry } from "./tools/registry.js";
 import type {
   AgentConfig,
@@ -62,6 +63,8 @@ export class AgentLoop {
   private readonly context: DefaultContextManager;
   private readonly maxTurns: number;
   private readonly maxTokensBudget: number | undefined;
+  private readonly errorRetries: number;
+  private readonly errorRetryBackoffMs: number;
 
   constructor(
     private readonly cfg: AgentConfig,
@@ -78,6 +81,8 @@ export class AgentLoop {
     });
     this.maxTurns = cfg.maxTurns ?? DEFAULTS.maxTurns;
     this.maxTokensBudget = cfg.maxTokensBudget;
+    this.errorRetries = cfg.errorRetries ?? 1;
+    this.errorRetryBackoffMs = cfg.errorRetryBackoffMs ?? 1500;
   }
 
   run(userInput: string, signal?: AbortSignal): AsyncIterable<TurnEvent> {
@@ -139,13 +144,27 @@ export class AgentLoop {
 
       const request = this.context.render(messages, this.registry.toApiTools());
 
+      // 同轮重试：SDK 的 HTTP 重试耗尽后，loop 层对瞬时错误再兜 errorRetries 次。
+      // 请求是幂等的（同一 request 重发），非瞬时错误（认证/4xx/abort）立即终止。
       let modelTurn;
-      try {
-        modelTurn = await this.model.send(request, (text) =>
-          q.push({ type: "text_delta", text }),
-        );
-      } catch (err) {
-        return finish("error", new Error(classifyApiError(err)));
+      for (let attempt = 0; ; attempt++) {
+        try {
+          modelTurn = await this.model.send(request, (text) =>
+            q.push({ type: "text_delta", text }),
+          );
+          break;
+        } catch (err) {
+          if (signal.aborted || !isTransientApiError(err) || attempt >= this.errorRetries) {
+            return finish("error", new Error(classifyApiError(err)));
+          }
+          q.push({
+            type: "api_retry",
+            turn,
+            attempt: attempt + 1,
+            reason: classifyApiError(err),
+          });
+          await delay(this.errorRetryBackoffMs * (attempt + 1));
+        }
       }
 
       usage.turns = turn;

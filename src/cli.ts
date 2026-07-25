@@ -268,6 +268,10 @@ async function main(): Promise<void> {
           ),
         );
         break;
+      case "api_retry":
+        endStreamLine();
+        console.log(c.yellow(`⟳ API 瞬时错误，同轮重试 #${event.attempt}：${event.reason}`));
+        break;
       case "compaction":
         console.log(c.yellow(`⚠ context compacted: dropped ${event.droppedBlocks} blocks`));
         break;
