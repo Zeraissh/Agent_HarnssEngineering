@@ -161,6 +161,24 @@ describe("AgentLoop", () => {
     expect(model.requests).toHaveLength(1);
   });
 
+  it("max_tokens：优雅终止（非 error），已生成的部分内容保留在历史中", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([textBlock("这是一份很长的报告，写到一半就")], "max_tokens"),
+    ]);
+    const loop = new AgentLoop({ ...baseConfig, tools: [] }, model);
+    const { events, result } = await collect(loop.run("go"));
+
+    expect(result.stopReason).toBe("max_tokens");
+    expect(result.error).toBeUndefined(); // 不是错误
+    // 部分 assistant 内容完整保留（可供宿主/用户查看或重跑）
+    const last = result.messages.at(-1)!;
+    expect(last.role).toBe("assistant");
+    expect(JSON.stringify(last.content)).toContain("写到一半就");
+    // assistant_text 事件也发出了截断前的文本
+    const textEvent = events.find((e) => e.type === "assistant_text");
+    expect(textEvent?.type === "assistant_text" && textEvent.text).toContain("很长的报告");
+  });
+
   it("usage 聚合：三类 token 分开累计且与各轮之和对账一致", async () => {
     const model = new FakeModelClient([
       fakeMessage([toolUseBlock("tu_1", "alpha", {})], "tool_use", {

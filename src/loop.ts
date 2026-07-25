@@ -175,13 +175,10 @@ export class AgentLoop {
           return finish("refusal");
 
         case "max_tokens":
-          // v0.2 从简：视为宿主级错误终止；v0.3 再考虑提额重试策略
-          return finish(
-            "error",
-            new Error(
-              `Output truncated at max_tokens=${this.cfg.maxTokens ?? DEFAULTS.maxTokens}; raise maxTokens in AgentConfig`,
-            ),
-          );
+          // 优雅终止而非报废整轮：部分 assistant 内容已入历史、assistant_text 已发出，
+          // 都得以保留。max_tokens 是刻意的护栏（防本地模型跑飞/上下文预算），撞上限
+          // 说明本轮输出需要更多空间——提高 maxTokens 即可，而非丢弃已完成的工作。
+          return finish("max_tokens");
 
         case "pause_turn":
           // 原样重发，不追加任何用户文本（API 硬约束 2）

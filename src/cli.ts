@@ -206,13 +206,22 @@ async function main(): Promise<void> {
       case "done": {
         endStreamLine();
         const u = event.result.usage;
-        const color = event.result.stopReason === "completed" ? c.green : c.red;
-        console.log(color(`\n■ ${event.result.stopReason}`) + c.dim(` (${u.turns} turns)`));
+        const reason = event.result.stopReason;
+        // completed = 绿；max_tokens = 黄（截断但已完成内容保留，非错误）；其余 = 红
+        const color = reason === "completed" ? c.green : reason === "max_tokens" ? c.yellow : c.red;
+        console.log(color(`\n■ ${reason}`) + c.dim(` (${u.turns} turns)`));
         console.log(
           c.dim(
             `  total: in=${u.inputTokens} cacheW=${u.cacheCreationTokens} cacheR=${u.cacheReadTokens} out=${u.outputTokens} | cacheHit=${(u.cacheHitRatio * 100).toFixed(1)}%`,
           ),
         );
+        if (reason === "max_tokens") {
+          console.log(
+            c.yellow(
+              `  末轮输出撞 max_tokens 被截断，已生成内容保留在结果中。若任务需要更长回复，提高 AGENT_MAX_TOKENS`,
+            ),
+          );
+        }
         if (event.result.error) console.error(c.red(`  error: ${event.result.error.message}`));
         break;
       }

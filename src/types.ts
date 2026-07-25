@@ -102,7 +102,12 @@ export interface AggregateUsage {
 }
 
 export interface AgentRunResult {
-  stopReason: "completed" | "max_turns" | "budget_exhausted" | "refusal" | "error";
+  /**
+   * completed = end_turn 正常结束；max_tokens = 末轮输出撞单次上限被截断
+   * （非错误：已生成内容保留在 messages 中，提高 maxTokens 可让其写完）；
+   * 其余为护栏/拒绝/宿主错误。
+   */
+  stopReason: "completed" | "max_tokens" | "max_turns" | "budget_exhausted" | "refusal" | "error";
   /** 完整会话历史（SDK 类型），可用于持久化或子代理接力 */
   messages: Anthropic.MessageParam[];
   usage: AggregateUsage;

@@ -131,7 +131,7 @@
 
 **真机故障定位（2026-07-25）**：植入除零 HardFault（`stm32l151_faultdemo`：main → app_init → process_config，`100 / g_divisor` with g_divisor=0，设 DIV_0_TRP）到 L151，让 **本地 qwen3.5:9b（Ollama, 262k 上下文）** 通过 harness+MCP 自主定位。9 轮约 2.5 分钟完成：suggest_server_args → start_debug_session → self_check → load_symbols → reconstruct_fault_context → read_call_stack → 写报告 → stop。诊断五项全对（UsageFault DIVBYZERO→HardFault / process_config main.c:27 / faulting PC 0x08000042 / 根因除零 / 调用链），与独立 objdump+CFSR 核对一致。证明：本地 9B 模型经此 harness 能自主完成真实硬件故障定位。
 - 现场发现：① 野指针写 0xCCCCCCCC 在 L151 外部设备区被静默丢弃、不触发故障——改除零才可靠；② SWD 自锁（固件低功耗/引脚重配 + 无 NRST）需物理上电复位抢连接救回。
-- **harness 短板（待改）**：首跑 `max_tokens=2048` 时模型报告太长被截断，而 loop 在 v0.2 把 max_tokens 当硬错误终止整轮——诊断其实已完成、仅报告没写成。应把 max_tokens 截断作为独立的非 error 终止态、保留已生成内容，而非丢弃整轮。
+- **harness 短板（已修，2026-07-25）**：首跑 `max_tokens=2048` 时模型报告太长被截断，而 loop 在 v0.2 把 max_tokens 当硬错误终止整轮——诊断其实已完成、仅报告没写成。**已改**：`max_tokens` 成为独立的非 error 终止态（`AgentRunResult.stopReason: "max_tokens"`），部分内容保留在 messages 中，CLI 渲染为黄色警告并提示提高 AGENT_MAX_TOKENS；护栏语义不变（仍尊重用户设的上限、不自动提额，防本地模型跑飞）。70 单测。
 
 ## 更远（不承诺顺序）
 
