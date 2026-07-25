@@ -6,6 +6,26 @@
 import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 
+/** src 下所有 .ts 文件里，以 import 开头的行中第一个引号内的模块标识符（非相对，即外部/内置模块） */
+async function collectImportSpecs(workdir: string): Promise<string[]> {
+  const specs = new Set<string>();
+  async function walk(dir: string): Promise<void> {
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) await walk(full);
+      else if (entry.name.endsWith(".ts")) {
+        for (const line of (await readFile(full, "utf8")).split("\n")) {
+          if (!line.trimStart().startsWith("import")) continue;
+          const m = line.match(/"([^"]+)"/);
+          if (m && !m[1]!.startsWith(".")) specs.add(m[1]!);
+        }
+      }
+    }
+  }
+  await walk(path.join(workdir, "src"));
+  return [...specs].sort();
+}
+
 async function countTsFiles(dir: string): Promise<number> {
   let count = 0;
   for (const entry of await readdir(dir, { withFileTypes: true })) {
@@ -262,6 +282,82 @@ export const cases: EvalCase[] = [
       return got.trim() === expected
         ? { pass: true, note: `分支正确（${lines % 2 === 0 ? "偶" : "奇"}数, ${lines} 行）` }
         : { pass: false, note: `期望 ${JSON.stringify(expected.slice(0, 40))}，实际 ${JSON.stringify(got.trim().slice(0, 40))}` };
+    },
+  },
+
+  // ————— 高难陷阱（hard-*）：多约束组合 / 跨文件推理 / 工具语义细节，
+  //        面向能过 trap-* 的模型（flash 级）设计。设计纪律（2026-07-25 教训）：
+  //        任务文本必须把判定口径写死，checker 与口径逐字一致，不留歧义。 —————
+  {
+    id: "hard-unused-deps",
+    covers: "高难：跨文件依赖分析（子路径导入的前缀匹配陷阱）",
+    task:
+      "找出 package.json 的 dependencies 与 devDependencies 中，src/ 目录（含子目录）的 .ts 源码从未 import 过的包。判定规则：一个包算被使用，当且仅当存在以 import 开头的语句，其模块标识符恰好等于包名、或以「包名+/」开头（子路径导入也算使用）。把未被使用的包名按字母升序、用英文逗号连接成一行写入 eval-out/unused-deps.txt；若全部被使用则写 none。",
+    async check(workdir) {
+      const got = await readOut(workdir, "eval-out/unused-deps.txt");
+      if (got === undefined) return { pass: false, note: "unused-deps.txt 未创建" };
+      const pkg = JSON.parse((await readOut(workdir, "package.json"))!) as {
+        dependencies: Record<string, string>;
+        devDependencies: Record<string, string>;
+      };
+      const deps = [...Object.keys(pkg.dependencies), ...Object.keys(pkg.devDependencies)];
+      const specs = await collectImportSpecs(workdir);
+      const unused = deps
+        .filter((d) => !specs.some((s) => s === d || s.startsWith(d + "/")))
+        .sort();
+      const expected = unused.length === 0 ? "none" : unused.join(",");
+      return got.trim() === expected
+        ? { pass: true, note: `未使用依赖判定正确 (${expected})` }
+        : { pass: false, note: `期望 "${expected}"，实际 ${JSON.stringify(got.trim().slice(0, 80))}（子路径导入是否算了使用？）` };
+    },
+  },
+  {
+    id: "hard-import-list",
+    covers: "高难：多约束组合（扫描+过滤+去重+排序+精确格式+字节纪律）",
+    task:
+      "收集 src/ 目录（含子目录）所有 .ts 文件中、以 import 开头的行里第一个双引号内的模块标识符，只保留不以 . 开头的（即外部/内置模块）。去重、按字母升序（ASCII 顺序）排序，用英文逗号连接成一行写入 eval-out/import-list.txt。要求：文件内容必须只有这一行，末尾不能有换行符或任何其他字符。",
+    async check(workdir) {
+      const got = await readOut(workdir, "eval-out/import-list.txt");
+      if (got === undefined) return { pass: false, note: "import-list.txt 未创建" };
+      const expected = (await collectImportSpecs(workdir)).join(",");
+      if (got === expected) return { pass: true, note: `列表与字节格式均正确 (${expected.split(",").length} 项)` };
+      return got.trim() === expected
+        ? { pass: false, note: "列表正确但含尾随字符（换行/空格）" }
+        : { pass: false, note: `期望 "${expected.slice(0, 60)}…"，实际 ${JSON.stringify(got.slice(0, 60))}` };
+    },
+  },
+  {
+    id: "hard-substring-count",
+    covers: "高难：工具语义（grep -c 数行 vs 子串出现总次数）",
+    task:
+      "统计 src/loop.ts 的文件内容中，字符串 'turn'（小写四个字母，区分大小写）作为子串出现的总次数。注意：要数的是出现次数，不是包含它的行数——一行出现多次要都算上；出现在别的单词内部也算（例如 return 里含有一个 turn，计 1 次）。把纯数字写入 eval-out/turn-count.txt。",
+    async check(workdir) {
+      const got = await readOut(workdir, "eval-out/turn-count.txt");
+      if (got === undefined) return { pass: false, note: "turn-count.txt 未创建" };
+      const src = (await readOut(workdir, "src/loop.ts")) ?? "";
+      const actual = src.split("turn").length - 1;
+      const lineCount = src.split("\n").filter((l) => l.includes("turn")).length;
+      if (Number(got.trim()) === actual) return { pass: true, note: `子串计数正确 (${actual})` };
+      const hint = Number(got.trim()) === lineCount ? "（这是行数——grep -c 的坑）" : "";
+      return { pass: false, note: `报告 ${got.trim()}，实际 ${actual} ${hint}` };
+    },
+  },
+  {
+    id: "hard-chain",
+    covers: "高难：跨文件依赖链（计数结果作为另一文件的行号索引）",
+    task:
+      "第一步：统计 src/types.ts 中以 'export interface' 开头的行数，记为 K。第二步：取 src/verifier.ts 的第 K 行（1-indexed，文件第一行是第 1 行），去掉首尾空白。把「K:该行内容」写入 eval-out/chain.txt——K 替换为实际数字，冒号为英文冒号，冒号后直接跟内容不加空格。",
+    async check(workdir) {
+      const got = await readOut(workdir, "eval-out/chain.txt");
+      if (got === undefined) return { pass: false, note: "chain.txt 未创建" };
+      const types = (await readOut(workdir, "src/types.ts")) ?? "";
+      const k = types.split("\n").filter((l) => l.startsWith("export interface")).length;
+      const verifier = (await readOut(workdir, "src/verifier.ts")) ?? "";
+      const lineK = (verifier.split("\n")[k - 1] ?? "").trim();
+      const expected = `${k}:${lineK}`;
+      return got.trim() === expected
+        ? { pass: true, note: `依赖链正确 (K=${k})` }
+        : { pass: false, note: `期望 ${JSON.stringify(expected.slice(0, 50))}，实际 ${JSON.stringify(got.trim().slice(0, 50))}` };
     },
   },
 ];

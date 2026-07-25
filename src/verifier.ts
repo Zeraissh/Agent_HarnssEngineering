@@ -45,12 +45,49 @@ export async function runVerifier(
   onEvent?: (event: TurnEvent) => void | Promise<void>,
 ): Promise<VerifyOutcome> {
   // 与父级同 system/tools（缓存前缀一致）；护栏收紧：核查不该比执行更贵
-  const loop = new AgentLoop({ ...cfg, maxTurns: Math.min(cfg.maxTurns ?? 50, 15) }, model);
+  const first = await drainVerifierLoop(
+    new AgentLoop({ ...cfg, maxTurns: Math.min(cfg.maxTurns ?? 50, 15) }, model),
+    buildVerifierPrompt(opts),
+    onEvent,
+  );
 
+  let verdict = parseVerdict(first.text);
+  let raw = first.text;
+  let usage = first.usage;
+
+  // 裁决重问（一次）：核查做了但最终消息不是纯 JSON 时，让模型把已有结论转写成 JSON。
+  // fail-closed 直接返工会对正确产物空转（A/B 实测烧 10 万级 token），一次重问便宜得多。
+  // 空输出没有可转写的结论，不重问（转写会变成无依据的编造），维持 fail-closed。
+  if (isParseFailure(verdict) && first.text.trim() !== "") {
+    const retry = await drainVerifierLoop(
+      new AgentLoop({ ...cfg, maxTurns: 3 }, model),
+      buildReformatPrompt(first.text),
+      onEvent,
+    );
+    usage = sumUsage(usage, retry.usage);
+    const second = parseVerdict(retry.text);
+    if (!isParseFailure(second)) {
+      verdict = second;
+      raw = retry.text;
+    }
+  }
+
+  return { verdict, usage, raw };
+}
+
+function isParseFailure(v: Verdict): boolean {
+  return !v.passed && v.issues[0] === VERDICT_PARSE_FAIL;
+}
+
+async function drainVerifierLoop(
+  loop: AgentLoop,
+  prompt: string,
+  onEvent?: (event: TurnEvent) => void | Promise<void>,
+): Promise<{ text: string; usage: AggregateUsage }> {
   let finalText = "";
   let usage: AggregateUsage | undefined;
 
-  for await (const event of loop.run(buildVerifierPrompt(opts))) {
+  for await (const event of loop.run(prompt)) {
     await onEvent?.(event);
     switch (event.type) {
       case "assistant_text":
@@ -68,7 +105,33 @@ export async function runVerifier(
     }
   }
 
-  return { verdict: parseVerdict(finalText), usage: usage!, raw: finalText };
+  return { text: finalText, usage: usage! };
+}
+
+function sumUsage(a: AggregateUsage, b: AggregateUsage): AggregateUsage {
+  const inputTokens = a.inputTokens + b.inputTokens;
+  const cacheCreationTokens = a.cacheCreationTokens + b.cacheCreationTokens;
+  const cacheReadTokens = a.cacheReadTokens + b.cacheReadTokens;
+  const denom = inputTokens + cacheCreationTokens + cacheReadTokens;
+  return {
+    inputTokens,
+    cacheCreationTokens,
+    cacheReadTokens,
+    outputTokens: a.outputTokens + b.outputTokens,
+    turns: a.turns + b.turns,
+    cacheHitRatio: denom === 0 ? 0 : cacheReadTokens / denom,
+  };
+}
+
+function buildReformatPrompt(raw: string): string {
+  return `你刚才作为独立验证员（verifier）完成了核查，但最终消息不符合输出契约（必须是单个 JSON 对象）。你的核查结论原文如下：
+
+<raw_verdict>
+${raw}
+</raw_verdict>
+
+请把上述结论【原样转写】为契约要求的 JSON——不要重新核查、不要改变结论内容。你的回复必须只包含一个 JSON 对象（不要代码围栏、不要多余文字）：
+{"passed": true/false, "issues": ["发现的问题，每条一个字符串；通过则为空数组"], "summary": "一句话结论"}`;
 }
 
 function buildVerifierPrompt(opts: VerifyOptions): string {
@@ -90,6 +153,9 @@ ${opts.verifyInstructions ? `\n领域核查方法：\n${opts.verifyInstructions}
 你的最后一条消息必须只包含一个 JSON 对象（不要代码围栏、不要多余文字）：
 {"passed": true/false, "issues": ["发现的问题，每条一个字符串；通过则为空数组"], "summary": "一句话结论"}`;
 }
+
+/** 解析失败的哨兵 issue 文本（fail-closed 裁决的第一条 issue 恒为它） */
+export const VERDICT_PARSE_FAIL = "verifier 输出无法解析为 JSON 裁决";
 
 /**
  * 宽容解析：兼容 compat 模型的输出习惯（代码围栏、JSON 前后带说明文字）。
@@ -122,7 +188,7 @@ export function parseVerdict(text: string): Verdict {
 
   return {
     passed: false,
-    issues: ["verifier 输出无法解析为 JSON 裁决"],
+    issues: [VERDICT_PARSE_FAIL],
     summary: text.slice(0, 200) || "(空输出)",
   };
 }

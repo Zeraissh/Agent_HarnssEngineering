@@ -84,6 +84,39 @@ describe("runVerifier", () => {
     expect(seen).toContain("tool_call");
     expect(seen).toContain("tool_result");
   });
+
+  it("裁决非 JSON → 重问一次转写，采纳第二次的裁决", async () => {
+    const model = new FakeModelClient([
+      // 第一轮：核查做了但最终消息是散文（不符合契约）
+      fakeMessage([textBlock("核查完毕：数值 11 正确，文件为纯数字，没有问题。")], "end_turn"),
+      // 重问轮：转写为合规 JSON
+      fakeMessage([textBlock('{"passed": true, "issues": [], "summary": "数值与格式均正确"}')], "end_turn"),
+    ]);
+    const outcome = await runVerifier({ ...baseConfig, tools: [] }, model, {
+      task: "t",
+      executorReport: "r",
+    });
+    expect(outcome.verdict.passed).toBe(true);
+    expect(outcome.verdict.summary).toBe("数值与格式均正确");
+    // 重问提示里应携带第一轮的结论原文（转写而非重新核查）
+    expect(model.requests).toHaveLength(2);
+    const retryMsg = model.requests[1]!.messages[0]!;
+    expect(JSON.stringify(retryMsg.content)).toContain("核查完毕");
+    // 两轮 usage 合并
+    expect(outcome.usage.turns).toBe(2);
+  });
+
+  it("裁决为空输出 → 不重问（无可转写内容），维持 fail-closed", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([textBlock("")], "end_turn"),
+    ]);
+    const outcome = await runVerifier({ ...baseConfig, tools: [] }, model, {
+      task: "t",
+      executorReport: "r",
+    });
+    expect(outcome.verdict.passed).toBe(false);
+    expect(model.requests).toHaveLength(1);
+  });
 });
 
 describe("runVerified（编排：执行 → 核查 → 返工）", () => {
