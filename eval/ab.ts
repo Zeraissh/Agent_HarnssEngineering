@@ -168,6 +168,7 @@ async function runArm(
     const outcome = await runVerified(cfg, client, task, {
       maxReworks: 1,
       ...(arm.verify?.instructions ? { verifyInstructions: arm.verify.instructions } : {}),
+      ...(arm.verify?.reworkMode ? { reworkMode: arm.verify.reworkMode } : {}),
       ...(arm.verify?.strongModel && verifierProvider
         ? { verifierModel: { client: verifierProvider.client, compat: verifierProvider.compat } }
         : {}),
@@ -176,8 +177,8 @@ async function runArm(
         if (event.type === "approval_request") event.respond("allow");
       },
     });
-    // 成本 = 主 run（含返工，取最后一次 result.usage）+ 各次核查
-    const mainU = outcome.main.usage;
+    // 成本 = 全部执行轮次合计（executionUsage 含被否掉的中间轮——旧版只算最后一轮，漏计返工前的主 run）+ 各次核查
+    const mainU = outcome.executionUsage;
     let tokens =
       mainU.inputTokens + mainU.cacheCreationTokens + mainU.cacheReadTokens + mainU.outputTokens;
     let turns = mainU.turns;

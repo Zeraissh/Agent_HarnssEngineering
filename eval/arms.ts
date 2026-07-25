@@ -16,6 +16,8 @@ export interface Arm {
     instructions?: string;
     /** true = 用 AB_VERIFIER_MODEL 指定的（更强）模型当 verifier；未设该 env 时此臂被跳过 */
     strongModel?: boolean;
+    /** 返工模式：fresh 全新上下文（默认）/ inherit 继承上一轮正史续跑 */
+    reworkMode?: "fresh" | "inherit";
   };
 }
 
@@ -83,6 +85,20 @@ export const ARMS: Arm[] = [
     hypothesis: "maxTurns 15→30：轮次预算是不是 import-list 失败的约束本身（对照 prompt-hint 无效）",
     mode: "single",
     configure: (base) => ({ ...base, maxTurns: 30 }),
+  },
+  {
+    name: "rework-fresh-t8",
+    hypothesis: "紧预算（maxTurns=8）下 fresh 返工：max_turns 后核查产物并全新重跑的成功率/成本",
+    mode: "verified",
+    configure: (base) => ({ ...base, maxTurns: 8 }),
+    verify: { strongModel: true, reworkMode: "fresh" },
+  },
+  {
+    name: "rework-inherit-t8",
+    hypothesis: "紧预算（maxTurns=8）下 inherit 返工：继承正史续跑能否用更少 token 达到更高成功率",
+    mode: "verified",
+    configure: (base) => ({ ...base, maxTurns: 8 }),
+    verify: { strongModel: true, reworkMode: "inherit" },
   },
   {
     name: "verified-strict",

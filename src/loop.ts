@@ -91,15 +91,46 @@ export class AgentLoop {
     return queue;
   }
 
+  /**
+   * 续跑：在已有会话正史之上追加一条 user 反馈继续执行（轮次预算重新起算）。
+   * 用途：返工继承上下文——agent 保留此前的探索/工具结果，不必从零重烧
+   * （A/B 实测 fresh 返工最贵一例白烧 127k tokens）。上下文增长由 compact 兜底。
+   */
+  runContinuation(
+    history: Anthropic.MessageParam[],
+    feedback: string,
+    signal?: AbortSignal,
+  ): AsyncIterable<TurnEvent> {
+    const queue = new AsyncEventQueue<TurnEvent>();
+    void this.drive(feedback, signal ?? new AbortController().signal, queue, history);
+    return queue;
+  }
+
   private async drive(
     userInput: string,
     signal: AbortSignal,
     q: AsyncEventQueue<TurnEvent>,
+    history?: Anthropic.MessageParam[],
   ): Promise<void> {
+    // 续跑且正史末条是 user（如 max_turns 停在 tool_result 后）：反馈合并进同一条
+    // user 消息，避免连续两条 user——Anthropic 官方允许，但第三方兼容端点未必。
+    if (history && history.at(-1)?.role === "user") {
+      const last = history.at(-1)!;
+      const blocks: Anthropic.ContentBlockParam[] =
+        typeof last.content === "string" ? [{ type: "text", text: last.content }] : [...last.content];
+      blocks.push({ type: "text", text: userInput });
+      history = [...history.slice(0, -1), { role: "user", content: blocks }];
+      userInput = ""; // 已并入 history
+    }
     let messages: Anthropic.MessageParam[] = [
-      this.cfg.dynamicContext
-        ? userMessageWithContext(userInput, this.cfg.dynamicContext)
-        : { role: "user", content: userInput },
+      ...(history ?? []),
+      ...(userInput === "" && history
+        ? []
+        : [
+            this.cfg.dynamicContext && !history
+              ? userMessageWithContext(userInput, this.cfg.dynamicContext)
+              : ({ role: "user", content: userInput } as Anthropic.MessageParam),
+          ]),
     ];
     const usage: AggregateUsage = {
       inputTokens: 0,

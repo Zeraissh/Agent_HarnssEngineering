@@ -108,7 +108,7 @@ async function drainVerifierLoop(
   return { text: finalText, usage: usage! };
 }
 
-function sumUsage(a: AggregateUsage, b: AggregateUsage): AggregateUsage {
+export function sumUsage(a: AggregateUsage, b: AggregateUsage): AggregateUsage {
   const inputTokens = a.inputTokens + b.inputTokens;
   const cacheCreationTokens = a.cacheCreationTokens + b.cacheCreationTokens;
   const cacheReadTokens = a.cacheReadTokens + b.cacheReadTokens;

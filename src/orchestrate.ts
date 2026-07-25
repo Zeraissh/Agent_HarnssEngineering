@@ -3,12 +3,19 @@
  * 主 loop 与 verifier 共用 systemPrompt/tools（缓存前缀一致），上下文互相隔离。
  */
 import { AgentLoop } from "./loop.js";
-import { runVerifier, type VerifyOutcome } from "./verifier.js";
-import type { AgentConfig, AgentRunResult, ModelClient, TurnEvent } from "./types.js";
+import { runVerifier, sumUsage, type VerifyOutcome } from "./verifier.js";
+import type { AgentConfig, AgentRunResult, AggregateUsage, ModelClient, TurnEvent } from "./types.js";
 
 export interface VerifiedRunOptions {
   /** 核查未通过时的最大返工轮数。默认 1 */
   maxReworks?: number;
+  /**
+   * 返工模式（A/B 变量）：
+   * - "fresh"（默认）：全新上下文重跑——独立重试，不被上一轮的错误推理污染；
+   * - "inherit"：在上一轮会话正史上续跑——保留探索与工具结果，不从零重烧
+   *   （fresh 模式最贵一例白烧 127k tokens；上下文增长由 compact 兜底）。
+   */
+  reworkMode?: "fresh" | "inherit";
   /** 领域验证指令：透传给 verifier，说明如何独立核查（如硬件场景自己连板重读） */
   verifyInstructions?: string;
   /**
@@ -33,6 +40,8 @@ export interface VerifiedRunResult {
   reworks: number;
   /** 最终裁决：最后一次核查是否通过 */
   finalPassed: boolean;
+  /** 全部执行轮次（含被否掉的中间轮）的 usage 合计——成本核算必须用它而非 main.usage */
+  executionUsage: AggregateUsage;
 }
 
 export async function runVerified(
@@ -42,49 +51,62 @@ export async function runVerified(
   opts: VerifiedRunOptions = {},
 ): Promise<VerifiedRunResult> {
   const maxReworks = opts.maxReworks ?? 1;
+  const reworkMode = opts.reworkMode ?? "fresh";
   const verifications: VerifyOutcome[] = [];
 
-  let input = task;
   let main: AgentRunResult | undefined;
+  let executionUsage: AggregateUsage | undefined;
+  let feedback = task; // 首轮 = 任务本身；返工轮 = 反馈消息（fresh 含完整任务，inherit 只有增量）
   let reworks = 0;
 
   for (let round = 0; ; round++) {
     const source = round === 0 ? "main" : "rework";
-    main = await drain(new AgentLoop(cfg, model), input, (e) => opts.onEvent?.(source, e));
+    // inherit 模式的返工在上一轮正史上续跑；fresh（与首轮）全新开局
+    const events =
+      round > 0 && reworkMode === "inherit"
+        ? new AgentLoop(cfg, model).runContinuation(main!.messages, feedback)
+        : new AgentLoop(cfg, model).run(feedback);
+    main = await drain(events, (e) => opts.onEvent?.(source, e));
+    executionUsage = executionUsage ? sumUsage(executionUsage, main.usage) : main.usage;
 
-    // 执行本身失败（护栏/宿主错误）就不必核查了
-    if (main.stopReason !== "completed") {
-      return { main, verifications, reworks, finalPassed: false };
+    // 纯产物哲学：max_turns 时产物可能已就绪，照常核查；error 等宿主级失败才短路
+    if (main.stopReason !== "completed" && main.stopReason !== "max_turns") {
+      return { main, verifications, reworks, finalPassed: false, executionUsage };
     }
 
     const outcome = await runVerifierWithEvents(cfg, model, task, main, opts);
     verifications.push(outcome);
 
     if (outcome.verdict.passed) {
-      return { main, verifications, reworks, finalPassed: true };
+      return { main, verifications, reworks, finalPassed: true, executionUsage };
     }
     if (round >= maxReworks) {
-      return { main, verifications, reworks, finalPassed: false };
+      return { main, verifications, reworks, finalPassed: false, executionUsage };
     }
 
     reworks += 1;
-    input = `${task}
-
-【返工】上一轮产出经独立核查未通过。核查结论：${outcome.verdict.summary}
+    const issueList = `核查结论：${outcome.verdict.summary}
 待修复问题：
-${outcome.verdict.issues.map((s, i) => `${i + 1}. ${s}`).join("\n")}
+${outcome.verdict.issues.map((s, i) => `${i + 1}. ${s}`).join("\n")}`;
+    feedback =
+      reworkMode === "inherit"
+        ? `【返工】你上面的产出经独立核查未通过。${issueList}
+
+请在已有工作的基础上核实并修复上述问题，然后重新交付。`
+        : `${task}
+
+【返工】上一轮产出经独立核查未通过。${issueList}
 
 请核实并修复上述问题，然后重新交付。`;
   }
 }
 
 async function drain(
-  loop: AgentLoop,
-  input: string,
+  events: AsyncIterable<TurnEvent>,
   onEvent: (e: TurnEvent) => void | Promise<void>,
 ): Promise<AgentRunResult> {
   let result: AgentRunResult | undefined;
-  for await (const event of loop.run(input)) {
+  for await (const event of events) {
     await onEvent(event);
     if (event.type === "done") result = event.result;
   }

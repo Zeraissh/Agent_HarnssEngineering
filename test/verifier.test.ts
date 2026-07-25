@@ -175,17 +175,76 @@ describe("runVerified（编排：执行 → 核查 → 返工）", () => {
     expect(outcome.reworks).toBe(1);
   });
 
-  it("主 run 未完成（如护栏触发）：跳过核查直接返回", async () => {
-    const model = new ScriptedClient([
-      fakeMessage([toolUseBlock("tu_1", "t", {})], "tool_use"), // 只会消耗 maxTurns
+  it("主 run 宿主级失败（error）：跳过核查直接返回", async () => {
+    // 非瞬时错误（401）→ loop 不重试 → stopReason=error → 编排短路，不运行 verifier
+    class AuthFailClient implements ModelClient {
+      send(): Promise<ModelTurn> {
+        return Promise.reject(Object.assign(new Error("bad key"), { status: 401 }));
+      }
+    }
+    const outcome = await runVerified({ ...baseConfig, tools: [] }, new AuthFailClient(), "任务");
+    expect(outcome.finalPassed).toBe(false);
+    expect(outcome.verifications).toHaveLength(0);
+    expect(outcome.main.stopReason).toBe("error");
+  });
+});
+
+describe("runVerified：返工模式与纯产物核查", () => {
+  class ScriptedClient2 implements ModelClient {
+    requests: ModelRequest[] = [];
+    constructor(private script: Anthropic.Message[]) {}
+    send(req: ModelRequest): Promise<ModelTurn> {
+      this.requests.push(structuredClone(req));
+      const m = this.script.shift();
+      if (!m) throw new Error("script exhausted");
+      return Promise.resolve({ message: m, stopReason: m.stop_reason, usage: m.usage });
+    }
+  }
+
+  it("inherit 返工：第二轮执行请求携带首轮正史，executionUsage 合计所有轮", async () => {
+    const model = new ScriptedClient2([
+      fakeMessage([textBlock("完成了")], "end_turn"), // main
+      fakeMessage([textBlock('{"passed": false, "issues": ["数字错了"], "summary": "未通过"}')], "end_turn"), // verifier #1
+      fakeMessage([textBlock("修好了")], "end_turn"), // rework（inherit 续跑）
+      fakeMessage([textBlock('{"passed": true, "issues": [], "summary": "已修复"}')], "end_turn"), // verifier #2
+    ]);
+    const outcome = await runVerified({ ...baseConfig, tools: [] }, model, "任务", {
+      reworkMode: "inherit",
+    });
+    expect(outcome.finalPassed).toBe(true);
+    const reworkReq = model.requests[2]!;
+    // 正史：user(任务) + assistant(完成了) + user(返工反馈)
+    expect(reworkReq.messages).toHaveLength(3);
+    expect(reworkReq.messages[1]!.role).toBe("assistant");
+    expect(JSON.stringify(reworkReq.messages[2]!.content)).toContain("返工");
+    expect(outcome.executionUsage.turns).toBe(2);
+  });
+
+  it("fresh 返工：第二轮执行请求不携带首轮正史", async () => {
+    const model = new ScriptedClient2([
+      fakeMessage([textBlock("完成了")], "end_turn"),
+      fakeMessage([textBlock('{"passed": false, "issues": ["x"], "summary": "未通过"}')], "end_turn"),
+      fakeMessage([textBlock("重做了")], "end_turn"),
+      fakeMessage([textBlock('{"passed": true, "issues": [], "summary": "ok"}')], "end_turn"),
+    ]);
+    const outcome = await runVerified({ ...baseConfig, tools: [] }, model, "任务", {
+      reworkMode: "fresh",
+    });
+    expect(outcome.finalPassed).toBe(true);
+    expect(model.requests[2]!.messages).toHaveLength(1); // 只有全新的返工任务消息
+  });
+
+  it("max_turns 后仍核查产物（纯产物哲学），核查通过则 finalPassed", async () => {
+    const model = new ScriptedClient2([
+      fakeMessage([toolUseBlock("tu_1", "probe", {})], "tool_use"), // main turn1 → max_turns
+      fakeMessage([textBlock('{"passed": true, "issues": [], "summary": "产物已就绪"}')], "end_turn"), // verifier
     ]);
     const outcome = await runVerified(
-      { ...baseConfig, tools: [makeTool({ name: "t" })], maxTurns: 1 },
+      { ...baseConfig, tools: [makeTool({ name: "probe" })], maxTurns: 1 },
       model,
       "任务",
     );
-    expect(outcome.finalPassed).toBe(false);
-    expect(outcome.verifications).toHaveLength(0);
     expect(outcome.main.stopReason).toBe("max_turns");
+    expect(outcome.finalPassed).toBe(true);
   });
 });
