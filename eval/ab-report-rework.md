@@ -67,3 +67,8 @@ fresh 从零重跑 vs inherit 继承正史续跑。执行者 flash。
   代码默认值暂保持 "fresh"，待 REPS≥5 复现后再翻转。
 - executionUsage 修正后成本才可信（旧版漏计被否掉的主 run——此前所有 verified
   臂的 token 数都被低估，横向比较时注意）。
+
+> ⚠️ **勘误（REPS=5 复现批，见 ab-report-rep5-rework.md）**：本报告"inherit 8/8 >
+> fresh 7/8"未能复现（REPS=5 反向：fresh 4/5 > inherit 2/5，合并无显著差异），
+> 且该批实验被 verifier 预算耦合缺陷污染。inherit vs fresh 结论**悬置**，默认
+> reworkMode 维持 fresh。

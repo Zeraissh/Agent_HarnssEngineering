@@ -44,9 +44,12 @@ export async function runVerifier(
   /** 过程事件透传：让宿主看到 verifier 自己的工具调用/复核过程（可见性） */
   onEvent?: (event: TurnEvent) => void | Promise<void>,
 ): Promise<VerifyOutcome> {
-  // 与父级同 system/tools（缓存前缀一致）；护栏收紧：核查不该比执行更贵
+  // 与父级同 system/tools（缓存前缀一致）。轮次预算与执行者解耦——REPS=5 复现批
+  // 教训：执行者被压到 maxTurns=8 时 verifier 若跟着缩水，核查跑不完，最终消息是
+  // 半截引言 → fail-closed 噪声淹没实验信号。核查预算固定 15，不随执行者收紧。
+  const VERIFIER_MAX_TURNS = 15;
   const first = await drainVerifierLoop(
-    new AgentLoop({ ...cfg, maxTurns: Math.min(cfg.maxTurns ?? 50, 15) }, model),
+    new AgentLoop({ ...cfg, maxTurns: VERIFIER_MAX_TURNS }, model),
     buildVerifierPrompt(opts),
     onEvent,
   );
@@ -130,7 +133,9 @@ function buildReformatPrompt(raw: string): string {
 ${raw}
 </raw_verdict>
 
-请把上述结论【原样转写】为契约要求的 JSON——不要重新核查、不要改变结论内容。你的回复必须只包含一个 JSON 对象（不要代码围栏、不要多余文字）：
+请把上述结论【原样转写】为契约要求的 JSON——不要重新核查、不要改变结论内容。
+硬规则：如果原文并不包含明确的通过/失败判定（比如只是核查过程的引言、半截输出），你【不得编造】结论，必须输出 {"passed": false, "issues": ["核查未产出明确结论"], "summary": "原始输出无实质结论"}。
+你的回复必须只包含一个 JSON 对象（不要代码围栏、不要多余文字）：
 {"passed": true/false, "issues": ["发现的问题，每条一个字符串；通过则为空数组"], "summary": "一句话结论"}`;
 }
 

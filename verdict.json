@@ -1,0 +1,1 @@
+{"passed": true, "issues": [], "summary": "核查通过：README.md中严格以##开头的行共6条（二级标题），与eval-out/h2.txt中的纯数字\"6\"一致"}
