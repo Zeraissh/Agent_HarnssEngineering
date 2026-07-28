@@ -1,29 +1,45 @@
 import { describe, expect, it } from "vitest";
-import { getPreset, PRESETS } from "../src/presets.js";
+import { getPack, getPreset, PACKS } from "../src/presets.js";
 import { runVerified } from "../src/orchestrate.js";
 import type Anthropic from "@anthropic-ai/sdk";
 import type { ModelClient, ModelRequest, ModelTurn } from "../src/types.js";
 import { fakeMessage, textBlock } from "./helpers.js";
 
-describe("presets", () => {
-  it("stm32-debug 预设：调试循环 system prompt + 自动验证 + 硬件核查指令", () => {
-    const p = getPreset("stm32-debug");
+describe("domain packs", () => {
+  it("stm32-debug 包：调试循环 system prompt + 自动验证 + 硬件核查指令 + MCP 白名单", () => {
+    const p = getPack("stm32-debug");
     expect(p).toBeDefined();
-    expect(p!.verify).toBe(true);
+    expect(p!.verify.enabled).toBe(true);
+    expect(p!.verify.mode).toBe("programmatic");
     expect(p!.systemPrompt).toContain("observe → orient → hypothesize → act → verify");
     expect(p!.systemPrompt).toContain("self_check");
-    expect(p!.verifyInstructions).toContain("不要相信报告");
-    expect(p!.verifyInstructions).toContain("reconstruct_fault_context");
+    expect(p!.verify.instructions).toContain("不要相信报告");
+    expect(typeof p!.mcp).toBe("object");
+    expect((p!.mcp as { includeTools: string[] }).includeTools).toContain("flash_firmware");
   });
 
-  it("未知预设名返回 undefined", () => {
-    expect(getPreset("does-not-exist")).toBeUndefined();
+  it("stm32-coding 包：固件工程纪律 + 构建验收 + 不接 MCP（编程阶段不碰硬件）", () => {
+    const p = getPack("stm32-coding");
+    expect(p).toBeDefined();
+    expect(p!.verify.enabled).toBe(true);
+    expect(p!.systemPrompt).toContain("cmake --build");
+    expect(p!.verify.instructions).toContain("arm-none-eabi-nm");
+    expect(p!.mcp).toBe(false);
+    expect(p!.builtinTools).not.toContain("fetch_url");
   });
 
-  it("所有预设的 name 与键一致（防注册错位）", () => {
-    for (const [key, preset] of Object.entries(PRESETS)) {
-      expect(preset.name).toBe(key);
+  it("未知包名返回 undefined", () => {
+    expect(getPack("does-not-exist")).toBeUndefined();
+  });
+
+  it("所有包的 name 与键一致（防注册错位）", () => {
+    for (const [key, pack] of Object.entries(PACKS)) {
+      expect(pack.name).toBe(key);
     }
+  });
+
+  it("兼容别名 getPreset 仍可用（v0.8 及之前的调用方）", () => {
+    expect(getPreset("stm32-debug")).toBe(getPack("stm32-debug"));
   });
 });
 

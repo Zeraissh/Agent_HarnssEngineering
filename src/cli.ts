@@ -15,8 +15,9 @@
  *   AGENT_VERIFIER_MODEL 可选，--verify 时 verifier 用的独立模型（应 ≥ 执行者强度）；
  *                       配套 AGENT_VERIFIER_PROVIDER / _BASE_URL / _API_KEY 可指向
  *                       不同端点，缺省沿用执行者的端点配置
- *   AGENT_PRESET        可选，预设名（如 stm32-debug）：覆盖 system prompt、
- *                       自动开启 verifier 核查、注入领域核查方法
+ *   AGENT_PACK          可选，领域包名（stm32-coding / stm32-debug）：覆盖 system
+ *                       prompt、内置工具面、MCP 接入与白名单、验证策略、护栏参数。
+ *                       AGENT_PRESET 为兼容别名
  *   AGENT_CONTEXT_LIMIT 可选，上下文 token 上限（触发 compact），默认 150000
  *   AGENT_MAX_TOKENS    可选，单次响应输出上限，默认 64000。本地慢速模型建议调低
  *                       （如 4096）以掐断思考螺旋——快速失败优于无限等待
@@ -29,9 +30,9 @@ import { AgentLoop } from "./loop.js";
 import { connectMcpServers, loadMcpConfig } from "./mcp.js";
 import { createMemoryTools, MemoryStore } from "./memory.js";
 import { runVerified } from "./orchestrate.js";
-import { getPreset } from "./presets.js";
+import { getPack, PACKS } from "./presets.js";
 import { createModelClientFromEnv } from "./provider.js";
-import { bashTool } from "./tools/bash.js";
+import { bashTool, SHELL_DESC } from "./tools/bash.js";
 import { fetchUrlTool } from "./tools/fetch-url.js";
 import { readFileTool } from "./tools/read-file.js";
 import { writeFileTool } from "./tools/write-file.js";
@@ -62,16 +63,19 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // 预设（可选）：覆盖 system prompt、验证策略、领域核查方法
-  const presetName = process.env.AGENT_PRESET;
-  const preset = presetName ? getPreset(presetName) : undefined;
-  if (presetName && !preset) {
-    console.error(`Unknown AGENT_PRESET "${presetName}". Available: stm32-debug`);
+  // 领域包（可选）：AGENT_PACK 选用（AGENT_PRESET 为兼容别名），
+  // 覆盖 system prompt、工具面、MCP 接入、验证策略、护栏参数
+  const packName = process.env.AGENT_PACK ?? process.env.AGENT_PRESET;
+  const pack = packName ? getPack(packName) : undefined;
+  if (packName && !pack) {
+    console.error(`Unknown pack "${packName}". Available: ${Object.keys(PACKS).join(", ")}`);
     process.exit(1);
   }
-  if (preset) console.log(c.dim(`preset: ${preset.name} (verify=${preset.verify})`));
-  // --verify 手动开启，或预设自动开启
-  const withVerify = args.includes("--verify") || preset?.verify === true;
+  if (pack) {
+    console.log(c.dim(`pack: ${pack.name} (verify=${pack.verify.enabled}/${pack.verify.mode}) — ${pack.description}`));
+  }
+  // --verify 手动开启，或领域包自动开启
+  const withVerify = args.includes("--verify") || pack?.verify.enabled === true;
 
   const model = process.env.AGENT_MODEL ?? "claude-opus-4-8";
   const { client: resolvedClient, provider, compat } = createModelClientFromEnv(model);
@@ -106,20 +110,32 @@ async function main(): Promise<void> {
     );
   }
 
+  // 护栏参数优先级：显式 env > 领域包默认 > 全局默认
   const contextTokenLimit = process.env.AGENT_CONTEXT_LIMIT
     ? Number(process.env.AGENT_CONTEXT_LIMIT)
-    : undefined;
-  const maxTokens = process.env.AGENT_MAX_TOKENS ? Number(process.env.AGENT_MAX_TOKENS) : undefined;
+    : pack?.guardrails?.contextTokenLimit;
+  const maxTokens = process.env.AGENT_MAX_TOKENS
+    ? Number(process.env.AGENT_MAX_TOKENS)
+    : pack?.guardrails?.maxTokens;
+  const maxTurns = pack?.guardrails?.maxTurns;
 
   // 跨会话记忆（L5）：默认 <cwd>/.agent-memory，可用 AGENT_MEMORY_DIR 覆盖
   const memory = new MemoryStore(
     process.env.AGENT_MEMORY_DIR ?? path.join(process.cwd(), ".agent-memory"),
   );
 
-  // MCP 工具（可选）：./mcp.json 存在即连接，AGENT_MCP_CONFIG 覆盖路径
-  const mcpConfig = await loadMcpConfig(
-    process.env.AGENT_MCP_CONFIG ?? path.join(process.cwd(), "mcp.json"),
-  );
+  // MCP 工具（可选）：./mcp.json 存在即连接，AGENT_MCP_CONFIG 覆盖路径；
+  // 领域包可整体关闭（mcp: false）或覆盖各 server 的工具白名单/审批策略
+  const mcpConfig =
+    pack?.mcp === false
+      ? undefined
+      : await loadMcpConfig(process.env.AGENT_MCP_CONFIG ?? path.join(process.cwd(), "mcp.json"));
+  if (mcpConfig && pack && typeof pack.mcp === "object") {
+    for (const server of Object.values(mcpConfig.servers)) {
+      if (pack.mcp.includeTools) server.includeTools = pack.mcp.includeTools;
+      if (pack.mcp.permission) server.permission = pack.mcp.permission;
+    }
+  }
   const mcp = mcpConfig ? await connectMcpServers(mcpConfig, (m) => console.warn(c.yellow(m))) : undefined;
   if (mcp) {
     for (const [server, count] of Object.entries(mcp.summary)) {
@@ -127,25 +143,30 @@ async function main(): Promise<void> {
     }
   }
 
+  // 内置工具按包名单装配（缺省全带）——领域包只带用得上的，减少触发面噪声
+  const builtinByName = new Map(
+    [bashTool, fetchUrlTool, readFileTool, writeFileTool].map((t) => [t.name, t]),
+  );
+  const builtinNames = pack?.builtinTools ?? [...builtinByName.keys()];
+  const builtins = builtinNames.map((n) => {
+    const t = builtinByName.get(n);
+    if (!t) throw new Error(`Pack "${pack?.name}" 声明了未知内置工具: ${n}`);
+    return t;
+  });
+
   const config: AgentConfig = {
-    systemPrompt: preset?.systemPrompt ?? SYSTEM_PROMPT,
-    tools: [
-      bashTool,
-      fetchUrlTool,
-      readFileTool,
-      writeFileTool,
-      ...createMemoryTools(memory),
-      ...(mcp?.tools ?? []),
-    ],
+    systemPrompt: pack?.systemPrompt ?? SYSTEM_PROMPT,
+    tools: [...builtins, ...createMemoryTools(memory), ...(mcp?.tools ?? [])],
     workdir: process.cwd(),
     compat,
     contextTokenLimit,
     maxTokens,
+    ...(maxTurns !== undefined ? { maxTurns } : {}),
     // 易变信息走 messages 注入（P3），system prompt 保持字节冻结
     dynamicContext: {
       date: new Date().toISOString().slice(0, 10),
       platform: process.platform,
-      shell: process.platform === "win32" ? "cmd.exe" : "/bin/sh",
+      shell: SHELL_DESC,
       workdir: process.cwd(),
       memory_index: await memory.indexBlock(),
     },
@@ -191,7 +212,7 @@ async function main(): Promise<void> {
 
   if (withVerify) {
     const outcome = await runVerified(config, modelClient, task, {
-      ...(preset?.verifyInstructions ? { verifyInstructions: preset.verifyInstructions } : {}),
+      ...(pack?.verify.instructions ? { verifyInstructions: pack.verify.instructions } : {}),
       ...(verifierProvider
         ? { verifierModel: { client: verifierProvider.client, compat: verifierProvider.compat } }
         : {}),

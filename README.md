@@ -82,7 +82,11 @@ npm run cli -- --verify "……"
 - **v0.5 ✅** — L5 跨会话记忆：`.agent-memory/` + 四个记忆工具 + 开局索引注入
 - **v0.6 ✅** — OpenAI wire 协议：`AGENT_PROVIDER=openai` 接入一切 chat-completions 端点，核心层零改动
 - **v0.7 ✅** — MCP 工具接入（`mcp.json` 声明 server，自动适配为 Tool）+ STM32L151 真机调试端到端
-- **后续** — harness A/B 研究、server-side compaction、多 agent 编排（见 [docs/04-roadmap.md](docs/04-roadmap.md)）
+- **v0.8 ✅** — harness A/B 研究（eval/ 下 6 份报告）：verifier 正反证据闭环与跨厂商验证、
+  真 Git Bash 修复（hard 套件 63%→88%）、逐 run JSONL/transcript 留档、loop 层瞬时错误重试
+- **v0.9 ✅** — DomainPack 领域包（五件套：工具面/prompt/核查/护栏/评估）+ `AGENT_PACK` 切换；
+  跨包试点闭环：stm32-coding 修固件产出 ELF → stm32-debug 真机烧录四项验收 → verifier 独立连板复核
+- **后续** — 计划单元与三角编排（planner→executor→verifier）、verifier 只读命令白名单、server-side compaction（见 [docs/04-roadmap.md](docs/04-roadmap.md)）
 
 ## 技术基线
 

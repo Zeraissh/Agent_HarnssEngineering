@@ -27,7 +27,8 @@ function detectWindowsBash(): string | undefined {
 }
 
 const WINDOWS_BASH = process.platform === "win32" ? detectWindowsBash() : undefined;
-const SHELL_DESC =
+/** 实际使用的 shell 描述（宿主注入 dynamicContext 用，保持与工具行为一致） */
+export const SHELL_DESC =
   process.platform !== "win32"
     ? "/bin/sh"
     : WINDOWS_BASH
