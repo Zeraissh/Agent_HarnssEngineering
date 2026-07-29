@@ -3,7 +3,9 @@
  * 主 loop 与 verifier 共用 systemPrompt/tools（缓存前缀一致），上下文互相隔离。
  */
 import { AgentLoop } from "./loop.js";
+import { runPlanner, type Plan, type PlanOutcome, type SubTask } from "./planner.js";
 import { runVerifier, sumUsage, type VerifyOutcome } from "./verifier.js";
+import type { DomainPack } from "./presets.js";
 import type { AgentConfig, AgentRunResult, AggregateUsage, ModelClient, TurnEvent } from "./types.js";
 
 export interface VerifiedRunOptions {
@@ -163,4 +165,93 @@ function lastAssistantText(result: AgentRunResult): string {
     if (text) return text;
   }
   return "";
+}
+
+// ————————————————— 三角编排：planner → executor → verifier —————————————————
+
+export interface PlannedRunOptions {
+  /** 可用领域包（planner 的菜单 + 子任务 pack 名校验） */
+  packs?: DomainPack[];
+  /**
+   * 宿主按子任务装配执行配置（按包换工具面/prompt/护栏）。
+   * 缺省 = 全部子任务用 baseCfg + baseVerify。
+   */
+  resolveSubtask?: (sub: SubTask) => {
+    cfg: AgentConfig;
+    verify?: Pick<VerifiedRunOptions, "verifyInstructions" | "verifierModel" | "reworkMode">;
+  };
+  /** 每个子任务的最大返工轮数。默认 1 */
+  maxReworks?: number;
+  /** 计划就绪回调（在任何子任务执行前触发）：宿主可展示计划、做人工把关 */
+  onPlan?: (plan: Plan) => void | Promise<void>;
+  /** 事件旁路：source 形如 "planner" / "s1/main" / "s1/verifier" / "s1/rework" */
+  onEvent?: (source: string, event: TurnEvent) => void | Promise<void>;
+}
+
+export interface PlannedStepResult {
+  sub: SubTask;
+  result: VerifiedRunResult;
+}
+
+export interface PlannedRunResult {
+  /** undefined = planner 产不出可解析计划（fail-closed，未执行任何子任务） */
+  plan?: Plan;
+  planOutcome: PlanOutcome;
+  /** 已执行的子任务（某步核查未通过则后续不再执行——快速失败） */
+  steps: PlannedStepResult[];
+  /** 全部子任务都执行且核查通过 */
+  completed: boolean;
+}
+
+/**
+ * 三角编排：planner 拆解（带验收标准）→ 逐子任务 runVerified（执行→核查→返工）
+ * → 上游执行摘要作为交接注入下游。任一子任务核查未通过即中止（可靠性是乘法，
+ * 带病继续只会把错误往下游放大）。
+ */
+export async function runPlanned(
+  baseCfg: AgentConfig,
+  model: ModelClient,
+  task: string,
+  opts: PlannedRunOptions = {},
+): Promise<PlannedRunResult> {
+  const packs = opts.packs ?? [];
+  const planOutcome = await runPlanner(baseCfg, model, task, packs, (e) =>
+    opts.onEvent?.("planner", e),
+  );
+  if (!planOutcome.plan) {
+    return { planOutcome, steps: [], completed: false };
+  }
+  const plan = planOutcome.plan;
+  await opts.onPlan?.(plan);
+
+  const steps: PlannedStepResult[] = [];
+  let prevHandoff = "";
+
+  for (const sub of plan.subtasks) {
+    // pack 名校验：未知包名不致命，降级为默认配置执行（记录在交接摘要里没有意义，宿主事件里可见）
+    const resolved = opts.resolveSubtask?.(sub) ?? { cfg: baseCfg };
+
+    const acceptance =
+      sub.acceptance.length > 0
+        ? `\n\n【验收标准】完成后将由独立核查者逐条验证：\n${sub.acceptance.map((a, i) => `${i + 1}. ${a}`).join("\n")}`
+        : "";
+    const handoff = prevHandoff
+      ? `\n\n【上游交接】上一个子任务的执行摘要（其产物路径以此为准）：\n${prevHandoff}`
+      : "";
+    const input = `${sub.description}${acceptance}${handoff}`;
+
+    const result = await runVerified(resolved.cfg, model, input, {
+      maxReworks: opts.maxReworks ?? 1,
+      ...(resolved.verify ?? {}),
+      onEvent: (source, event) => opts.onEvent?.(`${sub.id}/${source}`, event),
+    });
+    steps.push({ sub, result });
+
+    if (!result.finalPassed) {
+      return { plan, planOutcome, steps, completed: false };
+    }
+    prevHandoff = lastAssistantText(result.main) || "(上游没有留下文字报告)";
+  }
+
+  return { plan, planOutcome, steps, completed: true };
 }

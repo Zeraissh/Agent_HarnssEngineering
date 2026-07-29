@@ -86,7 +86,8 @@ npm run cli -- --verify "……"
   真 Git Bash 修复（hard 套件 63%→88%）、逐 run JSONL/transcript 留档、loop 层瞬时错误重试
 - **v0.9 ✅** — DomainPack 领域包（五件套：工具面/prompt/核查/护栏/评估）+ `AGENT_PACK` 切换；
   跨包试点闭环：stm32-coding 修固件产出 ELF → stm32-debug 真机烧录四项验收 → verifier 独立连板复核
-- **后续** — 计划单元与三角编排（planner→executor→verifier）、verifier 只读命令白名单、server-side compaction（见 [docs/04-roadmap.md](docs/04-roadmap.md)）
+- **v1.0 ✅** — 计划单元 + 三角编排：planner 只读拆解（JSON 计划契约：子任务×领域包×可程序化验收清单）→ 逐子任务执行→核查→返工 → 交接下游，快速失败；`--plan` 一句话任务真机闭环（planner 自主选包，verifier 独立连板逐条复核 8 项验收）
+- **后续** — verifier 只读命令白名单、调度 agent（任务→包路由）、server-side compaction（见 [docs/04-roadmap.md](docs/04-roadmap.md)）
 
 ## 技术基线
 

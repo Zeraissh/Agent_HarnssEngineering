@@ -29,8 +29,8 @@ import readline from "node:readline/promises";
 import { AgentLoop } from "./loop.js";
 import { connectMcpServers, loadMcpConfig } from "./mcp.js";
 import { createMemoryTools, MemoryStore } from "./memory.js";
-import { runVerified } from "./orchestrate.js";
-import { getPack, PACKS } from "./presets.js";
+import { runPlanned, runVerified } from "./orchestrate.js";
+import { getPack, PACKS, selectPackTools } from "./presets.js";
 import { createModelClientFromEnv } from "./provider.js";
 import { bashTool, SHELL_DESC } from "./tools/bash.js";
 import { fetchUrlTool } from "./tools/fetch-url.js";
@@ -57,15 +57,17 @@ You have a persistent memory that survives across sessions. The current memory i
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const autoYes = args.includes("--yes");
+  const withPlan = args.includes("--plan");
   const task = args.filter((a) => !a.startsWith("--")).join(" ").trim();
   if (!task) {
-    console.error('Usage: npx tsx src/cli.ts "task description" [--yes] [--verify]');
+    console.error('Usage: npx tsx src/cli.ts "task description" [--yes] [--verify] [--plan]');
     process.exit(1);
   }
 
   // 领域包（可选）：AGENT_PACK 选用（AGENT_PRESET 为兼容别名），
-  // 覆盖 system prompt、工具面、MCP 接入、验证策略、护栏参数
-  const packName = process.env.AGENT_PACK ?? process.env.AGENT_PRESET;
+  // 覆盖 system prompt、工具面、MCP 接入、验证策略、护栏参数。
+  // --plan 模式下忽略 AGENT_PACK：包由 planner 按子任务从注册表里选
+  const packName = withPlan ? undefined : (process.env.AGENT_PACK ?? process.env.AGENT_PRESET);
   const pack = packName ? getPack(packName) : undefined;
   if (packName && !pack) {
     console.error(`Unknown pack "${packName}". Available: ${Object.keys(PACKS).join(", ")}`);
@@ -154,9 +156,10 @@ async function main(): Promise<void> {
     return t;
   });
 
+  const memTools = createMemoryTools(memory);
   const config: AgentConfig = {
     systemPrompt: pack?.systemPrompt ?? SYSTEM_PROMPT,
-    tools: [...builtins, ...createMemoryTools(memory), ...(mcp?.tools ?? [])],
+    tools: [...builtins, ...memTools, ...(mcp?.tools ?? [])],
     workdir: process.cwd(),
     compat,
     contextTokenLimit,
@@ -210,7 +213,85 @@ async function main(): Promise<void> {
     }
   };
 
-  if (withVerify) {
+  if (withPlan) {
+    // 三角编排：planner 拆解 → 逐子任务(执行→核查→返工) → 交接下游
+    const builtinPool = [bashTool, fetchUrlTool, readFileTool, writeFileTool];
+    const mcpPool = mcp?.tools ?? [];
+    let currentStep = "";
+    let planRef: Awaited<ReturnType<typeof runPlanned>>["plan"];
+    const outcome = await runPlanned(config, modelClient, task, {
+      packs: Object.values(PACKS),
+      onPlan: (plan) => {
+        planRef = plan;
+        endStreamLine();
+        console.log(c.cyan("\n═══ 计划 ═══"));
+        for (const s of plan.subtasks) {
+          console.log(`${c.cyan(s.id)} ${s.title}${s.pack ? c.dim(` [pack: ${s.pack}]`) : ""}`);
+          for (const a of s.acceptance) console.log(c.dim(`    验收: ${a}`));
+        }
+      },
+      resolveSubtask: (sub) => {
+        const p = sub.pack ? getPack(sub.pack) : undefined;
+        if (sub.pack && !p) console.log(c.yellow(`⚠ 未知领域包 "${sub.pack}"，子任务 ${sub.id} 用默认配置执行`));
+        return {
+          cfg: {
+            ...config,
+            systemPrompt: p?.systemPrompt ?? SYSTEM_PROMPT,
+            tools: [...selectPackTools(p, builtinPool, mcpPool), ...memTools],
+            ...(p?.guardrails?.maxTurns !== undefined ? { maxTurns: p.guardrails.maxTurns } : {}),
+            ...(p?.guardrails?.maxTokens !== undefined && !process.env.AGENT_MAX_TOKENS
+              ? { maxTokens: p.guardrails.maxTokens }
+              : {}),
+          },
+          verify: {
+            ...(p?.verify.instructions ? { verifyInstructions: p.verify.instructions } : {}),
+            ...(verifierProvider
+              ? { verifierModel: { client: verifierProvider.client, compat: verifierProvider.compat } }
+              : {}),
+          },
+        };
+      },
+      onEvent: async (source, event) => {
+        const stepId = source.split("/")[0]!;
+        if (stepId !== currentStep) {
+          currentStep = stepId;
+          endStreamLine();
+          if (stepId === "planner") {
+            console.log(c.cyan("\n━━━ 计划单元（planner，只读拆解）━━━"));
+          } else {
+            const sub = planRef?.subtasks.find((s) => s.id === stepId);
+            console.log(
+              c.cyan(`\n━━━ 子任务 ${stepId}${sub ? `：${sub.title}` : ""}${sub?.pack ? c.dim(` [pack: ${sub.pack}]`) : ""} ━━━`),
+            );
+          }
+        }
+        if (source.endsWith("/verifier")) {
+          renderVerifierEvent(event);
+          return;
+        }
+        if (source.endsWith("/rework") && event.type === "turn_start" && event.turn === 1) {
+          console.log(c.yellow("\n↺ 核查未通过，开始返工…"));
+        }
+        await renderEvent(event);
+      },
+    });
+    console.log(c.cyan("\n═══ 三角编排结果 ═══"));
+    if (!outcome.plan) {
+      console.log(c.red(`✘ planner 未能产出可解析计划：${outcome.planOutcome.raw.slice(0, 200)}`));
+    } else {
+      for (const sub of outcome.plan.subtasks) {
+        const step = outcome.steps.find((s) => s.sub.id === sub.id);
+        const mark = !step ? c.dim("－ 未执行") : step.result.finalPassed ? c.green("✔ 通过") : c.red("✘ 未通过");
+        console.log(`${mark} ${sub.id} ${sub.title}${sub.pack ? c.dim(` [${sub.pack}]`) : ""}`);
+        if (step && !step.result.finalPassed) {
+          for (const issue of step.result.verifications.at(-1)?.verdict.issues ?? []) {
+            console.log(c.red(`    - ${issue}`));
+          }
+        }
+      }
+      console.log(outcome.completed ? c.green("\n✔ 全部子任务执行并核查通过") : c.red("\n✘ 编排未完成（快速失败）"));
+    }
+  } else if (withVerify) {
     const outcome = await runVerified(config, modelClient, task, {
       ...(pack?.verify.instructions ? { verifyInstructions: pack.verify.instructions } : {}),
       ...(verifierProvider

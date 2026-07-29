@@ -1,3 +1,5 @@
+import type { Tool } from "./types.js";
+
 /**
  * DomainPack（领域包）：把一个领域的 harness 内容打包成可切换单元。
  * 包是【数据/配置】，不是核心代码——机制层（loop/context/verifier 纪律/编排）
@@ -66,6 +68,8 @@ const STM32_DEBUG_SYSTEM = `你是一个自主的嵌入式调试 agent，通过 
 5. reconstruct_fault_context 会解 CFSR/HFSR 并把压栈的 PC 映射回源码——诊断 HardFault 时优先用它。
 6. 每个进度声明都要能对应到一条真实的工具返回结果；没核实的就明说，不要编。
 7. 结束前用 stop_debug_session 干净收尾。
+8. 一切硬件操作只通过 stm32 MCP 工具进行——不要自建 OpenOCD/GDB/telnet 调试栈，
+   不要杀进程"清理环境"；MCP 工具报错时处理错误本身，而不是绕开它。
 
 把结论落到用户要求的产出（如报告文件），并用一两句话总结。用用户使用的语言回答。`;
 
@@ -105,8 +109,10 @@ export const PACKS: Record<string, DomainPack> = {
     name: "stm32-debug",
     description: "STM32 真机烧录与调试：ST-Link/OpenOCD 上电、烧录 ELF、断点/变量/故障现场取证",
     systemPrompt: STM32_DEBUG_SYSTEM,
-    // 调试包不需要 fetch_url；bash 留给读构建产物路径等轻活
-    builtinTools: ["bash", "read_file", "write_file"],
+    // 不给 bash：v1.0 演示实证——给了 bash，执行者会绕开 MCP 自建 openocd/gdb
+    // 调试栈,还会 taskkill "清理"时扫死共享的 MCP server。调试动作全走 MCP,
+    // 报告用 write_file,读产物用 read_file,足够。
+    builtinTools: ["read_file", "write_file"],
     mcp: {
       includeTools: [
         "suggest_server_args",
@@ -155,6 +161,34 @@ export const PACKS: Record<string, DomainPack> = {
 
 export function getPack(name: string): DomainPack | undefined {
   return PACKS[name];
+}
+
+/**
+ * 按包从已装配的工具池里选工具（宿主用）：
+ * - 内置池按 builtinTools 名单过滤（缺省全带）；
+ * - MCP 池按包的接入面过滤——false 全不带；includeTools 按【原始名】匹配
+ *   （已适配的 MCP 工具名形如 `${server}__${raw}`，见 mcp.ts）；缺省全带。
+ * 好处：MCP 只需按 mcp.json 连接一次，按包换工具面是纯内存过滤（三角编排
+ * 的子任务切包不用重连 server）。
+ */
+export function selectPackTools(
+  pack: DomainPack | undefined,
+  builtinPool: Tool[],
+  mcpPool: Tool[],
+): Tool[] {
+  const builtinNames = pack?.builtinTools ?? builtinPool.map((t) => t.name);
+  const builtins = builtinPool.filter((t) => builtinNames.includes(t.name));
+
+  let mcp: Tool[];
+  if (pack?.mcp === false) {
+    mcp = [];
+  } else if (pack && typeof pack.mcp === "object" && pack.mcp.includeTools) {
+    const allow = new Set(pack.mcp.includeTools);
+    mcp = mcpPool.filter((t) => allow.has(t.name.split("__").slice(1).join("__")));
+  } else {
+    mcp = mcpPool;
+  }
+  return [...builtins, ...mcp];
 }
 
 // ————— 兼容别名（v0.8 及之前的 Preset 命名）—————

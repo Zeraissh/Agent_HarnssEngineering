@@ -86,6 +86,12 @@ export function adaptMcpTool(
   };
 }
 
+/** 传输层死亡判定：SDK 在 stdio 断开后抛 "Not connected" / "Connection closed" */
+export function isTransportDead(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /not connected|connection closed|transport.*closed/i.test(msg);
+}
+
 /** MCP content 块渲染为回填文本：text 直通，其余类型标注占位 */
 export function renderMcpContent(content: unknown): string {
   if (!Array.isArray(content)) return String(content ?? "");
@@ -101,13 +107,18 @@ export function renderMcpContent(content: unknown): string {
 // ---------------------------------------------------------------- 连接管理
 
 export class McpConnection {
+  private client: Client;
+  private reconnecting?: Promise<void>;
+
   private constructor(
-    private readonly client: Client,
+    client: Client,
     readonly serverName: string,
     private readonly cfg: McpServerConfig,
-  ) {}
+  ) {
+    this.client = client;
+  }
 
-  static async connect(serverName: string, cfg: McpServerConfig): Promise<McpConnection> {
+  private static async createClient(cfg: McpServerConfig): Promise<Client> {
     const transport = new StdioClientTransport({
       command: cfg.command,
       args: cfg.args ?? [],
@@ -116,7 +127,31 @@ export class McpConnection {
     });
     const client = new Client({ name: "agent-harness", version: "0.7.0" });
     await client.connect(transport);
-    return new McpConnection(client, serverName, cfg);
+    return client;
+  }
+
+  static async connect(serverName: string, cfg: McpServerConfig): Promise<McpConnection> {
+    return new McpConnection(await McpConnection.createClient(cfg), serverName, cfg);
+  }
+
+  /**
+   * 传输层死亡（server 进程被杀/stdio 断开）→ 重启 server 进程重连（一次）。
+   * 教训（v1.0 三角编排演示）：执行者用 bash 清理进程时把共享的 MCP server 扫死，
+   * 之后 verifier 全部调用 "Not connected"——多轮编排的寿命比连接长，必须能自愈。
+   * 注意：重连后 server 端会话状态清零（如调试会话），调用方需自行重建会话。
+   */
+  private async reconnect(): Promise<void> {
+    this.reconnecting ??= (async () => {
+      try {
+        await this.client.close();
+      } catch {
+        // 传输已死，close 失败属预期
+      }
+      this.client = await McpConnection.createClient(this.cfg);
+    })().finally(() => {
+      this.reconnecting = undefined;
+    });
+    return this.reconnecting;
   }
 
   async tools(): Promise<Tool[]> {
@@ -135,6 +170,19 @@ export class McpConnection {
   }
 
   private async call(
+    name: string,
+    args: Record<string, unknown>,
+  ): Promise<{ content: string; isError: boolean }> {
+    try {
+      return await this.doCall(name, args);
+    } catch (err) {
+      if (!isTransportDead(err)) throw err;
+      await this.reconnect();
+      return await this.doCall(name, args); // 重连后重试一次；再失败如实上抛
+    }
+  }
+
+  private async doCall(
     name: string,
     args: Record<string, unknown>,
   ): Promise<{ content: string; isError: boolean }> {
