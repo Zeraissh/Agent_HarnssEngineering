@@ -360,4 +360,138 @@ export const cases: EvalCase[] = [
         : { pass: false, note: `期望 ${JSON.stringify(expected.slice(0, 50))}，实际 ${JSON.stringify(got.trim().slice(0, 50))}` };
     },
   },
+
+  // ————— 极难套件（xhard-*）：多源聚合 / 长依赖链 / 字节级格式 / 成文规则 vs 直觉。
+  //        为 hard-* 已被 flash 基本攻克（仅 import-list 存区分度）而设。
+  //        设计纪律同 hard-*：任务文本写死口径，checker 逐字同口径，事实先程序化采集。 —————
+  {
+    id: "xhard-script-imports",
+    covers: "极难：多源聚合（scripts 入口 × 各自的相对依赖计数 × 排序格式）",
+    task:
+      "读取 package.json 的 scripts。对其中每个以 'tsx ' 开头的 script，取命令的第二个空格分隔段作为入口文件；统计该入口文件中【以 import 开头、且第一个双引号内的模块标识符以 ./ 或 ../ 开头】的行数。把结果按 script 名字母升序，每行一条，格式 'script名:数量'，写入 eval-out/script-imports.txt。",
+    async check(workdir) {
+      const got = await readOut(workdir, "eval-out/script-imports.txt");
+      if (got === undefined) return { pass: false, note: "script-imports.txt 未创建" };
+      const pkg = JSON.parse((await readOut(workdir, "package.json"))!) as {
+        scripts: Record<string, string>;
+      };
+      const expected = (
+        await Promise.all(
+          Object.entries(pkg.scripts)
+            .filter(([, cmd]) => cmd.startsWith("tsx "))
+            .sort(([a], [b]) => (a < b ? -1 : 1))
+            .map(async ([name, cmd]) => {
+              const entry = cmd.split(" ")[1]!;
+              const src = (await readOut(workdir, entry)) ?? "";
+              const n = src
+                .split("\n")
+                .filter((l) => l.startsWith("import") && /^\.\.?\//.test(l.match(/"([^"]+)"/)?.[1] ?? "")).length;
+              return `${name}:${n}`;
+            }),
+        )
+      ).join("\n");
+      return got.trim().replace(/\r/g, "") === expected
+        ? { pass: true, note: `聚合正确 (${expected.replace(/\n/g, " ")})` }
+        : { pass: false, note: `期望 ${JSON.stringify(expected)}，实际 ${JSON.stringify(got.trim().slice(0, 60))}` };
+    },
+  },
+  {
+    id: "xhard-export-chain",
+    covers: "极难：长依赖链（入口 → 本地依赖集 → 逐文件统计 → 聚合）",
+    task:
+      "第一步：找出 src/loop.ts 中以 import 开头、且第一个双引号内的标识符以 ./ 开头的行，收集这些相对模块（去重）。第二步：把每个模块映射为源文件（相对 src/ 解析，.js 后缀换成 .ts）。第三步：统计每个源文件中以 'export function '、'export const '、'export class '、'export interface '、'export type ' 之一开头的行数。把所有文件的计数总和（纯数字）写入 eval-out/export-chain.txt。",
+    async check(workdir) {
+      const got = await readOut(workdir, "eval-out/export-chain.txt");
+      if (got === undefined) return { pass: false, note: "export-chain.txt 未创建" };
+      const loop = (await readOut(workdir, "src/loop.ts")) ?? "";
+      const locals = [
+        ...new Set(
+          loop
+            .split("\n")
+            .filter((l) => l.startsWith("import"))
+            .map((l) => l.match(/"(\.\/[^"]+)"/)?.[1])
+            .filter((s): s is string => !!s),
+        ),
+      ];
+      let total = 0;
+      for (const m of locals) {
+        const src = (await readOut(workdir, path.join("src", m.replace(/\.js$/, ".ts")))) ?? "";
+        total += src
+          .split("\n")
+          .filter((l) => /^export (function|const|class|interface|type) /.test(l)).length;
+      }
+      return Number(got.trim()) === total
+        ? { pass: true, note: `依赖链聚合正确 (${total}，${locals.length} 个模块)` }
+        : { pass: false, note: `报告 ${got.trim()}，实际 ${total}` };
+    },
+  },
+  {
+    id: "xhard-csv-bytes",
+    covers: "极难：字节级产物（LF 换行、无尾随字节、精确表格式）",
+    task:
+      "生成 eval-out/lines.csv，内容恰好三行：第一行表头 'name,lines'；第二行 'loop.ts,<N1>'；第三行 'verifier.ts,<N2>'。N1/N2 分别是 src/loop.ts 与 src/verifier.ts 的行数（wc -l 口径，即换行符个数）。字节要求：行与行之间用 LF（\\n）分隔，不能出现 CR（\\r），最后一行末尾不能有换行或任何其他字符。",
+    async check(workdir) {
+      const got = await readOut(workdir, "eval-out/lines.csv");
+      if (got === undefined) return { pass: false, note: "lines.csv 未创建" };
+      const wc = async (rel: string): Promise<number> => {
+        const s = (await readOut(workdir, rel)) ?? "";
+        return s.split("\n").length - (s.endsWith("\n") ? 1 : 0);
+      };
+      const expected = `name,lines\nloop.ts,${await wc("src/loop.ts")}\nverifier.ts,${await wc("src/verifier.ts")}`;
+      if (got === expected) return { pass: true, note: "字节级精确匹配" };
+      if (got.includes("\r")) return { pass: false, note: "含 CR（CRLF 换行）——要求 LF" };
+      return got.replace(/\n+$/, "") === expected
+        ? { pass: false, note: "内容正确但末尾有多余换行" }
+        : { pass: false, note: `期望 ${JSON.stringify(expected)}，实际 ${JSON.stringify(got.slice(0, 50))}` };
+    },
+  },
+  {
+    id: "xhard-report-arms",
+    covers: "极难：多文件模式提取（正则口径成文，跨 6+ 份报告去重排序）",
+    task:
+      "在 eval/ 目录下所有文件名以 ab-report 开头、以 .md 结尾的文件里，找出符合形态「| 臂名 | 数字% |」开头的表格行（即正则 /^\\| (\\S+) \\| \\d+% \\|/ 匹配的行），收集第一列的臂名。去重、按字母升序、用英文逗号连接成一行写入 eval-out/arms.txt。",
+    async check(workdir) {
+      const got = await readOut(workdir, "eval-out/arms.txt");
+      if (got === undefined) return { pass: false, note: "arms.txt 未创建" };
+      const arms = new Set<string>();
+      for (const f of (await readdir(path.join(workdir, "eval"))).filter(
+        (f) => f.startsWith("ab-report") && f.endsWith(".md"),
+      )) {
+        for (const l of ((await readOut(workdir, path.join("eval", f))) ?? "").split("\n")) {
+          const m = l.match(/^\| (\S+) \| \d+% \|/);
+          if (m) arms.add(m[1]!);
+        }
+      }
+      const expected = [...arms].sort().join(",");
+      return got.trim() === expected
+        ? { pass: true, note: `臂名集合正确 (${arms.size} 个)` }
+        : { pass: false, note: `期望 "${expected}"，实际 ${JSON.stringify(got.trim().slice(0, 80))}` };
+    },
+  },
+  {
+    id: "xhard-unimported-tools",
+    covers: "极难：成文规则 vs 直觉（只看 cli.ts 的直接 import，不管间接使用）",
+    task:
+      "src/tools/ 目录下有若干 .ts 工具文件。找出其中【没有被 src/cli.ts 直接 import】的文件——判定规则：src/cli.ts 中以 import 开头的行里，双引号内出现 './tools/<文件名>.js' 才算被直接 import；被其他模块间接引用【不算】。把未被直接 import 的文件名（不含 .ts 后缀）按字母升序、英文逗号连接写入 eval-out/unimported.txt；若全部被直接 import 则写 none。",
+    async check(workdir) {
+      const got = await readOut(workdir, "eval-out/unimported.txt");
+      if (got === undefined) return { pass: false, note: "unimported.txt 未创建" };
+      const cli = (await readOut(workdir, "src/cli.ts")) ?? "";
+      const imported = new Set(
+        cli
+          .split("\n")
+          .filter((l) => l.startsWith("import"))
+          .map((l) => l.match(/"\.\/tools\/([^"]+)\.js"/)?.[1])
+          .filter((s): s is string => !!s),
+      );
+      const all = (await readdir(path.join(workdir, "src/tools")))
+        .filter((f) => f.endsWith(".ts"))
+        .map((f) => f.replace(/\.ts$/, ""));
+      const missing = all.filter((t) => !imported.has(t)).sort();
+      const expected = missing.length === 0 ? "none" : missing.join(",");
+      return got.trim() === expected
+        ? { pass: true, note: `直接导入判定正确 (${expected})` }
+        : { pass: false, note: `期望 "${expected}"，实际 ${JSON.stringify(got.trim().slice(0, 60))}（间接引用算进去了？）` };
+    },
+  },
 ];
