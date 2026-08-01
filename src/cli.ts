@@ -1,8 +1,10 @@
 /**
  * CLI 宿主：事件流的一个消费者示例。
- * 用法：npx tsx src/cli.ts "任务描述" [--yes] [--verify]
+ * 用法：npx tsx src/cli.ts "任务描述" [--yes] [--verify] [--plan] [--auto]
  *   --yes     自动批准所有审批请求（非交互环境/CI 用；交互终端下走 y/n 提示）
  *   --verify  完成后由 verifier 子代理独立核查，未通过自动返工一轮
+ *   --plan    三角编排：planner 拆解子任务（自选领域包）→ 逐个执行→核查→交接
+ *   --auto    调度单元路由领域包（单领域任务免手选；显式 AGENT_PACK 优先）
  *
  * 环境变量：
  *   AGENT_PROVIDER      anthropic（默认）| openai —— 选择 wire 协议
@@ -31,6 +33,7 @@ import { connectMcpServers, loadMcpConfig } from "./mcp.js";
 import { createMemoryTools, MemoryStore } from "./memory.js";
 import { runPlanned, runVerified } from "./orchestrate.js";
 import { getPack, PACKS, selectPackTools } from "./presets.js";
+import { routeToPack } from "./router.js";
 import { createModelClientFromEnv } from "./provider.js";
 import { bashTool, SHELL_DESC } from "./tools/bash.js";
 import { fetchUrlTool } from "./tools/fetch-url.js";
@@ -58,29 +61,46 @@ async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const autoYes = args.includes("--yes");
   const withPlan = args.includes("--plan");
+  const withAuto = args.includes("--auto");
   const task = args.filter((a) => !a.startsWith("--")).join(" ").trim();
   if (!task) {
-    console.error('Usage: npx tsx src/cli.ts "task description" [--yes] [--verify] [--plan]');
+    console.error('Usage: npx tsx src/cli.ts "task description" [--yes] [--verify] [--plan] [--auto]');
     process.exit(1);
   }
 
-  // 领域包（可选）：AGENT_PACK 选用（AGENT_PRESET 为兼容别名），
-  // 覆盖 system prompt、工具面、MCP 接入、验证策略、护栏参数。
-  // --plan 模式下忽略 AGENT_PACK：包由 planner 按子任务从注册表里选
+  const model = process.env.AGENT_MODEL ?? "claude-opus-4-8";
+  const { client: resolvedClient, provider, compat } = createModelClientFromEnv(model);
+
+  // 领域包（可选）：AGENT_PACK 显式选用（AGENT_PRESET 为兼容别名）；
+  // --auto 时由调度单元路由（显式 > 路由）；--plan 时忽略：包由 planner 按子任务选
   const packName = withPlan ? undefined : (process.env.AGENT_PACK ?? process.env.AGENT_PRESET);
-  const pack = packName ? getPack(packName) : undefined;
+  let pack = packName ? getPack(packName) : undefined;
   if (packName && !pack) {
     console.error(`Unknown pack "${packName}". Available: ${Object.keys(PACKS).join(", ")}`);
     process.exit(1);
+  }
+  if (withAuto && !pack && !withPlan) {
+    const route = await routeToPack(
+      { systemPrompt: SYSTEM_PROMPT, tools: [], workdir: process.cwd(), compat },
+      resolvedClient,
+      task,
+      Object.values(PACKS),
+    );
+    if (route.decision.pack) {
+      pack = getPack(route.decision.pack);
+      console.log(c.dim(`pack(auto): ${route.decision.pack} — ${route.decision.reason}`));
+    } else {
+      console.log(c.dim(`pack(auto): 不选包 — ${route.decision.reason}`));
+      if (/--plan|计划单元|跨领域/.test(route.decision.reason)) {
+        console.log(c.yellow("提示：router 判断这是跨领域任务，用 --plan 交给三角编排更合适。"));
+      }
+    }
   }
   if (pack) {
     console.log(c.dim(`pack: ${pack.name} (verify=${pack.verify.enabled}/${pack.verify.mode}) — ${pack.description}`));
   }
   // --verify 手动开启，或领域包自动开启
   const withVerify = args.includes("--verify") || pack?.verify.enabled === true;
-
-  const model = process.env.AGENT_MODEL ?? "claude-opus-4-8";
-  const { client: resolvedClient, provider, compat } = createModelClientFromEnv(model);
 
   // --verify 时可选的独立 verifier 模型（核查者应 ≥ 执行者强度）
   const verifierModelName = process.env.AGENT_VERIFIER_MODEL;
