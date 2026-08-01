@@ -92,6 +92,7 @@ async function main(): Promise<void> {
         // 每个 run 前清空产出目录——保证判定只看本次 run 的产物
         await rm(path.join(workdir, "eval-out"), { recursive: true, force: true });
         await mkdir(path.join(workdir, "eval-out"), { recursive: true });
+        await evalCase.setup?.(workdir);
 
         const { result, turns, tokens, verdicts } = await runArm(
           arm,

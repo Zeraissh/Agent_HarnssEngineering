@@ -3,8 +3,54 @@
  * 每个用例的 check() 是程序化判定 —— 不靠人眼，保证可重复回归。
  * 产出统一写到 eval-out/（.gitignore），check 只看实际文件。
  */
-import { readFile, readdir } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { cp, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
+import { promisify } from "node:util";
+
+const execFileP = promisify(execFile);
+
+/** 在指定目录跑 node，回传是否零退出与合并输出（变更类用例的回归判定用） */
+async function runNode(cwd: string, args: string[]): Promise<{ ok: boolean; out: string }> {
+  try {
+    const { stdout, stderr } = await execFileP("node", args, { cwd, timeout: 60_000 });
+    return { ok: true, out: `${stdout}\n${stderr}` };
+  } catch (err) {
+    const e = err as { stdout?: string; stderr?: string; message?: string };
+    return { ok: false, out: `${e.stdout ?? ""}\n${e.stderr ?? e.message ?? ""}` };
+  }
+}
+
+/** 行为探针：以 ESM 内联脚本断言被改项目的实际行为（断言失败即非零退出） */
+async function probe(projDir: string, body: string): Promise<{ ok: boolean; out: string }> {
+  const rangeUrl = pathToFileURL(path.join(projDir, "src/range.js")).href;
+  const statsUrl = pathToFileURL(path.join(projDir, "src/stats.js")).href;
+  const script = `import assert from "node:assert/strict";
+const range = await import(${JSON.stringify(rangeUrl)});
+const stats = await import(${JSON.stringify(statsUrl)});
+${body}`;
+  return runNode(projDir, ["--input-type=module", "-e", script]);
+}
+
+/** 变更类用例的公共前置：把 mini-range fixture 复制为 eval-out/proj */
+async function setupMiniRange(workdir: string): Promise<void> {
+  await cp(path.join(workdir, "eval/fixtures/mini-range"), path.join(workdir, "eval-out/proj"), {
+    recursive: true,
+  });
+}
+
+/** 断言 test/ 目录与 fixture 原版逐字节一致（防"改测试凑通过"） */
+async function testsUntouched(workdir: string): Promise<boolean> {
+  const orig = await readFile(
+    path.join(workdir, "eval/fixtures/mini-range/test/range.test.js"),
+    "utf8",
+  );
+  const now = await readFile(path.join(workdir, "eval-out/proj/test/range.test.js"), "utf8").catch(
+    () => "",
+  );
+  return orig === now;
+}
 
 /** src 下所有 .ts 文件里，以 import 开头的行中第一个引号内的模块标识符（非相对，即外部/内置模块） */
 async function collectImportSpecs(workdir: string): Promise<string[]> {
@@ -40,6 +86,11 @@ export interface EvalCase {
   /** 覆盖的行为面（报告用） */
   covers: string;
   task: string;
+  /**
+   * 可选前置：在 eval-out 清空后、run 开始前执行（如把 fixture 项目复制进
+   * eval-out——变更类用例绝不让 agent 改仓库本体）。
+   */
+  setup?(workdir: string): Promise<void>;
   check(workdir: string): Promise<{ pass: boolean; note: string }>;
 }
 
@@ -492,6 +543,85 @@ export const cases: EvalCase[] = [
       return got.trim() === expected
         ? { pass: true, note: `直接导入判定正确 (${expected})` }
         : { pass: false, note: `期望 "${expected}"，实际 ${JSON.stringify(got.trim().slice(0, 60))}（间接引用算进去了？）` };
+    },
+  },
+
+  // ————— 变更+回归套件（mut-*）：改代码不许破坏既有行为。错误面比只读任务大一个
+  //        量级：判定 = 既有测试全过 + 新行为探针 + 测试文件未被篡改。
+  //        fixture 项目由 setup 复制进 eval-out/proj——agent 永不触碰仓库本体。 —————
+  {
+    id: "mut-fix-throw",
+    covers: "变更：缺陷修复 + 回归地雷（单点区间 3-3 必须继续合法）",
+    task:
+      "eval-out/proj 是一个已就位的 Node 项目（npm test 即 node --test）。已知缺陷：src/range.js 的 parseRange 在起点大于终点（如 '5-3'）时静默返回空数组。请修复：这种输入必须抛出 RangeError，错误消息包含 'invalid range'。硬性要求：test/ 目录的既有测试一个都不许改、npm test 必须全部通过；除修复所必需外不得改变任何其他行为。",
+    setup: setupMiniRange,
+    async check(workdir) {
+      const proj = path.join(workdir, "eval-out/proj");
+      if (!(await testsUntouched(workdir))) return { pass: false, note: "test/ 被篡改（禁止改测试凑通过）" };
+      const tests = await runNode(proj, ["--test"]);
+      if (!tests.ok) return { pass: false, note: `既有测试回归：${tests.out.split("\n").find((l) => l.includes("not ok")) ?? "非零退出"}` };
+      const p = await probe(
+        proj,
+        `assert.throws(() => range.parseRange("5-3"), (e) => e instanceof RangeError && /invalid range/.test(e.message));
+assert.deepEqual(range.parseRange("3-3"), [3]);
+assert.deepEqual(range.parseRange("1-4"), [1, 2, 3, 4]);`,
+      );
+      return p.ok
+        ? { pass: true, note: "修复生效且零回归（3-3 单点区间保住）" }
+        : { pass: false, note: `行为探针失败：${p.out.trim().split("\n").at(-1)?.slice(0, 100)}` };
+    },
+  },
+  {
+    id: "mut-add-clamp",
+    covers: "变更：新增导出函数，既有行为一毫不动",
+    task:
+      "eval-out/proj 是一个已就位的 Node 项目（npm test 即 node --test）。在 src/stats.js 新增并导出函数 clamp(value, min, max)：返回被夹在 [min, max] 区间内的 value；当 min > max 时抛出 RangeError。硬性要求：test/ 目录的既有测试一个都不许改、npm test 必须全部通过；既有导出函数（sum/avg/rangeSum）的行为不得有任何变化。",
+    setup: setupMiniRange,
+    async check(workdir) {
+      const proj = path.join(workdir, "eval-out/proj");
+      if (!(await testsUntouched(workdir))) return { pass: false, note: "test/ 被篡改" };
+      const tests = await runNode(proj, ["--test"]);
+      if (!tests.ok) return { pass: false, note: "既有测试回归" };
+      const p = await probe(
+        proj,
+        `assert.equal(stats.clamp(5, 1, 3), 3);
+assert.equal(stats.clamp(-1, 0, 10), 0);
+assert.equal(stats.clamp(4, 1, 9), 4);
+assert.throws(() => stats.clamp(1, 3, 2), RangeError);
+assert.equal(stats.sum([1, 2, 3]), 6);
+assert.equal(stats.avg([2, 4]), 3);
+assert.equal(stats.rangeSum("1-4"), 10);`,
+      );
+      return p.ok
+        ? { pass: true, note: "clamp 行为正确且既有函数无回归" }
+        : { pass: false, note: `行为探针失败：${p.out.trim().split("\n").at(-1)?.slice(0, 100)}` };
+    },
+  },
+  {
+    id: "mut-rename",
+    covers: "变更：跨文件重命名（源码与测试全量同步，漏一处即挂）",
+    task:
+      "eval-out/proj 是一个已就位的 Node 项目（npm test 即 node --test）。把导出函数 sum 重命名为 total——src/ 与 test/ 中所有定义、导入、调用全部同步更新；rangeSum 的名字保持不变（只是内部改调 total）；对外行为完全不变；npm test 必须全部通过。完成后源码与测试中不得再出现独立标识符 sum（rangeSum 不算）。",
+    setup: setupMiniRange,
+    async check(workdir) {
+      const proj = path.join(workdir, "eval-out/proj");
+      const tests = await runNode(proj, ["--test"]);
+      if (!tests.ok) return { pass: false, note: "测试未全过（改漏了引用？）" };
+      const files = ["src/range.js", "src/stats.js", "test/range.test.js"];
+      for (const f of files) {
+        const src = (await readOut(workdir, path.join("eval-out/proj", f))) ?? "";
+        if (/\bsum\b/.test(src)) return { pass: false, note: `${f} 中仍存在独立标识符 sum` };
+      }
+      const p = await probe(
+        proj,
+        `assert.equal(stats.total([1, 2, 3]), 6);
+assert.equal(stats.avg([2, 4]), 3);
+assert.equal(stats.rangeSum("2-4"), 9);
+assert.equal(typeof stats.sum, "undefined");`,
+      );
+      return p.ok
+        ? { pass: true, note: "重命名完整：total 生效、sum 消失、行为不变" }
+        : { pass: false, note: `行为探针失败：${p.out.trim().split("\n").at(-1)?.slice(0, 100)}` };
     },
   },
 ];
