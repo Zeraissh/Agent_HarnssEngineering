@@ -245,6 +245,7 @@ async function main(): Promise<void> {
           },
           verify: {
             ...(p?.verify.instructions ? { verifyInstructions: p.verify.instructions } : {}),
+            ...(p?.verify.readOnlyCommands ? { verifyReadOnlyCommands: p.verify.readOnlyCommands } : {}),
             ...(verifierProvider
               ? { verifierModel: { client: verifierProvider.client, compat: verifierProvider.compat } }
               : {}),
@@ -294,6 +295,7 @@ async function main(): Promise<void> {
   } else if (withVerify) {
     const outcome = await runVerified(config, modelClient, task, {
       ...(pack?.verify.instructions ? { verifyInstructions: pack.verify.instructions } : {}),
+      ...(pack?.verify.readOnlyCommands ? { verifyReadOnlyCommands: pack.verify.readOnlyCommands } : {}),
       ...(verifierProvider
         ? { verifierModel: { client: verifierProvider.client, compat: verifierProvider.compat } }
         : {}),

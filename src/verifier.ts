@@ -28,6 +28,13 @@ export interface VerifyOptions {
    * 例如硬件调试场景：让 verifier 自己连板、重读故障寄存器，而非只看文件。
    */
   verifyInstructions?: string;
+  /**
+   * 只读命令白名单（可选，领域包声明）：verifier 的 bash 审批默认全 deny，
+   * 但"独立重新推导"在需要工具链的领域（重新构建、nm 查符号）离不开命令——
+   * 匹配白名单前缀且无写入风险形态的命令放行，其余照旧 deny。
+   * v0.9/v1.0 实证：没有它，coding 域的 verifier 只能靠间接证据（读 .map）通过。
+   */
+  readOnlyCommands?: string[];
 }
 
 export interface VerifyOutcome {
@@ -52,6 +59,7 @@ export async function runVerifier(
     new AgentLoop({ ...cfg, maxTurns: VERIFIER_MAX_TURNS }, model),
     buildVerifierPrompt(opts),
     onEvent,
+    opts.readOnlyCommands,
   );
 
   let verdict = parseVerdict(first.text);
@@ -86,6 +94,7 @@ async function drainVerifierLoop(
   loop: AgentLoop,
   prompt: string,
   onEvent?: (event: TurnEvent) => void | Promise<void>,
+  readOnlyCommands?: string[],
 ): Promise<{ text: string; usage: AggregateUsage }> {
   let finalText = "";
   let usage: AggregateUsage | undefined;
@@ -96,10 +105,20 @@ async function drainVerifierLoop(
       case "assistant_text":
         finalText = event.text; // 只留最后一条：契约要求最终消息为纯 JSON
         break;
-      case "approval_request":
-        // 硬约束：verifier 只读。deny 理由回传模型，让它改用只读手段
-        event.respond("deny", "Verifier is read-only. Use read_file or read-only commands to inspect.");
+      case "approval_request": {
+        // 硬约束：verifier 只读。唯一例外：bash 命令命中领域包声明的只读白名单
+        const command =
+          event.name === "bash" ? String((event.input as { command?: unknown })?.command ?? "") : "";
+        if (command && readOnlyCommands && isReadOnlyCommand(command, readOnlyCommands)) {
+          event.respond("allow");
+        } else {
+          const hint = readOnlyCommands?.length
+            ? ` Allowed verification commands: ${readOnlyCommands.join(", ")} (no redirects/chaining).`
+            : "";
+          event.respond("deny", `Verifier is read-only. Use read_file or read-only commands to inspect.${hint}`);
+        }
         break;
+      }
       case "done":
         usage = event.result.usage;
         break;
@@ -109,6 +128,39 @@ async function drainVerifierLoop(
   }
 
   return { text: finalText, usage: usage! };
+}
+
+/** 管道下游允许的通用只读过滤器 */
+const READ_FILTERS = new Set([
+  "grep", "wc", "sort", "head", "tail", "uniq", "cat", "od", "xxd",
+  "awk", "cut", "tr", "diff", "cmp", "strings", "ls", "find",
+]);
+
+/**
+ * 只读命令判定：首段必须命中白名单前缀（词边界），全命令禁止重定向、
+ * 链式执行与命令替换；管道后续段允许白名单或通用只读过滤器。
+ * 这是纪律护栏而非安全沙箱——目标是把 verifier 的"独立重推导"能力
+ * 限定在核查动作上，不是抵御恶意。
+ */
+export function isReadOnlyCommand(command: string, allowedPrefixes: string[]): boolean {
+  const cmd = command.trim();
+  if (cmd === "" || allowedPrefixes.length === 0) return false;
+  if (/>|;|&&|\|\||`|\$\(/.test(cmd)) return false; // 重定向/链式/子命令替换
+
+  const matchesPrefix = (segment: string): boolean =>
+    allowedPrefixes.some((p) => {
+      const prefix = p.trim();
+      if (!segment.startsWith(prefix)) return false;
+      const next = segment[prefix.length];
+      return next === undefined || next === " "; // 词边界：防 "nm" 放行 "nmap"
+    });
+
+  return cmd.split("|").map((s) => s.trim()).every((segment, i) => {
+    if (segment === "") return false;
+    if (matchesPrefix(segment)) return true;
+    if (i === 0) return false;
+    return READ_FILTERS.has(segment.split(/\s+/)[0] ?? "");
+  });
 }
 
 export function sumUsage(a: AggregateUsage, b: AggregateUsage): AggregateUsage {
@@ -154,7 +206,7 @@ ${opts.executorReport}
 1. 只读核查：用只读手段检查实际状态；不要修改、创建或删除任何东西（除了最终结论）。
 2. 逐条核对任务要求与实际产出：有没有偷工减料或与报告不符之处。
 3. 数值类声明（地址、寄存器值、行号、统计结果）必须独立重新获取，不能照抄报告。
-${opts.verifyInstructions ? `\n领域核查方法：\n${opts.verifyInstructions}\n` : ""}
+${opts.readOnlyCommands?.length ? `\n你的 bash 只放行以下核查命令（前缀匹配，禁止重定向/链式）：${opts.readOnlyCommands.join("、")}。用它们独立重新推导（如亲自重新构建、查符号），不要只依赖间接证据。\n` : ""}${opts.verifyInstructions ? `\n领域核查方法：\n${opts.verifyInstructions}\n` : ""}
 你的最后一条消息必须只包含一个 JSON 对象（不要代码围栏、不要多余文字）：
 {"passed": true/false, "issues": ["发现的问题，每条一个字符串；通过则为空数组"], "summary": "一句话结论"}`;
 }

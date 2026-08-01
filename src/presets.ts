@@ -40,6 +40,12 @@ export interface DomainPack {
     mode: "programmatic" | "rubric";
     /** 领域核查方法：注入 verifier 提示，说明如何独立复核 */
     instructions?: string;
+    /**
+     * verifier 的 bash 只读命令白名单（前缀匹配；禁止重定向/链式）。
+     * "独立重新推导"在需要工具链的领域离不开命令（重新构建、nm 查符号）——
+     * 没有它 verifier 只能靠间接证据。只声明核查必需的最小集合。
+     */
+    readOnlyCommands?: string[];
   };
   /** 护栏参数（env 显式设置时以 env 为准） */
   guardrails?: {
@@ -154,6 +160,18 @@ export const PACKS: Record<string, DomainPack> = {
       enabled: true,
       mode: "programmatic",
       instructions: STM32_CODING_VERIFY_INSTRUCTIONS,
+      // 核查必需的最小命令集：重新构建 + 符号/体积检查 + 常规只读探查
+      readOnlyCommands: [
+        "cmake --build",
+        "cmake -B",
+        "ninja",
+        "arm-none-eabi-nm",
+        "arm-none-eabi-size",
+        "arm-none-eabi-objdump",
+        "ls",
+        "grep",
+        "wc",
+      ],
     },
     guardrails: { maxTurns: 25 },
   },

@@ -20,6 +20,8 @@ export interface VerifiedRunOptions {
   reworkMode?: "fresh" | "inherit";
   /** 领域验证指令：透传给 verifier，说明如何独立核查（如硬件场景自己连板重读） */
   verifyInstructions?: string;
+  /** verifier 的 bash 只读命令白名单（领域包声明），见 VerifyOptions.readOnlyCommands */
+  verifyReadOnlyCommands?: string[];
   /**
    * 独立的 verifier 模型（默认与执行者共用同一个 client）。
    * A/B 研究结论：verifier 必须 ≥ 执行者强度，否则假阴性返工是净负——
@@ -137,6 +139,7 @@ async function runVerifierWithEvents(
       task,
       executorReport,
       ...(opts.verifyInstructions ? { verifyInstructions: opts.verifyInstructions } : {}),
+      ...(opts.verifyReadOnlyCommands ? { readOnlyCommands: opts.verifyReadOnlyCommands } : {}),
     },
     (event) => {
       if (event.type === "assistant_text" || event.type === "done") return;
@@ -178,7 +181,10 @@ export interface PlannedRunOptions {
    */
   resolveSubtask?: (sub: SubTask) => {
     cfg: AgentConfig;
-    verify?: Pick<VerifiedRunOptions, "verifyInstructions" | "verifierModel" | "reworkMode">;
+    verify?: Pick<
+      VerifiedRunOptions,
+      "verifyInstructions" | "verifyReadOnlyCommands" | "verifierModel" | "reworkMode"
+    >;
   };
   /** 每个子任务的最大返工轮数。默认 1 */
   maxReworks?: number;

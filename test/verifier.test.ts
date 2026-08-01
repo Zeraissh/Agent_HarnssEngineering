@@ -248,3 +248,57 @@ describe("runVerified：返工模式与纯产物核查", () => {
     expect(outcome.finalPassed).toBe(true);
   });
 });
+
+describe("verifier 只读命令白名单", () => {
+  const PREFIXES = ["cmake --build", "arm-none-eabi-nm", "grep", "wc", "ls"];
+
+  it("isReadOnlyCommand：前缀命中放行，词边界防误放", async () => {
+    const { isReadOnlyCommand } = await import("../src/verifier.js");
+    expect(isReadOnlyCommand("cmake --build build", PREFIXES)).toBe(true);
+    expect(isReadOnlyCommand("arm-none-eabi-nm build/x.elf", PREFIXES)).toBe(true);
+    expect(isReadOnlyCommand("grep -c heartbeat src/main.c", PREFIXES)).toBe(true);
+    // 词边界：白名单 "ls" 不放行 "lsblk"；"cmake --build" 不放行 "cmake --builder"
+    expect(isReadOnlyCommand("lsblk", PREFIXES)).toBe(false);
+    expect(isReadOnlyCommand("rm -rf build", PREFIXES)).toBe(false);
+  });
+
+  it("isReadOnlyCommand：重定向/链式/子命令替换一律拒绝；管道只允许只读过滤器", async () => {
+    const { isReadOnlyCommand } = await import("../src/verifier.js");
+    expect(isReadOnlyCommand("arm-none-eabi-nm x.elf > out.txt", PREFIXES)).toBe(false);
+    expect(isReadOnlyCommand("cmake --build build && rm -rf src", PREFIXES)).toBe(false);
+    expect(isReadOnlyCommand("grep foo; rm bar", PREFIXES)).toBe(false);
+    expect(isReadOnlyCommand("grep $(cat cmd) src", PREFIXES)).toBe(false);
+    expect(isReadOnlyCommand("arm-none-eabi-nm x.elf | grep g_divisor | wc -l", PREFIXES)).toBe(true);
+    expect(isReadOnlyCommand("arm-none-eabi-nm x.elf | xargs rm", PREFIXES)).toBe(false);
+  });
+
+  it("审批：白名单命令自动放行执行，其余仍 deny", async () => {
+    const model = new FakeModelClient([
+      // verifier 先跑一条白名单命令（真实执行），再跑一条越界命令（被 deny），最后裁决
+      fakeMessage([toolUseBlock("tu_1", "bash", { command: "wc -l package.json" })], "tool_use"),
+      fakeMessage([toolUseBlock("tu_2", "bash", { command: "rm -rf eval-out" })], "tool_use"),
+      fakeMessage([textBlock('{"passed": true, "issues": [], "summary": "ok"}')], "end_turn"),
+    ]);
+    const { bashTool } = await import("../src/tools/bash.js");
+    const results: { id: string; isError: boolean; head: string }[] = [];
+    await runVerifier(
+      { ...baseConfig, tools: [bashTool] },
+      model,
+      { task: "t", executorReport: "r", readOnlyCommands: ["wc"] },
+      (e) => {
+        if (e.type === "tool_result") {
+          results.push({
+            id: e.toolUseId,
+            isError: e.result.isError === true,
+            head: e.result.content.split("\n")[0] ?? "",
+          });
+        }
+      },
+    );
+    const allowed = results.find((r) => r.id === "tu_1")!;
+    const denied = results.find((r) => r.id === "tu_2")!;
+    expect(allowed.isError).toBe(false); // 真实执行了 wc
+    expect(denied.isError).toBe(true);
+    expect(denied.head).toContain("read-only");
+  });
+});
