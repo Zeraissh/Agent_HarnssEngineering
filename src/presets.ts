@@ -55,6 +55,18 @@ export interface DomainPack {
   };
 }
 
+/**
+ * 成文口径优先纪律（rule-precedence）：A/B 实证后采纳为全局默认
+ * （eval/ab-report-rulefirst.md：baseline 7/10 → 加此条款 10/10,副作用检查 8/8 干净）。
+ * 针对的失败模式：任务给了明确口径(正则/行前缀/映射规则)时,模型的语义直觉会
+ * "补全"字面规则漏掉的情况(如多行 import 的续行),遵从稳定性仅 ~50%。
+ */
+export const RULE_PRECEDENCE_DISCIPLINE = `
+
+Rule-precedence discipline:
+- When the task states an explicit convention (a regex, a line-prefix rule, "lines starting with X", a mapping rule), apply it LITERALLY. The stated convention IS the ground truth — even when your semantic understanding suggests a "more complete" or "more correct" answer.
+- Do not improve upon the rule. If the letter of the rule appears to miss real cases (e.g., multi-line constructs whose continuation lines don't match a line-prefix rule), follow the letter anyway; you may note the discrepancy in your final summary, but the artifact must follow the stated rule.`;
+
 // ————————————————————————— stm32-debug —————————————————————————
 
 const STM32_DEBUG_SYSTEM = `你是一个自主的嵌入式调试 agent，通过 MCP 工具（stm32-gdb-mcp：GDB + OpenOCD/ST-Link）操作真实的 STM32 硬件。
@@ -114,7 +126,7 @@ export const PACKS: Record<string, DomainPack> = {
   "stm32-debug": {
     name: "stm32-debug",
     description: "STM32 真机烧录与调试：ST-Link/OpenOCD 上电、烧录 ELF、断点/变量/故障现场取证",
-    systemPrompt: STM32_DEBUG_SYSTEM,
+    systemPrompt: STM32_DEBUG_SYSTEM + RULE_PRECEDENCE_DISCIPLINE,
     // 不给 bash：v1.0 演示实证——给了 bash，执行者会绕开 MCP 自建 openocd/gdb
     // 调试栈,还会 taskkill "清理"时扫死共享的 MCP server。调试动作全走 MCP,
     // 报告用 write_file,读产物用 read_file,足够。
@@ -153,7 +165,7 @@ export const PACKS: Record<string, DomainPack> = {
   "stm32-coding": {
     name: "stm32-coding",
     description: "STM32 固件编程：读写 C 源码、CMake 交叉编译、产出可烧录 ELF（交接给 stm32-debug）",
-    systemPrompt: STM32_CODING_SYSTEM,
+    systemPrompt: STM32_CODING_SYSTEM + RULE_PRECEDENCE_DISCIPLINE,
     builtinTools: ["bash", "read_file", "write_file"],
     mcp: false, // 编程阶段不碰硬件——需要真机时切 stm32-debug 包
     verify: {

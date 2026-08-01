@@ -32,7 +32,7 @@ import { AgentLoop } from "./loop.js";
 import { connectMcpServers, loadMcpConfig } from "./mcp.js";
 import { createMemoryTools, MemoryStore } from "./memory.js";
 import { runPlanned, runVerified } from "./orchestrate.js";
-import { getPack, PACKS, selectPackTools } from "./presets.js";
+import { getPack, PACKS, RULE_PRECEDENCE_DISCIPLINE, selectPackTools } from "./presets.js";
 import { routeToPack } from "./router.js";
 import { createModelClientFromEnv } from "./provider.js";
 import { bashTool, SHELL_DESC } from "./tools/bash.js";
@@ -55,7 +55,7 @@ Complete the user's task end to end using the available tools.
 Ground every claim of progress in an actual tool result. When the task is done, summarize what you did in one or two sentences.
 Keep file outputs clean and well-structured. Respond in the language the user used.
 
-You have a persistent memory that survives across sessions. The current memory index is provided in the <context> block of the first message. Consult relevant memories (memory_read) before starting work. When you learn a durable fact, user preference, or lesson worth reusing — a correction you received, a project constant, an approach that worked — save it with memory_write (one fact per file, first line = summary). Update or delete memories that turn out to be wrong. Do not store transient task state or things already recorded in the repository.`;
+You have a persistent memory that survives across sessions. The current memory index is provided in the <context> block of the first message. Consult relevant memories (memory_read) before starting work. When you learn a durable fact, user preference, or lesson worth reusing — a correction you received, a project constant, an approach that worked — save it with memory_write (one fact per file, first line = summary). Update or delete memories that turn out to be wrong. Do not store transient task state or things already recorded in the repository.` + RULE_PRECEDENCE_DISCIPLINE;
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);

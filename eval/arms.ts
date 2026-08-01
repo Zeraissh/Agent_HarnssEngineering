@@ -55,6 +55,16 @@ Tool-use strategy:
 - Before acting, ask: can 1-2 commands fetch ALL the raw data this task needs? If yes, do that first.
 - Before writing an output file, re-check every format constraint (separators, ordering, trailing bytes).`;
 
+/**
+ * 成文口径优先纪律（rule-first 臂的实验变量）。
+ * 假设来源：letter-vs-spirit 失败模式两次独立复现,flash 遵从稳定性 ~50/50。
+ * 实验结果（ab-report-rulefirst.md）：baseline 7/10 → 10/10,副作用 8/8 干净,
+ * 已采纳进全局默认 prompt（presets.RULE_PRECEDENCE_DISCIPLINE）——
+ * 此后 rule-first 臂与 baseline 等价,保留仅为历史复现。
+ */
+export { RULE_PRECEDENCE_DISCIPLINE as RULE_FIRST_HINT } from "../src/presets.js";
+import { RULE_PRECEDENCE_DISCIPLINE } from "../src/presets.js";
+
 export const ARMS: Arm[] = [
   {
     name: "baseline",
@@ -79,6 +89,12 @@ export const ARMS: Arm[] = [
     hypothesis: "批量命令策略提示能否救活轮次预算耗尽型失败（对照 baseline 的 max_turns 全灭）",
     mode: "single",
     configure: (base) => ({ ...base, systemPrompt: base.systemPrompt + TOOL_STRATEGY_HINT }),
+  },
+  {
+    name: "rule-first",
+    hypothesis: "（已采纳进默认 prompt,与 baseline 等价,保留为历史复现）成文口径优先纪律",
+    mode: "single",
+    configure: (base) => ({ ...base, systemPrompt: base.systemPrompt + RULE_PRECEDENCE_DISCIPLINE }),
   },
   {
     name: "budget-30",

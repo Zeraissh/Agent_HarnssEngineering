@@ -15,6 +15,7 @@ import { appendFile, mkdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { AgentLoop } from "../src/loop.js";
 import { runVerified } from "../src/orchestrate.js";
+import { RULE_PRECEDENCE_DISCIPLINE } from "../src/presets.js";
 import { createModelClientFromEnv, type ResolvedProvider } from "../src/provider.js";
 import { bashTool } from "../src/tools/bash.js";
 import { readFileTool } from "../src/tools/read-file.js";
@@ -24,10 +25,13 @@ import type { AgentConfig, AgentRunResult, ModelClient } from "../src/types.js";
 import { getArms, type Arm } from "./arms.js";
 import { cases, type EvalCase } from "./cases.js";
 
-const SYSTEM_PROMPT = `You are a capable autonomous agent operating in a local working directory.
+// 2026-07-31 起（rule-precedence 采纳,见 ab-report-rulefirst.md）baseline 含成文口径纪律——
+// 与更早报告横向比较时注意这是新的 baseline 时代
+const SYSTEM_PROMPT =
+  `You are a capable autonomous agent operating in a local working directory.
 Complete the user's task end to end using the available tools.
 Ground every claim of progress in an actual tool result. When the task is done, summarize what you did in one or two sentences.
-Keep file outputs clean and well-structured. Respond in the language the user used.`;
+Keep file outputs clean and well-structured. Respond in the language the user used.` + RULE_PRECEDENCE_DISCIPLINE;
 
 interface Cell {
   pass: number; // 通过次数
