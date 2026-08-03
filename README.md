@@ -43,6 +43,8 @@ $env:ANTHROPIC_API_KEY  = "sk-..."
 $env:AGENT_MODEL        = "deepseek-chat"   # 非 claude-* 自动进入 compat 模式
 
 # 或本地 Ollama（v0.14+ 原生 Anthropic 兼容；本地慢速模型务必配超时与输出上限）
+# 定位（2026-08 起）：本地端点仅作离线/隐私路径验证（npm run smoke:local），
+# 研究实验一律用云端——弱执行者请用云端小模型（SiliconFlow/DashScope 的 qwen 阶梯）
 $env:ANTHROPIC_BASE_URL = "http://localhost:11434"
 $env:ANTHROPIC_API_KEY  = "ollama"          # 任意值即可
 $env:AGENT_MODEL        = "qwen3.5:9b"
@@ -61,6 +63,7 @@ npm run cli -- --verify "……"                                     # 完成后
 npm run eval                                                      # 跑 5 用例回归基线
 npm run lab                                                       # A/B 实验向导：选端点/臂/用例，免拼环境变量
 npm run lab -- --last                                             # 重放上一次实验配置
+npm run smoke:local                                               # 离线端点冒烟（本地 Ollama 路径存活验证）
 npm test                                                          # 单元测试
 ```
 

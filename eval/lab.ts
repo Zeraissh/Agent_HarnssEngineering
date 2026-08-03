@@ -27,6 +27,8 @@ interface EndpointProfile {
   maxTokens?: number;
   timeoutMs?: number;
   maxRetries?: number;
+  /** 备注（选择器里展示，如"离线验证专用"） */
+  note?: string;
 }
 
 interface RunSpec {
@@ -186,7 +188,9 @@ async function pickProfile(
   names.forEach((n, i) => {
     const p = cfg.profiles[n]!;
     const key = p.apiKey ? "key✓" : yellow("key未填");
-    console.log(`  ${i + 1}) ${n} ${dim(`— ${p.provider} ${p.baseURL ?? "(官方)"} ${p.model} ${key}`)}`);
+    console.log(
+      `  ${i + 1}) ${n} ${dim(`— ${p.provider} ${p.baseURL ?? "(官方)"} ${p.model} ${key}${p.note ? ` ｜${p.note}` : ""}`)}`,
+    );
   });
   console.log(`  n) 新建 profile`);
   const pick = await ask("选择", def ?? names[0] ?? "n");

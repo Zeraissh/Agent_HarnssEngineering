@@ -9,6 +9,7 @@
     "eval": "tsx eval/run.ts",
     "ab": "tsx eval/ab.ts",
     "lab": "tsx eval/lab.ts",
+    "smoke:local": "tsx eval/smoke-local.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
