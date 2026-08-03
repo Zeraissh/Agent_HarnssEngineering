@@ -150,6 +150,7 @@ export const PACKS: Record<string, DomainPack> = {
         "read_variable",
         "read_memory",
         "read_peripheral_register",
+        "write_memory", // 故障注入测试用（如置位触发标志）——真实任务案例 #1 催生
         "reset_target",
         "stop_debug_session",
       ],
