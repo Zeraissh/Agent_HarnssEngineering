@@ -624,4 +624,63 @@ assert.equal(typeof stats.sum, "undefined");`,
         : { pass: false, note: `行为探针失败：${p.out.trim().split("\n").at(-1)?.slice(0, 100)}` };
     },
   },
+
+  // ————— 规模压力套件（scale-*）：60 模块生成式 fixture（eval/scale-fixture.ts,
+  //        确定性种子——生成逻辑即口径）。针对"快 oracle 导致饱和"对症下药：
+  //        传递闭包 grep 抗性 + 不完备测试覆盖（9/60）抓不住漏改。 —————
+  {
+    id: "scale-audit",
+    covers: "规模：60 模块依赖图的传递闭包（只查直接依赖会漏一半以上）",
+    task:
+      "eval-out/proj 是一个 60 模块的 Node 项目（src/m00.js…m59.js，另有 src/legacy.js）。找出所有【直接或间接】依赖 src/legacy.js 的模块——判定规则：模块 A 依赖 legacy 当且仅当 A 直接 import 了 legacy.js，或 A import 的某个模块（传递地）依赖 legacy。把这些模块名（不含 .js 后缀、不含 legacy 自身）按字母升序、英文逗号连接成一行写入 eval-out/legacy-closure.txt。",
+    async setup(workdir) {
+      const { writeScaleFixture } = await import("./scale-fixture.js");
+      await writeScaleFixture(path.join(workdir, "eval-out/proj"));
+    },
+    async check(workdir) {
+      const got = await readOut(workdir, "eval-out/legacy-closure.txt");
+      if (got === undefined) return { pass: false, note: "legacy-closure.txt 未创建" };
+      const { genPlan, legacyClosure } = await import("./scale-fixture.js");
+      const plan = genPlan();
+      const expected = legacyClosure(plan).join(",");
+      if (got.trim() === expected) return { pass: true, note: `闭包正确 (${expected.split(",").length} 个)` };
+      const directOnly = plan.legacyDirect.slice().sort().join(",");
+      const hint = got.trim() === directOnly ? "（只算了直接依赖——传递闭包漏了）" : "";
+      return { pass: false, note: `期望 ${expected.split(",").length} 个，实际 ${got.trim().split(",").length} 个 ${hint}` };
+    },
+  },
+  {
+    id: "scale-double",
+    covers: "规模：60 文件批量变更 + 不完备 oracle（测试只覆盖 9/60，漏改抓不住）",
+    task:
+      "eval-out/proj 是一个 60 模块的 Node 项目。把 src/m00.js…m59.js 每个文件中 LIMIT 常量的数值改为原值的两倍——只改这个数值，legacy.js 与 test/ 目录不得改动，每个文件的其余内容一字不变。npm test（即 node --test，注意它只覆盖部分模块）必须全部通过。",
+    async setup(workdir) {
+      const { writeScaleFixture } = await import("./scale-fixture.js");
+      await writeScaleFixture(path.join(workdir, "eval-out/proj"));
+    },
+    async check(workdir) {
+      const proj = path.join(workdir, "eval-out/proj");
+      const { genPlan, moduleSource } = await import("./scale-fixture.js");
+      const plan = genPlan();
+      const tests = await runNode(proj, ["--test"]);
+      if (!tests.ok) return { pass: false, note: "测试未全过" };
+      const legacyNow = await readOut(workdir, "eval-out/proj/src/legacy.js");
+      if (legacyNow !== `// deprecated shared module\nexport const LEGACY = true;\n`) {
+        return { pass: false, note: "legacy.js 被改动（要求不动）" };
+      }
+      let wrong = 0;
+      let firstWrong = "";
+      for (const name of plan.modules) {
+        const now = await readOut(workdir, `eval-out/proj/src/${name}.js`);
+        const expected = moduleSource(plan, name, plan.limits[name]! * 2);
+        if (now !== expected) {
+          wrong += 1;
+          if (!firstWrong) firstWrong = name;
+        }
+      }
+      return wrong === 0
+        ? { pass: true, note: "60 个文件全部精确翻倍，无附带改动" }
+        : { pass: false, note: `${wrong}/60 个文件不符（首个: ${firstWrong}）——漏改/多改/格式漂移（测试只覆盖 9 个，抓不住）` };
+    },
+  },
 ];
