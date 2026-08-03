@@ -3,7 +3,7 @@
  * 主 loop 与 verifier 共用 systemPrompt/tools（缓存前缀一致），上下文互相隔离。
  */
 import { AgentLoop } from "./loop.js";
-import { runPlanner, type Plan, type PlanOutcome, type SubTask } from "./planner.js";
+import { runPlanner, validatePlanGraph, type Plan, type PlanOutcome, type SubTask } from "./planner.js";
 import { runVerifier, sumUsage, type VerifyOutcome } from "./verifier.js";
 import type { DomainPack } from "./presets.js";
 import type { AgentConfig, AgentRunResult, AggregateUsage, ModelClient, TurnEvent } from "./types.js";
@@ -199,6 +199,12 @@ export interface PlannedRunOptions {
    * 由其内部自答，不进门）。
    */
   concurrency?: number;
+  /**
+   * 宿主注入的固定计划：跳过 planner，直接调度。用途：宿主自有拆解逻辑，
+   * 或实验里隔离调度器变量（planner 拆不拆是独立的被测行为）。
+   * 图非法时抛错（宿主代码 bug 应该炸响，不适用模型输出的 fail-closed）。
+   */
+  plan?: Plan;
 }
 
 export interface PlannedStepResult {
@@ -236,9 +242,17 @@ export async function runPlanned(
   opts: PlannedRunOptions = {},
 ): Promise<PlannedRunResult> {
   const packs = opts.packs ?? [];
-  const planOutcome = await runPlanner(baseCfg, model, task, packs, (e) =>
-    opts.onEvent?.("planner", e),
-  );
+  let planOutcome: PlanOutcome;
+  if (opts.plan) {
+    if (!validatePlanGraph(opts.plan.subtasks)) {
+      throw new Error("注入的计划依赖图非法（id 重复/悬空引用/成环）");
+    }
+    planOutcome = { plan: opts.plan, usage: ZERO_USAGE, raw: "(host-provided plan)" };
+  } else {
+    planOutcome = await runPlanner(baseCfg, model, task, packs, (e) =>
+      opts.onEvent?.("planner", e),
+    );
+  }
   if (!planOutcome.plan) {
     return { planOutcome, steps: [], skipped: [], completed: false };
   }
@@ -309,6 +323,15 @@ export async function runPlanned(
   const completed = skipped.length === 0 && steps.every((s) => s.result.finalPassed);
   return { plan, planOutcome, steps, skipped, completed };
 }
+
+const ZERO_USAGE: AggregateUsage = {
+  inputTokens: 0,
+  cacheCreationTokens: 0,
+  cacheReadTokens: 0,
+  outputTokens: 0,
+  turns: 0,
+  cacheHitRatio: 0,
+};
 
 /** 子任务输入 = 任务书 + 验收标准 + 直接依赖的交接摘要（多依赖多段，带来源标注） */
 function buildSubtaskInput(

@@ -92,6 +92,11 @@ export interface EvalCase {
    */
   setup?(workdir: string): Promise<void>;
   check(workdir: string): Promise<{ pass: boolean; note: string }>;
+  /**
+   * 可选参考拆解（v1.1 并行实验）：fixed-* 臂注入此计划跳过 planner——
+   * 隔离调度器变量测墙钟；planner 拆不拆由 planned 臂单独观测。
+   */
+  plan?: import("../src/planner.js").Plan;
 }
 
 async function readOut(workdir: string, rel: string): Promise<string | undefined> {
@@ -700,6 +705,41 @@ assert.equal(typeof stats.sum, "undefined");`,
     async setup(workdir) {
       const { writeScaleFixture } = await import("./scale-fixture.js");
       await writeScaleFixture(path.join(workdir, "eval-out/proj"));
+    },
+    // 参考拆解：3 个独立分片 + 依赖全部分片的汇总（fixed-* 臂用,隔离调度器测墙钟）
+    plan: {
+      subtasks: [
+        ...([
+          ["sa", "a", "m00.js…m19.js", "m00…m19"],
+          ["sb", "b", "m20.js…m39.js", "m20…m39"],
+          ["sc", "c", "m40.js…m59.js", "m40…m59"],
+        ] as const).map(([id, part, files, range]) => ({
+          id,
+          title: `分区 ${part.toUpperCase()} 求和`,
+          pack: null,
+          description:
+            `eval-out/proj/src/ 下 ${files} 共 20 个文件,每个文件里恰有一行 \`export const LIMIT = <数值>;\`。` +
+            `把 ${range} 这 20 个 LIMIT 数值之和写入 eval-out/part-${part}.txt——文件只含一行纯数字、无其他内容。` +
+            `只准读这 20 个文件和写这一个输出文件,不得动其他任何文件。`,
+          acceptance: [
+            `eval-out/part-${part}.txt 存在且只含一行纯数字`,
+            `数值等于 ${range} 各文件 LIMIT 字面值之和`,
+          ],
+          dependsOn: [],
+        })),
+        {
+          id: "sd",
+          title: "汇总",
+          pack: null,
+          description:
+            "读取 eval-out/part-a.txt、eval-out/part-b.txt、eval-out/part-c.txt(各含一行纯数字),把三个数值之和写入 eval-out/grand-total.txt——文件只含一行纯数字、无其他内容。不得重新统计源文件,以三个 part 文件为准。",
+          acceptance: [
+            "eval-out/grand-total.txt 存在且只含一行纯数字",
+            "数值等于三个 part 文件数值之和",
+          ],
+          dependsOn: ["sa", "sb", "sc"],
+        },
+      ],
     },
     async check(workdir) {
       const { genPlan } = await import("./scale-fixture.js");

@@ -45,6 +45,10 @@ interface Cell {
 interface PlanTrace {
   /** 计划形状，如 "s1[] s2[] s3[s1,s2]"；undefined = planner 产不出计划 */
   planShape?: string;
+  /** planner 阶段墙钟/轮数/tokens（冒烟发现 planner 是墙钟大头,单独记账；fixed 臂为 0） */
+  plannerWallMs?: number;
+  plannerTurns?: number;
+  plannerTokens?: number;
   /** 子任务阶段墙钟（不含 planner 耗时） */
   subtaskWallMs?: number;
   /** 逐子任务：id、耗时、是否通过 */
@@ -100,6 +104,12 @@ async function main(): Promise<void> {
 
   for (const evalCase of suite) {
     for (const arm of arms) {
+      // fixed-* 臂需要用例自带参考拆解；没带就在该用例上跳过（cell.reps=0 → 报告渲染 "—"）
+      if (arm.planned?.useFixedPlan && !evalCase.plan) {
+        grid[evalCase.id]![arm.name] = { pass: 0, reps: 0, turns: 0, tokens: 0, wallMs: 0 };
+        console.log(`[skip] ${evalCase.id} / ${arm.name}: 用例未提供参考拆解（EvalCase.plan）`);
+        continue;
+      }
       const cell: Cell = { pass: 0, reps, turns: 0, tokens: 0, wallMs: 0 };
       for (let r = 0; r < reps; r++) {
         // 每个 run 前清空产出目录——保证判定只看本次 run 的产物
@@ -113,6 +123,7 @@ async function main(): Promise<void> {
           client,
           evalCase.task,
           verifierProvider,
+          arm.planned?.useFixedPlan ? evalCase.plan : undefined,
         );
         cell.turns += turns;
         cell.tokens += tokens;
@@ -183,6 +194,7 @@ async function runArm(
   client: ModelClient,
   task: string,
   verifierProvider?: ResolvedProvider,
+  fixedPlan?: import("../src/planner.js").Plan,
 ): Promise<{
   result: AgentRunResult;
   turns: number;
@@ -195,12 +207,14 @@ async function runArm(
   const startedAt = Date.now();
   if (arm.mode === "planned") {
     // 三角编排：planner 切分 → 每子任务 runVerified（各自全新轮次预算）；
-    // v1.1：planned.concurrency>1 时依赖图上独立的子任务并发执行
+    // v1.1：planned.concurrency>1 时依赖图上独立的子任务并发执行；
+    // fixed 臂注入用例参考拆解跳过 planner（隔离调度器变量）
     let planReadyAt: number | undefined;
     let planShape: string | undefined;
     const outcome = await runPlanned(cfg, client, task, {
       maxReworks: 1,
       concurrency: arm.planned?.concurrency ?? 1,
+      ...(fixedPlan ? { plan: fixedPlan } : {}),
       onPlan: (plan) => {
         planReadyAt = Date.now();
         planShape = plan.subtasks.map((s) => `${s.id}[${s.dependsOn.join(",")}]`).join(" ");
@@ -216,8 +230,12 @@ async function runArm(
         }
       },
     });
+    const pu = outcome.planOutcome.usage;
     const planTrace: PlanTrace = {
       planShape,
+      plannerWallMs: planReadyAt ? planReadyAt - startedAt : undefined,
+      plannerTurns: pu.turns,
+      plannerTokens: pu.inputTokens + pu.cacheCreationTokens + pu.cacheReadTokens + pu.outputTokens,
       subtaskWallMs: planReadyAt ? Date.now() - planReadyAt : undefined,
       steps: outcome.steps.map((s) => ({
         id: s.sub.id,
@@ -309,6 +327,7 @@ function renderReport(
   const rows = suite.map((c) => {
     const cells = arms.map((a) => {
       const cell = grid[c.id]![a.name]!;
+      if (cell.reps === 0) return "—"; // fixed 臂在无参考拆解的用例上跳过
       return `${cell.pass}/${cell.reps} · ${(cell.turns / cell.reps).toFixed(1)}t · ${Math.round(cell.tokens / cell.reps / 1000)}k · ${Math.round(cell.wallMs / cell.reps / 1000)}s`;
     });
     return `| ${c.id} | ${c.covers} | ${cells.join(" | ")} |`;
@@ -340,9 +359,10 @@ function renderReport(
 
   const armLegend = arms.map((a) => `- **${a.name}**（${a.mode}）：${a.hypothesis}`).join("\n");
   const aggRows = agg
-    .map(
-      (a) =>
-        `| ${a.name} | ${(a.rate * 100).toFixed(0)}% | ${a.avgTurns.toFixed(1)} | ${Math.round(a.avgTokens)} | ${Math.round(a.avgWallMs / 1000)}s |`,
+    .map((a) =>
+      Number.isNaN(a.rate)
+        ? `| ${a.name} | — | — | — | — |`
+        : `| ${a.name} | ${(a.rate * 100).toFixed(0)}% | ${a.avgTurns.toFixed(1)} | ${Math.round(a.avgTokens)} | ${Math.round(a.avgWallMs / 1000)}s |`,
     )
     .join("\n");
 

@@ -189,7 +189,11 @@ export function parsePlan(text: string): Plan | undefined {
   return undefined;
 }
 
-/** 依赖图合法性：id 唯一、引用存在、无环（Kahn 拓扑） */
+/** 依赖图合法性：id 唯一、引用存在、无环（Kahn 拓扑）。宿主注入计划时也用它把关 */
+export function validatePlanGraph(subtasks: SubTask[]): boolean {
+  return validateGraph(subtasks);
+}
+
 function validateGraph(subtasks: SubTask[]): boolean {
   const ids = new Set<string>();
   for (const s of subtasks) {

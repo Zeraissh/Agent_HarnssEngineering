@@ -23,6 +23,12 @@ export interface Arm {
   planned?: {
     /** 子任务并行度（缺省 1 = 串行）。墙钟收益是并行臂的主指标 */
     concurrency?: number;
+    /**
+     * true = 注入用例的参考拆解（EvalCase.plan）跳过 planner——隔离调度器
+     * 变量测墙钟（冒烟发现 planner 既不拆分又占大头墙钟,混在一起测不出
+     * 调度器本身的收益）。用例没带 plan 时该臂在此用例上跳过。
+     */
+    useFixedPlan?: boolean;
   };
 }
 
@@ -114,6 +120,22 @@ export const ARMS: Arm[] = [
     mode: "planned",
     configure: (base) => base,
     planned: { concurrency: 3 },
+  },
+  {
+    name: "fixed-serial",
+    hypothesis:
+      "注入参考拆解（跳过 planner）+ 串行调度：调度器对照组——子任务墙钟的全序和基线",
+    mode: "planned",
+    configure: (base) => base,
+    planned: { concurrency: 1, useFixedPlan: true },
+  },
+  {
+    name: "fixed-par3",
+    hypothesis:
+      "注入参考拆解（跳过 planner）+ concurrency=3：同一 DAG 下并行调度的净墙钟收益（与 fixed-serial 唯一变量=并行度）",
+    mode: "planned",
+    configure: (base) => base,
+    planned: { concurrency: 3, useFixedPlan: true },
   },
   {
     name: "budget-30",

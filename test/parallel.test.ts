@@ -187,6 +187,30 @@ describe("runPlanned：DAG 并行调度", () => {
     expect(client.requests.some((r) => reqText(r).includes("任务d") && !isPlannerReq(r))).toBe(false);
   });
 
+  it("注入固定计划：跳过 planner，直接按图调度；非法图抛错", async () => {
+    const client = new RoutingClient(async (req) => {
+      if (isPlannerReq(req)) throw new Error("不应调用 planner——计划已注入");
+      if (isVerifierReq(req)) return passVerdict();
+      return fakeMessage([textBlock("done")], "end_turn");
+    });
+    const plan = {
+      subtasks: [
+        { id: "x", title: "X", pack: null, description: "任务x", acceptance: [], dependsOn: [] },
+        { id: "y", title: "Y", pack: null, description: "任务y", acceptance: [], dependsOn: ["x"] },
+      ],
+    };
+    const outcome = await runPlanned(baseConfig, client, "总任务", { plan });
+    expect(outcome.completed).toBe(true);
+    expect(outcome.planOutcome.usage.turns).toBe(0); // planner 零成本
+    expect(outcome.steps.map((s) => s.sub.id)).toEqual(["x", "y"]);
+
+    await expect(
+      runPlanned(baseConfig, client, "总任务", {
+        plan: { subtasks: [{ id: "x", title: "X", pack: null, description: "d", acceptance: [], dependsOn: ["ghost"] }] },
+      }),
+    ).rejects.toThrow(/依赖图非法/);
+  });
+
   it("审批互斥门：并发子任务的审批逐个到达宿主，绝不同时挂两个", async () => {
     const askTool: Tool = {
       name: "touch",
