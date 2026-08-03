@@ -161,10 +161,16 @@
 不流式）。
 
 **验证 checklist**
-- [x] 118 单测全绿（+11：图解析校验×6、并发重叠证明、fan-out 交接隔离、失败语义、审批互斥门）
+- [x] 119 单测全绿（+12：图解析校验×6、并发重叠证明、fan-out 交接隔离、失败语义、审批互斥门、计划注入）
 - [x] 旧 planner/orchestrate 测试零改动通过（线性链推断兜住 v1.0 语义）
-- [ ] 真机 A/B：planned-serial vs planned-parallel 墙钟对比（分支内数据）
-- [ ] planner 依赖图产出质量：真实模型能否写出正确的 dependsOn（悬空/成环率）
+- [x] 真机 A/B（ab-report-parallel.md，flash，12+1 runs）：**同 DAG 下 concurrency=3 墙钟
+  −58.5%（127.7s→53s），且精确等于关键路径 max(分片)+汇总——调度开销秒级不可见；
+  token −8%（噪声级，符合"并行不省 token"预期）**。实验解耦是关键：planner 混淆变量
+  用 opts.plan 注入固定计划隔离（fixed-serial vs fixed-par3 唯一变量=并行度）
+- [x] planner 依赖图产出质量（同报告）：拆分率 1/4（3 次 s1[] 不拆，1 次拆出正确
+  fan-out+join），四份计划零非法图（悬空/成环率 0，fail-closed 零触发）。
+  唯一一次拆分落在串行臂成全场最慢（335s）——"拆而不并"两头亏，
+  推论：planned 拆分后应默认并行调度（待采纳）
 
 ## 更远（不承诺顺序）
 
