@@ -3,8 +3,9 @@
  * 用法：npx tsx src/cli.ts "任务描述" [--yes] [--verify] [--plan [--parallel[=N]]] [--auto]
  *   --yes       自动批准所有审批请求（非交互环境/CI 用；交互终端下走 y/n 提示）
  *   --verify    完成后由 verifier 子代理独立核查，未通过自动返工一轮
- *   --plan      三角编排：planner 拆解子任务（自选领域包+依赖图）→ 执行→核查→交接
- *   --parallel  --plan 的并行度（=N 指定，裸旗标取 2）：依赖图上互不依赖的子任务并发执行
+ *   --plan      三角编排：planner 拆解子任务（自选领域包+依赖图）→ 执行→核查→交接；
+ *               互不依赖的子任务默认并发执行（并行度 auto = min(3, 计划层宽)）
+ *   --parallel=N  显式并行度覆盖 auto；=1 退回全串行
  *   --auto      调度单元路由领域包（单领域任务免手选；显式 AGENT_PACK 优先）
  *
  * 环境变量：
@@ -32,7 +33,7 @@ import readline from "node:readline/promises";
 import { AgentLoop } from "./loop.js";
 import { connectMcpServers, loadMcpConfig } from "./mcp.js";
 import { createMemoryTools, MemoryStore } from "./memory.js";
-import { runPlanned, runVerified } from "./orchestrate.js";
+import { AUTO_CONCURRENCY_CAP, planParallelWidth, runPlanned, runVerified } from "./orchestrate.js";
 import { getPack, PACKS, RULE_PRECEDENCE_DISCIPLINE, selectPackTools } from "./presets.js";
 import { routeToPack } from "./router.js";
 import { createModelClientFromEnv } from "./provider.js";
@@ -63,19 +64,20 @@ async function main(): Promise<void> {
   const autoYes = args.includes("--yes");
   const withPlan = args.includes("--plan");
   const withAuto = args.includes("--auto");
-  // --parallel[=N]：--plan 的并行度（默认 1 = 串行；裸 --parallel 取 2）
+  // --parallel=N：--plan 的显式并行度。缺省 "auto" = min(3, 计划层宽)——
+  // A/B 采纳（ab-report-parallel.md）：拆分率 ~50/50 下串行默认让一半 run 白付
+  // 拆分成本；线性链 auto 自动退化为串行。--parallel=1 显式退回全串行。
   const parallelArg = args.find((a) => a === "--parallel" || a.startsWith("--parallel="));
-  const concurrency = parallelArg
-    ? parallelArg.includes("=")
+  const concurrency: number | "auto" =
+    parallelArg && parallelArg.includes("=")
       ? Math.max(1, Math.floor(Number(parallelArg.split("=")[1]) || 1))
-      : 2
-    : 1;
+      : "auto";
   const task = args.filter((a) => !a.startsWith("--")).join(" ").trim();
   if (!task) {
-    console.error('Usage: npx tsx src/cli.ts "task description" [--yes] [--verify] [--plan [--parallel[=N]]] [--auto]');
+    console.error('Usage: npx tsx src/cli.ts "task description" [--yes] [--verify] [--plan [--parallel=N]] [--auto]');
     process.exit(1);
   }
-  if (concurrency > 1 && !withPlan) {
+  if (parallelArg && !withPlan) {
     console.error("--parallel 只对 --plan 生效（并行度是子任务调度的属性）");
     process.exit(1);
   }
@@ -309,14 +311,23 @@ async function main(): Promise<void> {
 
     const startedAt = Date.now();
     let planReadyAt = startedAt; // onPlan 时刻：并行节省只对子任务阶段计算，不混入 planner 耗时
+    // auto 并行度在计划就绪时才能解析（依赖计划层宽）；渲染模式随之切换
+    let effectiveConcurrency = typeof concurrency === "number" ? concurrency : 1;
     const outcome = await runPlanned(config, modelClient, task, {
       packs: Object.values(PACKS),
       concurrency,
       onPlan: (plan) => {
         planRef = plan;
         planReadyAt = Date.now();
+        if (concurrency === "auto") {
+          effectiveConcurrency = Math.min(AUTO_CONCURRENCY_CAP, planParallelWidth(plan.subtasks));
+        }
         endStreamLine();
-        console.log(c.cyan(`\n═══ 计划${concurrency > 1 ? c.dim(`（并行度 ${concurrency}）`) : ""} ═══`));
+        console.log(
+          c.cyan(
+            `\n═══ 计划${effectiveConcurrency > 1 ? c.dim(`（并行度 ${effectiveConcurrency}${concurrency === "auto" ? " auto" : ""}）`) : ""} ═══`,
+          ),
+        );
         for (const s of plan.subtasks) {
           const deps = s.dependsOn.length > 0 ? c.dim(` ⇐ ${s.dependsOn.join(",")}`) : "";
           console.log(`${c.cyan(s.id)} ${s.title}${s.pack ? c.dim(` [pack: ${s.pack}]`) : ""}${deps}`);
@@ -346,7 +357,7 @@ async function main(): Promise<void> {
         };
       },
       onEvent: async (source, event) => {
-        if (concurrency > 1 && source !== "planner") {
+        if (effectiveConcurrency > 1 && source !== "planner") {
           await renderParallelEvent(source, event);
           return;
         }
@@ -395,7 +406,7 @@ async function main(): Promise<void> {
         }
       }
       const serialMs = outcome.steps.reduce((acc, s) => acc + s.durationMs, 0);
-      const wallNote = `全程 ${(totalWallMs / 1000).toFixed(1)}s，子任务阶段墙钟 ${(wallMs / 1000).toFixed(1)}s，子任务合计 ${(serialMs / 1000).toFixed(1)}s${concurrency > 1 ? `，并行节省 ${Math.max(0, (serialMs - wallMs) / 1000).toFixed(1)}s` : ""}`;
+      const wallNote = `全程 ${(totalWallMs / 1000).toFixed(1)}s，子任务阶段墙钟 ${(wallMs / 1000).toFixed(1)}s，子任务合计 ${(serialMs / 1000).toFixed(1)}s${effectiveConcurrency > 1 ? `，并行节省 ${Math.max(0, (serialMs - wallMs) / 1000).toFixed(1)}s` : ""}`;
       console.log(
         outcome.completed
           ? c.green(`\n✔ 全部子任务执行并核查通过`) + c.dim(`（${wallNote}）`)

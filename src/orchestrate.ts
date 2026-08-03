@@ -197,8 +197,12 @@ export interface PlannedRunOptions {
    * >1 时依赖图上互不依赖的子任务并发执行；执行/返工的 approval_request 经
    * 互斥门排队，宿主同一时刻至多面对一个待答审批（planner/verifier 的审批
    * 由其内部自答，不进门）。
+   *
+   * "auto" = min(3, 计划层宽)——A/B 采纳结论（ab-report-parallel.md）：拆分率
+   * ~50/50 摇摆下串行默认让一半 run 白付拆分成本；并行调度零可见开销、token
+   * 持平。线性链层宽 1 自动退化为串行，行为不变。
    */
-  concurrency?: number;
+  concurrency?: number | "auto";
   /**
    * 宿主注入的固定计划：跳过 planner，直接调度。用途：宿主自有拆解逻辑，
    * 或实验里隔离调度器变量（planner 拆不拆是独立的被测行为）。
@@ -259,7 +263,10 @@ export async function runPlanned(
   const plan = planOutcome.plan;
   await opts.onPlan?.(plan);
 
-  const concurrency = Math.max(1, Math.floor(opts.concurrency ?? 1));
+  const concurrency =
+    opts.concurrency === "auto"
+      ? Math.min(AUTO_CONCURRENCY_CAP, planParallelWidth(plan.subtasks))
+      : Math.max(1, Math.floor(opts.concurrency ?? 1));
   const byId = new Map(plan.subtasks.map((s) => [s.id, s]));
   const stepsById = new Map<string, PlannedStepResult>();
   const handoffs = new Map<string, string>();
@@ -322,6 +329,35 @@ export async function runPlanned(
   const skipped = plan.subtasks.filter((s) => !stepsById.has(s.id));
   const completed = skipped.length === 0 && steps.every((s) => s.result.finalPassed);
   return { plan, planOutcome, steps, skipped, completed };
+}
+
+/** auto 并行度上限：收益曲线未测满前保守取 3（端点限流与宿主渲染都友好） */
+export const AUTO_CONCURRENCY_CAP = 3;
+
+/**
+ * 计划的并行层宽（启发式）：按"距根的最长路径深度"分层，取最大层宽——
+ * 即调度器在某一时刻可能同时就绪的子任务数的近似上界。线性链恒为 1。
+ * 前提：依赖图已过校验（无环、引用存在）。
+ */
+export function planParallelWidth(subtasks: SubTask[]): number {
+  if (subtasks.length === 0) return 1;
+  const byId = new Map(subtasks.map((s) => [s.id, s]));
+  const depth = new Map<string, number>();
+  const depthOf = (id: string): number => {
+    const cached = depth.get(id);
+    if (cached !== undefined) return cached;
+    const sub = byId.get(id)!;
+    const v =
+      sub.dependsOn.length === 0 ? 0 : Math.max(...sub.dependsOn.map((d) => depthOf(d))) + 1;
+    depth.set(id, v);
+    return v;
+  };
+  const widths = new Map<number, number>();
+  for (const s of subtasks) {
+    const level = depthOf(s.id);
+    widths.set(level, (widths.get(level) ?? 0) + 1);
+  }
+  return Math.max(...widths.values());
 }
 
 const ZERO_USAGE: AggregateUsage = {

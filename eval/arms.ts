@@ -138,6 +138,14 @@ export const ARMS: Arm[] = [
     planned: { concurrency: 3, useFixedPlan: true },
   },
   {
+    name: "fixed-par6",
+    hypothesis:
+      "concurrency=6：收益曲线上限点——6 独立分片下 par6 应 ≈ max(分片)+汇总,par3 应 ≈ 两波次;并发 6 执行者+核查者是否触发端点限流/干扰",
+    mode: "planned",
+    configure: (base) => base,
+    planned: { concurrency: 6, useFixedPlan: true },
+  },
+  {
     name: "budget-30",
     hypothesis: "maxTurns 15→30：轮次预算是不是 import-list 失败的约束本身（对照 prompt-hint 无效）",
     mode: "single",

@@ -764,4 +764,77 @@ assert.equal(typeof stats.sum, "undefined");`,
       return { pass: true, note: "三个分区与汇总全部正确" };
     },
   },
+  {
+    id: "par-fanout6",
+    covers: "并行：六分片 + 汇总——收益曲线（par1/par3/par6 下排队行为与墙钟）",
+    task:
+      "eval-out/proj 是一个 60 模块的 Node 项目（src/m00.js…m59.js，每个模块导出一个整数常量 LIMIT）。产出六份分区统计与一份汇总，七个文件都只含一行纯数字、无其他内容：\n" +
+      "- eval-out/part-1.txt：m00…m09 这 10 个模块的 LIMIT 之和\n" +
+      "- eval-out/part-2.txt：m10…m19 的 LIMIT 之和\n" +
+      "- eval-out/part-3.txt：m20…m29 的 LIMIT 之和\n" +
+      "- eval-out/part-4.txt：m30…m39 的 LIMIT 之和\n" +
+      "- eval-out/part-5.txt：m40…m49 的 LIMIT 之和\n" +
+      "- eval-out/part-6.txt：m50…m59 的 LIMIT 之和\n" +
+      "- eval-out/grand-total.txt：以上六个分区之和\n" +
+      "判定规则：每个和都按对应文件里 `export const LIMIT = <数值>;` 的字面数值计算；legacy.js 不属于任何分区。",
+    async setup(workdir) {
+      const { writeScaleFixture } = await import("./scale-fixture.js");
+      await writeScaleFixture(path.join(workdir, "eval-out/proj"));
+    },
+    plan: {
+      subtasks: [
+        ...Array.from({ length: 6 }, (_, i) => {
+          const from = i * 10;
+          const range = `m${String(from).padStart(2, "0")}…m${String(from + 9).padStart(2, "0")}`;
+          return {
+            id: `s${i + 1}`,
+            title: `分区 ${i + 1} 求和`,
+            pack: null,
+            description:
+              `eval-out/proj/src/ 下 ${range.replace("…", ".js…")}.js 共 10 个文件,每个文件里恰有一行 \`export const LIMIT = <数值>;\`。` +
+              `把 ${range} 这 10 个 LIMIT 数值之和写入 eval-out/part-${i + 1}.txt——文件只含一行纯数字、无其他内容。` +
+              `只准读这 10 个文件和写这一个输出文件,不得动其他任何文件。`,
+            acceptance: [
+              `eval-out/part-${i + 1}.txt 存在且只含一行纯数字`,
+              `数值等于 ${range} 各文件 LIMIT 字面值之和`,
+            ],
+            dependsOn: [] as string[],
+          };
+        }),
+        {
+          id: "s7",
+          title: "汇总",
+          pack: null,
+          description:
+            "读取 eval-out/part-1.txt 至 eval-out/part-6.txt 六个文件(各含一行纯数字),把六个数值之和写入 eval-out/grand-total.txt——文件只含一行纯数字、无其他内容。不得重新统计源文件,以六个 part 文件为准。",
+          acceptance: [
+            "eval-out/grand-total.txt 存在且只含一行纯数字",
+            "数值等于六个 part 文件数值之和",
+          ],
+          dependsOn: ["s1", "s2", "s3", "s4", "s5", "s6"],
+        },
+      ],
+    },
+    async check(workdir) {
+      const { genPlan } = await import("./scale-fixture.js");
+      const plan = genPlan();
+      const shard = (from: number, to: number) =>
+        plan.modules.slice(from, to).reduce((acc, name) => acc + plan.limits[name]!, 0);
+      const expected: [string, number][] = [
+        ...Array.from({ length: 6 }, (_, i): [string, number] => [
+          `part-${i + 1}.txt`,
+          shard(i * 10, i * 10 + 10),
+        ]),
+        ["grand-total.txt", shard(0, 60)],
+      ];
+      for (const [file, value] of expected) {
+        const got = await readOut(workdir, `eval-out/${file}`);
+        if (got === undefined) return { pass: false, note: `${file} 未创建` };
+        if (got.trim() !== String(value)) {
+          return { pass: false, note: `${file} 期望 ${value}，实际 ${got.trim().slice(0, 50)}` };
+        }
+      }
+      return { pass: true, note: "六个分区与汇总全部正确" };
+    },
+  },
 ];

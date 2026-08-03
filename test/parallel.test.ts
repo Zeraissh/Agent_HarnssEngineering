@@ -8,7 +8,7 @@ import { describe, expect, it } from "vitest";
 import type Anthropic from "@anthropic-ai/sdk";
 import { setTimeout as delay } from "node:timers/promises";
 import { parsePlan } from "../src/planner.js";
-import { runPlanned } from "../src/orchestrate.js";
+import { planParallelWidth, runPlanned } from "../src/orchestrate.js";
 import type { ModelClient, ModelRequest, ModelTurn, Tool } from "../src/types.js";
 import { fakeMessage, textBlock, toolUseBlock } from "./helpers.js";
 
@@ -185,6 +185,42 @@ describe("runPlanned：DAG 并行调度", () => {
     // c、d 从未发出执行请求
     expect(client.requests.some((r) => reqText(r).includes("任务c") && !isPlannerReq(r))).toBe(false);
     expect(client.requests.some((r) => reqText(r).includes("任务d") && !isPlannerReq(r))).toBe(false);
+  });
+
+  it("planParallelWidth：线性链=1、fan-out=分支数、菱形=中间层宽", () => {
+    const sub = (id: string, deps: string[]) => ({
+      id, title: id, pack: null, description: id, acceptance: [], dependsOn: deps,
+    });
+    expect(planParallelWidth([sub("a", []), sub("b", ["a"]), sub("c", ["b"])])).toBe(1);
+    expect(planParallelWidth([sub("a", []), sub("b", []), sub("c", []), sub("d", ["a", "b", "c"])])).toBe(3);
+    expect(planParallelWidth([sub("a", []), sub("b", ["a"]), sub("c", ["a"]), sub("d", ["b", "c"])])).toBe(2);
+  });
+
+  it('concurrency:"auto"：fan-out 计划自动并行，线性链自动退化为串行', async () => {
+    const fanout = makeOverlapFixture(20);
+    const outcome = await runPlanned(baseConfig, fanout.client, "总任务", { concurrency: "auto" });
+    expect(outcome.completed).toBe(true);
+    expect(fanout.maxActive()).toBe(2); // 两分支 → auto=2
+
+    // 线性链计划：同样 auto，必须严格串行
+    let active = 0;
+    let maxActive = 0;
+    const chain = new RoutingClient(async (req) => {
+      if (isPlannerReq(req))
+        return planMessage([
+          { id: "a", title: "A", description: "任务a", acceptance: [], dependsOn: [] },
+          { id: "b", title: "B", description: "任务b", acceptance: [], dependsOn: ["a"] },
+        ]);
+      if (isVerifierReq(req)) return passVerdict();
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await delay(10);
+      active -= 1;
+      return fakeMessage([textBlock("done")], "end_turn");
+    });
+    const chained = await runPlanned(baseConfig, chain, "总任务", { concurrency: "auto" });
+    expect(chained.completed).toBe(true);
+    expect(maxActive).toBe(1);
   });
 
   it("注入固定计划：跳过 planner，直接按图调度；非法图抛错", async () => {
