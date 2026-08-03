@@ -8,7 +8,7 @@ export interface Arm {
   name: string;
   /** 报告里的一句话说明这个 arm 在测什么 */
   hypothesis: string;
-  mode: "single" | "verified";
+  mode: "single" | "verified" | "planned";
   configure(base: AgentConfig): AgentConfig;
   /** verified 模式的附加配置（实验变量） */
   verify?: {
@@ -95,6 +95,12 @@ export const ARMS: Arm[] = [
     hypothesis: "（已采纳进默认 prompt,与 baseline 等价,保留为历史复现）成文口径优先纪律",
     mode: "single",
     configure: (base) => ({ ...base, systemPrompt: base.systemPrompt + RULE_PRECEDENCE_DISCIPLINE }),
+  },
+  {
+    name: "planned",
+    hypothesis: "三角编排（planner 切分,每子任务全新预算）能否缓解预算×规模张力——对照纯加预算的 budget-30",
+    mode: "planned",
+    configure: (base) => base,
   },
   {
     name: "budget-30",

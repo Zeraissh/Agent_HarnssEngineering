@@ -14,7 +14,7 @@
 import { appendFile, mkdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { AgentLoop } from "../src/loop.js";
-import { runVerified } from "../src/orchestrate.js";
+import { runPlanned, runVerified } from "../src/orchestrate.js";
 import { RULE_PRECEDENCE_DISCIPLINE } from "../src/presets.js";
 import { createModelClientFromEnv, type ResolvedProvider } from "../src/provider.js";
 import { bashTool } from "../src/tools/bash.js";
@@ -169,6 +169,44 @@ async function runArm(
   verifierProvider?: ResolvedProvider,
 ): Promise<{ result: AgentRunResult; turns: number; tokens: number; verdicts: Verdict[] }> {
   const cfg = arm.configure(base);
+  if (arm.mode === "planned") {
+    // 三角编排：planner 切分 → 每子任务 runVerified（各自全新轮次预算）
+    const outcome = await runPlanned(cfg, client, task, {
+      maxReworks: 1,
+      onEvent: (source, event) => {
+        // 只放行执行/返工的审批——planner/verifier 的 respond 是先到先得,
+        // 抢答 allow 会把它们的内部只读 deny 变成空操作
+        if (
+          event.type === "approval_request" &&
+          (source.endsWith("/main") || source.endsWith("/rework"))
+        ) {
+          event.respond("allow");
+        }
+      },
+    });
+    const tok = (u: { inputTokens: number; cacheCreationTokens: number; cacheReadTokens: number; outputTokens: number }) =>
+      u.inputTokens + u.cacheCreationTokens + u.cacheReadTokens + u.outputTokens;
+    let tokens = tok(outcome.planOutcome.usage);
+    let turns = outcome.planOutcome.usage.turns;
+    const verdicts = [];
+    for (const step of outcome.steps) {
+      tokens += tok(step.result.executionUsage);
+      turns += step.result.executionUsage.turns;
+      for (const v of step.result.verifications) {
+        tokens += tok(v.usage);
+        turns += v.usage.turns;
+        verdicts.push(v.verdict);
+      }
+    }
+    const lastMain = outcome.steps.at(-1)?.result.main;
+    const result: AgentRunResult = lastMain ?? {
+      stopReason: "error",
+      messages: [],
+      usage: outcome.planOutcome.usage,
+      error: new Error("planner 未产出可解析计划"),
+    };
+    return { result, turns, tokens, verdicts };
+  }
   if (arm.mode === "verified") {
     const outcome = await runVerified(cfg, client, task, {
       maxReworks: 1,
@@ -177,9 +215,10 @@ async function runArm(
       ...(arm.verify?.strongModel && verifierProvider
         ? { verifierModel: { client: verifierProvider.client, compat: verifierProvider.compat } }
         : {}),
-      // eval 场景自动放行主/返工 agent 的审批（verifier 的审批已在内部自动 deny）
-      onEvent: (_source, event) => {
-        if (event.type === "approval_request") event.respond("allow");
+      // 只放行主/返工 agent 的审批——verifier 的 respond 先到先得,抢答 allow
+      // 会打穿其只读 deny(2026-08-01 发现的潜伏 bug:此前 verified 臂一直被打穿)
+      onEvent: (source, event) => {
+        if (event.type === "approval_request" && source !== "verifier") event.respond("allow");
       },
     });
     // 成本 = 全部执行轮次合计（executionUsage 含被否掉的中间轮——旧版只算最后一轮，漏计返工前的主 run）+ 各次核查
