@@ -1,10 +1,11 @@
 /**
  * CLI 宿主：事件流的一个消费者示例。
- * 用法：npx tsx src/cli.ts "任务描述" [--yes] [--verify] [--plan] [--auto]
- *   --yes     自动批准所有审批请求（非交互环境/CI 用；交互终端下走 y/n 提示）
- *   --verify  完成后由 verifier 子代理独立核查，未通过自动返工一轮
- *   --plan    三角编排：planner 拆解子任务（自选领域包）→ 逐个执行→核查→交接
- *   --auto    调度单元路由领域包（单领域任务免手选；显式 AGENT_PACK 优先）
+ * 用法：npx tsx src/cli.ts "任务描述" [--yes] [--verify] [--plan [--parallel[=N]]] [--auto]
+ *   --yes       自动批准所有审批请求（非交互环境/CI 用；交互终端下走 y/n 提示）
+ *   --verify    完成后由 verifier 子代理独立核查，未通过自动返工一轮
+ *   --plan      三角编排：planner 拆解子任务（自选领域包+依赖图）→ 执行→核查→交接
+ *   --parallel  --plan 的并行度（=N 指定，裸旗标取 2）：依赖图上互不依赖的子任务并发执行
+ *   --auto      调度单元路由领域包（单领域任务免手选；显式 AGENT_PACK 优先）
  *
  * 环境变量：
  *   AGENT_PROVIDER      anthropic（默认）| openai —— 选择 wire 协议
@@ -62,9 +63,20 @@ async function main(): Promise<void> {
   const autoYes = args.includes("--yes");
   const withPlan = args.includes("--plan");
   const withAuto = args.includes("--auto");
+  // --parallel[=N]：--plan 的并行度（默认 1 = 串行；裸 --parallel 取 2）
+  const parallelArg = args.find((a) => a === "--parallel" || a.startsWith("--parallel="));
+  const concurrency = parallelArg
+    ? parallelArg.includes("=")
+      ? Math.max(1, Math.floor(Number(parallelArg.split("=")[1]) || 1))
+      : 2
+    : 1;
   const task = args.filter((a) => !a.startsWith("--")).join(" ").trim();
   if (!task) {
-    console.error('Usage: npx tsx src/cli.ts "task description" [--yes] [--verify] [--plan] [--auto]');
+    console.error('Usage: npx tsx src/cli.ts "task description" [--yes] [--verify] [--plan [--parallel[=N]]] [--auto]');
+    process.exit(1);
+  }
+  if (concurrency > 1 && !withPlan) {
+    console.error("--parallel 只对 --plan 生效（并行度是子任务调度的属性）");
     process.exit(1);
   }
 
@@ -239,14 +251,75 @@ async function main(): Promise<void> {
     const mcpPool = mcp?.tools ?? [];
     let currentStep = "";
     let planRef: Awaited<ReturnType<typeof runPlanned>>["plan"];
+
+    // 并行模式（concurrency>1）的行级渲染：事件交错到达，流式 delta 会打架——
+    // 改为每事件一行 + [子任务/角色] 前缀；审批仍走完整问答（已被编排层串行化）
+    const renderParallelEvent = async (source: string, event: TurnEvent): Promise<void> => {
+      const isVerifier = source.endsWith("/verifier");
+      const tag = isVerifier ? c.magenta(`[${source}]`) : c.cyan(`[${source}]`);
+      switch (event.type) {
+        case "turn_start":
+          if (event.turn === 1 && source.endsWith("/rework"))
+            console.log(c.yellow(`${tag} ↺ 核查未通过，返工…`));
+          break;
+        case "tool_call":
+          console.log(`${tag} → ${event.name} ${c.dim(JSON.stringify(event.input).slice(0, 160))}`);
+          break;
+        case "tool_result": {
+          const head = (event.result.content.split("\n")[0] ?? "").slice(0, 100);
+          console.log(`${tag} ${event.result.isError ? c.red("✗") : c.green("✓")} ${c.dim(head)}`);
+          break;
+        }
+        case "assistant_text": {
+          const text = event.text.length > 500 ? `${event.text.slice(0, 500)}…` : event.text;
+          if (text) console.log(`${tag} ${text}`);
+          break;
+        }
+        case "approval_request": {
+          if (isVerifier) break; // verifier 审批由其内部自答，仅供观察，不提示
+          if (autoYes || !rl) {
+            console.log(c.yellow(`${tag} ⚠ auto-approved: ${event.name} ${JSON.stringify(event.input)}`));
+            event.respond("allow");
+            break;
+          }
+          const answer = await rl.question(
+            c.yellow(`${tag} ⚠ approve ${event.name} ${JSON.stringify(event.input)}? [y/N] `),
+          );
+          if (answer.trim().toLowerCase() === "y") event.respond("allow");
+          else event.respond("deny", (await rl.question(c.dim("  reason (optional): "))).trim() || undefined);
+          break;
+        }
+        case "compaction":
+          console.log(c.yellow(`${tag} ⚠ context compacted: dropped ${event.droppedBlocks} blocks`));
+          break;
+        case "api_retry":
+          console.log(c.yellow(`${tag} ⟳ API 瞬时错误，同轮重试 #${event.attempt}`));
+          break;
+        case "done": {
+          const u = event.result.usage;
+          console.log(
+            `${tag} ■ ${event.result.stopReason} ${c.dim(`(${u.turns} turns, in=${u.inputTokens + u.cacheCreationTokens + u.cacheReadTokens} out=${u.outputTokens})`)}`,
+          );
+          break;
+        }
+        default:
+          break;
+      }
+    };
+
+    const startedAt = Date.now();
+    let planReadyAt = startedAt; // onPlan 时刻：并行节省只对子任务阶段计算，不混入 planner 耗时
     const outcome = await runPlanned(config, modelClient, task, {
       packs: Object.values(PACKS),
+      concurrency,
       onPlan: (plan) => {
         planRef = plan;
+        planReadyAt = Date.now();
         endStreamLine();
-        console.log(c.cyan("\n═══ 计划 ═══"));
+        console.log(c.cyan(`\n═══ 计划${concurrency > 1 ? c.dim(`（并行度 ${concurrency}）`) : ""} ═══`));
         for (const s of plan.subtasks) {
-          console.log(`${c.cyan(s.id)} ${s.title}${s.pack ? c.dim(` [pack: ${s.pack}]`) : ""}`);
+          const deps = s.dependsOn.length > 0 ? c.dim(` ⇐ ${s.dependsOn.join(",")}`) : "";
+          console.log(`${c.cyan(s.id)} ${s.title}${s.pack ? c.dim(` [pack: ${s.pack}]`) : ""}${deps}`);
           for (const a of s.acceptance) console.log(c.dim(`    验收: ${a}`));
         }
       },
@@ -273,6 +346,10 @@ async function main(): Promise<void> {
         };
       },
       onEvent: async (source, event) => {
+        if (concurrency > 1 && source !== "planner") {
+          await renderParallelEvent(source, event);
+          return;
+        }
         const stepId = source.split("/")[0]!;
         if (stepId !== currentStep) {
           currentStep = stepId;
@@ -296,21 +373,34 @@ async function main(): Promise<void> {
         await renderEvent(event);
       },
     });
+    const totalWallMs = Date.now() - startedAt;
+    const wallMs = Date.now() - planReadyAt; // 子任务阶段墙钟（排除 planner）
     console.log(c.cyan("\n═══ 三角编排结果 ═══"));
     if (!outcome.plan) {
       console.log(c.red(`✘ planner 未能产出可解析计划：${outcome.planOutcome.raw.slice(0, 200)}`));
     } else {
       for (const sub of outcome.plan.subtasks) {
         const step = outcome.steps.find((s) => s.sub.id === sub.id);
-        const mark = !step ? c.dim("－ 未执行") : step.result.finalPassed ? c.green("✔ 通过") : c.red("✘ 未通过");
-        console.log(`${mark} ${sub.id} ${sub.title}${sub.pack ? c.dim(` [${sub.pack}]`) : ""}`);
+        const mark = !step
+          ? c.dim("－ 跳过（依赖失败或调度停止）")
+          : step.result.finalPassed
+            ? c.green("✔ 通过")
+            : c.red("✘ 未通过");
+        const dur = step ? c.dim(` ${(step.durationMs / 1000).toFixed(1)}s`) : "";
+        console.log(`${mark} ${sub.id} ${sub.title}${sub.pack ? c.dim(` [${sub.pack}]`) : ""}${dur}`);
         if (step && !step.result.finalPassed) {
           for (const issue of step.result.verifications.at(-1)?.verdict.issues ?? []) {
             console.log(c.red(`    - ${issue}`));
           }
         }
       }
-      console.log(outcome.completed ? c.green("\n✔ 全部子任务执行并核查通过") : c.red("\n✘ 编排未完成（快速失败）"));
+      const serialMs = outcome.steps.reduce((acc, s) => acc + s.durationMs, 0);
+      const wallNote = `全程 ${(totalWallMs / 1000).toFixed(1)}s，子任务阶段墙钟 ${(wallMs / 1000).toFixed(1)}s，子任务合计 ${(serialMs / 1000).toFixed(1)}s${concurrency > 1 ? `，并行节省 ${Math.max(0, (serialMs - wallMs) / 1000).toFixed(1)}s` : ""}`;
+      console.log(
+        outcome.completed
+          ? c.green(`\n✔ 全部子任务执行并核查通过`) + c.dim(`（${wallNote}）`)
+          : c.red("\n✘ 编排未完成（快速失败）") + c.dim(`（${wallNote}）`),
+      );
     }
   } else if (withVerify) {
     const outcome = await runVerified(config, modelClient, task, {

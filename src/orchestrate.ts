@@ -192,27 +192,42 @@ export interface PlannedRunOptions {
   onPlan?: (plan: Plan) => void | Promise<void>;
   /** 事件旁路：source 形如 "planner" / "s1/main" / "s1/verifier" / "s1/rework" */
   onEvent?: (source: string, event: TurnEvent) => void | Promise<void>;
+  /**
+   * 并行度（v1.1）：同时在飞的子任务上限。默认 1 = 严格串行，行为与 v1.0 一致。
+   * >1 时依赖图上互不依赖的子任务并发执行；执行/返工的 approval_request 经
+   * 互斥门排队，宿主同一时刻至多面对一个待答审批（planner/verifier 的审批
+   * 由其内部自答，不进门）。
+   */
+  concurrency?: number;
 }
 
 export interface PlannedStepResult {
   sub: SubTask;
   result: VerifiedRunResult;
+  /** 该子任务全程（执行+核查+返工）的墙钟耗时——并行价值的主度量 */
+  durationMs: number;
 }
 
 export interface PlannedRunResult {
   /** undefined = planner 产不出可解析计划（fail-closed，未执行任何子任务） */
   plan?: Plan;
   planOutcome: PlanOutcome;
-  /** 已执行的子任务（某步核查未通过则后续不再执行——快速失败） */
+  /** 已执行的子任务，按计划顺序（某步核查未通过则停止发射新任务——快速失败） */
   steps: PlannedStepResult[];
+  /** 未执行的子任务：依赖失败，或失败发生后调度停止（在飞的照常跑完） */
+  skipped: SubTask[];
   /** 全部子任务都执行且核查通过 */
   completed: boolean;
 }
 
 /**
- * 三角编排：planner 拆解（带验收标准）→ 逐子任务 runVerified（执行→核查→返工）
- * → 上游执行摘要作为交接注入下游。任一子任务核查未通过即中止（可靠性是乘法，
- * 带病继续只会把错误往下游放大）。
+ * 三角编排：planner 拆解（带验收标准 + 依赖图）→ 子任务按依赖就绪调度
+ * runVerified（执行→核查→返工）→ 直接依赖的执行摘要作为交接注入下游。
+ *
+ * 并行语义（v1.1）：concurrency>1 时互不依赖的子任务并发执行；任一子任务
+ * 核查未通过即停止发射新任务——含与失败者无关的独立分支（整体已败，续跑
+ * 只是烧 token），在飞的照常跑完（工具有副作用，中途硬断比跑完更危险），
+ * 其余标记 skipped。可靠性是乘法，带病继续只会把错误往下游放大。
  */
 export async function runPlanned(
   baseCfg: AgentConfig,
@@ -225,39 +240,126 @@ export async function runPlanned(
     opts.onEvent?.("planner", e),
   );
   if (!planOutcome.plan) {
-    return { planOutcome, steps: [], completed: false };
+    return { planOutcome, steps: [], skipped: [], completed: false };
   }
   const plan = planOutcome.plan;
   await opts.onPlan?.(plan);
 
-  const steps: PlannedStepResult[] = [];
-  let prevHandoff = "";
+  const concurrency = Math.max(1, Math.floor(opts.concurrency ?? 1));
+  const byId = new Map(plan.subtasks.map((s) => [s.id, s]));
+  const stepsById = new Map<string, PlannedStepResult>();
+  const handoffs = new Map<string, string>();
+  const passed = new Set<string>();
+  const running = new Map<string, Promise<void>>();
+  const queue = [...plan.subtasks]; // 未发射的子任务，保持计划顺序
+  let aborted = false; // 首个失败后停止发射（在飞的跑完）
+  let schedulerError: unknown;
 
-  for (const sub of plan.subtasks) {
-    // pack 名校验：未知包名不致命，降级为默认配置执行（记录在交接摘要里没有意义，宿主事件里可见）
-    const resolved = opts.resolveSubtask?.(sub) ?? { cfg: baseCfg };
+  const forward = makeApprovalSerializer(opts.onEvent);
 
-    const acceptance =
-      sub.acceptance.length > 0
-        ? `\n\n【验收标准】完成后将由独立核查者逐条验证：\n${sub.acceptance.map((a, i) => `${i + 1}. ${a}`).join("\n")}`
-        : "";
-    const handoff = prevHandoff
-      ? `\n\n【上游交接】上一个子任务的执行摘要（其产物路径以此为准）：\n${prevHandoff}`
-      : "";
-    const input = `${sub.description}${acceptance}${handoff}`;
+  const launch = (sub: SubTask): Promise<void> =>
+    (async () => {
+      // pack 名校验：未知包名不致命，降级为默认配置执行（宿主事件里可见）
+      const resolved = opts.resolveSubtask?.(sub) ?? { cfg: baseCfg };
+      const input = buildSubtaskInput(sub, byId, handoffs);
+      const startedAt = Date.now();
+      const result = await runVerified(resolved.cfg, model, input, {
+        maxReworks: opts.maxReworks ?? 1,
+        ...(resolved.verify ?? {}),
+        // 审批门只管执行/返工——verifier/planner 的 respond 由其内部自答，
+        // 排队等宿主应答会死锁（内部自答在 onEvent 返回之后才发生）
+        onEvent: (source, event) => forward(`${sub.id}/${source}`, event, source !== "verifier"),
+      });
+      stepsById.set(sub.id, { sub, result, durationMs: Date.now() - startedAt });
+      if (result.finalPassed) {
+        passed.add(sub.id);
+        handoffs.set(sub.id, lastAssistantText(result.main) || "(上游没有留下文字报告)");
+      } else {
+        aborted = true;
+      }
+    })()
+      .catch((err) => {
+        // 宿主级异常：记下第一个，停止发射；等全部在飞任务归位后再抛，
+        // 不留下悬空 promise（unhandled rejection）
+        schedulerError ??= err;
+        aborted = true;
+      })
+      .finally(() => {
+        running.delete(sub.id);
+      });
 
-    const result = await runVerified(resolved.cfg, model, input, {
-      maxReworks: opts.maxReworks ?? 1,
-      ...(resolved.verify ?? {}),
-      onEvent: (source, event) => opts.onEvent?.(`${sub.id}/${source}`, event),
-    });
-    steps.push({ sub, result });
-
-    if (!result.finalPassed) {
-      return { plan, planOutcome, steps, completed: false };
+  while (true) {
+    if (!aborted) {
+      const ready = queue.filter((s) => s.dependsOn.every((d) => passed.has(d)));
+      for (const sub of ready) {
+        if (running.size >= concurrency) break;
+        queue.splice(queue.indexOf(sub), 1);
+        running.set(sub.id, launch(sub));
+      }
     }
-    prevHandoff = lastAssistantText(result.main) || "(上游没有留下文字报告)";
+    if (running.size === 0) break; // 无在飞：全部完成，或失败/依赖不满足使调度停止
+    await Promise.race(running.values());
   }
+  if (schedulerError) throw schedulerError;
 
-  return { plan, planOutcome, steps, completed: true };
+  const steps = plan.subtasks
+    .map((s) => stepsById.get(s.id))
+    .filter((s): s is PlannedStepResult => s !== undefined);
+  const skipped = plan.subtasks.filter((s) => !stepsById.has(s.id));
+  const completed = skipped.length === 0 && steps.every((s) => s.result.finalPassed);
+  return { plan, planOutcome, steps, skipped, completed };
+}
+
+/** 子任务输入 = 任务书 + 验收标准 + 直接依赖的交接摘要（多依赖多段，带来源标注） */
+function buildSubtaskInput(
+  sub: SubTask,
+  byId: Map<string, SubTask>,
+  handoffs: Map<string, string>,
+): string {
+  const acceptance =
+    sub.acceptance.length > 0
+      ? `\n\n【验收标准】完成后将由独立核查者逐条验证：\n${sub.acceptance.map((a, i) => `${i + 1}. ${a}`).join("\n")}`
+      : "";
+  const sections = sub.dependsOn
+    .filter((d) => handoffs.has(d))
+    .map((d) => {
+      const title = byId.get(d)?.title;
+      return `── 来自 ${d}${title ? `（${title}）` : ""} ──\n${handoffs.get(d)!}`;
+    });
+  const handoff =
+    sections.length > 0
+      ? `\n\n【上游交接】你直接依赖的上游子任务的执行摘要（其产物路径以此为准）：\n${sections.join("\n\n")}`
+      : "";
+  return `${sub.description}${acceptance}${handoff}`;
+}
+
+/**
+ * 审批互斥门：并发子任务的 approval_request 排队逐个交给宿主——终端审批
+ * 提示同时弹两个是灾难（应答错配 + 渲染打架）。gated=false 的事件直通
+ * （verifier 审批：宿主只观察，respond 由 verifier 内部自答，入队会死锁）。
+ * 其余事件类型不排队：交错渲染是宿主的表达问题，不是正确性问题。
+ */
+function makeApprovalSerializer(
+  onEvent?: (source: string, event: TurnEvent) => void | Promise<void>,
+): (source: string, event: TurnEvent, gated: boolean) => void | Promise<void> {
+  if (!onEvent) return () => {};
+  let tail: Promise<void> = Promise.resolve();
+  return (source, event, gated) => {
+    if (event.type !== "approval_request" || !gated) return onEvent(source, event);
+    const job = tail.then(async () => {
+      let release!: () => void;
+      const answered = new Promise<void>((resolve) => (release = resolve));
+      const inner = event.respond;
+      await onEvent(source, {
+        ...event,
+        respond: (decision, reason) => {
+          inner(decision, reason);
+          release();
+        },
+      });
+      await answered;
+    });
+    tail = job.catch(() => {}); // 宿主异常不阻塞后续审批；异常本身沿 job 抛给调用方
+    return job;
+  };
 }

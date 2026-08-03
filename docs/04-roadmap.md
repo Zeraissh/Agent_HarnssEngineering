@@ -133,11 +133,43 @@
 - 现场发现：① 野指针写 0xCCCCCCCC 在 L151 外部设备区被静默丢弃、不触发故障——改除零才可靠；② SWD 自锁（固件低功耗/引脚重配 + 无 NRST）需物理上电复位抢连接救回。
 - **harness 短板（已修，2026-07-25）**：首跑 `max_tokens=2048` 时模型报告太长被截断，而 loop 在 v0.2 把 max_tokens 当硬错误终止整轮——诊断其实已完成、仅报告没写成。**已改**：`max_tokens` 成为独立的非 error 终止态（`AgentRunResult.stopReason: "max_tokens"`），部分内容保留在 messages 中，CLI 渲染为黄色警告并提示提高 AGENT_MAX_TOKENS；护栏语义不变（仍尊重用户设的上限、不自动提额，防本地模型跑飞）。70 单测。
 
+## v1.1 — 并行编排（DAG 调度）【feat/parallel-orchestration 分支，2026-08-03】
+
+**动机**：预算轴 A/B（c527eef）证明 planned 臂在单领域任务上 token 只会更贵——三角编排的
+价值边界在跨领域交接/长管线。并行化不追 token（并行不省 token），追的是**墙钟**：
+互不依赖的子任务同时跑，wall-clock 逼近关键路径而非全序和。
+
+**契约**
+- `SubTask.dependsOn: string[]`——planner 显式声明直接依赖；就绪条件 = 全部依赖核查通过。
+  交接摘要只从直接依赖传入（多依赖多段，带来源标注）。
+- 图校验 fail-closed：id 重复 / 悬空引用 / 成环 → 整份计划作废（与裁决解析同纪律）。
+- 兼容：整份计划无 dependsOn → 推断线性链（v1.0 隐式顺序语义，旧测试原样通过）。
+
+**调度器**（`runPlanned` + `concurrency`，默认 1 = 与 v1.0 逐字节同行为）
+- ready-queue：依赖全通过即发射，至多 concurrency 个在飞。
+- 失败语义：任一子任务核查未通过 → 停止发射（含无关独立分支——整体已败，续跑烧钱）；
+  在飞的照常跑完（工具有副作用，中途硬断比跑完危险）；未启动的标记 `skipped`。
+- 审批互斥门：并发子任务的 approval_request 排队逐个交宿主（终端同时弹两个审批 =
+  应答错配）；verifier/planner 的审批由内部自答，不入门（入门会死锁）。
+- 每步记 `durationMs`——并行价值的主度量是墙钟节省，CLI 汇总"子任务合计 vs 阶段墙钟"。
+
+**planner 纪律新增**：dependsOn 只在【必须用到对方产物】时声明；互不依赖的子任务
+不得写同一文件/独占资源（探针、端口），会冲突就串行化；汇总 = 收尾子任务 dependsOn
+全部分支（不造聚合器单元）。
+
+**CLI**：`--plan --parallel[=N]`（裸旗标 =2）；并行模式行级渲染（`[sX/角色]` 前缀，
+不流式）。
+
+**验证 checklist**
+- [x] 118 单测全绿（+11：图解析校验×6、并发重叠证明、fan-out 交接隔离、失败语义、审批互斥门）
+- [x] 旧 planner/orchestrate 测试零改动通过（线性链推断兜住 v1.0 语义）
+- [ ] 真机 A/B：planned-serial vs planned-parallel 墙钟对比（分支内数据）
+- [ ] planner 依赖图产出质量：真实模型能否写出正确的 dependsOn（悬空/成环率）
+
 ## 更远（不承诺顺序）
 
 - **Harness A/B 研究**：用 eval 量化各 harness 特性的收益（verifier 开关、compact 阈值、工具描述写法、跨模型/协议矩阵）；前置：eval 用例扩到 15–20 个
 - server-side compaction（beta）替换本地截断
-- 多 agent 编排（并行 fan-out + 汇总）
 - Anthropic 原生缓存断点补验（待 Anthropic key）
 
 ---
