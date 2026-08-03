@@ -683,4 +683,45 @@ assert.equal(typeof stats.sum, "undefined");`,
         : { pass: false, note: `${wrong}/60 个文件不符（首个: ${firstWrong}）——漏改/多改/格式漂移（测试只覆盖 9 个，抓不住）` };
     },
   },
+
+  // ————— 并行编排套件（par-*，v1.1）：fan-out 形状的任务——互不重叠的分片 +
+  //        依赖全部分片的汇总。用于 planned-serial vs planned-parallel 墙钟 A/B
+  //        与 planner 依赖图产出质量观测（拆不拆、dependsOn 对不对是被测变量）。 —————
+  {
+    id: "par-fanout",
+    covers: "并行：三个互不重叠分片统计 + 依赖全部分片的汇总（fan-out + 汇聚形状）",
+    task:
+      "eval-out/proj 是一个 60 模块的 Node 项目（src/m00.js…m59.js，每个模块导出一个整数常量 LIMIT）。产出三份分区统计与一份汇总，四个文件都只含一行纯数字、无其他内容：\n" +
+      "- eval-out/part-a.txt：m00…m19 这 20 个模块的 LIMIT 之和\n" +
+      "- eval-out/part-b.txt：m20…m39 的 LIMIT 之和\n" +
+      "- eval-out/part-c.txt：m40…m59 的 LIMIT 之和\n" +
+      "- eval-out/grand-total.txt：以上三个分区之和\n" +
+      "判定规则：每个和都按对应文件里 `export const LIMIT = <数值>;` 的字面数值计算；legacy.js 不属于任何分区。",
+    async setup(workdir) {
+      const { writeScaleFixture } = await import("./scale-fixture.js");
+      await writeScaleFixture(path.join(workdir, "eval-out/proj"));
+    },
+    async check(workdir) {
+      const { genPlan } = await import("./scale-fixture.js");
+      const plan = genPlan();
+      const shard = (from: number, to: number) =>
+        plan.modules
+          .slice(from, to)
+          .reduce((acc, name) => acc + plan.limits[name]!, 0);
+      const expected: [string, number][] = [
+        ["part-a.txt", shard(0, 20)],
+        ["part-b.txt", shard(20, 40)],
+        ["part-c.txt", shard(40, 60)],
+        ["grand-total.txt", shard(0, 60)],
+      ];
+      for (const [file, value] of expected) {
+        const got = await readOut(workdir, `eval-out/${file}`);
+        if (got === undefined) return { pass: false, note: `${file} 未创建` };
+        if (got.trim() !== String(value)) {
+          return { pass: false, note: `${file} 期望 ${value}，实际 ${got.trim().slice(0, 50)}` };
+        }
+      }
+      return { pass: true, note: "三个分区与汇总全部正确" };
+    },
+  },
 ];

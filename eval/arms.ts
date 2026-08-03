@@ -19,6 +19,11 @@ export interface Arm {
     /** 返工模式：fresh 全新上下文（默认）/ inherit 继承上一轮正史续跑 */
     reworkMode?: "fresh" | "inherit";
   };
+  /** planned 模式的附加配置（v1.1 并行编排实验变量） */
+  planned?: {
+    /** 子任务并行度（缺省 1 = 串行）。墙钟收益是并行臂的主指标 */
+    concurrency?: number;
+  };
 }
 
 /**
@@ -101,6 +106,14 @@ export const ARMS: Arm[] = [
     hypothesis: "三角编排（planner 切分,每子任务全新预算）能否缓解预算×规模张力——对照纯加预算的 budget-30",
     mode: "planned",
     configure: (base) => base,
+  },
+  {
+    name: "planned-par3",
+    hypothesis:
+      "并行编排（concurrency=3）：fan-out 任务上墙钟能否逼近关键路径（对照 planned 串行的全序和）；token 预期持平（并行不省 token）",
+    mode: "planned",
+    configure: (base) => base,
+    planned: { concurrency: 3 },
   },
   {
     name: "budget-30",

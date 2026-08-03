@@ -38,6 +38,19 @@ interface Cell {
   reps: number;
   turns: number; // 累计轮数
   tokens: number; // 累计总 tokens
+  wallMs: number; // 累计墙钟（并行臂的主指标——token 不省，省的是时间）
+}
+
+/** planned 模式逐 run 的编排细节（依赖图质量 + 墙钟分解，逐 run 落 ab-log） */
+interface PlanTrace {
+  /** 计划形状，如 "s1[] s2[] s3[s1,s2]"；undefined = planner 产不出计划 */
+  planShape?: string;
+  /** 子任务阶段墙钟（不含 planner 耗时） */
+  subtaskWallMs?: number;
+  /** 逐子任务：id、耗时、是否通过 */
+  steps?: { id: string; ms: number; passed: boolean }[];
+  /** 因失败停止调度而未执行的子任务 id */
+  skipped?: string[];
 }
 
 async function main(): Promise<void> {
@@ -87,14 +100,14 @@ async function main(): Promise<void> {
 
   for (const evalCase of suite) {
     for (const arm of arms) {
-      const cell: Cell = { pass: 0, reps, turns: 0, tokens: 0 };
+      const cell: Cell = { pass: 0, reps, turns: 0, tokens: 0, wallMs: 0 };
       for (let r = 0; r < reps; r++) {
         // 每个 run 前清空产出目录——保证判定只看本次 run 的产物
         await rm(path.join(workdir, "eval-out"), { recursive: true, force: true });
         await mkdir(path.join(workdir, "eval-out"), { recursive: true });
         await evalCase.setup?.(workdir);
 
-        const { result, turns, tokens, verdicts } = await runArm(
+        const { result, turns, tokens, verdicts, wallMs, planTrace } = await runArm(
           arm,
           baseConfig,
           client,
@@ -103,6 +116,7 @@ async function main(): Promise<void> {
         );
         cell.turns += turns;
         cell.tokens += tokens;
+        cell.wallMs += wallMs;
         // 评分策略（2026-07-25 改）：纯产物制——无论 stopReason 一律检查实际产物。
         // 旧策略对 max_turns 直接判负，但 agent 可能在最后一轮已写出正确产物；
         // 过程如何终止是过程指标（stopReason 单独留档），产物对错才是任务成败。
@@ -142,6 +156,8 @@ async function main(): Promise<void> {
             stopReason: result.stopReason,
             turns,
             tokens,
+            wallMs,
+            ...(planTrace ? { planTrace } : {}),
             verifierVerdicts: verdicts,
           }) + "\n",
           "utf8",
@@ -167,12 +183,28 @@ async function runArm(
   client: ModelClient,
   task: string,
   verifierProvider?: ResolvedProvider,
-): Promise<{ result: AgentRunResult; turns: number; tokens: number; verdicts: Verdict[] }> {
+): Promise<{
+  result: AgentRunResult;
+  turns: number;
+  tokens: number;
+  verdicts: Verdict[];
+  wallMs: number;
+  planTrace?: PlanTrace;
+}> {
   const cfg = arm.configure(base);
+  const startedAt = Date.now();
   if (arm.mode === "planned") {
-    // 三角编排：planner 切分 → 每子任务 runVerified（各自全新轮次预算）
+    // 三角编排：planner 切分 → 每子任务 runVerified（各自全新轮次预算）；
+    // v1.1：planned.concurrency>1 时依赖图上独立的子任务并发执行
+    let planReadyAt: number | undefined;
+    let planShape: string | undefined;
     const outcome = await runPlanned(cfg, client, task, {
       maxReworks: 1,
+      concurrency: arm.planned?.concurrency ?? 1,
+      onPlan: (plan) => {
+        planReadyAt = Date.now();
+        planShape = plan.subtasks.map((s) => `${s.id}[${s.dependsOn.join(",")}]`).join(" ");
+      },
       onEvent: (source, event) => {
         // 只放行执行/返工的审批——planner/verifier 的 respond 是先到先得,
         // 抢答 allow 会把它们的内部只读 deny 变成空操作
@@ -184,6 +216,16 @@ async function runArm(
         }
       },
     });
+    const planTrace: PlanTrace = {
+      planShape,
+      subtaskWallMs: planReadyAt ? Date.now() - planReadyAt : undefined,
+      steps: outcome.steps.map((s) => ({
+        id: s.sub.id,
+        ms: s.durationMs,
+        passed: s.result.finalPassed,
+      })),
+      skipped: outcome.skipped.map((s) => s.id),
+    };
     const tok = (u: { inputTokens: number; cacheCreationTokens: number; cacheReadTokens: number; outputTokens: number }) =>
       u.inputTokens + u.cacheCreationTokens + u.cacheReadTokens + u.outputTokens;
     let tokens = tok(outcome.planOutcome.usage);
@@ -205,7 +247,7 @@ async function runArm(
       usage: outcome.planOutcome.usage,
       error: new Error("planner 未产出可解析计划"),
     };
-    return { result, turns, tokens, verdicts };
+    return { result, turns, tokens, verdicts, wallMs: Date.now() - startedAt, planTrace };
   }
   if (arm.mode === "verified") {
     const outcome = await runVerified(cfg, client, task, {
@@ -235,6 +277,7 @@ async function runArm(
       turns,
       tokens,
       verdicts: outcome.verifications.map((v) => v.verdict),
+      wallMs: Date.now() - startedAt,
     };
   }
   // single
@@ -250,6 +293,7 @@ async function runArm(
     turns: u.turns,
     tokens: u.inputTokens + u.cacheCreationTokens + u.cacheReadTokens + u.outputTokens,
     verdicts: [],
+    wallMs: Date.now() - startedAt,
   };
 }
 
@@ -265,7 +309,7 @@ function renderReport(
   const rows = suite.map((c) => {
     const cells = arms.map((a) => {
       const cell = grid[c.id]![a.name]!;
-      return `${cell.pass}/${cell.reps} · ${(cell.turns / cell.reps).toFixed(1)}t · ${Math.round(cell.tokens / cell.reps / 1000)}k`;
+      return `${cell.pass}/${cell.reps} · ${(cell.turns / cell.reps).toFixed(1)}t · ${Math.round(cell.tokens / cell.reps / 1000)}k · ${Math.round(cell.wallMs / cell.reps / 1000)}s`;
     });
     return `| ${c.id} | ${c.covers} | ${cells.join(" | ")} |`;
   });
@@ -275,22 +319,30 @@ function renderReport(
     let pass = 0,
       reps2 = 0,
       turns = 0,
-      tokens = 0;
+      tokens = 0,
+      wallMs = 0;
     for (const c of suite) {
       const cell = grid[c.id]![a.name]!;
       pass += cell.pass;
       reps2 += cell.reps;
       turns += cell.turns;
       tokens += cell.tokens;
+      wallMs += cell.wallMs;
     }
-    return { name: a.name, rate: pass / reps2, avgTurns: turns / reps2, avgTokens: tokens / reps2 };
+    return {
+      name: a.name,
+      rate: pass / reps2,
+      avgTurns: turns / reps2,
+      avgTokens: tokens / reps2,
+      avgWallMs: wallMs / reps2,
+    };
   });
 
   const armLegend = arms.map((a) => `- **${a.name}**（${a.mode}）：${a.hypothesis}`).join("\n");
   const aggRows = agg
     .map(
       (a) =>
-        `| ${a.name} | ${(a.rate * 100).toFixed(0)}% | ${a.avgTurns.toFixed(1)} | ${Math.round(a.avgTokens)} |`,
+        `| ${a.name} | ${(a.rate * 100).toFixed(0)}% | ${a.avgTurns.toFixed(1)} | ${Math.round(a.avgTokens)} | ${Math.round(a.avgWallMs / 1000)}s |`,
     )
     .join("\n");
 
@@ -306,13 +358,13 @@ ${armLegend}
 
 ## 每臂汇总
 
-| 臂 | 成功率 | 平均轮数 | 平均 tokens |
-|---|---|---|---|
+| 臂 | 成功率 | 平均轮数 | 平均 tokens | 平均墙钟 |
+|---|---|---|---|---|
 ${aggRows}
 
 ## 明细矩阵
 
-单元格格式：\`通过/次数 · 平均轮数t · 平均 k-tokens\`
+单元格格式：\`通过/次数 · 平均轮数t · 平均 k-tokens · 平均墙钟 s\`（并行臂看墙钟——token 不省，省的是时间）
 
 | ${header.join(" | ")} |
 |${header.map(() => "---").join("|")}|
