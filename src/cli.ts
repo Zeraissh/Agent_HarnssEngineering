@@ -383,6 +383,8 @@ async function main(): Promise<void> {
               ? { verifierModel: { client: verifierProvider.client, compat: verifierProvider.compat } }
               : {}),
           },
+          // 独占资源（如 swd-probe）：调度器对同标签子任务强制串行
+          ...(p?.resources ? { resources: p.resources } : {}),
         };
       },
       onEvent: async (source, event) => {

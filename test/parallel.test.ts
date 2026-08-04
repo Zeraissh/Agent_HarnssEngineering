@@ -411,3 +411,55 @@ describe("runPlanned：DAG 并行调度", () => {
     expect(maxOutstanding).toBe(1); // 互斥门生效
   });
 });
+
+describe("独占资源互斥（v1.1.1：领域包声明 resources，同标签强制串行）", () => {
+  /** 两个独立子任务 + 可配置的每任务资源声明；记录执行窗口最大重叠 */
+  function makeResourceFixture(resourcesById: Record<string, string[]>) {
+    let active = 0;
+    let maxActive = 0;
+    const client = new RoutingClient(async (req) => {
+      if (isPlannerReq(req))
+        return planMessage([
+          { id: "a", title: "A", description: "任务a", acceptance: [], dependsOn: [] },
+          { id: "b", title: "B", description: "任务b", acceptance: [], dependsOn: [] },
+        ]);
+      if (isVerifierReq(req)) return passVerdict();
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await delay(20);
+      active -= 1;
+      const which = reqText(req).includes("任务a") ? "a" : "b";
+      return fakeMessage([textBlock(`摘要${which}`)], "end_turn");
+    });
+    const opts = {
+      concurrency: 2,
+      resolveSubtask: (sub: { id: string }) => ({
+        cfg: baseConfig,
+        resources: resourcesById[sub.id] ?? [],
+      }),
+    };
+    return { client, opts, maxActive: () => maxActive };
+  }
+
+  it("同资源（swd-probe）：concurrency=2 下仍强制串行，两个都完成", async () => {
+    const { client, opts, maxActive } = makeResourceFixture({ a: ["swd-probe"], b: ["swd-probe"] });
+    const outcome = await runPlanned(baseConfig, client, "总任务", opts);
+    expect(outcome.completed).toBe(true);
+    expect(outcome.steps).toHaveLength(2);
+    expect(maxActive()).toBe(1); // 资源互斥生效：无执行窗口重叠
+  });
+
+  it("异资源：并发不受影响（重叠恢复）", async () => {
+    const { client, opts, maxActive } = makeResourceFixture({ a: ["probe-1"], b: ["probe-2"] });
+    const outcome = await runPlanned(baseConfig, client, "总任务", opts);
+    expect(outcome.completed).toBe(true);
+    expect(maxActive()).toBe(2);
+  });
+
+  it("无资源声明：行为与 v1.1 完全一致（回归保护）", async () => {
+    const { client, opts, maxActive } = makeResourceFixture({});
+    const outcome = await runPlanned(baseConfig, client, "总任务", opts);
+    expect(outcome.completed).toBe(true);
+    expect(maxActive()).toBe(2);
+  });
+});

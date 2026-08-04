@@ -193,6 +193,14 @@ export interface PlannedRunOptions {
       VerifiedRunOptions,
       "verifyInstructions" | "verifyReadOnlyCommands" | "verifierModel" | "reworkMode"
     >;
+    /**
+     * 独占资源标签（v1.1.1，领域包声明，如 ["swd-probe"]）：持有相同标签的
+     * 子任务互斥——即使依赖图上独立、并行度允许，也强制先后执行。
+     * 动机：真机域的探针/串口是全局单件，无锁并发 = 抢探针事故（实录见
+     * case-01 与 windows-taskstop 僵尸风暴）。资源只在子任务在飞期间持有，
+     * 结束即释放，不会死锁。
+     */
+    resources?: string[];
   };
   /** 每个子任务的最大返工轮数。默认 1 */
   maxReworks?: number;
@@ -308,12 +316,18 @@ export async function runPlanned(
   let aborted = false; // 首个失败后停止发射（在飞的跑完）
   let schedulerError: unknown;
 
+  // 每个子任务只解析一次（解析结果含资源声明，调度判定与执行都要用）
+  const resolvedById = new Map(
+    plan.subtasks.map((s) => [s.id, opts.resolveSubtask?.(s) ?? { cfg: baseCfg }]),
+  );
+  const heldResources = new Set<string>();
+
   const forward = makeApprovalSerializer(opts.onEvent);
 
   const launch = (sub: SubTask): Promise<void> =>
     (async () => {
       // pack 名校验：未知包名不致命，降级为默认配置执行（宿主事件里可见）
-      const resolved = opts.resolveSubtask?.(sub) ?? { cfg: baseCfg };
+      const resolved = resolvedById.get(sub.id)!;
       const input = buildSubtaskInput(sub, byId, handoffs);
       const startedAt = Date.now();
       const result = await runVerified(resolved.cfg, model, input, {
@@ -339,6 +353,7 @@ export async function runPlanned(
       })
       .finally(() => {
         running.delete(sub.id);
+        for (const r of resolvedById.get(sub.id)!.resources ?? []) heldResources.delete(r);
       });
 
   while (true) {
@@ -346,6 +361,10 @@ export async function runPlanned(
       const ready = queue.filter((s) => s.dependsOn.every((d) => passed.has(d)));
       for (const sub of ready) {
         if (running.size >= concurrency) break;
+        // 独占资源互斥：与在飞子任务共享任一资源标签的，本轮不发射（资源释放后自然就绪）
+        const resources = resolvedById.get(sub.id)!.resources ?? [];
+        if (resources.some((r) => heldResources.has(r))) continue;
+        for (const r of resources) heldResources.add(r);
         queue.splice(queue.indexOf(sub), 1);
         running.set(sub.id, launch(sub));
       }

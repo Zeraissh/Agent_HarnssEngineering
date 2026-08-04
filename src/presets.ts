@@ -47,6 +47,12 @@ export interface DomainPack {
      */
     readOnlyCommands?: string[];
   };
+  /**
+   * 独占资源标签（调度器互斥用）：声明本包子任务在飞期间独占的全局单件
+   * （探针/串口/某台设备）。并行编排里同标签子任务强制串行——真机域的
+   * 无锁并发 = 抢探针事故（case-01 实录）。
+   */
+  resources?: string[];
   /** 护栏参数（env 显式设置时以 env 为准） */
   guardrails?: {
     maxTurns?: number;
@@ -160,6 +166,7 @@ export const PACKS: Record<string, DomainPack> = {
       mode: "programmatic",
       instructions: STM32_VERIFY_INSTRUCTIONS,
     },
+    resources: ["swd-probe"],
     guardrails: { maxTurns: 40 },
   },
 
