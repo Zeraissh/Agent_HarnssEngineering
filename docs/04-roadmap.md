@@ -183,6 +183,13 @@
   **AUTO_CONCURRENCY_CAP=3 获曲线背书**。token 三臂持平（第三次确认）。
   研究线收口：三问（调度器收益/planner 图质量/收益曲线）全闭环，
   开放项（拆分摇摆稳定化、跨域真机并行）归入"更远"
+- [x] 拆分摇摆稳定化第一杆已测并证伪（cb15e06 + strongplanner 批）：plannerModel
+  独立模型口子（镜像 verifierModel；CLI AGENT_PLANNER_*、eval AB_PLANNER_* +
+  planned-strong-plan 臂）；kimi-k3 拆解 + flash 执行 ×5 → **拆分率 2/5 vs flash 5/9,
+  同为掷硬币；planner 墙钟 2.5×（thinking 延迟）纯亏；图合法率累计 14/14**。
+  定论：拆分摇摆是纪律歧义区的自由裁量问题,不是能力问题——判断歧义要用
+  确定性规则消除,不能用更强判断者掩盖。下一杆候选：结构化拆分协议
+  （先枚举分片+预计轮数,再套确定性规则）,未实施
 
 ## 更远（不承诺顺序）
 
