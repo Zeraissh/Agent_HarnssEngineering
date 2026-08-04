@@ -209,6 +209,13 @@ export interface PlannedRunOptions {
    * 图非法时抛错（宿主代码 bug 应该炸响，不适用模型输出的 fail-closed）。
    */
   plan?: Plan;
+  /**
+   * 独立的 planner 模型（默认与执行者共用 client）——镜像 verifierModel 的口子。
+   * 动机（ab-report-parallel.md）：flash 的拆分决策 ~50/50 摇摆是并行价值的
+   * 瓶颈，"更强 planner"是稳定化候选之一。compat 随端点而定，需一并指定。
+   * opts.plan 存在时此项无效（计划已注入，planner 不运行）。
+   */
+  plannerModel?: { client: ModelClient; compat?: boolean };
 }
 
 export interface PlannedStepResult {
@@ -253,7 +260,12 @@ export async function runPlanned(
     }
     planOutcome = { plan: opts.plan, usage: ZERO_USAGE, raw: "(host-provided plan)" };
   } else {
-    planOutcome = await runPlanner(baseCfg, model, task, packs, (e) =>
+    const plannerClient = opts.plannerModel?.client ?? model;
+    const plannerCfg =
+      opts.plannerModel && opts.plannerModel.compat !== undefined
+        ? { ...baseCfg, compat: opts.plannerModel.compat }
+        : baseCfg;
+    planOutcome = await runPlanner(plannerCfg, plannerClient, task, packs, (e) =>
       opts.onEvent?.("planner", e),
     );
   }

@@ -29,6 +29,11 @@ export interface Arm {
      * 调度器本身的收益）。用例没带 plan 时该臂在此用例上跳过。
      */
     useFixedPlan?: boolean;
+    /**
+     * true = 用 AB_PLANNER_MODEL 指定的（更强）模型当 planner（执行者不变）。
+     * 假设：flash 拆分决策 ~50/50 摇摆的稳定化候选。未设该 env 时此臂被跳过。
+     */
+    strongPlanner?: boolean;
   };
 }
 
@@ -136,6 +141,14 @@ export const ARMS: Arm[] = [
     mode: "planned",
     configure: (base) => base,
     planned: { concurrency: 3, useFixedPlan: true },
+  },
+  {
+    name: "planned-strong-plan",
+    hypothesis:
+      "强 planner（AB_PLANNER_MODEL）+ 原执行者：拆分摇摆（flash 5/9）能否稳定;图合法率、汇总收口句遵从一并观测。concurrency=3 与 planned-par3 同口径",
+    mode: "planned",
+    configure: (base) => base,
+    planned: { concurrency: 3, strongPlanner: true },
   },
   {
     name: "fixed-par6",

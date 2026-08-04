@@ -247,6 +247,26 @@ describe("runPlanned：DAG 并行调度", () => {
     ).rejects.toThrow(/依赖图非法/);
   });
 
+  it("plannerModel：计划请求走独立 client，执行/核查仍走主 client", async () => {
+    const plannerClient = new RoutingClient(async (req) => {
+      if (!isPlannerReq(req)) throw new Error("planner client 收到非 planner 请求");
+      return planMessage([
+        { id: "a", title: "A", description: "任务a", acceptance: [], dependsOn: [] },
+      ]);
+    });
+    const mainClient = new RoutingClient(async (req) => {
+      if (isPlannerReq(req)) throw new Error("主 client 不应收到 planner 请求");
+      if (isVerifierReq(req)) return passVerdict();
+      return fakeMessage([textBlock("done")], "end_turn");
+    });
+    const outcome = await runPlanned(baseConfig, mainClient, "总任务", {
+      plannerModel: { client: plannerClient, compat: true },
+    });
+    expect(outcome.completed).toBe(true);
+    expect(plannerClient.requests).toHaveLength(1);
+    expect(mainClient.requests.length).toBeGreaterThanOrEqual(2); // 执行 + 核查
+  });
+
   it("审批互斥门：并发子任务的审批逐个到达宿主，绝不同时挂两个", async () => {
     const askTool: Tool = {
       name: "touch",

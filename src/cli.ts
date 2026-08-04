@@ -134,6 +134,25 @@ async function main(): Promise<void> {
   if (withVerify && verifierProvider) {
     console.log(c.dim(`verifier model: ${verifierModelName}`));
   }
+
+  // --plan 时可选的独立 planner 模型（拆分决策摇摆的稳定化杆,镜像 verifier 组）
+  const plannerModelName = process.env.AGENT_PLANNER_MODEL;
+  const plannerProvider = plannerModelName
+    ? createModelClientFromEnv(plannerModelName, {
+        ...(process.env.AGENT_PLANNER_PROVIDER
+          ? { provider: process.env.AGENT_PLANNER_PROVIDER as "anthropic" | "openai" }
+          : {}),
+        ...(process.env.AGENT_PLANNER_BASE_URL
+          ? { baseURL: process.env.AGENT_PLANNER_BASE_URL }
+          : {}),
+        ...(process.env.AGENT_PLANNER_API_KEY
+          ? { apiKey: process.env.AGENT_PLANNER_API_KEY }
+          : {}),
+      })
+    : undefined;
+  if (withPlan && plannerProvider) {
+    console.log(c.dim(`planner model: ${plannerModelName}`));
+  }
   if (compat) {
     const base =
       provider === "openai"
@@ -316,6 +335,9 @@ async function main(): Promise<void> {
     const outcome = await runPlanned(config, modelClient, task, {
       packs: Object.values(PACKS),
       concurrency,
+      ...(plannerProvider
+        ? { plannerModel: { client: plannerProvider.client, compat: plannerProvider.compat } }
+        : {}),
       onPlan: (plan) => {
         planRef = plan;
         planReadyAt = Date.now();

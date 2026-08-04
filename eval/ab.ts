@@ -76,9 +76,25 @@ async function main(): Promise<void> {
       })
     : undefined;
 
+  // planned-strong-plan 臂的独立 planner 模型（拆分摇摆稳定化实验）；未配置则跳过该臂
+  const plannerModelName = process.env.AB_PLANNER_MODEL;
+  const plannerProvider: ResolvedProvider | undefined = plannerModelName
+    ? createModelClientFromEnv(plannerModelName, {
+        ...(process.env.AB_PLANNER_PROVIDER
+          ? { provider: process.env.AB_PLANNER_PROVIDER as "anthropic" | "openai" }
+          : {}),
+        ...(process.env.AB_PLANNER_BASE_URL ? { baseURL: process.env.AB_PLANNER_BASE_URL } : {}),
+        ...(process.env.AB_PLANNER_API_KEY ? { apiKey: process.env.AB_PLANNER_API_KEY } : {}),
+      })
+    : undefined;
+
   const arms = getArms(process.env.AB_ARMS?.split(",").map((s) => s.trim())).filter((a) => {
     if (a.verify?.strongModel && !verifierProvider) {
       console.log(`[skip] 臂 ${a.name} 需要 AB_VERIFIER_MODEL，未配置`);
+      return false;
+    }
+    if (a.planned?.strongPlanner && !plannerProvider) {
+      console.log(`[skip] 臂 ${a.name} 需要 AB_PLANNER_MODEL，未配置`);
       return false;
     }
     return true;
@@ -124,6 +140,7 @@ async function main(): Promise<void> {
           evalCase.task,
           verifierProvider,
           arm.planned?.useFixedPlan ? evalCase.plan : undefined,
+          arm.planned?.strongPlanner ? plannerProvider : undefined,
         );
         cell.turns += turns;
         cell.tokens += tokens;
@@ -168,6 +185,9 @@ async function main(): Promise<void> {
             turns,
             tokens,
             wallMs,
+            ...(arm.planned?.strongPlanner && plannerModelName
+              ? { plannerModel: plannerModelName }
+              : {}),
             ...(planTrace ? { planTrace } : {}),
             verifierVerdicts: verdicts,
           }) + "\n",
@@ -183,7 +203,7 @@ async function main(): Promise<void> {
   }
 
   const reportPath = process.env.AB_REPORT ?? path.join("eval", "ab-report.md");
-  const report = renderReport(model, reps, suite, arms, grid, verifierModelName);
+  const report = renderReport(model, reps, suite, arms, grid, verifierModelName, plannerModelName);
   await writeFile(path.join(workdir, reportPath), report, "utf8");
   console.log(`\n报告已写入 ${reportPath}`);
 }
@@ -195,6 +215,7 @@ async function runArm(
   task: string,
   verifierProvider?: ResolvedProvider,
   fixedPlan?: import("../src/planner.js").Plan,
+  plannerProvider?: ResolvedProvider,
 ): Promise<{
   result: AgentRunResult;
   turns: number;
@@ -215,6 +236,9 @@ async function runArm(
       maxReworks: 1,
       concurrency: arm.planned?.concurrency ?? 1,
       ...(fixedPlan ? { plan: fixedPlan } : {}),
+      ...(plannerProvider
+        ? { plannerModel: { client: plannerProvider.client, compat: plannerProvider.compat } }
+        : {}),
       onPlan: (plan) => {
         planReadyAt = Date.now();
         planShape = plan.subtasks.map((s) => `${s.id}[${s.dependsOn.join(",")}]`).join(" ");
@@ -322,6 +346,7 @@ function renderReport(
   arms: Arm[],
   grid: Record<string, Record<string, Cell>>,
   verifierModel?: string,
+  plannerModel?: string,
 ): string {
   const header = ["用例", "覆盖面", ...arms.map((a) => a.name)];
   const rows = suite.map((c) => {
@@ -369,7 +394,7 @@ function renderReport(
   return `# Harness A/B 对比报告
 
 - 日期：${new Date().toISOString().slice(0, 10)}
-- 模型：\`${model}\`${verifierModel ? `\n- verifier 模型（verified-strong 臂）：\`${verifierModel}\`` : ""}
+- 模型：\`${model}\`${verifierModel ? `\n- verifier 模型（verified-strong 臂）：\`${verifierModel}\`` : ""}${plannerModel ? `\n- planner 模型（planned-strong-plan 臂）：\`${plannerModel}\`` : ""}
 - 规模：${suite.length} 用例 × ${arms.length} 臂 × ${reps} 次
 
 ## 实验臂
