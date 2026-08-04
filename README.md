@@ -27,7 +27,9 @@
 | [docs/01-philosophy.md](docs/01-philosophy.md) | Harness engineering 设计哲学与设计原则 |
 | [docs/02-architecture.md](docs/02-architecture.md) | 五层架构、模块职责、一轮 turn 的完整数据流、关键 API 事实 |
 | [docs/03-interfaces.md](docs/03-interfaces.md) | 核心 TypeScript 接口定义（实现蓝本） |
-| [docs/04-roadmap.md](docs/04-roadmap.md) | v0.1 → v0.4 演进路线与每阶段验证 checklist |
+| [docs/04-roadmap.md](docs/04-roadmap.md) | 演进路线（v0.1 → v1.1）与每阶段验证 checklist |
+| [docs/reference/README.md](docs/reference/README.md) | `src/` 全部 21 个模块的参考文档（签名与源码逐一核对；由 v1.1 并行编排自举生成，见案例 #2） |
+| [docs/cases/](docs/cases) | 真实任务案例：#1 遥测固件真机闭环、#2 并行编排交付参考文档（墙钟 −43%） |
 
 ## 快速开始
 
@@ -60,7 +62,9 @@ $env:AGENT_MODEL        = "deepseek-chat"
 npm run cli -- "阅读 docs/ 下所有文档，生成 SUMMARY.md"          # 交互审批 y/n
 npm run cli -- --yes "……"                                        # 自动批准（CI）
 npm run cli -- --verify "……"                                     # 完成后 verifier 独立核查，未通过自动返工
-npm run eval                                                      # 跑 5 用例回归基线
+npm run cli -- --plan "……"                                       # 三角编排：planner 拆解→执行→核查→交接；
+                                                                  #   互不依赖的子任务默认并行（auto=min(3,层宽)），--parallel=N 覆盖
+npm run eval                                                      # 全量用例回归基线（31 用例，纯产物评分）
 npm run lab                                                       # A/B 实验向导：选端点/臂/用例，免拼环境变量
 npm run lab -- --last                                             # 重放上一次实验配置
 npm run smoke:local                                               # 离线端点冒烟（本地 Ollama 路径存活验证）
@@ -89,8 +93,9 @@ npm run cli -- --verify "……"
   真 Git Bash 修复（hard 套件 63%→88%）、逐 run JSONL/transcript 留档、loop 层瞬时错误重试
 - **v0.9 ✅** — DomainPack 领域包（五件套：工具面/prompt/核查/护栏/评估）+ `AGENT_PACK` 切换；
   跨包试点闭环：stm32-coding 修固件产出 ELF → stm32-debug 真机烧录四项验收 → verifier 独立连板复核
-- **v1.0 ✅** — 计划单元 + 三角编排：planner 只读拆解（JSON 计划契约：子任务×领域包×可程序化验收清单）→ 逐子任务执行→核查→返工 → 交接下游，快速失败；`--plan` 一句话任务真机闭环（planner 自主选包，verifier 独立连板逐条复核 8 项验收）
-- **后续** — verifier 只读命令白名单、调度 agent（任务→包路由）、server-side compaction（见 [docs/04-roadmap.md](docs/04-roadmap.md)）
+- **v1.0 ✅** — 计划单元 + 三角编排：planner 只读拆解（JSON 计划契约：子任务×领域包×可程序化验收清单）→ 逐子任务执行→核查→返工 → 交接下游，快速失败；`--plan` 一句话任务真机闭环（planner 自主选包，verifier 独立连板逐条复核 8 项验收）；随后补齐 verifier 只读命令白名单与 router 调度单元（`--auto` 任务→包路由）
+- **v1.1 ✅** — 并行编排：`SubTask.dependsOn` 依赖图契约（fail-closed 校验）+ ready-queue 调度器 + 审批互斥门，互不依赖的子任务并发执行（`--parallel`，缺省 auto）。A/B 实证（eval/ab-report-parallel.md）：同 DAG 墙钟 −56~−62% 且精确贴关键路径、token 持平；拆分摇摆（freeform ~50/50，强 planner 无效）由**结构化拆分协议**消除——planner 只枚举分片事实，拆不拆由宿主规则判定（`AGENT_PLAN_PROTOCOL=structured`，拆分率 5/5 零方差）。首个生产交付：本仓库 docs/reference/（案例 #2，墙钟 −43%）
+- **后续** — 结构化清单契约扩 deps 字段（统一 fan-out 与顺序链两协议）、server-side compaction、跨域真机任务上的并行编排（见 [docs/04-roadmap.md](docs/04-roadmap.md)）
 
 ## 技术基线
 
