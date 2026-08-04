@@ -153,6 +153,12 @@ async function main(): Promise<void> {
   if (withPlan && plannerProvider) {
     console.log(c.dim(`planner model: ${plannerModelName}`));
   }
+  // AGENT_PLAN_PROTOCOL=structured：枚举与决策分离的结构化拆分协议（默认 freeform）
+  const planProtocol =
+    process.env.AGENT_PLAN_PROTOCOL === "structured" ? ("structured" as const) : ("freeform" as const);
+  if (withPlan && planProtocol === "structured") {
+    console.log(c.dim("plan protocol: structured（分片枚举 + 宿主规则判拆）"));
+  }
   if (compat) {
     const base =
       provider === "openai"
@@ -335,6 +341,7 @@ async function main(): Promise<void> {
     const outcome = await runPlanned(config, modelClient, task, {
       packs: Object.values(PACKS),
       concurrency,
+      plannerProtocol: planProtocol,
       ...(plannerProvider
         ? { plannerModel: { client: plannerProvider.client, compat: plannerProvider.compat } }
         : {}),

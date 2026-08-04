@@ -43,6 +43,231 @@ export interface PlanOutcome {
   usage: AggregateUsage;
   /** planner 的原始最终输出（审计用） */
   raw: string;
+  /** 结构化协议下的分片清单（观测枚举稳定性用；freeform 协议无此项） */
+  inventory?: ShardInventory;
+}
+
+// ————————— 结构化拆分协议（v1.1 拆分摇摆稳定化,强 planner 证伪后的规则杆） —————————
+
+/**
+ * 分片清单：planner 的输出物只是【事实枚举】——互不依赖的分片 + 可选汇总。
+ * 拆不拆由宿主的 SplitRule 确定性判定,模型在决策点上零裁量
+ * （判断歧义用规则消除,不能用更强判断者掩盖——strongplanner 批的定论）。
+ */
+export interface ShardInventory {
+  shards: {
+    id: string;
+    title: string;
+    pack?: string | null;
+    /** 自包含任务书（与 SubTask.description 同要求） */
+    description: string;
+    acceptance: string[];
+    /** 预计工具调用轮数（模型的粗估,记录为观测数据;规则可选用） */
+    estTurns?: number;
+  }[];
+  /** 可选汇总步：只消费分片产物;存在时构图 dependsOn 全部分片 */
+  join?: { title: string; pack?: string | null; description: string; acceptance: string[] };
+}
+
+/** 拆分规则：分片数 ≥ minShards 且每片 estTurns ≥ minEstTurns → 拆 */
+export interface SplitRule {
+  minShards: number;
+  minEstTurns: number;
+}
+
+/** 默认规则按分片数判定（枚举是最事实化的输出;轮数估计最模糊,默认不设门槛只记录） */
+export const DEFAULT_SPLIT_RULE: SplitRule = { minShards: 2, minEstTurns: 1 };
+
+/**
+ * 宿主规则构图（纯函数,零模型参与）：
+ * - 规则命中 → 分片为并行子任务 + join（若有）dependsOn 全部分片；
+ * - 未命中 → 单体子任务（description=原任务全文,验收=分片+join 验收合并——
+ *   验收清单与拆分方式无关,合并后单 agent 产物仍可逐条核查）。
+ */
+export function buildPlanFromInventory(task: string, inv: ShardInventory, rule: SplitRule): Plan {
+  const split =
+    inv.shards.length >= rule.minShards &&
+    inv.shards.every((s) => (s.estTurns ?? 1) >= rule.minEstTurns);
+  if (!split) {
+    const acceptance = [
+      ...inv.shards.flatMap((s) => s.acceptance),
+      ...(inv.join?.acceptance ?? []),
+    ];
+    return {
+      subtasks: [
+        { id: "s1", title: "整体执行", pack: inv.shards[0]?.pack ?? null, description: task, acceptance, dependsOn: [] },
+      ],
+    };
+  }
+  const shardTasks: SubTask[] = inv.shards.map((s) => ({
+    id: s.id,
+    title: s.title,
+    pack: s.pack ?? null,
+    description: s.description,
+    acceptance: s.acceptance,
+    dependsOn: [],
+  }));
+  const subtasks = [...shardTasks];
+  if (inv.join) {
+    subtasks.push({
+      id: "join",
+      title: inv.join.title,
+      pack: inv.join.pack ?? null,
+      description: inv.join.description,
+      acceptance: inv.join.acceptance,
+      dependsOn: shardTasks.map((s) => s.id),
+    });
+  }
+  return { subtasks };
+}
+
+export async function runStructuredPlanner(
+  cfg: AgentConfig,
+  model: ModelClient,
+  task: string,
+  packs: DomainPack[],
+  rule: SplitRule = DEFAULT_SPLIT_RULE,
+  onEvent?: (event: TurnEvent) => void | Promise<void>,
+): Promise<PlanOutcome> {
+  const drain = async (prompt: string): Promise<{ text: string; usage: AggregateUsage }> => {
+    const loop = new AgentLoop({ ...cfg, maxTurns: Math.min(cfg.maxTurns ?? 50, 12) }, model);
+    let text = "";
+    let usage: AggregateUsage | undefined;
+    for await (const event of loop.run(prompt)) {
+      await onEvent?.(event);
+      switch (event.type) {
+        case "assistant_text":
+          text = event.text;
+          break;
+        case "approval_request":
+          event.respond("deny", "Planner is read-only. Explore with read-only means; do not modify anything.");
+          break;
+        case "done":
+          usage = event.result.usage;
+          break;
+        default:
+          break;
+      }
+    }
+    return { text, usage: usage! };
+  };
+
+  const first = await drain(buildInventoryPrompt(task, packs));
+  let inventory = parseShardInventory(first.text);
+  let raw = first.text;
+  let usage = first.usage;
+
+  if (!inventory && first.text.trim() !== "") {
+    const retry = await drain(buildInventoryReformatPrompt(first.text));
+    usage = sumUsage(usage, retry.usage);
+    const second = parseShardInventory(retry.text);
+    if (second) {
+      inventory = second;
+      raw = retry.text;
+    }
+  }
+
+  if (!inventory) return { usage, raw };
+  return { plan: buildPlanFromInventory(task, inventory, rule), usage, raw, inventory };
+}
+
+function buildInventoryPrompt(task: string, packs: DomainPack[]): string {
+  const packList =
+    packs.length > 0
+      ? packs.map((p) => `- ${p.name}: ${p.description}`).join("\n")
+      : "(无可用领域包——所有 pack 都填 null)";
+  return `你现在的角色是计划单元（结构化拆分协议）。注意：【要不要拆分不由你决定】——那由宿主的确定性规则判定。你的职责只是枚举事实：把任务分解为分片清单。
+
+<task>
+${task}
+</task>
+
+可用领域包（pack 决定工具面与工作纪律;不需要特定领域时填 null）：
+${packList}
+
+枚举纪律：
+1. 分片（shard）= 互不依赖的部分：写集不相交（不写同一文件/目录/独占资源）、无执行顺序约束、可独立验收。只做客观分解,不评判"值不值得拆"。
+2. 若任务本质是一个整体（各部分共享状态或顺序耦合,无法独立执行）,就只输出一个分片,把整个任务写进它的 description。不要为了凑数硬拆。
+3. 每个分片：description 必须自包含（执行 agent 看不到你的上下文,绝对路径/命令/口径写全）;acceptance 可被独立核查者逐条程序化验证;estTurns 为预计工具调用轮数（整数,粗估即可）。
+4. 若各分片结果需要合并,输出 join（汇总步,会在全部分片完成后执行）:它【只消费分片的产物,不得重新推导源数据】——把这一句写进 join 的 description。无需合并则省略 join。
+5. 你的探索仅限只读;不要修改、创建或删除任何东西。
+
+你的最后一条消息必须只包含一个 JSON 对象（不要代码围栏、不要多余文字）：
+{"shards": [{"id": "s1", "title": "短标题", "pack": "包名或 null", "description": "自包含任务书", "acceptance": ["验收点"], "estTurns": 2}], "join": {"title": "...", "pack": null, "description": "...", "acceptance": ["..."]}}
+（join 可省略）`;
+}
+
+function buildInventoryReformatPrompt(raw: string): string {
+  return `你刚才作为计划单元（结构化拆分协议）完成了分片枚举,但最终消息不符合输出契约（必须是单个 JSON 对象）。你的枚举原文如下：
+
+<raw_inventory>
+${raw}
+</raw_inventory>
+
+请把上述内容【原样转写】为契约要求的 JSON——不要重新分解、不要增删分片。
+硬规则：如果原文并不包含具体的分片枚举,你【不得编造】,必须输出 {"shards": []}。
+你的回复必须只包含一个 JSON 对象（不要代码围栏、不要多余文字）：
+{"shards": [{"id": "s1", "title": "...", "pack": "包名或 null", "description": "...", "acceptance": ["..."], "estTurns": 2}], "join": {"title": "...", "pack": null, "description": "...", "acceptance": ["..."]}}`;
+}
+
+/**
+ * 分片清单解析（宽容提取 + fail-closed）：shards 空/description 缺失/id 重复 → undefined。
+ */
+export function parseShardInventory(text: string): ShardInventory | undefined {
+  const candidates: string[] = [];
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/g);
+  if (fenced) for (const f of fenced) candidates.push(f.replace(/```(?:json)?\s*|```/g, ""));
+  const braced = text.match(/\{[\s\S]*\}/);
+  if (braced) candidates.push(braced[0]);
+
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate) as { shards?: unknown; join?: unknown };
+      if (!Array.isArray(parsed.shards) || parsed.shards.length === 0) continue;
+      const shards: ShardInventory["shards"] = [];
+      let valid = true;
+      const seen = new Set<string>();
+      for (const [i, s] of (parsed.shards as Record<string, unknown>[]).entries()) {
+        if (typeof s.description !== "string" || s.description.trim() === "") {
+          valid = false;
+          break;
+        }
+        const id = typeof s.id === "string" && s.id ? s.id : `s${i + 1}`;
+        if (seen.has(id)) {
+          valid = false;
+          break;
+        }
+        seen.add(id);
+        shards.push({
+          id,
+          title: typeof s.title === "string" ? s.title : `分片 ${i + 1}`,
+          pack: typeof s.pack === "string" && s.pack !== "null" ? s.pack : null,
+          description: s.description,
+          acceptance: Array.isArray(s.acceptance) ? s.acceptance.map(String) : [],
+          ...(typeof s.estTurns === "number" && Number.isFinite(s.estTurns)
+            ? { estTurns: Math.max(1, Math.round(s.estTurns)) }
+            : {}),
+        });
+      }
+      if (!valid) continue;
+      let join: ShardInventory["join"];
+      if (parsed.join && typeof parsed.join === "object") {
+        const j = parsed.join as Record<string, unknown>;
+        if (typeof j.description === "string" && j.description.trim() !== "") {
+          join = {
+            title: typeof j.title === "string" ? j.title : "汇总",
+            pack: typeof j.pack === "string" && j.pack !== "null" ? j.pack : null,
+            description: j.description,
+            acceptance: Array.isArray(j.acceptance) ? j.acceptance.map(String) : [],
+          };
+        }
+      }
+      return { shards, ...(join ? { join } : {}) };
+    } catch {
+      // 尝试下一个候选
+    }
+  }
+  return undefined;
 }
 
 export const PLAN_PARSE_FAIL = "planner 输出无法解析为 JSON 计划";

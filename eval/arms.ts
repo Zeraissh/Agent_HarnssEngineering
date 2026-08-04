@@ -32,8 +32,12 @@ export interface Arm {
     /**
      * true = 用 AB_PLANNER_MODEL 指定的（更强）模型当 planner（执行者不变）。
      * 假设：flash 拆分决策 ~50/50 摇摆的稳定化候选。未设该 env 时此臂被跳过。
+     * （已证伪：kimi-k3 拆分率 2/5,摇摆不动且 planner 墙钟 2.5×——摇摆是
+     * 裁量问题非能力问题,见 ab-report-parallel.md 强 planner 批）
      */
     strongPlanner?: boolean;
+    /** "structured" = 结构化拆分协议：planner 只枚举分片,拆不拆由宿主规则判定 */
+    protocol?: "freeform" | "structured";
   };
 }
 
@@ -149,6 +153,14 @@ export const ARMS: Arm[] = [
     mode: "planned",
     configure: (base) => base,
     planned: { concurrency: 3, strongPlanner: true },
+  },
+  {
+    name: "planned-struct-par3",
+    hypothesis:
+      "结构化拆分协议（枚举与决策分离,宿主规则判拆）：拆分摇摆（freeform flash 5/9、kimi 2/5）能否稳定;枚举本身的稳定性（分片数方差）是新观测点。concurrency=3 同口径",
+    mode: "planned",
+    configure: (base) => base,
+    planned: { concurrency: 3, protocol: "structured" },
   },
   {
     name: "fixed-par6",

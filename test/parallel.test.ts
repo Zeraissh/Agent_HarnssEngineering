@@ -7,7 +7,13 @@
 import { describe, expect, it } from "vitest";
 import type Anthropic from "@anthropic-ai/sdk";
 import { setTimeout as delay } from "node:timers/promises";
-import { parsePlan } from "../src/planner.js";
+import {
+  buildPlanFromInventory,
+  DEFAULT_SPLIT_RULE,
+  parsePlan,
+  parseShardInventory,
+  type ShardInventory,
+} from "../src/planner.js";
 import { planParallelWidth, runPlanned } from "../src/orchestrate.js";
 import type { ModelClient, ModelRequest, ModelTurn, Tool } from "../src/types.js";
 import { fakeMessage, textBlock, toolUseBlock } from "./helpers.js";
@@ -84,6 +90,90 @@ describe("parsePlan：dependsOn 解析与依赖图校验", () => {
     expect(
       parsePlan(JSON.stringify({ subtasks: [sub("a", []), sub("a", [])] })),
     ).toBeUndefined();
+  });
+});
+
+describe("结构化拆分协议：清单解析与宿主规则构图", () => {
+  const inv = (n: number, withJoin: boolean, estTurns?: number): ShardInventory => ({
+    shards: Array.from({ length: n }, (_, i) => ({
+      id: `s${i + 1}`,
+      title: `分片${i + 1}`,
+      pack: null,
+      description: `做第 ${i + 1} 份`,
+      acceptance: [`产物 ${i + 1} 正确`],
+      ...(estTurns !== undefined ? { estTurns } : {}),
+    })),
+    ...(withJoin
+      ? { join: { title: "汇总", pack: null, description: "只消费分片产物", acceptance: ["总和正确"] } }
+      : {}),
+  });
+
+  it("规则命中 → 分片并行 + join dependsOn 全部分片", () => {
+    const plan = buildPlanFromInventory("总任务", inv(3, true), DEFAULT_SPLIT_RULE);
+    expect(plan.subtasks).toHaveLength(4);
+    expect(plan.subtasks.slice(0, 3).every((s) => s.dependsOn.length === 0)).toBe(true);
+    expect(plan.subtasks[3]!.id).toBe("join");
+    expect(plan.subtasks[3]!.dependsOn).toEqual(["s1", "s2", "s3"]);
+  });
+
+  it("规则未命中（单分片）→ 单体子任务:description=原任务,验收合并", () => {
+    const plan = buildPlanFromInventory("总任务原文", inv(1, true), DEFAULT_SPLIT_RULE);
+    expect(plan.subtasks).toHaveLength(1);
+    expect(plan.subtasks[0]!.description).toBe("总任务原文");
+    expect(plan.subtasks[0]!.acceptance).toEqual(["产物 1 正确", "总和正确"]);
+  });
+
+  it("minEstTurns 门槛生效", () => {
+    const rule = { minShards: 2, minEstTurns: 2 };
+    expect(buildPlanFromInventory("t", inv(3, false, 1), rule).subtasks).toHaveLength(1);
+    expect(buildPlanFromInventory("t", inv(3, false, 2), rule).subtasks).toHaveLength(3);
+  });
+
+  it("parseShardInventory：合法解析;shards 空/id 重复 → undefined（fail-closed）", () => {
+    const ok = parseShardInventory(
+      '{"shards": [{"id": "a", "description": "d1", "acceptance": [], "estTurns": 2.6}], "join": {"description": "合并", "acceptance": []}}',
+    );
+    expect(ok).toBeDefined();
+    expect(ok!.shards[0]!.estTurns).toBe(3); // 四舍五入取整
+    expect(ok!.join?.title).toBe("汇总"); // title 缺省补
+    expect(parseShardInventory('{"shards": []}')).toBeUndefined();
+    expect(
+      parseShardInventory('{"shards": [{"id":"a","description":"x"},{"id":"a","description":"y"}]}'),
+    ).toBeUndefined();
+  });
+
+  it("runPlanned plannerProtocol=structured：走清单提示词,规则构图后进调度器", async () => {
+    const client = new RoutingClient(async (req) => {
+      const text = reqText(req);
+      if (text.includes("结构化拆分协议")) {
+        return fakeMessage(
+          [
+            textBlock(
+              JSON.stringify({
+                shards: [
+                  { id: "sa", title: "A", description: "任务a", acceptance: [] },
+                  { id: "sb", title: "B", description: "任务b", acceptance: [] },
+                ],
+                join: { title: "汇总", description: "任务j:只消费产物", acceptance: [] },
+              }),
+            ),
+          ],
+          "end_turn",
+        );
+      }
+      if (isPlannerReq(req)) throw new Error("structured 协议不应走 freeform 提示词");
+      if (isVerifierReq(req)) return passVerdict();
+      await delay(5);
+      return fakeMessage([textBlock("done")], "end_turn");
+    });
+    const outcome = await runPlanned(baseConfig, client, "总任务", {
+      plannerProtocol: "structured",
+      concurrency: 2,
+    });
+    expect(outcome.completed).toBe(true);
+    expect(outcome.plan!.subtasks.map((s) => s.id)).toEqual(["sa", "sb", "join"]);
+    expect(outcome.plan!.subtasks[2]!.dependsOn).toEqual(["sa", "sb"]);
+    expect(outcome.planOutcome.inventory?.shards).toHaveLength(2);
   });
 });
 

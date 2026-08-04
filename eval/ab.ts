@@ -55,6 +55,9 @@ interface PlanTrace {
   steps?: { id: string; ms: number; passed: boolean }[];
   /** 因失败停止调度而未执行的子任务 id */
   skipped?: string[];
+  /** structured 协议：枚举的分片数与各自 estTurns（枚举稳定性观测点） */
+  inventoryShards?: number;
+  estTurns?: (number | null)[];
 }
 
 async function main(): Promise<void> {
@@ -236,6 +239,7 @@ async function runArm(
       maxReworks: 1,
       concurrency: arm.planned?.concurrency ?? 1,
       ...(fixedPlan ? { plan: fixedPlan } : {}),
+      ...(arm.planned?.protocol ? { plannerProtocol: arm.planned.protocol } : {}),
       ...(plannerProvider
         ? { plannerModel: { client: plannerProvider.client, compat: plannerProvider.compat } }
         : {}),
@@ -267,6 +271,12 @@ async function runArm(
         passed: s.result.finalPassed,
       })),
       skipped: outcome.skipped.map((s) => s.id),
+      ...(outcome.planOutcome.inventory
+        ? {
+            inventoryShards: outcome.planOutcome.inventory.shards.length,
+            estTurns: outcome.planOutcome.inventory.shards.map((s) => s.estTurns ?? null),
+          }
+        : {}),
     };
     const tok = (u: { inputTokens: number; cacheCreationTokens: number; cacheReadTokens: number; outputTokens: number }) =>
       u.inputTokens + u.cacheCreationTokens + u.cacheReadTokens + u.outputTokens;

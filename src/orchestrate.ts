@@ -3,7 +3,15 @@
  * 主 loop 与 verifier 共用 systemPrompt/tools（缓存前缀一致），上下文互相隔离。
  */
 import { AgentLoop } from "./loop.js";
-import { runPlanner, validatePlanGraph, type Plan, type PlanOutcome, type SubTask } from "./planner.js";
+import {
+  runPlanner,
+  runStructuredPlanner,
+  validatePlanGraph,
+  type Plan,
+  type PlanOutcome,
+  type SplitRule,
+  type SubTask,
+} from "./planner.js";
 import { runVerifier, sumUsage, type VerifyOutcome } from "./verifier.js";
 import type { DomainPack } from "./presets.js";
 import type { AgentConfig, AgentRunResult, AggregateUsage, ModelClient, TurnEvent } from "./types.js";
@@ -216,6 +224,16 @@ export interface PlannedRunOptions {
    * opts.plan 存在时此项无效（计划已注入，planner 不运行）。
    */
   plannerModel?: { client: ModelClient; compat?: boolean };
+  /**
+   * planner 协议（v1.1 拆分摇摆稳定化）：
+   * - "freeform"（默认）：经典单发拆解，拆不拆由模型自由裁量（实测 ~50/50 摇摆，
+   *   强 planner 无效——摇摆是纪律歧义区的裁量问题非能力问题）；
+   * - "structured"：枚举与决策分离——planner 只枚举互不依赖分片（事实清单），
+   *   拆不拆由宿主 splitRule 确定性判定，模型在决策点零裁量。
+   */
+  plannerProtocol?: "freeform" | "structured";
+  /** structured 协议的拆分规则（默认 DEFAULT_SPLIT_RULE：分片≥2 即拆） */
+  splitRule?: SplitRule;
 }
 
 export interface PlannedStepResult {
@@ -265,9 +283,11 @@ export async function runPlanned(
       opts.plannerModel && opts.plannerModel.compat !== undefined
         ? { ...baseCfg, compat: opts.plannerModel.compat }
         : baseCfg;
-    planOutcome = await runPlanner(plannerCfg, plannerClient, task, packs, (e) =>
-      opts.onEvent?.("planner", e),
-    );
+    const onPlannerEvent = (e: TurnEvent) => opts.onEvent?.("planner", e);
+    planOutcome =
+      opts.plannerProtocol === "structured"
+        ? await runStructuredPlanner(plannerCfg, plannerClient, task, packs, opts.splitRule, onPlannerEvent)
+        : await runPlanner(plannerCfg, plannerClient, task, packs, onPlannerEvent);
   }
   if (!planOutcome.plan) {
     return { planOutcome, steps: [], skipped: [], completed: false };
