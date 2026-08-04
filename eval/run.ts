@@ -1,24 +1,33 @@
 /**
- * 评估基线执行器：跑固定 5 用例，记录 通过/轮数/token 成本，生成报告。
+ * 评估基线执行器：全量用例单跑（baseline 口径），记录 通过/轮数/token 成本，生成报告。
  * 用法：npm run eval   （环境变量同 CLI：ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL / AGENT_MODEL）
+ *   EVAL_CASES=write-basic,par-fanout   只跑指定用例（默认全部）
  *
  * 这是回归基线：改动 harness 后重跑，对比 eval/baseline-report.md 看是否退化。
  * 审批一律自动放行（用例本身就是写文件类任务）。
+ *
+ * 口径与 eval/ab.ts 的 baseline 臂对齐（2026-08-04 修化石漂移——本文件自 v0.6 起
+ * 失修,缺 setup/逐用例清场/纯产物评分/rule-precedence,fixture 类用例结果全体无效）：
+ * - 每用例前清空 eval-out 并跑 setup（fixture 供给;ab.ts 的铁律）
+ * - 纯产物评分：无论 stopReason 一律查产物,过程终止态只做元数据
+ * - SYSTEM_PROMPT 含 rule-precedence（2026-07-31 起的 baseline 时代）
  */
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { AgentLoop } from "../src/loop.js";
+import { RULE_PRECEDENCE_DISCIPLINE } from "../src/presets.js";
 import { createModelClientFromEnv } from "../src/provider.js";
-import { bashTool } from "../src/tools/bash.js";
+import { bashTool, SHELL_DESC } from "../src/tools/bash.js";
 import { readFileTool } from "../src/tools/read-file.js";
 import { writeFileTool } from "../src/tools/write-file.js";
 import type { AgentConfig, AgentRunResult, ModelClient } from "../src/types.js";
 import { cases } from "./cases.js";
 
-const SYSTEM_PROMPT = `You are a capable autonomous agent operating in a local working directory.
+const SYSTEM_PROMPT =
+  `You are a capable autonomous agent operating in a local working directory.
 Complete the user's task end to end using the available tools.
 Ground every claim of progress in an actual tool result. When the task is done, summarize what you did in one or two sentences.
-Keep file outputs clean and well-structured. Respond in the language the user used.`;
+Keep file outputs clean and well-structured. Respond in the language the user used.` + RULE_PRECEDENCE_DISCIPLINE;
 
 interface CaseRecord {
   id: string;
@@ -45,27 +54,31 @@ async function main(): Promise<void> {
     maxTokens: process.env.AGENT_MAX_TOKENS ? Number(process.env.AGENT_MAX_TOKENS) : undefined,
     dynamicContext: {
       platform: process.platform,
-      shell: process.platform === "win32" ? "cmd.exe" : "/bin/sh",
+      shell: SHELL_DESC,
       workdir,
     },
   };
 
-  // 干净起跑：清空上一次的产出目录
-  await rm(path.join(workdir, "eval-out"), { recursive: true, force: true });
-  await mkdir(path.join(workdir, "eval-out"), { recursive: true });
+  const caseFilter = process.env.EVAL_CASES?.split(",").map((s) => s.trim());
+  const suite = caseFilter ? cases.filter((c) => caseFilter.includes(c.id)) : cases;
 
   const records: CaseRecord[] = [];
-  for (const evalCase of cases) {
+  for (const evalCase of suite) {
+    // 铁律（与 ab.ts 同款）：每用例前清空产出目录并供给 fixture——
+    // 否则用例互相污染,判定可能"通过"在别的用例遗留的文件上
+    await rm(path.join(workdir, "eval-out"), { recursive: true, force: true });
+    await mkdir(path.join(workdir, "eval-out"), { recursive: true });
+    await evalCase.setup?.(workdir);
+
     process.stdout.write(`[${evalCase.id}] running... `);
     const started = Date.now();
     const result = await runCase(config, client, evalCase.task);
+    // 纯产物评分：无论 stopReason 一律查产物;非 completed 只做备注元数据
+    const artifact = await evalCase.check(workdir);
     const verdict =
       result.stopReason === "completed"
-        ? await evalCase.check(workdir)
-        : {
-            pass: false,
-            note: `run 未完成: ${result.stopReason}${result.error ? ` — ${result.error.message}` : ""}`,
-          };
+        ? artifact
+        : { ...artifact, note: `${artifact.note} [stopReason=${result.stopReason}]` };
     const u = result.usage;
     records.push({
       id: evalCase.id,
