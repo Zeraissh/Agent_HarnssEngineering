@@ -190,6 +190,16 @@
   定论：拆分摇摆是纪律歧义区的自由裁量问题,不是能力问题——判断歧义要用
   确定性规则消除,不能用更强判断者掩盖。下一杆候选：结构化拆分协议
   （先枚举分片+预计轮数,再套确定性规则）,未实施
+- [x] 结构化拆分协议已实施并证实（aebeb60 + struct 批）：runStructuredPlanner
+  （模型只枚举互不依赖分片+estTurns+可选join,拆不拆由宿主 SplitRule 纯函数判定,
+  buildPlanFromInventory 构图）；plannerProtocol freeform|structured、
+  AGENT_PLAN_PROTOCOL、planned-struct-par3 臂。127 单测。
+  **A/B（flash×5）:拆分率 5/5、五次计划形状全同、分片枚举 3/3/3/3/3 零方差——
+  摇摆消失且未迁移到枚举;planner 反而快 2.7×（29s vs 80s）**。
+  协议对照全景:freeform-flash 5/9 / freeform-kimi 2/5 / structured-flash 5/5。
+  杠杆定律补完:歧义消不掉时,把裁量移出模型（宿主规则+模型只出事实）。
+  边界:structured 只表达 fan-out+join 与单体,顺序链仍归 freeform——两协议并存,
+  统一需清单契约扩 deps 字段（候选,未实施）
 
 ## 更远（不承诺顺序）
 
