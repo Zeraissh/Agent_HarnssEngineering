@@ -185,6 +185,7 @@ async function main(): Promise<void> {
             pass: verdict.pass,
             note: verdict.note,
             stopReason: result.stopReason,
+            ...(result.error ? { error: result.error.message.slice(0, 300) } : {}),
             turns,
             tokens,
             wallMs,
