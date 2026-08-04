@@ -302,3 +302,16 @@ describe("verifier 只读命令白名单", () => {
     expect(denied.head).toContain("read-only");
   });
 });
+
+describe("verifier 裁决纪律（rule-precedence 延伸到裁决端）", () => {
+  it("verifier 提示包含按字面裁决条款（案例 #1：+510 被'实质合理'放行的教训）", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([textBlock('{"passed": true, "issues": [], "summary": "ok"}')], "end_turn"),
+    ]);
+    await runVerifier({ ...baseConfig, tools: [] }, model, { task: "t", executorReport: "r" });
+    const prompt = JSON.stringify(model.requests[0]!.messages[0]!.content);
+    expect(prompt).toContain("裁决按字面");
+    expect(prompt).toContain("标准值 vs 实测值");
+    expect(prompt).toContain("不由核查者裁定");
+  });
+});
