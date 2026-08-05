@@ -22,6 +22,9 @@
  *   AGENT_PACK          可选，领域包名（stm32-coding / stm32-debug）：覆盖 system
  *                       prompt、内置工具面、MCP 接入与白名单、验证策略、护栏参数。
  *                       AGENT_PRESET 为兼容别名
+ *   AGENT_READ_ROOTS    可选，额外只读根（分号/路径分隔符分隔的绝对路径）：
+ *                       read_file 可读取这些目录（写类工具不受益）。用于工作区外的
+ *                       领域素材库（如 KiCad 官方符号/封装库）
  *   AGENT_CONTEXT_LIMIT 可选，上下文 token 上限（触发 compact），默认 150000
  *   AGENT_MAX_TOKENS    可选，单次响应输出上限，默认 64000。本地慢速模型建议调低
  *                       （如 4096）以掐断思考螺旋——快速失败优于无限等待
@@ -215,11 +218,18 @@ async function main(): Promise<void> {
     return t;
   });
 
+  // 额外只读根：AGENT_READ_ROOTS（path.delimiter 分隔），read_file 专享
+  const readRoots = (process.env.AGENT_READ_ROOTS ?? "")
+    .split(path.delimiter)
+    .map((s) => s.trim())
+    .filter(Boolean);
+
   const memTools = createMemoryTools(memory);
   const config: AgentConfig = {
     systemPrompt: pack?.systemPrompt ?? SYSTEM_PROMPT,
     tools: [...builtins, ...memTools, ...(mcp?.tools ?? [])],
     workdir: process.cwd(),
+    ...(readRoots.length ? { readRoots } : {}),
     compat,
     contextTokenLimit,
     maxTokens,
@@ -230,6 +240,7 @@ async function main(): Promise<void> {
       platform: process.platform,
       shell: SHELL_DESC,
       workdir: process.cwd(),
+      ...(readRoots.length ? { read_only_roots: readRoots.join("; ") } : {}),
       memory_index: await memory.indexBlock(),
     },
   };

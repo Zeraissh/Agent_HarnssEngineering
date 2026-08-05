@@ -12,6 +12,11 @@ export type JSONSchema = Anthropic.Tool.InputSchema;
 export interface ToolContext {
   /** 工作目录（路径校验的根，所有文件类工具不得逃逸） */
   workdir: string;
+  /**
+   * 额外只读根（可选）：read_file 可读取这些目录下的绝对路径（写类工具不受益）。
+   * 用于领域素材库（如 KiCad 官方符号/封装库）在工作区之外的场景。
+   */
+  readRoots?: string[];
   /** 本次调用的 tool_use_id，用于日志关联 */
   toolUseId: string;
   /** 取消信号：护栏触发或用户中断时，长时间运行的工具应尽快退出 */
@@ -78,6 +83,8 @@ export interface AgentConfig {
   /** 可选：整个 run 的累计 token 上限（input+cacheCreation+cacheRead+output） */
   maxTokensBudget?: number;
   workdir: string;
+  /** 额外只读根（见 ToolContext.readRoots）。CLI 经 AGENT_READ_ROOTS 注入 */
+  readRoots?: string[];
   /**
    * 第三方 Anthropic 兼容端点模式（DeepSeek/GLM/Kimi 等）：
    * 去掉 Claude 专属参数（adaptive thinking / output_config.effort / cache_control）。

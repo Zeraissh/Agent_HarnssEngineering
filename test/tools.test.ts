@@ -38,6 +38,55 @@ describe("resolveInWorkdir", () => {
   });
 });
 
+describe("额外只读根（readRoots，案例 #5 催生）", () => {
+  let readRoot: string;
+
+  beforeAll(async () => {
+    readRoot = await mkdtemp(path.join(tmpdir(), "harness-readroot-"));
+    const w = await writeFileTool.execute(
+      { path: "lib/part.kicad_sym", content: "(kicad_symbol_lib)" },
+      { workdir: readRoot, toolUseId: "tu_seed", signal: new AbortController().signal },
+    );
+    expect(w.isError).toBeUndefined();
+  });
+
+  afterAll(async () => {
+    await rm(readRoot, { recursive: true, force: true });
+  });
+
+  it("read_file 可用绝对路径读取只读根内的文件", async () => {
+    const r = await readFileTool.execute(
+      { path: path.join(readRoot, "lib/part.kicad_sym") },
+      { ...ctx(), readRoots: [readRoot] },
+    );
+    expect(r.content).toBe("(kicad_symbol_lib)");
+  });
+
+  it("未配置只读根时,同一绝对路径仍被拒绝(错误提示不提根)", async () => {
+    await expect(
+      readFileTool.execute({ path: path.join(readRoot, "lib/part.kicad_sym") }, ctx()),
+    ).rejects.toThrow(/escapes(?![\s\S]*read-only roots)/);
+  });
+
+  it("从只读根 .. 逃逸被拒绝,且错误提示列出可用根", async () => {
+    await expect(
+      readFileTool.execute(
+        { path: path.join(readRoot, "..", "sibling.txt") },
+        { ...ctx(), readRoots: [readRoot] },
+      ),
+    ).rejects.toThrow(/read-only roots/);
+  });
+
+  it("write_file 不受只读根影响——根内绝对路径仍被拒绝", async () => {
+    await expect(
+      writeFileTool.execute(
+        { path: path.join(readRoot, "lib/hacked.txt"), content: "x" },
+        { ...ctx(), readRoots: [readRoot] },
+      ),
+    ).rejects.toThrow(/escapes/);
+  });
+});
+
 describe("write_file + read_file", () => {
   it("写入后可读回，自动创建父目录", async () => {
     const w = await writeFileTool.execute({ path: "nested/dir/out.txt", content: "你好 harness" }, ctx());

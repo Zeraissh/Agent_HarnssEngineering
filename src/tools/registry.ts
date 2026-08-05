@@ -46,6 +46,7 @@ export class ToolExecutor {
   constructor(
     private readonly registry: ToolRegistry,
     private readonly workdir: string,
+    private readonly readRoots?: string[],
   ) {}
 
   /**
@@ -119,6 +120,7 @@ export class ToolExecutor {
     try {
       return await tool.execute(block.input, {
         workdir: this.workdir,
+        ...(this.readRoots?.length ? { readRoots: this.readRoots } : {}),
         toolUseId: block.id,
         signal,
       });

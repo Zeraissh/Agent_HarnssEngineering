@@ -71,7 +71,7 @@ export class AgentLoop {
     private readonly model: ModelClient,
   ) {
     for (const tool of cfg.tools) this.registry.register(tool);
-    this.executor = new ToolExecutor(this.registry, cfg.workdir);
+    this.executor = new ToolExecutor(this.registry, cfg.workdir, cfg.readRoots);
     this.context = new DefaultContextManager({
       systemPrompt: cfg.systemPrompt,
       maxTokens: cfg.maxTokens ?? DEFAULTS.maxTokens,
