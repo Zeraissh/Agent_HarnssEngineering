@@ -128,6 +128,41 @@ const STM32_CODING_VERIFY_INSTRUCTIONS = `这是一次【固件代码交付】�
 4. 只读核查 + 构建验证；除构建产物外不要修改任何源文件。
 只要有任何一项对不上（源码缺变更、构建报错、符号缺失），判 passed=false 并在 issues 里写明：期望什么、实际什么、用什么命令得到。`;
 
+// ————————————————————————— python-coding —————————————————————————
+// 案例 #4（stm32-gdb-mcp 探针锁）催生：通用配置面首跑 Python 项目暴露两个缺口——
+// ① 无核查白名单 → verifier 跑不了质量门禁,只能间接证据裁决,还曾因"无实质结论"
+//    fail-closed 触发 22 轮空转返工;② 执行者幻觉 edit_file 工具名（工具面只有
+//    write_file）。本包逐条对症。
+
+const PYTHON_CODING_SYSTEM = `你是一个自主的 Python 工程 agent，在本地 Python 项目中工作。
+
+工程纪律：
+1. 动手前先读：pyproject.toml（依赖、工具配置、质量门禁）、测试布局与共享替身
+   （如 tests/conftest.py）、现有代码风格——改动必须贴合项目既有约定，复用既有测试替身。
+2. 最小改动：只改任务要求的部分，不顺手重构；优先标准库，不引入新依赖（除非任务明说）。
+3. 文件修改用 write_file 整文件写回——工具面里【没有】edit_file/patch 之类的编辑工具。
+   改大文件时先 read_file 取全文，改完整体写回。
+4. 每次实质性修改后必须真实运行项目的质量门禁（以 pyproject.toml 声明为准，典型为
+   python -m pytest / python -m ruff check / python -m mypy），把工具输出当事实——
+   零错误才算通过；测试失败时读输出定位，不要盲改。
+5. 新增行为必须带测试；先跑一遍基线记录通过数，改完确认无回归。
+6. 每个进度声明都要能对应到一条真实的工具返回结果；没核实的就明说，不要编。
+7. 禁止 git 写命令（add/commit/push）——提交由委托方决定。
+
+把结论落到用户要求的产出，并用一两句话总结。用用户使用的语言回答。`;
+
+const PYTHON_CODING_VERIFY_INSTRUCTIONS = `这是一次【Python 代码交付】的核查，不要相信报告，逐项实证：
+1. read_file 读实际源码与测试，逐条核对任务要求的每一处变更真实存在、断言到位
+   （不是只看报告里的代码片段）。
+2. 亲自重跑质量门禁：python -m pytest -q、python -m ruff check .、python -m mypy、
+   python -m compileall（以任务/项目声明的门禁为准），确认退出码与通过数，
+   对比报告声明是否一致（有没有隐瞒的失败/回归）。
+3. 用 git status / git diff 核对改动面：无任务范围外的文件被改动、依赖声明未变
+   （如任务有此要求）。
+4. 只读核查 + 门禁重跑；不要修改任何源文件。
+只要有任何一项对不上（源码缺变更、门禁未过、测试通过数回归），判 passed=false
+并在 issues 里写明：期望什么、实际什么、用什么命令得到。`;
+
 export const PACKS: Record<string, DomainPack> = {
   "stm32-debug": {
     name: "stm32-debug",
@@ -194,6 +229,36 @@ export const PACKS: Record<string, DomainPack> = {
       ],
     },
     guardrails: { maxTurns: 25 },
+  },
+
+  "python-coding": {
+    name: "python-coding",
+    description: "Python 工程：读写源码、pytest/ruff/mypy 质量门禁、交付带测试的变更（不接硬件/MCP）",
+    systemPrompt: PYTHON_CODING_SYSTEM + RULE_PRECEDENCE_DISCIPLINE,
+    builtinTools: ["bash", "read_file", "write_file"],
+    mcp: false, // 纯代码域——需要真机时切 stm32-debug 包
+    verify: {
+      enabled: true,
+      mode: "programmatic",
+      instructions: PYTHON_CODING_VERIFY_INSTRUCTIONS,
+      // 核查必需的最小命令集：质量门禁重跑 + 改动面核对 + 常规只读探查。
+      // 刻意不放行裸 "python"/"python -c"（任意代码执行=写风险）；
+      // "python -m ruff check" 带子命令,防止前缀误放 ruff format（会改文件）。
+      readOnlyCommands: [
+        "python -m pytest",
+        "python -m ruff check",
+        "python -m mypy",
+        "python -m compileall",
+        "python -m pip list",
+        "git status",
+        "git diff",
+        "git log",
+        "ls",
+        "grep",
+        "wc",
+      ],
+    },
+    guardrails: { maxTurns: 30 },
   },
 };
 

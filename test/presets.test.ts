@@ -31,6 +31,26 @@ describe("domain packs", () => {
     expect(p!.builtinTools).not.toContain("fetch_url");
   });
 
+  it("python-coding 包：质量门禁纪律 + 核查白名单 + 不接 MCP（案例 #4 催生）", () => {
+    const p = getPack("python-coding");
+    expect(p).toBeDefined();
+    expect(p!.verify.enabled).toBe(true);
+    expect(p!.verify.mode).toBe("programmatic");
+    // 案例 #4 缺口①：无白名单 → verifier 核查饥饿,fail-closed 空转返工
+    expect(p!.verify.readOnlyCommands).toContain("python -m pytest");
+    expect(p!.verify.readOnlyCommands).toContain("python -m mypy");
+    // 任意代码执行=写风险,不得放行;ruff 必须带 check 子命令防误放 format
+    expect(p!.verify.readOnlyCommands).not.toContain("python");
+    expect(p!.verify.readOnlyCommands).not.toContain("python -c");
+    expect(p!.verify.readOnlyCommands).not.toContain("python -m ruff");
+    // 案例 #4 缺口②：执行者幻觉 edit_file——成文说明工具面只有 write_file
+    expect(p!.systemPrompt).toContain("没有】edit_file");
+    expect(p!.systemPrompt).toContain("python -m pytest");
+    expect(p!.mcp).toBe(false);
+    expect(p!.builtinTools).toContain("bash");
+    expect(p!.builtinTools).not.toContain("fetch_url");
+  });
+
   it("未知包名返回 undefined", () => {
     expect(getPack("does-not-exist")).toBeUndefined();
   });
