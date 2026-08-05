@@ -27,6 +27,30 @@ function detectWindowsBash(): string | undefined {
 }
 
 const WINDOWS_BASH = process.platform === "win32" ? detectWindowsBash() : undefined;
+
+/**
+ * coreutils（wc/grep/sed…）住在 Git\usr\bin，而 `bash -c` 不跑 profile——
+ * PATH 全靠父进程传入。父进程是 Git Bash 时碰巧有；是 PowerShell/任务计划时
+ * 没有 → "wc: command not found"。工具必须自带运行时完整性，不赌宿主环境。
+ */
+function bashEnv(): NodeJS.ProcessEnv | undefined {
+  if (!WINDOWS_BASH) return undefined;
+  // bash 可能在 <root>\usr\bin 或 <root>\bin —— 两种推导都试，existsSync 筛掉错的
+  const binDir = path.dirname(WINDOWS_BASH);
+  const candidates = [
+    binDir,
+    path.join(path.dirname(binDir), "usr", "bin"), // <root>\bin\bash.exe 变体
+    path.join(path.dirname(path.dirname(binDir)), "usr", "bin"), // <root>\usr\bin\bash.exe 变体
+  ]
+    .filter((p, i, arr) => arr.indexOf(p) === i)
+    .filter((p) => existsSync(p));
+  const current = process.env["PATH"] ?? "";
+  const missing = candidates.filter((p) => !current.toLowerCase().includes(p.toLowerCase()));
+  if (missing.length === 0) return undefined;
+  return { ...process.env, PATH: [...missing, current].join(path.delimiter) };
+}
+
+const BASH_ENV = bashEnv();
 /** 实际使用的 shell 描述（宿主注入 dynamicContext 用，保持与工具行为一致） */
 export const SHELL_DESC =
   process.platform !== "win32"
@@ -66,6 +90,7 @@ export const bashTool: Tool = {
           signal: ctx.signal,
           windowsHide: true,
           ...(WINDOWS_BASH ? { shell: WINDOWS_BASH } : {}),
+          ...(BASH_ENV ? { env: BASH_ENV } : {}),
         },
         (err, stdout, stderr) => {
           const combined = [stdout, stderr].filter(Boolean).join("\n--- stderr ---\n");
