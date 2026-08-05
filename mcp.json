@@ -2,7 +2,10 @@
   "servers": {
     "stm32": {
       "command": "D:/Work/MCP_Servers/stm32-gdb-mcp/.venv/Scripts/python.exe",
-      "args": ["-m", "mcp_server.server"],
+      "args": [
+        "-m",
+        "mcp_server.server"
+      ],
       "cwd": "D:/Work/MCP_Servers/stm32-gdb-mcp",
       "env": {
         "PYTHONPATH": "D:/Work/MCP_Servers/stm32-gdb-mcp/src",
@@ -23,7 +26,14 @@
         "read_memory",
         "read_peripheral_register",
         "reset_target",
-        "stop_debug_session"
+        "stop_debug_session",
+        "flash_firmware",
+        "flash_and_run",
+        "run_and_wait",
+        "run_for_duration",
+        "breakpoint",
+        "debug_until",
+        "write_memory"
       ]
     }
   }
