@@ -51,6 +51,23 @@ describe("domain packs", () => {
     expect(p!.builtinTools).not.toContain("fetch_url");
   });
 
+  it("kicad 包：文件生成路线 + kicad-cli 判官白名单 + 不接 MCP（案例 #5 催生）", () => {
+    const p = getPack("kicad");
+    expect(p).toBeDefined();
+    expect(p!.verify.enabled).toBe(true);
+    expect(p!.verify.mode).toBe("programmatic");
+    expect(p!.verify.readOnlyCommands).toContain("kicad-cli");
+    expect(p!.systemPrompt).toContain("s-expression");
+    expect(p!.systemPrompt).toContain("kicad-cli sch erc");
+    expect(p!.systemPrompt).toContain("--schematic-parity");
+    // MCP 创作面实测判死——文件路线不碰 GUI/MCP
+    expect(p!.mcp).toBe(false);
+    expect(p!.systemPrompt).toContain("不使用任何 KiCad MCP");
+    // 库件保真:嵌入官方库原文,只读根挂载
+    expect(p!.systemPrompt).toContain("read_only_roots");
+    expect(p!.verify.instructions).toContain("保真");
+  });
+
   it("未知包名返回 undefined", () => {
     expect(getPack("does-not-exist")).toBeUndefined();
   });

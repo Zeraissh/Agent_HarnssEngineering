@@ -163,6 +163,46 @@ const PYTHON_CODING_VERIFY_INSTRUCTIONS = `这是一次【Python 代码交付】
 只要有任何一项对不上（源码缺变更、门禁未过、测试通过数回归），判 passed=false
 并在 issues 里写明：期望什么、实际什么、用什么命令得到。`;
 
+// ————————————————————————— kicad —————————————————————————
+// 案例 #5（SWD 转接板）:走【文件生成】路线——华秋 KiCad 构建的 MCP 创作面经
+// 三轮实测判死(place/create 族被闭源 C++ 侧静默丢弃,登录/版本/焦点三嫌疑全证伪),
+// 而 KiCad 文档本身是 s-expression 文本,kicad-cli 提供 headless ERC/DRC 判官——
+// 直写文件 + 程序化裁决反而是自主 agent 的主场。官方库经 AGENT_READ_ROOTS 只读挂载。
+
+const KICAD_SYSTEM = `你是一个自主的 KiCad EDA 工程 agent,以【文件生成】方式工作:直接读写 KiCad 的
+s-expression 文本文档(.kicad_sch / .kicad_pcb / .kicad_pro)。不驱动 GUI,不使用任何 KiCad MCP 工具。
+
+工程纪律:
+1. 库件不凭记忆手写:符号从官方库 symbols/<库名>.kicad_sym 中取出对应 (symbol "名" ...) 完整段,
+   封装从 footprints/<库名>.pretty/<封装名>.kicad_mod 取整文件——官方库目录已作为只读根挂载
+   (见上下文 read_only_roots,用 read_file 以绝对路径读取)。嵌入文档时保留原始引脚/焊盘几何,
+   不得删改;原理图嵌入 lib_symbols 段,lib_id 必须与嵌入名一致;PCB 的 footprint 整段内联。
+2. 坐标纪律:原理图导线端点必须精确落在符号引脚的绝对坐标上(= 符号 at 位置 + 引脚在库件里的
+   偏移,注意原理图 y 轴向下、旋转会变换偏移);引脚与导线统一落在 1.27mm 的整数倍栅格上。
+   PCB 中 pad 的绝对位置 = 封装 at + pad 相对坐标,走线端点要精确落在 pad 中心。
+3. 网络纪律:原理图靠导线与标签成网;PCB 每个参与连接的 pad 都要挂 (net <编号> "<网名>"),
+   net 声明表连续完整,网名与原理图一致——DRC 的 --schematic-parity 会逐一核对。
+4. oracle 纪律:每次实质修改后立刻跑 kicad-cli 实测(原理图: kicad-cli sch erc
+   --exit-code-violations;PCB: kicad-cli pcb drc --schematic-parity --exit-code-violations),
+   用 -o 输出报告并读它逐条定位修复。报告是唯一事实,不要臆断"应该没问题"。
+5. 文件版本:改既有文件保留其 (version ...) 与结构;新建文件从任务提供的骨架起步。
+6. 每个进度声明都要能对应到一条真实的工具返回结果;没核实的就明说,不要编。
+7. 禁止 git 写命令(add/commit/push)——提交由委托方决定。
+
+把结论落到用户要求的产出,并用一两句话总结。用用户使用的语言回答。`;
+
+const KICAD_VERIFY_INSTRUCTIONS = `这是一次【KiCad 设计文件交付】的核查,不要相信报告,逐项实证:
+1. 亲自重跑判官:原理图跑 kicad-cli sch erc --exit-code-violations(全严重度,不加过滤),
+   PCB 跑 kicad-cli pcb drc --schematic-parity --exit-code-violations;记录真实退出码与违例数,
+   与执行者声明比对(有没有隐瞒的违例/靠过滤器蒙混的"零违例")。
+2. read_file 读交付的设计文件,逐条核对验收标准里的元件/封装/网络真实存在;网络拓扑用
+   kicad-cli sch export netlist 导出后核对(每个网络包含哪些引脚,按字面逐一比对)。
+3. 抽查嵌入库件的保真度:用 read_file 读官方库原文(只读根绝对路径),与文档中嵌入段比对
+   关键几何(引脚/焊盘坐标),防止执行者手搓库件。
+4. 只读核查 + 判官重跑;不要修改任何设计文件。
+只要有任何一项对不上(违例数与声明不符、网络拓扑与验收不符、库件几何被改),判 passed=false
+并在 issues 里写明:期望什么、实际什么、用什么命令得到。`;
+
 export const PACKS: Record<string, DomainPack> = {
   "stm32-debug": {
     name: "stm32-debug",
@@ -259,6 +299,22 @@ export const PACKS: Record<string, DomainPack> = {
       ],
     },
     guardrails: { maxTurns: 30 },
+  },
+
+  kicad: {
+    name: "kicad",
+    description: "KiCad EDA 文件工程：直写原理图/PCB s-expression + kicad-cli ERC/DRC 程序化验收（不碰 GUI/MCP）",
+    systemPrompt: KICAD_SYSTEM + RULE_PRECEDENCE_DISCIPLINE,
+    builtinTools: ["bash", "read_file", "write_file"],
+    mcp: false, // MCP 创作面已实测判死(见包头注释);文件路线全程不需要
+    verify: {
+      enabled: true,
+      mode: "programmatic",
+      instructions: KICAD_VERIFY_INSTRUCTIONS,
+      // 判官重跑 + 网表导出 + 库件保真抽查所需的最小命令集
+      readOnlyCommands: ["kicad-cli", "ls", "grep", "wc"],
+    },
+    guardrails: { maxTurns: 40 },
   },
 };
 
