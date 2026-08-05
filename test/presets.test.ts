@@ -68,6 +68,20 @@ describe("domain packs", () => {
     expect(p!.verify.instructions).toContain("保真");
   });
 
+  it("ts-coding 包：vitest/tsc 双门禁白名单 + 不接 MCP（案例 #7 催生）", () => {
+    const p = getPack("ts-coding");
+    expect(p).toBeDefined();
+    expect(p!.verify.enabled).toBe(true);
+    expect(p!.verify.mode).toBe("programmatic");
+    expect(p!.verify.readOnlyCommands).toContain("npx vitest run");
+    expect(p!.verify.readOnlyCommands).toContain("npx tsc");
+    // 裸 npx 不放行(可执行任意包);工具面成文说明沿用 python-coding 教训
+    expect(p!.verify.readOnlyCommands).not.toContain("npx");
+    expect(p!.systemPrompt).toContain("没有】edit_file");
+    expect(p!.systemPrompt).toContain("npx vitest run");
+    expect(p!.mcp).toBe(false);
+  });
+
   it("未知包名返回 undefined", () => {
     expect(getPack("does-not-exist")).toBeUndefined();
   });
