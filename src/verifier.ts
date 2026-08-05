@@ -16,6 +16,17 @@ export interface Verdict {
   passed: boolean;
   issues: string[];
   summary: string;
+  /**
+   * 查不了的验收项（rubric-verifier,案例 #6 催生）：verifier 缺乏核查手段时
+   * 不猜测、不因"查不了"判 failed——逐条自陈缺什么手段,移交委托方复核。
+   * 不影响 passed,不触发返工。缺省 = 无(旧裁决兼容)。
+   */
+  unverified?: string[];
+  /**
+   * 主观/评分表意见：好不好、清不清晰这类判断自陈判法后写在这里。
+   * 不影响 passed,不触发返工——主观裁决权在委托方(案例 #1/#6 定论)。
+   */
+  advisory?: string[];
 }
 
 export interface VerifyOptions {
@@ -35,6 +46,12 @@ export interface VerifyOptions {
    * v0.9/v1.0 实证：没有它，coding 域的 verifier 只能靠间接证据（读 .map）通过。
    */
   readOnlyCommands?: string[];
+  /**
+   * 主观评分表（可选,rubric 模式的载体）：任务的主要验收是主观质量时,
+   * 把评分维度写在这里。verifier 按表逐维度评估,意见进 advisory,
+   * 不影响 passed——客观 side 条款照常按字面进 issues。
+   */
+  rubric?: string;
 }
 
 export interface VerifyOutcome {
@@ -188,7 +205,7 @@ ${raw}
 请把上述结论【原样转写】为契约要求的 JSON——不要重新核查、不要改变结论内容。
 硬规则：如果原文并不包含明确的通过/失败判定（比如只是核查过程的引言、半截输出），你【不得编造】结论，必须输出 {"passed": false, "issues": ["核查未产出明确结论"], "summary": "原始输出无实质结论"}。
 你的回复必须只包含一个 JSON 对象（不要代码围栏、不要多余文字）：
-{"passed": true/false, "issues": ["发现的问题，每条一个字符串；通过则为空数组"], "summary": "一句话结论"}`;
+{"passed": true/false, "issues": ["客观项不符之处；无则空数组"], "unverified": ["缺手段核查的项；原文没有则省略"], "advisory": ["主观意见；原文没有则省略"], "summary": "一句话结论"}`;
 }
 
 function buildVerifierPrompt(opts: VerifyOptions): string {
@@ -210,9 +227,14 @@ ${opts.executorReport}
    即使你认为行为"实质合理/方向正确/持续递增也算递增"，也必须判 failed 并把
    【标准值 vs 实测值】写进 issues。你可以在 summary 里注明你怀疑标准本身有误，
    但裁决不得因此放行；标准的对错由任务的委托方裁定，不由核查者裁定。
-${opts.readOnlyCommands?.length ? `\n你的 bash 只放行以下核查命令（前缀匹配，禁止重定向/链式）：${opts.readOnlyCommands.join("、")}。用它们独立重新推导（如亲自重新构建、查符号），不要只依赖间接证据。\n` : ""}${opts.verifyInstructions ? `\n领域核查方法：\n${opts.verifyInstructions}\n` : ""}
+5. 诚实降级：某条验收项你【缺乏手段】核查时（工具被拒、材料读不到、本质上不可程序化判定），
+   不得猜测、也不得仅因"查不了"判 failed——把它写进 unverified，每条注明缺什么手段，
+   移交委托方复核。主观质量类判断（好不好、清不清晰、是否优雅）写进 advisory 并自陈判法。
+   passed 只由你【实际核查过的客观项】决定：客观项全过 = true（哪怕有 unverified/advisory），
+   任一客观项不符 = false。
+${opts.readOnlyCommands?.length ? `\n你的 bash 只放行以下核查命令（前缀匹配，禁止重定向/链式）：${opts.readOnlyCommands.join("、")}。用它们独立重新推导（如亲自重新构建、查符号），不要只依赖间接证据。\n` : ""}${opts.verifyInstructions ? `\n领域核查方法：\n${opts.verifyInstructions}\n` : ""}${opts.rubric ? `\n主观评分表（rubric）——本任务的主要验收是主观质量,按下表逐维度评估,每条意见进 advisory,格式"维度 | 结论 | 依据与判法"。评分表意见不影响 passed(主观裁决权在委托方),客观 side 条款照常按字面进 issues：\n${opts.rubric}\n` : ""}
 你的最后一条消息必须只包含一个 JSON 对象（不要代码围栏、不要多余文字）：
-{"passed": true/false, "issues": ["发现的问题，每条一个字符串；通过则为空数组"], "summary": "一句话结论"}`;
+{"passed": true/false, "issues": ["客观项不符之处，每条一个字符串；无则空数组"], "unverified": ["缺手段核查的项及原因；无则省略"], "advisory": ["主观意见/评分；无则省略"], "summary": "一句话结论"}`;
 }
 
 /** 解析失败的哨兵 issue 文本（fail-closed 裁决的第一条 issue 恒为它） */
@@ -236,10 +258,15 @@ export function parseVerdict(text: string): Verdict {
     try {
       const parsed = JSON.parse(candidate) as Partial<Verdict>;
       if (typeof parsed.passed === "boolean") {
+        // 可选三值扩展字段仅在非空时保留——旧裁决形状(三字段)原样兼容
+        const unverified = Array.isArray(parsed.unverified) ? parsed.unverified.map(String) : [];
+        const advisory = Array.isArray(parsed.advisory) ? parsed.advisory.map(String) : [];
         return {
           passed: parsed.passed,
           issues: Array.isArray(parsed.issues) ? parsed.issues.map(String) : [],
           summary: typeof parsed.summary === "string" ? parsed.summary : "",
+          ...(unverified.length ? { unverified } : {}),
+          ...(advisory.length ? { advisory } : {}),
         };
       }
     } catch {

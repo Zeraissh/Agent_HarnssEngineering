@@ -32,6 +32,32 @@ describe("parseVerdict（宽容解析，fail-closed）", () => {
     expect(v.passed).toBe(false);
     expect(v.issues[0]).toContain("无法解析");
   });
+
+  it("三值裁决：unverified/advisory 可选字段解析（rubric-verifier,案例 #6）", () => {
+    const v = parseVerdict(
+      '{"passed": true, "issues": [], "unverified": ["行数需 wc 复核（bash 被拒）"], "advisory": ["提炼度 | 良 | 抽查三节均为跨报告合并"], "summary": "客观项全过"}',
+    );
+    expect(v).toEqual({
+      passed: true,
+      issues: [],
+      unverified: ["行数需 wc 复核（bash 被拒）"],
+      advisory: ["提炼度 | 良 | 抽查三节均为跨报告合并"],
+      summary: "客观项全过",
+    });
+  });
+
+  it("三值裁决：旧三字段形状不产生多余键（向后兼容）", () => {
+    const v = parseVerdict('{"passed": true, "issues": [], "summary": "ok"}');
+    expect("unverified" in v).toBe(false);
+    expect("advisory" in v).toBe(false);
+  });
+
+  it("三值裁决：非数组的扩展字段被忽略,空数组不保留", () => {
+    const v = parseVerdict(
+      '{"passed": false, "issues": ["x"], "unverified": "不是数组", "advisory": [], "summary": "s"}',
+    );
+    expect(v).toEqual({ passed: false, issues: ["x"], summary: "s" });
+  });
 });
 
 describe("runVerifier", () => {
@@ -313,5 +339,59 @@ describe("verifier 裁决纪律（rule-precedence 延伸到裁决端）", () => 
     expect(prompt).toContain("裁决按字面");
     expect(prompt).toContain("标准值 vs 实测值");
     expect(prompt).toContain("不由核查者裁定");
+  });
+});
+
+describe("rubric-verifier（三值裁决协议,案例 #6 催生）", () => {
+  it("诚实降级条款默认在提示中：查不了进 unverified,主观进 advisory,passed 只由客观项决定", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([textBlock('{"passed": true, "issues": [], "summary": "ok"}')], "end_turn"),
+    ]);
+    await runVerifier({ ...baseConfig, tools: [] }, model, { task: "t", executorReport: "r" });
+    const prompt = JSON.stringify(model.requests[0]!.messages[0]!.content);
+    expect(prompt).toContain("诚实降级");
+    expect(prompt).toContain("unverified");
+    expect(prompt).toContain("advisory");
+    expect(prompt).toContain("实际核查过的客观项");
+  });
+
+  it("传入 rubric 时评分表注入提示,并声明意见不影响 passed", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([textBlock('{"passed": true, "issues": [], "summary": "ok"}')], "end_turn"),
+    ]);
+    await runVerifier({ ...baseConfig, tools: [] }, model, {
+      task: "t",
+      executorReport: "r",
+      rubric: "维度A:清晰度——读者能否不看原始报告获得结论",
+    });
+    const prompt = JSON.stringify(model.requests[0]!.messages[0]!.content);
+    expect(prompt).toContain("主观评分表");
+    expect(prompt).toContain("维度A:清晰度");
+    expect(prompt).toContain("主观裁决权在委托方");
+  });
+
+  it("runVerified：advisory/unverified 不触发返工——passed=true 即通过,扩展字段保留", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([textBlock("完成")], "end_turn"), // main
+      fakeMessage(
+        [
+          textBlock(
+            '{"passed": true, "issues": [], "unverified": ["行数待复核"], "advisory": ["提炼度 | 良 | 判法自陈"], "summary": "客观项全过"}',
+          ),
+        ],
+        "end_turn",
+      ), // verifier——若误触返工,脚本会因消息耗尽而失败
+    ]);
+    const outcome = await runVerified(
+      { systemPrompt: "sys", tools: [], workdir: process.cwd() },
+      model,
+      "任务",
+      { verifyRubric: "维度A:提炼度" },
+    );
+    expect(outcome.finalPassed).toBe(true);
+    expect(outcome.reworks).toBe(0);
+    const v = outcome.verifications[0]!.verdict;
+    expect(v.unverified).toEqual(["行数待复核"]);
+    expect(v.advisory).toEqual(["提炼度 | 良 | 判法自陈"]);
   });
 });

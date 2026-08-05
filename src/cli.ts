@@ -258,16 +258,20 @@ async function main(): Promise<void> {
   // 裁决信号浮出（案例 #1 改进项）：boot_count 规格 bug 曾藏在 passed=true 的
   // 裁决 summary 里——宿主只看布尔就会漏。最终结果块无论通过与否都展示
   // summary 与 issues（通过时 issues 以 ⚠ 警示色呈现,是"通过但有话要说"的信号）。
+  // 三值裁决扩展（案例 #6 → rubric-verifier）：unverified=查不了移交委托方,
+  // advisory=主观意见——两者都不影响 passed,但必须站上决策面。
   const printVerdictSignal = (
     indent: string,
     finalPassed: boolean,
-    verdict: { summary: string; issues: string[] } | undefined,
+    verdict: { summary: string; issues: string[]; unverified?: string[]; advisory?: string[] } | undefined,
   ): void => {
     if (!verdict) return;
     if (verdict.summary) console.log(c.magenta(`${indent}[verifier] ${verdict.summary}`));
     for (const issue of verdict.issues) {
       console.log(finalPassed ? c.yellow(`${indent}⚠ ${issue}`) : c.red(`${indent}- ${issue}`));
     }
+    for (const item of verdict.unverified ?? []) console.log(c.yellow(`${indent}⋯ 待委托方复核: ${item}`));
+    for (const item of verdict.advisory ?? []) console.log(c.magenta(`${indent}◈ 评审意见: ${item}`));
   };
 
   // verifier 过程渲染：洋红色 [verifier] 前缀，与主 agent 视觉区分
@@ -405,6 +409,7 @@ async function main(): Promise<void> {
           verify: {
             ...(p?.verify.instructions ? { verifyInstructions: p.verify.instructions } : {}),
             ...(p?.verify.readOnlyCommands ? { verifyReadOnlyCommands: p.verify.readOnlyCommands } : {}),
+            ...(p?.verify.rubric ? { verifyRubric: p.verify.rubric } : {}),
             ...(verifierProvider
               ? { verifierModel: { client: verifierProvider.client, compat: verifierProvider.compat } }
               : {}),
@@ -472,6 +477,7 @@ async function main(): Promise<void> {
     const outcome = await runVerified(config, modelClient, task, {
       ...(pack?.verify.instructions ? { verifyInstructions: pack.verify.instructions } : {}),
       ...(pack?.verify.readOnlyCommands ? { verifyReadOnlyCommands: pack.verify.readOnlyCommands } : {}),
+      ...(pack?.verify.rubric ? { verifyRubric: pack.verify.rubric } : {}),
       ...(verifierProvider
         ? { verifierModel: { client: verifierProvider.client, compat: verifierProvider.compat } }
         : {}),

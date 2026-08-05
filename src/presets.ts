@@ -35,11 +35,18 @@ export interface DomainPack {
     /**
      * 核查形态（决定结论的可信度等级）：
      * - "programmatic"：产出可独立重新推导/实测比对（行数、寄存器、构建结果）——高可信；
-     * - "rubric"：主观质量按评分表判（文案、审美）——低一档，裁决只能当参考。
+     * - "rubric"：主观质量为主——评分表经 verify.rubric 注入,意见进裁决的 advisory
+     *   字段(自陈判法),【不影响 passed、不触发返工】,最终裁决权在委托方;
+     *   客观 side 条款照常按字面判进 issues(案例 #6 定型的三值裁决协议)。
      */
     mode: "programmatic" | "rubric";
     /** 领域核查方法：注入 verifier 提示，说明如何独立复核 */
     instructions?: string;
+    /**
+     * 主观评分表（rubric 模式的载体）：逐维度写清"评什么、怎么评"。
+     * verifier 按表评估进 advisory;programmatic 包通常不需要。
+     */
+    rubric?: string;
     /**
      * verifier 的 bash 只读命令白名单（前缀匹配；禁止重定向/链式）。
      * "独立重新推导"在需要工具链的领域离不开命令（重新构建、nm 查符号）——

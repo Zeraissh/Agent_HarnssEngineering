@@ -30,6 +30,8 @@ export interface VerifiedRunOptions {
   verifyInstructions?: string;
   /** verifier 的 bash 只读命令白名单（领域包声明），见 VerifyOptions.readOnlyCommands */
   verifyReadOnlyCommands?: string[];
+  /** 主观评分表（rubric 模式载体），见 VerifyOptions.rubric——意见进 advisory,不触发返工 */
+  verifyRubric?: string;
   /**
    * 独立的 verifier 模型（默认与执行者共用同一个 client）。
    * A/B 研究结论：verifier 必须 ≥ 执行者强度，否则假阴性返工是净负——
@@ -148,6 +150,7 @@ async function runVerifierWithEvents(
       executorReport,
       ...(opts.verifyInstructions ? { verifyInstructions: opts.verifyInstructions } : {}),
       ...(opts.verifyReadOnlyCommands ? { readOnlyCommands: opts.verifyReadOnlyCommands } : {}),
+      ...(opts.verifyRubric ? { rubric: opts.verifyRubric } : {}),
     },
     (event) => {
       if (event.type === "assistant_text" || event.type === "done") return;
