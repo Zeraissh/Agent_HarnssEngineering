@@ -244,6 +244,21 @@ async function main(): Promise<void> {
     }
   };
 
+  // 裁决信号浮出（案例 #1 改进项）：boot_count 规格 bug 曾藏在 passed=true 的
+  // 裁决 summary 里——宿主只看布尔就会漏。最终结果块无论通过与否都展示
+  // summary 与 issues（通过时 issues 以 ⚠ 警示色呈现,是"通过但有话要说"的信号）。
+  const printVerdictSignal = (
+    indent: string,
+    finalPassed: boolean,
+    verdict: { summary: string; issues: string[] } | undefined,
+  ): void => {
+    if (!verdict) return;
+    if (verdict.summary) console.log(c.magenta(`${indent}[verifier] ${verdict.summary}`));
+    for (const issue of verdict.issues) {
+      console.log(finalPassed ? c.yellow(`${indent}⚠ ${issue}`) : c.red(`${indent}- ${issue}`));
+    }
+  };
+
   // verifier 过程渲染：洋红色 [verifier] 前缀，与主 agent 视觉区分
   let verifierStarted = false;
   const renderVerifierEvent = (event: TurnEvent) => {
@@ -430,10 +445,8 @@ async function main(): Promise<void> {
             : c.red("✘ 未通过");
         const dur = step ? c.dim(` ${(step.durationMs / 1000).toFixed(1)}s`) : "";
         console.log(`${mark} ${sub.id} ${sub.title}${sub.pack ? c.dim(` [${sub.pack}]`) : ""}${dur}`);
-        if (step && !step.result.finalPassed) {
-          for (const issue of step.result.verifications.at(-1)?.verdict.issues ?? []) {
-            console.log(c.red(`    - ${issue}`));
-          }
+        if (step) {
+          printVerdictSignal("    ", step.result.finalPassed, step.result.verifications.at(-1)?.verdict);
         }
       }
       const serialMs = outcome.steps.reduce((acc, s) => acc + s.durationMs, 0);
@@ -462,10 +475,9 @@ async function main(): Promise<void> {
         await renderEvent(event);
       },
     });
-    const v = outcome.verifications.at(-1)?.verdict;
     const tag = outcome.finalPassed ? c.green("✔ 核查通过") : c.red("✘ 核查未通过");
     console.log(`\n${tag}${outcome.reworks ? c.dim(`（返工 ${outcome.reworks} 轮）`) : ""}`);
-    if (v && !outcome.finalPassed) for (const issue of v.issues) console.log(c.red(`  - ${issue}`));
+    printVerdictSignal("  ", outcome.finalPassed, outcome.verifications.at(-1)?.verdict);
   } else {
     const loop = new AgentLoop(config, modelClient);
     for await (const event of loop.run(task)) {
