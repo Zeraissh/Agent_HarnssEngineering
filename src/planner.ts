@@ -31,6 +31,13 @@ export interface SubTask {
    * 兼容旧计划：整份计划都没写 dependsOn 时推断为线性链（保持 v1.0 语义）。
    */
   dependsOn: string[];
+  /**
+   * 子任务级独占资源标签（可选）：设置时【覆盖】包级 resources。
+   * 动机（双探针实战）：资源本质是仪器实例级的——两块板的调试子任务同属
+   * stm32-debug 包，包级 swd-probe 标签会让它们互斥；只有任务上下文知道
+   * 哪个子任务用哪只探针（如 ["probe-stlink"] vs ["probe-daplink"]）。
+   */
+  resources?: string[];
 }
 
 export interface Plan {
@@ -399,6 +406,9 @@ export function parsePlan(text: string): Plan | undefined {
           dependsOn: Array.isArray(rawDeps)
             ? [...new Set(rawDeps.map(String).map((d) => d.trim()).filter((d) => d !== ""))]
             : [],
+          ...(Array.isArray(s.resources) && s.resources.length > 0
+            ? { resources: s.resources.map(String) }
+            : {}),
         });
       }
       if (!valid) continue;

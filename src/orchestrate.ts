@@ -353,7 +353,7 @@ export async function runPlanned(
       })
       .finally(() => {
         running.delete(sub.id);
-        for (const r of resolvedById.get(sub.id)!.resources ?? []) heldResources.delete(r);
+        for (const r of sub.resources ?? resolvedById.get(sub.id)!.resources ?? []) heldResources.delete(r);
       });
 
   while (true) {
@@ -361,8 +361,10 @@ export async function runPlanned(
       const ready = queue.filter((s) => s.dependsOn.every((d) => passed.has(d)));
       for (const sub of ready) {
         if (running.size >= concurrency) break;
-        // 独占资源互斥：与在飞子任务共享任一资源标签的，本轮不发射（资源释放后自然就绪）
-        const resources = resolvedById.get(sub.id)!.resources ?? [];
+        // 独占资源互斥：与在飞子任务共享任一资源标签的，本轮不发射（资源释放后自然就绪）。
+        // 子任务级声明覆盖包级默认（资源是仪器实例级的——双探针场景两个 debug 子任务
+        // 各绑一只探针,包级同标签会误伤真并行）
+        const resources = sub.resources ?? resolvedById.get(sub.id)!.resources ?? [];
         if (resources.some((r) => heldResources.has(r))) continue;
         for (const r of resources) heldResources.add(r);
         queue.splice(queue.indexOf(sub), 1);

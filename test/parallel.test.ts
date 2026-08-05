@@ -463,3 +463,46 @@ describe("独占资源互斥（v1.1.1：领域包声明 resources，同标签强
     expect(maxActive()).toBe(2);
   });
 });
+
+describe("子任务级资源覆盖（双探针场景：同包不同仪器实例）", () => {
+  it("同包（包级同标签）但子任务各绑一只探针 → 真并发", async () => {
+    let active = 0;
+    let maxActive = 0;
+    const client = new RoutingClient(async (req) => {
+      if (isVerifierReq(req)) return passVerdict();
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await delay(20);
+      active -= 1;
+      const which = reqText(req).includes("板A") ? "A" : "B";
+      return fakeMessage([textBlock(`摘要${which}`)], "end_turn");
+    });
+    const outcome = await runPlanned(baseConfig, client, "总任务", {
+      concurrency: 2,
+      // 宿主注入计划：同包(资源解析给包级 swd-probe),子任务级覆盖为各自探针
+      plan: {
+        subtasks: [
+          { id: "a", title: "板A", description: "板A验证", acceptance: [], dependsOn: [], resources: ["probe-stlink"] },
+          { id: "b", title: "板B", description: "板B验证", acceptance: [], dependsOn: [], resources: ["probe-daplink"] },
+        ],
+      },
+      resolveSubtask: () => ({ cfg: baseConfig, resources: ["swd-probe"] }), // 包级默认:同标签
+    });
+    expect(outcome.completed).toBe(true);
+    expect(maxActive).toBe(2); // 子任务级覆盖生效:未被包级同标签误伤
+  });
+
+  it("parsePlan 透传 resources 字段", () => {
+    const p = parsePlan(
+      JSON.stringify({
+        subtasks: [
+          { id: "a", description: "x", acceptance: [], dependsOn: [], resources: ["r1"] },
+          { id: "b", description: "y", acceptance: [], dependsOn: [] },
+        ],
+      }),
+    );
+    expect(p).toBeDefined();
+    expect(p!.subtasks[0]!.resources).toEqual(["r1"]);
+    expect(p!.subtasks[1]!.resources).toBeUndefined();
+  });
+});
