@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agent Harness — Web UI</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+
+<!-- 侧栏：运行列表 -->
+<aside class="sidebar">
+  <div class="sidebar-header">📋 运行列表</div>
+  <div id="run-list" class="run-list">
+    <div class="run-list-empty">加载中…</div>
+  </div>
+</aside>
+
+<!-- 主区 -->
+<main class="main">
+  <!-- 提交栏 -->
+  <form id="submit-form" class="submit-bar" autocomplete="off">
+    <textarea id="task-input" placeholder="输入任务描述…" rows="1"></textarea>
+    <label>
+      <input type="checkbox" id="verify-toggle" />
+      <span>核查</span>
+    </label>
+    <button type="submit" class="btn btn--primary" id="submit-btn">提交</button>
+  </form>
+
+  <!-- 内容区 -->
+  <div id="main-area" class="content-area">
+    <div class="empty-state">
+      <div class="empty-icon">📋</div>
+      <p>尚无运行。提交一个任务开始。</p>
+    </div>
+  </div>
+</main>
+
+<script type="module" src="/app.js"></script>
+<script type="module">
+/**
+ * Harness Web UI — 主控制器（浏览器端入口）。
+ * 连接 DOM 渲染与纯 reducer，管理 SSE 订阅与 HTTP 调用。
+ */
+import {
+  createInitialState,
+  reduceEvent,
+  markApprovalResolved,
+  renderRunList,
+  renderRunDetail,
+  renderEmptyState,
+} from "/app.js";
+
+// ---- 状态 ----
+/** @type {Map<string, import('/app.js').RunState>} */
+const runStates = new Map();
+let selectedRunId = /** @type {string|null} */ (null);
+let runs = /** @type {{runId:string, task:string, status:string, verify:boolean}[]} */ ([]);
+let eventSources = /** @type {Map<string, EventSource>} */ (new Map());
+
+// ---- DOM 引用 ----
+const submitForm = /** @type {HTMLFormElement} */ (document.getElementById("submit-form"));
+const taskInput = /** @type {HTMLTextAreaElement} */ (document.getElementById("task-input"));
+const verifyToggle = /** @type {HTMLInputElement} */ (document.getElementById("verify-toggle"));
+const submitBtn = /** @type {HTMLButtonElement} */ (document.getElementById("submit-btn"));
+
+// ---- 加载运行列表 ----
+async function loadRuns() {
+  try {
+    const res = await fetch("/api/runs");
+    if (!res.ok) return;
+    runs = await res.json();
+    renderRunList(runs, selectedRunId, selectRun);
+  } catch {
+    // 服务器未就绪时静默
+  }
+}
+
+// ---- 选择运行 ----
+function selectRun(runId) {
+  if (selectedRunId === runId) return;
+  selectedRunId = runId;
+  renderRunList(runs, selectedRunId, selectRun);
+
+  const existing = runStates.get(runId);
+  if (existing) {
+    renderRunDetail(existing, approvalCallbacks(runId));
+    return;
+  }
+
+  // 初始化 state 并订阅 SSE
+  const info = runs.find((r) => r.runId === runId);
+  if (!info) return;
+  const state = createInitialState(runId, info.task, info.verify);
+  runStates.set(runId, state);
+  renderRunDetail(state, approvalCallbacks(runId));
+
+  subscribeSSE(runId);
+}
+
+// ---- SSE 订阅 ----
+function subscribeSSE(runId) {
+  // 避免重复订阅
+  if (eventSources.has(runId)) return;
+
+  const es = new EventSource(`/api/runs/${runId}/events`);
+  eventSources.set(runId, es);
+
+  es.addEventListener("message", (msg) => {
+    try {
+      const sseEvent = JSON.parse(msg.data);
+      const state = runStates.get(runId);
+      if (!state) return;
+      const next = reduceEvent(state, sseEvent);
+      runStates.set(runId, next);
+
+      // 仅当该 run 仍在查看时重渲染
+      if (selectedRunId === runId) {
+        renderRunDetail(next, approvalCallbacks(runId));
+      }
+
+      // 完成后刷新运行列表
+      if (next.status === "done") {
+        loadRuns();
+      }
+    } catch {
+      // 解析失败静默
+    }
+  });
+
+  es.addEventListener("error", () => {
+    es.close();
+    eventSources.delete(runId);
+    // 刷新列表以获取最终状态
+    loadRuns();
+  });
+}
+
+// ---- 审批回调 ----
+function approvalCallbacks(runId) {
+  return {
+    onAllow(toolUseId) {
+      postApproval(runId, toolUseId, "allow");
+    },
+    onDeny(toolUseId) {
+      // 无理由也拒绝
+      postApproval(runId, toolUseId, "deny", "");
+    },
+    onDenyReason(toolUseId, reason) {
+      postApproval(runId, toolUseId, "deny", reason);
+    },
+  };
+}
+
+async function postApproval(runId, toolUseId, decision, reason) {
+  try {
+    const res = await fetch(`/api/runs/${runId}/approvals/${toolUseId}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision, reason }),
+    });
+    if (!res.ok) return;
+    // 本地标记已处理
+    const state = runStates.get(runId);
+    if (state) {
+      const next = markApprovalResolved(
+        state,
+        toolUseId,
+        decision === "allow" ? "allowed" : "denied",
+        reason,
+      );
+      runStates.set(runId, next);
+      if (selectedRunId === runId) {
+        renderRunDetail(next, approvalCallbacks(runId));
+      }
+    }
+  } catch {
+    // 网络错误静默
+  }
+}
+
+// ---- 提交任务 ----
+submitForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const task = taskInput.value.trim();
+  if (!task) return;
+
+  submitBtn.disabled = true;
+  submitBtn.textContent = "提交中…";
+
+  try {
+    const verify = verifyToggle.checked;
+    const res = await fetch("/api/runs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task, verify }),
+    });
+    if (!res.ok) {
+      alert("提交失败");
+      return;
+    }
+    const { runId } = await res.json();
+
+    // 初始化本地 state
+    const state = createInitialState(runId, task, verify);
+    runStates.set(runId, state);
+
+    // 加入列表并选中
+    runs.unshift({ runId, task, status: "running", verify });
+    selectedRunId = runId;
+    renderRunList(runs, selectedRunId, selectRun);
+    renderRunDetail(state, approvalCallbacks(runId));
+
+    // 订阅 SSE
+    subscribeSSE(runId);
+
+    // 清空输入
+    taskInput.value = "";
+  } catch (err) {
+    alert("提交失败：" + (err.message ?? "网络错误"));
+  } finally {
+    submitBtn.disabled = false;
+    submitBtn.textContent = "提交";
+  }
+});
+
+// ---- 启动 ----
+loadRuns();
+// 定时刷新列表（轻量轮询，替代 WebSocket）
+setInterval(loadRuns, 3000);
+</script>
+
+</body>
+</html>
