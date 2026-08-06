@@ -214,6 +214,49 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
   const runs = new Map<string, StoredRun>();
 
+  /**
+   * 全局生命周期流的订阅者（V-10）。
+   *
+   * 存在的理由：侧栏此前靠 `setInterval(loadRuns, 3000)` 保持新鲜，而那次轮询会
+   * 整体重建列表——实测焦点停在运行项上 3.6 秒后就变成 BODY。改成推送之后，
+   * 侧栏只在真的有变化时更新，而且更新走键控补丁，不再摧毁焦点。
+   * 这条流只广播"哪个 run 变了"，不带事件载荷——详情仍走 per-run 的 SSE。
+   */
+  const lifecycleClients = new Set<ServerResponse>();
+
+  /**
+   * 列表项摘要。V-14：元数据由服务端算好，侧栏不再依赖"这个 run 是否被订阅过"
+   * ——此前核查结论一列只有打开过的 run 才有值。
+   */
+  function runSummary(r: StoredRun): Record<string, unknown> {
+    return {
+      runId: r.id,
+      task: r.task,
+      status: r.status,
+      verify: r.verify,
+      createdAt: r.createdAt,
+      finishedAt: r.finishedAt ?? null,
+      packName: pack?.name ?? null,
+      stopReason: r.mainStopReason ?? null,
+      finalPassed: r.outcome?.finalPassed ?? null,
+      reworks: r.outcome?.reworks ?? null,
+      pendingApprovals: r.pendingApprovals.size,
+      verdict: r.outcome?.verifications.at(-1)?.verdict ?? null,
+    };
+  }
+
+  function broadcastLifecycle(type: string, run: StoredRun): void {
+    if (lifecycleClients.size === 0) return;
+    const frame = `data: ${JSON.stringify({ type, run: runSummary(run) })}\n\n`;
+    for (const client of lifecycleClients) {
+      try {
+        client.write(frame);
+      } catch {
+        lifecycleClients.delete(client);
+      }
+    }
+  }
+
   // 思考预算档：非法值当场抛错而不是静默退回默认——静默降级会让"我明明设了 max"
   // 与实际行为长期不一致（口径与 src/cli.ts 一致，CLI 是 exit 1，库里改成抛错）
   const effortEnv = process.env.AGENT_EFFORT;
@@ -346,6 +389,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         at: sseEvent.ts,
         respond: event.respond,
       });
+      // 侧栏的"待审批"计数靠这条推送保鲜，不必再轮询
+      broadcastLifecycle("run_updated", run);
     }
 
     // 段计数在 done 之后递增：done 自身属于刚结束的那一段
@@ -433,6 +478,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       try { client.end(); } catch { /* ignore */ }
     }
     run.sseClients.clear();
+
+    broadcastLifecycle("run_finished", run);
   }
 
   /** 启动一次不带核查的运行 */
@@ -646,6 +693,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     | { type: "static"; filePath: string }
     | { type: "harness" }
     | { type: "runsList" }
+    | { type: "lifecycleStream" }
     | { type: "createRun" }
     | { type: "events"; runId: string }
     | { type: "approval"; runId: string; toolUseId: string }
@@ -665,6 +713,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
     if (method === "GET" && url === "/api/runs") {
       return { type: "runsList" };
+    }
+
+    if (method === "GET" && url === "/api/stream") {
+      return { type: "lifecycleStream" };
     }
 
     if (method === "POST" && url === "/api/runs") {
@@ -709,24 +761,30 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       case "runsList": {
         // V-13：按 createdAt 降序。此前是插入顺序（最旧在上），而客户端提交后把
         // 新任务 unshift 到顶——3 秒后一轮询它就从顶跳到底。
-        // V-14：补齐列表元数据，让侧栏不再依赖"这个 run 是否被订阅过"。
         const list = [...runs.values()]
           .sort((a, b) => b.createdAt - a.createdAt)
-          .map((r) => ({
-            runId: r.id,
-            task: r.task,
-            status: r.status,
-            verify: r.verify,
-            createdAt: r.createdAt,
-            finishedAt: r.finishedAt ?? null,
-            packName: pack?.name ?? null,
-            stopReason: r.mainStopReason ?? null,
-            finalPassed: r.outcome?.finalPassed ?? null,
-            reworks: r.outcome?.reworks ?? null,
-            pendingApprovals: r.pendingApprovals.size,
-            verdict: r.outcome?.verifications.at(-1)?.verdict ?? null,
-          }));
+          .map(runSummary);
         return json(res, 200, list);
+      }
+
+      case "lifecycleStream": {
+        res.writeHead(200, {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive",
+        });
+        // 先发一份当前快照，订阅者不必再额外拉一次 /api/runs
+        res.write(
+          `data: ${JSON.stringify({
+            type: "snapshot",
+            runs: [...runs.values()].sort((a, b) => b.createdAt - a.createdAt).map(runSummary),
+          })}\n\n`,
+        );
+        lifecycleClients.add(res);
+        req.on("close", () => {
+          lifecycleClients.delete(res);
+        });
+        return;
       }
 
       case "createRun": {
@@ -761,6 +819,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           segmentIndex: 0,
         };
         runs.set(id, run);
+        broadcastLifecycle("run_created", run);
 
         if (verify) {
           void startVerifiedRun(run);
@@ -827,6 +886,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         });
         run.respondedToolUseIds.add(pending.toolUseId);
         run.pendingApprovals.delete(key!);
+        broadcastLifecycle("run_updated", run);
 
         // V-02：决策进事件流。此前只写在浏览器内存里，刷新后已允许的审批
         // 会显示成"已过期"——审计记录必须由服务端持有，任意客户端重放一致

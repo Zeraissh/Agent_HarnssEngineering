@@ -7,3 +7,5 @@ eval/lab-profiles.json
 eval/ab-log.jsonl
 .agent-memory/
 eval/transcripts/
+logs/
+scratch/

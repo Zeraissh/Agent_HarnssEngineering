@@ -22,7 +22,7 @@
 | V-07 成本口径错误 | P1 | R2 | ✅ | `run_end` 带 `executionUsage`（全部执行轮合计）与单列的 `verificationUsage`；用量脚注改为「执行（全部轮次合计）/ 核查 / 返工 N 轮 / 缓存命中」，运行中则显示「本段」并明示口径。契约测试 v2-9 断言 `executionUsage.turns` 严格大于末轮 done 的 turns |
 | V-08 中间轮裁决丢失 | P1 | R2 | ✅ | `src/orchestrate.ts` 新增可选 `onVerification(round, outcome)`（纯附加、零行为变化，获批的唯一 src 破例），服务端据此逐轮发 `verification` 事件；`run_end` 另带全量 `verifications[]` + `reworks` + `finalPassed` 供重放兜底。契约测试 v2-9 断言两轮裁决俱在且首轮 issues 可见 |
 | V-09 usage 事件被当噪声丢弃 | P1 | R2 | ✅ | `usage` 事件进 `usageByTurn`，不再落 default 分支渲染成空的 `• usage` 行；新增纯函数 `deriveContextUsage`。**口径要害**：水位分子取最近一轮输入而非累计——`ContextManager.noteUsage` 是赋值不是累加，按累计画会得到永远即将压缩却永不压缩的假警报。三条 reducer 测试锁住该口径 |
-| V-10 直播重渲染摧毁焦点与输入 | P1 | R3 | ⬜ | |
+| V-10 直播重渲染摧毁焦点与输入 | P1 | R3 | ✅ | 新增 `core/diff.js`（`diffKeyed`，LCS 求最小 move）+ `dom/patch.js`（`patchList`/`appendOnly`/`setText`/`keepScrollAnchored`）+ `core/batch.js`（事件折叠）。详情页改骨架 + 分区补丁，侧栏与审批栏改键控补丁，日志改只追加，3 秒轮询换成 `GET /api/stream` 推送。**浏览器实证**（脚本化模型实例）：拒绝理由输入在直播重渲染后值与光标位置均保持（`"路径不在只读白名单内"` / `selectionStart=5`）、输入框与卡片是同一节点对象；日志 56→59 条时前 56 个节点全部复用；贴底时跟随、上翻时不被拽回；侧栏焦点连续 38 秒不失焦（旧实现 3.6 秒即变 `BODY`）。**实测抓到并修掉一个自造 bug**：首版只用 `requestAnimationFrame`，而隐藏标签页不触发 rAF——事件在队列里无限堆积、界面永不更新，后台标签页等审批的人一直等不到卡片，等于换个门重造了 V-01 那类失效；已改为隐藏时退回定时器 + `visibilitychange` 立即补齐，并以 `createBatcher` 常驻回归锁死 |
 | V-11 日志混排且来源不可辨 | P1 | R2/R4 | ⬜ | |
 | V-12 工具结果显示 ID / 耗时不可读 | P1 | R4 | ⬜ | |
 | V-13 列表顺序不一致 | P1 | R2 | ✅ | `/api/runs` 按 createdAt 降序，与客户端乐观 unshift 一致（此前新任务 3 秒后会从列表顶跳到底）；契约测试 v2-10 断言最新在前 |
@@ -48,8 +48,8 @@
 | AC2-07 数字带口径 / executionUsage | ✅ | 契约测试 v2-9 + reducer 测试「run_end 带来 executionUsage / reworks / finalPassed」；脚注文案明写"执行（全部轮次合计）/ 核查 / 本段" |
 | AC2-08 逐轮裁决实时可见 | ✅ | `onVerification` + `verification` 事件；契约测试 v2-9 与 reducer 测试各一条 |
 | AC2-09 上下文水位口径正确 | ✅ | `deriveContextUsage` 三条测试，其中「水位口径 = 最近一轮输入 / 上限，不是全 run 累计」直接锁住那个会产生假警报的错误口径 |
-| AC2-10 焦点与输入在直播中存活 | ⬜ | |
-| AC2-11 1000 事件单帧 < 16ms | ⬜ | |
+| AC2-10 焦点与输入在直播中存活 | ✅ | 浏览器实证：拒绝理由值与光标存活、输入框与审批卡为同一节点对象、侧栏焦点 38 秒不失焦（旧实现 3.6 秒即死）；jsdom 回归锁 6 条（含节点同一性用 `toBe` 而非 `toEqual`、渲染幂等、滚动跟随双向） |
+| AC2-11 1000 事件单帧 < 16ms | ⚠️ 折叠次数已锁，耗时未量化 | `createBatcher` 测试断言 1000 条事件只触发 1 次 flush（锁死 O(n²) 不回归）；日志侧 1000 行渲染后再来一条只新增 1 个节点、首节点仍是原对象。**尚缺**：真实浏览器的单帧毫秒数测量，留 R6 |
 | AC2-12 日志分段与来源可辨 | ⬜ | |
 | AC2-13 首屏四决定因素可读 | ⬜ | |
 | AC2-14 双主题对比度门禁 | ⬜ | |
@@ -65,6 +65,22 @@
 | v2 基线（`632fdb8`） | 225 | 16 文件 |
 | R1 正确性 | 244 | +19：reducer 11（段终止/审批审计/六值/幂等）+ 服务端契约 6 + 既有 2 条随协议演进 |
 | R2 数据面 | 256 | +12：服务端契约 5（白名单到达 verifier / harness 快照 / 成本与逐轮裁决 / 列表口径 / delta 通道）+ reducer 7（水位口径 / 成本 / 逐轮裁决 / 工具名回填） |
+| R3 细粒度渲染 | 285 | +29：新增 `test/ui-patch.test.ts` 24（`diffKeyed` 6 / `patchList`·`appendOnly` 5 / 滚动锚定 2 / `createBatcher` 4 / 详情页与侧栏状态存活 7）+ 服务端契约 1（`/api/stream`）+ 由源码扫描升级为真实 DOM 断言 4 |
+
+## R3 把两条静态断言升级为真实 DOM 断言
+
+`test/ui-app.test.ts` 的 #29 与 #32b 原本是扫 `app.js` 源码找 `role="option"` /
+`aria-labelledby` 字面量。渲染层改用 `setAttribute` 之后字面量消失，测试随之失败。
+**做法是升级而不是删除**——迁到 `test/ui-a11y.test.ts` 在渲染结果上查真实节点，
+并逐条确认新断言严格强于旧断言：
+
+| 旧（源码扫描） | 新（真实 DOM） | 强在哪 |
+|---|---|---|
+| `app.js` 含 `role="option"` / `tabindex=` / `aria-selected=` | 渲染后每个 `.run-item` 三者俱全，**且 `aria-selected` 真的落在被选中那一项上**、父容器为 `listbox` | 字面量在场 ≠ 属性挂对了对象；选中态是动态值，字符串扫描永远看不见 |
+| `app.js` 含 `role="tabpanel"` 邻近 `aria-labelledby` | 每个 tab 的 `aria-controls` 指向面板、面板 `aria-labelledby` 反指当前 tab，**且切换标签后引用跟着换、`getElementById` 不悬空** | 反向引用一旦悬空，屏幕阅读器报不出面板名——这正是 s3d 那两处结构缺陷的形态 |
+
+另新增「重渲染复用节点：选中态更新但 DOM 节点是同一个」与 roving tabindex 的 DOM 断言。
+这与 s3d 的教训同源：字符串断言抓不住父子契约，也抓不住动态属性。
 
 ## 顺带修正的测试仪器缺陷
 

@@ -167,6 +167,85 @@ describe("axe 自动扫描：空态 / 列表 / 详情三种画面零 violations"
   });
 });
 
+describe("运行列表的 ARIA 语义（真实 DOM 断言，取代原先的源码字符串扫描）", () => {
+  const runs = [
+    { runId: "run-1", task: "创建 demo.txt", status: "done", verify: true },
+    { runId: "run-2", task: "另一个任务", status: "running", verify: false },
+  ];
+
+  it("运行列表项的 role / tabindex / aria-selected 在真实 DOM 上成立", () => {
+    renderRunList(runs, "run-1", () => {}, new Map());
+    const items = [...document.querySelectorAll("#run-list .run-item")];
+    expect(items).toHaveLength(2);
+    for (const el of items) {
+      expect(el.getAttribute("role")).toBe("option");
+      expect(el.getAttribute("tabindex")).toBe("0");
+      expect(el.hasAttribute("aria-selected")).toBe(true);
+    }
+    // 字符串扫描抓不住的部分：选中态必须真的落在被选中那一项上
+    expect(items[0].getAttribute("aria-selected")).toBe("true");
+    expect(items[1].getAttribute("aria-selected")).toBe("false");
+    expect(document.getElementById("run-list")!.getAttribute("role")).toBe("listbox");
+  });
+
+  it("重渲染复用节点：选中态更新但 DOM 节点是同一个（焦点得以保持）", () => {
+    renderRunList(runs, "run-1", () => {}, new Map());
+    const before = document.querySelector("#run-list .run-item")!;
+    (before as HTMLElement).focus();
+
+    // 模拟侧栏刷新（此前每 3 秒整体重建一次，焦点随之被摧毁）
+    renderRunList(runs, "run-2", () => {}, new Map());
+    const after = document.querySelector("#run-list .run-item")!;
+
+    expect(after).toBe(before); // 同一个节点对象，不是"长得一样"
+    expect(document.activeElement).toBe(before);
+    expect(after.getAttribute("aria-selected")).toBe("false"); // 选中态确实更新了
+  });
+
+  it("列表变空时摘掉 listbox 身份（空壳 listbox 是 critical 违规）", () => {
+    renderRunList(runs, "run-1", () => {}, new Map());
+    renderRunList([], null, () => {}, new Map());
+    const listEl = document.getElementById("run-list")!;
+    expect(listEl.hasAttribute("role")).toBe(false);
+    expect(listEl.querySelectorAll(".run-item")).toHaveLength(0);
+  });
+});
+
+describe("标签三件套（真实 DOM 断言，取代原先的源码字符串扫描）", () => {
+  it("tab 三件套在真实 DOM 上闭环，且 aria-labelledby 随选中项更新", () => {
+    renderRunDetail(buildRichState(), { activeTab: "overview" });
+
+    const tablist = document.querySelector('[role="tablist"]')!;
+    const panel = document.querySelector('[role="tabpanel"]')!;
+    expect(tablist).toBeTruthy();
+
+    // 每个 tab 都指向那个面板，且面板反向指回当前选中的 tab
+    const tabs = [...document.querySelectorAll('[role="tab"]')];
+    expect(tabs.length).toBeGreaterThanOrEqual(2);
+    for (const t of tabs) expect(t.getAttribute("aria-controls")).toBe("tab-content");
+    expect(panel.getAttribute("aria-labelledby")).toBe("tab-overview");
+    // 反向引用不得悬空——字符串扫描看不见这一点
+    expect(document.getElementById(panel.getAttribute("aria-labelledby")!)).toBeTruthy();
+
+    // 切到另一个标签后，引用必须跟着换
+    renderRunDetail(buildRichState(), { activeTab: "log" });
+    const panel2 = document.querySelector('[role="tabpanel"]')!;
+    expect(panel2.getAttribute("aria-labelledby")).toBe("tab-log");
+    expect(document.getElementById("tab-log")).toBeTruthy();
+  });
+
+  it("roving tabindex：仅选中项可 Tab 进入，其余为 -1", () => {
+    renderRunDetail(buildRichState(), { activeTab: "overview" });
+    const tabs = [...document.querySelectorAll('[role="tab"]')];
+    const active = tabs.filter((t) => t.getAttribute("tabindex") === "0");
+    expect(active).toHaveLength(1);
+    expect(active[0].getAttribute("aria-selected")).toBe("true");
+    for (const t of tabs.filter((t) => t !== active[0])) {
+      expect(t.getAttribute("tabindex")).toBe("-1");
+    }
+  });
+});
+
 describe("扫描器双向自检：植入已知缺陷必须被抓到", () => {
   // 项目纪律：checker 本身要能证明"它抓得住"，否则全绿可能只是没在看
   it("植入 s3d 的真实缺陷（role=option 脱离 listbox）→ aria-required-parent 必须报错", async () => {

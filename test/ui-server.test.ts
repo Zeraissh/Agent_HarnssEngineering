@@ -1385,4 +1385,78 @@ describe("ui-server", () => {
     // seq 仍然连续（delta 不占号）
     events.forEach((e: any, i: number) => expect(e.seq).toBe(i));
   });
+
+  // ---- V-10 全局生命周期流（取代 3 秒轮询）----
+  it("v2-12. /api/stream 先发快照，再推 run_created / run_finished", async () => {
+    handle = createUiServer({
+      modelClient: new FakeModelClient([fakeMessage([textBlock("done")], "end_turn")]),
+      tools: [autoTool("noop")],
+      workdir: process.cwd(),
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+
+    const res = await fetch(`${base}/api/stream`);
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    const seen: Record<string, unknown>[] = [];
+
+    // 后台读取循环：不能用 Promise.race(read, timer) 去"轮询"——输掉比赛的那个
+    // read 仍会 resolve，它带回的 chunk 就被静默丢弃了（首版这么写，结果只收到快照）
+    let buffer = "";
+    const pumping = (async () => {
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) return;
+          buffer += decoder.decode(value, { stream: true });
+          let idx: number;
+          while ((idx = buffer.indexOf("\n\n")) !== -1) {
+            const block = buffer.slice(0, idx);
+            buffer = buffer.slice(idx + 2);
+            const line = block.split("\n").find((l) => l.startsWith("data:"));
+            if (line) seen.push(JSON.parse(line.slice(5).trimStart()));
+          }
+        }
+      } catch {
+        // reader.cancel() 会让 read 抛错，属正常收尾
+      }
+    })();
+
+    const waitFor = async (pred: () => boolean, timeoutMs = 4000) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline && !pred()) {
+        await new Promise((r) => setTimeout(r, 25));
+      }
+    };
+
+    try {
+      await waitFor(() => seen.length > 0, 1000);
+      // 订阅即得当前快照——客户端不必额外拉一次 /api/runs
+      expect((seen[0] as any).type).toBe("snapshot");
+      expect(Array.isArray((seen[0] as any).runs)).toBe(true);
+
+      await fetch(`${base}/api/runs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task: "lifecycle", verify: false }),
+      });
+      await waitFor(() => seen.some((s: any) => s.type === "run_finished"));
+    } finally {
+      await reader.cancel().catch(() => {});
+      await pumping;
+    }
+
+    const created = seen.find((s: any) => s.type === "run_created") as any;
+    const finished = seen.find((s: any) => s.type === "run_finished") as any;
+    expect(created).toBeDefined();
+    expect(created.run.task).toBe("lifecycle");
+    expect(created.run.status).toBe("running");
+    expect(finished).toBeDefined();
+    expect(finished.run.status).toBe("done");
+    // 列表元数据由服务端算好：侧栏不再依赖"这个 run 是否被订阅过"
+    expect(finished.run.finishedAt).not.toBeNull();
+    expect(finished.run).toHaveProperty("stopReason");
+    expect(finished.run).toHaveProperty("pendingApprovals");
+  });
 });

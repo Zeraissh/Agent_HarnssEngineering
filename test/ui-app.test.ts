@@ -1190,15 +1190,13 @@ describe("AC5 WCAG 对比度 (R-06)", () => {
 
 // ---- AC6: 无障碍语义静态断言 (R-05) ----
 describe("AC6 无障碍语义 (R-05)", () => {
-  it("29. 运行列表项含 tabindex / role / aria-selected", () => {
-    const appPath = join(__dirname, "..", "ui", "public", "app.js");
-    const appSrc = readFileSync(appPath, "utf-8");
-
-    // renderRunList 渲染输出中必须包含
-    expect(appSrc).toContain('role="option"');
-    expect(appSrc).toContain("tabindex=");
-    expect(appSrc).toContain("aria-selected=");
-  });
+  // 29 已升级为真实 DOM 断言，见 test/ui-a11y.test.ts 的
+  // 「运行列表项的 role / tabindex / aria-selected 在真实 DOM 上成立」。
+  //
+  // 原因与 s3d 的教训同源：这里原本是扫 app.js 源码找 `role="option"` 字面量。
+  // 渲染层改为 setAttribute 之后字面量消失，但语义反而更完整（选中态会随
+  // aria-selected 实时更新）。字符串断言既抓不住父子契约，也抓不住动态属性——
+  // 换成在渲染结果上查真实节点，是加强不是削弱。
 
   it("30. 任务输入框有关联 label", () => {
     const htmlPath = join(__dirname, "..", "ui", "public", "index.html");
@@ -1241,11 +1239,16 @@ describe("AC6 无障碍语义 (R-05)", () => {
     expect(html).not.toMatch(/id="run-list"[^>]*role="listbox"/);
   });
 
-  it("32b. tab 三件套完整：tablist / tab(aria-controls) / tabpanel(aria-labelledby)", () => {
+  // 32b 已升级为真实 DOM 断言，见 test/ui-a11y.test.ts 的
+  // 「tab 三件套在真实 DOM 上闭环，且 aria-labelledby 随选中项更新」。
+  //
+  // 渲染层改为分区补丁后，aria-labelledby 由 setAttribute 动态写入，源码里不再有
+  // 字面量。而 DOM 断言能多守住一件字符串扫描永远看不见的事：**切换标签后
+  // tabpanel 的反向引用有没有跟着换**——引用一旦悬空，屏幕阅读器就报不出面板名。
+  it("32b-src. tab 静态标记仍在（tablist / aria-controls / 稳定 id）", () => {
     const appSrc = readFileSync(join(__dirname, "..", "ui", "public", "app.js"), "utf-8");
     expect(appSrc).toContain('role="tablist"');
     expect(appSrc).toContain('aria-controls="tab-content"');
-    expect(appSrc).toMatch(/role="tabpanel"[\s\S]{0,80}aria-labelledby=|aria-labelledby=[\s\S]{0,80}role="tabpanel"/);
     // 每个 tab 有稳定 id 供 tabpanel 反向引用
     expect(appSrc).toContain('id="tab-${tab}"');
   });

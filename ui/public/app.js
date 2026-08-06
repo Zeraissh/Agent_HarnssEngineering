@@ -1,3 +1,18 @@
+import { createBatcher } from "./core/batch.js";
+import { diffKeyed, signature } from "./core/diff.js";
+import {
+  patchList,
+  appendOnly,
+  setText,
+  setAttr,
+  setClass,
+  keepScrollAnchored,
+  withFocusPreserved,
+} from "./dom/patch.js";
+
+// 桶文件转出：现有 import 路径（测试与控制器都从 /app.js 取）保持不变
+export { createBatcher, diffKeyed, signature, patchList, appendOnly, setText, setAttr, setClass, keepScrollAnchored, withFocusPreserved };
+
 /**
  * Harness Web UI — 纯函数 reducer + DOM 渲染层。
  *
@@ -834,56 +849,78 @@ export function renderRunList(runs, selectedRunId, onSelect, metaMap) {
   // 有 option 子项时才挂 listbox 身份
   listEl.setAttribute("role", "listbox");
   listEl.setAttribute("aria-label", "运行列表");
-  listEl.innerHTML = runs
-    .map(
-      (r) => {
-        const meta = metaMap ? metaMap.get(r.runId) : null;
-        const isSelected = r.runId === selectedRunId;
-        // R-08: 时间与耗时
-        const timeStr = meta ? formatTimeShort(meta.startTime) : "";
-        const durationStr = meta && meta.duration != null ? formatDuration(meta.duration) : "";
-        // R-08: 核查结论
-        let verdictLabel = "";
-        if (meta && meta.verdictConclusion === "passed") verdictLabel = '<span class="run-item-verdict run-item-verdict--pass">✓</span>';
-        else if (meta && meta.verdictConclusion === "failed") verdictLabel = '<span class="run-item-verdict run-item-verdict--fail">✗</span>';
-        else if (meta && meta.verdictConclusion === "pending") verdictLabel = '<span class="run-item-verdict run-item-verdict--pending">⋯</span>';
+  // 空态留下的占位节点不属于 patchList 管辖，先清掉
+  const placeholder = listEl.querySelector(".run-list-empty");
+  if (placeholder) placeholder.remove();
 
-        return `
-    <div class="run-item ${isSelected ? "run-item--selected" : ""}"
-         data-run-id="${esc(r.runId)}"
-         role="option"
-         tabindex="0"
-         aria-selected="${isSelected}">
-      <div class="run-item-status">
-        <span class="status-dot ${r.status === "running" ? "status-dot--live" : ""}"></span>
-        ${r.verify ? '<span class="verify-badge">核查</span>' : ""}
-        ${verdictLabel}
-        <span class="run-item-state-label">${r.status === "running" ? "运行中" : "已完成"}</span>
-      </div>
-      <div class="run-item-task">${esc(r.task)}</div>
-      <div class="run-item-meta">
-        ${timeStr ? `<span class="run-item-time">${esc(timeStr)}</span>` : ""}
-        ${durationStr ? `<span class="run-item-duration">${esc(durationStr)}</span>` : ""}
-      </div>
-    </div>`;
-      },
-    )
-    .join("");
-
-  // 绑定点击 + 键盘事件
-  listEl.querySelectorAll(".run-item").forEach((el) => {
-    el.addEventListener("click", () => {
-      const id = el.getAttribute("data-run-id");
-      if (id) onSelect(id);
-    });
-    el.addEventListener("keydown", (e) => {
-      if (e.key === "Enter" || e.key === " ") {
-        e.preventDefault();
-        const id = el.getAttribute("data-run-id");
-        if (id) onSelect(id);
-      }
-    });
+  // V-10：键控补丁而非 innerHTML 重建。侧栏每 3 秒被刷新一次，整体重建会把
+  // 停在运行项上的键盘焦点直接摧毁（实测 3.6s 后 activeElement 变成 BODY）。
+  // 复用节点后，焦点、hover 态、CSS 过渡都得以保持。
+  patchList(listEl, runs, {
+    key: (r) => r.runId,
+    create: (r) => {
+      const el = document.createElement("div");
+      el.className = "run-item";
+      el.setAttribute("role", "option");
+      el.setAttribute("tabindex", "0");
+      el.setAttribute("data-run-id", r.runId);
+      el.innerHTML =
+        '<div class="run-item-status">' +
+        '<span class="status-dot"></span>' +
+        '<span class="verify-badge" hidden>核查</span>' +
+        '<span class="run-item-verdict" hidden></span>' +
+        '<span class="run-item-state-label"></span>' +
+        "</div>" +
+        '<div class="run-item-task"></div>' +
+        '<div class="run-item-meta">' +
+        '<span class="run-item-time"></span>' +
+        '<span class="run-item-duration"></span>' +
+        "</div>";
+      el.addEventListener("click", () => onSelect(r.runId));
+      el.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onSelect(r.runId);
+        }
+      });
+      updateRunItem(el, r, metaMap, selectedRunId);
+      return el;
+    },
+    update: (el, r) => updateRunItem(el, r, metaMap, selectedRunId),
   });
+}
+
+/** 就地更新一个运行项的可变部分（不碰节点本身） */
+function updateRunItem(el, r, metaMap, selectedRunId) {
+  const meta = metaMap ? metaMap.get(r.runId) : null;
+  const isSelected = r.runId === selectedRunId;
+
+  setClass(el, "run-item--selected", isSelected);
+  setAttr(el, "aria-selected", String(isSelected));
+
+  setClass(el.querySelector(".status-dot"), "status-dot--live", r.status === "running");
+
+  const verifyBadge = el.querySelector(".verify-badge");
+  setAttr(verifyBadge, "hidden", r.verify ? null : "");
+
+  const verdictEl = el.querySelector(".run-item-verdict");
+  const conclusion = meta ? meta.verdictConclusion : null;
+  const marks = { passed: "✓", failed: "✗", pending: "⋯" };
+  if (conclusion && marks[conclusion]) {
+    setAttr(verdictEl, "hidden", null);
+    setText(verdictEl, marks[conclusion]);
+    verdictEl.className = `run-item-verdict run-item-verdict--${conclusion === "passed" ? "pass" : conclusion === "failed" ? "fail" : "pending"}`;
+  } else {
+    setAttr(verdictEl, "hidden", "");
+  }
+
+  setText(el.querySelector(".run-item-state-label"), r.status === "running" ? "运行中" : "已完成");
+  setText(el.querySelector(".run-item-task"), r.task);
+  setText(el.querySelector(".run-item-time"), meta ? formatTimeShort(meta.startTime) : "");
+  setText(
+    el.querySelector(".run-item-duration"),
+    meta && meta.duration != null ? formatDuration(meta.duration) : "",
+  );
 }
 
 /**
@@ -908,86 +945,187 @@ export function renderRunDetail(state, callbacks) {
   const overview = deriveOverview(state);
 
   const isRunning = state.status === "running";
-  // V-04：六值分档，不再把 max_turns / budget_exhausted / refusal / max_tokens
-  // 一律显示成绿色"已完成"
+
+  // V-10：骨架建一次，之后逐区补丁。此前每条 SSE 事件重建整页 innerHTML——
+  // 实测拒绝理由输入框的字被清空、日志滚动归零、长运行退化成 O(n²)。
+  const parts = ensureDetailSkeleton(mainEl, state, callbacks);
+
+  patchDetailHeader(parts, state, isRunning);
+  patchApprovalRail(parts, state, isRunning, callbacks);
+  patchTabNav(parts, state, activeTab, callbacks);
+  patchTabContent(parts, state, activeTab, overview, logEntries, callbacks);
+  patchUsageFooter(parts, state);
+}
+
+/**
+ * 建立（或复用）详情页骨架，返回各分区容器的引用。
+ *
+ * 重建条件只有三个：换了 run、窄屏返回栏的有无变了、容器被外部整体替换过
+ * （renderEmptyState 会这么干，测试里的 beforeEach 也会）。
+ * 其余情况一律复用——这正是输入值与焦点得以存活的根据。
+ */
+function ensureDetailSkeleton(mainEl, state, callbacks) {
+  const showBack = Boolean(callbacks.showBack && callbacks.onBack);
+  const intact = mainEl.__parts && mainEl.querySelector(".detail-header");
+  if (intact && mainEl.__runId === state.runId && mainEl.__showBack === showBack) {
+    return mainEl.__parts;
+  }
+
+  mainEl.innerHTML =
+    (showBack
+      ? '<div class="back-bar"><button class="btn back-btn" id="back-to-list-btn">← 返回列表</button></div>'
+      : "") +
+    '<div class="detail-header">' +
+    '<h2 class="detail-task"></h2>' +
+    '<div class="detail-meta">' +
+    '<span class="status-badge"></span>' +
+    '<span class="verify-badge" hidden>核查模式</span>' +
+    "</div></div>" +
+    '<div class="approval-cards" hidden></div>' +
+    '<div class="tab-nav" role="tablist" aria-label="详情视图切换"></div>' +
+    '<div class="tab-content" id="tab-content" role="tabpanel" tabindex="0"></div>' +
+    '<div class="usage-footer" hidden></div>';
+
+  if (showBack) {
+    mainEl.querySelector("#back-to-list-btn").addEventListener("click", callbacks.onBack);
+  }
+
+  const parts = {
+    root: mainEl,
+    task: mainEl.querySelector(".detail-task"),
+    statusBadge: mainEl.querySelector(".status-badge"),
+    verifyBadge: mainEl.querySelector(".verify-badge"),
+    approvals: mainEl.querySelector(".approval-cards"),
+    tabNav: mainEl.querySelector(".tab-nav"),
+    tabContent: mainEl.querySelector(".tab-content"),
+    usage: mainEl.querySelector(".usage-footer"),
+    sig: {},
+  };
+  mainEl.__parts = parts;
+  mainEl.__runId = state.runId;
+  mainEl.__showBack = showBack;
+  return parts;
+}
+
+function patchDetailHeader(parts, state, isRunning) {
   const cls = classifyStopReason(isRunning ? null : state.stopReason);
-  const statusClass = isRunning ? "status--live" : toneClass(cls.tone);
-  const statusText = isRunning ? "运行中" : cls.label;
+  const sig = signature([state.task, isRunning, state.stopReason, state.verify]);
+  if (parts.sig.header === sig) return;
+  parts.sig.header = sig;
 
-  let html = "";
+  setText(parts.task, state.task);
+  setText(parts.statusBadge, isRunning ? "运行中" : cls.label);
+  parts.statusBadge.className = `status-badge ${isRunning ? "status--live" : toneClass(cls.tone)}`;
+  setAttr(parts.verifyBadge, "hidden", state.verify ? null : "");
+}
 
-  // 窄屏返回按钮
-  if (callbacks.showBack && callbacks.onBack) {
-    html += `<div class="back-bar"><button class="btn back-btn" id="back-to-list-btn">← 返回列表</button></div>`;
+/**
+ * 审批栏（V-10 的关键分区）。
+ *
+ * 用 patchList 按 approvalId 键控：已存在的卡片节点永不重建，于是里面的
+ * 拒绝理由输入框连同光标位置一起活下来。直播中的 run 几百毫秒一个事件，
+ * 旧实现下这个输入框根本没法用。
+ */
+function patchApprovalRail(parts, state, isRunning, callbacks) {
+  const list = state.pendingApprovals;
+  setAttr(parts.approvals, "hidden", list.length > 0 ? null : "");
+  if (list.length === 0) {
+    patchList(parts.approvals, [], { key: (a) => a.approvalId || a.toolUseId, create: () => document.createElement("div") });
+    return;
   }
 
-  // 详情页头
-  html += `<div class="detail-header">`;
-  html += `<h2 class="detail-task">${esc(state.task)}</h2>`;
-  html += `<div class="detail-meta">`;
-  html += `<span class="status-badge ${statusClass}">${statusText}</span>`;
-  if (state.verify) html += `<span class="verify-badge">核查模式</span>`;
-  html += `</div></div>`;
+  patchList(parts.approvals, list, {
+    key: (a) => a.approvalId || a.toolUseId,
+    create: (a) => {
+      const card = document.createElement("div");
+      card.className = "approval-card";
+      card.setAttribute("data-approval-id", a.approvalId || a.toolUseId);
+      card.innerHTML =
+        '<div class="approval-card-header">' +
+        '<span class="approval-tool-name"></span>' +
+        '<span class="approval-result" hidden></span>' +
+        "</div>" +
+        '<pre class="approval-input"></pre>' +
+        '<div class="approval-actions" hidden>' +
+        '<button class="btn btn--allow" data-action="allow">允许本次</button>' +
+        '<button class="btn btn--deny" data-action="deny">拒绝并说明</button>' +
+        '<input class="deny-reason" placeholder="拒绝理由（可选）" />' +
+        "</div>" +
+        '<div class="approval-meta" hidden></div>' +
+        '<div class="approval-reason" hidden></div>';
 
-  // ---- 审批卡（R-01：仅 pending + run 运行中才渲染操作按钮） ----
-  if (state.pendingApprovals.length > 0) {
-    html += renderApprovalCards(state, isRunning);
+      const cardId = a.approvalId || a.toolUseId;
+      const input = card.querySelector(".deny-reason");
+      input.setAttribute("data-fk", `approval:${cardId}:reason`);
+      card.querySelector("[data-action='allow']").addEventListener("click", () => {
+        callbacks.onAllow?.(cardId);
+      });
+      card.querySelector("[data-action='deny']").addEventListener("click", () => {
+        callbacks.onDenyReason?.(cardId, input.value.trim());
+      });
+      updateApprovalCard(card, a, isRunning);
+      return card;
+    },
+    update: (card, a) => updateApprovalCard(card, a, isRunning),
+  });
+}
+
+function updateApprovalCard(card, a, isRunning) {
+  const isPending = a.status === "pending";
+  const operable = isPending && isRunning;
+  const resolved = !isPending;
+
+  setClass(card, "approval-card--resolved", resolved);
+  setText(card.querySelector(".approval-tool-name"), `🔔 ${a.name}`);
+
+  const resultEl = card.querySelector(".approval-result");
+  if (resolved) {
+    const label = a.status === "allowed" ? "已允许" : a.status === "denied" ? "已拒绝" : "已过期";
+    const mod = a.status === "allowed" ? "allow" : a.status === "denied" ? "deny" : "expired";
+    setAttr(resultEl, "hidden", null);
+    setText(resultEl, label);
+    resultEl.className = `approval-result approval-result--${mod}`;
+  } else {
+    setAttr(resultEl, "hidden", "");
   }
 
-  // ---- 标签页导航 (R-03) ----
-  html += `<div class="tab-nav" role="tablist" aria-label="详情视图切换">`;
-  html += renderTabButton("overview", "概览", activeTab);
-  html += renderTabButton("log", "运行日志", activeTab);
+  setText(card.querySelector(".approval-input"), formatInput(a.input));
+  card.querySelector(".deny-reason").setAttribute(
+    "aria-label",
+    `拒绝 ${a.name} 的理由（可选）`,
+  );
+
+  // 只切显隐，不重建——输入框节点必须原地存活
+  setAttr(card.querySelector(".approval-actions"), "hidden", operable ? null : "");
+
+  const metaEl = card.querySelector(".approval-meta");
+  setAttr(metaEl, "hidden", resolved && a.decidedAt ? null : "");
+  if (resolved && a.decidedAt) setText(metaEl, formatTime(a.decidedAt));
+
+  const reasonEl = card.querySelector(".approval-reason");
+  setAttr(reasonEl, "hidden", resolved && a.reason ? null : "");
+  if (resolved && a.reason) setText(reasonEl, `理由：${a.reason}`);
+}
+
+function patchTabNav(parts, state, activeTab, callbacks) {
+  const tabs = [
+    { id: "overview", label: "概览" },
+    { id: "log", label: "运行日志" },
+  ];
   if (state.verifierTimeline.length > 0 || state.verdict) {
-    html += renderTabButton("verify", "核查", activeTab);
-  }
-  html += `</div>`;
-
-  // ---- 标签内容 ----
-  // role=tabpanel + aria-labelledby 与当前 tab 配对，补全 tablist/tab/tabpanel 三件套
-  html += `<div class="tab-content" id="tab-content" role="tabpanel" aria-labelledby="tab-${activeTab}" tabindex="0">`;
-
-  if (activeTab === "overview") {
-    html += renderOverviewTab(overview, state);
-  } else if (activeTab === "log") {
-    html += renderLogTab(logEntries);
-  } else if (activeTab === "verify") {
-    html += renderVerifyTab(state);
+    tabs.push({ id: "verify", label: "核查" });
   }
 
-  html += `</div>`;
+  const sig = signature([tabs.map((t) => t.id).join(","), activeTab]);
+  if (parts.sig.tabNav === sig) return;
+  parts.sig.tabNav = sig;
 
-  // 用量脚注（始终显示）
-  html += renderUsageFooter(state);
+  parts.tabNav.innerHTML = tabs
+    .map((t) => renderTabButton(t.id, t.label, activeTab))
+    .join("");
+  setAttr(parts.tabContent, "aria-labelledby", `tab-${activeTab}`);
 
-  mainEl.innerHTML = html;
-
-  // 绑定窄屏返回按钮
-  if (callbacks.showBack && callbacks.onBack) {
-    const backBtn = document.getElementById("back-to-list-btn");
-    if (backBtn) {
-      backBtn.addEventListener("click", callbacks.onBack);
-    }
-  }
-
-  // 绑定审批按钮
-  mainEl.querySelectorAll("[data-action='allow']").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const id = btn.getAttribute("data-approval-id");
-      if (id && callbacks.onAllow) callbacks.onAllow(id);
-    });
-  });
-  mainEl.querySelectorAll("[data-action='deny']").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const id = btn.getAttribute("data-approval-id");
-      const reasonInput = mainEl.querySelector(`.deny-reason[data-approval-id="${id}"]`);
-      const reason = reasonInput ? reasonInput.value.trim() : "";
-      if (id && callbacks.onDenyReason) callbacks.onDenyReason(id, reason);
-    });
-  });
-
-  // 绑定标签切换（点击 + APG tabs 键盘模式）
-  const tabBtns = [...mainEl.querySelectorAll(".tab-btn")];
+  const tabBtns = [...parts.tabNav.querySelectorAll(".tab-btn")];
   const switchTab = (tab) => {
     if (tab) document.dispatchEvent(new CustomEvent("tab-switch", { detail: { tab } }));
   };
@@ -1007,16 +1145,111 @@ export function renderRunDetail(state, callbacks) {
       switchTab(tabBtns[next].getAttribute("data-tab"));
     });
   });
+}
 
-  // 绑定日志条目展开/折叠
-  mainEl.querySelectorAll(".log-entry-header").forEach((header) => {
-    header.addEventListener("click", () => {
-      const seqStr = header.getAttribute("data-seq");
-      if (seqStr !== null && callbacks.onToggleEntry) {
-        callbacks.onToggleEntry(Number(seqStr));
-      }
+function patchTabContent(parts, state, activeTab, overview, logEntries, callbacks) {
+  const container = parts.tabContent;
+
+  // 换标签页时内容形态完全不同，直接重建；同一标签内走各自的增量策略
+  if (container.__tab !== activeTab) {
+    container.innerHTML = "";
+    container.__patchNodes = undefined;
+    container.__tab = activeTab;
+    parts.sig.tabBody = null;
+    if (activeTab === "log") {
+      container.innerHTML = '<h3 class="overview-section-title">Agent 执行</h3><div class="log-entries"></div>';
+      container.__logHost = container.querySelector(".log-entries");
+      container.__renderedSeqs = new Set();
+    }
+  }
+
+  if (activeTab === "log") {
+    patchLogPanel(container, logEntries, callbacks);
+    return;
+  }
+
+  // 概览 / 核查：无输入控件、无滚动锚点，签名变了整体重绘即可
+  const sig =
+    activeTab === "overview"
+      ? signature([
+          state.stopReason, state.status, overview.resultSummary,
+          state.verdict ? JSON.stringify(state.verdict) : "",
+          overview.actionItems.pendingApprovals.length,
+          overview.actionItems.unverifiedItems.length,
+          overview.resolvedApprovals.length, state.error,
+        ])
+      : signature([
+          state.verifierTimeline.length,
+          state.verdict ? JSON.stringify(state.verdict) : "",
+        ]);
+  if (parts.sig.tabBody === sig) return;
+  parts.sig.tabBody = sig;
+
+  container.innerHTML =
+    activeTab === "overview" ? renderOverviewTab(overview, state) : renderVerifyTab(state);
+}
+
+/**
+ * 日志面板：只追加，从不重排已渲染的条目。
+ *
+ * 两个后果都是实测过的痛点：① 展开/折叠状态与滚动位置天然保持；
+ * ② 单次代价降到 O(新增条数)，长运行不再是 O(n²)。
+ * 滚动跟随沿用 GitHub Actions 的规矩——贴底才跟，用户往上翻时不拽回去。
+ */
+function patchLogPanel(container, logEntries, callbacks) {
+  const host = container.__logHost;
+  if (!host) return;
+
+  if (logEntries.length === 0) {
+    if (!container.querySelector(".log-empty")) {
+      const empty = document.createElement("div");
+      empty.className = "log-empty";
+      empty.textContent = "暂无日志记录。";
+      host.appendChild(empty);
+    }
+    return;
+  }
+  const empty = container.querySelector(".log-empty");
+  if (empty) empty.remove();
+
+  const scroller = host.closest(".content-area") || host;
+  keepScrollAnchored(scroller, () => {
+    appendOnly(host, logEntries, {
+      key: (e) => String(e.seq),
+      create: (e) => {
+        const wrap = document.createElement("div");
+        wrap.innerHTML = renderLogEntry(e);
+        const node = wrap.firstElementChild;
+        node.querySelector(".log-entry-header")?.addEventListener("click", () => {
+          callbacks.onToggleEntry?.(Number(e.seq));
+        });
+        return node;
+      },
+      // 折叠状态是唯一会变的部分：重建 innerHTML 但保留外层节点，
+      // 这样滚动锚点与 patchNodes 映射都不受影响
+      update: (node, e) => {
+        const wasCollapsed = node.classList.contains("log-entry--collapsed");
+        if (wasCollapsed === Boolean(e.collapsed)) return;
+        const wrap = document.createElement("div");
+        wrap.innerHTML = renderLogEntry(e);
+        const fresh = wrap.firstElementChild;
+        node.className = fresh.className;
+        node.innerHTML = fresh.innerHTML;
+        node.querySelector(".log-entry-header")?.addEventListener("click", () => {
+          callbacks.onToggleEntry?.(Number(e.seq));
+        });
+      },
     });
   });
+}
+
+function patchUsageFooter(parts, state) {
+  const html = renderUsageFooterBody(state);
+  const sig = signature([html.length, html.slice(0, 120)]);
+  if (parts.sig.usage === sig) return;
+  parts.sig.usage = sig;
+  setAttr(parts.usage, "hidden", html ? null : "");
+  parts.usage.innerHTML = html;
 }
 
 /** @returns {string} */
@@ -1042,13 +1275,13 @@ function renderTabButton(tab, label, activeTab) {
  * 每个数字都带口径标注：界面上不出现没有口径的数字。
  * @returns {string}
  */
-function renderUsageFooter(state) {
+function renderUsageFooterBody(state) {
   const exec = state.runEnd && state.runEnd.executionUsage;
   const verify = state.runEnd && state.runEnd.verificationUsage;
 
   if (!exec && !state.usage) return "";
 
-  let html = `<div class="usage-footer">`;
+  let html = "";
   if (exec) {
     html += `<span class="usage-item">执行（全部轮次合计）：${exec.turns} 轮 · 入 ${formatTokens(exec.inputTokens)} · 出 ${formatTokens(exec.outputTokens)}</span>`;
     if (verify && verify.turns > 0) {
@@ -1066,7 +1299,6 @@ function renderUsageFooter(state) {
     html += `<span class="usage-item">本段：${state.usage.turns} 轮 · 入 ${formatTokens(state.usage.inputTokens)} · 出 ${formatTokens(state.usage.outputTokens)}</span>`;
     html += `<span class="usage-item">缓存命中 ${(state.usage.cacheHitRatio * 100).toFixed(0)}%</span>`;
   }
-  html += `</div>`;
   return html;
 }
 
@@ -1195,20 +1427,9 @@ function renderOverviewTab(overview, state) {
   return html;
 }
 
-/** @returns {string} */
-function renderLogTab(logEntries) {
-  if (logEntries.length === 0) {
-    return `<div class="log-empty">暂无日志记录。</div>`;
-  }
-
-  let html = `<h3 class="overview-section-title">Agent 执行</h3>
-<div class="log-entries">`;
-  for (const e of logEntries) {
-    html += renderLogEntry(e);
-  }
-  html += `</div>`;
-  return html;
-}
+// renderLogTab 已移除：日志面板改为 patchLogPanel 的增量追加，
+// 不再有"把整份日志拼成一段 HTML"这一步（那正是 O(n²) 与滚动跳动的来源）。
+// 区块标题 "Agent 执行" 移到 patchTabContent 的骨架里（委托方 §12 文案不变）。
 
 /** @returns {string} */
 function renderLogEntry(e) {

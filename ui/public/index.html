@@ -73,6 +73,7 @@
  * 阶段二新增：标签页切换、日志折叠、筛选器、无障碍语义。
  */
 import {
+  createBatcher,
   createInitialState,
   reduceEvent,
   reduceEvents,
@@ -271,6 +272,37 @@ function renderDetailWithState(state) {
  * 建立事件订阅。只在"尚无订阅 且 run 未终态"时建立——旧实现把这个判断和
  * "是否已有 state"混在 selectRun 里，导致重新打开一个断过线的 run 不会重订阅。
  */
+// ---- 事件批处理（V-10）----
+// 调度细节见 core/batch.js（含"隐藏标签页 rAF 不触发"那个坑的处理）
+const batcher = createBatcher((batches) => {
+  for (const [runId, queue] of batches) {
+    const state = runStates.get(runId);
+    if (!state) continue;
+
+    const next = reduceEvents(state, queue);
+    runStates.set(runId, next);
+
+    if (selectedRunId === runId) renderDetailWithState(next);
+
+    // run_end 是唯一的"可以收工"信号：此时主动 close，浏览器才不会再自动重连
+    if (next.status === "done") {
+      const es = eventSources.get(runId);
+      if (es) {
+        es.close();
+        eventSources.delete(runId);
+        announceStatus(`运行已完成：${next.task}`);
+      }
+    }
+  }
+});
+
+const enqueueEvent = (runId, sseEvent) => batcher.push(runId, sseEvent);
+
+// 切回前台时立刻补齐一次，不必等下一个节拍
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") batcher.flushNow();
+});
+
 function ensureSubscription(runId) {
   if (eventSources.has(runId)) return;
   const state = runStates.get(runId);
@@ -281,24 +313,7 @@ function ensureSubscription(runId) {
 
   es.addEventListener("message", (msg) => {
     try {
-      const sseEvent = JSON.parse(msg.data);
-      const state = runStates.get(runId);
-      if (!state) return;
-      // 走批量入口：内含 seq 幂等闸门，重连续传/重复重放都不会产生重复条目
-      const next = reduceEvents(state, [sseEvent]);
-      runStates.set(runId, next);
-
-      if (selectedRunId === runId) {
-        renderDetailWithState(next);
-      }
-
-      // run_end 是唯一的"可以收工"信号：此时主动 close，浏览器才不会再自动重连
-      if (next.status === "done") {
-        es.close();
-        eventSources.delete(runId);
-        announceStatus(`运行已完成：${next.task}`);
-        loadRuns();
-      }
+      enqueueEvent(runId, JSON.parse(msg.data));
     } catch {
       // 解析失败静默
     }
@@ -414,9 +429,51 @@ submitForm.addEventListener("submit", async (e) => {
   }
 });
 
+// ---- 全局生命周期流（V-10：取代 3 秒轮询）----
+// 轮询本身不是问题，"每 3 秒整体重建侧栏"才是——实测焦点停在运行项上 3.6 秒后
+// 就变成 BODY。改成推送 + 键控补丁：只在真有变化时更新，且不重建节点。
+// 兜底轮询保留但降到 30 秒，且仅在推送流断开期间生效。
+let lifecycleStream = null;
+let fallbackPoll = null;
+
+function startFallbackPoll() {
+  if (fallbackPoll !== null) return;
+  fallbackPoll = setInterval(loadRuns, 30000);
+}
+
+function stopFallbackPoll() {
+  if (fallbackPoll === null) return;
+  clearInterval(fallbackPoll);
+  fallbackPoll = null;
+}
+
+function subscribeLifecycle() {
+  lifecycleStream = new EventSource("/api/stream");
+
+  lifecycleStream.addEventListener("message", (msg) => {
+    try {
+      const payload = JSON.parse(msg.data);
+      if (payload.type === "snapshot") {
+        runs = payload.runs;
+      } else if (payload.run) {
+        const idx = runs.findIndex((r) => r.runId === payload.run.runId);
+        if (idx >= 0) runs[idx] = payload.run;
+        else runs = [payload.run, ...runs];
+      }
+      refreshRunListView();
+    } catch {
+      // 解析失败静默
+    }
+  });
+
+  lifecycleStream.addEventListener("open", stopFallbackPoll);
+  // 不 close：浏览器会自己重连，届时服务端重发 snapshot 补齐缺口
+  lifecycleStream.addEventListener("error", startFallbackPoll);
+}
+
 // ---- 启动 ----
 loadRuns();
-setInterval(loadRuns, 3000);
+subscribeLifecycle();
 </script>
 
 </body>
