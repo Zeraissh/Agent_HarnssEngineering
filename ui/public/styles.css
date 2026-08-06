@@ -205,6 +205,19 @@
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
+/**
+ * hidden 属性必须真的隐藏。
+ *
+ * UA 样式表里的 `[hidden] { display: none }` 优先级极低，任何作者写的
+ * `display: flex` 都能压过它。渲染层用 `hidden` 属性控制显隐的分区里，
+ * `.action-rail` 与 `.live-strip` 恰好都设了 display——后果是一个已经异常
+ * 终止的运行仍然挂着绿点显示"等待模型响应…"。界面在说谎，而这正是本轮
+ * 信息架构最不能犯的错。
+ *
+ * 用一条全局 !important 从结构上消灭这一类 bug，而不是逐个组件打补丁。
+ */
+[hidden] { display: none !important; }
+
 body {
   font-family: var(--font-ui);
   font-size: var(--font-lg);

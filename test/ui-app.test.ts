@@ -1482,6 +1482,66 @@ describe("V-20 字体阶梯", () => {
 });
 
 // ================================================================
+// v2 R5b: 单色排印符 + hidden 真隐藏 (V-20 补)
+// ================================================================
+
+describe("V-20 图标：单色排印符，不用 emoji", () => {
+  /**
+   * 判据用 Unicode 的 Emoji_Presentation 属性，而不是手列黑名单。
+   *
+   * 该属性的定义就是"默认渲染为彩色 emoji"——而这正是问题所在：
+   * 彩色字形自带调色板，CSS `color` 对它们无效，因此**无法参与主题系统**，
+   * 在浅色暖底上尤其像贴上去的异物。反过来，✓ ✗ ⚠ ◈ ⋯ 这些是文本表现字形，
+   * 继承 currentColor，明暗两套主题下都跟着语义色走。
+   * U+FE0F（变体选择符）会把文本字形强制成 emoji 表现，一并拦掉。
+   */
+  const EMOJI = /\p{Emoji_Presentation}|️/gu;
+
+  it.each(["app.js", "index.html", "styles.css"])("%s 不含 emoji 字形", (file) => {
+    const src = readFileSync(join(__dirname, "..", "ui", "public", file), "utf-8");
+    const hits = [...src.matchAll(EMOJI)].map((m) => {
+      const at = src.slice(Math.max(0, m.index - 30), m.index + 20).replace(/\s+/g, " ");
+      return `${m[0]} @ …${at}…`;
+    });
+    expect(hits, `发现 emoji：${hits.join(" / ")}`).toEqual([]);
+  });
+
+  it("CLI 的记号在 Web 侧同样在场（终端与网页看到同一套符号）", () => {
+    const app = readFileSync(join(__dirname, "..", "ui", "public", "app.js"), "utf-8");
+    // 对齐 src/cli.ts:512-591 的符号表
+    for (const mark of ["──", "→", "✓", "✗", "⚠", "⟳", "■", "✔", "✘", "⋯", "◈", "↺"]) {
+      expect(app, `缺少记号 ${mark}`).toContain(mark);
+    }
+  });
+});
+
+describe("V-20 hidden 必须真的隐藏", () => {
+  const css = readFileSync(join(__dirname, "..", "ui", "public", "styles.css"), "utf-8");
+
+  /**
+   * 实测抓到的 bug：一个已经异常终止的运行仍挂着绿点显示"等待模型响应…"。
+   * 根因是 UA 样式表的 `[hidden]{display:none}` 优先级极低，被
+   * `.live-strip{display:flex}` 这类作者规则压过。渲染层用 hidden 属性
+   * 控显隐的分区里有好几个都设了 display，所以这是一类系统性问题，
+   * 不是单点疏忽——用一条全局 !important 从结构上消灭它。
+   */
+  it("存在全局 [hidden] 覆盖且带 !important", () => {
+    expect(css).toMatch(/\[hidden\]\s*\{[^}]*display:\s*none\s*!important/);
+  });
+
+  it("渲染层用 hidden 控显隐的分区，全部有全局覆盖兜底", () => {
+    const app = readFileSync(join(__dirname, "..", "ui", "public", "app.js"), "utf-8");
+    // 这些分区在 app.js 里靠 setAttr(..., "hidden", ...) 切换；
+    // 只要其中任何一个的 CSS 里写了 display，没有全局 !important 就会失效
+    const toggled = ["action-rail", "live-strip", "approval-cards", "usage-footer", "unverified-rail"];
+    for (const cls of toggled) {
+      expect(app, `${cls} 应由渲染层管理显隐`).toContain(cls);
+    }
+    expect(css).toMatch(/\[hidden\]\s*\{[^}]*display:\s*none\s*!important/);
+  });
+});
+
+// ================================================================
 // R-07: 核查区视觉收敛 — magenta 仅身份标识，不大面积铺底
 // ================================================================
 

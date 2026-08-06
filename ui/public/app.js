@@ -1443,7 +1443,7 @@ function updateApprovalCard(card, a, isRunning) {
   const resolved = !isPending;
 
   setClass(card, "approval-card--resolved", resolved);
-  setText(card.querySelector(".approval-tool-name"), `🔔 ${a.name}`);
+  setText(card.querySelector(".approval-tool-name"), `⚠ ${a.name}`);
 
   const resultEl = card.querySelector(".approval-result");
   if (resolved) {
@@ -2052,7 +2052,7 @@ function renderApprovalCards(state, isRunning) {
 
     html += `<div class="approval-card ${resolved ? "approval-card--resolved" : ""}" data-approval-id="${esc(cardId)}">`;
     html += `<div class="approval-card-header">`;
-    html += `<span class="approval-tool-name">🔔 ${esc(app.name)}</span>`;
+    html += `<span class="approval-tool-name">⚠ ${esc(app.name)}</span>`;
 
     if (resolved) {
       const decisionLabel =
@@ -2108,7 +2108,7 @@ function renderOverviewTab(overview, state) {
   // 结果摘要
   if (overview.resultSummary) {
     html += `<div class="overview-section">`;
-    html += `<h3 class="overview-section-title">📝 结果摘要</h3>`;
+    html += `<h3 class="overview-section-title">结果摘要</h3>`;
     html += `<div class="overview-summary-text">${esc(overview.resultSummary)}</div>`;
     html += `</div>`;
   }
@@ -2124,10 +2124,10 @@ function renderOverviewTab(overview, state) {
     overview.actionItems.unverifiedItems.length > 0;
   if (hasActionItems) {
     html += `<div class="overview-section overview-section--action">`;
-    html += `<h3 class="overview-section-title">⚠️ 需介入事项</h3>`;
+    html += `<h3 class="overview-section-title">⚠ 需介入事项</h3>`;
     html += `<ul class="action-items">`;
     for (const a of overview.actionItems.pendingApprovals) {
-      html += `<li class="action-item action-item--approval">⏳ 待审批：${esc(a.name)} — ${esc(truncate(formatInput(a.input), 80))}</li>`;
+      html += `<li class="action-item action-item--approval">⚠ 待审批：${esc(a.name)} — ${esc(truncate(formatInput(a.input), 80))}</li>`;
     }
     for (const u of overview.actionItems.unverifiedItems) {
       html += `<li class="action-item action-item--unverified">⋯ 待复核：${esc(u)}</li>`;
@@ -2139,7 +2139,7 @@ function renderOverviewTab(overview, state) {
   // 已处理审批（只读记录，不静默丢失）
   if (overview.resolvedApprovals && overview.resolvedApprovals.length > 0) {
     html += `<div class="overview-section">`;
-    html += `<h3 class="overview-section-title">📋 审批记录</h3>`;
+    html += `<h3 class="overview-section-title">审批记录</h3>`;
     html += `<ul class="action-items">`;
     for (const a of overview.resolvedApprovals) {
       const label = a.status === "allowed" ? "已允许" : a.status === "denied" ? "已拒绝" : "已过期";
@@ -2152,7 +2152,7 @@ function renderOverviewTab(overview, state) {
 
   // 错误醒目
   if (state.error) {
-    html += `<div class="error-banner">⚠️ ${esc(state.error)}</div>`;
+    html += `<div class="error-banner">⚠ ${esc(state.error)}</div>`;
   }
 
   // 无结果时显示提示
@@ -2228,15 +2228,24 @@ function renderLogEntryBody(e) {
 
 /** @returns {string} */
 function entryIcon(type, isError) {
+  // 一律用**单色排印符**，不用 emoji。
+  //
+  // 理由不是审美：emoji 是自带调色板的彩色字形，CSS `color` 对它们无效，
+  // 因此它们无法参与主题系统——浅色暖底上尤其像贴上去的异物。排印符继承
+  // currentColor，明暗两套主题里都跟着语义色走。
+  //
+  // 符号表同时向 CLI 收敛（src/cli.ts:512-591），Web 与终端看到的是同一套记号。
   switch (type) {
-    case "turn_start": return "──";
-    case "tool_call": return "🔧";
-    case "tool_result": return isError ? "❌" : "✅";
-    case "assistant_text": return "💬";
-    case "approval_request": return "⏳";
-    case "api_retry": return "🔄";
-    case "compaction": return "📦";
-    default: return "•";
+    case "turn_start": return "──";      // cli.ts:516
+    case "tool_call": return "→";        // cli.ts:527
+    case "tool_result": return isError ? "✗" : "✓"; // cli.ts:530-531
+    case "assistant_text": return "¶";   // CLI 直接流式打印无标记，列表里需要一个
+    case "approval_request": return "⚠"; // cli.ts:539
+    case "api_retry": return "⟳";        // cli.ts:563
+    // CLI 对压缩也用 ⚠，这里刻意分开：V-19 要求不可逆自成语域，
+    // 与普通警告共用符号会让人对它脱敏
+    case "compaction": return "⊟";
+    default: return "·";
   }
 }
 
@@ -2328,7 +2337,7 @@ function renderVerifyTab(state, face) {
   // 核查时间线（使用日志卡片风格）
   if (state.verifierTimeline.length > 0) {
     html += `<div class="verify-timeline">`;
-    html += `<h3 class="overview-section-title">📋 核查 Agent 过程</h3>`;
+    html += `<h3 class="overview-section-title">◆ 核查 Agent 过程</h3>`;
     for (const e of state.verifierTimeline) {
       const logEntry = { ...e, collapsed: defaultCollapsed(e) };
       html += renderLogEntry(logEntry);
@@ -2346,26 +2355,26 @@ function renderVerifyTab(state, face) {
 /** @returns {string} */
 function renderVerdictCard(v) {
   const badge = v.passed
-    ? '<span class="verdict-badge verdict-badge--pass">✅ 核查通过</span>'
-    : '<span class="verdict-badge verdict-badge--fail">❌ 核查未通过</span>';
+    ? '<span class="verdict-badge verdict-badge--pass">✔ 核查通过</span>'
+    : '<span class="verdict-badge verdict-badge--fail">✘ 核查未通过</span>';
   let html = `<div class="verdict-card">`;
   html += `<div class="verdict-header">${badge}<span class="verdict-summary">${esc(v.summary)}</span></div>`;
 
   if (v.issues.length > 0) {
     html += `<div class="verdict-section verdict-section--issues">`;
-    html += `<div class="verdict-section-title">🔴 客观项不符</div>`;
+    html += `<div class="verdict-section-title">✗ 客观项不符</div>`;
     html += `<ul>${v.issues.map((s) => `<li>${esc(s)}</li>`).join("")}</ul>`;
     html += `</div>`;
   }
   if (v.unverified.length > 0) {
     html += `<div class="verdict-section verdict-section--unverified">`;
-    html += `<div class="verdict-section-title">🟡 待委托方复核</div>`;
+    html += `<div class="verdict-section-title">⋯ 待委托方复核</div>`;
     html += `<ul>${v.unverified.map((s) => `<li>⋯ ${esc(s)}</li>`).join("")}</ul>`;
     html += `</div>`;
   }
   if (v.advisory.length > 0) {
     html += `<div class="verdict-section verdict-section--advisory">`;
-    html += `<div class="verdict-section-title">🟣 评审意见</div>`;
+    html += `<div class="verdict-section-title">◈ 评审意见</div>`;
     html += `<ul>${v.advisory.map((s) => `<li>◈ ${esc(s)}</li>`).join("")}</ul>`;
     html += `</div>`;
   }
@@ -2385,7 +2394,7 @@ export function renderEmptyState(hasRuns) {
       ? "选择左侧运行查看详情，或创建新任务。"
       : "尚无运行。";
     mainEl.innerHTML = `<div class="empty-state">
-      <div class="empty-icon">📋</div>
+      <div class="empty-icon">◌</div>
       <p>${msg}</p>
     </div>`;
   }
