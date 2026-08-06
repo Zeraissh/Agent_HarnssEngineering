@@ -26,6 +26,7 @@ import {
   reduceEvent,
   reduceEvents,
   classifyStopReason,
+  deriveContextUsage,
   markApprovalResolved,
   expirePendingApprovals,
   deriveOverview,
@@ -633,6 +634,120 @@ describe("v2 R1 · 重放幂等与批量等价 (V-05)", () => {
     s = reduceEvents(s, [seqSse(3, "main", "turn_start", { turn: 99 })]);
     expect(s.timeline).toHaveLength(1);
     expect(s.lastSeq).toBe(5);
+  });
+});
+
+describe("v2 R2 · 上下文水位与成本口径 (V-07/V-09)", () => {
+  const usageEvt = (seq, turn, input, cw, cr, out) =>
+    seqSse(seq, "main", "usage", {
+      turn,
+      usage: {
+        input_tokens: input,
+        cache_creation_input_tokens: cw,
+        cache_read_input_tokens: cr,
+        output_tokens: out,
+      },
+    });
+
+  it("usage 事件不再是噪声行，进 usageByTurn 而不进时间线", () => {
+    let s = createInitialState("u1", "t", false);
+    s = reduceEvents(s, [
+      seqSse(0, "main", "turn_start", { turn: 1 }),
+      usageEvt(1, 1, 1000, 200, 300, 50),
+    ]);
+    expect(s.timeline).toHaveLength(1); // 只有 turn_start
+    expect(s.usageByTurn).toHaveLength(1);
+    expect(s.usageByTurn[0]).toEqual({ turn: 1, input: 1000, cacheCreation: 200, cacheRead: 300, output: 50 });
+  });
+
+  it("水位口径 = 最近一轮输入 / 上限，不是全 run 累计", () => {
+    let s = createInitialState("u2", "t", false);
+    s = reduceEvents(s, [
+      usageEvt(0, 1, 1000, 0, 0, 10),
+      usageEvt(1, 2, 2000, 0, 0, 10),
+      usageEvt(2, 3, 3000, 0, 0, 10),
+    ]);
+    const ctx = deriveContextUsage(s, 10000);
+    // 最近一轮 3000/10000 = 0.3。若按累计（6000）算会是 0.6——
+    // ContextManager.noteUsage 是赋值不是累加，按累计画会得到"永远即将压缩"的假警报
+    expect(ctx.lastInputTokens).toBe(3000);
+    expect(ctx.ratio).toBeCloseTo(0.3, 5);
+    expect(ctx.watermark).toBe(0.8);
+    // 累计另算，归成本口径
+    expect(ctx.cumulative.input).toBe(6000);
+  });
+
+  it("缓存命中率按三分口径计算", () => {
+    let s = createInitialState("u3", "t", false);
+    s = reduceEvents(s, [usageEvt(0, 1, 100, 100, 800, 10)]);
+    const ctx = deriveContextUsage(s, null);
+    // cacheRead / (input + cacheCreation + cacheRead) = 800/1000
+    expect(ctx.cacheHitRatio).toBeCloseTo(0.8, 5);
+    expect(ctx.limit).toBeNull();
+    expect(ctx.ratio).toBeNull();
+  });
+
+  it("run_end 带来 executionUsage / reworks / finalPassed", () => {
+    let s = createInitialState("u4", "t", true);
+    s = reduceEvents(s, [
+      seqSse(0, "main", "done", { stopReason: "completed", usage: { turns: 2, inputTokens: 10, outputTokens: 5, cacheHitRatio: 0 } }),
+      seqSse(1, "host", "run_end", {
+        outcome: "completed",
+        mainStopReason: "completed",
+        finishedAt: 1,
+        finalPassed: true,
+        reworks: 1,
+        executionUsage: { turns: 5, inputTokens: 900, outputTokens: 300, cacheCreationTokens: 0, cacheReadTokens: 100 },
+        verificationUsage: { turns: 3, inputTokens: 400, outputTokens: 100, cacheCreationTokens: 0, cacheReadTokens: 0 },
+      }),
+    ]);
+    // 段级 usage 仍是 2 轮，但 run 级成本是 5 轮——旧实现把前者当后者用
+    expect(s.usage.turns).toBe(2);
+    expect(s.runEnd.executionUsage.turns).toBe(5);
+    expect(s.runEnd.verificationUsage.turns).toBe(3);
+    expect(s.runEnd.reworks).toBe(1);
+    expect(s.runEnd.finalPassed).toBe(true);
+  });
+});
+
+describe("v2 R2 · 逐轮裁决与工具名回填 (V-08/V-12)", () => {
+  it("verification 事件逐轮入账，中间轮的 issues 不再丢失", () => {
+    let s = createInitialState("v1", "t", true);
+    s = reduceEvents(s, [
+      seqSse(0, "verifier", "verification", {
+        round: 0,
+        verdict: { passed: false, issues: ["漏了收尾"], summary: "未通过" },
+      }),
+      seqSse(1, "verifier", "verification", {
+        round: 1,
+        verdict: { passed: true, issues: [], unverified: ["需人工看"], summary: "通过" },
+      }),
+    ]);
+    expect(s.verifications).toHaveLength(2);
+    expect(s.verifications[0].verdict.issues).toEqual(["漏了收尾"]);
+    expect(s.verifications[1].verdict.unverified).toEqual(["需人工看"]);
+  });
+
+  it("tool_result 回填工具名，不再显示 toolUseId", () => {
+    let s = createInitialState("v2", "t", false);
+    s = reduceEvents(s, [
+      seqSse(0, "main", "tool_call", { toolUseId: "toolu_01Ab", name: "read_file", input: {} }),
+      seqSse(1, "main", "tool_result", { toolUseId: "toolu_01Ab", result: { content: "ok" }, durationMs: 3 }),
+    ]);
+    const result = s.timeline.find((e) => e.type === "tool_result");
+    expect(result.name).toBe("read_file");
+  });
+
+  it("verifier 与主 agent 的工具名各自回填，来源不混", () => {
+    let s = createInitialState("v3", "t", true);
+    s = reduceEvents(s, [
+      seqSse(0, "main", "tool_call", { toolUseId: "m1", name: "write_file", input: {} }),
+      seqSse(1, "verifier", "tool_call", { toolUseId: "v1", name: "read_file", input: {} }),
+      seqSse(2, "verifier", "tool_result", { toolUseId: "v1", result: { content: "x" }, durationMs: 1 }),
+      seqSse(3, "main", "tool_result", { toolUseId: "m1", result: { content: "y" }, durationMs: 2 }),
+    ]);
+    expect(s.timeline.find((e) => e.type === "tool_result").name).toBe("write_file");
+    expect(s.verifierTimeline.find((e) => e.type === "tool_result").name).toBe("read_file");
   });
 });
 

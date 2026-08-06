@@ -115,6 +115,12 @@ export function createInitialState(runId, task, verify) {
     stopReason: null,
     lastSeq: -1,
     runEnd: null,
+    /** 逐轮 token（来自 usage 事件）——上下文水位与成本的唯一来源 */
+    usageByTurn: [],
+    /** 逐轮核查裁决（来自 verification 事件），末轮之外的也保留 */
+    verifications: [],
+    /** toolUseId → 工具名。tool_result 事件本身不带 name，只能靠 tool_call 回填 */
+    toolNames: {},
   };
 }
 
@@ -203,14 +209,122 @@ export function reduceEvent(state, sseEvent) {
   if (type === "approval_expired") {
     return applyApprovalExpired(state, event);
   }
+  if (type === "usage") {
+    return applyUsage(state, event);
+  }
+  if (type === "verification") {
+    return applyVerification(state, event);
+  }
 
   // 其余事件进入时间线
   const entry = buildTimelineEntry(seq, source, type, event);
   const isVerifier = isVerifierSource(source);
+
+  // V-12：tool_result 事件不带工具名（src/loop.ts 只发 toolUseId），日志里就成了
+  // "toolu_01AbC... 成功"。靠 tool_call 记下的映射回填。
+  let toolNames = state.toolNames;
+  if (type === "tool_call" && entry.toolUseId) {
+    toolNames = { ...toolNames, [entry.toolUseId]: entry.name };
+  } else if (type === "tool_result" && entry.toolUseId && toolNames[entry.toolUseId]) {
+    entry.name = toolNames[entry.toolUseId];
+  }
+
   return {
     ...state,
+    toolNames,
     timeline: isVerifier ? state.timeline : [...state.timeline, entry],
     verifierTimeline: isVerifier ? [...state.verifierTimeline, entry] : state.verifierTimeline,
+  };
+}
+
+/**
+ * 逐轮 token（V-09）。
+ *
+ * 此前这类事件落进 default 分支，被渲染成一条图标「•」、动作名「usage」、
+ * 详情空白的噪声行——每轮一条。而它是**唯一**能提前算出"上下文快满了"的信号：
+ * ContextManager 就是拿 input+cacheW+cacheR 对上限判是否要压缩的。
+ * @returns {RunState}
+ */
+function applyUsage(state, event) {
+  const u = /** @type {any} */ (event.usage) ?? {};
+  return {
+    ...state,
+    usageByTurn: [
+      ...state.usageByTurn,
+      {
+        turn: Number(event.turn ?? state.usageByTurn.length + 1),
+        input: Number(u.input_tokens ?? 0),
+        cacheCreation: Number(u.cache_creation_input_tokens ?? 0),
+        cacheRead: Number(u.cache_read_input_tokens ?? 0),
+        output: Number(u.output_tokens ?? 0),
+      },
+    ],
+  };
+}
+
+/** 逐轮核查裁决（V-08）：中间轮的 issues 就是"为什么要返工"。@returns {RunState} */
+function applyVerification(state, event) {
+  const raw = /** @type {any} */ (event.verdict) ?? {};
+  return {
+    ...state,
+    verifications: [
+      ...state.verifications,
+      {
+        round: Number(event.round ?? state.verifications.length),
+        verdict: {
+          passed: Boolean(raw.passed),
+          summary: String(raw.summary ?? ""),
+          issues: Array.isArray(raw.issues) ? raw.issues.map(String) : [],
+          unverified: Array.isArray(raw.unverified) ? raw.unverified.map(String) : [],
+          advisory: Array.isArray(raw.advisory) ? raw.advisory.map(String) : [],
+        },
+        usage: event.usage ?? null,
+      },
+    ],
+  };
+}
+
+/**
+ * 上下文水位（V-09）。
+ *
+ * 口径要害：分母是 contextTokenLimit，分子是**最近一轮**的输入
+ * （input + cacheCreation + cacheRead），**不是全 run 累计**——
+ * ContextManager.noteUsage 是赋值不是累加，按累计画会得到一条永远"即将压缩"
+ * 却永远不压缩的假警报。累计量属于成本，另算。
+ *
+ * @param {RunState} state
+ * @param {number|null} contextTokenLimit
+ * @returns {{lastInputTokens:number, limit:number|null, ratio:number|null,
+ *   watermark:number, split:{input:number,cacheCreation:number,cacheRead:number},
+ *   cumulative:{input:number,cacheCreation:number,cacheRead:number,output:number},
+ *   cacheHitRatio:number}}
+ */
+export function deriveContextUsage(state, contextTokenLimit) {
+  const last = state.usageByTurn[state.usageByTurn.length - 1];
+  const split = last
+    ? { input: last.input, cacheCreation: last.cacheCreation, cacheRead: last.cacheRead }
+    : { input: 0, cacheCreation: 0, cacheRead: 0 };
+  const lastInputTokens = split.input + split.cacheCreation + split.cacheRead;
+
+  const cumulative = state.usageByTurn.reduce(
+    (a, t) => ({
+      input: a.input + t.input,
+      cacheCreation: a.cacheCreation + t.cacheCreation,
+      cacheRead: a.cacheRead + t.cacheRead,
+      output: a.output + t.output,
+    }),
+    { input: 0, cacheCreation: 0, cacheRead: 0, output: 0 },
+  );
+
+  const denom = cumulative.input + cumulative.cacheCreation + cumulative.cacheRead;
+  return {
+    lastInputTokens,
+    limit: contextTokenLimit ?? null,
+    ratio: contextTokenLimit ? lastInputTokens / contextTokenLimit : null,
+    watermark: 0.8,
+    split,
+    cumulative,
+    cacheHitRatio: denom > 0 ? cumulative.cacheRead / denom : 0,
   };
 }
 
@@ -445,10 +559,25 @@ function applyRunEnd(state, event) {
     error:
       mainStopReason === "error" ? state.error || "运行异常终止" : state.error,
     pendingApprovals: expireAll(state.pendingApprovals),
+    // 末轮之前若未收到 verification 事件（如旧事件流重放），用 run_end 里的补齐
+    verifications:
+      state.verifications.length > 0 || !Array.isArray(event.verifications)
+        ? state.verifications
+        : /** @type {any[]} */ (event.verifications).map((v, i) => ({
+            round: Number(v.round ?? i),
+            verdict: v.verdict,
+            usage: v.usage ?? null,
+          })),
     runEnd: {
       outcome: String(event.outcome ?? "completed"),
       ...(mainStopReason ? { mainStopReason } : {}),
       finishedAt: Number(event.finishedAt ?? Date.now()),
+      ...(event.finalPassed !== undefined ? { finalPassed: Boolean(event.finalPassed) } : {}),
+      ...(event.reworks !== undefined ? { reworks: Number(event.reworks) } : {}),
+      // V-07：成本口径。executionUsage 含被否掉的中间轮，是唯一正确的执行成本；
+      // verificationUsage 是核查侧开销，两者分列不混。
+      ...(event.executionUsage ? { executionUsage: event.executionUsage } : {}),
+      ...(event.verificationUsage ? { verificationUsage: event.verificationUsage } : {}),
     },
   };
 }
@@ -829,14 +958,7 @@ export function renderRunDetail(state, callbacks) {
   html += `</div>`;
 
   // 用量脚注（始终显示）
-  if (state.usage) {
-    html += `<div class="usage-footer">`;
-    html += `🔄 ${state.usage.turns} 轮 · `;
-    html += `📥 ${formatTokens(state.usage.inputTokens)} · `;
-    html += `📤 ${formatTokens(state.usage.outputTokens)} · `;
-    html += `💾 缓存命中 ${(state.usage.cacheHitRatio * 100).toFixed(0)}%`;
-    html += `</div>`;
-  }
+  html += renderUsageFooter(state);
 
   mainEl.innerHTML = html;
 
@@ -909,6 +1031,43 @@ function renderTabButton(tab, label, activeTab) {
     aria-controls="tab-content"
     tabindex="${isActive ? "0" : "-1"}"
     data-tab="${tab}">${label}</button>`;
+}
+
+/**
+ * 用量脚注（V-07）。
+ *
+ * 口径是这里的全部要点。旧版把最后一条 done 的 usage 当成整个 run 的开销——
+ * 返工场景下那只是最后一轮，主轮与 verifier 的花费全部漏计。现在优先用
+ * executionUsage（全部执行轮合计，含被否掉的中间轮），核查开销单列，
+ * 每个数字都带口径标注：界面上不出现没有口径的数字。
+ * @returns {string}
+ */
+function renderUsageFooter(state) {
+  const exec = state.runEnd && state.runEnd.executionUsage;
+  const verify = state.runEnd && state.runEnd.verificationUsage;
+
+  if (!exec && !state.usage) return "";
+
+  let html = `<div class="usage-footer">`;
+  if (exec) {
+    html += `<span class="usage-item">执行（全部轮次合计）：${exec.turns} 轮 · 入 ${formatTokens(exec.inputTokens)} · 出 ${formatTokens(exec.outputTokens)}</span>`;
+    if (verify && verify.turns > 0) {
+      html += `<span class="usage-item">核查：${verify.turns} 轮 · 入 ${formatTokens(verify.inputTokens)} · 出 ${formatTokens(verify.outputTokens)}</span>`;
+    }
+    if (state.runEnd.reworks) {
+      html += `<span class="usage-item">返工 ${state.runEnd.reworks} 轮</span>`;
+    }
+    const denom = exec.inputTokens + exec.cacheCreationTokens + exec.cacheReadTokens;
+    if (denom > 0) {
+      html += `<span class="usage-item">缓存命中 ${((exec.cacheReadTokens / denom) * 100).toFixed(0)}%</span>`;
+    }
+  } else {
+    // 运行中：只有段级数据，标注清楚它不是全程合计
+    html += `<span class="usage-item">本段：${state.usage.turns} 轮 · 入 ${formatTokens(state.usage.inputTokens)} · 出 ${formatTokens(state.usage.outputTokens)}</span>`;
+    html += `<span class="usage-item">缓存命中 ${(state.usage.cacheHitRatio * 100).toFixed(0)}%</span>`;
+  }
+  html += `</div>`;
+  return html;
 }
 
 /** @returns {string} */

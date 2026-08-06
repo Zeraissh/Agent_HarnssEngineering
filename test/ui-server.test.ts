@@ -1195,4 +1195,194 @@ describe("ui-server", () => {
     });
     expect(again.status).toBe(409);
   });
+
+  // ================================================================
+  // v2 / R2 — 数据面透出
+  // ================================================================
+
+  // ---- V-06 领域包核查三件套真实生效（本轮最重要的一条） ----
+  it("v2-7. pack 的只读白名单真实到达 verifier：合规命令被放行而非一律拒绝", async () => {
+    // verifier 第一步跑一条白名单内的命令，第二步交裁决
+    const model = new FakeModelClient([
+      fakeMessage([textBlock("已实现")], "end_turn"),
+      fakeMessage([toolUseBlock("v_bash", "bash", { command: "python -m pytest -q" })], "tool_use"),
+      fakeMessage(
+        [textBlock(JSON.stringify({ passed: true, issues: [], summary: "门禁全绿" }))],
+        "end_turn",
+      ),
+    ]);
+
+    handle = createUiServer({
+      modelClient: model,
+      packName: "python-coding",
+      // 注入一个假 bash（permission=ask，与真 bashTool 同）：verifier 对 ask 类工具
+      // 默认全 deny，只有命中包白名单才放行
+      tools: [makeTool({ name: "bash", permission: "ask", parallelSafe: false,
+        execute: async () => ({ content: "916 passed" }) })],
+      workdir: process.cwd(),
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "whitelist reaches verifier", verify: true }),
+    })).json() as { runId: string };
+    await waitForDone(base, runId);
+
+    const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+    const vResult = events.find(
+      (e: any) => e.source === "verifier" && e.event.type === "tool_result",
+    ) as any;
+    expect(vResult, "verifier 应当真的跑了那条命令").toBeDefined();
+    // 关键：不是"Verifier is read-only"的拒绝消息，而是命令的真实产出。
+    // 白名单没传到时，这里会是 deny 文案——正是案例 #4 那个 22 轮空转的起点
+    expect(vResult.event.result.isError).toBeFalsy();
+    expect(vResult.event.result.content).toContain("916 passed");
+  });
+
+  // ---- V-18 宿主真相快照 ----
+  it("v2-8. GET /api/harness 暴露包/工具面/护栏/只读根/effort，且不含密钥", async () => {
+    handle = createUiServer({
+      modelClient: new FakeModelClient([]),
+      packName: "python-coding",
+      workdir: process.cwd(),
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+
+    const snap = await (await fetch(`${base}/api/harness`)).json() as any;
+
+    expect(snap.pack.name).toBe("python-coding");
+    // 与 CLI 同源：护栏取自领域包
+    expect(snap.guardrails.maxTurns).toBe(30);
+    expect(snap.pack.verify.readOnlyCommands.length).toBeGreaterThan(0);
+    expect(snap.pack.verify.mode).toBeTruthy();
+    expect(snap.verifierBudgetTurns).toBe(15);
+    expect(snap.compactWatermark).toBe(0.8);
+    expect(Array.isArray(snap.tools)).toBe(true);
+    expect(snap.tools.every((t: any) => t.name && t.permission)).toBe(true);
+    expect(snap.shell).toBeTruthy();
+    // MCP 默认关（常驻宿主持有独占资源有风险），且如实说明原因
+    expect(snap.mcp.enabled).toBe(false);
+    expect(snap.mcp.reason).toContain("AGENT_UI_MCP");
+    // 绝不泄漏密钥
+    const asText = JSON.stringify(snap);
+    expect(asText).not.toContain("apiKey");
+    expect(asText).not.toContain("sk-");
+  });
+
+  // ---- V-07 / V-08 成本口径与逐轮裁决 ----
+  it("v2-9. run_end 带 executionUsage/verifications/reworks，且逐轮 verification 实时发出", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([textBlock("首轮")], "end_turn"),
+      fakeMessage(
+        [textBlock(JSON.stringify({ passed: false, issues: ["漏了收尾"], summary: "未通过" }))],
+        "end_turn",
+      ),
+      fakeMessage([textBlock("返工完成")], "end_turn"),
+      fakeMessage(
+        [textBlock(JSON.stringify({ passed: true, issues: [], summary: "通过" }))],
+        "end_turn",
+      ),
+    ]);
+    handle = createUiServer({ modelClient: model, tools: [autoTool("noop")], workdir: process.cwd() });
+    port = await startServer(handle);
+    base = baseUrl(port);
+
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "cost accounting", verify: true }),
+    })).json() as { runId: string };
+    await waitForDone(base, runId);
+
+    const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+
+    // 逐轮裁决实时发出：两轮核查 = 两条 verification 事件，中间轮的 issues 可见
+    const verifications = events.filter((e: any) => e.event.type === "verification") as any[];
+    expect(verifications).toHaveLength(2);
+    expect(verifications[0].event.verdict.passed).toBe(false);
+    expect(verifications[0].event.verdict.issues).toContain("漏了收尾");
+    expect(verifications[1].event.verdict.passed).toBe(true);
+
+    const runEnd = events[events.length - 1] as any;
+    expect(runEnd.event.type).toBe("run_end");
+    expect(runEnd.event.reworks).toBe(1);
+    expect(runEnd.event.finalPassed).toBe(true);
+    expect(runEnd.event.verifications).toHaveLength(2);
+
+    // 成本口径：executionUsage 覆盖两个执行轮，必然多于最后一条 done 的 usage
+    const dones = events.filter((e: any) => e.event.type === "done") as any[];
+    const lastDoneTurns = dones[dones.length - 1].event.usage.turns;
+    expect(runEnd.event.executionUsage.turns).toBeGreaterThan(lastDoneTurns);
+    expect(runEnd.event.verificationUsage.turns).toBeGreaterThan(0);
+  });
+
+  // ---- V-13 / V-14 列表口径 ----
+  it("v2-10. GET /api/runs 按 createdAt 降序且带 verdict/stopReason 等元数据", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([textBlock("a")], "end_turn"),
+      fakeMessage([textBlock("b")], "end_turn"),
+    ]);
+    handle = createUiServer({ modelClient: model, tools: [autoTool("noop")], workdir: process.cwd() });
+    port = await startServer(handle);
+    base = baseUrl(port);
+
+    const mk = async (task: string) =>
+      (await (await fetch(`${base}/api/runs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task, verify: false }),
+      })).json() as { runId: string }).runId;
+
+    const first = await mk("older");
+    await waitForDone(base, first);
+    await new Promise((r) => setTimeout(r, 5));
+    const second = await mk("newer");
+    await waitForDone(base, second);
+
+    const list = await (await fetch(`${base}/api/runs`)).json() as any[];
+    // 最新在前——此前是插入顺序，新任务提交后会从列表顶跳到底
+    expect(list[0].runId).toBe(second);
+    expect(list[1].runId).toBe(first);
+    // 元数据不再依赖"这个 run 是否被订阅过"
+    expect(list[0].stopReason).toBe("completed");
+    expect(list[0]).toHaveProperty("verdict");
+    expect(list[0]).toHaveProperty("pendingApprovals");
+  });
+
+  // ---- V-15 流式增量不进持久缓冲 ----
+  it("v2-11. text_delta 不占 seq、不进事件缓冲（走命名通道）", async () => {
+    let deltasEmitted = 0;
+    const model: ModelClient = {
+      async send(_req: ModelRequest, onDelta?: (text: string) => void): Promise<ModelTurn> {
+        // text_delta 经 send 的第二个参数旁路发出（见 src/types.ts 的 ModelClient 契约）
+        onDelta?.("流式");
+        onDelta?.("片段");
+        deltasEmitted += 2;
+        const message = fakeMessage([textBlock("最终文本")], "end_turn");
+        return { message, stopReason: message.stop_reason, usage: message.usage };
+      },
+    };
+    handle = createUiServer({ modelClient: model, tools: [autoTool("noop")], workdir: process.cwd() });
+    port = await startServer(handle);
+    base = baseUrl(port);
+
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "streaming", verify: false }),
+    })).json() as { runId: string };
+    await waitForDone(base, runId);
+
+    // 先确认 delta 确实产生过，否则这条测试是"因为没触发所以通过"的假绿
+    expect(deltasEmitted).toBeGreaterThan(0);
+
+    const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+    expect(events.find((e: any) => e.event.type === "text_delta")).toBeUndefined();
+    // seq 仍然连续（delta 不占号）
+    events.forEach((e: any, i: number) => expect(e.seq).toBe(i));
+  });
 });

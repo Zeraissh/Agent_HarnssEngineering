@@ -44,6 +44,15 @@ export interface VerifiedRunOptions {
    * 仍是宿主的事）。verifier 的事件也转发，但其 approval 已在内部 deny，仅供观察。
    */
   onEvent?: (source: "main" | "rework" | "verifier", event: TurnEvent) => void | Promise<void>;
+  /**
+   * 每轮核查裁决出炉即回调（v2 Web 宿主催生）。
+   *
+   * 为什么需要它：verifications[] 只在 runVerified 返回时才拿得到，宿主要么等到
+   * run 结束才能显示裁决，要么只能显示最后一轮——中间轮的 issues（也就是"为什么
+   * 要返工"）在界面上永远不可见。这个回调让"逐轮裁决"能实时透出。
+   * 纯附加、不影响控制流；不实现即完全等价于原行为。
+   */
+  onVerification?: (round: number, outcome: VerifyOutcome) => void | Promise<void>;
 }
 
 export interface VerifiedRunResult {
@@ -90,6 +99,7 @@ export async function runVerified(
 
     const outcome = await runVerifierWithEvents(cfg, model, task, main, opts);
     verifications.push(outcome);
+    await opts.onVerification?.(round, outcome);
 
     if (outcome.verdict.passed) {
       return { main, verifications, reworks, finalPassed: true, executionUsage };

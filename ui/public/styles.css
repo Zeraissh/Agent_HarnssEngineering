@@ -667,7 +667,11 @@ body {
   background: var(--bg2);
   border-radius: var(--radius);
   margin-top: var(--space-lg);
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-xs) var(--space-md);
 }
+.usage-item { white-space: nowrap; }
 
 /* ===== 错误横幅 ===== */
 
