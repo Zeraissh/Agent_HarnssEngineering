@@ -611,6 +611,264 @@ function expireAll(approvals) {
 }
 
 // ---------------------------------------------------------------
+// v2 R4：四决定因素派生层 (V-17)
+//
+// 组织原则来自 docs/01-philosophy.md:5-12——模型能力固定时，agent 表现的
+// 差异全部落在 Loop / Tools / Context / Verification 四处。所以控制台首屏
+// 呈现的是这四个面的当前状态，日志退为它们的下钻内容，而不是反过来。
+// 全部是纯函数，可在 node 环境直测。
+// ---------------------------------------------------------------
+
+/** verifier 输出无法解析时的哨兵（与 src/verifier.ts:303 逐字一致） */
+export const VERDICT_PARSE_FAIL = "verifier 输出无法解析为 JSON 裁决";
+
+/** 写类工具：会改变外部世界的那些，用于识别"零写入返工" */
+const WRITE_TOOLS = new Set(["write_file", "memory_write", "bash"]);
+
+/** source → 角色。前缀式来源（"s1/main"）为并行编排预留 */
+function segmentRole(source) {
+  if (isVerifierSource(source)) return "verifier";
+  const tail = typeof source === "string" && source.includes("/")
+    ? source.slice(source.lastIndexOf("/") + 1)
+    : source;
+  return tail === "rework" ? "rework" : "main";
+}
+
+/**
+ * 把时间线切成段：main → verifier → rework → verifier …
+ *
+ * 存在的理由：此前日志把三种来源按 seq 混排，标题写着"Agent 执行"却混着核查
+ * 条目，"第 1 轮"出现四次而看不出属于哪一段（V-11）。CLI 有明确的黄色
+ * `↺ 核查未通过，开始返工…` 分界（src/cli.ts:449），Web 一直没有。
+ *
+ * @param {RunState} state
+ * @returns {{index:number, source:string, role:string, round:number, startSeq:number, endSeq:number, entries:TimelineEntry[]}[]}
+ */
+export function deriveSegments(state) {
+  const all = [...state.timeline, ...state.verifierTimeline].sort((a, b) => a.seq - b.seq);
+  const segments = [];
+  let current = null;
+  const roundOf = { main: 0, rework: 0, verifier: 0 };
+
+  for (const entry of all) {
+    if (!current || current.source !== entry.source) {
+      const role = segmentRole(entry.source);
+      const round = role === "main" ? 0 : roundOf[role]++ + (role === "rework" ? 1 : 0);
+      current = {
+        index: segments.length,
+        source: entry.source,
+        role,
+        round,
+        startSeq: entry.seq,
+        endSeq: entry.seq,
+        entries: [],
+      };
+      segments.push(current);
+    }
+    current.endSeq = entry.seq;
+    current.entries.push(entry);
+  }
+  return segments;
+}
+
+/**
+ * Loop 面：轮次水位、六值终止、返工裁决序列。
+ * @param {RunState} state
+ * @param {object|null} harness `/api/harness` 快照
+ */
+export function deriveLoopFace(state, harness) {
+  const isRunning = state.status === "running";
+  const maxTurns = harness?.guardrails?.maxTurns ?? null;
+
+  // 轮次取执行侧（main/rework）的最大 turn_start——核查轮预算独立，不该混进来
+  let turn = 0;
+  for (const e of state.timeline) {
+    if (e.type === "turn_start" && typeof e.turn === "number" && e.turn > turn) turn = e.turn;
+  }
+
+  const segments = deriveSegments(state);
+  const verdictOf = (round) => state.verifications.find((v) => v.round === round)?.verdict ?? null;
+  let verifierSeen = 0;
+  const chain = segments.map((s) => {
+    if (s.role !== "verifier") return { role: s.role, round: s.round, passed: null };
+    const v = verdictOf(verifierSeen++);
+    return { role: "verifier", round: s.round, passed: v ? Boolean(v.passed) : null };
+  });
+
+  return {
+    isRunning,
+    turn,
+    maxTurns,
+    ratio: maxTurns ? Math.min(turn / maxTurns, 1) : null,
+    nearLimit: Boolean(maxTurns && turn / maxTurns >= 0.8),
+    stopReason: isRunning ? null : classifyStopReason(state.stopReason),
+    chain,
+    reworks: state.runEnd?.reworks ?? segments.filter((s) => s.role === "rework").length,
+    retries: state.timeline.filter((e) => e.type === "api_retry"),
+    effort: harness?.effort ?? null,
+    effortApplies: Boolean(harness?.effortApplies),
+  };
+}
+
+/**
+ * Context 面 = 水位口径 + 压缩事件。
+ *
+ * 水位分子是**最近一轮输入**而不是全 run 累计：ContextManager.noteUsage 是
+ * 赋值不是累加（src/context.ts:56-61），按累计画会得到"永远即将压缩却永不
+ * 压缩"的假警报。压缩单独成一个不可逆语域——被置换的 tool_result 原文
+ * 永不可恢复，那不是又一条普通警告。
+ */
+export function deriveContextFace(state, harness) {
+  const usage = deriveContextUsage(state, harness?.guardrails?.contextTokenLimit ?? null);
+  const compactions = [...state.timeline, ...state.verifierTimeline]
+    .filter((e) => e.type === "compaction")
+    .sort((a, b) => a.seq - b.seq)
+    .map((e) => ({ seq: e.seq, source: e.source, droppedBlocks: e.droppedBlocks ?? 0 }));
+
+  return {
+    ...usage,
+    watermark: harness?.compactWatermark ?? usage.watermark,
+    nearWatermark: usage.ratio !== null && usage.ratio >= (harness?.compactWatermark ?? 0.8),
+    compactions,
+    droppedBlocks: compactions.reduce((n, c) => n + c.droppedBlocks, 0),
+    perTurn: state.usageByTurn,
+  };
+}
+
+/**
+ * Tools 面：本次运行模型能做什么、实际做了什么、边界在哪。
+ *
+ * "改道"是 P5「错误进上下文，不炸循环」的可视化证据：工具失败之后模型换了
+ * 工具或换了参数继续走，而不是循环崩掉。
+ */
+export function deriveToolsFace(state, harness) {
+  const all = [...state.timeline, ...state.verifierTimeline].sort((a, b) => a.seq - b.seq);
+  const stats = new Map();
+  const bump = (name, key) => {
+    if (!name) return;
+    const s = stats.get(name) ?? { calls: 0, errors: 0 };
+    s[key] += 1;
+    stats.set(name, s);
+  };
+
+  const reroutes = [];
+  for (let i = 0; i < all.length; i++) {
+    const e = all[i];
+    if (e.type === "tool_call") bump(e.name, "calls");
+    if (e.type === "tool_result") {
+      const name = state.toolNames[e.toolUseId] ?? null;
+      if (e.resultIsError) {
+        bump(name, "errors");
+        // 紧随其后的下一次工具调用即"改道"
+        const next = all.slice(i + 1).find((x) => x.type === "tool_call");
+        if (next) {
+          reroutes.push({
+            errorSeq: e.seq,
+            failedTool: name,
+            nextSeq: next.seq,
+            nextTool: next.name,
+            switched: next.name !== name,
+          });
+        }
+      }
+    }
+  }
+
+  const declared = harness?.tools ?? [];
+  const tools = declared.map((t) => ({
+    ...t,
+    calls: stats.get(t.name)?.calls ?? 0,
+    errors: stats.get(t.name)?.errors ?? 0,
+  }));
+  // 声明面之外被真实调用过的（MCP 未接入时可能出现），照实列出而不是隐藏
+  for (const [name, s] of stats) {
+    if (!declared.some((t) => t.name === name)) {
+      tools.push({ name, permission: null, origin: "unknown", calls: s.calls, errors: s.errors });
+    }
+  }
+
+  return {
+    pack: harness?.pack ?? null,
+    shell: harness?.shell ?? null,
+    workdir: harness?.workdir ?? null,
+    readRoots: harness?.readRoots ?? [],
+    mcp: harness?.mcp ?? null,
+    guardrails: harness?.guardrails ?? null,
+    tools,
+    totalCalls: [...stats.values()].reduce((n, s) => n + s.calls, 0),
+    totalErrors: [...stats.values()].reduce((n, s) => n + s.errors, 0),
+    denials: state.pendingApprovals
+      .filter((a) => a.status === "denied")
+      .map((a) => ({ name: a.name, reason: a.reason ?? null })),
+    reroutes,
+  };
+}
+
+/**
+ * Verification 面：三值裁决 + 三类饥饿告警。
+ *
+ * `pass_with_notes` 是刻意独立的一态：CLI 对 passed=true 但 issues 非空会
+ * 降级为黄色 `⚠`（src/cli.ts:276），Web 此前一律红色。项目有两个真实案例
+ * 是"通过但备注里藏着真 bug"，这一态不能被绿色吞掉。
+ */
+export function deriveVerificationFace(state, harness) {
+  const v = state.verdict;
+  const badge = !v
+    ? "pending"
+    : v.passed && v.issues.length > 0
+      ? "pass_with_notes"
+      : v.passed
+        ? "pass"
+        : "fail";
+
+  const segments = deriveSegments(state);
+  const whitelist = harness?.pack?.verify?.readOnlyCommands ?? [];
+
+  // ① 白名单饥饿：verifier 没有可用的只读命令，却确实撞上了审批门——案例 #4 的形态。
+  //    注意判据不能看 pendingApprovals：verifier 的审批由 harness 内部自答，
+  //    压根不进那个列表（applyApproval 直接把它扔进 verifierTimeline）。
+  const verifierDenied = state.verifierTimeline.some((e) => e.type === "approval_request");
+  // ② 空返工：被否触发的返工段里一次写类调用都没有，纯粹在重证明已为真的东西
+  const emptyRework = segments
+    .filter((s) => s.role === "rework")
+    .filter((s) => !s.entries.some((e) => e.type === "tool_call" && WRITE_TOOLS.has(e.name)))
+    .map((s) => s.round);
+  // ③ 解析失败型：fail-closed 的第一种误伤形态
+  const parseFail = Boolean(v && !v.passed && v.issues[0] === VERDICT_PARSE_FAIL);
+
+  return {
+    badge,
+    verdict: v,
+    rounds: state.verifications,
+    finalPassed: state.runEnd?.finalPassed ?? (v ? v.passed : null),
+    whitelist,
+    rubricSource: harness?.pack?.verify?.rubricSource ?? null,
+    budgetTurns: harness?.verifierBudgetTurns ?? null,
+    starvation: {
+      noWhitelist: whitelist.length === 0 && verifierDenied,
+      emptyRework,
+      parseFail,
+    },
+  };
+}
+
+/**
+ * 需要人介入的事项——ActionRail 的唯一数据源。
+ *
+ * unverified 只在这里出现一次；裁决卡里的同一批是详情下钻，不是第二份清单
+ * （V-16：此前概览的"裁决卡"与"需介入事项"把它列了两遍）。
+ */
+export function deriveActionState(state) {
+  const pending = state.pendingApprovals.filter((a) => a.status === "pending");
+  const unverified = state.verdict ? state.verdict.unverified : [];
+  return {
+    pendingApprovals: pending,
+    unverifiedItems: unverified,
+    needsAttention: pending.length > 0 || unverified.length > 0,
+  };
+}
+
+// ---------------------------------------------------------------
 // 阶段二 新增：概览模型 (R-03)
 // ---------------------------------------------------------------
 
@@ -666,6 +924,11 @@ export function deriveLogEntries(state) {
   );
   return all.map((e) => ({
     ...e,
+    // V-12：tool_result 事件本身不带 name（src/loop.ts:259-264），此前界面直接
+    // 显示 `toolu_01AbC… 成功`。在派生层按 toolUseId 回填，渲染层不必知道这件事。
+    ...(e.type === "tool_result" && !e.name && state.toolNames[e.toolUseId]
+      ? { name: state.toolNames[e.toolUseId] }
+      : {}),
     collapsed: defaultCollapsed(e),
   }));
 }
@@ -940,21 +1203,43 @@ export function renderRunDetail(state, callbacks) {
   const mainEl = document.getElementById("main-area");
   if (!mainEl) return;
 
-  const activeTab = callbacks.activeTab || "overview";
+  const activeTab = normalizeTab(callbacks.activeTab);
   const logEntries = callbacks.logEntries || deriveLogEntries(state);
   const overview = deriveOverview(state);
+  const harness = callbacks.harness ?? null;
 
   const isRunning = state.status === "running";
+
+  // V-17：四决定因素派生一次，各分区共用
+  const faces = {
+    loop: deriveLoopFace(state, harness),
+    context: deriveContextFace(state, harness),
+    tools: deriveToolsFace(state, harness),
+    verification: deriveVerificationFace(state, harness),
+    action: deriveActionState(state),
+  };
 
   // V-10：骨架建一次，之后逐区补丁。此前每条 SSE 事件重建整页 innerHTML——
   // 实测拒绝理由输入框的字被清空、日志滚动归零、长运行退化成 O(n²)。
   const parts = ensureDetailSkeleton(mainEl, state, callbacks);
 
-  patchDetailHeader(parts, state, isRunning);
+  patchDetailHeader(parts, state, isRunning, faces);
   patchApprovalRail(parts, state, isRunning, callbacks);
-  patchTabNav(parts, state, activeTab, callbacks);
-  patchTabContent(parts, state, activeTab, overview, logEntries, callbacks);
+  patchUnverifiedRail(parts, faces);
+  patchLiveStrip(parts, state, isRunning);
+  patchOutcomeCard(parts, state, overview, faces);
+  patchFactorGrid(parts, faces, callbacks);
+  patchTabNav(parts, state, activeTab, callbacks, faces);
+  patchTabContent(parts, state, activeTab, overview, logEntries, callbacks, faces);
   patchUsageFooter(parts, state);
+}
+
+/** L3 下钻标签集合。overview 是历史别名——旧链接落到 Loop 面 */
+const DETAIL_TABS = ["loop", "context", "tools", "verify"];
+
+export function normalizeTab(tab) {
+  if (tab === "log" || tab === "overview" || !tab) return "loop";
+  return DETAIL_TABS.includes(tab) ? tab : "loop";
 }
 
 /**
@@ -971,6 +1256,8 @@ function ensureDetailSkeleton(mainEl, state, callbacks) {
     return mainEl.__parts;
   }
 
+  // V-17 的 L2 结构，自上而下：页头 → 需你决定 → 直播 → 结果 → 四决定因素 → 下钻。
+  // 日志不在这一层——它是 Loop 面的下钻内容。
   mainEl.innerHTML =
     (showBack
       ? '<div class="back-bar"><button class="btn back-btn" id="back-to-list-btn">← 返回列表</button></div>'
@@ -980,8 +1267,15 @@ function ensureDetailSkeleton(mainEl, state, callbacks) {
     '<div class="detail-meta">' +
     '<span class="status-badge"></span>' +
     '<span class="verify-badge" hidden>核查模式</span>' +
+    '<span class="detail-hint" hidden></span>' +
     "</div></div>" +
+    '<div class="action-rail" hidden>' +
     '<div class="approval-cards" hidden></div>' +
+    '<div class="unverified-rail" hidden></div>' +
+    "</div>" +
+    '<div class="live-strip" hidden aria-live="polite"></div>' +
+    '<div class="outcome-card"></div>' +
+    '<div class="factor-grid"></div>' +
     '<div class="tab-nav" role="tablist" aria-label="详情视图切换"></div>' +
     '<div class="tab-content" id="tab-content" role="tabpanel" tabindex="0"></div>' +
     '<div class="usage-footer" hidden></div>';
@@ -995,7 +1289,13 @@ function ensureDetailSkeleton(mainEl, state, callbacks) {
     task: mainEl.querySelector(".detail-task"),
     statusBadge: mainEl.querySelector(".status-badge"),
     verifyBadge: mainEl.querySelector(".verify-badge"),
+    hint: mainEl.querySelector(".detail-hint"),
+    actionRail: mainEl.querySelector(".action-rail"),
     approvals: mainEl.querySelector(".approval-cards"),
+    unverified: mainEl.querySelector(".unverified-rail"),
+    liveStrip: mainEl.querySelector(".live-strip"),
+    outcome: mainEl.querySelector(".outcome-card"),
+    factorGrid: mainEl.querySelector(".factor-grid"),
     tabNav: mainEl.querySelector(".tab-nav"),
     tabContent: mainEl.querySelector(".tab-content"),
     usage: mainEl.querySelector(".usage-footer"),
@@ -1007,16 +1307,83 @@ function ensureDetailSkeleton(mainEl, state, callbacks) {
   return parts;
 }
 
-function patchDetailHeader(parts, state, isRunning) {
+function patchDetailHeader(parts, state, isRunning, faces) {
   const cls = classifyStopReason(isRunning ? null : state.stopReason);
-  const sig = signature([state.task, isRunning, state.stopReason, state.verify]);
+  const loop = faces.loop;
+  const sig = signature([
+    state.task, isRunning, state.stopReason, state.verify, loop.turn, loop.maxTurns,
+  ]);
   if (parts.sig.header === sig) return;
   parts.sig.header = sig;
 
   setText(parts.task, state.task);
-  setText(parts.statusBadge, isRunning ? "运行中" : cls.label);
+  const turnLabel = loop.maxTurns ? ` · 第 ${loop.turn}/${loop.maxTurns} 轮` : "";
+  setText(parts.statusBadge, (isRunning ? "运行中" : cls.label) + (isRunning ? turnLabel : ""));
   parts.statusBadge.className = `status-badge ${isRunning ? "status--live" : toneClass(cls.tone)}`;
   setAttr(parts.verifyBadge, "hidden", state.verify ? null : "");
+
+  // 六值终止的补救提示直接进页头——max_turns / error 这两类核查根本救不了，
+  // 用户必须在第一屏就知道"通过也不代表任务做完"
+  setAttr(parts.hint, "hidden", !isRunning && cls.hint ? null : "");
+  if (!isRunning && cls.hint) setText(parts.hint, cls.hint);
+}
+
+/**
+ * 待复核项（⋯ unverified）。
+ *
+ * 只在这里出现一次。V-16：此前概览的"裁决卡"与"需介入事项"把同一批列了两遍，
+ * 用户以为有两组待办。裁决卡里的那份现在是下钻详情，不是第二份清单。
+ */
+function patchUnverifiedRail(parts, faces) {
+  const items = faces.action.unverifiedItems;
+  const sig = signature([items.length, items.join("|")]);
+  setAttr(parts.actionRail, "hidden", faces.action.needsAttention ? null : "");
+  if (parts.sig.unverified === sig) return;
+  parts.sig.unverified = sig;
+
+  setAttr(parts.unverified, "hidden", items.length > 0 ? null : "");
+  if (items.length === 0) {
+    parts.unverified.innerHTML = "";
+    return;
+  }
+  parts.unverified.innerHTML =
+    `<h3 class="rail-title">⋯ ${items.length} 项待你复核</h3>` +
+    '<ul class="unverified-list">' +
+    items.map((i) => `<li class="unverified-item">${esc(i)}</li>`).join("") +
+    "</ul>" +
+    '<p class="rail-note">核查者无法自行判定这些项，已移交委托方。不影响 passed，也不触发返工。</p>';
+}
+
+/** 直播条：运行中显示最近一次工具调用或最后一句输出 */
+function patchLiveStrip(parts, state, isRunning) {
+  if (!isRunning) {
+    setAttr(parts.liveStrip, "hidden", "");
+    parts.sig.live = null;
+    return;
+  }
+  const recent = [...state.timeline].reverse();
+  const call = recent.find((e) => e.type === "tool_call");
+  const text = recent.find((e) => e.type === "assistant_text");
+  const label = call
+    ? `${call.name}(${summarizeInput(call.input)})`
+    : text
+      ? String(text.text ?? "").slice(0, 80)
+      : "等待模型响应…";
+
+  const sig = signature([label]);
+  if (parts.sig.live === sig) return;
+  parts.sig.live = sig;
+  setAttr(parts.liveStrip, "hidden", null);
+  parts.liveStrip.innerHTML =
+    '<span class="live-dot"></span><span class="live-text"></span>';
+  setText(parts.liveStrip.querySelector(".live-text"), label);
+}
+
+function summarizeInput(input) {
+  if (!input || typeof input !== "object") return "";
+  const first = Object.values(input)[0];
+  const s = typeof first === "string" ? first : JSON.stringify(first ?? "");
+  return s.length > 40 ? `${s.slice(0, 40)}…` : s;
 }
 
 /**
@@ -1107,13 +1474,190 @@ function updateApprovalCard(card, a, isRunning) {
   if (resolved && a.reason) setText(reasonEl, `理由：${a.reason}`);
 }
 
-function patchTabNav(parts, state, activeTab, callbacks) {
+/**
+ * 结果卡：恒在、恒展开。
+ *
+ * 排序刻意把核查结论放在执行者报告之前——委托方 §6 的要求是"无需展开日志
+ * 即可判断结果"，而执行者的自述与核查者的裁决不是一回事，后者才是结论。
+ */
+function patchOutcomeCard(parts, state, overview, faces) {
+  const v = faces.verification;
+  const loop = faces.loop;
+  const summary = overview.resultSummary;
+  const sig = signature([
+    state.status, state.stopReason, state.error, v.badge,
+    v.verdict ? JSON.stringify(v.verdict) : "", loop.reworks, summary,
+  ]);
+  if (parts.sig.outcome === sig) return;
+  parts.sig.outcome = sig;
+
+  let html = "";
+  if (state.status === "running") {
+    html += '<p class="outcome-pending">运行中，尚无最终结果。</p>';
+  } else {
+    const cls = classifyStopReason(state.stopReason);
+    html += `<div class="outcome-line outcome-line--${cls.tone}">`;
+    html += `<span class="outcome-mark">■</span> ${esc(cls.label)}`;
+    html += "</div>";
+    if (state.error) html += `<p class="outcome-error">${esc(state.error)}</p>`;
+  }
+
+  if (v.verdict) {
+    const reworkNote = loop.reworks > 0 ? `（返工 ${loop.reworks} 轮后${v.verdict.passed ? "通过" : "仍未过"}）` : "";
+    html += `<div class="outcome-verdict outcome-verdict--${v.badge}">`;
+    html += `<span class="outcome-verdict-badge">${verdictBadgeLabel(v.badge)}</span>`;
+    html += `<span class="outcome-verdict-note">${esc(reworkNote)}</span>`;
+    html += "</div>";
+    if (v.verdict.summary) {
+      html += `<p class="outcome-verdict-summary">${esc(v.verdict.summary)}</p>`;
+    }
+    if (v.verdict.issues.length > 0) {
+      // V-19：passed=true 时 issues 降级为黄色备注而不是红色不符——
+      // 项目有两个真实案例是"通过但备注里藏着真 bug"，这一态不能被绿色吞掉
+      const mark = v.verdict.passed ? "⚠" : "✗";
+      const tone = v.verdict.passed ? "warn" : "bad";
+      html += `<ul class="outcome-issues outcome-issues--${tone}">`;
+      html += v.verdict.issues.map((i) => `<li>${mark} ${esc(i)}</li>`).join("");
+      html += "</ul>";
+    }
+  }
+
+  if (summary) {
+    const lines = summary.split("\n");
+    const long = lines.length > 6;
+    html += '<details class="outcome-summary"' + (long ? "" : " open") + ">";
+    html += `<summary>执行者报告${long ? `（${lines.length} 行）` : ""}</summary>`;
+    html += `<div class="outcome-summary-text">${esc(summary)}</div>`;
+    html += "</details>";
+  }
+
+  parts.outcome.innerHTML = html;
+}
+
+function verdictBadgeLabel(badge) {
+  return {
+    pass: "✔ 核查通过",
+    pass_with_notes: "✔ 通过（有备注）",
+    fail: "✘ 核查未通过",
+    pending: "⋯ 尚未核查",
+  }[badge] ?? "⋯ 尚未核查";
+}
+
+/**
+ * 四决定因素网格 (V-17)。
+ *
+ * 异常面自动加权并排到首位——用户第一眼该看到的是"哪一面出了问题"，
+ * 而不是四张长得一样的卡片。
+ */
+function patchFactorGrid(parts, faces, callbacks) {
+  const cards = buildFactorCards(faces);
+  const sig = signature([JSON.stringify(cards.map((c) => [c.id, c.abnormal, c.lines.join("~")]))]);
+  if (parts.sig.factors === sig) return;
+  parts.sig.factors = sig;
+
+  patchList(parts.factorGrid, cards, {
+    key: (c) => c.id,
+    create: (c) => {
+      const el = document.createElement("button");
+      el.type = "button";
+      el.className = "factor-card";
+      el.setAttribute("data-factor", c.id);
+      el.innerHTML =
+        '<span class="factor-title"></span><span class="factor-lines"></span>';
+      el.addEventListener("click", () => {
+        document.dispatchEvent(new CustomEvent("tab-switch", { detail: { tab: c.id } }));
+      });
+      updateFactorCard(el, c);
+      return el;
+    },
+    update: updateFactorCard,
+  });
+}
+
+function updateFactorCard(el, c) {
+  setClass(el, "factor-card--abnormal", c.abnormal);
+  setText(el.querySelector(".factor-title"), c.title);
+  setAttr(el, "aria-label", `${c.title}：${c.lines.join("，")}。查看详情`);
+  el.querySelector(".factor-lines").innerHTML = c.lines
+    .map((l) => `<span class="factor-line">${esc(l)}</span>`)
+    .join("");
+}
+
+/** 四张卡的内容与异常判定，纯函数——可直测 */
+export function buildFactorCards(faces) {
+  const { loop, context, tools, verification: v } = faces;
+
+  const loopLines = [];
+  loopLines.push(loop.maxTurns ? `${loop.turn}/${loop.maxTurns} 轮` : `${loop.turn} 轮`);
+  if (loop.stopReason) loopLines.push(`■ ${loop.stopReason.label}`);
+  if (loop.reworks > 0) loopLines.push(`↺ 返工 ${loop.reworks} 轮`);
+  if (loop.retries.length > 0) loopLines.push(`⟳ 重试 ${loop.retries.length} 次已自愈`);
+  if (loop.effort) loopLines.push(`effort ${loop.effort}${loop.effortApplies ? "" : "（compat 下不发送）"}`);
+
+  const ctxLines = [];
+  if (context.limit) {
+    ctxLines.push(`本轮输入 ${formatTokens(context.lastInputTokens)} / ${formatTokens(context.limit)}`);
+  } else {
+    ctxLines.push(`本轮输入 ${formatTokens(context.lastInputTokens)}`);
+  }
+  ctxLines.push(`缓存命中 ${(context.cacheHitRatio * 100).toFixed(0)}%`);
+  if (context.compactions.length > 0) {
+    ctxLines.push(`⚠ 压缩 ${context.compactions.length} 次 · 置换 ${context.droppedBlocks} 块不可恢复`);
+  }
+
+  const toolLines = [];
+  toolLines.push(tools.pack?.name ? `包 ${tools.pack.name}` : "无领域包");
+  toolLines.push(`${tools.tools.length} 个工具 · 调用 ${tools.totalCalls} 次`);
+  if (tools.totalErrors > 0) toolLines.push(`✗ 失败 ${tools.totalErrors} 次`);
+  if (tools.denials.length > 0) toolLines.push(`⊘ 被拒 ${tools.denials.length} 次`);
+  if (tools.readRoots.length > 0) toolLines.push(`只读根 ${tools.readRoots.length} 个`);
+
+  const vLines = [verdictBadgeLabel(v.badge)];
+  if (v.verdict) {
+    const bits = [];
+    if (v.verdict.unverified.length) bits.push(`⋯ ${v.verdict.unverified.length}`);
+    if (v.verdict.advisory.length) bits.push(`◈ ${v.verdict.advisory.length}`);
+    if (bits.length) vLines.push(bits.join(" · "));
+  }
+  if (v.starvation.noWhitelist) vLines.push("⚠ verifier 无白名单（核查饥饿）");
+  if (v.starvation.emptyRework.length > 0) vLines.push("⚠ 返工零写入（疑似核查饥饿）");
+  if (v.starvation.parseFail) vLines.push("⚠ 裁决解析失败（fail-closed 误伤）");
+
+  const cards = [
+    {
+      id: "loop", title: "Loop 循环", lines: loopLines,
+      abnormal: Boolean(loop.stopReason && loop.stopReason.tone !== "ok") || loop.nearLimit,
+    },
+    {
+      id: "context", title: "Context 上下文", lines: ctxLines,
+      abnormal: context.compactions.length > 0 || context.nearWatermark,
+    },
+    {
+      id: "tools", title: "Tools 工具", lines: toolLines,
+      abnormal: tools.totalErrors > 0 || tools.denials.length > 0,
+    },
+    {
+      id: "verify", title: "Verification 核查", lines: vLines,
+      abnormal:
+        v.badge === "fail" || v.badge === "pass_with_notes" ||
+        (v.verdict?.unverified.length ?? 0) > 0 ||
+        v.starvation.noWhitelist || v.starvation.parseFail ||
+        v.starvation.emptyRework.length > 0,
+    },
+  ];
+
+  // 异常面排到首位（稳定排序：同为异常/正常者保持声明顺序）
+  return [...cards.filter((c) => c.abnormal), ...cards.filter((c) => !c.abnormal)];
+}
+
+function patchTabNav(parts, state, activeTab, callbacks, faces) {
   const tabs = [
-    { id: "overview", label: "概览" },
-    { id: "log", label: "运行日志" },
+    { id: "loop", label: "Loop 循环" },
+    { id: "context", label: "Context 上下文" },
+    { id: "tools", label: "Tools 工具" },
   ];
   if (state.verifierTimeline.length > 0 || state.verdict) {
-    tabs.push({ id: "verify", label: "核查" });
+    tabs.push({ id: "verify", label: "Verification 核查" });
   }
 
   const sig = signature([tabs.map((t) => t.id).join(","), activeTab]);
@@ -1147,7 +1691,7 @@ function patchTabNav(parts, state, activeTab, callbacks) {
   });
 }
 
-function patchTabContent(parts, state, activeTab, overview, logEntries, callbacks) {
+function patchTabContent(parts, state, activeTab, overview, logEntries, callbacks, faces) {
   const container = parts.tabContent;
 
   // 换标签页时内容形态完全不同，直接重建；同一标签内走各自的增量策略
@@ -1156,37 +1700,195 @@ function patchTabContent(parts, state, activeTab, overview, logEntries, callback
     container.__patchNodes = undefined;
     container.__tab = activeTab;
     parts.sig.tabBody = null;
-    if (activeTab === "log") {
-      container.innerHTML = '<h3 class="overview-section-title">Agent 执行</h3><div class="log-entries"></div>';
+    if (activeTab === "loop") {
+      container.innerHTML =
+        '<h3 class="overview-section-title">Agent 执行</h3>' +
+        '<div class="rework-chain"></div>' +
+        '<div class="log-entries"></div>';
       container.__logHost = container.querySelector(".log-entries");
-      container.__renderedSeqs = new Set();
     }
   }
 
-  if (activeTab === "log") {
-    patchLogPanel(container, logEntries, callbacks);
+  if (activeTab === "loop") {
+    patchReworkChain(container.querySelector(".rework-chain"), faces.loop);
+    patchLogPanel(container, logEntries, callbacks, state);
     return;
   }
 
-  // 概览 / 核查：无输入控件、无滚动锚点，签名变了整体重绘即可
+  // context / tools / verify：无输入控件、无滚动锚点，签名变了整体重绘即可
   const sig =
-    activeTab === "overview"
+    activeTab === "context"
       ? signature([
-          state.stopReason, state.status, overview.resultSummary,
-          state.verdict ? JSON.stringify(state.verdict) : "",
-          overview.actionItems.pendingApprovals.length,
-          overview.actionItems.unverifiedItems.length,
-          overview.resolvedApprovals.length, state.error,
+          faces.context.lastInputTokens, faces.context.limit,
+          faces.context.compactions.length, faces.context.perTurn.length,
         ])
-      : signature([
-          state.verifierTimeline.length,
-          state.verdict ? JSON.stringify(state.verdict) : "",
-        ]);
+      : activeTab === "tools"
+        ? signature([
+            faces.tools.totalCalls, faces.tools.totalErrors,
+            faces.tools.tools.length, faces.tools.denials.length,
+            faces.tools.reroutes.length, faces.tools.pack?.name ?? "",
+          ])
+        : signature([
+            state.verifierTimeline.length,
+            state.verdict ? JSON.stringify(state.verdict) : "",
+            faces.verification.rounds.length,
+            JSON.stringify(faces.verification.starvation),
+          ]);
   if (parts.sig.tabBody === sig) return;
   parts.sig.tabBody = sig;
 
   container.innerHTML =
-    activeTab === "overview" ? renderOverviewTab(overview, state) : renderVerifyTab(state);
+    activeTab === "context"
+      ? renderContextTab(faces.context)
+      : activeTab === "tools"
+        ? renderToolsTab(faces.tools)
+        : renderVerifyTab(state, faces.verification);
+}
+
+/** 返工裁决序列：main ─■─▶ verifier ✘ ─↺─▶ rework ─■─▶ verifier ✔ */
+function patchReworkChain(host, loop) {
+  if (!host) return;
+  if (loop.chain.length <= 1) {
+    host.innerHTML = "";
+    setAttr(host, "hidden", "");
+    return;
+  }
+  setAttr(host, "hidden", null);
+  const roleLabel = { main: "主轮", rework: "返工", verifier: "核查" };
+  host.innerHTML = loop.chain
+    .map((c) => {
+      const mark = c.role === "verifier" ? (c.passed === null ? "⋯" : c.passed ? "✔" : "✘") : "■";
+      const tone = c.role === "verifier" ? (c.passed === null ? "pending" : c.passed ? "ok" : "bad") : "neutral";
+      const label = c.role === "rework" ? `↺ ${roleLabel[c.role]}` : roleLabel[c.role];
+      const round = c.role === "main" ? "" : ` ${c.round}`;
+      return `<span class="chain-node chain-node--${tone}">${mark} ${esc(label)}${round}</span>`;
+    })
+    .join('<span class="chain-arrow">▸</span>');
+}
+
+/** Context 面下钻：逐轮 token 与压缩点 */
+function renderContextTab(ctx) {
+  let html = '<h3 class="overview-section-title">上下文水位</h3>';
+
+  if (ctx.limit) {
+    const pct = Math.round((ctx.ratio ?? 0) * 100);
+    html += '<div class="meter" role="progressbar"' +
+      ` aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100"` +
+      ` aria-label="上下文水位 ${pct}%">`;
+    html += `<div class="meter-fill" style="width:${pct}%"></div>`;
+    html += `<div class="meter-threshold" style="left:${Math.round(ctx.watermark * 100)}%"></div>`;
+    html += "</div>";
+    html += `<p class="meter-note">最近一轮输入 ${formatTokens(ctx.lastInputTokens)} / 上限 ${formatTokens(ctx.limit)}（${pct}%），超过 ${Math.round(ctx.watermark * 100)}% 触发压缩。<strong>口径是最近一轮，不是全程累计</strong>——压缩判据取的就是单轮输入。</p>`;
+  } else {
+    html += `<p class="meter-note">最近一轮输入 ${formatTokens(ctx.lastInputTokens)}（未配置上限，无法给出水位）。</p>`;
+  }
+
+  html += '<h3 class="overview-section-title">Token 三分（全程累计）</h3>';
+  const c = ctx.cumulative;
+  const total = c.input + c.cacheCreation + c.cacheRead;
+  if (total > 0) {
+    const seg = (n, cls, label) =>
+      n > 0 ? `<span class="token-seg token-seg--${cls}" style="flex:${n}" title="${label} ${formatTokens(n)}"></span>` : "";
+    html += '<div class="token-bar">';
+    html += seg(c.input, "uncached", "未缓存输入");
+    html += seg(c.cacheCreation, "cache-write", "缓存写入");
+    html += seg(c.cacheRead, "cache-read", "缓存读取");
+    html += "</div>";
+    html += '<ul class="token-legend">';
+    html += `<li><span class="token-dot token-dot--uncached"></span>未缓存 ${formatTokens(c.input)}</li>`;
+    html += `<li><span class="token-dot token-dot--cache-write"></span>缓存写入 ${formatTokens(c.cacheCreation)}</li>`;
+    html += `<li><span class="token-dot token-dot--cache-read"></span>缓存读取 ${formatTokens(c.cacheRead)}</li>`;
+    html += `<li>命中率 ${(ctx.cacheHitRatio * 100).toFixed(0)}%</li>`;
+    html += "</ul>";
+  } else {
+    html += '<p class="empty-note">尚无 token 计量。</p>';
+  }
+
+  if (ctx.compactions.length > 0) {
+    // V-19：不可逆自成语域。被置换的 tool_result 原文永不可恢复，
+    // 这不是"又一条黄色警告"，混在一起会让人对它脱敏。
+    html += '<div class="callout callout--irreversible">';
+    html += `<strong>⚠ 上下文压缩 ${ctx.compactions.length} 次，置换 ${ctx.droppedBlocks} 个 tool_result 原文</strong>`;
+    html += "<p>本地截断是不可逆的信息丢失：被置换的原文永不可恢复，模型只能重新调用工具取回。</p>";
+    html += "</div>";
+  }
+
+  if (ctx.perTurn.length > 0) {
+    html += '<h3 class="overview-section-title">逐轮明细</h3>';
+    html += '<div class="table-scroll"><table class="usage-table">';
+    html += "<thead><tr><th>轮</th><th>未缓存</th><th>缓存写</th><th>缓存读</th><th>输出</th></tr></thead><tbody>";
+    for (const t of ctx.perTurn) {
+      html += `<tr><td>${t.turn}</td><td>${formatTokens(t.input)}</td><td>${formatTokens(t.cacheCreation)}</td><td>${formatTokens(t.cacheRead)}</td><td>${formatTokens(t.output)}</td></tr>`;
+    }
+    html += "</tbody></table></div>";
+  }
+  return html;
+}
+
+/** Tools 面下钻：工具面、边界、改道证据 */
+function renderToolsTab(tools) {
+  let html = '<h3 class="overview-section-title">工具面</h3>';
+
+  if (tools.tools.length === 0) {
+    html += '<p class="empty-note">未获取到工具清单（宿主快照不可用）。</p>';
+  } else {
+    html += '<ul class="tool-chips">';
+    for (const t of tools.tools) {
+      const perm = t.permission ? `<span class="chip-perm chip-perm--${t.permission}">${t.permission}</span>` : "";
+      const count = t.calls > 0 ? `<span class="chip-count">${t.calls} 次</span>` : "";
+      const err = t.errors > 0 ? `<span class="chip-err">${t.errors} 失败</span>` : "";
+      html += `<li class="tool-chip${t.errors > 0 ? " tool-chip--err" : ""}"><span class="chip-name">${esc(t.name)}</span>${perm}${count}${err}</li>`;
+    }
+    html += "</ul>";
+  }
+
+  html += '<h3 class="overview-section-title">运行边界</h3><dl class="boundary-list">';
+  const row = (k, v) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`;
+  if (tools.pack) {
+    html += row("领域包", tools.pack.name ? `${tools.pack.name} — ${tools.pack.description ?? ""}` : "（无）");
+    html += row("核查模式", tools.pack.verify?.mode ?? "（无）");
+    const wl = tools.pack.verify?.readOnlyCommands ?? [];
+    html += row("核查只读白名单", wl.length ? wl.join("、") : "（空——verifier 只能读文件，无法亲手重跑门禁）");
+    if (tools.pack.resources?.length) html += row("独占资源", tools.pack.resources.join("、"));
+  }
+  if (tools.shell) html += row("bash 运行时", tools.shell);
+  if (tools.workdir) html += row("工作目录", tools.workdir);
+  html += row("额外只读根", tools.readRoots.length ? tools.readRoots.join("；") : "（无）");
+  if (tools.guardrails) {
+    const g = tools.guardrails;
+    html += row("护栏", `maxTurns ${g.maxTurns ?? "—"} · maxTokens ${g.maxTokens ?? "—"} · 上下文上限 ${g.contextTokenLimit ?? "—"}`);
+  }
+  if (tools.mcp) {
+    const servers = tools.mcp.servers ?? [];
+    html += row(
+      "MCP",
+      servers.length
+        ? servers.map((s) => `${s.name}（${s.status}${s.toolCount != null ? `，${s.toolCount} 工具` : ""}）`).join("；")
+        : tools.mcp.configured ? "已配置但未连接" : "未配置",
+    );
+  }
+  html += "</dl>";
+
+  if (tools.denials.length > 0) {
+    html += '<h3 class="overview-section-title">被拒记录</h3><ul class="deny-list">';
+    for (const d of tools.denials) {
+      html += `<li><code>${esc(d.name)}</code>${d.reason ? `：${esc(d.reason)}` : "（未填理由）"}</li>`;
+    }
+    html += "</ul>";
+    html += '<p class="rail-note">拒绝理由会原样回传给模型——deny 消息本身就是能力边界说明书。</p>';
+  }
+
+  const switched = tools.reroutes.filter((r) => r.switched);
+  if (switched.length > 0) {
+    // P5「错误进上下文，不炸循环」的可视化证据
+    html += '<h3 class="overview-section-title">失败后的改道</h3><ul class="reroute-list">';
+    for (const r of switched) {
+      html += `<li><code>${esc(r.failedTool ?? "?")}</code> 失败 <span class="reroute-arrow">↳</span> 改用 <code>${esc(r.nextTool)}</code></li>`;
+    }
+    html += "</ul>";
+    html += '<p class="rail-note">工具失败是常态路径：错误进上下文、循环不中断，模型自行改道。</p>';
+  }
+  return html;
 }
 
 /**
@@ -1196,7 +1898,7 @@ function patchTabContent(parts, state, activeTab, overview, logEntries, callback
  * ② 单次代价降到 O(新增条数)，长运行不再是 O(n²)。
  * 滚动跟随沿用 GitHub Actions 的规矩——贴底才跟，用户往上翻时不拽回去。
  */
-function patchLogPanel(container, logEntries, callbacks) {
+function patchLogPanel(container, logEntries, callbacks, state) {
   const host = container.__logHost;
   if (!host) return;
 
@@ -1212,35 +1914,69 @@ function patchLogPanel(container, logEntries, callbacks) {
   const empty = container.querySelector(".log-empty");
   if (empty) empty.remove();
 
+  // V-11：段首插入来源分界。此前三种来源按 seq 混排，标题写着"Agent 执行"
+  // 却混着核查条目，"第 1 轮"出现四次而看不出属于哪一段。
+  // CLI 一直有黄色 `↺ 核查未通过，开始返工…`（src/cli.ts:449），Web 没有。
+  const boundaries = new Map();
+  if (state) {
+    for (const s of deriveSegments(state)) {
+      if (s.index > 0) boundaries.set(s.startSeq, s);
+    }
+  }
+
   const scroller = host.closest(".content-area") || host;
   keepScrollAnchored(scroller, () => {
     appendOnly(host, logEntries, {
       key: (e) => String(e.seq),
       create: (e) => {
         const wrap = document.createElement("div");
-        wrap.innerHTML = renderLogEntry(e);
-        const node = wrap.firstElementChild;
+        const boundary = boundaries.get(e.seq);
+        wrap.innerHTML = (boundary ? renderSegmentBoundary(boundary) : "") + renderLogEntry(e);
+        // 有分界时把两个节点包进一个容器，保持 appendOnly 的"一 key 一节点"契约
+        let node;
+        if (boundary) {
+          node = document.createElement("div");
+          node.className = "log-group";
+          while (wrap.firstChild) node.appendChild(wrap.firstChild);
+        } else {
+          node = wrap.firstElementChild;
+        }
         node.querySelector(".log-entry-header")?.addEventListener("click", () => {
           callbacks.onToggleEntry?.(Number(e.seq));
         });
         return node;
       },
-      // 折叠状态是唯一会变的部分：重建 innerHTML 但保留外层节点，
+      // 折叠状态是唯一会变的部分：重建内容但保留外层节点，
       // 这样滚动锚点与 patchNodes 映射都不受影响
       update: (node, e) => {
-        const wasCollapsed = node.classList.contains("log-entry--collapsed");
+        const target = node.classList.contains("log-group")
+          ? node.querySelector(".log-entry")
+          : node;
+        if (!target) return;
+        const wasCollapsed = target.classList.contains("log-entry--collapsed");
         if (wasCollapsed === Boolean(e.collapsed)) return;
         const wrap = document.createElement("div");
         wrap.innerHTML = renderLogEntry(e);
         const fresh = wrap.firstElementChild;
-        node.className = fresh.className;
-        node.innerHTML = fresh.innerHTML;
-        node.querySelector(".log-entry-header")?.addEventListener("click", () => {
+        target.className = fresh.className;
+        target.innerHTML = fresh.innerHTML;
+        target.querySelector(".log-entry-header")?.addEventListener("click", () => {
           callbacks.onToggleEntry?.(Number(e.seq));
         });
       },
     });
   });
+}
+
+/** 段分界：main→verifier 用 ━，返工用 CLI 同款 ↺（src/cli.ts:449） */
+function renderSegmentBoundary(seg) {
+  const label = {
+    verifier: "核查 Agent 独立复核（全新上下文）",
+    rework: `核查未通过，开始返工（第 ${seg.round} 轮）`,
+    main: "Agent 执行",
+  }[seg.role];
+  const mark = seg.role === "rework" ? "↺" : seg.role === "verifier" ? "◆" : "▸";
+  return `<div class="segment-boundary segment-boundary--${seg.role}"><span class="segment-mark">${mark}</span><span class="segment-label">${esc(label)}</span></div>`;
 }
 
 function patchUsageFooter(parts, state) {
@@ -1455,9 +2191,12 @@ function renderLogEntryHeader(e, collapsed) {
   const icon = entryIcon(e.type, e.resultIsError);
   const action = entryActionLabel(e);
   const detail = entryDetail(e);
-  const duration = e.durationMs != null ? `${e.durationMs}ms` : "";
+  // V-12：耗时用可读格式（此前原样输出 `124757ms`，人得自己心算成 2 分钟）
+  const duration = e.durationMs != null ? formatDuration(e.durationMs) : "";
   const expandIcon = collapsed ? "▸" : "▾";
 
+  // action / detail 在此统一 esc，entryActionLabel 内部不得再 esc 一次
+  // （V-16：双重转义会把工具参数里的引号显示成 &amp;quot;）
   return `<div class="log-entry-header" data-seq="${e.seq}" tabindex="0" role="button" aria-expanded="${!collapsed}">
     <span class="log-entry-expand">${expandIcon}</span>
     <span class="log-entry-icon">${icon}</span>
@@ -1503,14 +2242,17 @@ function entryIcon(type, isError) {
 
 /** @returns {string} */
 function entryActionLabel(e) {
+  // 这里一律返回**未转义**的纯文本，转义由 renderLogEntryHeader 统一做（V-16）
   switch (e.type) {
     case "turn_start": return `第 ${e.turn ?? "?"} 轮`;
-    case "tool_call": return `${esc(e.name ?? "")}`;
-    case "tool_result": return `${esc(e.name ?? e.toolUseId ?? "")} ${e.resultIsError ? "失败" : "成功"}`;
-    case "assistant_text": return `助手消息`;
-    case "approval_request": return `审批请求：${esc(e.name ?? "")}`;
+    case "tool_call": return e.name ?? "";
+    // name 由 deriveLogEntries 按 toolUseId 回填；真取不到才退回 id（V-12）
+    case "tool_result": return `${e.name ?? e.toolUseId ?? ""} ${e.resultIsError ? "失败" : "成功"}`;
+    case "assistant_text": return "助手消息";
+    case "approval_request": return `审批请求：${e.name ?? ""}`;
     case "api_retry": return `API 重试（第${e.attempt ?? "?"}次）`;
-    case "compaction": return `上下文压缩`;
+    case "compaction": return "上下文压缩";
+    case "usage": return "本轮用量";
     default: return e.type;
   }
 }
@@ -1534,12 +2276,53 @@ function entryDetail(e) {
 }
 
 /** @returns {string} */
-function renderVerifyTab(state) {
+function renderVerifyTab(state, face) {
   let html = "";
+
+  // 三类饥饿告警分开列，不混成一条——它们指向不同的根因层，混在一起就没法归因
+  if (face) {
+    const s = face.starvation;
+    if (s.noWhitelist) {
+      html += '<div class="callout callout--warn"><strong>⚠ verifier 处于无白名单状态</strong>' +
+        "<p>本包未声明 <code>verify.readOnlyCommands</code>，核查者撞上审批门只能被拒——它无法亲手重跑门禁，只能靠间接证据。这正是案例 #4 那次 22 轮空转的配置形态。</p></div>";
+    }
+    if (s.emptyRework.length > 0) {
+      html += `<div class="callout callout--warn"><strong>⚠ 第 ${s.emptyRework.join("、")} 轮返工零写入</strong>` +
+        "<p>被否之后的返工段里没有任何写类工具调用，疑似核查饥饿（fail-closed 的第三种误伤形态）：模型在重新证明已经为真的东西，而不是修东西。</p></div>";
+    }
+    if (s.parseFail) {
+      html += '<div class="callout callout--bad"><strong>⚠ 裁决解析失败</strong>' +
+        "<p>verifier 的输出不是可解析的 JSON 裁决，被 fail-closed 判为未通过。这是误伤，不是真的核查不过。</p></div>";
+    }
+  }
 
   // 核查结论（如果存在）
   if (state.verdict) {
     html += renderVerdictCard(state.verdict);
+  }
+
+  // 逐轮裁决（V-08：末轮之外的中间轮也保留）
+  if (face && face.rounds.length > 1) {
+    html += '<h3 class="overview-section-title">逐轮裁决</h3><ol class="verify-rounds">';
+    for (const r of face.rounds) {
+      const mark = r.verdict?.passed ? "✔" : "✘";
+      const issues = r.verdict?.issues?.length ?? 0;
+      html += `<li class="verify-round verify-round--${r.verdict?.passed ? "ok" : "bad"}">` +
+        `<span class="round-mark">${mark}</span> 第 ${r.round + 1} 次核查` +
+        (issues ? `：${issues} 项不符` : "") +
+        (r.verdict?.summary ? `<span class="round-summary">${esc(r.verdict.summary)}</span>` : "") +
+        "</li>";
+    }
+    html += "</ol>";
+  }
+
+  // 核查者的能力边界——deny 消息即教学，白名单即边界说明书
+  if (face) {
+    html += '<h3 class="overview-section-title">核查者的边界</h3><dl class="boundary-list">';
+    html += `<dt>只读白名单</dt><dd>${face.whitelist.length ? esc(face.whitelist.join("、")) : "（空——只能读文件，无法重跑门禁）"}</dd>`;
+    html += `<dt>核查预算</dt><dd>${face.budgetTurns ?? "—"} 轮（固定，与执行者的 maxTurns 解耦）</dd>`;
+    html += `<dt>评分表来源</dt><dd>${face.rubricSource ? esc(face.rubricSource) : "（未注入——advisory 恒为空）"}</dd>`;
+    html += "</dl>";
   }
 
   // 核查时间线（使用日志卡片风格）

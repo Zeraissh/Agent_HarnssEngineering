@@ -38,6 +38,31 @@ function loadSkeleton(): string {
   return body.replace(/<script[\s\S]*?<\/script>/g, "");
 }
 
+/** 宿主快照替身：护栏、工具面、包与白名单齐全，四决定因素才有东西可渲染 */
+const FAKE_HARNESS = {
+  model: "claude-opus-4-8",
+  effort: "high",
+  effortApplies: true,
+  shell: "Git Bash (C:\\Program Files\\Git\\bin\\bash.exe)",
+  workdir: "D:\\repo",
+  readRoots: ["D:\\refs"],
+  guardrails: { maxTurns: 40, maxTokens: 64000, contextTokenLimit: 150000 },
+  compactWatermark: 0.8,
+  verifierBudgetTurns: 15,
+  pack: {
+    name: "ts-coding",
+    description: "TypeScript 编码域",
+    resources: [],
+    verify: { enabled: true, mode: "rubric", hasInstructions: true, readOnlyCommands: ["npm test"], rubricSource: "pack" },
+  },
+  tools: [
+    { name: "bash", permission: "ask", parallelSafe: false, origin: "builtin" },
+    { name: "read_file", permission: "auto", parallelSafe: true, origin: "builtin" },
+    { name: "write_file", permission: "ask", parallelSafe: false, origin: "builtin" },
+  ],
+  mcp: { configured: false, servers: [] },
+};
+
 /** 构造一个"内容尽量丰富"的运行状态：审批卡（待处理+已应答）、核查过程、三值裁决、用量 */
 function buildRichState() {
   let s = createInitialState("run-1", "创建 demo.txt 并核对内容", true);
@@ -142,26 +167,43 @@ describe("axe 自动扫描：空态 / 列表 / 详情三种画面零 violations"
     expect(violations, JSON.stringify(violations, null, 2)).toEqual([]);
   });
 
-  it("运行详情·概览标签（审批卡 + 三值裁决 + 用量）", async () => {
-    renderRunDetail(buildRichState(), { activeTab: "overview" });
+  // v2 R4：详情页从"概览/日志/核查"三标签改为「结果 + 四决定因素」结构。
+  // 每个面各扫一遍——审批栏、结果卡与因子网格在四个面下都恒在，所以任一面
+  // 的 violations 都会同时暴露 L2 与 L3 的问题。
+  it("运行详情·Loop 面（返工链 + 分段日志 + 折叠条目）", async () => {
+    renderRunDetail(buildRichState(), { activeTab: "loop", harness: FAKE_HARNESS });
     const violations = await runAxe();
     expect(violations, JSON.stringify(violations, null, 2)).toEqual([]);
   });
 
-  it("运行详情·运行日志标签（折叠/展开条目）", async () => {
-    renderRunDetail(buildRichState(), { activeTab: "log" });
+  it("运行详情·Context 面（水位条 + token 三分 + 逐轮表）", async () => {
+    renderRunDetail(buildRichState(), { activeTab: "context", harness: FAKE_HARNESS });
     const violations = await runAxe();
     expect(violations, JSON.stringify(violations, null, 2)).toEqual([]);
   });
 
-  it("运行详情·核查标签（核查过程 + 裁决）", async () => {
-    renderRunDetail(buildRichState(), { activeTab: "verify" });
+  it("运行详情·Tools 面（工具芯片 + 边界清单）", async () => {
+    renderRunDetail(buildRichState(), { activeTab: "tools", harness: FAKE_HARNESS });
+    const violations = await runAxe();
+    expect(violations, JSON.stringify(violations, null, 2)).toEqual([]);
+  });
+
+  it("运行详情·Verification 面（三值裁决 + 饥饿告警 + 边界）", async () => {
+    renderRunDetail(buildRichState(), { activeTab: "verify", harness: FAKE_HARNESS });
     const violations = await runAxe();
     expect(violations, JSON.stringify(violations, null, 2)).toEqual([]);
   });
 
   it("窄屏详情态（含返回列表按钮）", async () => {
-    renderRunDetail(buildRichState(), { activeTab: "overview", showBack: true, onBack: () => {} });
+    renderRunDetail(buildRichState(), {
+      activeTab: "loop", showBack: true, onBack: () => {}, harness: FAKE_HARNESS,
+    });
+    const violations = await runAxe();
+    expect(violations, JSON.stringify(violations, null, 2)).toEqual([]);
+  });
+
+  it("宿主快照缺席时降级渲染仍零 violations", async () => {
+    renderRunDetail(buildRichState(), { activeTab: "tools" });
     const violations = await runAxe();
     expect(violations, JSON.stringify(violations, null, 2)).toEqual([]);
   });
@@ -213,7 +255,7 @@ describe("运行列表的 ARIA 语义（真实 DOM 断言，取代原先的源�
 
 describe("标签三件套（真实 DOM 断言，取代原先的源码字符串扫描）", () => {
   it("tab 三件套在真实 DOM 上闭环，且 aria-labelledby 随选中项更新", () => {
-    renderRunDetail(buildRichState(), { activeTab: "overview" });
+    renderRunDetail(buildRichState(), { activeTab: "loop", harness: FAKE_HARNESS });
 
     const tablist = document.querySelector('[role="tablist"]')!;
     const panel = document.querySelector('[role="tabpanel"]')!;
@@ -223,19 +265,27 @@ describe("标签三件套（真实 DOM 断言，取代原先的源码字符串�
     const tabs = [...document.querySelectorAll('[role="tab"]')];
     expect(tabs.length).toBeGreaterThanOrEqual(2);
     for (const t of tabs) expect(t.getAttribute("aria-controls")).toBe("tab-content");
-    expect(panel.getAttribute("aria-labelledby")).toBe("tab-overview");
+    expect(panel.getAttribute("aria-labelledby")).toBe("tab-loop");
     // 反向引用不得悬空——字符串扫描看不见这一点
     expect(document.getElementById(panel.getAttribute("aria-labelledby")!)).toBeTruthy();
 
-    // 切到另一个标签后，引用必须跟着换
-    renderRunDetail(buildRichState(), { activeTab: "log" });
+    // 切到另一个面后，引用必须跟着换
+    renderRunDetail(buildRichState(), { activeTab: "context", harness: FAKE_HARNESS });
     const panel2 = document.querySelector('[role="tabpanel"]')!;
-    expect(panel2.getAttribute("aria-labelledby")).toBe("tab-log");
-    expect(document.getElementById("tab-log")).toBeTruthy();
+    expect(panel2.getAttribute("aria-labelledby")).toBe("tab-context");
+    expect(document.getElementById("tab-context")).toBeTruthy();
+  });
+
+  it("旧标签 id 归一到 Loop 面，深链不 404", () => {
+    for (const legacy of ["overview", "log", undefined, "bogus"]) {
+      renderRunDetail(buildRichState(), { activeTab: legacy, harness: FAKE_HARNESS });
+      const panel = document.querySelector('[role="tabpanel"]')!;
+      expect(panel.getAttribute("aria-labelledby")).toBe("tab-loop");
+    }
   });
 
   it("roving tabindex：仅选中项可 Tab 进入，其余为 -1", () => {
-    renderRunDetail(buildRichState(), { activeTab: "overview" });
+    renderRunDetail(buildRichState(), { activeTab: "loop", harness: FAKE_HARNESS });
     const tabs = [...document.querySelectorAll('[role="tab"]')];
     const active = tabs.filter((t) => t.getAttribute("tabindex") === "0");
     expect(active).toHaveLength(1);
@@ -280,7 +330,7 @@ describe("扫描器双向自检：植入已知缺陷必须被抓到", () => {
     // 针对 s3d 新增的 tabpanel/aria-labelledby 关系：引用指向不存在的 id 时，
     // 屏幕阅读器取不到面板名称。axe 把它归为"需人工复核"（引用元素可能后续动态出现），
     // 所以守护它的是上面那条 incomplete 白名单测试 —— 此处证明白名单确实拦得住。
-    renderRunDetail(buildRichState(), { activeTab: "overview" });
+    renderRunDetail(buildRichState(), { activeTab: "loop", harness: FAKE_HARNESS });
     document.querySelector('[role="tabpanel"]')!.setAttribute("aria-labelledby", "tab-does-not-exist");
     const unexpected = (await incompleteIds()).filter((id) => !KNOWN_INCOMPLETE.has(id));
     expect(unexpected).toContain("aria-valid-attr-value");
@@ -289,14 +339,14 @@ describe("扫描器双向自检：植入已知缺陷必须被抓到", () => {
 
 describe("环境边界声明（防止把 incomplete 误当通过）", () => {
   it("详情页的待复核项不得超出已知白名单（新增 incomplete 必须有人看一眼）", async () => {
-    renderRunDetail(buildRichState(), { activeTab: "overview" });
+    renderRunDetail(buildRichState(), { activeTab: "loop", harness: FAKE_HARNESS });
     renderRunList([{ runId: "run-1", task: "t", status: "done", verify: true }], "run-1", () => {}, new Map());
     const unexpected = (await incompleteIds()).filter((id) => !KNOWN_INCOMPLETE.has(id));
     expect(unexpected, `新出现的待复核规则: ${unexpected.join(", ")}`).toEqual([]);
   });
 
   it("color-contrast 在 jsdom 下不产出 violations —— 对比度由 ui-app.test.ts 的 WCAG 实算测试守护", async () => {
-    renderRunDetail(buildRichState(), { activeTab: "overview" });
+    renderRunDetail(buildRichState(), { activeTab: "loop", harness: FAKE_HARNESS });
     const results = await axe.run(document, { runOnly: { type: "rule", values: ["color-contrast"] } });
     // 断言的是"这里不承担对比度判定"这一事实，而不是"对比度没问题"
     expect(results.violations).toEqual([]);

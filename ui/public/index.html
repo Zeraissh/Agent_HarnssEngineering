@@ -54,6 +54,7 @@
       <span>开启独立核查</span>
     </label>
     <button type="submit" class="btn btn--primary" id="submit-btn">运行任务</button>
+    <p id="submit-error" class="inline-error" role="alert" hidden></p>
   </form>
 
   <!-- 内容区 -->
@@ -74,6 +75,7 @@
  */
 import {
   createBatcher,
+  normalizeTab,
   createInitialState,
   reduceEvent,
   reduceEvents,
@@ -111,6 +113,7 @@ const submitForm = /** @type {HTMLFormElement} */ (document.getElementById("subm
 const taskInput = /** @type {HTMLTextAreaElement} */ (document.getElementById("task-input"));
 const verifyToggle = /** @type {HTMLInputElement} */ (document.getElementById("verify-toggle"));
 const submitBtn = /** @type {HTMLButtonElement} */ (document.getElementById("submit-btn"));
+const submitError = /** @type {HTMLElement} */ (document.getElementById("submit-error"));
 const sidebar = /** @type {HTMLElement} */ (document.getElementById("sidebar"));
 const mainPanel = /** @type {HTMLElement} */ (document.getElementById("main-panel"));
 const runFilter = /** @type {HTMLSelectElement} */ (document.getElementById("run-filter"));
@@ -141,6 +144,7 @@ function exitDetailMode() {
 
 function backToList() {
   exitDetailMode();
+  writeHash(null, null);
 }
 
 /** R-05: 更新屏幕阅读器播报 */
@@ -193,6 +197,7 @@ function selectRun(runId) {
   if (!state) return;
   renderDetailWithState(state);
   enterDetailMode();
+  writeHash(runId, activeTabs.get(runId));
   announceStatus(`已选择运行：${state.task}`);
   ensureSubscription(runId);
 }
@@ -209,9 +214,10 @@ function ensureState(runId) {
 
 // ---- 标签页切换 (R-03) ----
 document.addEventListener("tab-switch", (e) => {
-  const tab = /** @type {string} */ (/** @type {CustomEvent} */ (e).detail.tab);
+  const tab = normalizeTab(/** @type {CustomEvent} */ (e).detail.tab);
   if (selectedRunId) {
     activeTabs.set(selectedRunId, tab);
+    writeHash(selectedRunId, tab);
     const state = runStates.get(selectedRunId);
     if (state) {
       renderDetailWithState(state);
@@ -221,6 +227,45 @@ document.addEventListener("tab-switch", (e) => {
       if (next) next.focus();
     }
   }
+});
+
+// ---- hash 路由（V-17）----
+// 深链与刷新不丢位置：#/run/<id>/<face>。零依赖，不引路由库。
+let suppressHashHandling = false;
+
+function writeHash(runId, tab) {
+  const next = runId ? `#/run/${runId}/${tab || "loop"}` : "#/";
+  if (location.hash === next) return;
+  suppressHashHandling = true;
+  location.hash = next;
+  // hashchange 是异步派发的，标志位要等它跑完再清
+  setTimeout(() => { suppressHashHandling = false; }, 0);
+}
+
+function parseHash() {
+  const m = /^#\/run\/([^/]+)(?:\/([^/?]+))?/.exec(location.hash || "");
+  if (!m) return null;
+  return { runId: decodeURIComponent(m[1]), tab: normalizeTab(m[2]) };
+}
+
+function applyHash() {
+  const route = parseHash();
+  if (!route) {
+    if (selectedRunId) backToList();
+    return;
+  }
+  activeTabs.set(route.runId, route.tab);
+  if (route.runId !== selectedRunId) {
+    selectRun(route.runId);
+  } else {
+    const state = runStates.get(route.runId);
+    if (state) renderDetailWithState(state);
+  }
+}
+
+window.addEventListener("hashchange", () => {
+  if (suppressHashHandling) return;
+  applyHash();
 });
 
 // ---- 日志折叠切换 (R-04) ----
@@ -242,7 +287,7 @@ function handleToggleEntry(seq) {
 // ---- 渲染详情（统一入口） ----
 function renderDetailWithState(state) {
   const runId = state.runId;
-  const activeTab = activeTabs.get(runId) || "overview";
+  const activeTab = normalizeTab(activeTabs.get(runId));
 
   // 构建日志条目（应用折叠覆盖）
   const baseEntries = deriveLogEntries(state);
@@ -264,7 +309,26 @@ function renderDetailWithState(state) {
     activeTab,
     logEntries,
     onToggleEntry: handleToggleEntry,
+    harness: harnessSnapshot,
   });
+}
+
+// ---- 宿主真相快照（Tools/Context/Loop 面的数据源）----
+// 拉一次即可：它描述的是本次进程的装配，run 与 run 之间不变
+let harnessSnapshot = null;
+async function loadHarness() {
+  try {
+    const res = await fetch("/api/harness");
+    if (!res.ok) return;
+    harnessSnapshot = await res.json();
+    // 快照到达前渲染过的详情要补一次——四决定因素的护栏/工具面全靠它
+    if (selectedRunId) {
+      const state = runStates.get(selectedRunId);
+      if (state) renderDetailWithState(state);
+    }
+  } catch {
+    // 拿不到就照实降级：Tools 面会显示"未获取到工具清单"
+  }
 }
 
 // ---- SSE 订阅 ----
@@ -394,6 +458,7 @@ submitForm.addEventListener("submit", async (e) => {
 
   submitBtn.disabled = true;
   submitBtn.textContent = "提交中…";
+  showSubmitError(null);
 
   try {
     const verify = verifyToggle.checked;
@@ -403,7 +468,12 @@ submitForm.addEventListener("submit", async (e) => {
       body: JSON.stringify({ task, verify }),
     });
     if (!res.ok) {
-      alert("提交失败");
+      let detail = "";
+      try {
+        const body = await res.json();
+        detail = body?.error ? `：${body.error}` : "";
+      } catch { /* 响应体不是 JSON，只报状态码 */ }
+      showSubmitError(`提交失败（HTTP ${res.status}）${detail}`);
       return;
     }
     const { runId } = await res.json();
@@ -413,21 +483,35 @@ submitForm.addEventListener("submit", async (e) => {
 
     runs.unshift({ runId, task, status: "running", verify, createdAt: Date.now(), finishedAt: null });
     selectedRunId = runId;
-    activeTabs.set(runId, "overview");
+    activeTabs.set(runId, "loop");
     refreshRunListView();
     renderDetailWithState(state);
     enterDetailMode();
+    writeHash(runId, "loop");
     announceStatus(`新任务已提交：${task}`);
 
     ensureSubscription(runId);
     taskInput.value = "";
   } catch (err) {
-    alert("提交失败：" + (err.message ?? "网络错误"));
+    showSubmitError(`提交失败：${err.message ?? "网络错误"}`);
   } finally {
     submitBtn.disabled = false;
     submitBtn.textContent = "运行任务";
   }
 });
+
+/**
+ * 提交错误就地显示（V-16）。
+ *
+ * 此前用 alert()：它抢焦点、阻塞整页、在窄屏上盖住内容，而且屏幕阅读器
+ * 的播报时机不受控。改成 role="alert" 的行内区域——辅助技术会自动播报，
+ * 键盘焦点不动，错误内容还能带上 HTTP 状态码与服务端文案。
+ */
+function showSubmitError(message) {
+  if (!submitError) return;
+  submitError.textContent = message ?? "";
+  submitError.hidden = !message;
+}
 
 // ---- 全局生命周期流（V-10：取代 3 秒轮询）----
 // 轮询本身不是问题，"每 3 秒整体重建侧栏"才是——实测焦点停在运行项上 3.6 秒后
@@ -472,7 +556,8 @@ function subscribeLifecycle() {
 }
 
 // ---- 启动 ----
-loadRuns();
+loadHarness();
+loadRuns().then(applyHash);
 subscribeLifecycle();
 </script>
 
