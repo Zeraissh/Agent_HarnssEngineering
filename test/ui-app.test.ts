@@ -886,6 +886,34 @@ describe("AC6 无障碍语义 (R-05)", () => {
     // 至少有一条非空规则
     expect(css).toMatch(/:focus-visible\s*\{[^}]+outline/);
   });
+
+  // 以下三条由浏览器实测的 ARIA 结构缺陷催生（AC-06 键盘/屏幕阅读器专项）
+  it("32a. role=option 的容器必须是 role=listbox（孤儿 option 无法被正确播报）", () => {
+    const html = readFileSync(join(__dirname, "..", "ui", "public", "index.html"), "utf-8");
+    // run-list 是 renderRunList 的挂载点，其子项渲染为 role="option"
+    expect(html).toMatch(/id="run-list"[^>]*role="listbox"/);
+    expect(html).toMatch(/id="run-list"[^>]*aria-label=/);
+  });
+
+  it("32b. tab 三件套完整：tablist / tab(aria-controls) / tabpanel(aria-labelledby)", () => {
+    const appSrc = readFileSync(join(__dirname, "..", "ui", "public", "app.js"), "utf-8");
+    expect(appSrc).toContain('role="tablist"');
+    expect(appSrc).toContain('aria-controls="tab-content"');
+    expect(appSrc).toMatch(/role="tabpanel"[\s\S]{0,80}aria-labelledby=|aria-labelledby=[\s\S]{0,80}role="tabpanel"/);
+    // 每个 tab 有稳定 id 供 tabpanel 反向引用
+    expect(appSrc).toContain('id="tab-${tab}"');
+  });
+
+  it("32c. roving tabindex 必须配方向键处理（否则未选中标签键盘不可达）", () => {
+    const appSrc = readFileSync(join(__dirname, "..", "ui", "public", "app.js"), "utf-8");
+    // 未选中 tab 为 tabindex=-1
+    expect(appSrc).toMatch(/tabindex="\$\{isActive \? "0" : "-1"\}"/);
+    // 必须有 keydown + 四个方向键 + Home/End
+    expect(appSrc).toContain('addEventListener("keydown"');
+    for (const key of ["ArrowRight", "ArrowLeft", "ArrowDown", "ArrowUp", "Home", "End"]) {
+      expect(appSrc).toContain(key);
+    }
+  });
 });
 
 // ---- AC7: 运行列表元数据与筛选 (R-08) ----

@@ -20,7 +20,9 @@
       <option value="failed">未通过</option>
     </select>
   </div>
-  <div id="run-list" class="run-list">
+  <!-- role=listbox 是 role=option 子项的必需父容器：孤儿 option 会让屏幕阅读器
+       无法播报"第 N 项/共 M 项"（AC-06 实测缺陷） -->
+  <div id="run-list" class="run-list" role="listbox" aria-label="运行列表">
     <div class="run-list-empty">加载中…</div>
   </div>
 </aside>
@@ -196,6 +198,10 @@ document.addEventListener("tab-switch", (e) => {
     const state = runStates.get(selectedRunId);
     if (state) {
       renderDetailWithState(state);
+      // 重渲染换掉了 DOM 节点：把焦点交还给新选中的标签，
+      // 否则方向键切换一次后焦点掉回 body，键盘用户被踢出标签组
+      const next = document.getElementById(`tab-${tab}`);
+      if (next) next.focus();
     }
   }
 });

@@ -580,7 +580,8 @@ export function renderRunDetail(state, callbacks) {
   html += `</div>`;
 
   // ---- 标签内容 ----
-  html += `<div class="tab-content" id="tab-content">`;
+  // role=tabpanel + aria-labelledby 与当前 tab 配对，补全 tablist/tab/tabpanel 三件套
+  html += `<div class="tab-content" id="tab-content" role="tabpanel" aria-labelledby="tab-${activeTab}" tabindex="0">`;
 
   if (activeTab === "overview") {
     html += renderOverviewTab(overview, state);
@@ -628,14 +629,25 @@ export function renderRunDetail(state, callbacks) {
     });
   });
 
-  // 绑定标签切换
-  mainEl.querySelectorAll(".tab-btn").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const tab = btn.getAttribute("data-tab");
-      if (tab) {
-        // 委托控制器重渲染
-        document.dispatchEvent(new CustomEvent("tab-switch", { detail: { tab } }));
-      }
+  // 绑定标签切换（点击 + APG tabs 键盘模式）
+  const tabBtns = [...mainEl.querySelectorAll(".tab-btn")];
+  const switchTab = (tab) => {
+    if (tab) document.dispatchEvent(new CustomEvent("tab-switch", { detail: { tab } }));
+  };
+  tabBtns.forEach((btn, idx) => {
+    btn.addEventListener("click", () => switchTab(btn.getAttribute("data-tab")));
+    // roving tabindex 下 Tab 只进当前项，组内移动靠方向键 —— 没有这段，
+    // 未选中的标签就彻底不可键盘到达（比改之前更糟）
+    btn.addEventListener("keydown", (e) => {
+      const key = /** @type {KeyboardEvent} */ (e).key;
+      let next = -1;
+      if (key === "ArrowRight" || key === "ArrowDown") next = (idx + 1) % tabBtns.length;
+      else if (key === "ArrowLeft" || key === "ArrowUp") next = (idx - 1 + tabBtns.length) % tabBtns.length;
+      else if (key === "Home") next = 0;
+      else if (key === "End") next = tabBtns.length - 1;
+      if (next < 0) return;
+      e.preventDefault();
+      switchTab(tabBtns[next].getAttribute("data-tab"));
     });
   });
 
@@ -653,9 +665,14 @@ export function renderRunDetail(state, callbacks) {
 /** @returns {string} */
 function renderTabButton(tab, label, activeTab) {
   const isActive = tab === activeTab;
+  // aria-controls + id 让屏幕阅读器知道该 tab 控制哪个面板；未选中项 tabindex=-1
+  // 走 roving tabindex（APG tabs 模式），Tab 键只进入当前选中项，组内用方向键切换
   return `<button class="tab-btn ${isActive ? "tab-btn--active" : ""}"
+    id="tab-${tab}"
     role="tab"
     aria-selected="${isActive}"
+    aria-controls="tab-content"
+    tabindex="${isActive ? "0" : "-1"}"
     data-tab="${tab}">${label}</button>`;
 }
 
