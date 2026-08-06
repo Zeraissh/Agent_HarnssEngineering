@@ -513,6 +513,7 @@ describe("对话视图", () => {
           {
             role: "assistant",
             content: [
+              { type: "thinking", thinking: "先确认路径是否在工作目录内，再决定用哪个工具。" },
               { type: "text", text: "我先写文件。" },
               { type: "tool_use", id: "t1", name: "write_file", input: { path: "demo.txt" } },
             ],
@@ -546,10 +547,51 @@ describe("对话视图", () => {
     expect(userBubbles).toHaveLength(1);
     expect(userBubbles[0].textContent).toContain("创建 demo.txt");
 
-    const toolBubbles = [...host.querySelectorAll(".chat-msg--tool")];
-    expect(toolBubbles).toHaveLength(1);
-    expect(toolBubbles[0].textContent).toContain("Wrote 5 bytes");
-    expect(toolBubbles[0].textContent).not.toContain("委托方");
+    const asides = [...host.querySelectorAll(".chat-aside")];
+    const result = asides.find((a) => a.textContent!.includes("工具返回"))!;
+    expect(result).toBeTruthy();
+    expect(result.textContent).toContain("Wrote 5 bytes");
+    expect(result.closest(".chat-msg--user")).toBeNull();
+  });
+
+  /**
+   * 委托方要求：对话是叙事，不该被调用话术淹没。工具调用与返回折叠成一行
+   * 摘要（<details> 默认收起），正文用大一号字号——但信息不丢，展开就有。
+   */
+  it("工具调用与返回默认折叠，正文不折叠", () => {
+    const host = mount(transcript);
+    for (const d of host.querySelectorAll(".chat-aside")) {
+      expect((d as HTMLDetailsElement).open, "旁支不应默认展开").toBe(false);
+    }
+    const texts = [...host.querySelectorAll(".chat-body--text")];
+    expect(texts.some((t) => t.textContent!.includes("我先写文件"))).toBe(true);
+    // 正文不在 <details> 里——它是主线，不该需要点一下才看得到
+    expect(texts.filter((t) => t.closest("details.chat-aside")).length).toBe(0);
+  });
+
+  /**
+   * 思考过程的数据一直在：src/model-client.ts:41 显式开了 adaptive thinking，
+   * loop.ts:209 完整 push 了 content 块。此前只是没人渲染它。
+   */
+  it("渲染 thinking 块，默认折叠且自成语域", () => {
+    const host = mount(transcript);
+    const th = host.querySelector("details.chat-thinking") as HTMLDetailsElement;
+    expect(th).toBeTruthy();
+    expect(th.open).toBe(false);
+    expect(th.querySelector("summary")!.textContent).toContain("思考过程");
+    expect(th.textContent).toContain("先确认路径是否在工作目录内");
+    // 与工具旁支不是同一类东西，不得混用同一个视觉语域
+    expect(th.classList.contains("chat-aside")).toBe(false);
+  });
+
+  it("加密的 thinking 照实说明，不假装没有", () => {
+    const host = mount({
+      segments: [{
+        index: 0, source: "main",
+        messages: [{ role: "assistant", content: [{ type: "redacted_thinking", data: "xxx" }] }],
+      }],
+    });
+    expect(host.textContent).toContain("已被服务端加密");
   });
 
   it("assistant 的 text 与 tool_use 同框呈现", () => {
@@ -557,7 +599,7 @@ describe("对话视图", () => {
     const a = [...host.querySelectorAll(".chat-msg--assistant")];
     expect(a).toHaveLength(2);
     expect(a[0].textContent).toContain("我先写文件");
-    expect(a[0].querySelector(".chat-toolcall")?.textContent).toContain("write_file");
+    expect(a[0].querySelector(".chat-aside--call")!.textContent).toContain("write_file");
   });
 
   it("失败的工具返回带错误标记", () => {
@@ -570,7 +612,7 @@ describe("对话视图", () => {
         }],
       }],
     });
-    expect(host.querySelector(".chat-msg--tool-err")).toBeTruthy();
+    expect(host.querySelector(".chat-aside--err")).toBeTruthy();
   });
 
   it("tool_result 的 content 为内容块数组时同样能取出文本", () => {
@@ -583,7 +625,7 @@ describe("对话视图", () => {
         }],
       }],
     });
-    expect(host.querySelector(".chat-msg--tool")!.textContent).toContain("块形式输出");
+    expect(host.querySelector(".chat-aside")!.textContent).toContain("块形式输出");
   });
 
   it("多段会话之间插入来源分界", () => {

@@ -2074,7 +2074,14 @@ export function renderConversation(transcript, state) {
   return html || '<p class="empty-note">会话为空。</p>';
 }
 
-/** @returns {string} */
+/**
+ * 单条消息。
+ *
+ * 排版原则：**对话是叙事，不是管道**。文字是主角，工具调用与返回值折叠成
+ * 一行摘要——需要时能展开，但不该淹没"它当时在说什么、在想什么"。
+ * 想看逐工具的完整过程，事件流视图本来就是干这个的。
+ * @returns {string}
+ */
 function renderChatMessage(msg) {
   const blocks = Array.isArray(msg?.content)
     ? msg.content
@@ -2087,32 +2094,61 @@ function renderChatMessage(msg) {
   let html = "";
   for (const b of toolResults) {
     const text = extractBlockText(b.content);
+    const head = firstLine(text, 72);
     html +=
-      `<div class="chat-msg chat-msg--tool${b.is_error ? " chat-msg--tool-err" : ""}">` +
-      `<div class="chat-role">${b.is_error ? "✗" : "✓"} 工具返回</div>` +
+      `<details class="chat-aside${b.is_error ? " chat-aside--err" : ""}">` +
+      `<summary><span class="aside-mark">${b.is_error ? "✗" : "✓"}</span> 工具返回` +
+      (head ? ` <span class="aside-peek">${esc(head)}</span>` : "") +
+      "</summary>" +
       `<pre class="chat-body">${esc(truncate(text, 4000))}</pre>` +
-      "</div>";
+      "</details>";
   }
 
+  const thinking = rest.filter((b) => b && (b.type === "thinking" || b.type === "redacted_thinking"));
   const speech = rest.filter((b) => b && (b.type === "text" || b.type === "tool_use"));
-  if (speech.length === 0) return html;
+  if (thinking.length === 0 && speech.length === 0) return html;
 
   const who = msg?.role === "assistant" ? "assistant" : "user";
   html += `<div class="chat-msg chat-msg--${who}">`;
   html += `<div class="chat-role">${who === "assistant" ? "¶ Agent" : "委托方"}</div>`;
+
+  // 思考过程：数据一直在 transcript 里（src/model-client.ts:41 显式开了
+  // adaptive thinking，loop.ts:209 完整 push 了 content 块），此前只是没人渲染。
+  // 默认折叠——它是"为什么这么做"的证据，不是主线叙述。
+  for (const b of thinking) {
+    if (b.type === "redacted_thinking") {
+      html += '<div class="chat-thinking chat-thinking--redacted">✽ 思考过程已被服务端加密（redacted），无法展示</div>';
+      continue;
+    }
+    const t = String(b.thinking ?? "");
+    html +=
+      '<details class="chat-thinking">' +
+      `<summary>✽ 思考过程 <span class="aside-peek">${t.length} 字</span></summary>` +
+      `<div class="chat-body chat-body--text">${esc(t)}</div>` +
+      "</details>";
+  }
+
   for (const b of speech) {
     if (b.type === "text") {
       html += `<div class="chat-body chat-body--text">${esc(b.text ?? "")}</div>`;
     } else {
+      const input = formatInput(b.input);
       html +=
-        '<div class="chat-toolcall">' +
-        `<span class="chat-toolcall-mark">→</span> <code>${esc(b.name ?? "")}</code>` +
-        `<pre class="chat-body">${esc(truncate(formatInput(b.input), 1200))}</pre>` +
-        "</div>";
+        '<details class="chat-aside chat-aside--call">' +
+        `<summary><span class="aside-mark">→</span> <code>${esc(b.name ?? "")}</code>` +
+        ` <span class="aside-peek">${esc(firstLine(input, 60))}</span></summary>` +
+        `<pre class="chat-body">${esc(truncate(input, 1200))}</pre>` +
+        "</details>";
     }
   }
   html += "</div>";
   return html;
+}
+
+/** 取首行并截断——折叠摘要上给一眼能认出是什么的线索 */
+function firstLine(text, max) {
+  const line = String(text ?? "").split(/\r?\n/).find((l) => l.trim()) ?? "";
+  return truncate(line.trim(), max);
 }
 
 /** tool_result 的 content 可能是字符串，也可能是内容块数组 */

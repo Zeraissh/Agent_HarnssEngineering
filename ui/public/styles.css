@@ -394,29 +394,29 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
 .view-btn:hover { background: var(--surface-2); color: var(--text-1); }
 .view-btn--active { background: var(--accent); color: var(--on-accent); }
 
-/* --- 对话视图 --- */
+/* --- 对话视图 ---
+   排版原则：文字是主角，工具调用与返回折叠成一行摘要。想看逐工具的完整
+   过程，事件流视图本来就是干这个的。 */
 .chat-view { display: flex; flex-direction: column; gap: var(--space-md); }
 
 .chat-msg {
-  border: 1px solid var(--border-1);
   border-radius: var(--radius);
   padding: var(--space-sm) var(--space-md);
-  background: var(--surface-1);
 }
 
 .chat-msg--assistant { background: var(--surface-1); }
 /* 委托方那一侧用强调色细边框区分——它是任务的来源，不是过程 */
-.chat-msg--user { background: var(--surface-0); border-left: 3px solid var(--accent); }
-.chat-msg--tool { background: var(--surface-2); }
-.chat-msg--tool-err { border-color: var(--status-bad); }
+.chat-msg--user {
+  background: var(--surface-0);
+  border: 1px solid var(--border-1);
+  border-left: 3px solid var(--accent);
+}
 
 .chat-role {
   font-size: var(--font-sm);
   color: var(--text-2);
   margin-bottom: var(--space-xs);
 }
-
-.chat-msg--tool-err .chat-role { color: var(--status-bad); }
 
 .chat-body {
   font-size: var(--font-md);
@@ -426,15 +426,64 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
   margin: 0;
 }
 
-.chat-body--text { font-family: var(--font-ui); }
-
-.chat-toolcall {
-  margin-top: var(--space-sm);
-  padding-left: var(--space-sm);
-  border-left: 2px solid var(--border-1);
+.chat-body--text {
+  font-family: var(--font-ui);
+  font-size: var(--font-lg);
+  line-height: var(--leading-loose);
 }
 
-.chat-toolcall-mark { color: var(--accent); }
+/* 折叠的旁支：工具调用 / 工具返回。安静、单行、可展开 */
+.chat-aside {
+  margin: var(--space-xs) 0;
+  font-size: var(--font-sm);
+  color: var(--text-3);
+}
+
+.chat-aside > summary {
+  cursor: pointer;
+  list-style: none;
+  padding: 2px var(--space-sm);
+  border-radius: var(--radius-xs);
+}
+
+.chat-aside > summary::-webkit-details-marker { display: none; }
+.chat-aside > summary:hover { background: var(--surface-2); color: var(--text-2); }
+.chat-aside[open] > summary { color: var(--text-2); }
+.chat-aside .chat-body {
+  margin-top: var(--space-xs);
+  padding: var(--space-sm);
+  background: var(--surface-2);
+  border-radius: var(--radius-sm);
+  font-size: var(--font-sm);
+}
+
+.aside-mark { color: var(--accent); }
+.chat-aside--err .aside-mark { color: var(--status-bad); }
+.aside-peek { color: var(--text-3); font-family: var(--font-mono); }
+
+/* 思考过程自成语域：它是"为什么这么做"的证据，不是主线叙述，
+   也不是工具管道——所以既不能和正文抢，也不能和旁支混。 */
+.chat-thinking {
+  margin: var(--space-xs) 0 var(--space-sm);
+  border-left: 2px dashed var(--identity-verifier);
+  padding-left: var(--space-sm);
+  font-size: var(--font-sm);
+}
+
+.chat-thinking > summary {
+  cursor: pointer;
+  color: var(--identity-verifier);
+  list-style: none;
+}
+
+.chat-thinking > summary::-webkit-details-marker { display: none; }
+.chat-thinking .chat-body {
+  margin-top: var(--space-xs);
+  color: var(--text-2);
+  font-size: var(--font-md);
+}
+
+.chat-thinking--redacted { color: var(--text-3); }
 
 /* --- 提交栏旋钮 --- */
 .btn--ghost {
@@ -514,11 +563,21 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
 
 .submit-bar {
   display: flex;
+  /* 必须允许换行：装配面板是 flex-basis:100% 的整行子项，没有 wrap 它会和
+     输入框挤在同一行，把 textarea 压成一条几像素宽的缝——那正是委托方截图里
+     那个"不知道是什么"的小方块。窄屏媒体查询里本来有这条，桌面态漏了。 */
+  flex-wrap: wrap;
   gap: var(--space-sm);
   padding: var(--space-md) var(--space-lg);
   border-bottom: 1px solid var(--border);
   background: var(--bg2);
   align-items: center;
+}
+
+/* 输入框吃掉剩余空间，但不得被压到无法辨认 */
+.submit-bar textarea {
+  flex: 1 1 260px;
+  min-width: 200px;
 }
 
 /* R-05: task-input 关联 label */

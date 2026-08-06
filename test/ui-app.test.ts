@@ -1506,6 +1506,33 @@ describe("V-20 图标：单色排印符，不用 emoji", () => {
   });
 });
 
+describe("V-24b 提交栏布局：整行子项必须能换行", () => {
+  const css = readFileSync(join(__dirname, "..", "ui", "public", "styles.css"), "utf-8");
+
+  /**
+   * 实测抓到的 bug：装配面板是 flex-basis:100% 的整行子项，而 .submit-bar 在
+   * 桌面态没有 flex-wrap（只有窄屏媒体查询里写了）。结果它和输入框挤在同一行，
+   * 把 textarea 压成一条几像素宽的缝——委托方截图里那个"不知道是什么"的小方块。
+   */
+  it(".submit-bar 在桌面态就有 flex-wrap，不只靠窄屏媒体查询", () => {
+    const block = css.match(/(^|\})\s*\.submit-bar\s*\{([^}]*)\}/);
+    expect(block, "缺少 .submit-bar 规则").not.toBeNull();
+    expect(block![2]).toMatch(/flex-wrap:\s*wrap/);
+  });
+
+  it("整行子项确实声明了 flex-basis:100%（换行的前提）", () => {
+    expect(css).toMatch(/\.run-knobs\s*\{[^}]*flex-basis:\s*100%/);
+  });
+
+  it("任务输入框有最小宽度，压不成一条缝", () => {
+    const rule = css.match(/\.submit-bar\s+textarea\s*\{([^}]*)\}/);
+    expect(rule, "缺少 .submit-bar textarea 规则").not.toBeNull();
+    const min = rule![1].match(/min-width:\s*(\d+)px/);
+    expect(min, "未设 min-width").not.toBeNull();
+    expect(Number(min![1])).toBeGreaterThanOrEqual(160);
+  });
+});
+
 describe("V-20 hidden 必须真的隐藏", () => {
   const css = readFileSync(join(__dirname, "..", "ui", "public", "styles.css"), "utf-8");
 
