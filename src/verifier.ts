@@ -154,7 +154,68 @@ const READ_FILTERS = new Set([
 ]);
 
 /**
- * 只读命令判定：首段必须命中白名单前缀（词边界），全命令禁止重定向、
+ * 引号感知的命令扫描：按【引号外】的管道符切段，并报告引号外是否出现
+ * 重定向/链式/命令替换。
+ *
+ * 为什么必须感知引号（案例 #7 实测催生）：正则整串匹配会把 grep 模式里的
+ * 管道当成 shell 管道——`grep -n "a\|b" f` 被判非法后，verifier 只能退化成
+ * 多条更弱的命令重试，白烧核查轮次（连续两轮 fail-closed 空转的元凶之一）。
+ * 反过来，引号外的危险构造仍要拦住：护栏的目标是限定核查动作，不是安全沙箱。
+ */
+function scanCommand(cmd: string): { segments: string[]; dangerous: boolean } {
+  const segments: string[] = [];
+  let buf = "";
+  let quote: '"' | "'" | null = null;
+  let dangerous = false;
+
+  for (let i = 0; i < cmd.length; i++) {
+    const ch = cmd[i]!;
+    const next = cmd[i + 1];
+
+    if (quote) {
+      if (ch === quote) quote = null;
+      buf += ch;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      buf += ch;
+      continue;
+    }
+    if (ch === "\\" && next !== undefined) {
+      buf += ch + next; // 转义字符整体保留：`\|` 是 grep 的交替符，不是管道
+      i++;
+      continue;
+    }
+    if (ch === ">" || ch === "<" || ch === ";" || ch === "`") {
+      dangerous = true;
+    } else if (ch === "$" && next === "(") {
+      dangerous = true;
+    } else if (ch === "&" && next === "&") {
+      dangerous = true;
+      buf += ch + next;
+      i++;
+      continue;
+    } else if (ch === "|") {
+      if (next === "|") {
+        dangerous = true;
+        buf += ch + next;
+        i++;
+        continue;
+      }
+      segments.push(buf);
+      buf = "";
+      continue;
+    }
+    buf += ch;
+  }
+  segments.push(buf);
+  // 引号未闭合 = 无法可靠判定边界，按可疑处理
+  return { segments, dangerous: dangerous || quote !== null };
+}
+
+/**
+ * 只读命令判定：首段必须命中白名单前缀（词边界），引号外禁止重定向、
  * 链式执行与命令替换；管道后续段允许白名单或通用只读过滤器。
  * 这是纪律护栏而非安全沙箱——目标是把 verifier 的"独立重推导"能力
  * 限定在核查动作上，不是抵御恶意。
@@ -162,7 +223,8 @@ const READ_FILTERS = new Set([
 export function isReadOnlyCommand(command: string, allowedPrefixes: string[]): boolean {
   const cmd = command.trim();
   if (cmd === "" || allowedPrefixes.length === 0) return false;
-  if (/>|;|&&|\|\||`|\$\(/.test(cmd)) return false; // 重定向/链式/子命令替换
+  const { segments, dangerous } = scanCommand(cmd);
+  if (dangerous) return false;
 
   const matchesPrefix = (segment: string): boolean =>
     allowedPrefixes.some((p) => {
@@ -172,7 +234,7 @@ export function isReadOnlyCommand(command: string, allowedPrefixes: string[]): b
       return next === undefined || next === " "; // 词边界：防 "nm" 放行 "nmap"
     });
 
-  return cmd.split("|").map((s) => s.trim()).every((segment, i) => {
+  return segments.map((s) => s.trim()).every((segment, i) => {
     if (segment === "") return false;
     if (matchesPrefix(segment)) return true;
     if (i === 0) return false;

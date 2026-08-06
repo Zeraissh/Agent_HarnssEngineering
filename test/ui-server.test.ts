@@ -4,7 +4,7 @@
  * 覆盖率:
  *   a. verify=false run → SSE 收到 turn_start…done，seq 单调递增
  *   b. approval_request → POST allow → 继续至 done
- *   c. approval_request → POST deny → tool_result isError，运行正常收尾
+ *   c. approval_request → POST deny → tool_result isError(含拒绝理由)，运行正常收尾
  *   d. verify=true → source="verifier" 事件 + verdict 合成事件（含 unverified/advisory）
  *   e. SSE 晚订阅（run 已结束后）→ 重放全部缓冲事件含 verdict
  *   f. GET /api/runs 列表状态正确；未知 runId 返回 404
@@ -12,6 +12,8 @@
  *   h. R-01 幂等: 同一 toolUseId 二次 POST 返回 409，respond 仅调用一次
  *   i. R-01 run 结束后审批 POST 返回 409
  *   j. R-01 GET /api/runs 返回 createdAt/finishedAt（字段存在+单调性）
+ *   k. 执行失败: 模型抛错不崩 → done/stopReason=error + 列表 status=done/finishedAt 非 null
+ *   l. 核查未通过: 末尾 verdict 合成事件 passed=false + issues 非空 + source="rework" 事件出现
  */
 import { afterEach, describe, expect, it } from "vitest";
 import { createUiServer, type UiServerHandle } from "../ui/server.js";
@@ -22,7 +24,7 @@ import {
   textBlock,
   toolUseBlock,
 } from "./helpers.js";
-import type { Tool } from "../src/types.js";
+import type { Tool, ModelClient, ModelRequest, ModelTurn } from "../src/types.js";
 
 // ------------------------------------------------------
 // Helpers
@@ -221,8 +223,8 @@ describe("ui-server", () => {
     expect((doneEvent as any).event.stopReason).toBe("completed");
   });
 
-  // ---- c. approval deny → tool_result isError，运行仍正常收尾 ----
-  it("c. approval_request → deny: 工具结果 isError，运行正常收尾", async () => {
+  // ---- c. approval deny → tool_result isError(含拒绝理由)，运行仍正常收尾 ----
+  it("c. approval_request → deny: 工具结果 isError 且内容含拒绝理由，运行正常收尾", async () => {
     const model = new FakeModelClient([
       fakeMessage([toolUseBlock("tu_2", "risky", {})], "tool_use"),
       fakeMessage([textBlock("handled denial gracefully")], "end_turn"),
@@ -265,6 +267,11 @@ describe("ui-server", () => {
     const trEvent = events.find((e) => (e as any).event.type === "tool_result");
     expect(trEvent).toBeDefined();
     expect((trEvent as any).event.result.isError).toBe(true);
+
+    // AC-10: 拒绝理由必须在工具结果中可见
+    const result = (trEvent as any).event.result;
+    const content = typeof result.content === "string" ? result.content : "";
+    expect(content).toContain("too dangerous");
 
     const doneEvent = events.find((e) => (e as any).event.type === "done");
     expect(doneEvent).toBeDefined();
@@ -684,5 +691,149 @@ describe("ui-server", () => {
     expect(doneEntry.finishedAt).toBeTypeOf("number");
     // finishedAt ≥ createdAt（单调性）
     expect(doneEntry.finishedAt).toBeGreaterThanOrEqual(doneEntry.createdAt);
+  });
+
+  // ---- k. 执行失败: 模型抛错不崩 + done/stopReason=error + 列表状态/finishedAt 正确 ----
+  it("k. 执行失败: 模型抛错不崩，SSE 含 done/stopReason=error，列表 status=done 且 finishedAt 非 null", async () => {
+    // 使用一个会在 send 时抛错的模型
+    class ThrowingClient implements ModelClient {
+      requests: ModelRequest[] = [];
+      async send(req: ModelRequest): Promise<ModelTurn> {
+        this.requests.push(structuredClone(req));
+        throw new Error("simulated model crash");
+      }
+    }
+
+    handle = createUiServer({
+      modelClient: new ThrowingClient(),
+      tools: [autoTool("probe")],
+      workdir: process.cwd(),
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+
+    const createRes = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "will crash", verify: false }),
+    });
+    expect(createRes.status).toBe(200);
+    const { runId } = await createRes.json() as { runId: string };
+
+    await waitForDone(base, runId);
+
+    // SSE 事件流必须包含 done 事件且 stopReason=error
+    const sseRes = await fetch(`${base}/api/runs/${runId}/events`);
+    const events = await readSSEAll(sseRes);
+
+    const doneEvent = events.find((e) => (e as any).event.type === "done");
+    expect(doneEvent).toBeDefined();
+    expect((doneEvent as any).source).toBe("main");
+    expect((doneEvent as any).event.stopReason).toBe("error");
+
+    // 服务不得崩溃——事件流能完整读取就是证据
+    expect(events.length).toBeGreaterThanOrEqual(1);
+
+    // GET /api/runs 列表: status=done, finishedAt 非 null
+    const listRes = await fetch(`${base}/api/runs`);
+    const list: any[] = await listRes.json();
+    const entry = list.find((r: any) => r.runId === runId);
+    expect(entry).toBeDefined();
+    expect(entry.status).toBe("done");
+    expect(entry.finishedAt).toBeTypeOf("number");
+    expect(entry.finishedAt).toBeGreaterThan(0);
+  });
+
+  // ---- l. 核查未通过: 末尾 verdict 合成事件 passed=false + issues 非空 + source="rework" 事件出现 ----
+  it("l. 核查未通过: 末尾 verdict 合成事件 passed=false + issues 非空 + source=rework 出现在流中", async () => {
+    // 脚本化编排: main → verifier(failed) → rework → verifier(再次 failed)
+    // 关键：末尾 verdict 必须 passed=false（两次核查均不通过），且 source=rework 事件在流中
+    const model = new FakeModelClient([
+      // round 1: main 完成任务
+      fakeMessage([textBlock("task done, results produced")], "end_turn"),
+      // round 1: verifier 裁决不通过（passed=false, issues 非空）
+      fakeMessage(
+        [
+          textBlock(
+            JSON.stringify({
+              passed: false,
+              issues: ["文件行数不符：期望 10 实际 8", "输出格式错误"],
+              unverified: [],
+              advisory: ["建议检查边界条件"],
+              summary: "客观项 2 条不符，需返工",
+            }),
+          ),
+        ],
+        "end_turn",
+      ),
+      // round 2: rework 尝试修复
+      fakeMessage([textBlock("attempted to fix issues")], "end_turn"),
+      // round 2: verifier 再次裁决不通过（passed=false, issues 仍非空）
+      fakeMessage(
+        [
+          textBlock(
+            JSON.stringify({
+              passed: false,
+              issues: ["输出格式错误", "缺少必要元数据字段"],
+              unverified: ["人工判断修复是否充分"],
+              advisory: ["建议重新生成输出"],
+              summary: "返工后仍有 2 条不符，核查未通过",
+            }),
+          ),
+        ],
+        "end_turn",
+      ),
+    ]);
+
+    handle = createUiServer({
+      modelClient: model,
+      tools: [autoTool("read")],
+      workdir: process.cwd(),
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+
+    const createRes = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "verify with rework and final fail", verify: true }),
+    });
+    const { runId } = await createRes.json() as { runId: string };
+
+    await waitForDone(base, runId);
+
+    const sseRes = await fetch(`${base}/api/runs/${runId}/events`);
+    const events = await readSSEAll(sseRes);
+
+    // === 核心断言：末尾 verdict 合成事件 passed=false 且 issues 非空 ===
+    const verdictEvents = events.filter((e) => (e as any).event.type === "verdict");
+    expect(verdictEvents.length).toBeGreaterThanOrEqual(1);
+
+    const lastVerdict = verdictEvents[verdictEvents.length - 1] as any;
+    // AC5: 末尾 verdict.passed 必须为 false
+    expect(lastVerdict.event.verdict.passed).toBe(false);
+    // AC5: issues 非空
+    expect(lastVerdict.event.verdict.issues).toBeInstanceOf(Array);
+    expect(lastVerdict.event.verdict.issues.length).toBeGreaterThan(0);
+    expect(lastVerdict.event.verdict.issues).toContain("输出格式错误");
+    expect(lastVerdict.event.verdict.summary).toBe("返工后仍有 2 条不符，核查未通过");
+    expect(lastVerdict.source).toBe("verifier");
+
+    // === 返工阶段断言：source="rework" 事件出现在流中 ===
+    const reworkEvents = events.filter((e) => (e as any).source === "rework");
+    expect(reworkEvents.length).toBeGreaterThan(0);
+    const reworkTypes = reworkEvents.map((e) => (e as any).event.type);
+    expect(reworkTypes).toContain("turn_start");
+
+    // === 来源区分：main / verifier / rework 三者均在流中 ===
+    const sources = new Set(events.map((e) => (e as any).source));
+    expect(sources.has("main")).toBe(true);
+    expect(sources.has("verifier")).toBe(true);
+    expect(sources.has("rework")).toBe(true);
+
+    // === seq 单调递增 ===
+    for (let i = 1; i < events.length; i++) {
+      expect((events[i] as any).seq).toBeGreaterThan((events[i - 1] as any).seq);
+    }
   });
 });

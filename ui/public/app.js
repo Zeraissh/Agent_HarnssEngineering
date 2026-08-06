@@ -78,6 +78,7 @@
  *   resultSummary: string|null,
  *   verdict: VerdictModel|null,
  *   actionItems: {pendingApprovals: PendingApproval[], unverifiedItems: string[]},
+ *   resolvedApprovals: PendingApproval[],
  *   usage: UsageModel|null
  * }} OverviewModel
  *
@@ -275,6 +276,10 @@ export function deriveOverview(state) {
   const pendingApprovals = state.pendingApprovals.filter(
     (a) => a.status === "pending",
   );
+  // 已处理审批（allow/deny/expired）：保留为只读记录，不得静默丢失
+  const resolvedApprovals = state.pendingApprovals.filter(
+    (a) => a.status !== "pending",
+  );
   const unverifiedItems = state.verdict ? state.verdict.unverified : [];
 
   return {
@@ -285,6 +290,7 @@ export function deriveOverview(state) {
       pendingApprovals,
       unverifiedItems,
     },
+    resolvedApprovals,
     usage: state.usage,
   };
 }
@@ -742,6 +748,20 @@ function renderOverviewTab(overview, state) {
     html += `</div>`;
   }
 
+  // 已处理审批（只读记录，不静默丢失）
+  if (overview.resolvedApprovals && overview.resolvedApprovals.length > 0) {
+    html += `<div class="overview-section">`;
+    html += `<h3 class="overview-section-title">📋 审批记录</h3>`;
+    html += `<ul class="action-items">`;
+    for (const a of overview.resolvedApprovals) {
+      const label = a.status === "allowed" ? "已允许" : a.status === "denied" ? "已拒绝" : "已过期";
+      const reasonSuffix = a.reason ? ` — ${esc(a.reason)}` : "";
+      html += `<li class="action-item action-item--resolved">${label}：${esc(a.name)}${reasonSuffix}</li>`;
+    }
+    html += `</ul>`;
+    html += `</div>`;
+  }
+
   // 错误醒目
   if (state.error) {
     html += `<div class="error-banner">⚠️ ${esc(state.error)}</div>`;
@@ -948,8 +968,8 @@ export function renderEmptyState(hasRuns) {
 }
 
 // ---------------------------------------------------------------
+
 // 格式化工具
-// ---------------------------------------------------------------
 
 function esc(s) {
   if (typeof s !== "string") return String(s ?? "");

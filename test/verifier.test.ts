@@ -288,6 +288,23 @@ describe("verifier 只读命令白名单", () => {
     expect(isReadOnlyCommand("rm -rf build", PREFIXES)).toBe(false);
   });
 
+  it("isReadOnlyCommand：引号内的管道符不是管道（案例 #7:grep 交替被误拒,烧核查轮次）", async () => {
+    const { isReadOnlyCommand } = await import("../src/verifier.js");
+    // 双引号内的 grep 交替符与字面管道
+    expect(isReadOnlyCommand(String.raw`grep -n "foo\|bar" src/x.ts`, PREFIXES)).toBe(true);
+    expect(isReadOnlyCommand(`grep -rn "a|b" src/`, PREFIXES)).toBe(true);
+    expect(isReadOnlyCommand(`grep -n 'x|y' src/`, PREFIXES)).toBe(true);
+    // 引号外的转义管道同样是字面量,不切段
+    expect(isReadOnlyCommand(String.raw`grep -n a\|b src/`, PREFIXES)).toBe(true);
+    // 但引号外的真管道照旧按段判定
+    expect(isReadOnlyCommand(`grep -n "a" src/ | wc -l`, PREFIXES)).toBe(true);
+    expect(isReadOnlyCommand(`grep -n "a" src/ | xargs rm`, PREFIXES)).toBe(false);
+    // 引号内的危险构造不放行整条命令的越权:引号外仍有链式即拒
+    expect(isReadOnlyCommand(`grep -n "a|b" src/ && rm -rf x`, PREFIXES)).toBe(false);
+    // 引号未闭合 = 边界不可靠,按可疑拒绝
+    expect(isReadOnlyCommand(`grep -n "unclosed src/`, PREFIXES)).toBe(false);
+  });
+
   it("isReadOnlyCommand：重定向/链式/子命令替换一律拒绝；管道只允许只读过滤器", async () => {
     const { isReadOnlyCommand } = await import("../src/verifier.js");
     expect(isReadOnlyCommand("arm-none-eabi-nm x.elf > out.txt", PREFIXES)).toBe(false);

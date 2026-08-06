@@ -10,6 +10,15 @@
  *   R-07: 视觉收敛 — CSS 无大面积洋红背景
  *   R-08: deriveRunListItems / filterRunsByStatus — 列表元数据与筛选
  *   P2: styles.css 中除 :root 外无裸十六进制色值
+ *
+ * 阶段三新增 (AC-10 异常流程回归):
+ *   审批拒绝·reducer: 被拒工具 tool_result 含理由（reduceEvent）
+ *   审批拒绝·概览: resolvedApprovals 含 denied 信息（status/reason/decidedAt）
+ *   执行失败·reducer: error→finalStatus=error + error 字段填充
+ *   执行失败·R-01联动: error stopReason 下 pending 审批转 expired
+ *   核查未通过·概览: verdict.passed=false + issues 列表呈现
+ *   核查未通过·渲染语义: verdict-badge--fail 使用红色系（区别于绿色 passed）
+ *   核查未通过·时间线: main/rework 来源区分
  */
 import { describe, expect, it } from "vitest";
 import {
@@ -353,6 +362,61 @@ describe("reduceEvent", () => {
     expect(appSrc).toContain("选择左侧运行查看详情，或创建新任务。");
     expect(appSrc).not.toContain("尚无运行。提交一个任务开始。");
   });
+
+  // ---- 阶段三: 审批拒绝 · 时间线 — 被拒工具的 tool_result 含拒绝理由 ----
+  it("审批拒绝·时间线: 被拒工具的 tool_result timeline 条目含拒绝理由", () => {
+    let state = createInitialState("r_deny_time", "deny timeline", false);
+
+    // 模拟审批请求
+    state = reduceEvent(state, sse("main", "approval_request", {
+      toolUseId: "tu_deny_tl",
+      name: "risky_op",
+      input: { cmd: "drop_db" },
+    }));
+
+    // 模拟服务端返回的 tool_result（isError=true，内容含拒绝理由）
+    state = reduceEvent(state, sse("main", "tool_result", {
+      toolUseId: "tu_deny_tl",
+      result: { content: "操作被拒绝：too dangerous", isError: true },
+      durationMs: 5,
+    }));
+
+    // 时间线中应包含该 tool_result
+    const toolResults = state.timeline.filter((e) => e.type === "tool_result");
+    expect(toolResults).toHaveLength(1);
+    expect(toolResults[0].resultIsError).toBe(true);
+    expect(toolResults[0].resultContent).toContain("too dangerous");
+    expect(toolResults[0].toolUseId).toBe("tu_deny_tl");
+  });
+
+  // ---- 阶段三: R-01 执行失败路径 —— error stopReason 下 pending 审批转 expired ----
+  it("R-01 执行失败: error stopReason 下仍 pending 的审批转为 expired（不可操作）", () => {
+    let state = createInitialState("r_err_exp", "error expiry", false);
+
+    // 先产生一个 pending 审批
+    state = reduceEvent(state, sse("main", "approval_request", {
+      toolUseId: "tu_err_x",
+      name: "danger_op",
+      input: { cmd: "drop_table" },
+    }));
+    expect(state.pendingApprovals).toHaveLength(1);
+    expect(state.pendingApprovals[0].status).toBe("pending");
+
+    // 模拟执行失败：done 事件 stopReason=error
+    state = reduceEvent(state, sse("main", "done", {
+      stopReason: "error",
+      usage: { inputTokens: 100, outputTokens: 50, turns: 1, cacheHitRatio: 0 },
+    }));
+
+    // R-01 P0: run 以 error 结束时，pending 审批必须转 expired
+    expect(state.pendingApprovals).toHaveLength(1);
+    expect(state.pendingApprovals[0].status).toBe("expired");
+    expect(state.status).toBe("done");
+    expect(state.error).toBe("运行异常终止");
+
+    // 关键断言：expired 审批不可操作（状态不是 pending）
+    expect(state.pendingApprovals[0].status).not.toBe("pending");
+  });
 });
 
 // ================================================================
@@ -494,6 +558,89 @@ describe("AC3 概览模型 deriveOverview (R-03)", () => {
     const overview = deriveOverview(state);
     expect(overview.actionItems.pendingApprovals).toHaveLength(1);
     expect(overview.actionItems.pendingApprovals[0].toolUseId).toBe("a1");
+  });
+
+  // ---- 阶段三: 审批拒绝 · 概览模型 — 拒绝信息不丢失 ----
+  it("审批拒绝·概览: resolvedApprovals 含 denied 信息（status/reason/decidedAt）不静默丢失", () => {
+    const state = makeState({
+      status: "done",
+      pendingApprovals: [
+        { toolUseId: "denied_1", name: "danger", input: { cmd: "rm -rf" }, status: "denied", reason: "too dangerous", decidedAt: 1234567890 },
+        { toolUseId: "allowed_1", name: "safe", input: { cmd: "ls" }, status: "allowed", reason: "ok", decidedAt: 1234567891 },
+      ],
+    });
+    const overview = deriveOverview(state);
+
+    // 已处理审批不在 actionItems.pendingApprovals 中（仅 pending）
+    expect(overview.actionItems.pendingApprovals).toHaveLength(0);
+
+    // 但进入 resolvedApprovals，不静默丢失
+    expect(overview.resolvedApprovals).toBeDefined();
+    expect(overview.resolvedApprovals).toHaveLength(2);
+
+    // denied 审批保留 status="denied"、reason 和 decidedAt
+    const deniedEntry = overview.resolvedApprovals.find(
+      (a: any) => a.toolUseId === "denied_1",
+    );
+    expect(deniedEntry).toBeDefined();
+    expect(deniedEntry.status).toBe("denied");
+    expect(deniedEntry.reason).toBe("too dangerous");
+    expect(deniedEntry.decidedAt).toBe(1234567890);
+
+    // allowed 审批也在 resolvedApprovals 中
+    const allowedEntry = overview.resolvedApprovals.find(
+      (a: any) => a.toolUseId === "allowed_1",
+    );
+    expect(allowedEntry).toBeDefined();
+    expect(allowedEntry.status).toBe("allowed");
+  });
+
+  // ---- 阶段三: 执行失败 · reducer — finalStatus 反映失败 + error 填充 ----
+  it("执行失败·reducer: finalStatus=error + error 字段被填充", () => {
+    const state = makeState({
+      status: "done",
+      error: "运行异常终止",
+    });
+    const overview = deriveOverview(state);
+
+    // finalStatus 反映失败（非"已完成"）
+    expect(overview.finalStatus).toBe("error");
+    expect(overview.finalStatus).not.toBe("done");
+
+    // state.error 被填充——与 finalStatus 一致
+    expect(state.error).toBe("运行异常终止");
+  });
+
+  // ---- 阶段三: 核查未通过 · 概览 — 呈现未通过 + issues 列表 ----
+  it("核查未通过·概览: verdict.passed=false + issues 列表完整呈现", () => {
+    const state = makeState({
+      status: "done",
+      verify: true,
+      verdict: {
+        passed: false,
+        summary: "客观项 3 条不符，需返工",
+        issues: ["行数不符", "格式错误", "缺少必要字段"],
+        unverified: ["人工确认二进制"],
+        advisory: ["建议重构"],
+      },
+    });
+    const overview = deriveOverview(state);
+
+    // verdict 存在且 passed=false
+    expect(overview.verdict).not.toBeNull();
+    expect(overview.verdict.passed).toBe(false);
+    expect(overview.verdict.summary).toBe("客观项 3 条不符，需返工");
+
+    // issues 列表完整呈现
+    expect(overview.verdict.issues).toEqual(["行数不符", "格式错误", "缺少必要字段"]);
+    expect(overview.verdict.issues).toHaveLength(3);
+
+    // unverified 与 advisory 同时到位
+    expect(overview.verdict.unverified).toEqual(["人工确认二进制"]);
+    expect(overview.verdict.advisory).toEqual(["建议重构"]);
+
+    // actionItems.unverifiedItems 从 verdict.unverified 派生
+    expect(overview.actionItems.unverifiedItems).toEqual(["人工确认二进制"]);
   });
 });
 
@@ -836,33 +983,11 @@ describe("AC8 CSS 令牌统一 (P2)", () => {
     const css = readFileSync(cssPath, "utf-8");
 
     // 移除 :root 块
-    const withoutRoot = css.replace(/:root\s*\{[^}]*\}/s, "");
-
-    // 搜索裸 #RRGGBB（不跟在 var( 后面的）
-    // 允许在注释中出现
-    const lines = withoutRoot.split("\n");
-    const bareHexLines = [];
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      // 跳过注释行
-      if (line.trim().startsWith("/*")) continue;
-      // 检查是否有 #XXXXXX 但不跟在 var( 后面
-      const hexMatch = line.match(/(?<!var\([^)]{0,50})(#[0-9a-fA-F]{6})\b/);
-      if (hexMatch && !line.includes("var(" + hexMatch[0])) {
-        // 如果这一行也用 var() 引用了这个颜色，跳过
-        // 简单策略：检查是否在属性值中作为裸色出现
-        bareHexLines.push(`Line ${i + 1}: ${line.trim()}`);
-      }
-    }
-
-    // 实际上我们需要更精确的匹配：在 CSS 属性值中出现的裸 #RRGGBB
-    // 用一个更稳健的方法：移除 :root 和注释后，在属性值中匹配
     const stripped = css
       .replace(/:root\s*\{[^}]*\}/s, "")
       .replace(/\/\*[\s\S]*?\*\//g, "");
 
     // 匹配属性值中的裸六位色值
-    // 模式：: 后面跟着空格 + #XXXXXX 但不是 var() 的一部分
     const propHexRe = /:\s*(?:[^;{]*?\s)?(#[0-9a-fA-F]{6})\b/g;
     const violations = [];
     let match;
@@ -889,7 +1014,6 @@ describe("R-07 核查区视觉收敛", () => {
 
     // magenta-bg 应仅用于小元素如 badge、border 等，不应出现在大面积组件中
     // 检查没有 padding > 8px 的 magenta background
-    // 这个测试通过检查 verdict-card 不再使用 magenta 大面积背景来验证
     // R-07 整改后 verdict-card 用 --bg2 + 细边框
     expect(css).toContain("magenta-border-strong");
 
@@ -900,3 +1024,89 @@ describe("R-07 核查区视觉收敛", () => {
     expect(magentaBgOccurrences).toBeLessThanOrEqual(4);
   });
 });
+
+// ================================================================
+// 阶段三: AC-10 异常流程 — 核查未通过 · 渲染语义 (静态断言)
+// ================================================================
+
+describe("AC-10 核查未通过 · 渲染语义", () => {
+  it("38. verdict-badge--fail 使用错误色（红），与 verdict-badge--pass（绿）不同", () => {
+    const cssPath = join(__dirname, "..", "ui", "public", "styles.css");
+    const css = readFileSync(cssPath, "utf-8");
+    const vars = parseRootVars(css);
+
+    // verdict-badge--pass 使用绿色系
+    expect(css).toContain("verdict-badge--pass");
+    const passMatch = css.match(/\.verdict-badge--pass\s*\{([^}]*)\}/);
+    expect(passMatch).not.toBeNull();
+    const passBlock = passMatch[1];
+
+    // verdict-badge--fail 使用红色系
+    expect(css).toContain("verdict-badge--fail");
+    const failMatch = css.match(/\.verdict-badge--fail\s*\{([^}]*)\}/);
+    expect(failMatch).not.toBeNull();
+    const failBlock = failMatch[1];
+
+    // --pass 用 green，--fail 用 red
+    expect(passBlock).toContain("--green");
+    expect(failBlock).toContain("--red");
+
+    // 两套颜色不同
+    const green = resolveColor(vars["green"] || "#3fb950", vars);
+    const red = resolveColor(vars["red"] || "#f85149", vars);
+    expect(green).not.toBe(red);
+
+    // 语义区分：红≠绿
+    const greenBg = resolveColor(vars["green-bg"] || "#12261e", vars);
+    const redBg = resolveColor(vars["red-bg"] || "#261212", vars);
+    expect(greenBg).not.toBe(redBg);
+  });
+
+  it("39. 概览模型区分 main 与 rework 来源的 timeline", () => {
+    // 构造含 main + rework 来源事件的 state
+    let state = createInitialState("r_diff_src", "source distinguish", true);
+
+    state = reduceEvent(state, sse("main", "turn_start", { turn: 1 }));
+    state = reduceEvent(state, sse("main", "assistant_text", { text: "main done" }));
+    state = reduceEvent(state, sse("rework", "turn_start", { turn: 1 }));
+    state = reduceEvent(state, sse("rework", "assistant_text", { text: "rework fixed" }));
+
+    // 主时间线包含 main 来源的事件
+    expect(state.timeline).toHaveLength(4);
+    const mainEntries = state.timeline.filter((e: any) => e.source === "main");
+    const reworkEntries = state.timeline.filter((e: any) => e.source === "rework");
+    expect(mainEntries.length).toBeGreaterThanOrEqual(1);
+    expect(reworkEntries.length).toBeGreaterThanOrEqual(1);
+    const mainText = mainEntries.find((e: any) => e.type === "assistant_text");
+    const reworkText = reworkEntries.find((e: any) => e.type === "assistant_text");
+    expect(mainText.text).toBe("main done");
+    expect(reworkText.text).toBe("rework fixed");
+  });
+});
+
+// ---- helper: parseRootVars (reused by AC-10 test) ----
+function parseRootVars(css) {
+  const rootMatch = css.match(/:root\s*\{([^}]*)\}/s);
+  if (!rootMatch) return {};
+  const block = rootMatch[1];
+  const vars = {};
+  const varRe = /--([\w-]+)\s*:\s*([^;]+);/g;
+  let m;
+  while ((m = varRe.exec(block)) !== null) {
+    vars[m[1].trim()] = m[2].trim();
+  }
+  return vars;
+}
+
+function resolveColor(value, vars) {
+  let v = value.trim();
+  const varRef = v.match(/^var\((--[\w-]+)\)$/);
+  if (varRef) {
+    const refName = varRef[1].replace(/^--/, "");
+    if (vars[refName]) {
+      v = vars[refName];
+    }
+  }
+  v = v.replace(/\/\*.*?\*\//g, "").trim();
+  return v;
+}
