@@ -5,6 +5,16 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Agent Harness — Web UI</title>
 <link rel="stylesheet" href="/styles.css">
+<script>
+// 主题在样式表生效前就定下来，否则从 localStorage 恢复暗色时会先闪一帧亮色。
+// 只有三种取值：light / dark / auto（auto 交给 prefers-color-scheme）。
+(function () {
+  try {
+    var t = localStorage.getItem("agent-ui-theme");
+    if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t);
+  } catch (e) { /* 隐私模式下 localStorage 可能抛错，忽略即可 */ }
+})();
+</script>
 </head>
 <body>
 
@@ -26,6 +36,7 @@
       <option value="done">已完成</option>
       <option value="failed">未通过</option>
     </select>
+    <button type="button" class="theme-toggle" id="theme-toggle" aria-label="切换配色主题">◐</button>
   </div>
   <!-- role=listbox / aria-label 由 renderRunList 动态挂载：listbox 必须含 option
        子项（aria-required-children），空态/加载态若静态带着 role 反而是 critical
@@ -114,6 +125,7 @@ const taskInput = /** @type {HTMLTextAreaElement} */ (document.getElementById("t
 const verifyToggle = /** @type {HTMLInputElement} */ (document.getElementById("verify-toggle"));
 const submitBtn = /** @type {HTMLButtonElement} */ (document.getElementById("submit-btn"));
 const submitError = /** @type {HTMLElement} */ (document.getElementById("submit-error"));
+const themeToggle = /** @type {HTMLButtonElement} */ (document.getElementById("theme-toggle"));
 const sidebar = /** @type {HTMLElement} */ (document.getElementById("sidebar"));
 const mainPanel = /** @type {HTMLElement} */ (document.getElementById("main-panel"));
 const runFilter = /** @type {HTMLSelectElement} */ (document.getElementById("run-filter"));
@@ -556,6 +568,40 @@ function subscribeLifecycle() {
 }
 
 // ---- 启动 ----
+// ---- 主题切换（V-20）----
+// 三态循环 auto → light → dark：auto 跟随系统，另外两个是显式覆盖。
+// 显式态写进 localStorage，由 <head> 里的内联脚本在样式生效前恢复，避免闪白。
+const THEME_KEY = "agent-ui-theme";
+const THEME_LABEL = { auto: "◐", light: "☀", dark: "☾" };
+
+function currentTheme() {
+  const explicit = document.documentElement.getAttribute("data-theme");
+  return explicit === "light" || explicit === "dark" ? explicit : "auto";
+}
+
+function applyTheme(next) {
+  if (next === "auto") document.documentElement.removeAttribute("data-theme");
+  else document.documentElement.setAttribute("data-theme", next);
+  try {
+    if (next === "auto") localStorage.removeItem(THEME_KEY);
+    else localStorage.setItem(THEME_KEY, next);
+  } catch { /* 隐私模式下写入可能抛错，主题仍在本次会话内生效 */ }
+  if (themeToggle) {
+    themeToggle.textContent = THEME_LABEL[next];
+    themeToggle.setAttribute("aria-label", `切换配色主题（当前：${
+      { auto: "跟随系统", light: "浅色", dark: "深色" }[next]
+    }）`);
+  }
+}
+
+if (themeToggle) {
+  applyTheme(currentTheme());
+  themeToggle.addEventListener("click", () => {
+    const order = ["auto", "light", "dark"];
+    applyTheme(order[(order.indexOf(currentTheme()) + 1) % order.length]);
+  });
+}
+
 loadHarness();
 loadRuns().then(applyHash);
 subscribeLifecycle();

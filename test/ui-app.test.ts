@@ -1083,108 +1083,144 @@ describe("AC5 WCAG 对比度 (R-06)", () => {
     return (lighter + 0.05) / (darker + 0.05);
   }
 
-  /** 从 styles.css 解析 :root 块中的 CSS 变量 */
-  function parseRootVars(css) {
-    const rootMatch = css.match(/:root\s*\{([^}]*)\}/s);
-    if (!rootMatch) return {};
-    const block = rootMatch[1];
+  /**
+   * 括号配平扫描：抓出所有主题定义块。
+   *
+   * 旧实现用 /:root\s*\{([^}]*)\}/s，只抓第一个 :root 且 [^}] 不跨嵌套——
+   * @media 内的 :root 一个都抓不到。双主题落地后这个解析器必须先升级，
+   * 否则整套对比度门禁会在"只看了浅色"的情况下全绿。
+   */
+  function extractBlocks(css) {
+    // 先把注释替换成等长空白：既避免注释里的花括号干扰配平，
+    // 又保住字符索引，后面"剔除主题块再扫剩余部分"才不会错位
+    const blank = css.replace(/\/\*[\s\S]*?\*\//g, (c) => " ".repeat(c.length));
+    const blocks = [];
+    const selRe = /(?:^|[{};])\s*([^{};@]*?:root[^{};]*?)\{/g;
+    let m;
+    while ((m = selRe.exec(blank)) !== null) {
+      const selector = m[1].trim();
+      let depth = 1;
+      let i = selRe.lastIndex;
+      while (i < blank.length && depth > 0) {
+        if (blank[i] === "{") depth++;
+        else if (blank[i] === "}") depth--;
+        i++;
+      }
+      blocks.push({ selector, body: css.slice(selRe.lastIndex, i - 1), start: m.index, end: i });
+    }
+    return blocks;
+  }
+
+  function parseDecls(body) {
     const vars = {};
     const varRe = /--([\w-]+)\s*:\s*([^;]+);/g;
     let m;
-    while ((m = varRe.exec(block)) !== null) {
-      vars[m[1].trim()] = m[2].trim();
-    }
+    while ((m = varRe.exec(body)) !== null) vars[m[1].trim()] = m[2].trim();
     return vars;
   }
 
-  /** 从 property value 解析最终色值（支持 var() 引用，仅一级解析） */
-  function resolveColor(value, vars) {
-    let v = value.trim();
-    // 处理 var(--xxx) 引用
-    const varRef = v.match(/^var\((--[\w-]+)\)$/);
-    if (varRef) {
-      const refName = varRef[1].replace(/^--/, "");
-      if (vars[refName]) {
-        v = vars[refName];
-      }
+  /**
+   * 解析出两套主题的最终变量表。
+   * 浅色 = 顶层 :root；深色 = 顶层 :root ⊕ [data-theme="dark"] 覆盖。
+   * 深色只重定义 Layer 1 原始色板，语义层靠 var() 自动跟随——这正是分层的意义。
+   */
+  function parseThemes(css) {
+    const blocks = extractBlocks(css);
+    const base = blocks.find((b) => b.selector === ":root");
+    if (!base) throw new Error("styles.css 缺少顶层 :root 块");
+    const light = parseDecls(base.body);
+    const darkBlock = blocks.find((b) => b.selector.includes('[data-theme="dark"]'));
+    if (!darkBlock) throw new Error('styles.css 缺少 [data-theme="dark"] 块');
+    return { light, dark: { ...light, ...parseDecls(darkBlock.body) }, blocks };
+  }
+
+  /** 顺着 var() 链一路解析到字面色值（分层后引用深度可达三层） */
+  function resolveColor(value, vars, depth = 0) {
+    let v = String(value).replace(/\/\*[\s\S]*?\*\//g, "").trim();
+    const ref = v.match(/^var\(\s*(--[\w-]+)\s*\)$/);
+    if (ref && depth < 8) {
+      const name = ref[1].replace(/^--/, "");
+      if (vars[name] !== undefined) return resolveColor(vars[name], vars, depth + 1);
     }
-    // 去除注释
-    v = v.replace(/\/\*.*?\*\//g, "").trim();
     return v;
   }
 
-  it("24. 主按钮文字/底色对比度 ≥ 4.5:1", () => {
-    const cssPath = join(__dirname, "..", "ui", "public", "styles.css");
-    const css = readFileSync(cssPath, "utf-8");
-    const vars = parseRootVars(css);
+  const THEMES = ["light", "dark"];
 
-    const btnPrimaryText = resolveColor(vars["btn-primary-text"] || "#ffffff", vars);
-    const accent = resolveColor(vars["accent"] || "#0969da", vars);
+  /** 每套主题都要过的色对清单：[标签, 前景令牌, 背景令牌, 最低比值] */
+  const PAIRS = [
+    ["正文 / 页面底", "text-1", "surface-0", 4.5],
+    ["正文 / 抬升面", "text-1", "surface-1", 4.5],
+    ["正文 / 下沉面", "text-1", "surface-2", 4.5],
+    ["次要文字 / 页面底", "text-2", "surface-0", 4.5],
+    ["次要文字 / 抬升面", "text-2", "surface-1", 4.5],
+    ["三级文字 / 页面底", "text-3", "surface-0", 4.5],
+    ["主按钮文字 / 强调底", "on-accent", "accent", 4.5],
+    ["强调色 / 页面底", "accent", "surface-0", 4.5],
+    ["通过色 / 页面底", "status-ok", "surface-0", 4.5],
+    ["警告色 / 页面底", "status-warn", "surface-0", 4.5],
+    ["错误色 / 页面底", "status-bad", "surface-0", 4.5],
+    ["verifier 身份色 / 页面底", "identity-verifier", "surface-0", 4.5],
+    ["通过色 / 通过底", "status-ok", "status-ok-surface", 3.0],
+    ["警告色 / 警告底", "status-warn", "status-warn-surface", 3.0],
+    ["错误色 / 错误底", "status-bad", "status-bad-surface", 3.0],
+    ["信息色 / 信息底", "status-info", "status-info-surface", 3.0],
+    ["verifier 身份色 / 其底", "identity-verifier", "identity-verifier-surface", 3.0],
+    ["不可逆色 / 其底", "irreversible", "irreversible-surface", 3.0],
+    ["焦点环 / 页面底", "focus", "surface-0", 3.0],
+    ["焦点环 / 抬升面", "focus", "surface-1", 3.0],
+    ["正文 / 警告底（审批卡）", "text-1", "status-warn-surface", 4.5],
+    ["正文 / 错误底", "text-1", "status-bad-surface", 4.5],
+    ["正文 / 通过底", "text-1", "status-ok-surface", 4.5],
+  ];
 
-    const ratio = contrastRatio(btnPrimaryText, accent);
-    expect(ratio).toBeGreaterThanOrEqual(4.5);
+  // 24-28 合并升级为「两套主题 × 全部色对」——断言面积从 5 条扩到 46 条。
+  // 门禁只准加强不准削弱：旧版覆盖的五组色对全部包含在 PAIRS 里。
+  describe.each(THEMES)("%s 主题", (theme) => {
+    const css = readFileSync(join(__dirname, "..", "ui", "public", "styles.css"), "utf-8");
+    const vars = parseThemes(css)[theme];
+
+    it.each(PAIRS)("%s ≥ %s:1", (label, fgToken, bgToken, min) => {
+      const fg = resolveColor(vars[fgToken], vars);
+      const bg = resolveColor(vars[bgToken], vars);
+      expect(fg, `${theme} 主题缺少令牌 --${fgToken}`).toMatch(/^#[0-9a-fA-F]{6}$/);
+      expect(bg, `${theme} 主题缺少令牌 --${bgToken}`).toMatch(/^#[0-9a-fA-F]{6}$/);
+      const ratio = contrastRatio(fg, bg);
+      expect(ratio, `${label}：${fg} on ${bg} = ${ratio.toFixed(2)}:1`).toBeGreaterThanOrEqual(min);
+    });
   });
 
-  it("25. 正文/页面底色对比度 ≥ 4.5:1", () => {
-    const cssPath = join(__dirname, "..", "ui", "public", "styles.css");
-    const css = readFileSync(cssPath, "utf-8");
-    const vars = parseRootVars(css);
-
-    const fg = resolveColor(vars["fg"] || "#c9d1d9", vars);
-    const bg = resolveColor(vars["bg"] || "#0d1117", vars);
-
-    const ratio = contrastRatio(fg, bg);
-    expect(ratio).toBeGreaterThanOrEqual(4.5);
+  it("两套主题定义的原始色板令牌名集合完全一致", () => {
+    const css = readFileSync(join(__dirname, "..", "ui", "public", "styles.css"), "utf-8");
+    const { blocks } = parseThemes(css);
+    const base = blocks.find((b) => b.selector === ":root");
+    const dark = blocks.find((b) => b.selector.includes('[data-theme="dark"]'));
+    const raw = (o) => Object.keys(o).filter((k) => k.startsWith("p-")).sort();
+    // 浅色漏定义某个 --p-*，深色就会静默沿用浅色值——这是双主题最难肉眼发现的 bug
+    expect(raw(parseDecls(dark.body))).toEqual(raw(parseDecls(base.body)));
   });
 
-  it("26. 状态徽章文字/底色对比度 ≥ 3:1（组件类）", () => {
-    const cssPath = join(__dirname, "..", "ui", "public", "styles.css");
-    const css = readFileSync(cssPath, "utf-8");
-    const vars = parseRootVars(css);
-
-    // 绿色徽章: green on green-bg
-    const green = resolveColor(vars["green"] || "#3fb950", vars);
-    const greenBg = resolveColor(vars["green-bg"] || "#12261e", vars);
-    const ratioGreen = contrastRatio(green, greenBg);
-    expect(ratioGreen).toBeGreaterThanOrEqual(3.0);
-
-    // 红色徽章: red on red-bg
-    const red = resolveColor(vars["red"] || "#f85149", vars);
-    const redBg = resolveColor(vars["red-bg"] || "#261212", vars);
-    const ratioRed = contrastRatio(red, redBg);
-    expect(ratioRed).toBeGreaterThanOrEqual(3.0);
-
-    // 黄色审批卡: fg on yellow-bg
-    const yellowBg = resolveColor(vars["yellow-bg"] || "#1d1c08", vars);
-    const ratioFgOnYellow = contrastRatio(
-      resolveColor(vars["fg"] || "#c9d1d9", vars),
-      yellowBg,
+  it("媒体查询暗色块与手动暗色块逐字段一致（防漂移）", () => {
+    const css = readFileSync(join(__dirname, "..", "ui", "public", "styles.css"), "utf-8");
+    const { blocks } = parseThemes(css);
+    // 零构建下这段值无法复用，只能写两遍；写两遍就必须有东西盯着它们不分家
+    const darkBlocks = blocks.filter(
+      (b) => b.selector.includes('[data-theme="dark"]') || b.selector.includes(':not([data-theme="light"])'),
     );
-    expect(ratioFgOnYellow).toBeGreaterThanOrEqual(3.0);
+    expect(darkBlocks.length).toBe(2);
+    expect(parseDecls(darkBlocks[0].body)).toEqual(parseDecls(darkBlocks[1].body));
   });
 
-  it("27. 焦点指示色与底板对比度 ≥ 3:1", () => {
-    const cssPath = join(__dirname, "..", "ui", "public", "styles.css");
-    const css = readFileSync(cssPath, "utf-8");
-    const vars = parseRootVars(css);
-
-    const focusRing = resolveColor(vars["focus-ring"] || "#0969da", vars);
-    const bg = resolveColor(vars["bg"] || "#0d1117", vars);
-
-    const ratio = contrastRatio(focusRing, bg);
-    expect(ratio).toBeGreaterThanOrEqual(3.0);
-  });
-
-  it("28. 拒绝按钮文字/底色对比度 ≥ 3:1（组件类）", () => {
-    const cssPath = join(__dirname, "..", "ui", "public", "styles.css");
-    const css = readFileSync(cssPath, "utf-8");
-    const vars = parseRootVars(css);
-
-    const denyText = resolveColor(vars["btn-deny-text"] || "#f85149", vars);
-    const denyBg = resolveColor(vars["red-bg"] || "#261212", vars);
-
-    const ratio = contrastRatio(denyText, denyBg);
-    expect(ratio).toBeGreaterThanOrEqual(3.0);
+  it("组件层不得直接引用 Layer 1 原始色板", () => {
+    const css = readFileSync(join(__dirname, "..", "ui", "public", "styles.css"), "utf-8");
+    const { blocks } = parseThemes(css);
+    let outside = css;
+    for (const b of [...blocks].sort((a, z) => z.start - a.start)) {
+      outside = outside.slice(0, b.start) + outside.slice(b.end);
+    }
+    // --p-* 是主题块的私有词汇；组件直接用它就绕过了语义层，换主题时会漏改
+    const leaks = outside.match(/var\(\s*--p-[\w-]+/g) ?? [];
+    expect(leaks).toEqual([]);
   });
 });
 
@@ -1355,14 +1391,31 @@ describe("AC7 运行列表元数据与筛选 (R-08)", () => {
 
 // ---- AC8: styles.css 令牌统一 — 除 :root 外无裸十六进制色值 (P2) ----
 describe("AC8 CSS 令牌统一 (P2)", () => {
-  it("36. styles.css 除 :root 定义块外无裸十六进制色值", () => {
+  it("36. styles.css 除主题定义块外无裸十六进制色值", () => {
     const cssPath = join(__dirname, "..", "ui", "public", "styles.css");
     const css = readFileSync(cssPath, "utf-8");
 
-    // 移除 :root 块
-    const stripped = css
-      .replace(/:root\s*\{[^}]*\}/s, "")
-      .replace(/\/\*[\s\S]*?\*\//g, "");
+    // 双主题落地后不能只剔除第一个 :root：暗色块也是合法的色值出处。
+    // 用括号配平剔除**全部**含 :root 的块（顶层、@media 内、[data-theme] 覆盖），
+    // 再扫剩余部分——这样断言仍是"组件层零裸色值"，覆盖面反而扩大了。
+    const blank = css.replace(/\/\*[\s\S]*?\*\//g, (c) => " ".repeat(c.length));
+    const ranges = [];
+    const selRe = /(?:^|[{};])\s*([^{};@]*?:root[^{};]*?)\{/g;
+    let sm;
+    while ((sm = selRe.exec(blank)) !== null) {
+      let depth = 1;
+      let i = selRe.lastIndex;
+      while (i < blank.length && depth > 0) {
+        if (blank[i] === "{") depth++;
+        else if (blank[i] === "}") depth--;
+        i++;
+      }
+      ranges.push([sm.index, i]);
+    }
+    let stripped = blank;
+    for (const [a, b] of ranges.sort((x, y) => y[0] - x[0])) {
+      stripped = stripped.slice(0, a) + stripped.slice(b);
+    }
 
     // 匹配属性值中的裸六位色值
     const propHexRe = /:\s*(?:[^;{]*?\s)?(#[0-9a-fA-F]{6})\b/g;
@@ -1377,6 +1430,54 @@ describe("AC8 CSS 令牌统一 (P2)", () => {
     }
 
     expect(violations).toEqual([]);
+  });
+});
+
+// ================================================================
+// v2 R5: 字体阶梯与字号下限 (V-20)
+// ================================================================
+
+describe("V-20 字体阶梯", () => {
+  const css = readFileSync(join(__dirname, "..", "ui", "public", "styles.css"), "utf-8");
+
+  it("全表无小于 12px 的字号——辅助信息的硬下限", () => {
+    // 委托方报告 §11 自己写的建议是辅助 ≥12px / 正文 ≥14px，s3 三轮都没做。
+    // 这条同时守两处：令牌定义与散落的硬编码 font-size。
+    const sizes = [...css.matchAll(/font-size:\s*(\d+)px/g)].map((m) => Number(m[1]));
+    const tokens = [...css.matchAll(/--font-[\w-]+:\s*(\d+)px/g)].map((m) => Number(m[1]));
+    const tooSmall = [...sizes, ...tokens].filter((n) => n < 12);
+    expect(tooSmall, `低于 12px 的字号: ${tooSmall.join(", ")}`).toEqual([]);
+  });
+
+  it("正文与卡片正文 ≥ 14px", () => {
+    const m = css.match(/--font-lg:\s*(\d+)px/);
+    expect(Number(m[1])).toBeGreaterThanOrEqual(14);
+    // body 显式设正文号，避免继承到浏览器默认的 16px 之外的值
+    expect(css).toMatch(/body\s*\{[\s\S]*?font-size:\s*var\(--font-lg\)/);
+  });
+
+  it("三套字体栈各有 ≥3 级回退且以通用族收尾", () => {
+    // 不赌宿主环境（C3）：衬线依赖 Noto Serif SC，它缺席时必须还有得降级
+    for (const token of ["font-display", "font-ui", "font-mono"]) {
+      const m = css.match(new RegExp(`--${token}:\s*([^;]+);`));
+      expect(m, `缺少 --${token}`).not.toBeNull();
+      const stack = m[1].split(",").map((x) => x.trim());
+      expect(stack.length, `--${token} 回退级数不足`).toBeGreaterThanOrEqual(3);
+      expect(["serif", "sans-serif", "monospace"]).toContain(stack[stack.length - 1]);
+    }
+  });
+
+  it("衬线只用于大字号标题，不铺到正文", () => {
+    // 中文衬线在小字号下可读性差；真降级到系统宋体时，影响面必须限于几处标题
+    const displayUse = [...css.matchAll(/font-family:\s*var\(--font-display\)/g)];
+    expect(displayUse.length).toBeGreaterThan(0);
+
+    // 注意作用域：`[\s\S]*?` 会跨出 body 块一路匹配到后面的标题规则，
+    // 所以必须先切出 body 的花括号体再查（初稿正是这么写错的，假阳性）
+    const bodyBlock = css.match(/(^|\})\s*body\s*\{([^}]*)\}/);
+    expect(bodyBlock, "styles.css 缺少 body 规则").not.toBeNull();
+    expect(bodyBlock[2]).toMatch(/font-family:\s*var\(--font-ui\)/);
+    expect(bodyBlock[2]).not.toMatch(/--font-display/);
   });
 });
 

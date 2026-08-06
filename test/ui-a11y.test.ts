@@ -352,3 +352,71 @@ describe("环境边界声明（防止把 incomplete 误当通过）", () => {
     expect(results.violations).toEqual([]);
   });
 });
+
+// ================================================================
+// v2 R5：双主题下的结构语义（V-20）
+// ================================================================
+
+describe("双主题：data-theme 切换不改变结构语义", () => {
+  const SCREENS: [string, () => void][] = [
+    ["空态", () => renderEmptyState(false)],
+    [
+      "运行列表",
+      () =>
+        renderRunList(
+          [
+            { runId: "run-1", task: "创建 demo.txt", status: "done", verify: true },
+            { runId: "run-2", task: "另一个任务", status: "running", verify: false },
+          ],
+          "run-1",
+          () => {},
+          new Map([["run-1", { startTime: 1785980000000, duration: 12345, verdictConclusion: "passed" }]]),
+        ),
+    ],
+    ["Loop 面", () => renderRunDetail(buildRichState(), { activeTab: "loop", harness: FAKE_HARNESS })],
+    ["Context 面", () => renderRunDetail(buildRichState(), { activeTab: "context", harness: FAKE_HARNESS })],
+    ["Tools 面", () => renderRunDetail(buildRichState(), { activeTab: "tools", harness: FAKE_HARNESS })],
+    ["Verification 面", () => renderRunDetail(buildRichState(), { activeTab: "verify", harness: FAKE_HARNESS })],
+    [
+      "窄屏详情态",
+      () =>
+        renderRunDetail(buildRichState(), {
+          activeTab: "loop", showBack: true, onBack: () => {}, harness: FAKE_HARNESS,
+        }),
+    ],
+    ["宿主快照缺席降级", () => renderRunDetail(buildRichState(), { activeTab: "tools" })],
+  ];
+
+  // 主题只改颜色不改结构；但"只改颜色"是需要被证明的，不是假设的。
+  // jsdom 不判对比度（那由 ui-app.test.ts 的 WCAG 实算守护），这里守的是
+  // 换主题后 ARIA 结构、地标、名称计算不发生任何漂移。
+  for (const theme of ["light", "dark"] as const) {
+    describe(`${theme} 主题`, () => {
+      it.each(SCREENS)("%s 零 violations", async (_name, render) => {
+        document.documentElement.setAttribute("data-theme", theme);
+        render();
+        const violations = await runAxe();
+        expect(violations, JSON.stringify(violations, null, 2)).toEqual([]);
+      });
+    });
+  }
+
+  it("切换主题不改变可访问性树（同一画面两套主题的 ARIA 快照一致）", () => {
+    const snapshot = (theme: string) => {
+      document.documentElement.setAttribute("data-theme", theme);
+      document.body.innerHTML = loadSkeleton();
+      renderRunDetail(buildRichState(), { activeTab: "verify", harness: FAKE_HARNESS });
+      return [...document.querySelectorAll("[role],[aria-label],[aria-labelledby],[aria-selected]")]
+        .map((el) =>
+          [
+            el.tagName,
+            el.getAttribute("role") ?? "",
+            el.getAttribute("aria-label") ?? "",
+            el.getAttribute("aria-labelledby") ?? "",
+            el.getAttribute("aria-selected") ?? "",
+          ].join("|"),
+        );
+    };
+    expect(snapshot("dark")).toEqual(snapshot("light"));
+  });
+});

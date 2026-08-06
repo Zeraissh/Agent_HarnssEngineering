@@ -1,77 +1,237 @@
 /* Harness Web UI — 样式表 (P2 令牌统一 + R-06 对比度修正) */
 
+/* ===================================================================
+   v2 R5：视觉语言（V-20）
+
+   三层令牌，逐层收窄：
+     Layer 1  --p-*      原始色板。**只允许出现在主题块里**，组件一律不得直接用。
+     Layer 2  语义层      --surface-* / --text-* / --status-* / --identity-* …
+     Layer 3  兼容别名    v1 时期的 --bg / --fg / --green …，指向语义层。
+
+   为什么留 Layer 3：全站有 237 处引用旧名，一次性改名的收益是命名整齐，
+   代价是一个巨大且难以复核的 diff。别名层让主题切换与语义分层立刻成立，
+   改名可以随后逐处收敛——这是刻意的取舍，不是遗漏。
+
+   主题：浅色为默认（温暖纸面），暗色为暖炭而非冷石板。
+   暗色块出现两次（媒体查询 + 手动覆盖），零构建下无法复用；
+   两块必须逐字段一致，有常驻测试盯着漂移。
+   =================================================================== */
+
 :root {
-  /* ===== 背景 ===== */
-  --bg: #0d1117;
-  --bg2: #161b22;
-  --bg3: #21262d;
-  --border: #30363d;
+  /* ---------- Layer 1：原始色板（浅色 · 温暖纸面）---------- */
+  --p-surface-0: #FAF9F5;
+  --p-surface-1: #F0EEE6;
+  --p-surface-2: #E5E2D8;
+  --p-line: #DDD9CE;
+  --p-line-strong: #C9C4B4;
+  --p-text-1: #14130F;
+  --p-text-2: #4A463D;
+  --p-text-3: #6E6959;
+  /* 陶土。注意不是 #C15F3C——那个白字上去只有 4.23:1、纸面上 4.01:1，两头都不达标 */
+  --p-accent: #B0522F;
+  --p-accent-hover: #8F4126;
+  --p-on-accent: #FFFFFF;
+  --p-ok: #2F6F43;
+  --p-ok-surface: #E7F0E8;
+  --p-warn: #8A5A11;
+  --p-warn-surface: #F6EEDC;
+  --p-warn-surface-alt: #EFE4CB;
+  --p-bad: #A33228;
+  --p-bad-surface: #F7E7E4;
+  --p-info: #3A5C8C;
+  --p-info-surface: #E8EEF6;
+  /* verifier 身份色。CLI 用洋红，纸面上 #c471f0 刺眼，换成同族深梅 */
+  --p-verifier: #6B4E9E;
+  --p-verifier-surface: #F0EAF7;
+  /* 不可逆自成语域，与 warn 视觉可区分——否则用户对压缩警告脱敏 */
+  --p-irreversible: #8A3D1F;
+  --p-irreversible-surface: #F4E6DC;
+  --p-focus: #8F4126;
 
-  /* ===== 前景 ===== */
-  --fg: #c9d1d9;
-  --fg2: #8b949e;
+  /* ---------- Layer 2：语义层 ---------- */
+  --surface-0: var(--p-surface-0);
+  --surface-1: var(--p-surface-1);
+  --surface-2: var(--p-surface-2);
+  --border-1: var(--p-line);
+  --border-2: var(--p-line-strong);
+  --text-1: var(--p-text-1);
+  --text-2: var(--p-text-2);
+  --text-3: var(--p-text-3);
+  --accent: var(--p-accent);
+  --accent-hover: var(--p-accent-hover);
+  --on-accent: var(--p-on-accent);
+  --status-ok: var(--p-ok);
+  --status-ok-surface: var(--p-ok-surface);
+  --status-warn: var(--p-warn);
+  --status-warn-surface: var(--p-warn-surface);
+  --status-bad: var(--p-bad);
+  --status-bad-surface: var(--p-bad-surface);
+  --status-info: var(--p-info);
+  --status-info-surface: var(--p-info-surface);
+  --identity-verifier: var(--p-verifier);
+  --identity-verifier-surface: var(--p-verifier-surface);
+  --irreversible: var(--p-irreversible);
+  --irreversible-surface: var(--p-irreversible-surface);
+  --focus: var(--p-focus);
+  --token-uncached: var(--p-info);
+  --token-cache-write: var(--p-verifier);
+  --token-cache-read: var(--p-ok);
+  --meter-track: var(--p-surface-2);
+  --meter-fill: var(--p-accent);
+  --meter-threshold: var(--p-warn);
 
-  /* ===== 强调色 ===== */
-  --accent: #0969da;
-  --accent-hover: #5098fd;
+  /* ---------- Layer 3：v1 兼容别名 ---------- */
+  --bg: var(--surface-0);
+  --bg2: var(--surface-1);
+  --bg3: var(--surface-2);
+  --border: var(--border-1);
+  --fg: var(--text-1);
+  --fg2: var(--text-2);
+  --green: var(--status-ok);
+  --red: var(--status-bad);
+  --yellow: var(--status-warn);
+  --magenta: var(--identity-verifier);
+  --green-bg: var(--status-ok-surface);
+  --green-bg-hover: var(--status-ok-surface);
+  --red-bg: var(--status-bad-surface);
+  --red-bg-hover: var(--status-bad-surface);
+  --yellow-bg: var(--status-warn-surface);
+  --yellow-bg-alt: var(--p-warn-surface-alt);
+  --magenta-bg: var(--identity-verifier-surface);
+  --magenta-border: var(--identity-verifier);
+  --magenta-border-strong: var(--identity-verifier);
+  --btn-primary-text: var(--on-accent);
+  --btn-allow-text: var(--status-ok);
+  --btn-deny-text: var(--status-bad);
+  --approval-card-bg: var(--status-warn-surface);
+  --tl-border: var(--border-1);
+  --log-entry-bg: var(--surface-0);
+  --log-entry-bg-hover: var(--surface-1);
+  --tab-active-bg: var(--surface-2);
+  --tab-inactive-bg: transparent;
+  --focus-ring: var(--focus);
 
-  /* ===== 状态色 ===== */
-  --green: #3fb950;
-  --red: #f85149;
-  --yellow: #d2991d;
-  --magenta: #c471f0;
+  /* ---------- 字体阶梯 ----------
+     下限硬性抬高：辅助 ≥12px、正文 ≥14px（委托方 §11 的建议，s3 未做）。
+     衬线只用于大字号：Windows 上中文衬线依赖 Noto Serif SC（已实测在场），
+     万一缺席也只影响少数几处标题，不会让整页中文变成小字号宋体。 */
+  --font-display: Georgia, "Noto Serif SC", STSong, Cambria, serif;
+  --font-ui: "Segoe UI", "Microsoft YaHei", "Noto Sans SC", system-ui, sans-serif;
+  --font-mono: "Cascadia Code", Consolas, ui-monospace, monospace;
 
-  /* ===== 状态色背景 ===== */
-  --green-bg: #12261e;
-  --green-bg-hover: #1a3a2e;
-  --red-bg: #261212;
-  --red-bg-hover: #3a1a1a;
-  --yellow-bg: #1d1c08;
-  --yellow-bg-alt: #2a2914;
-  --magenta-bg: #2d1832;
-  --magenta-border: rgba(196, 113, 240, 0.2);
-  --magenta-border-strong: rgba(196, 113, 240, 0.35);
-
-  /* ===== 按钮文字色 ===== */
-  --btn-primary-text: #ffffff;
-  --btn-allow-text: #3fb950;
-  --btn-deny-text: #f85149;
-
-  /* ===== 尺寸令牌 ===== */
-  --radius: 6px;
-  --radius-sm: 4px;
-  --radius-xs: 3px;
-  --font-xs: 11px;
+  --font-xs: 12px;
   --font-sm: 12px;
   --font-md: 13px;
   --font-lg: 14px;
-  --font-xl: 16px;
-  --font-xxl: 18px;
+  --font-xl: 17px;
+  --font-xxl: 20px;
+  --font-display-lg: 28px;
+
+  --leading-tight: 1.35;
+  --leading-normal: 1.6;
+  --leading-loose: 1.75;
+
+  /* ---------- 尺寸 ---------- */
+  --radius: 6px;
+  --radius-sm: 4px;
+  --radius-xs: 3px;
   --space-xs: 4px;
   --space-sm: 8px;
   --space-md: 12px;
   --space-lg: 16px;
   --space-xl: 24px;
+}
 
-  /* ===== 组件背景色 ===== */
-  --approval-card-bg: var(--yellow-bg);
-  --tl-border: rgba(48, 54, 61, 0.4);
-  --log-entry-bg: var(--bg);
-  --log-entry-bg-hover: var(--bg2);
-  --tab-active-bg: var(--bg3);
-  --tab-inactive-bg: transparent;
-  --focus-ring: #0969da;
+/* ---------- 暗色：暖炭，不是冷石板 ---------- */
+/* THEME-DARK-BLOCK */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --p-surface-0: #1B1A18;
+    --p-surface-1: #232220;
+    --p-surface-2: #2E2C29;
+    --p-line: #3A3835;
+    --p-line-strong: #4A4744;
+    --p-text-1: #F2F0EA;
+    --p-text-2: #C2BDB2;
+    --p-text-3: #9C968A;
+    --p-accent: #D9784F;
+    --p-accent-hover: #E8916B;
+    --p-on-accent: #1B1A18;
+    --p-ok: #6FBF7F;
+    --p-ok-surface: #1E2A20;
+    --p-warn: #D9A441;
+    --p-warn-surface: #2B2416;
+    --p-warn-surface-alt: #3A3018;
+    --p-bad: #E8705F;
+    --p-bad-surface: #2E1D1A;
+    --p-info: #7FA6D9;
+    --p-info-surface: #1C2430;
+    --p-verifier: #B18CE0;
+    --p-verifier-surface: #26203A;
+    --p-irreversible: #E08A5F;
+    --p-irreversible-surface: #31221A;
+    --p-focus: #E08A5F;
+  }
+}
+
+/* THEME-DARK-BLOCK */
+:root[data-theme="dark"] {
+  --p-surface-0: #1B1A18;
+  --p-surface-1: #232220;
+  --p-surface-2: #2E2C29;
+  --p-line: #3A3835;
+  --p-line-strong: #4A4744;
+  --p-text-1: #F2F0EA;
+  --p-text-2: #C2BDB2;
+  --p-text-3: #9C968A;
+  --p-accent: #D9784F;
+  --p-accent-hover: #E8916B;
+  --p-on-accent: #1B1A18;
+  --p-ok: #6FBF7F;
+  --p-ok-surface: #1E2A20;
+  --p-warn: #D9A441;
+  --p-warn-surface: #2B2416;
+  --p-warn-surface-alt: #3A3018;
+  --p-bad: #E8705F;
+  --p-bad-surface: #2E1D1A;
+  --p-info: #7FA6D9;
+  --p-info-surface: #1C2430;
+  --p-verifier: #B18CE0;
+  --p-verifier-surface: #26203A;
+  --p-irreversible: #E08A5F;
+  --p-irreversible-surface: #31221A;
+  --p-focus: #E08A5F;
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
 body {
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, sans-serif;
-  background: var(--bg);
-  color: var(--fg);
+  font-family: var(--font-ui);
+  font-size: var(--font-lg);
+  line-height: var(--leading-normal);
+  background: var(--surface-0);
+  color: var(--text-1);
   display: flex;
   height: 100vh;
   overflow: hidden;
+  /* 纸面观感：关掉子像素抖动，让暖色底上的正文更干净 */
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 衬线只用于大字号标题——中文衬线依赖 Noto Serif SC，缺席时降级只影响这几处 */
+h1, h2, h3,
+.detail-task,
+.outcome-line,
+.factor-title,
+.overview-section-title,
+.rail-title {
+  font-family: var(--font-display);
+  line-height: var(--leading-tight);
+  font-weight: 600;
+}
+
+code, pre, .chip-name, .usage-table td, .log-entry-body {
+  font-family: var(--font-mono);
 }
 
 /* ===== 焦点可见样式 (R-05) ===== */
@@ -158,7 +318,7 @@ body {
 }
 
 .verify-badge {
-  font-size: 10px;
+  font-size: var(--font-sm);
   padding: 1px 5px;
   border-radius: var(--radius-xs);
   background: var(--magenta-bg);
@@ -168,12 +328,12 @@ body {
 
 /* R-08 列表项状态标签 */
 .run-item-state-label {
-  font-size: 10px;
+  font-size: var(--font-sm);
   color: var(--fg2);
 }
 
 .run-item-verdict {
-  font-size: 10px;
+  font-size: var(--font-sm);
   font-weight: 700;
   padding: 0 3px;
   border-radius: var(--radius-xs);
@@ -1083,6 +1243,23 @@ body {
 .round-summary { display: block; color: var(--fg2); font-size: var(--font-sm); }
 
 .empty-note { color: var(--fg2); font-size: var(--font-md); margin: 0 0 var(--space-lg); }
+
+/* --- 主题切换按钮 --- */
+.theme-toggle {
+  border: 1px solid var(--border-1);
+  border-radius: var(--radius-sm);
+  background: var(--surface-0);
+  color: var(--text-2);
+  cursor: pointer;
+  font-size: var(--font-md);
+  line-height: 1;
+  padding: var(--space-xs) var(--space-sm);
+}
+
+.theme-toggle:hover {
+  background: var(--surface-2);
+  color: var(--text-1);
+}
 
 /* --- 提交错误就地显示（取代 alert）--- */
 .inline-error {

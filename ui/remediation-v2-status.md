@@ -32,7 +32,7 @@
 | V-17 首屏不呈现四决定因素 | P2 | R4 | ✅ | L2 重构为「页头 → 需你决定 → 直播 → 结果 → 四决定因素 → 下钻」，日志降为 Loop 面的下钻内容（组织原则见 `docs/01-philosophy.md:5-12`）。新增五个派生纯函数 + `buildFactorCards`；**异常面自动排到网格首位**。L3 标签从「概览/日志/核查」改为 Loop/Context/Tools/Verification，配 hash 路由 `#/run/<id>/<face>`。**浏览器实证**：分区顺序逐一核对；15 次工具失败时 Tools 卡带异常边框排首位；深链刷新后 run 与面双双恢复（`#/run/<id>/verify` → `aria-labelledby=tab-verify`）|
 | V-18 工具面与边界不可见 | P2 | R2/R4 | ✅ | 新增 `GET /api/harness`：包名/描述/核查三件套/工具面（含 auto·ask 与 builtin·mcp 来源）/ MCP 状态 / 只读根 / 护栏 / effort（含 compat 下是否实际发送）/ 核查预算 15 / 压缩水位 0.8。**MCP 默认关**（`AGENT_UI_MCP=1` 显式开）——stm32-debug 声明 swd-probe 独占，常驻宿主默认连接就是案例 #3 那种攥着探针的僵尸会话。契约测试 v2-8 另断言快照不含密钥。**R4 补上呈现层**：Tools 面列工具芯片（名 + auto/ask + 调用数 + 失败数）、运行边界清单（包/核查模式/只读白名单/bash 运行时/工作目录/额外只读根/护栏/MCP）、被拒记录与失败后的改道；Verification 面另列核查者边界（白名单/预算 15 轮/评分表来源）。快照缺席时照实降级为「未获取到工具清单」，不编造 |
 | V-19 通过带备注未降级 / 不可逆无语域 | P2 | R4 | ✅ | `pass_with_notes` 成为独立第四态（`passed && issues.length`），徽章 `✔ 通过（有备注）`、issues 用 `⚠` 走 warn 色——对齐 CLI `src/cli.ts:276`，项目有两个真实案例是「通过但备注里藏着真 bug」。压缩另起 `.callout--irreversible` 语域（双线左边框 + 区别于 warn 的底色），文案明写「被置换的原文永不可恢复」。**浏览器实证**：徽章类名为 `outcome-verdict--pass_with_notes`、issues 为 `outcome-issues--warn` |
-| V-20 单一暗色主题 / 字号过小 | P2 | R5 | ⬜ | |
+| V-20 单一暗色主题 / 字号过小 | P2 | R5 | ✅ | 三层令牌（`--p-*` 原始色板 → 语义层 → v1 兼容别名）；**浅色温暖纸面为默认**、暖炭深色为次要，配 `prefers-color-scheme` + `[data-theme]` 手动覆盖 + `<head>` 内联脚本从 localStorage 恢复（首帧前就位，无闪白）。主题按钮三态循环 auto/light/dark。字号下限抬到 12px（删 `--font-xs: 11px` 与三处硬编码 10px），正文 14px；衬线 `Georgia, Noto Serif SC` 只用于大字号标题。**关键一坑**：Claude 标志性陶土 `#C15F3C` 直接用是不合格的——白字 4.23:1、纸面 4.01:1 双双低于 4.5，与 R-06 那个 2.53:1 蓝按钮同型；调深到 `#B0522F` 才双向达标（5.13 / 4.87）。**浏览器实证**：三态切换与 localStorage 持久化、页面最小实渲字号 = 12px、纸面各层取值符合设计 |
 | V-21 缺 launcher | P2 | R1 | ✅ | 新建 `ui/serve.ts` + `npm run ui`；默认绑 `127.0.0.1`（该宿主能执行 bash 并批准写文件，非本地地址会打警告）；SIGINT/SIGTERM 优雅关停。顺带把 `ui` 纳入 tsconfig `include`——此前 `ui/serve.ts` 这类未被测试导入的文件根本不受类型检查 |
 
 ## 验收标准（AC2-01 ~ AC2-18）
@@ -52,9 +52,9 @@
 | AC2-11 1000 事件单帧 < 16ms | ⚠️ 折叠次数已锁，耗时未量化 | `createBatcher` 测试断言 1000 条事件只触发 1 次 flush（锁死 O(n²) 不回归）；日志侧 1000 行渲染后再来一条只新增 1 个节点、首节点仍是原对象。**尚缺**：真实浏览器的单帧毫秒数测量，留 R6 |
 | AC2-12 日志分段与来源可辨 | ✅ | `deriveSegments` 三条测试（四段切分与轮次、单段不产生虚假分界、并行前缀来源归类）+ 浏览器实证三条分界与返工链 |
 | AC2-13 首屏四决定因素可读 | ✅ | 新增 `test/ui-faces.test.ts` 33 条覆盖五个派生函数与 `buildFactorCards`；浏览器实证两个「第一眼」场景、异常面加权排序、hash 深链恢复 |
-| AC2-14 双主题对比度门禁 | ⬜ | |
-| AC2-15 四视口 × 双主题无溢出 | ⬜ | |
-| AC2-16 axe 六画面双主题零 violations | ⚠️ 暗色六画面已闭合，浅色留 R5 | 画面集合随新 IA 更新为：空态 / 列表 / Loop / Context / Tools / Verification / 窄屏 / 宿主快照缺席降级，八个画面 violations 恒空。双主题版本随 R5 的浅色令牌落地 |
+| AC2-14 双主题对比度门禁 | ✅ | 解析器升级为**括号配平扫描**（旧的 `/:root\s*\{([^}]*)\}/s` 只抓第一个 `:root`、不跨嵌套，@media 内的一个都抓不到——双主题下会在「只看了浅色」的情况下全绿）。断言面积 5 条 → **46 条**（2 主题 × 23 组色对），另加三条结构门禁：两主题原始色板令牌名集合一致、媒体查询暗色块与手动暗色块逐字段一致（防漂移）、组件层不得直接引用 `--p-*`。裸色值检查从「除 :root 外」扩为「除全部主题块外」 |
+| AC2-15 四视口 × 双主题无溢出 | ✅ | **32 种组合零溢出**（390/768/1280/1440 × light/dark × Loop/Context/Tools/Verification），逐格实测 `scrollWidth - clientWidth`。窄屏另确认侧栏 `display:none` 与返回按钮在位（R-02 原始要求）。200% 缩放零横向溢出、标签与主操作齐全（AC-09 未回退）|
+| AC2-16 axe 六画面双主题零 violations | ✅ | 画面集合随新 IA 扩为八个（空态 / 列表 / Loop / Context / Tools / Verification / 窄屏 / 宿主快照缺席降级），**两套主题各扫一遍共 16 次，violations 恒空**。另加一条「切换主题不改变可访问性树」：同一画面两套主题的 ARIA 快照逐项相等——「主题只改颜色不改结构」是需要被证明的，不是假设的 |
 | AC2-17 npm run ui 可启动且绑本地 | ✅ | `ui/serve.ts` 落地，默认 `127.0.0.1:4173`；纳入 tsconfig 后受 `npm run typecheck` 覆盖 |
 | AC2-18 v1.0 全部条目未回退 | ⬜ | |
 
@@ -67,6 +67,7 @@
 | R2 数据面 | 256 | +12：服务端契约 5（白名单到达 verifier / harness 快照 / 成本与逐轮裁决 / 列表口径 / delta 通道）+ reducer 7（水位口径 / 成本 / 逐轮裁决 / 工具名回填） |
 | R3 细粒度渲染 | 285 | +29：新增 `test/ui-patch.test.ts` 24（`diffKeyed` 6 / `patchList`·`appendOnly` 5 / 滚动锚定 2 / `createBatcher` 4 / 详情页与侧栏状态存活 7）+ 服务端契约 1（`/api/stream`）+ 由源码扫描升级为真实 DOM 断言 4 |
 | R4 新信息架构 | 321 | +36：新增 `test/ui-faces.test.ts` 33（段切分 3 / Loop 面 6 / Context 面 4 / Tools 面 5 / Verification 面 5 / ActionRail 2 / 因子卡 4 / 标签归一 2 / 工具名回填 2）+ a11y 画面随新 IA 扩为 8 个并新增「旧标签 id 归一」1 条 |
+| R5 视觉语言 | 386 | +21：对比度门禁 5 → 46（2 主题 × 23 色对，净 +41 断言归入 4 个 `it.each`）+ 主题结构门禁 3（令牌名集合一致 / 暗色块防漂移 / 组件层不碰 `--p-*`）+ 字体阶梯 4 + a11y 双主题 16 画面与 ARIA 快照一致 1 |
 
 ## R3 把两条静态断言升级为真实 DOM 断言
 
