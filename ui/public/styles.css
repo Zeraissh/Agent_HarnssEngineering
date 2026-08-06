@@ -337,6 +337,29 @@ body {
 .status--live { background: var(--green-bg); color: var(--green); }
 .status--done { background: var(--bg3); color: var(--fg2); }
 .status--error { background: var(--red-bg); color: var(--red); }
+/* V-04：max_tokens 这类"跑完了但没跑好"的终止，既不是成功也不是硬失败 */
+.status--warn { background: var(--yellow-bg); color: var(--yellow); }
+
+/* stopReason 的补救提示——只给标签不给出路，用户仍然不知道下一步做什么 */
+.status-hint {
+  margin-top: var(--space-sm);
+  font-size: var(--font-sm);
+  color: var(--fg2);
+  line-height: 1.6;
+}
+
+/* ===== 传输层状态条 (V-05) ===== */
+
+.reconnect-banner {
+  margin: 0 var(--space-lg) var(--space-sm);
+  padding: 6px var(--space-md);
+  border: 1px solid var(--yellow);
+  background: var(--yellow-bg);
+  color: var(--yellow);
+  border-radius: var(--radius);
+  font-size: var(--font-sm);
+}
+.reconnect-banner[hidden] { display: none; }
 
 /* ===== 审批卡 ===== */
 

@@ -24,6 +24,8 @@ import { describe, expect, it } from "vitest";
 import {
   createInitialState,
   reduceEvent,
+  reduceEvents,
+  classifyStopReason,
   markApprovalResolved,
   expirePendingApprovals,
   deriveOverview,
@@ -420,6 +422,221 @@ describe("reduceEvent", () => {
 });
 
 // ================================================================
+// v2 / R1：段终止 vs run 终止、审批审计、stopReason 分档、幂等
+// ================================================================
+
+/** 带显式 seq 的事件构造器（真实 SSE 的 seq 单调递增，幂等闸门依赖它） */
+function seqSse(seq, source, type, extra = {}) {
+  return { seq, source, event: { type, ...extra } };
+}
+
+describe("v2 R1 · 段终止 ≠ run 终止 (V-01)", () => {
+  it("核查模式下主轮 done 不终止 run —— 返工轮的审批仍可操作", () => {
+    let state = createInitialState("rw1", "rework task", true);
+    let n = 0;
+
+    state = reduceEvents(state, [
+      seqSse(n++, "main", "turn_start", { turn: 1 }),
+      seqSse(n++, "main", "assistant_text", { text: "首轮交付" }),
+      seqSse(n++, "main", "done", {
+        stopReason: "completed",
+        usage: { inputTokens: 10, outputTokens: 5, turns: 1, cacheHitRatio: 0 },
+      }),
+    ]);
+
+    // 旧实现在这里就把 run 置成 done 了 —— 这是死锁的起点
+    expect(state.status).toBe("running");
+
+    // 核查未通过 → 返工轮请求审批
+    state = reduceEvents(state, [
+      seqSse(n++, "verifier", "verdict", {
+        verdict: { passed: false, issues: ["缺收尾"], summary: "未通过" },
+      }),
+      seqSse(n++, "rework", "turn_start", { turn: 1 }),
+      seqSse(n++, "rework", "approval_request", {
+        toolUseId: "tu_fix",
+        name: "write_file",
+        input: { path: "a.txt" },
+      }),
+    ]);
+
+    // 关键断言：返工轮的审批处于 pending 且 run 仍在运行 —— 两者同时成立，
+    // 渲染层的 operable = isPending && isRunning 才为真，按钮才会出现
+    expect(state.status).toBe("running");
+    expect(state.pendingApprovals).toHaveLength(1);
+    expect(state.pendingApprovals[0].status).toBe("pending");
+
+    // 只有 run_end 才收敛
+    state = reduceEvents(state, [
+      seqSse(n++, "host", "run_end", {
+        outcome: "completed",
+        mainStopReason: "completed",
+        finishedAt: 1785980000000,
+      }),
+    ]);
+    expect(state.status).toBe("done");
+    expect(state.pendingApprovals[0].status).toBe("expired");
+    expect(state.runEnd.outcome).toBe("completed");
+  });
+
+  it("非核查运行只有一段：done 即终止（单段快路径）", () => {
+    let state = createInitialState("p1", "plain", false);
+    state = reduceEvents(state, [
+      seqSse(0, "main", "approval_request", { toolUseId: "t", name: "x", input: {} }),
+      seqSse(1, "main", "done", { stopReason: "completed", usage: null }),
+    ]);
+    expect(state.status).toBe("done");
+    expect(state.pendingApprovals[0].status).toBe("expired");
+  });
+});
+
+describe("v2 R1 · 审批审计 (V-02/V-03)", () => {
+  it("approval_resolved 按 requestSeq 落卡，含决策/理由/主体/时间", () => {
+    let state = createInitialState("a1", "audit", false);
+    state = reduceEvents(state, [
+      seqSse(3, "main", "approval_request", { toolUseId: "tu_x", name: "bash", input: {} }),
+      seqSse(4, "host", "approval_resolved", {
+        requestSeq: 3,
+        toolUseId: "tu_x",
+        decision: "deny",
+        reason: "路径不在白名单",
+        actor: "user",
+        at: 1785980000000,
+      }),
+    ]);
+    const a = state.pendingApprovals[0];
+    expect(a.status).toBe("denied");
+    expect(a.reason).toBe("路径不在白名单");
+    expect(a.decidedAt).toBe(1785980000000);
+    expect(a.approvalId).toBe("tu_x#3");
+  });
+
+  it("同一 toolUseId 跨返工轮不串卡：应答第二轮不改写第一轮的记录", () => {
+    let state = createInitialState("a2", "cross round", true);
+    state = reduceEvents(state, [
+      // 第一轮：同一个 toolUseId，已允许
+      seqSse(1, "main", "approval_request", { toolUseId: "tu_same", name: "write_file", input: {} }),
+      seqSse(2, "host", "approval_resolved", {
+        requestSeq: 1, toolUseId: "tu_same", decision: "allow", actor: "user", at: 1,
+      }),
+      // 第二轮（返工）：同一个 toolUseId 再次出现
+      seqSse(5, "rework", "approval_request", { toolUseId: "tu_same", name: "write_file", input: {} }),
+      seqSse(6, "host", "approval_resolved", {
+        requestSeq: 5, toolUseId: "tu_same", decision: "deny", reason: "这轮不行", actor: "user", at: 2,
+      }),
+    ]);
+
+    expect(state.pendingApprovals).toHaveLength(2);
+    // 旧实现按 toolUseId 全量匹配，两张卡会被同一次点击一起改写
+    expect(state.pendingApprovals[0].status).toBe("allowed");
+    expect(state.pendingApprovals[0].reason).toBeUndefined();
+    expect(state.pendingApprovals[1].status).toBe("denied");
+    expect(state.pendingApprovals[1].reason).toBe("这轮不行");
+  });
+
+  it("approval_expired 只作用于仍 pending 的卡，已决策的保持原样", () => {
+    let state = createInitialState("a3", "expiry", true);
+    state = reduceEvents(state, [
+      seqSse(1, "main", "approval_request", { toolUseId: "t1", name: "a", input: {} }),
+      seqSse(2, "host", "approval_resolved", { requestSeq: 1, toolUseId: "t1", decision: "allow", at: 1 }),
+      seqSse(3, "main", "approval_request", { toolUseId: "t2", name: "b", input: {} }),
+      seqSse(4, "host", "approval_expired", { requestSeq: 3, toolUseId: "t2", cause: "run_finished" }),
+    ]);
+    expect(state.pendingApprovals[0].status).toBe("allowed");
+    expect(state.pendingApprovals[1].status).toBe("expired");
+  });
+
+  it("markApprovalResolved 用裸 toolUseId 时只命中最新挂起卡", () => {
+    let state = createInitialState("a4", "bare ref", true);
+    state = reduceEvents(state, [
+      seqSse(1, "main", "approval_request", { toolUseId: "dup", name: "a", input: {} }),
+      seqSse(2, "host", "approval_resolved", { requestSeq: 1, toolUseId: "dup", decision: "allow", at: 1 }),
+      seqSse(5, "rework", "approval_request", { toolUseId: "dup", name: "a", input: {} }),
+    ]);
+    state = markApprovalResolved(state, "dup", "denied", "第二轮拒绝");
+    expect(state.pendingApprovals[0].status).toBe("allowed");
+    expect(state.pendingApprovals[1].status).toBe("denied");
+  });
+});
+
+describe("v2 R1 · stopReason 六值分档 (V-04)", () => {
+  it("六种终止原因各有色调、人话标签与补救提示", () => {
+    expect(classifyStopReason("completed").tone).toBe("ok");
+    expect(classifyStopReason("max_tokens").tone).toBe("warn");
+    expect(classifyStopReason("max_tokens").hint).toContain("AGENT_MAX_TOKENS");
+    // max_turns / error 是 verifier 救不了的两类，界面必须直说
+    expect(classifyStopReason("max_turns").tone).toBe("bad");
+    expect(classifyStopReason("max_turns").hint).toContain("核查救不了");
+    expect(classifyStopReason("budget_exhausted").tone).toBe("bad");
+    expect(classifyStopReason("refusal").tone).toBe("bad");
+    expect(classifyStopReason("error").tone).toBe("bad");
+    // 运行中（尚无 stopReason）
+    expect(classifyStopReason(null).label).toBe("运行中");
+  });
+
+  it("四种非 completed 的非 error 终止不再被当作成功", () => {
+    for (const r of ["max_turns", "budget_exhausted", "refusal", "max_tokens"]) {
+      let s = createInitialState(`s_${r}`, "t", false);
+      s = reduceEvents(s, [seqSse(0, "main", "done", { stopReason: r, usage: null })]);
+      expect(s.stopReason).toBe(r);
+      // 旧实现只判 error，这四种一律绿色"已完成"
+      expect(classifyStopReason(s.stopReason).tone).not.toBe("ok");
+    }
+  });
+
+  it("done 携带的真实 error.message 被透出，而非写死的一句话", () => {
+    let s = createInitialState("e1", "t", false);
+    s = reduceEvents(s, [
+      seqSse(0, "main", "done", {
+        stopReason: "error",
+        error: { name: "Error", message: "上游端点 502" },
+        usage: null,
+      }),
+    ]);
+    expect(s.error).toBe("上游端点 502");
+  });
+});
+
+describe("v2 R1 · 重放幂等与批量等价 (V-05)", () => {
+  it("同一批事件重放两次，状态深相等（重连续传安全）", () => {
+    const events = [
+      seqSse(0, "main", "turn_start", { turn: 1 }),
+      seqSse(1, "main", "tool_call", { toolUseId: "t1", name: "read", input: {} }),
+      seqSse(2, "main", "tool_result", { toolUseId: "t1", result: { content: "ok" }, durationMs: 3 }),
+      seqSse(3, "main", "approval_request", { toolUseId: "t2", name: "write", input: {} }),
+    ];
+    const base = createInitialState("i1", "idem", true);
+    const once = reduceEvents(base, events);
+    const twice = reduceEvents(once, events);
+    expect(twice).toEqual(once);
+    // turn_start / tool_call / tool_result / approval_request 各一条，重放不翻倍
+    expect(twice.timeline).toHaveLength(4);
+    expect(twice.pendingApprovals).toHaveLength(1);
+  });
+
+  it("批量折叠与逐条折叠等价", () => {
+    const events = [
+      seqSse(0, "main", "turn_start", { turn: 1 }),
+      seqSse(1, "main", "assistant_text", { text: "hi" }),
+      seqSse(2, "main", "compaction", { droppedBlocks: 4 }),
+    ];
+    const base = createInitialState("i2", "equiv", false);
+    const batched = reduceEvents(base, events);
+    let stepwise = base;
+    for (const e of events) stepwise = reduceEvents(stepwise, [e]);
+    expect(batched).toEqual(stepwise);
+  });
+
+  it("乱序/落后的 seq 被丢弃，不产生重复条目", () => {
+    let s = createInitialState("i3", "ooo", false);
+    s = reduceEvents(s, [seqSse(5, "main", "turn_start", { turn: 1 })]);
+    s = reduceEvents(s, [seqSse(3, "main", "turn_start", { turn: 99 })]);
+    expect(s.timeline).toHaveLength(1);
+    expect(s.lastSeq).toBe(5);
+  });
+});
+
+// ================================================================
 // AC6: 窄屏 CSS 静态断言
 // ================================================================
 
@@ -486,6 +703,14 @@ describe("AC3 概览模型 deriveOverview (R-03)", () => {
     state = reduceEvent(state, sse("main", "done", {
       stopReason: "completed",
       usage: { inputTokens: 500, outputTokens: 200, turns: 1, cacheHitRatio: 0.1 },
+    }));
+    // 核查模式（verify=true）下主轮的 done 只是**一段**结束，后面还有核查段、
+    // 可能还有返工段——run 级终止由 run_end 宣告。这里补上它，事件流才是完整协议。
+    // （旧实现把段终止当 run 终止，正是返工轮审批永久挂死的根因，见 V-01）
+    state = reduceEvent(state, sse("host", "run_end", {
+      outcome: "completed",
+      mainStopReason: "completed",
+      finishedAt: 1785980000000,
     }));
 
     // 设置 verdict

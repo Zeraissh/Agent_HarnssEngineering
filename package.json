@@ -6,6 +6,7 @@
   "description": "Harness engineering agent framework — hand-written agent loop on the Anthropic Messages API",
   "scripts": {
     "cli": "tsx src/cli.ts",
+    "ui": "tsx ui/serve.ts",
     "eval": "tsx eval/run.ts",
     "ab": "tsx eval/ab.ts",
     "lab": "tsx eval/lab.ts",

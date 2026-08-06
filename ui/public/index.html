@@ -40,6 +40,11 @@
   <!-- R-05: aria-live 状态播报区域 -->
   <div id="status-announcer" class="sr-only" aria-live="polite" aria-atomic="true"></div>
 
+  <!-- 传输层状态条：断线只提示，不改运行状态、不作废挂起审批（V-05） -->
+  <div id="reconnect-banner" class="reconnect-banner" role="status" hidden>
+    连接中断，正在重连…（运行仍在服务端继续）
+  </div>
+
   <!-- 提交栏 -->
   <form id="submit-form" class="submit-bar" autocomplete="off">
     <label for="task-input" class="task-label">任务描述</label>
@@ -70,6 +75,7 @@
 import {
   createInitialState,
   reduceEvent,
+  reduceEvents,
   markApprovalResolved,
   expirePendingApprovals,
   deriveLogEntries,
@@ -180,22 +186,24 @@ function selectRun(runId) {
   selectedRunId = runId;
   refreshRunListView();
 
-  const existing = runStates.get(runId);
-  if (existing) {
-    renderDetailWithState(existing);
-    enterDetailMode();
-    announceStatus(`已选择运行：${existing.task}`);
-    return;
-  }
-
-  const info = runs.find((r) => r.runId === runId);
-  if (!info) return;
-  const state = createInitialState(runId, info.task, info.verify);
-  runStates.set(runId, state);
+  // 拆成两件事：确保有 state、确保有订阅。旧实现在"已有 state"时直接 return，
+  // 于是一个断过线的 run 被重新打开时永远不会重新订阅，界面就此定格。
+  const state = ensureState(runId);
+  if (!state) return;
   renderDetailWithState(state);
   enterDetailMode();
-  announceStatus(`已选择运行：${info.task}`);
-  subscribeSSE(runId);
+  announceStatus(`已选择运行：${state.task}`);
+  ensureSubscription(runId);
+}
+
+function ensureState(runId) {
+  const existing = runStates.get(runId);
+  if (existing) return existing;
+  const info = runs.find((r) => r.runId === runId);
+  if (!info) return null;
+  const state = createInitialState(runId, info.task, info.verify);
+  runStates.set(runId, state);
+  return state;
 }
 
 // ---- 标签页切换 (R-03) ----
@@ -249,9 +257,9 @@ function renderDetailWithState(state) {
   renderRunDetail(state, {
     showBack: isNarrow(),
     onBack: backToList,
-    onAllow: (toolUseId) => postApproval(runId, toolUseId, "allow"),
-    onDenyReason: (toolUseId, reason) =>
-      postApproval(runId, toolUseId, "deny", reason || ""),
+    onAllow: (approvalId) => postApproval(runId, approvalId, "allow"),
+    onDenyReason: (approvalId, reason) =>
+      postApproval(runId, approvalId, "deny", reason || ""),
     activeTab,
     logEntries,
     onToggleEntry: handleToggleEntry,
@@ -259,8 +267,14 @@ function renderDetailWithState(state) {
 }
 
 // ---- SSE 订阅 ----
-function subscribeSSE(runId) {
+/**
+ * 建立事件订阅。只在"尚无订阅 且 run 未终态"时建立——旧实现把这个判断和
+ * "是否已有 state"混在 selectRun 里，导致重新打开一个断过线的 run 不会重订阅。
+ */
+function ensureSubscription(runId) {
   if (eventSources.has(runId)) return;
+  const state = runStates.get(runId);
+  if (state && state.status === "done") return;
 
   const es = new EventSource(`/api/runs/${runId}/events`);
   eventSources.set(runId, es);
@@ -270,14 +284,18 @@ function subscribeSSE(runId) {
       const sseEvent = JSON.parse(msg.data);
       const state = runStates.get(runId);
       if (!state) return;
-      const next = reduceEvent(state, sseEvent);
+      // 走批量入口：内含 seq 幂等闸门，重连续传/重复重放都不会产生重复条目
+      const next = reduceEvents(state, [sseEvent]);
       runStates.set(runId, next);
 
       if (selectedRunId === runId) {
         renderDetailWithState(next);
       }
 
+      // run_end 是唯一的"可以收工"信号：此时主动 close，浏览器才不会再自动重连
       if (next.status === "done") {
+        es.close();
+        eventSources.delete(runId);
         announceStatus(`运行已完成：${next.task}`);
         loadRuns();
       }
@@ -287,35 +305,59 @@ function subscribeSSE(runId) {
   });
 
   es.addEventListener("error", () => {
-    es.close();
-    eventSources.delete(runId);
-    const state = runStates.get(runId);
-    if (state && state.status !== "done") {
-      const expired = expirePendingApprovals(state);
-      runStates.set(runId, expired);
-      if (selectedRunId === runId) {
-        renderDetailWithState(expired);
-      }
-    }
+    // 关键：既不 close 也不把挂起审批标成过期。
+    //   · close() 会掐死浏览器原生的自动重连（带 Last-Event-ID 续传）；
+    //   · 把 pending 标 expired 更糟——一次网络抖动就让活着的审批卡消失，
+    //     运行随即无人可应答而永久挂起。审批过期只由服务端 approval_expired 宣告。
+    // 这里只反映"传输层断了"，不改 harness 事实。
+    setConnectionState(runId, "reconnecting");
     loadRuns();
+  });
+
+  es.addEventListener("open", () => {
+    setConnectionState(runId, "live");
   });
 }
 
+// ---- 连接态（控制器状态，不进 RunState：它是传输层的事，不是 harness 事实） ----
+/** @type {Map<string, "live"|"reconnecting">} */
+const connectionStates = new Map();
+
+function setConnectionState(runId, next) {
+  const prev = connectionStates.get(runId);
+  if (prev === next) return;
+  connectionStates.set(runId, next);
+  if (selectedRunId !== runId) return;
+  const banner = document.getElementById("reconnect-banner");
+  if (banner) banner.hidden = next !== "reconnecting";
+  if (next === "reconnecting") announceStatus("连接中断，正在重连…");
+}
+
 // ---- 审批回调 ----
-async function postApproval(runId, toolUseId, decision, reason) {
+/**
+ * @param {string} approvalId 形如 `toolUseId#requestSeq`——返工轮复用同一
+ *   toolUseId，只有带请求序号才能指明是哪一轮的那张卡（V-03）。
+ *   `#` 是 URL 片段分隔符，必须编码后再拼路径。
+ */
+async function postApproval(runId, approvalId, decision, reason) {
   try {
-    const res = await fetch(`/api/runs/${runId}/approvals/${toolUseId}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ decision, reason }),
-    });
+    const res = await fetch(
+      `/api/runs/${runId}/approvals/${encodeURIComponent(approvalId)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ decision, reason }),
+      },
+    );
     if (res.status === 409) return;
     if (!res.ok) return;
+    // 乐观更新，让点击立刻有反馈；服务端随后会推 approval_resolved，
+    // 那条才是权威记录（刷新/换标签页后靠它复原，见 V-02）
     const state = runStates.get(runId);
     if (state) {
       const next = markApprovalResolved(
         state,
-        toolUseId,
+        approvalId,
         decision === "allow" ? "allowed" : "denied",
         reason,
       );
@@ -362,7 +404,7 @@ submitForm.addEventListener("submit", async (e) => {
     enterDetailMode();
     announceStatus(`新任务已提交：${task}`);
 
-    subscribeSSE(runId);
+    ensureSubscription(runId);
     taskInput.value = "";
   } catch (err) {
     alert("提交失败：" + (err.message ?? "网络错误"));

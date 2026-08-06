@@ -27,7 +27,10 @@
  *   pendingApprovals: PendingApproval[],
  *   verdict: VerdictModel|null,
  *   usage: UsageModel|null,
- *   error: string|null
+ *   error: string|null,
+ *   stopReason: string|null,
+ *   lastSeq: number,
+ *   runEnd: {outcome:string, mainStopReason?:string, finishedAt:number}|null
  * }} RunState
  *
  * @typedef {{
@@ -55,7 +58,9 @@
  *   input: unknown,
  *   status: "pending"|"allowed"|"denied"|"expired",
  *   reason?: string,
- *   decidedAt?: number
+ *   decidedAt?: number,
+ *   requestSeq?: number,
+ *   approvalId?: string
  * }} PendingApproval
  *
  * @typedef {{
@@ -107,7 +112,59 @@ export function createInitialState(runId, task, verify) {
     verdict: null,
     usage: null,
     error: null,
+    stopReason: null,
+    lastSeq: -1,
+    runEnd: null,
   };
+}
+
+// ---------------------------------------------------------------
+// 纯函数：stopReason 分档 (V-04)
+// ---------------------------------------------------------------
+
+/**
+ * 把六种终止原因分档为 {色调, 人话标签, 补救提示}。
+ *
+ * 为什么值得单独一个函数：此前前端只判 `error`，其余五值一律显示绿色"已完成"。
+ * 而 max_turns 与 error 恰是「verifier 救不了」的两类——执行根本没跑完，
+ * 核查通过也不代表任务做完。界面必须直说，否则是在报喜不报忧。
+ * 分档口径对齐 CLI（src/cli.ts 的 completed=绿 / max_tokens=黄 / 其余=红）。
+ *
+ * @param {string|null|undefined} stopReason
+ * @returns {{tone:"ok"|"warn"|"bad", label:string, hint:string|null}}
+ */
+export function classifyStopReason(stopReason) {
+  switch (stopReason) {
+    case "completed":
+      return { tone: "ok", label: "已完成", hint: null };
+    case "max_tokens":
+      return {
+        tone: "warn",
+        label: "输出被截断",
+        hint: "单次响应达到上限，产物可能不完整；可提高 AGENT_MAX_TOKENS 后重跑",
+      };
+    case "max_turns":
+      return {
+        tone: "bad",
+        label: "撞轮次护栏",
+        hint: "执行未自然结束，核查救不了这一类——即使核查通过也不代表任务做完",
+      };
+    case "budget_exhausted":
+      return {
+        tone: "bad",
+        label: "token 预算耗尽",
+        hint: "执行未自然结束，产物大概率不完整",
+      };
+    case "refusal":
+      return { tone: "bad", label: "模型拒答", hint: "模型拒绝继续，需要改写任务描述" };
+    case "error":
+      return { tone: "bad", label: "异常终止", hint: "宿主级失败，核查不会运行" };
+    case null:
+    case undefined:
+      return { tone: "ok", label: "运行中", hint: null };
+    default:
+      return { tone: "warn", label: String(stopReason), hint: null };
+  }
 }
 
 // ---------------------------------------------------------------
@@ -132,20 +189,62 @@ export function reduceEvent(state, sseEvent) {
     return applyVerdict(state, event);
   }
   if (type === "done") {
-    return applyDone(state, event);
+    return applySegmentDone(state, event);
+  }
+  if (type === "run_end") {
+    return applyRunEnd(state, event);
   }
   if (type === "approval_request") {
     return applyApproval(state, seq, source, event);
   }
+  if (type === "approval_resolved") {
+    return applyApprovalResolved(state, event);
+  }
+  if (type === "approval_expired") {
+    return applyApprovalExpired(state, event);
+  }
 
   // 其余事件进入时间线
   const entry = buildTimelineEntry(seq, source, type, event);
-  const isVerifier = source === "verifier";
+  const isVerifier = isVerifierSource(source);
   return {
     ...state,
     timeline: isVerifier ? state.timeline : [...state.timeline, entry],
     verifierTimeline: isVerifier ? [...state.verifierTimeline, entry] : state.verifierTimeline,
   };
+}
+
+/**
+ * 批量折叠一批事件——控制器的真实入口。
+ *
+ * 相比逐条 reduceEvent 有两点不同，都是必要的：
+ * ① 幂等：seq ≤ lastSeq 的事件直接丢弃。SSE 断线重连会带 Last-Event-ID 续传，
+ *    但服务端可能全量重放（或客户端重复订阅），没有这道闸门就会出现重复的
+ *    时间线条目与重复的审批卡。
+ * ② 一批只做一次数组拷贝的语义边界，供渲染层按批重绘（消 O(n²)）。
+ *
+ * reduceEvent 保持"单事件、不设闸门"的旧语义：既有测试用固定 seq=0 构造事件流，
+ * 在那里加闸门会把第二条以后的事件全丢掉。真实路径一律走本函数。
+ *
+ * @param {RunState} state
+ * @param {{seq:number, source:string, event:Record<string,unknown>}[]} sseEvents
+ * @returns {RunState}
+ */
+export function reduceEvents(state, sseEvents) {
+  let next = state;
+  for (const e of sseEvents) {
+    if (typeof e.seq === "number" && e.seq <= next.lastSeq) continue;
+    next = reduceEvent(next, e);
+    if (typeof e.seq === "number" && e.seq > next.lastSeq) {
+      next = { ...next, lastSeq: e.seq };
+    }
+  }
+  return next;
+}
+
+/** 来源是否属于 verifier（放开为字符串后要兼容 "s1/verifier" 这类编排来源） */
+function isVerifierSource(source) {
+  return source === "verifier" || (typeof source === "string" && source.endsWith("/verifier"));
 }
 
 // ---------------------------------------------------------------
@@ -198,22 +297,79 @@ function applyApproval(state, seq, source, event) {
   const entry = { seq, source, type: "approval_request", toolUseId, name, input };
 
   // F2: verifier 审批不进 pendingApprovals（内部已自答，HTTP 不应再应答）
-  if (source === "verifier") {
+  if (isVerifierSource(source)) {
     return {
       ...state,
       verifierTimeline: [...state.verifierTimeline, entry],
     };
   }
 
-  // main/rework 审批：进时间线 + 挂起审批列表
+  // main/rework 审批：进时间线 + 挂起审批列表。
+  // requestSeq 是这张卡的身份：返工轮会复用同一个 toolUseId，只有请求序号
+  // 能区分"这是第几轮的那次审批"——否则一次点击会改写历史卡（V-03）。
   return {
     ...state,
     timeline: [...state.timeline, entry],
     pendingApprovals: [
       ...state.pendingApprovals,
-      { toolUseId, name, input, status: "pending" },
+      {
+        toolUseId,
+        name,
+        input,
+        status: "pending",
+        requestSeq: seq,
+        approvalId: `${toolUseId}#${seq}`,
+      },
     ],
   };
+}
+
+/**
+ * 服务端宣告的审批决策（V-02）。
+ * 决策此前只写在浏览器内存里，刷新即失真——现在以服务端事件为准，
+ * 任意客户端重放同一事件流都得到同一份审计记录。
+ * @returns {RunState}
+ */
+function applyApprovalResolved(state, event) {
+  const requestSeq = /** @type {number} */ (event.requestSeq);
+  const toolUseId = /** @type {string} */ (event.toolUseId);
+  const status = event.decision === "allow" ? "allowed" : "denied";
+  return {
+    ...state,
+    pendingApprovals: state.pendingApprovals.map((a) =>
+      matchesApproval(a, requestSeq, toolUseId)
+        ? {
+            ...a,
+            status,
+            ...(event.reason ? { reason: String(event.reason) } : {}),
+            decidedAt: Number(event.at ?? Date.now()),
+            actor: event.actor ? String(event.actor) : undefined,
+          }
+        : a,
+    ),
+  };
+}
+
+/** 服务端宣告的审批过期（run 结束时逐条发出）。@returns {RunState} */
+function applyApprovalExpired(state, event) {
+  const requestSeq = /** @type {number} */ (event.requestSeq);
+  const toolUseId = /** @type {string} */ (event.toolUseId);
+  return {
+    ...state,
+    pendingApprovals: state.pendingApprovals.map((a) =>
+      matchesApproval(a, requestSeq, toolUseId) && a.status === "pending"
+        ? { ...a, status: /** @type {"expired"} */ ("expired") }
+        : a,
+    ),
+  };
+}
+
+/** 优先按 requestSeq 精确匹配；缺该字段时退回 toolUseId（兼容旧事件流重放） */
+function matchesApproval(approval, requestSeq, toolUseId) {
+  if (typeof requestSeq === "number" && typeof approval.requestSeq === "number") {
+    return approval.requestSeq === requestSeq;
+  }
+  return approval.toolUseId === toolUseId;
 }
 
 /** @returns {RunState} */
@@ -231,21 +387,33 @@ function applyVerdict(state, event) {
   };
 }
 
-/** @returns {RunState} */
-function applyDone(state, event) {
+/**
+ * 段终止（V-01 的核心修复点）。
+ *
+ * `done` 宣告的是**一段**执行结束，不是整个 run 结束。核查模式下
+ * `runVerified` 会把主轮的 done 也转发出来，此后还有 verifier 段、可能还有
+ * 返工段。旧实现在这里直接把 run 置为 done 并把挂起审批全部作废，导致
+ * 返工轮的审批卡不再渲染操作按钮 → respond 永不被调用 → 循环永久 await。
+ *
+ * 现在：只记录段的终止原因与用量；run 级收敛交给 run_end。
+ * 唯一例外是非核查运行——它按协议只有一段，其 done 即 run 终止，
+ * 这条快路径同时保住了既有测试的语义。
+ *
+ * @returns {RunState}
+ */
+function applySegmentDone(state, event) {
   const usage = event.usage && typeof event.usage === "object" ? /** @type {any} */ (event.usage) : null;
   const stopReason = /** @type {string} */ (event.stopReason);
+  const errorMessage =
+    event.error && typeof event.error === "object"
+      ? String(/** @type {any} */ (event.error).message ?? "")
+      : "";
 
-  // R-01: run 完成后所有仍 pending 的审批卡转为 expired
-  const expiredApprovals = state.pendingApprovals.map((a) =>
-    a.status === "pending" ? { ...a, status: /** @type {"expired"} */ ("expired") } : a,
-  );
-
-  return {
+  const next = {
     ...state,
-    status: "done",
-    error: stopReason === "error" ? "运行异常终止" : null,
-    pendingApprovals: expiredApprovals,
+    stopReason,
+    // 服务端此前把 error 整条丢掉，前端只能写死一句话；现在有真实消息就用真实的
+    error: stopReason === "error" ? errorMessage || "运行异常终止" : null,
     usage: usage
       ? {
           turns: Number(usage.turns ?? 0),
@@ -253,8 +421,49 @@ function applyDone(state, event) {
           outputTokens: Number(usage.outputTokens ?? 0),
           cacheHitRatio: Number(usage.cacheHitRatio ?? 0),
         }
-      : null,
+      : state.usage,
   };
+
+  // 单段运行的快路径：非核查模式下不会再有后续段，done 即终止
+  if (!state.verify) {
+    return { ...next, status: "done", pendingApprovals: expireAll(next.pendingApprovals) };
+  }
+  return next;
+}
+
+/**
+ * run 级终止（服务端 run_end，恒为最后一条 durable 事件）。
+ * 幂等——单段快路径可能已经收敛过一次。
+ * @returns {RunState}
+ */
+function applyRunEnd(state, event) {
+  const mainStopReason = event.mainStopReason ? String(event.mainStopReason) : state.stopReason;
+  return {
+    ...state,
+    status: "done",
+    stopReason: mainStopReason,
+    error:
+      mainStopReason === "error" ? state.error || "运行异常终止" : state.error,
+    pendingApprovals: expireAll(state.pendingApprovals),
+    runEnd: {
+      outcome: String(event.outcome ?? "completed"),
+      ...(mainStopReason ? { mainStopReason } : {}),
+      finishedAt: Number(event.finishedAt ?? Date.now()),
+    },
+  };
+}
+
+/** stopReason 色调 → 状态徽章 class */
+function toneClass(tone) {
+  if (tone === "bad") return "status--error";
+  if (tone === "warn") return "status--warn";
+  return "status--done";
+}
+
+function expireAll(approvals) {
+  return approvals.map((a) =>
+    a.status === "pending" ? { ...a, status: /** @type {"expired"} */ ("expired") } : a,
+  );
 }
 
 // ---------------------------------------------------------------
@@ -430,15 +639,31 @@ export function isEntryCollapsedByDefault(entry) {
  * @param {string} [reason]
  * @returns {RunState}
  */
-export function markApprovalResolved(state, toolUseId, decision, reason) {
+export function markApprovalResolved(state, ref, decision, reason) {
+  // V-03：旧实现按 toolUseId 全量匹配，返工轮复用同一 id 时一次点击会连历史卡
+  // 一起改写。改为：带 `#seq` 走精确匹配；裸 id 只命中最新的那张挂起卡。
+  const target = findApprovalIndex(state.pendingApprovals, ref);
+  if (target < 0) return state;
   return {
     ...state,
-    pendingApprovals: state.pendingApprovals.map((a) =>
-      a.toolUseId === toolUseId
-        ? { ...a, status: decision, reason, decidedAt: Date.now() }
-        : a,
+    pendingApprovals: state.pendingApprovals.map((a, i) =>
+      i === target ? { ...a, status: decision, reason, decidedAt: Date.now() } : a,
     ),
   };
+}
+
+/** 解析审批引用（approvalId 或裸 toolUseId）到下标；裸 id 取最新的挂起项 */
+function findApprovalIndex(approvals, ref) {
+  if (typeof ref === "string" && ref.includes("#")) {
+    return approvals.findIndex((a) => a.approvalId === ref);
+  }
+  let best = -1;
+  for (let i = 0; i < approvals.length; i++) {
+    const a = approvals[i];
+    if (a.toolUseId !== ref) continue;
+    if (best < 0 || a.status === "pending") best = i;
+  }
+  return best;
 }
 
 /**
@@ -554,8 +779,11 @@ export function renderRunDetail(state, callbacks) {
   const overview = deriveOverview(state);
 
   const isRunning = state.status === "running";
-  const statusClass = isRunning ? "status--live" : state.error ? "status--error" : "status--done";
-  const statusText = isRunning ? "运行中" : state.error ? "异常终止" : "已完成";
+  // V-04：六值分档，不再把 max_turns / budget_exhausted / refusal / max_tokens
+  // 一律显示成绿色"已完成"
+  const cls = classifyStopReason(isRunning ? null : state.stopReason);
+  const statusClass = isRunning ? "status--live" : toneClass(cls.tone);
+  const statusText = isRunning ? "运行中" : cls.label;
 
   let html = "";
 
@@ -623,14 +851,14 @@ export function renderRunDetail(state, callbacks) {
   // 绑定审批按钮
   mainEl.querySelectorAll("[data-action='allow']").forEach((btn) => {
     btn.addEventListener("click", () => {
-      const id = btn.getAttribute("data-tool-use-id");
+      const id = btn.getAttribute("data-approval-id");
       if (id && callbacks.onAllow) callbacks.onAllow(id);
     });
   });
   mainEl.querySelectorAll("[data-action='deny']").forEach((btn) => {
     btn.addEventListener("click", () => {
-      const id = btn.getAttribute("data-tool-use-id");
-      const reasonInput = mainEl.querySelector(`.deny-reason[data-tool-use-id="${id}"]`);
+      const id = btn.getAttribute("data-approval-id");
+      const reasonInput = mainEl.querySelector(`.deny-reason[data-approval-id="${id}"]`);
       const reason = reasonInput ? reasonInput.value.trim() : "";
       if (id && callbacks.onDenyReason) callbacks.onDenyReason(id, reason);
     });
@@ -691,7 +919,11 @@ function renderApprovalCards(state, isRunning) {
     const operable = isPending && isRunning;
     const resolved = !isPending;
 
-    html += `<div class="approval-card ${resolved ? "approval-card--resolved" : ""}" data-tool-use-id="${esc(app.toolUseId)}">`;
+    // 卡片身份用 approvalId（toolUseId#requestSeq）：返工轮复用同一 toolUseId，
+    // 只有它能把"这一轮的卡"和"上一轮的历史卡"区分开（V-03）
+    const cardId = app.approvalId || app.toolUseId;
+
+    html += `<div class="approval-card ${resolved ? "approval-card--resolved" : ""}" data-approval-id="${esc(cardId)}">`;
     html += `<div class="approval-card-header">`;
     html += `<span class="approval-tool-name">🔔 ${esc(app.name)}</span>`;
 
@@ -710,9 +942,11 @@ function renderApprovalCards(state, isRunning) {
 
     if (operable) {
       html += `<div class="approval-actions">`;
-      html += `<button class="btn btn--allow" data-action="allow" data-tool-use-id="${esc(app.toolUseId)}">允许本次</button>`;
-      html += `<button class="btn btn--deny" data-action="deny" data-tool-use-id="${esc(app.toolUseId)}">拒绝并说明</button>`;
-      html += `<input class="deny-reason" data-tool-use-id="${esc(app.toolUseId)}" placeholder="拒绝理由（可选）" />`;
+      html += `<button class="btn btn--allow" data-action="allow" data-approval-id="${esc(cardId)}">允许本次</button>`;
+      html += `<button class="btn btn--deny" data-action="deny" data-approval-id="${esc(cardId)}">拒绝并说明</button>`;
+      // aria-label 而非只靠 placeholder：placeholder 虽按 accname 规范算兜底名称，
+      // 但输入后即从视觉上消失，屏幕阅读器用户失去上下文
+      html += `<input class="deny-reason" data-approval-id="${esc(cardId)}" aria-label="拒绝 ${esc(app.name)} 的理由（可选）" placeholder="拒绝理由（可选）" />`;
       html += `</div>`;
     } else if (resolved) {
       if (app.decidedAt) {
@@ -732,13 +966,16 @@ function renderApprovalCards(state, isRunning) {
 function renderOverviewTab(overview, state) {
   let html = "";
 
-  // 最终状态徽章（醒目）
-  const isError = overview.finalStatus === "error";
+  // 最终状态徽章（醒目）+ 补救提示（V-04）
   const isRunning = overview.finalStatus === "running";
-  const statusLabel = isError ? "异常终止" : isRunning ? "运行中" : "已完成";
-  const statusCls = isError ? "status--error" : isRunning ? "status--live" : "status--done";
+  const cls = classifyStopReason(isRunning ? null : state.stopReason);
+  const statusLabel = isRunning ? "运行中" : cls.label;
+  const statusCls = isRunning ? "status--live" : toneClass(cls.tone);
   html += `<div class="overview-status">`;
-  html += `<span class="status-badge status-badge--lg ${statusCls}">${statusLabel}</span>`;
+  html += `<span class="status-badge status-badge--lg ${statusCls}">${esc(statusLabel)}</span>`;
+  // 说明这次终止意味着什么、下一步能做什么——"撞轮次护栏"这类结局，
+  // 光给一个标签用户还是不知道该怎么办
+  if (cls.hint) html += `<div class="status-hint">${esc(cls.hint)}</div>`;
   html += `</div>`;
 
   // 结果摘要

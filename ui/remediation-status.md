@@ -1,5 +1,9 @@
 # 整改报告 V1.0 · 关闭状态（2026-08-06）
 
+> **v2 声明**：本表全部已关闭条目（R-01~R-08、P2 令牌统一、AC-01~AC-10）在
+> [UI v2 重做](remediation-v2.md)中**持续有效**——回退任意一条即 v2 不通过（AC2-18）。
+> v2 的新增条目见 [`remediation-v2-status.md`](remediation-v2-status.md)。
+
 对照委托方整改报告 [`remediation-v1.md`](remediation-v1.md) 的问题编号与验收标准，
 逐条记录关闭状态与证据。实施分两轮：s3a（P0 + 文案，commit 4156a57）、
 s3b（P1 + P2，commit b1f7dfa）。

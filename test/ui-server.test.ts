@@ -60,15 +60,25 @@ async function* readSSE(
     const { done, value } = await reader.read();
     if (value) buffer += decoder.decode(value, { stream: !done });
 
-    // 提取完整的 SSE 事件（\n\n 分隔）
+    // 提取完整的 SSE 事件（\n\n 分隔）。
+    // 一帧可含多个字段（id: / event: / data:），顺序不限——只按 "data: " 前缀
+    // 判断整块会漏掉带 id 的帧（断点续传需要 id），所以按行解析。
     while (true) {
       const idx = buffer.indexOf("\n\n");
       if (idx === -1) break;
-      const block = buffer.slice(0, idx).trim();
+      const block = buffer.slice(0, idx);
       buffer = buffer.slice(idx + 2);
-      if (block.startsWith("data: ")) {
-        yield JSON.parse(block.slice(6));
+
+      const dataLines: string[] = [];
+      let eventName = "message";
+      for (const line of block.split("\n")) {
+        if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+        else if (line.startsWith("event:")) eventName = line.slice(6).trim();
       }
+      if (dataLines.length === 0) continue;
+      // 命名通道（如 event: delta）不是 durable 事件流的一部分，跳过
+      if (eventName !== "message") continue;
+      yield JSON.parse(dataLines.join("\n"));
     }
 
     if (done) break;
@@ -82,6 +92,54 @@ async function readSSEAll(response: Response): Promise<Record<string, unknown>[]
     events.push(e);
   }
   return events;
+}
+
+/**
+ * 在**运行中**的 run 上等待某条事件出现。
+ * 不能用 readSSEAll——运行中的流不会自行结束，会一直读到测试超时。
+ */
+async function waitForEvent(
+  base: string,
+  runId: string,
+  predicate: (e: Record<string, unknown>) => boolean,
+  timeoutMs = 4000,
+): Promise<Record<string, unknown> | undefined> {
+  const res = await fetch(`${base}/api/runs/${runId}/events`);
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const deadline = Date.now() + timeoutMs;
+
+  try {
+    while (Date.now() < deadline) {
+      const chunk = await Promise.race([
+        reader.read(),
+        new Promise<{ value: undefined; done: false }>((r) =>
+          setTimeout(() => r({ value: undefined, done: false }), 100),
+        ),
+      ]);
+      if (chunk.value) buffer += decoder.decode(chunk.value, { stream: true });
+
+      let idx: number;
+      while ((idx = buffer.indexOf("\n\n")) !== -1) {
+        const block = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        const dataLines: string[] = [];
+        let eventName = "message";
+        for (const line of block.split("\n")) {
+          if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+          else if (line.startsWith("event:")) eventName = line.slice(6).trim();
+        }
+        if (dataLines.length === 0 || eventName !== "message") continue;
+        const ev = JSON.parse(dataLines.join("\n"));
+        if (predicate(ev)) return ev;
+      }
+      if (chunk.done) break;
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+  return undefined;
 }
 
 /** 等待 run 变为 done */
@@ -835,5 +893,306 @@ describe("ui-server", () => {
     for (let i = 1; i < events.length; i++) {
       expect((events[i] as any).seq).toBeGreaterThan((events[i - 1] as any).seq);
     }
+  });
+
+  // ================================================================
+  // v2 / R1 — 状态机与审批审计契约
+  // ================================================================
+
+  // ---- V-01 死锁回归锁：返工轮的审批必须仍可应答 ----
+  it("v2-1. 返工轮审批可应答：主轮 done 之后出现的审批仍能放行，运行正常收尾", async () => {
+    // 事件序列：main(完成) → verifier(不通过) → rework(请求审批) → verifier(通过)
+    const model = new FakeModelClient([
+      fakeMessage([textBlock("首轮交付")], "end_turn"),
+      fakeMessage(
+        [textBlock(JSON.stringify({ passed: false, issues: ["缺少收尾"], summary: "未通过" }))],
+        "end_turn",
+      ),
+      fakeMessage([toolUseBlock("tu_rework", "sensitive", { op: "fix" })], "tool_use"),
+      fakeMessage([textBlock("返工完成")], "end_turn"),
+      fakeMessage(
+        [textBlock(JSON.stringify({ passed: true, issues: [], summary: "通过" }))],
+        "end_turn",
+      ),
+    ]);
+
+    handle = createUiServer({
+      modelClient: model,
+      tools: [askTool("sensitive")],
+      workdir: process.cwd(),
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+
+    const createRes = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "rework needs approval", verify: true }),
+    });
+    const { runId } = await createRes.json() as { runId: string };
+
+    // 等返工轮的审批请求出现（它在主轮 done 之后——旧实现正是在这里把前端锁死的）
+    const approval: any = await waitForEvent(
+      base,
+      runId,
+      (e: any) => e.event.type === "approval_request" && e.source === "rework",
+    );
+    expect(approval, "返工轮应发出 approval_request").toBeDefined();
+
+    // 该审批出现在 main 的 done 之后——这正是旧实现判定"run 已结束"的时点
+    const mainDone: any = await waitForEvent(
+      base,
+      runId,
+      (e: any) => e.event.type === "done" && e.source === "main",
+    );
+    expect(mainDone).toBeDefined();
+    expect(approval.seq).toBeGreaterThan(mainDone.seq);
+
+    // 精确形式应答：approvalId = toolUseId#requestSeq
+    const approvalRef = `${approval.event.toolUseId}#${approval.seq}`;
+    const postRes = await fetch(
+      `${base}/api/runs/${runId}/approvals/${encodeURIComponent(approvalRef)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ decision: "allow" }),
+      },
+    );
+    expect(postRes.status).toBe(200);
+
+    // 放行后运行必须能收尾——旧实现下 respond 永不被调用，这里会超时
+    await waitForDone(base, runId);
+
+    const final = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+    const resolved = final.find((e: any) => e.event.type === "approval_resolved");
+    expect(resolved).toBeDefined();
+    expect((resolved as any).event.decision).toBe("allow");
+    expect((resolved as any).event.requestSeq).toBe(approval.seq);
+  });
+
+  // ---- V-02 审批决策进事件流（刷新后审计不失真） ----
+  it("v2-2. approval_resolved 进缓冲：重放事件流可复原决策/主体/时间", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("tu_audit", "sensitive", { op: "write" })], "tool_use"),
+      fakeMessage([textBlock("done")], "end_turn"),
+    ]);
+    handle = createUiServer({
+      modelClient: model,
+      tools: [askTool("sensitive")],
+      workdir: process.cwd(),
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "audit trail", verify: false }),
+    })).json() as { runId: string };
+
+    const req: any = await waitForEvent(
+      base,
+      runId,
+      (e: any) => e.event.type === "approval_request",
+    );
+    expect(req).toBeDefined();
+
+    await fetch(
+      `${base}/api/runs/${runId}/approvals/${encodeURIComponent(`tu_audit#${req.seq}`)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ decision: "deny", reason: "路径不在白名单" }),
+      },
+    );
+    await waitForDone(base, runId);
+
+    // 关键：全新订阅（等价于浏览器刷新）重放后，决策仍在
+    const replayed = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+    const resolved = replayed.find((e: any) => e.event.type === "approval_resolved") as any;
+    expect(resolved).toBeDefined();
+    expect(resolved.event.decision).toBe("deny");
+    expect(resolved.event.reason).toBe("路径不在白名单");
+    expect(resolved.event.actor).toBe("user");
+    expect(typeof resolved.event.at).toBe("number");
+    expect(resolved.event.toolUseId).toBe("tu_audit");
+  });
+
+  // ---- run_end 恒为最后一条 durable 事件，且在段级 done 之后 ----
+  it("v2-3a. run_end 是最后一条 durable 事件，排在段级 done 之后", async () => {
+    const model = new FakeModelClient([fakeMessage([textBlock("ok")], "end_turn")]);
+    handle = createUiServer({ modelClient: model, tools: [autoTool("noop")], workdir: process.cwd() });
+    port = await startServer(handle);
+    base = baseUrl(port);
+
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "ordering", verify: false }),
+    })).json() as { runId: string };
+    await waitForDone(base, runId);
+
+    const final = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+    const last = final[final.length - 1] as any;
+    expect(last.event.type).toBe("run_end");
+    expect(last.event.outcome).toBe("completed");
+    expect(last.event.mainStopReason).toBe("completed");
+    expect(typeof last.event.finishedAt).toBe("number");
+
+    const doneIdx = final.findIndex((e: any) => e.event.type === "done");
+    expect(doneIdx).toBeGreaterThanOrEqual(0);
+    expect(final.length - 1).toBeGreaterThan(doneIdx);
+  });
+
+  // ---- V-02 审批过期由服务端宣告（宿主关停路径） ----
+  it("v2-3b. approval_expired：宿主关停时仍挂起的审批被逐条宣告过期", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("tu_never", "sensitive", { op: "x" })], "tool_use"),
+    ]);
+    handle = createUiServer({
+      modelClient: model,
+      tools: [askTool("sensitive")],
+      workdir: process.cwd(),
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "never answered", verify: false }),
+    })).json() as { runId: string };
+
+    const req = await waitForEvent(base, runId, (e: any) => e.event.type === "approval_request");
+    expect(req).toBeDefined();
+
+    // 开一条常驻订阅，然后关停宿主——关停帧应当先于断流被写出
+    const live = await fetch(`${base}/api/runs/${runId}/events`);
+    const reader = live.body!.getReader();
+    const decoder = new TextDecoder();
+
+    const closing = handle.close();
+    handle = undefined; // 已关，afterEach 不要再关一次
+
+    let buffer = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (value) buffer += decoder.decode(value, { stream: true });
+      if (done) break;
+    }
+    await closing;
+
+    const types = buffer
+      .split("\n\n")
+      .map((b) => b.split("\n").find((l) => l.startsWith("data:")))
+      .filter((l): l is string => Boolean(l))
+      .map((l) => JSON.parse(l.slice(5).trimStart()));
+
+    const expired = types.find((e: any) => e.event.type === "approval_expired") as any;
+    expect(expired, "关停时挂起的审批必须被宣告过期").toBeDefined();
+    expect(expired.event.toolUseId).toBe("tu_never");
+    expect(expired.event.cause).toBe("run_finished");
+    expect(expired.event.requestSeq).toBe((req as any).seq);
+
+    const runEnd = types.find((e: any) => e.event.type === "run_end") as any;
+    expect(runEnd).toBeDefined();
+    expect(runEnd.event.outcome).toBe("closed");
+    // 过期宣告必须排在 run_end 之前：先说清每张卡的下场，再宣布收工
+    expect(types.indexOf(expired)).toBeLessThan(types.indexOf(runEnd));
+  });
+
+  // ---- V-04 / done 载荷补全 ----
+  it("v2-4. done 事件透出 error.message 与 segment 身份", async () => {
+    const model: ModelClient = {
+      send(_req: ModelRequest): Promise<ModelTurn> {
+        return Promise.reject(new Error("上游端点 502"));
+      },
+    };
+    handle = createUiServer({ modelClient: model, tools: [autoTool("noop")], workdir: process.cwd() });
+    port = await startServer(handle);
+    base = baseUrl(port);
+
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "boom", verify: false }),
+    })).json() as { runId: string };
+    await waitForDone(base, runId);
+
+    const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+    const done = events.find((e: any) => e.event.type === "done") as any;
+    expect(done).toBeDefined();
+    expect(done.event.stopReason).toBe("error");
+    // 此前 error 被整条丢弃，前端只能写死"运行异常终止"
+    expect(done.event.error?.message).toContain("502");
+    expect(done.event.segment).toEqual({ index: 0, source: "main" });
+    expect(typeof done.ts).toBe("number");
+  });
+
+  // ---- V-05 断点续传 ----
+  it("v2-5. Last-Event-ID 续传：只补发 seq 更大的事件", async () => {
+    const model = new FakeModelClient([fakeMessage([textBlock("ok")], "end_turn")]);
+    handle = createUiServer({ modelClient: model, tools: [autoTool("noop")], workdir: process.cwd() });
+    port = await startServer(handle);
+    base = baseUrl(port);
+
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "resume", verify: false }),
+    })).json() as { runId: string };
+    await waitForDone(base, runId);
+
+    const all = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+    expect(all.length).toBeGreaterThan(2);
+
+    const cut = (all[1] as any).seq;
+    const resumed = await readSSEAll(
+      await fetch(`${base}/api/runs/${runId}/events`, { headers: { "Last-Event-ID": String(cut) } }),
+    );
+    expect(resumed.length).toBe(all.length - 2);
+    expect((resumed[0] as any).seq).toBe(cut + 1);
+  });
+
+  // ---- V-03 审批引用二义解析 ----
+  it("v2-6. approvalRef 二义：裸 toolUseId 与 id#seq 都能应答，且互不串卡", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("tu_dup", "sensitive", { n: 1 })], "tool_use"),
+      fakeMessage([textBlock("ok")], "end_turn"),
+    ]);
+    handle = createUiServer({
+      modelClient: model,
+      tools: [askTool("sensitive")],
+      workdir: process.cwd(),
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "bare ref", verify: false }),
+    })).json() as { runId: string };
+
+    expect(
+      await waitForEvent(base, runId, (e: any) => e.event.type === "approval_request"),
+    ).toBeDefined();
+
+    // 裸 toolUseId：兼容形式，取该 id 下最新的挂起项
+    const bare = await fetch(`${base}/api/runs/${runId}/approvals/tu_dup`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: "allow" }),
+    });
+    expect(bare.status).toBe(200);
+    await waitForDone(base, runId);
+
+    // 已应答后再来一次（无论哪种形式）都是 409，respond 只调一次
+    const again = await fetch(`${base}/api/runs/${runId}/approvals/tu_dup`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: "deny" }),
+    });
+    expect(again.status).toBe(409);
   });
 });
