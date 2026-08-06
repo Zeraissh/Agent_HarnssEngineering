@@ -1281,24 +1281,15 @@ describe("AC6 无障碍语义 (R-05)", () => {
   // 渲染层改为分区补丁后，aria-labelledby 由 setAttribute 动态写入，源码里不再有
   // 字面量。而 DOM 断言能多守住一件字符串扫描永远看不见的事：**切换标签后
   // tabpanel 的反向引用有没有跟着换**——引用一旦悬空，屏幕阅读器就报不出面板名。
-  it("32b-src. tab 静态标记仍在（tablist / aria-controls / 稳定 id）", () => {
-    const appSrc = readFileSync(join(__dirname, "..", "ui", "public", "app.js"), "utf-8");
-    expect(appSrc).toContain('role="tablist"');
-    expect(appSrc).toContain('aria-controls="tab-content"');
-    // 每个 tab 有稳定 id 供 tabpanel 反向引用
-    expect(appSrc).toContain('id="tab-${tab}"');
-  });
+  // 32b / 32c 已全部升级为真实 DOM 断言，见 test/ui-a11y.test.ts 的
+  // 「tab 三件套在真实 DOM 上闭环」「roving tabindex」「方向键在四个面之间移动」。
+  //
+  // 触发原因：四张因子卡合并成了 tablist，renderTabButton 随之删除，源码里
+  // 不再有 `aria-controls="tab-content"` / `tabindex="${isActive…}"` 这类字面量。
+  // DOM 断言能多守住两件字符串扫描看不见的事：tabpanel 的反向引用不悬空，
+  // 以及方向键真的能在四个面之间循环——后者正是 s3d 那条「只加 roving 不加
+  // 方向键比不改更糟」的教训所指。
 
-  it("32c. roving tabindex 必须配方向键处理（否则未选中标签键盘不可达）", () => {
-    const appSrc = readFileSync(join(__dirname, "..", "ui", "public", "app.js"), "utf-8");
-    // 未选中 tab 为 tabindex=-1
-    expect(appSrc).toMatch(/tabindex="\$\{isActive \? "0" : "-1"\}"/);
-    // 必须有 keydown + 四个方向键 + Home/End
-    expect(appSrc).toContain('addEventListener("keydown"');
-    for (const key of ["ArrowRight", "ArrowLeft", "ArrowDown", "ArrowUp", "Home", "End"]) {
-      expect(appSrc).toContain(key);
-    }
-  });
 });
 
 // ---- AC7: 运行列表元数据与筛选 (R-08) ----

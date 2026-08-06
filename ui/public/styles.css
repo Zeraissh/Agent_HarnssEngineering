@@ -371,6 +371,25 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
   white-space: nowrap;
 }
 
+/* --- 侧栏搜索 --- */
+.sidebar-search {
+  padding: var(--space-sm) var(--space-lg);
+  border-bottom: 1px solid var(--border-1);
+}
+
+.run-search {
+  width: 100%;
+  padding: var(--space-xs) var(--space-sm);
+  border: 1px solid var(--border-1);
+  border-radius: var(--radius-sm);
+  background: var(--surface-0);
+  color: var(--text-1);
+  font: inherit;
+  font-size: var(--font-md);
+}
+
+.run-search::placeholder { color: var(--text-3); }
+
 /* ===== 主区 ===== */
 
 .main {
@@ -594,33 +613,14 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
 
 .approval-reason { font-size: var(--font-xs); color: var(--fg2); margin-top: var(--space-xs); }
 
-/* ===== 标签导航 (R-03) ===== */
-
-.tab-nav {
-  display: flex;
-  gap: 2px;
-  border-bottom: 1px solid var(--border);
-  margin-bottom: var(--space-lg);
-}
-
-.tab-btn {
-  background: var(--tab-inactive-bg);
-  border: none;
-  border-bottom: 2px solid transparent;
-  color: var(--fg2);
-  font-size: var(--font-md);
-  padding: var(--space-sm) var(--space-md);
-  cursor: pointer;
-  transition: color 0.15s, border-color 0.15s;
-}
-.tab-btn:hover { color: var(--fg); }
-.tab-btn--active {
-  color: var(--accent);
-  border-bottom-color: var(--accent);
-}
+/* ===== 下钻面板 =====
+   标签栏由四张因子卡承担（.factor-grid[role=tablist]），此处不再有独立的
+   .tab-nav / .tab-btn —— 那一行与卡片完全重复。 */
 
 .tab-content {
   min-height: 120px;
+  border-top: 1px solid var(--border-1);
+  padding-top: var(--space-lg);
 }
 
 /* ===== 概览标签 (R-03) ===== */
@@ -1047,8 +1047,17 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
   font: inherit;
 }
 
-.factor-card:hover { background: var(--bg3); }
-.factor-card--abnormal { border-color: var(--yellow); }
+.factor-card:hover { background: var(--surface-2); }
+.factor-card--abnormal { border-color: var(--status-warn); }
+
+/* 选中态：卡片同时是标签，当前查看的那张必须一眼可辨。
+   用左侧强调条 + 强调色标题，而不是整块反色——四张卡本身已经是信息密集区。 */
+.factor-card--active {
+  border-color: var(--accent);
+  box-shadow: inset 3px 0 0 var(--accent);
+  background: var(--surface-0);
+}
+.factor-card--active .factor-title { color: var(--accent); }
 
 .factor-title {
   font-size: var(--font-lg);
@@ -1173,6 +1182,7 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
 }
 
 .callout p { margin: var(--space-xs) 0 0; color: var(--fg2); font-size: var(--font-sm); }
+.callout--info { border-left-color: var(--status-info); background: var(--status-info-surface); }
 .callout--warn { border-left-color: var(--yellow); background: var(--yellow-bg); }
 .callout--bad { border-left-color: var(--red); background: var(--red-bg); }
 /* 不可逆与普通警告必须视觉可区分，否则用户对它脱敏 */
@@ -1317,11 +1327,6 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
 
   .submit-bar textarea {
     min-width: 120px;
-  }
-
-  .tab-nav {
-    overflow-x: auto;
-    -webkit-overflow-scrolling: touch;
   }
 
   .log-entry-header {

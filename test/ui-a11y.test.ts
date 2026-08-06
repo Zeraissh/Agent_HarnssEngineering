@@ -294,6 +294,82 @@ describe("标签三件套（真实 DOM 断言，取代原先的源码字符串�
       expect(t.getAttribute("tabindex")).toBe("-1");
     }
   });
+
+  it("方向键在四个面之间移动——只加 roving 不加方向键比不改更糟（s3d 教训）", () => {
+    renderRunDetail(buildRichState(), { activeTab: "loop", harness: FAKE_HARNESS });
+    const seen: string[] = [];
+    document.addEventListener("tab-switch", (e) => seen.push((e as CustomEvent).detail.tab));
+
+    for (const key of ["ArrowRight", "ArrowLeft", "ArrowDown", "ArrowUp", "Home", "End"]) {
+      seen.length = 0;
+      const active = document.querySelector('[role="tab"][tabindex="0"]')!;
+      active.dispatchEvent(new window.KeyboardEvent("keydown", { key, bubbles: true }));
+      expect(seen, `${key} 未触发切换`).toHaveLength(1);
+    }
+  });
+
+  /**
+   * 委托方截图发现：因子卡恒为四张，而当时的标签栏在没有核查记录时只渲染三个。
+   * 点第四张卡会切到一个根本不存在的标签，tabpanel 的 aria-labelledby 随之
+   * 指向空引用——屏幕阅读器报不出面板名。合并成同一组 tab 后这类不一致
+   * 从结构上消失，这几条锁住它不复发。
+   */
+  it("未开启核查的运行同样有 Verification 面，且反向引用不悬空", () => {
+    let s = createInitialState("run-nv", "没开核查的任务", false);
+    s = reduceEvent(s, { seq: 0, source: "main", event: { type: "turn_start", turn: 1 } });
+    s = reduceEvent(s, {
+      seq: 1, source: "main",
+      event: { type: "done", stopReason: "completed", usage: { turns: 1 } },
+    });
+
+    renderRunDetail(s, { activeTab: "verify", harness: FAKE_HARNESS });
+    const tabs = [...document.querySelectorAll('[role="tab"]')].map((t) => t.getAttribute("data-tab"));
+    expect(tabs).toEqual(expect.arrayContaining(["loop", "context", "tools", "verify"]));
+
+    const panel = document.querySelector('[role="tabpanel"]')!;
+    expect(panel.getAttribute("aria-labelledby")).toBe("tab-verify");
+    expect(document.getElementById("tab-verify")).toBeTruthy(); // 不悬空
+    // 没有裁决时给出的是解释而不是空白——"没跑核查"本身就是一条信息
+    expect(panel.textContent).toContain("未开启独立核查");
+  });
+
+  it("开了核查但执行先挂掉时，明说核查没机会运行", () => {
+    let s = createInitialState("run-err", "认证失败的任务", true);
+    s = reduceEvent(s, { seq: 0, source: "main", event: { type: "turn_start", turn: 1 } });
+    s = reduceEvent(s, {
+      seq: 1, source: "main",
+      event: { type: "done", stopReason: "error", error: { message: "auth failed" }, usage: { turns: 0 } },
+    });
+    s = reduceEvent(s, {
+      seq: 2, source: "host",
+      event: { type: "run_end", outcome: "error", mainStopReason: "error", finishedAt: 1 },
+    });
+
+    renderRunDetail(s, { activeTab: "verify", harness: FAKE_HARNESS });
+    const panel = document.querySelector('[role="tabpanel"]')!;
+    expect(panel.textContent).toContain("核查未运行");
+    // 这一句是要害：没有裁决不等于没有问题
+    expect(panel.textContent).toContain("没有裁决不等于没有问题");
+  });
+
+  it("当前查看的面在卡片上有选中标记（卡片即标签）", () => {
+    renderRunDetail(buildRichState(), { activeTab: "tools", harness: FAKE_HARNESS });
+    const active = document.querySelector('.factor-card[aria-selected="true"]')!;
+    expect(active.getAttribute("data-factor")).toBe("tools");
+    expect(active.classList.contains("factor-card--active")).toBe(true);
+    expect(active.getAttribute("aria-label")).toContain("当前查看");
+    expect(document.querySelectorAll('.factor-card[aria-selected="true"]')).toHaveLength(1);
+  });
+
+  it("不再存在与因子卡重复的第二排标签", () => {
+    renderRunDetail(buildRichState(), { activeTab: "loop", harness: FAKE_HARNESS });
+    expect(document.querySelectorAll(".tab-nav")).toHaveLength(0);
+    expect(document.querySelectorAll(".tab-btn")).toHaveLength(0);
+    // tablist 只有一个，就是因子卡那一组
+    const lists = [...document.querySelectorAll('[role="tablist"]')];
+    expect(lists).toHaveLength(1);
+    expect(lists[0].classList.contains("factor-grid")).toBe(true);
+  });
 });
 
 describe("扫描器双向自检：植入已知缺陷必须被抓到", () => {

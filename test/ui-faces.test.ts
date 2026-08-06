@@ -19,6 +19,7 @@ import {
   deriveLogEntries,
   buildFactorCards,
   normalizeTab,
+  filterRunsByQuery,
   VERDICT_PARSE_FAIL,
 } from "../ui/public/app.js";
 
@@ -401,5 +402,33 @@ describe("deriveLogEntries 的工具名回填 (V-12)", () => {
     ]);
     const result = deriveLogEntries(s).find((e) => e.type === "tool_result");
     expect(result.name).toBeUndefined();
+  });
+});
+
+describe("filterRunsByQuery（侧栏搜索）", () => {
+  const runs = [
+    { runId: "a", task: "整理参考文档" },
+    { runId: "b", task: "修复 SSE 重连缺陷" },
+    { runId: "c", task: "Fix SSE reconnect" },
+  ];
+
+  it("空查询原样返回，不做任何过滤", () => {
+    expect(filterRunsByQuery(runs, "")).toBe(runs);
+    expect(filterRunsByQuery(runs, "   ")).toBe(runs);
+    expect(filterRunsByQuery(runs, undefined)).toBe(runs);
+  });
+
+  it("按任务描述子串匹配", () => {
+    expect(filterRunsByQuery(runs, "文档").map((r) => r.runId)).toEqual(["a"]);
+    expect(filterRunsByQuery(runs, "SSE").map((r) => r.runId)).toEqual(["b", "c"]);
+  });
+
+  it("大小写无关、首尾空白无关", () => {
+    expect(filterRunsByQuery(runs, "  sse  ").map((r) => r.runId)).toEqual(["b", "c"]);
+    expect(filterRunsByQuery(runs, "RECONNECT").map((r) => r.runId)).toEqual(["c"]);
+  });
+
+  it("无匹配时返回空列表而不是全部", () => {
+    expect(filterRunsByQuery(runs, "不存在的词")).toEqual([]);
   });
 });

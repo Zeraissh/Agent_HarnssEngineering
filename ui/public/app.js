@@ -1021,6 +1021,20 @@ export function filterRunsByStatus(runs, states, filter) {
   });
 }
 
+/**
+ * 按任务描述搜索运行。
+ *
+ * 只匹配 task 字段：runId 是 UUID，用户不会记；状态已有独立筛选器。
+ * 大小写与首尾空白无关；空查询原样返回，不做任何过滤。
+ * @param {{runId:string, task:string}[]} runs
+ * @param {string} query
+ */
+export function filterRunsByQuery(runs, query) {
+  const q = String(query ?? "").trim().toLowerCase();
+  if (!q) return runs;
+  return runs.filter((r) => String(r.task ?? "").toLowerCase().includes(q));
+}
+
 // ---------------------------------------------------------------
 // 阶段二 新增：日志条目默认展开/折叠状态查询
 // ---------------------------------------------------------------
@@ -1228,8 +1242,7 @@ export function renderRunDetail(state, callbacks) {
   patchUnverifiedRail(parts, faces);
   patchLiveStrip(parts, state, isRunning);
   patchOutcomeCard(parts, state, overview, faces);
-  patchFactorGrid(parts, faces, callbacks);
-  patchTabNav(parts, state, activeTab, callbacks, faces);
+  patchFactorGrid(parts, faces, activeTab, callbacks);
   patchTabContent(parts, state, activeTab, overview, logEntries, callbacks, faces);
   patchUsageFooter(parts, state);
 }
@@ -1275,8 +1288,10 @@ function ensureDetailSkeleton(mainEl, state, callbacks) {
     "</div>" +
     '<div class="live-strip" hidden aria-live="polite"></div>' +
     '<div class="outcome-card"></div>' +
-    '<div class="factor-grid"></div>' +
-    '<div class="tab-nav" role="tablist" aria-label="详情视图切换"></div>' +
+    // 四张因子卡**本身就是标签栏**：它们既是四个决定因素的摘要，也是切到对应
+    // 下钻面的入口。此前卡片下面还另起一行同名标签，两排四个一模一样的词——
+    // 委托方一眼看出是重复。合并之后选中态由 aria-selected 天然承载。
+    '<div class="factor-grid" role="tablist" aria-label="四决定因素"></div>' +
     '<div class="tab-content" id="tab-content" role="tabpanel" tabindex="0"></div>' +
     '<div class="usage-footer" hidden></div>';
 
@@ -1296,7 +1311,6 @@ function ensureDetailSkeleton(mainEl, state, callbacks) {
     liveStrip: mainEl.querySelector(".live-strip"),
     outcome: mainEl.querySelector(".outcome-card"),
     factorGrid: mainEl.querySelector(".factor-grid"),
-    tabNav: mainEl.querySelector(".tab-nav"),
     tabContent: mainEl.querySelector(".tab-content"),
     usage: mainEl.querySelector(".usage-footer"),
     sig: {},
@@ -1549,9 +1563,12 @@ function verdictBadgeLabel(badge) {
  * 异常面自动加权并排到首位——用户第一眼该看到的是"哪一面出了问题"，
  * 而不是四张长得一样的卡片。
  */
-function patchFactorGrid(parts, faces, callbacks) {
+function patchFactorGrid(parts, faces, activeTab, callbacks) {
   const cards = buildFactorCards(faces);
-  const sig = signature([JSON.stringify(cards.map((c) => [c.id, c.abnormal, c.lines.join("~")]))]);
+  const sig = signature([
+    JSON.stringify(cards.map((c) => [c.id, c.abnormal, c.lines.join("~")])),
+    activeTab,
+  ]);
   if (parts.sig.factors === sig) return;
   parts.sig.factors = sig;
 
@@ -1561,23 +1578,51 @@ function patchFactorGrid(parts, faces, callbacks) {
       const el = document.createElement("button");
       el.type = "button";
       el.className = "factor-card";
+      el.id = `tab-${c.id}`;
+      el.setAttribute("role", "tab");
+      el.setAttribute("aria-controls", "tab-content");
       el.setAttribute("data-factor", c.id);
+      el.setAttribute("data-tab", c.id);
       el.innerHTML =
         '<span class="factor-title"></span><span class="factor-lines"></span>';
-      el.addEventListener("click", () => {
-        document.dispatchEvent(new CustomEvent("tab-switch", { detail: { tab: c.id } }));
+      el.addEventListener("click", () => switchToFace(c.id));
+      // roving tabindex 下 Tab 只进当前项，组内移动靠方向键——没有这段，
+      // 未选中的面就彻底不可键盘到达（比不做 roving 更糟）
+      el.addEventListener("keydown", (e) => {
+        const key = /** @type {KeyboardEvent} */ (e).key;
+        const all = [...parts.factorGrid.querySelectorAll('[role="tab"]')];
+        const idx = all.indexOf(el);
+        let next = -1;
+        if (key === "ArrowRight" || key === "ArrowDown") next = (idx + 1) % all.length;
+        else if (key === "ArrowLeft" || key === "ArrowUp") next = (idx - 1 + all.length) % all.length;
+        else if (key === "Home") next = 0;
+        else if (key === "End") next = all.length - 1;
+        if (next < 0) return;
+        e.preventDefault();
+        switchToFace(all[next].getAttribute("data-tab"));
       });
-      updateFactorCard(el, c);
+      updateFactorCard(el, c, activeTab);
       return el;
     },
-    update: updateFactorCard,
+    update: (el, c) => updateFactorCard(el, c, activeTab),
   });
+
+  setAttr(parts.tabContent, "aria-labelledby", `tab-${activeTab}`);
 }
 
-function updateFactorCard(el, c) {
+function switchToFace(tab) {
+  if (tab) document.dispatchEvent(new CustomEvent("tab-switch", { detail: { tab } }));
+}
+
+function updateFactorCard(el, c, activeTab) {
+  const isActive = c.id === activeTab;
   setClass(el, "factor-card--abnormal", c.abnormal);
+  setClass(el, "factor-card--active", isActive);
+  setAttr(el, "aria-selected", String(isActive));
+  setAttr(el, "tabindex", isActive ? "0" : "-1");
   setText(el.querySelector(".factor-title"), c.title);
-  setAttr(el, "aria-label", `${c.title}：${c.lines.join("，")}。查看详情`);
+  // 名称里带上"当前查看"，屏幕阅读器才知道这一张既是摘要也是当前选中的面
+  setAttr(el, "aria-label", `${c.title}：${c.lines.join("，")}${isActive ? "。当前查看" : "。查看详情"}`);
   el.querySelector(".factor-lines").innerHTML = c.lines
     .map((l) => `<span class="factor-line">${esc(l)}</span>`)
     .join("");
@@ -1650,46 +1695,11 @@ export function buildFactorCards(faces) {
   return [...cards.filter((c) => c.abnormal), ...cards.filter((c) => !c.abnormal)];
 }
 
-function patchTabNav(parts, state, activeTab, callbacks, faces) {
-  const tabs = [
-    { id: "loop", label: "Loop 循环" },
-    { id: "context", label: "Context 上下文" },
-    { id: "tools", label: "Tools 工具" },
-  ];
-  if (state.verifierTimeline.length > 0 || state.verdict) {
-    tabs.push({ id: "verify", label: "Verification 核查" });
-  }
-
-  const sig = signature([tabs.map((t) => t.id).join(","), activeTab]);
-  if (parts.sig.tabNav === sig) return;
-  parts.sig.tabNav = sig;
-
-  parts.tabNav.innerHTML = tabs
-    .map((t) => renderTabButton(t.id, t.label, activeTab))
-    .join("");
-  setAttr(parts.tabContent, "aria-labelledby", `tab-${activeTab}`);
-
-  const tabBtns = [...parts.tabNav.querySelectorAll(".tab-btn")];
-  const switchTab = (tab) => {
-    if (tab) document.dispatchEvent(new CustomEvent("tab-switch", { detail: { tab } }));
-  };
-  tabBtns.forEach((btn, idx) => {
-    btn.addEventListener("click", () => switchTab(btn.getAttribute("data-tab")));
-    // roving tabindex 下 Tab 只进当前项，组内移动靠方向键 —— 没有这段，
-    // 未选中的标签就彻底不可键盘到达（比改之前更糟）
-    btn.addEventListener("keydown", (e) => {
-      const key = /** @type {KeyboardEvent} */ (e).key;
-      let next = -1;
-      if (key === "ArrowRight" || key === "ArrowDown") next = (idx + 1) % tabBtns.length;
-      else if (key === "ArrowLeft" || key === "ArrowUp") next = (idx - 1 + tabBtns.length) % tabBtns.length;
-      else if (key === "Home") next = 0;
-      else if (key === "End") next = tabBtns.length - 1;
-      if (next < 0) return;
-      e.preventDefault();
-      switchTab(tabBtns[next].getAttribute("data-tab"));
-    });
-  });
-}
+// patchTabNav 已移除：四张因子卡直接充当 tablist（见 patchFactorGrid）。
+// 此前卡片下面另起一行同名标签，两排四个一模一样的词，是纯粹的重复导航；
+// 更要命的是两者的成员还不一致——卡片恒为四张，而标签栏在没有核查记录时
+// 只渲染三个，于是点第四张卡会切到一个根本不存在的标签，tabpanel 的
+// aria-labelledby 随之指向空引用（悬空引用，屏幕阅读器报不出面板名）。
 
 function patchTabContent(parts, state, activeTab, overview, logEntries, callbacks, faces) {
   const container = parts.tabContent;
@@ -1988,19 +1998,6 @@ function patchUsageFooter(parts, state) {
   parts.usage.innerHTML = html;
 }
 
-/** @returns {string} */
-function renderTabButton(tab, label, activeTab) {
-  const isActive = tab === activeTab;
-  // aria-controls + id 让屏幕阅读器知道该 tab 控制哪个面板；未选中项 tabindex=-1
-  // 走 roving tabindex（APG tabs 模式），Tab 键只进入当前选中项，组内用方向键切换
-  return `<button class="tab-btn ${isActive ? "tab-btn--active" : ""}"
-    id="tab-${tab}"
-    role="tab"
-    aria-selected="${isActive}"
-    aria-controls="tab-content"
-    tabindex="${isActive ? "0" : "-1"}"
-    data-tab="${tab}">${label}</button>`;
-}
 
 /**
  * 用量脚注（V-07）。
@@ -2287,6 +2284,21 @@ function entryDetail(e) {
 /** @returns {string} */
 function renderVerifyTab(state, face) {
   let html = "";
+
+  // Verification 面恒在：没跑核查本身就是一条信息，不是一个空白。
+  // 界面要说清"为什么没有裁决"——是没开核查，还是执行根本没跑完导致核查
+  // 压根没机会运行。后者尤其重要：那种情形下"没有裁决"绝不等于"没问题"。
+  if (!state.verdict && state.verifierTimeline.length === 0) {
+    if (!state.verify) {
+      html += '<div class="callout callout--info"><strong>本次运行未开启独立核查</strong>' +
+        "<p>提交任务时勾选「开启独立核查」，会由一个全新上下文的核查 Agent 重读产物并出具三值裁决。</p></div>";
+    } else {
+      const cls = classifyStopReason(state.stopReason);
+      html += '<div class="callout callout--warn"><strong>核查未运行</strong>' +
+        `<p>已开启独立核查，但执行段以 <code>${esc(state.stopReason ?? "未知")}</code>（${esc(cls.label)}）终止，核查没有机会执行。<strong>没有裁决不等于没有问题</strong>——这一类失败核查救不了。</p></div>`;
+    }
+    return html;
+  }
 
   // 三类饥饿告警分开列，不混成一条——它们指向不同的根因层，混在一起就没法归因
   if (face) {

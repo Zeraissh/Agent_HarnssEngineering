@@ -38,6 +38,10 @@
     </select>
     <button type="button" class="theme-toggle" id="theme-toggle" aria-label="切换配色主题">◐</button>
   </div>
+  <div class="sidebar-search">
+    <label for="run-search" class="sr-only">搜索运行</label>
+    <input type="search" id="run-search" class="run-search" placeholder="搜索任务描述…" autocomplete="off" />
+  </div>
   <!-- role=listbox / aria-label 由 renderRunList 动态挂载：listbox 必须含 option
        子项（aria-required-children），空态/加载态若静态带着 role 反而是 critical
        违规——这条是 axe 扫描器上线首跑抓到的（s3d 手工修复引入的新问题） -->
@@ -96,6 +100,7 @@ import {
   toggleEntryCollapsed,
   deriveRunListItems,
   filterRunsByStatus,
+  filterRunsByQuery,
   renderRunList,
   renderRunDetail,
   renderEmptyState,
@@ -118,6 +123,7 @@ const logCollapseOverrides = new Map();
 
 // R-08 筛选器状态
 let currentFilter = "all";
+let currentQuery = "";
 
 // ---- DOM 引用 ----
 const submitForm = /** @type {HTMLFormElement} */ (document.getElementById("submit-form"));
@@ -129,6 +135,7 @@ const themeToggle = /** @type {HTMLButtonElement} */ (document.getElementById("t
 const sidebar = /** @type {HTMLElement} */ (document.getElementById("sidebar"));
 const mainPanel = /** @type {HTMLElement} */ (document.getElementById("main-panel"));
 const runFilter = /** @type {HTMLSelectElement} */ (document.getElementById("run-filter"));
+const runSearch = /** @type {HTMLInputElement} */ (document.getElementById("run-search"));
 const statusAnnouncer = /** @type {HTMLElement} */ (document.getElementById("status-announcer"));
 
 // ---- 响应式：窄屏视图状态 ----
@@ -168,7 +175,7 @@ function announceStatus(msg) {
 
 // ---- 运行列表刷新 ----
 function getFilteredRuns() {
-  return filterRunsByStatus(runs, runStates, currentFilter);
+  return filterRunsByQuery(filterRunsByStatus(runs, runStates, currentFilter), currentQuery);
 }
 
 function refreshRunListView() {
@@ -196,6 +203,14 @@ runFilter.addEventListener("change", () => {
   currentFilter = runFilter.value;
   refreshRunListView();
 });
+
+// 搜索：列表用键控补丁更新，不重建节点，所以边打字边过滤不会打断输入焦点
+if (runSearch) {
+  runSearch.addEventListener("input", () => {
+    currentQuery = runSearch.value;
+    refreshRunListView();
+  });
+}
 
 // ---- 选择运行 ----
 function selectRun(runId) {
