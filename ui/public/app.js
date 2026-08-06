@@ -470,9 +470,16 @@ export function renderRunList(runs, selectedRunId, onSelect, metaMap) {
   const listEl = document.getElementById("run-list");
   if (!listEl) return;
   if (runs.length === 0) {
+    // 空态不得挂 role=listbox：listbox 必须含 option 子项（aria-required-children），
+    // 空壳 listbox 是 critical 违规。role 与内容同生共死。
+    listEl.removeAttribute("role");
+    listEl.removeAttribute("aria-label");
     listEl.innerHTML = '<div class="run-list-empty">尚无运行。</div>';
     return;
   }
+  // 有 option 子项时才挂 listbox 身份
+  listEl.setAttribute("role", "listbox");
+  listEl.setAttribute("aria-label", "运行列表");
   listEl.innerHTML = runs
     .map(
       (r) => {

@@ -8,6 +8,13 @@
 </head>
 <body>
 
+<!-- 页面级标题：屏幕阅读器靠 h1 建立文档大纲与"跳到标题"导航；视觉上由侧栏/
+     详情页头承担，故 sr-only 隐藏。必须包在 header（banner 地标）里——裸 h1
+     游离于所有地标之外会触发 axe region 规则（页面内容须归属地标） -->
+<header class="sr-only">
+  <h1>Agent Harness 控制台</h1>
+</header>
+
 <!-- 侧栏：运行列表 -->
 <aside class="sidebar" id="sidebar">
   <div class="sidebar-header">
@@ -20,9 +27,10 @@
       <option value="failed">未通过</option>
     </select>
   </div>
-  <!-- role=listbox 是 role=option 子项的必需父容器：孤儿 option 会让屏幕阅读器
-       无法播报"第 N 项/共 M 项"（AC-06 实测缺陷） -->
-  <div id="run-list" class="run-list" role="listbox" aria-label="运行列表">
+  <!-- role=listbox / aria-label 由 renderRunList 动态挂载：listbox 必须含 option
+       子项（aria-required-children），空态/加载态若静态带着 role 反而是 critical
+       违规——这条是 axe 扫描器上线首跑抓到的（s3d 手工修复引入的新问题） -->
+  <div id="run-list" class="run-list">
     <div class="run-list-empty">加载中…</div>
   </div>
 </aside>

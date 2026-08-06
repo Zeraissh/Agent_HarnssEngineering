@@ -888,11 +888,17 @@ describe("AC6 无障碍语义 (R-05)", () => {
   });
 
   // 以下三条由浏览器实测的 ARIA 结构缺陷催生（AC-06 键盘/屏幕阅读器专项）
-  it("32a. role=option 的容器必须是 role=listbox（孤儿 option 无法被正确播报）", () => {
+  it("32a. listbox 身份与 option 子项同生共死（有项才挂 role，空态必须摘掉）", () => {
+    const appSrc = readFileSync(join(__dirname, "..", "ui", "public", "app.js"), "utf-8");
+    // 空态分支摘掉 role/aria-label——空壳 listbox 违反 aria-required-children（critical）
+    expect(appSrc).toMatch(/removeAttribute\("role"\)/);
+    expect(appSrc).toMatch(/removeAttribute\("aria-label"\)/);
+    // 有 option 子项时才挂上 listbox 身份
+    expect(appSrc).toMatch(/setAttribute\("role", "listbox"\)/);
+    expect(appSrc).toMatch(/setAttribute\("aria-label", "运行列表"\)/);
+    // 静态 HTML 不得预挂 role，否则加载态即违规
     const html = readFileSync(join(__dirname, "..", "ui", "public", "index.html"), "utf-8");
-    // run-list 是 renderRunList 的挂载点，其子项渲染为 role="option"
-    expect(html).toMatch(/id="run-list"[^>]*role="listbox"/);
-    expect(html).toMatch(/id="run-list"[^>]*aria-label=/);
+    expect(html).not.toMatch(/id="run-list"[^>]*role="listbox"/);
   });
 
   it("32b. tab 三件套完整：tablist / tab(aria-controls) / tabpanel(aria-labelledby)", () => {
