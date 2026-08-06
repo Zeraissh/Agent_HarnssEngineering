@@ -37,7 +37,7 @@ s3b（P1 + P2，commit b1f7dfa）。
 
 - P0 全部关闭 ✅（状态冲突、历史审批可操作、窄屏不可用三项均为 0）
 - 桌面端核心流程通过 ✅；移动端（390px）核心流程通过 ✅
-- 自动化无障碍扫描 ⚠️ 未引入 axe 类工具（未新增依赖）；已用浏览器真机走查覆盖键盘/ARIA 结构层
+- 自动化无障碍扫描 ✅ axe-core 常驻门禁（六画面 violations = 0，含 incomplete 白名单与双向自检）+ 浏览器真机键盘走查
 - 审批重复提交率 0 ✅（服务端幂等 409）
 - 监控基线 ⚠️ 未建立（属运营项，非本轮范围）
 
@@ -65,11 +65,39 @@ s3b（P1 + P2，commit b1f7dfa）。
 三条对应回归测试已入库（32a/32b/32c），其中 32c 专门锁死"roving tabindex
 必须配方向键"这一对约束，防止后续改动只做一半。
 
+## axe-core 常驻门禁（s3e，委托方决定引入）
+
+`test/ui-a11y.test.ts`（`@vitest-environment jsdom`，devDep 仅此一处使用；
+`ui/` 运行时依赖保持为零）。六个画面——空态/运行列表/概览/运行日志/核查/窄屏
+——`violations` 恒为空，每次 `npm test` 都跑。
+
+**上线首跑即抓到两处真缺陷**（此前手写静态断言全绿）：
+
+1. **空壳 listbox（critical）**：s3d 手工修复把 `role="listbox"` 静态写死进
+   `index.html`，列表为空/加载中时无 `option` 子项，违反 `aria-required-children`。
+   → 改为「身份与内容同生共死」：`renderRunList` 有项才挂 role/aria-label，空态摘掉。
+2. **缺页面级 `h1`**：补 `<header class="sr-only"><h1>Agent Harness 控制台</h1></header>`。
+   必须包在 `header`（banner 地标）内——裸 `h1` 游离于所有地标之外会触发 `region`
+   规则，这是补 h1 时当场撞到的连锁反应。
+
+**incomplete 白名单机制**：只断言 `violations` 为空并不够——axe 把「本环境判定不了」
+的规则放进 `incomplete` 桶，既非通过也非失败，不盯就会静默溜过。已锁定已知三条
+（`color-contrast` / `landmark-one-main` / `page-has-heading-one`，各注明原因），
+新增任何一条即测试失败，强制有人看一眼。
+
+**双向自检三条**（项目 checker 纪律）：植入 orphan option → `aria-required-parent`；
+植入空壳 listbox → `aria-required-children`；植入悬空 `aria-labelledby` → 落待复核桶。
+证明扫描器抓得住，而非「全绿只是没在看」。
+
+**边界**：对比度、焦点可见性、目标尺寸等视觉类规则 jsdom 判不了，继续由
+`ui-app.test.ts` 中从 `styles.css` 解析色对、按 WCAG 相对亮度公式实算的测试守护——
+两者互补，不可互相替代。`npm audit` 新增 0 条（既有 7 条来自 `@anthropic-ai/sdk`
+与 `@modelcontextprotocol/sdk`，与本次无关）。
+
 ## 剩余项建议
 
-1. **NVDA 听感**（AC-06 的人工部分）：结构语义已实测正确，但真实屏幕阅读器的
-   朗读顺序与措辞体验仍建议人工过一遍；如允许新增 devDependency，可引入
-   axe-core 做自动扫描并纳入 vitest 作为持续门禁。
+1. **NVDA 听感**（AC-06 的人工部分）：结构语义已由 axe 常驻门禁 + 浏览器走查覆盖，
+   但真实屏幕阅读器的朗读顺序与措辞体验仍建议人工过一遍。
 2. 监控基线（状态冲突率、审批处理耗时、结果定位耗时）属上线后运营项，非本轮范围。
 
 ## 附带修复的 harness 缺陷
@@ -81,4 +109,4 @@ verifier 因此反复退化重试、烧光核查轮次（s3b/s3c 连续两轮 fa
 元凶之一）。已改为引号感知扫描：引号内的 `|`/转义 `\|` 视作字面量，引号外的
 重定向/链式/命令替换照旧拦截，未闭合引号按可疑拒绝。
 
-单测总数：208（s3 三轮 +46，含白名单修复 1 个、无障碍结构 3 个）。
+单测总数：220（s3 五轮 +58，含白名单修复 1、无障碍结构 3、axe 门禁 12）。
