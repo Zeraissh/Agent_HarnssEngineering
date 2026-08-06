@@ -1386,6 +1386,93 @@ describe("ui-server", () => {
     events.forEach((e: any, i: number) => expect(e.seq).toBe(i));
   });
 
+  // ---- V-23 会话正史按需拉 ----
+  it("v2-13. GET /api/runs/:id/transcript 返回逐段会话，且不进 SSE 缓冲", async () => {
+    handle = createUiServer({
+      modelClient: new FakeModelClient([fakeMessage([textBlock("done")], "end_turn")]),
+      tools: [autoTool("noop")],
+      workdir: process.cwd(),
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "transcript 探针", verify: false }),
+    })).json() as { runId: string };
+    await waitForDone(base, runId);
+
+    const t = await (await fetch(`${base}/api/runs/${runId}/transcript`)).json() as any;
+    expect(t.runId).toBe(runId);
+    expect(Array.isArray(t.segments)).toBe(true);
+    expect(t.segments.length).toBeGreaterThan(0);
+    // 至少含最初那条 user 任务
+    const first = t.segments[0];
+    expect(first.source).toBe("main");
+    expect(first.messages.length).toBeGreaterThan(0);
+    expect(JSON.stringify(first.messages)).toContain("transcript 探针");
+
+    // 关键：会话正文不得混进事件流（几 MB 的内容会让每个晚订阅者重放一遍）
+    const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+    const doneEvt = events.find((e: any) => e.event.type === "done") as any;
+    expect(doneEvt.event.messages).toBeUndefined();
+    expect(typeof doneEvt.event.messageCount).toBe("number");
+  });
+
+  it("v2-14. 未知 runId 的 transcript 返回 404", async () => {
+    handle = createUiServer({ modelClient: new FakeModelClient([]), tools: [], workdir: process.cwd() });
+    port = await startServer(handle);
+    base = baseUrl(port);
+    const res = await fetch(`${baseUrl(port)}/api/runs/nope/transcript`);
+    expect(res.status).toBe(404);
+  });
+
+  // ---- V-24 逐 run 装配 ----
+  it("v2-15. 提交时可逐 run 指定 pack / effort / rubric，非法值当场 400", async () => {
+    handle = createUiServer({
+      modelClient: new FakeModelClient([fakeMessage([textBlock("ok")], "end_turn")]),
+      tools: [autoTool("noop")],
+      workdir: process.cwd(),
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+
+    const post = (body: unknown) =>
+      fetch(`${base}/api/runs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+
+    // 静默降级是长期成本：设了 python-coding 却跑成默认配置，查起来很贵
+    const badPack = await post({ task: "t", pack: "不存在的包" });
+    expect(badPack.status).toBe(400);
+    expect((await badPack.json() as any).error).toContain("未知领域包");
+
+    const badEffort = await post({ task: "t", effort: "turbo" });
+    expect(badEffort.status).toBe(400);
+    expect((await badEffort.json() as any).error).toContain("effort");
+
+    const ok = await post({ task: "t", pack: "python-coding", effort: "low", rubric: "可读性" });
+    expect(ok.status).toBe(200);
+  });
+
+  it("v2-16. /api/harness 列出可选领域包与 effort 档位（前端不硬编码）", async () => {
+    handle = createUiServer({ modelClient: new FakeModelClient([]), tools: [], workdir: process.cwd() });
+    port = await startServer(handle);
+    const snap = await (await fetch(`${baseUrl(port)}/api/harness`)).json() as any;
+
+    expect(Array.isArray(snap.availablePacks)).toBe(true);
+    expect(snap.availablePacks.length).toBeGreaterThan(0);
+    for (const p of snap.availablePacks) {
+      expect(typeof p.name).toBe("string");
+      // 只给名字与描述，不泄露 systemPrompt
+      expect(p).not.toHaveProperty("systemPrompt");
+    }
+    expect(snap.effortLevels).toEqual(["low", "medium", "high", "xhigh", "max"]);
+  });
+
   // ---- V-10 全局生命周期流（取代 3 秒轮询）----
   it("v2-12. /api/stream 先发快照，再推 run_created / run_finished", async () => {
     handle = createUiServer({

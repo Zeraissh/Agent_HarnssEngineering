@@ -26,6 +26,7 @@ import {
   renderRunList,
   renderRunDetail,
   renderEmptyState,
+  renderConversation,
 } from "../ui/public/app.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -494,5 +495,123 @@ describe("双主题：data-theme 切换不改变结构语义", () => {
         );
     };
     expect(snapshot("dark")).toEqual(snapshot("light"));
+  });
+});
+
+// ================================================================
+// v2 R6a：会话正史视图 (V-23)
+// ================================================================
+
+describe("对话视图", () => {
+  const transcript = {
+    segments: [
+      {
+        index: 0,
+        source: "main",
+        messages: [
+          { role: "user", content: "创建 demo.txt" },
+          {
+            role: "assistant",
+            content: [
+              { type: "text", text: "我先写文件。" },
+              { type: "tool_use", id: "t1", name: "write_file", input: { path: "demo.txt" } },
+            ],
+          },
+          {
+            role: "user",
+            content: [{ type: "tool_result", tool_use_id: "t1", content: "Wrote 5 bytes" }],
+          },
+          { role: "assistant", content: [{ type: "text", text: "已完成。" }] },
+        ],
+      },
+    ],
+  };
+
+  function mount(t: unknown) {
+    const host = document.createElement("div");
+    host.innerHTML = renderConversation(t, { lastSeq: 0 });
+    document.body.appendChild(host);
+    return host;
+  }
+
+  /**
+   * 这一条是整个视图最容易搞错的地方：Anthropic 协议把**工具返回值放在
+   * user 角色里**回传给模型。照 role 直接画气泡的话，界面会显示成
+   * "用户对着 agent 念了一堆命令输出"——完全不是发生过的事。
+   */
+  it("带 tool_result 的 user 消息渲染为工具返回，不是用户发言", () => {
+    const host = mount(transcript);
+    const userBubbles = [...host.querySelectorAll(".chat-msg--user")];
+    // 只有真正的那一句任务描述算用户发言
+    expect(userBubbles).toHaveLength(1);
+    expect(userBubbles[0].textContent).toContain("创建 demo.txt");
+
+    const toolBubbles = [...host.querySelectorAll(".chat-msg--tool")];
+    expect(toolBubbles).toHaveLength(1);
+    expect(toolBubbles[0].textContent).toContain("Wrote 5 bytes");
+    expect(toolBubbles[0].textContent).not.toContain("委托方");
+  });
+
+  it("assistant 的 text 与 tool_use 同框呈现", () => {
+    const host = mount(transcript);
+    const a = [...host.querySelectorAll(".chat-msg--assistant")];
+    expect(a).toHaveLength(2);
+    expect(a[0].textContent).toContain("我先写文件");
+    expect(a[0].querySelector(".chat-toolcall")?.textContent).toContain("write_file");
+  });
+
+  it("失败的工具返回带错误标记", () => {
+    const host = mount({
+      segments: [{
+        index: 0, source: "main",
+        messages: [{
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "t", content: "boom", is_error: true }],
+        }],
+      }],
+    });
+    expect(host.querySelector(".chat-msg--tool-err")).toBeTruthy();
+  });
+
+  it("tool_result 的 content 为内容块数组时同样能取出文本", () => {
+    const host = mount({
+      segments: [{
+        index: 0, source: "main",
+        messages: [{
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "t", content: [{ type: "text", text: "块形式输出" }] }],
+        }],
+      }],
+    });
+    expect(host.querySelector(".chat-msg--tool")!.textContent).toContain("块形式输出");
+  });
+
+  it("多段会话之间插入来源分界", () => {
+    const host = mount({
+      segments: [
+        { index: 0, source: "main", messages: [{ role: "user", content: "任务" }] },
+        { index: 1, source: "rework", messages: [{ role: "user", content: "返工" }] },
+      ],
+    });
+    const bounds = [...host.querySelectorAll(".segment-boundary")];
+    expect(bounds.length).toBeGreaterThanOrEqual(2);
+    expect(bounds.some((b) => b.textContent!.includes("返工"))).toBe(true);
+  });
+
+  it("未拉到 / 为空时给出解释而不是空白", () => {
+    expect(mount(null).textContent).toContain("正在载入会话");
+    expect(mount({ segments: [] }).textContent).toContain("尚无完整会话记录");
+  });
+
+  it("对话视图零 violations（两套主题）", async () => {
+    for (const theme of ["light", "dark"]) {
+      document.body.innerHTML = loadSkeleton();
+      document.documentElement.setAttribute("data-theme", theme);
+      renderRunDetail(buildRichState(), {
+        activeTab: "loop", harness: FAKE_HARNESS, loopView: "chat", transcript,
+      });
+      const violations = await runAxe();
+      expect(violations, `${theme}: ${JSON.stringify(violations, null, 2)}`).toEqual([]);
+    }
   });
 });

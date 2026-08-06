@@ -371,6 +371,108 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
   white-space: nowrap;
 }
 
+/* --- 执行视图切换（事件流 / 对话）--- */
+.view-switch {
+  display: inline-flex;
+  gap: 2px;
+  margin-bottom: var(--space-md);
+  border: 1px solid var(--border-1);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.view-btn {
+  background: var(--surface-0);
+  border: none;
+  color: var(--text-2);
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--font-md);
+  padding: var(--space-xs) var(--space-md);
+}
+
+.view-btn:hover { background: var(--surface-2); color: var(--text-1); }
+.view-btn--active { background: var(--accent); color: var(--on-accent); }
+
+/* --- 对话视图 --- */
+.chat-view { display: flex; flex-direction: column; gap: var(--space-md); }
+
+.chat-msg {
+  border: 1px solid var(--border-1);
+  border-radius: var(--radius);
+  padding: var(--space-sm) var(--space-md);
+  background: var(--surface-1);
+}
+
+.chat-msg--assistant { background: var(--surface-1); }
+/* 委托方那一侧用强调色细边框区分——它是任务的来源，不是过程 */
+.chat-msg--user { background: var(--surface-0); border-left: 3px solid var(--accent); }
+.chat-msg--tool { background: var(--surface-2); }
+.chat-msg--tool-err { border-color: var(--status-bad); }
+
+.chat-role {
+  font-size: var(--font-sm);
+  color: var(--text-2);
+  margin-bottom: var(--space-xs);
+}
+
+.chat-msg--tool-err .chat-role { color: var(--status-bad); }
+
+.chat-body {
+  font-size: var(--font-md);
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: auto;
+  margin: 0;
+}
+
+.chat-body--text { font-family: var(--font-ui); }
+
+.chat-toolcall {
+  margin-top: var(--space-sm);
+  padding-left: var(--space-sm);
+  border-left: 2px solid var(--border-1);
+}
+
+.chat-toolcall-mark { color: var(--accent); }
+
+/* --- 提交栏旋钮 --- */
+.btn--ghost {
+  background: transparent;
+  border: 1px solid var(--border-1);
+  color: var(--text-2);
+}
+
+.btn--ghost:hover { background: var(--surface-2); color: var(--text-1); }
+
+.run-knobs {
+  flex-basis: 100%;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: var(--space-md);
+  margin-top: var(--space-md);
+  padding-top: var(--space-md);
+  border-top: 1px solid var(--border-1);
+}
+
+.knob { display: flex; flex-direction: column; gap: var(--space-xs); }
+.knob--wide { grid-column: 1 / -1; }
+
+.knob label { font-size: var(--font-sm); color: var(--text-2); }
+
+.knob select,
+.knob textarea {
+  border: 1px solid var(--border-1);
+  border-radius: var(--radius-sm);
+  background: var(--surface-0);
+  color: var(--text-1);
+  font: inherit;
+  font-size: var(--font-md);
+  padding: var(--space-xs) var(--space-sm);
+}
+
+.knob-hint { font-size: var(--font-sm); color: var(--text-3); }
+
 /* --- 侧栏搜索 --- */
 .sidebar-search {
   padding: var(--space-sm) var(--space-lg);

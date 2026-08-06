@@ -69,7 +69,32 @@
       <span>开启独立核查</span>
     </label>
     <button type="submit" class="btn btn--primary" id="submit-btn">运行任务</button>
+    <button type="button" class="btn btn--ghost" id="knobs-toggle" aria-expanded="false" aria-controls="run-knobs">装配 ▾</button>
     <p id="submit-error" class="inline-error" role="alert" hidden></p>
+
+    <!-- V-24：harness 的旋钮此前只能靠重启换环境变量。默认折叠，不打扰
+         "填个任务就跑"的主路径 -->
+    <div class="run-knobs" id="run-knobs" hidden>
+      <div class="knob">
+        <label for="pack-select">领域包</label>
+        <select id="pack-select">
+          <option value="">（不用领域包）</option>
+        </select>
+        <span class="knob-hint" id="pack-hint"></span>
+      </div>
+      <div class="knob">
+        <label for="effort-select">思考预算</label>
+        <select id="effort-select">
+          <option value="">（默认）</option>
+        </select>
+        <span class="knob-hint" id="effort-hint"></span>
+      </div>
+      <div class="knob knob--wide">
+        <label for="rubric-input">主观评分表</label>
+        <textarea id="rubric-input" rows="2" placeholder="逐条列出评分项，核查者按表评估进 advisory——不影响 passed，也不触发返工"></textarea>
+        <span class="knob-hint">需同时勾选「开启独立核查」才会生效。</span>
+      </div>
+    </div>
   </form>
 
   <!-- 内容区 -->
@@ -125,6 +150,12 @@ const logCollapseOverrides = new Map();
 let currentFilter = "all";
 let currentQuery = "";
 
+// V-23 Loop 面的读法（事件流 / 对话），以及按需拉来的会话正文
+/** @type {Map<string, "events"|"chat">} */
+const loopViews = new Map();
+/** @type {Map<string, any>} */
+const transcripts = new Map();
+
 // ---- DOM 引用 ----
 const submitForm = /** @type {HTMLFormElement} */ (document.getElementById("submit-form"));
 const taskInput = /** @type {HTMLTextAreaElement} */ (document.getElementById("task-input"));
@@ -132,6 +163,11 @@ const verifyToggle = /** @type {HTMLInputElement} */ (document.getElementById("v
 const submitBtn = /** @type {HTMLButtonElement} */ (document.getElementById("submit-btn"));
 const submitError = /** @type {HTMLElement} */ (document.getElementById("submit-error"));
 const themeToggle = /** @type {HTMLButtonElement} */ (document.getElementById("theme-toggle"));
+const knobsToggle = /** @type {HTMLButtonElement} */ (document.getElementById("knobs-toggle"));
+const runKnobs = /** @type {HTMLElement} */ (document.getElementById("run-knobs"));
+const packSelect = /** @type {HTMLSelectElement} */ (document.getElementById("pack-select"));
+const effortSelect = /** @type {HTMLSelectElement} */ (document.getElementById("effort-select"));
+const rubricInput = /** @type {HTMLTextAreaElement} */ (document.getElementById("rubric-input"));
 const sidebar = /** @type {HTMLElement} */ (document.getElementById("sidebar"));
 const mainPanel = /** @type {HTMLElement} */ (document.getElementById("main-panel"));
 const runFilter = /** @type {HTMLSelectElement} */ (document.getElementById("run-filter"));
@@ -337,7 +373,40 @@ function renderDetailWithState(state) {
     logEntries,
     onToggleEntry: handleToggleEntry,
     harness: harnessSnapshot,
+    loopView: loopViews.get(runId) ?? "events",
+    transcript: transcripts.get(runId) ?? null,
+    onSwitchView: (view) => switchLoopView(runId, view),
   });
+}
+
+/**
+ * 切换 Loop 面的读法。对话视图的正文按需拉——会话可达数 MB，没必要在
+ * 用户根本没点开它的时候付这笔代价。
+ */
+function switchLoopView(runId, view) {
+  loopViews.set(runId, view === "chat" ? "chat" : "events");
+  const state = runStates.get(runId);
+  if (state) renderDetailWithState(state);
+  if (view === "chat" && !transcripts.has(runId)) void loadTranscript(runId);
+}
+
+async function loadTranscript(runId) {
+  try {
+    const res = await fetch(`/api/runs/${runId}/transcript`);
+    if (!res.ok) return;
+    transcripts.set(runId, await res.json());
+    const state = runStates.get(runId);
+    if (state && selectedRunId === runId) renderDetailWithState(state);
+  } catch {
+    // 拉不到就保持"正在载入会话…"，不伪造内容
+  }
+}
+
+// run 结束时会话才落盘：若用户正停在对话视图上，收尾后自动补一次
+function refreshTranscriptIfWatching(runId) {
+  if (loopViews.get(runId) !== "chat") return;
+  transcripts.delete(runId);
+  void loadTranscript(runId);
 }
 
 // ---- 宿主真相快照（Tools/Context/Loop 面的数据源）----
@@ -348,6 +417,7 @@ async function loadHarness() {
     const res = await fetch("/api/harness");
     if (!res.ok) return;
     harnessSnapshot = await res.json();
+    populateKnobs(harnessSnapshot);
     // 快照到达前渲染过的详情要补一次——四决定因素的护栏/工具面全靠它
     if (selectedRunId) {
       const state = runStates.get(selectedRunId);
@@ -382,6 +452,7 @@ const batcher = createBatcher((batches) => {
         es.close();
         eventSources.delete(runId);
         announceStatus(`运行已完成：${next.task}`);
+        refreshTranscriptIfWatching(runId);
       }
     }
   }
@@ -492,7 +563,13 @@ submitForm.addEventListener("submit", async (e) => {
     const res = await fetch("/api/runs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ task, verify }),
+      body: JSON.stringify({
+        task,
+        verify,
+        ...(packSelect?.value ? { pack: packSelect.value } : {}),
+        ...(effortSelect?.value ? { effort: effortSelect.value } : {}),
+        ...(rubricInput?.value.trim() ? { rubric: rubricInput.value.trim() } : {}),
+      }),
     });
     if (!res.ok) {
       let detail = "";
@@ -583,6 +660,52 @@ function subscribeLifecycle() {
 }
 
 // ---- 启动 ----
+/** 用宿主快照填充旋钮选项——可选值由服务端给，前端不硬编码 */
+function populateKnobs(snap) {
+  if (packSelect && Array.isArray(snap.availablePacks)) {
+    for (const p of snap.availablePacks) {
+      const opt = document.createElement("option");
+      opt.value = p.name;
+      opt.textContent = `${p.name} — ${p.description ?? ""}`;
+      packSelect.appendChild(opt);
+    }
+    if (snap.pack?.name) packSelect.value = snap.pack.name;
+    updatePackHint();
+  }
+  if (effortSelect && Array.isArray(snap.effortLevels)) {
+    for (const lv of snap.effortLevels) {
+      const opt = document.createElement("option");
+      opt.value = lv;
+      opt.textContent = lv;
+      effortSelect.appendChild(opt);
+    }
+    if (snap.effort) effortSelect.value = snap.effort;
+  }
+  const eh = document.getElementById("effort-hint");
+  // compat 端点不认识 output_config.effort——不说清楚，用户会以为自己设的档位生效了
+  if (eh && snap.compat) eh.textContent = "compat 模式下该参数不会发送";
+}
+
+function updatePackHint() {
+  const hint = document.getElementById("pack-hint");
+  if (!hint || !harnessSnapshot?.availablePacks) return;
+  const p = harnessSnapshot.availablePacks.find((x) => x.name === packSelect.value);
+  hint.textContent = p
+    ? `核查 ${p.verifyMode ?? "—"}${p.hasRubric ? " · 自带评分表" : ""}`
+    : "用默认 system prompt 与全部内置工具";
+}
+
+if (packSelect) packSelect.addEventListener("change", updatePackHint);
+
+if (knobsToggle && runKnobs) {
+  knobsToggle.addEventListener("click", () => {
+    const open = runKnobs.hidden;
+    runKnobs.hidden = !open;
+    knobsToggle.setAttribute("aria-expanded", String(open));
+    knobsToggle.textContent = open ? "装配 ▴" : "装配 ▾";
+  });
+}
+
 // ---- 主题切换（V-20）----
 // 三态循环 auto → light → dark：auto 跟随系统，另外两个是显式覆盖。
 // 显式态写进 localStorage，由 <head> 里的内联脚本在样式生效前恢复，避免闪白。

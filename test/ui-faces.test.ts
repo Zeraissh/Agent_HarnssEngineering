@@ -432,3 +432,67 @@ describe("filterRunsByQuery（侧栏搜索）", () => {
     expect(filterRunsByQuery(runs, "不存在的词")).toEqual([]);
   });
 });
+
+describe("逐 run 装配优先于进程级快照 (V-24)", () => {
+  const runCfg = (over = {}) => ({
+    seq: 0, source: "host",
+    event: {
+      type: "run_config",
+      pack: { name: "ts-coding", description: "TS 域", resources: [], verify: { mode: "rubric", readOnlyCommands: ["npm test"], rubricSource: "pack" } },
+      effort: "max",
+      effortApplies: true,
+      rubricSource: "run",
+      guardrails: { maxTurns: 12, maxTokens: 8000, contextTokenLimit: 500 },
+      tools: [{ name: "read_file", permission: "auto", origin: "builtin" }],
+      ...over,
+    },
+  });
+
+  /**
+   * pack 现在可逐 run 覆盖，而 /api/harness 是进程级快照。若各面继续读快照，
+   * 用户选了 ts-coding 却会看到 python-coding 的工具面与白名单——界面说谎。
+   */
+  it("Tools 面读本 run 的包与工具，不读进程默认", () => {
+    seq = 0;
+    let s = createInitialState("r", "t", true);
+    s = reduceEvents(s, [runCfg()]);
+    const f = deriveToolsFace(s, HARNESS); // HARNESS 里是 python-coding
+    expect(f.pack.name).toBe("ts-coding");
+    expect(f.tools.map((t) => t.name)).toEqual(["read_file"]);
+    expect(f.guardrails.maxTurns).toBe(12);
+  });
+
+  it("Verification 面读本 run 的白名单与评分表来源", () => {
+    seq = 0;
+    let s = createInitialState("r", "t", true);
+    s = reduceEvents(s, [runCfg()]);
+    const f = deriveVerificationFace(s, HARNESS);
+    expect(f.whitelist).toEqual(["npm test"]);
+    expect(f.rubricSource).toBe("run");
+  });
+
+  it("Loop / Context 面的护栏与水位上限同样跟着本 run 走", () => {
+    seq = 0;
+    let s = createInitialState("r", "t", true);
+    s = reduceEvents(s, [
+      runCfg(),
+      { seq: 1, source: "main", event: { type: "turn_start", turn: 10 } },
+      { seq: 2, source: "main", event: { type: "usage", turn: 10, usage: { input_tokens: 450, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } } },
+    ]);
+    const loop = deriveLoopFace(s, HARNESS);
+    expect(loop.maxTurns).toBe(12); // 不是 HARNESS 的 40
+    expect(loop.nearLimit).toBe(true); // 10/12
+    expect(loop.effort).toBe("max");
+
+    const ctx = deriveContextFace(s, HARNESS);
+    expect(ctx.limit).toBe(500); // 不是 HARNESS 的 1000
+    expect(ctx.nearWatermark).toBe(true); // 450/500
+  });
+
+  it("没有 run_config 时回落到进程级快照，行为与改动前一致", () => {
+    seq = 0;
+    const s = feed([ev("main", { type: "turn_start", turn: 1 })]);
+    expect(deriveToolsFace(s, HARNESS).pack.name).toBe("python-coding");
+    expect(deriveLoopFace(s, HARNESS).maxTurns).toBe(40);
+  });
+});

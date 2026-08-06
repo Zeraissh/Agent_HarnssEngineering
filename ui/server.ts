@@ -11,7 +11,7 @@ import { randomUUID } from "node:crypto";
 import { AgentLoop } from "../src/loop.js";
 import { runVerified, type VerifiedRunResult } from "../src/orchestrate.js";
 import { createModelClientFromEnv } from "../src/provider.js";
-import { getPack, selectPackTools } from "../src/presets.js";
+import { getPack, selectPackTools, PACKS } from "../src/presets.js";
 import { bashTool, SHELL_DESC } from "../src/tools/bash.js";
 import { fetchUrlTool } from "../src/tools/fetch-url.js";
 import { readFileTool } from "../src/tools/read-file.js";
@@ -82,6 +82,16 @@ interface StoredRun {
   outcome?: VerifiedRunResult;
   /** 最终交付那一段的终止原因，列表接口直接读（不必等客户端订阅） */
   mainStopReason?: string;
+  /**
+   * 逐段完整会话（V-23）。`done` 事件的 result.messages 一直存在，只是从没
+   * 透出过——SSE 里只带 messageCount，几 MB 的会话不能进事件缓冲。
+   * 存在这里供 GET /api/runs/:id/transcript 按需拉。
+   */
+  transcript: { index: number; source: string; messages: unknown[] }[];
+  /** 本次运行的装配（V-24：可逐 run 覆盖，不再是进程级常量） */
+  packName?: string;
+  effort?: Effort;
+  rubric?: string;
 }
 
 /** 审批唯一键：同一 toolUseId 在返工轮再次出现时，靠 requestSeq 区分 */
@@ -236,7 +246,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       verify: r.verify,
       createdAt: r.createdAt,
       finishedAt: r.finishedAt ?? null,
-      packName: pack?.name ?? null,
+      packName: r.packName ?? pack?.name ?? null,
       stopReason: r.mainStopReason ?? null,
       finalPassed: r.outcome?.finalPassed ?? null,
       reworks: r.outcome?.reworks ?? null,
@@ -303,10 +313,19 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       : { reason: "Web 宿主默认不接 MCP（设 AGENT_UI_MCP=1 开启）——常驻进程持有独占资源有风险" }),
   };
 
-  function buildConfig(): AgentConfig {
-    const systemPrompt = pack?.systemPrompt ?? DEFAULT_SYSTEM_PROMPT;
-    const tools = injectedTools ?? (pack
-      ? selectPackTools(pack, BUILTIN_POOL, [])
+  /**
+   * 装配一次运行的配置。
+   *
+   * V-24：pack 与 effort 从进程级常量改为**逐 run 可覆盖**——同一个宿主进程
+   * 里跑不同领域的任务是常态，此前只能靠重启换 AGENT_PACK。
+   * 未指定时回落到进程级默认（env 装配的那套），行为与改动前一致。
+   */
+  function buildConfig(run?: StoredRun): AgentConfig {
+    const runPack = run?.packName ? getPack(run.packName) : pack;
+    const runEffort = run?.effort ?? effort;
+    const systemPrompt = runPack?.systemPrompt ?? DEFAULT_SYSTEM_PROMPT;
+    const tools = injectedTools ?? (runPack
+      ? selectPackTools(runPack, BUILTIN_POOL, [])
       : BUILTIN_POOL);
     return {
       systemPrompt,
@@ -314,11 +333,13 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       workdir,
       compat: envCompat,
       // 此前这里只设四个字段，pack 的护栏、只读根、effort 全部丢失
-      ...(effort ? { effort } : {}),
+      ...(runEffort ? { effort: runEffort } : {}),
       ...(readRoots.length ? { readRoots } : {}),
       ...(contextTokenLimit !== undefined ? { contextTokenLimit } : {}),
       ...(maxTokens !== undefined ? { maxTokens } : {}),
-      ...(maxTurns !== undefined ? { maxTurns } : {}),
+      ...((run?.packName ? runPack?.guardrails?.maxTurns : maxTurns) !== undefined
+        ? { maxTurns: (run?.packName ? runPack?.guardrails?.maxTurns : maxTurns) as number }
+        : {}),
     };
   }
 
@@ -330,11 +351,14 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    * 状态，bash 全被拒，只能靠间接证据核查，正是案例 #4 那个 22 轮空转的核查饥饿
    * 配置；rubric 失效则让 advisory 永远为空。
    */
-  function buildVerifyOptions() {
+  function buildVerifyOptions(run?: StoredRun) {
+    const runPack = run?.packName ? getPack(run.packName) : pack;
+    // rubric 是任务属性，包只提供缺省：逐 run > env > 包（口径同 src/cli.ts）
+    const runRubric = run?.rubric || rubric || runPack?.verify.rubric;
     return {
-      ...(pack?.verify.instructions ? { verifyInstructions: pack.verify.instructions } : {}),
-      ...(pack?.verify.readOnlyCommands ? { verifyReadOnlyCommands: pack.verify.readOnlyCommands } : {}),
-      ...(rubric ? { verifyRubric: rubric } : {}),
+      ...(runPack?.verify.instructions ? { verifyInstructions: runPack.verify.instructions } : {}),
+      ...(runPack?.verify.readOnlyCommands ? { verifyReadOnlyCommands: runPack.verify.readOnlyCommands } : {}),
+      ...(runRubric ? { verifyRubric: runRubric } : {}),
     };
   }
 
@@ -394,7 +418,14 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     }
 
     // 段计数在 done 之后递增：done 自身属于刚结束的那一段
-    if (event.type === "done") run.segmentIndex += 1;
+    if (event.type === "done") {
+      run.transcript.push({
+        index: run.segmentIndex,
+        source,
+        messages: event.result.messages ?? [],
+      });
+      run.segmentIndex += 1;
+    }
 
     // 推送给在线 SSE 客户端
     broadcastSSE(run, frameFor(sseEvent));
@@ -484,7 +515,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
   /** 启动一次不带核查的运行 */
   async function startPlainRun(run: StoredRun): Promise<void> {
-    const cfg = buildConfig();
+    pushRunConfig(run);
+    const cfg = buildConfig(run);
     const loop = new AgentLoop(cfg, modelClient);
     let mainStopReason: string | undefined;
     try {
@@ -515,11 +547,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
   /** 启动一次带核查的运行 */
   async function startVerifiedRun(run: StoredRun): Promise<void> {
-    const cfg = buildConfig();
+    pushRunConfig(run);
+    const cfg = buildConfig(run);
     let mainStopReason: string | undefined;
     try {
       const outcome = await runVerified(cfg, modelClient, run.task, {
-        ...buildVerifyOptions(),
+        ...buildVerifyOptions(run),
         onEvent: (source, event) => {
           // 只记主/返工段的终止原因：verifier 的 done 已被 orchestrate 压掉，
           // 这里取到的最后一个就是最终交付那一段的
@@ -601,6 +634,58 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    * 领域包工具面、MCP 状态、只读根、护栏、effort、核查白名单。这些此前在
    * Web 上完全不可见，用户只能猜。**不含任何密钥**，只暴露 baseURL 级别的信息。
    */
+  /** 领域包的对外投影：只给边界与策略，不泄露 systemPrompt */
+  function packView(p: ReturnType<typeof getPack>): Record<string, unknown> {
+    if (!p) {
+      return {
+        name: null, description: null, resources: [],
+        verify: { enabled: false, mode: null, hasInstructions: false, readOnlyCommands: [], rubricSource: null },
+      };
+    }
+    return {
+      name: p.name,
+      description: p.description,
+      resources: p.resources ?? [],
+      verify: {
+        enabled: p.verify.enabled,
+        mode: p.verify.mode,
+        hasInstructions: Boolean(p.verify.instructions),
+        readOnlyCommands: p.verify.readOnlyCommands ?? [],
+        rubricSource: process.env.AGENT_VERIFY_RUBRIC ? "env" : p.verify.rubric ? "pack" : null,
+      },
+    };
+  }
+
+  /**
+   * 本次运行的实际装配（V-24）。
+   *
+   * 必须逐 run 发一份：pack 现在可以逐 run 覆盖，而 /api/harness 是进程级快照。
+   * 若 Tools 面继续读进程默认，用户选了 python-coding 却会看到默认包的工具面与
+   * 白名单——界面说谎，正是本项目最忌讳的那类错误。
+   */
+  function pushRunConfig(run: StoredRun): void {
+    const runPack = run.packName ? getPack(run.packName) : pack;
+    const cfg = buildConfig(run);
+    pushSyntheticEvent(run, "host", {
+      type: "run_config",
+      pack: packView(runPack),
+      effort: run.effort ?? effort ?? null,
+      effortApplies: Boolean(run.effort ?? effort) && !envCompat,
+      rubricSource: run.rubric ? "run" : process.env.AGENT_VERIFY_RUBRIC ? "env" : runPack?.verify.rubric ? "pack" : null,
+      guardrails: {
+        maxTurns: cfg.maxTurns ?? null,
+        maxTokens: cfg.maxTokens ?? null,
+        contextTokenLimit: cfg.contextTokenLimit ?? null,
+      },
+      tools: cfg.tools.map((t) => ({
+        name: t.name,
+        permission: t.permission,
+        parallelSafe: t.parallelSafe,
+        origin: BUILTIN_POOL.some((b) => b.name === t.name) ? "builtin" : "mcp",
+      })),
+    });
+  }
+
   function harnessSnapshot(): Record<string, unknown> {
     const tools = buildConfig().tools;
     return {
@@ -620,37 +705,17 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         contextTokenLimit: contextTokenLimit ?? null,
       },
       compactWatermark: 0.8,
+      // V-24：提交表单要能列出可选领域包。只给名字与描述，不泄露 systemPrompt
+      availablePacks: Object.entries(PACKS).map(([name, p]) => ({
+        name,
+        description: p.description,
+        verifyMode: p.verify.mode ?? null,
+        hasRubric: Boolean(p.verify.rubric),
+      })),
+      effortLevels: [...EFFORT_LEVELS],
       // 核查预算与执行者解耦，硬编码在 src/verifier.ts
       verifierBudgetTurns: 15,
-      pack: pack
-        ? {
-            name: pack.name,
-            description: pack.description,
-            resources: pack.resources ?? [],
-            verify: {
-              enabled: pack.verify.enabled,
-              mode: pack.verify.mode,
-              hasInstructions: Boolean(pack.verify.instructions),
-              readOnlyCommands: pack.verify.readOnlyCommands ?? [],
-              rubricSource: process.env.AGENT_VERIFY_RUBRIC
-                ? "env"
-                : pack.verify.rubric
-                  ? "pack"
-                  : null,
-            },
-          }
-        : {
-            name: null,
-            description: null,
-            resources: [],
-            verify: {
-              enabled: false,
-              mode: null,
-              hasInstructions: false,
-              readOnlyCommands: [],
-              rubricSource: process.env.AGENT_VERIFY_RUBRIC ? "env" : null,
-            },
-          },
+      pack: packView(pack),
       tools: tools.map((t) => ({
         name: t.name,
         permission: t.permission,
@@ -694,6 +759,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     | { type: "harness" }
     | { type: "runsList" }
     | { type: "lifecycleStream" }
+    | { type: "transcript"; runId: string }
     | { type: "createRun" }
     | { type: "events"; runId: string }
     | { type: "approval"; runId: string; toolUseId: string }
@@ -717,6 +783,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
     if (method === "GET" && url === "/api/stream") {
       return { type: "lifecycleStream" };
+    }
+
+    const transcriptMatch = method === "GET" && url.match(/^\/api\/runs\/([^/]+)\/transcript$/);
+    if (transcriptMatch) {
+      return { type: "transcript", runId: transcriptMatch[1]! };
     }
 
     if (method === "POST" && url === "/api/runs") {
@@ -767,6 +838,18 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         return json(res, 200, list);
       }
 
+      case "transcript": {
+        const run = runs.get(route.runId);
+        if (!run) return notFound(res, `Run not found: ${route.runId}`);
+        // 按需拉：会话正文可达数 MB，不能进 SSE 缓冲（那会让每个晚订阅的
+        // 客户端都重放一遍）。这里只在用户真的切到对话视图时才付这笔代价。
+        return json(res, 200, {
+          runId: run.id,
+          task: run.task,
+          segments: run.transcript,
+        });
+      }
+
       case "lifecycleStream": {
         res.writeHead(200, {
           "Content-Type": "text/event-stream",
@@ -794,7 +877,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         } catch {
           return badRequest(res, "Failed to read request body");
         }
-        let parsed: { task?: string; verify?: boolean };
+        let parsed: { task?: string; verify?: boolean; pack?: string; effort?: string; rubric?: string };
         try {
           parsed = JSON.parse(body);
         } catch {
@@ -803,6 +886,19 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         if (!parsed.task || typeof parsed.task !== "string") {
           return badRequest(res, 'Missing or invalid "task" field');
         }
+        // V-24：外部输入一律当场校验拒绝，不静默降级——静默降级会让"我明明选了
+        // python-coding"与实际行为长期不一致，查起来很贵（口径同 src/cli.ts 对
+        // AGENT_EFFORT 的处理）
+        if (parsed.pack !== undefined && parsed.pack !== "" && !getPack(parsed.pack)) {
+          return badRequest(res, `未知领域包 "${parsed.pack}"。可选：${Object.keys(PACKS).join(" | ")}`);
+        }
+        if (
+          parsed.effort !== undefined && parsed.effort !== "" &&
+          !(EFFORT_LEVELS as readonly string[]).includes(parsed.effort)
+        ) {
+          return badRequest(res, `effort "${parsed.effort}" 无效。可选：${EFFORT_LEVELS.join(" | ")}`);
+        }
+
         const verify = parsed.verify === true;
         const id = randomUUID();
         const run: StoredRun = {
@@ -817,6 +913,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           respondedToolUseIds: new Set(),
           sseClients: new Set(),
           segmentIndex: 0,
+          transcript: [],
+          ...(parsed.pack ? { packName: parsed.pack } : {}),
+          ...(parsed.effort ? { effort: parsed.effort as Effort } : {}),
+          ...(parsed.rubric ? { rubric: parsed.rubric } : {}),
         };
         runs.set(id, run);
         broadcastLifecycle("run_created", run);

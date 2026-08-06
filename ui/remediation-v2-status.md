@@ -34,6 +34,9 @@
 | V-19 通过带备注未降级 / 不可逆无语域 | P2 | R4 | ✅ | `pass_with_notes` 成为独立第四态（`passed && issues.length`），徽章 `✔ 通过（有备注）`、issues 用 `⚠` 走 warn 色——对齐 CLI `src/cli.ts:276`，项目有两个真实案例是「通过但备注里藏着真 bug」。压缩另起 `.callout--irreversible` 语域（双线左边框 + 区别于 warn 的底色），文案明写「被置换的原文永不可恢复」。**浏览器实证**：徽章类名为 `outcome-verdict--pass_with_notes`、issues 为 `outcome-issues--warn` |
 | V-20 单一暗色主题 / 字号过小 | P2 | R5 | ✅ | 三层令牌（`--p-*` 原始色板 → 语义层 → v1 兼容别名）；**浅色温暖纸面为默认**、暖炭深色为次要，配 `prefers-color-scheme` + `[data-theme]` 手动覆盖 + `<head>` 内联脚本从 localStorage 恢复（首帧前就位，无闪白）。主题按钮三态循环 auto/light/dark。字号下限抬到 12px（删 `--font-xs: 11px` 与三处硬编码 10px），正文 14px；衬线 `Georgia, Noto Serif SC` 只用于大字号标题。**关键一坑**：Claude 标志性陶土 `#C15F3C` 直接用是不合格的——白字 4.23:1、纸面 4.01:1 双双低于 4.5，与 R-06 那个 2.53:1 蓝按钮同型；调深到 `#B0522F` 才双向达标（5.13 / 4.87）。**浏览器实证**：三态切换与 localStorage 持久化、页面最小实渲字号 = 12px、纸面各层取值符合设计。**委托方看到成品截图后指出 emoji 与主题不符**——根本问题不是审美：emoji 是自带调色板的彩色字形，CSS `color` 对它们无效，无法参与主题系统。已全部换为单色排印符并向 CLI 收敛（`→ ✓ ✗ ⚠ ⟳ ■ ✔ ✘ ⋯ ◈ ↺ ──`，压缩另用 `⊟` 以保持不可逆语域独立）；门禁用 Unicode `Emoji_Presentation` 属性判定而非手列黑名单，上线即抓到两处肉眼难辨的 `⚠️`（带 U+FE0F 变体选择符）|
 | V-22 hidden 属性被作者 display 规则压过（截图暴露） | P0 | R5 | ✅ | UA 样式表的 `[hidden]{display:none}` 优先级极低，`.live-strip{display:flex}` 这类作者规则直接压过它。后果是**一个已经异常终止的运行仍挂着绿点显示「等待模型响应…」**——界面在说谎，正是本轮信息架构最不能犯的错。全表只有 `.reconnect-banner[hidden]` 单独写过覆盖，其余全靠 UA 规则，一律失效。已加全局 `[hidden]{display:none!important}` 从结构上消灭这一类，而不是逐组件打补丁。**浏览器实证**：复刻截图场景（认证失败 → 异常终止）后 live-strip `display:none` 且「等待模型响应」从页面文本消失；切回运行中恢复 `display:flex` 并正常显示当前工具调用——双向成立，不是简单地永久隐藏 |
+| V-23 无会话正史视图 | P2 | R6a | ✅ | `AgentRunResult.messages` 一直存在却从没透出（SSE 只带 messageCount，几 MB 会话不能进事件缓冲）。服务端逐段落盘到 `StoredRun.transcript`，新增 `GET /api/runs/:id/transcript` 按需拉；Loop 面加「事件流 / 对话」视图切换，只在用户真的点开对话时才付这笔代价。**渲染要害**：Anthropic 协议把 tool_result 放在 **user 角色**里回传，照 role 直接画气泡会显示成「用户对着 agent 念了一堆命令输出」——按内容块类型分派，工具返回归工具那一侧。**浏览器实证**：对话区渲染出「委托方 …／¶ Agent …」，事件流与对话双向切换正常 |
+| V-24 harness 旋钮不可调 | P2 | R6a | ✅ | 提交栏加可折叠「装配」区：领域包下拉、思考预算、主观评分表；可选值由 `/api/harness` 的 `availablePacks` / `effortLevels` 提供，前端不硬编码。`POST /api/runs` 接 pack/effort/rubric，**非法值当场 400 而非静默降级**（口径同 `src/cli.ts` 对 AGENT_EFFORT 的处理）。`buildConfig`/`buildVerifyOptions` 从进程级常量改为逐 run 可覆盖。**顺带修掉一个自己引入的说谎**：pack 可逐 run 换之后，Tools 面若继续读进程级 `/api/harness`，用户选了 ts-coding 却会看到默认包的工具面与白名单。新增 `run_config` 合成事件承载本 run 实际装配，四个面一律优先读它。**浏览器实证**：选 ts-coding + effort low 提交后，Tools 卡显示「包 ts-coding · 3 个工具」、边界清单是 ts-coding 的真实白名单、Loop 卡显示「1/40 轮 · effort low」|
+| V-25 侧栏无搜索 | P2 | R6a | ✅ | 新增纯函数 `filterRunsByQuery`（按任务描述子串，大小写与首尾空白无关）+ 侧栏搜索框。列表走键控补丁，边打字边过滤不打断输入焦点（实证）|
 | V-21 缺 launcher | P2 | R1 | ✅ | 新建 `ui/serve.ts` + `npm run ui`；默认绑 `127.0.0.1`（该宿主能执行 bash 并批准写文件，非本地地址会打警告）；SIGINT/SIGTERM 优雅关停。顺带把 `ui` 纳入 tsconfig `include`——此前 `ui/serve.ts` 这类未被测试导入的文件根本不受类型检查 |
 
 ## 验收标准（AC2-01 ~ AC2-18）
@@ -68,7 +71,8 @@
 | R2 数据面 | 256 | +12：服务端契约 5（白名单到达 verifier / harness 快照 / 成本与逐轮裁决 / 列表口径 / delta 通道）+ reducer 7（水位口径 / 成本 / 逐轮裁决 / 工具名回填） |
 | R3 细粒度渲染 | 285 | +29：新增 `test/ui-patch.test.ts` 24（`diffKeyed` 6 / `patchList`·`appendOnly` 5 / 滚动锚定 2 / `createBatcher` 4 / 详情页与侧栏状态存活 7）+ 服务端契约 1（`/api/stream`）+ 由源码扫描升级为真实 DOM 断言 4 |
 | R4 新信息架构 | 321 | +36：新增 `test/ui-faces.test.ts` 33（段切分 3 / Loop 面 6 / Context 面 4 / Tools 面 5 / Verification 面 5 / ActionRail 2 / 因子卡 4 / 标签归一 2 / 工具名回填 2）+ a11y 画面随新 IA 扩为 8 个并新增「旧标签 id 归一」1 条 |
-| R5 视觉语言 | 392 | +21：对比度门禁 5 → 46（2 主题 × 23 色对，净 +41 断言归入 4 个 `it.each`）+ 主题结构门禁 3（令牌名集合一致 / 暗色块防漂移 / 组件层不碰 `--p-*`）+ 字体阶梯 4 + a11y 双主题 16 画面与 ARIA 快照一致 1 + emoji 门禁 3 与 hidden 兜底 2（委托方截图反馈后补）|
+| R5 视觉语言 | 395 | +21：对比度门禁 5 → 46（2 主题 × 23 色对，净 +41 断言归入 4 个 `it.each`）+ 主题结构门禁 3（令牌名集合一致 / 暗色块防漂移 / 组件层不碰 `--p-*`）+ 字体阶梯 4 + a11y 双主题 16 画面与 ARIA 快照一致 1 + emoji 门禁 3 与 hidden 兜底 2 + 卡片即标签/Verification 恒在/搜索 8（两轮截图反馈）|
+| R6a 对话视图 + 装配旋钮 | 414 | +19：对话渲染 7（含「tool_result 在 user 角色下」这条要害与双主题 axe）+ 服务端契约 4（transcript 按需拉且不进 SSE / 404 / 逐 run 装配非法值 400 / 快照列包与档位）+ 逐 run 装配优先级 4 + 搜索 4 |
 
 ## R3 把两条静态断言升级为真实 DOM 断言
 

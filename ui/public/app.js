@@ -136,6 +136,11 @@ export function createInitialState(runId, task, verify) {
     verifications: [],
     /** toolUseId → 工具名。tool_result 事件本身不带 name，只能靠 tool_call 回填 */
     toolNames: {},
+    /**
+     * 本次运行的实际装配（V-24）。pack 可逐 run 覆盖，而 /api/harness 是进程级
+     * 快照——两者不一致时以这个为准，否则 Tools 面会展示另一个包的边界。
+     */
+    runConfig: null,
   };
 }
 
@@ -223,6 +228,19 @@ export function reduceEvent(state, sseEvent) {
   }
   if (type === "approval_expired") {
     return applyApprovalExpired(state, event);
+  }
+  if (type === "run_config") {
+    return {
+      ...state,
+      runConfig: {
+        pack: event.pack ?? null,
+        effort: event.effort ?? null,
+        effortApplies: Boolean(event.effortApplies),
+        rubricSource: event.rubricSource ?? null,
+        guardrails: event.guardrails ?? null,
+        tools: Array.isArray(event.tools) ? event.tools : [],
+      },
+    };
   }
   if (type === "usage") {
     return applyUsage(state, event);
@@ -678,7 +696,9 @@ export function deriveSegments(state) {
  */
 export function deriveLoopFace(state, harness) {
   const isRunning = state.status === "running";
-  const maxTurns = harness?.guardrails?.maxTurns ?? null;
+  // 逐 run 装配优先于进程级快照——用户选了别的包时，护栏也跟着换
+  const rc = state.runConfig;
+  const maxTurns = rc?.guardrails?.maxTurns ?? harness?.guardrails?.maxTurns ?? null;
 
   // 轮次取执行侧（main/rework）的最大 turn_start——核查轮预算独立，不该混进来
   let turn = 0;
@@ -705,8 +725,8 @@ export function deriveLoopFace(state, harness) {
     chain,
     reworks: state.runEnd?.reworks ?? segments.filter((s) => s.role === "rework").length,
     retries: state.timeline.filter((e) => e.type === "api_retry"),
-    effort: harness?.effort ?? null,
-    effortApplies: Boolean(harness?.effortApplies),
+    effort: rc?.effort ?? harness?.effort ?? null,
+    effortApplies: Boolean(rc ? rc.effortApplies : harness?.effortApplies),
   };
 }
 
@@ -719,7 +739,9 @@ export function deriveLoopFace(state, harness) {
  * 永不可恢复，那不是又一条普通警告。
  */
 export function deriveContextFace(state, harness) {
-  const usage = deriveContextUsage(state, harness?.guardrails?.contextTokenLimit ?? null);
+  const limit =
+    state.runConfig?.guardrails?.contextTokenLimit ?? harness?.guardrails?.contextTokenLimit ?? null;
+  const usage = deriveContextUsage(state, limit);
   const compactions = [...state.timeline, ...state.verifierTimeline]
     .filter((e) => e.type === "compaction")
     .sort((a, b) => a.seq - b.seq)
@@ -774,7 +796,8 @@ export function deriveToolsFace(state, harness) {
     }
   }
 
-  const declared = harness?.tools ?? [];
+  const rc = state.runConfig;
+  const declared = rc?.tools ?? harness?.tools ?? [];
   const tools = declared.map((t) => ({
     ...t,
     calls: stats.get(t.name)?.calls ?? 0,
@@ -788,12 +811,12 @@ export function deriveToolsFace(state, harness) {
   }
 
   return {
-    pack: harness?.pack ?? null,
+    pack: rc?.pack ?? harness?.pack ?? null,
     shell: harness?.shell ?? null,
     workdir: harness?.workdir ?? null,
     readRoots: harness?.readRoots ?? [],
     mcp: harness?.mcp ?? null,
-    guardrails: harness?.guardrails ?? null,
+    guardrails: rc?.guardrails ?? harness?.guardrails ?? null,
     tools,
     totalCalls: [...stats.values()].reduce((n, s) => n + s.calls, 0),
     totalErrors: [...stats.values()].reduce((n, s) => n + s.errors, 0),
@@ -822,7 +845,8 @@ export function deriveVerificationFace(state, harness) {
         : "fail";
 
   const segments = deriveSegments(state);
-  const whitelist = harness?.pack?.verify?.readOnlyCommands ?? [];
+  const runPack = state.runConfig?.pack ?? harness?.pack;
+  const whitelist = runPack?.verify?.readOnlyCommands ?? [];
 
   // ① 白名单饥饿：verifier 没有可用的只读命令，却确实撞上了审批门——案例 #4 的形态。
   //    注意判据不能看 pendingApprovals：verifier 的审批由 harness 内部自答，
@@ -842,7 +866,7 @@ export function deriveVerificationFace(state, harness) {
     rounds: state.verifications,
     finalPassed: state.runEnd?.finalPassed ?? (v ? v.passed : null),
     whitelist,
-    rubricSource: harness?.pack?.verify?.rubricSource ?? null,
+    rubricSource: state.runConfig?.rubricSource ?? runPack?.verify?.rubricSource ?? null,
     budgetTurns: harness?.verifierBudgetTurns ?? null,
     starvation: {
       noWhitelist: whitelist.length === 0 && verifierDenied,
@@ -1711,17 +1735,30 @@ function patchTabContent(parts, state, activeTab, overview, logEntries, callback
     container.__tab = activeTab;
     parts.sig.tabBody = null;
     if (activeTab === "loop") {
+      // V-23：同一段执行的两种读法。事件流是"它做了什么"（逐工具、逐结果），
+      // 对话是"它当时在想什么"（user/assistant/tool 往返）。两者信息量不同，
+      // 不是换皮——回看一次失败时，往往要先看对话才知道它为什么那么做。
       container.innerHTML =
+        '<div class="view-switch" role="group" aria-label="执行视图">' +
+        '<button type="button" class="view-btn" data-view="events">事件流</button>' +
+        '<button type="button" class="view-btn" data-view="chat">对话</button>' +
+        "</div>" +
         '<h3 class="overview-section-title">Agent 执行</h3>' +
         '<div class="rework-chain"></div>' +
-        '<div class="log-entries"></div>';
+        '<div class="log-entries"></div>' +
+        '<div class="chat-view" hidden></div>';
       container.__logHost = container.querySelector(".log-entries");
+      container.querySelectorAll(".view-btn").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          callbacks.onSwitchView?.(btn.getAttribute("data-view"));
+        });
+      });
     }
   }
 
   if (activeTab === "loop") {
     patchReworkChain(container.querySelector(".rework-chain"), faces.loop);
-    patchLogPanel(container, logEntries, callbacks, state);
+    patchLoopView(parts, container, state, logEntries, callbacks);
     return;
   }
 
@@ -1976,6 +2013,115 @@ function patchLogPanel(container, logEntries, callbacks, state) {
       },
     });
   });
+}
+
+/** Loop 面的两种读法之间切换 */
+function patchLoopView(parts, container, state, logEntries, callbacks) {
+  const view = callbacks.loopView === "chat" ? "chat" : "events";
+  const logHost = container.querySelector(".log-entries");
+  const chatHost = container.querySelector(".chat-view");
+
+  for (const btn of container.querySelectorAll(".view-btn")) {
+    const on = btn.getAttribute("data-view") === view;
+    setClass(btn, "view-btn--active", on);
+    setAttr(btn, "aria-pressed", String(on));
+  }
+  setAttr(logHost, "hidden", view === "events" ? null : "");
+  setAttr(chatHost, "hidden", view === "chat" ? null : "");
+
+  if (view === "events") {
+    patchLogPanel(container, logEntries, callbacks, state);
+    return;
+  }
+
+  const sig = signature([callbacks.transcript ? callbacks.transcript.segments.length : -1, state.lastSeq]);
+  if (parts.sig.chat === sig) return;
+  parts.sig.chat = sig;
+  chatHost.innerHTML = renderConversation(callbacks.transcript, state);
+}
+
+/**
+ * 会话正史视图。
+ *
+ * 数据来自 GET /api/runs/:id/transcript——`AgentRunResult.messages` 一直存在，
+ * 只是从没透出过（SSE 里只带 messageCount，几 MB 的会话不能进事件缓冲）。
+ *
+ * 渲染上有一处容易搞错：**带 tool_result 的 user 消息不是用户说的话**。
+ * Anthropic 的协议把工具返回值放在 user 角色里回传给模型，若照 role 直接画成
+ * 用户气泡，界面会显示成"用户对着 agent 念了一堆命令输出"。这里按内容块
+ * 类型分派，工具返回归到工具那一侧。
+ * @returns {string}
+ */
+export function renderConversation(transcript, state) {
+  if (!transcript) {
+    return '<p class="empty-note">正在载入会话…</p>';
+  }
+  const segments = transcript.segments ?? [];
+  if (segments.length === 0) {
+    return '<p class="empty-note">本次运行尚无完整会话记录——会话在每一段执行结束时落盘，运行中请先看事件流。</p>';
+  }
+
+  let html = "";
+  for (const seg of segments) {
+    const role = segmentRole(seg.source);
+    if (segments.length > 1) {
+      html += renderSegmentBoundary({ role, round: seg.index, source: seg.source });
+    }
+    for (const msg of seg.messages ?? []) {
+      html += renderChatMessage(msg);
+    }
+  }
+  return html || '<p class="empty-note">会话为空。</p>';
+}
+
+/** @returns {string} */
+function renderChatMessage(msg) {
+  const blocks = Array.isArray(msg?.content)
+    ? msg.content
+    : [{ type: "text", text: String(msg?.content ?? "") }];
+
+  // 工具返回块单独成组：协议上它们挂在 user 角色下，语义上属于工具
+  const toolResults = blocks.filter((b) => b && b.type === "tool_result");
+  const rest = blocks.filter((b) => !b || b.type !== "tool_result");
+
+  let html = "";
+  for (const b of toolResults) {
+    const text = extractBlockText(b.content);
+    html +=
+      `<div class="chat-msg chat-msg--tool${b.is_error ? " chat-msg--tool-err" : ""}">` +
+      `<div class="chat-role">${b.is_error ? "✗" : "✓"} 工具返回</div>` +
+      `<pre class="chat-body">${esc(truncate(text, 4000))}</pre>` +
+      "</div>";
+  }
+
+  const speech = rest.filter((b) => b && (b.type === "text" || b.type === "tool_use"));
+  if (speech.length === 0) return html;
+
+  const who = msg?.role === "assistant" ? "assistant" : "user";
+  html += `<div class="chat-msg chat-msg--${who}">`;
+  html += `<div class="chat-role">${who === "assistant" ? "¶ Agent" : "委托方"}</div>`;
+  for (const b of speech) {
+    if (b.type === "text") {
+      html += `<div class="chat-body chat-body--text">${esc(b.text ?? "")}</div>`;
+    } else {
+      html +=
+        '<div class="chat-toolcall">' +
+        `<span class="chat-toolcall-mark">→</span> <code>${esc(b.name ?? "")}</code>` +
+        `<pre class="chat-body">${esc(truncate(formatInput(b.input), 1200))}</pre>` +
+        "</div>";
+    }
+  }
+  html += "</div>";
+  return html;
+}
+
+/** tool_result 的 content 可能是字符串，也可能是内容块数组 */
+function extractBlockText(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return String(content ?? "");
+  return content
+    .map((c) => (c && c.type === "text" ? c.text : typeof c === "string" ? c : JSON.stringify(c)))
+    .join("\n");
 }
 
 /** 段分界：main→verifier 用 ━，返工用 CLI 同款 ↺（src/cli.ts:449） */
