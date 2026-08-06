@@ -22,6 +22,8 @@
  *   AGENT_PACK          可选，领域包名（stm32-coding / stm32-debug）：覆盖 system
  *                       prompt、内置工具面、MCP 接入与白名单、验证策略、护栏参数。
  *                       AGENT_PRESET 为兼容别名
+ *   AGENT_EFFORT        可选，思考预算档 low|medium|high|xhigh|max，默认 high。
+ *                       仅原生 Claude 端点生效（compat 模式下该参数不发送）
  *   AGENT_VERIFY_RUBRIC 可选，主观评分表（任务级注入,优先于领域包的 verify.rubric）：
  *                       verifier 按表评估进裁决 advisory 字段,不影响 passed 不触发返工
  *   AGENT_READ_ROOTS    可选，额外只读根（分号/路径分隔符分隔的绝对路径）：
@@ -46,7 +48,8 @@ import { bashTool, SHELL_DESC } from "./tools/bash.js";
 import { fetchUrlTool } from "./tools/fetch-url.js";
 import { readFileTool } from "./tools/read-file.js";
 import { writeFileTool } from "./tools/write-file.js";
-import type { AgentConfig, TurnEvent } from "./types.js";
+import { EFFORT_LEVELS } from "./types.js";
+import type { AgentConfig, Effort, TurnEvent } from "./types.js";
 
 const c = {
   dim: (s: string) => `\x1b[2m${s}\x1b[0m`,
@@ -220,6 +223,18 @@ async function main(): Promise<void> {
     return t;
   });
 
+  // 思考预算档：外部输入,非法值当场报错而不是静默退回默认——
+  // 静默降级会让"我明明设了 max"与实际行为长期不一致,查起来很贵
+  const effortEnv = process.env.AGENT_EFFORT;
+  if (effortEnv && !(EFFORT_LEVELS as readonly string[]).includes(effortEnv)) {
+    console.error(`AGENT_EFFORT="${effortEnv}" 无效。可选值: ${EFFORT_LEVELS.join(" | ")}`);
+    process.exit(1);
+  }
+  const effort = effortEnv as Effort | undefined;
+  if (effort && compat) {
+    console.log(c.yellow(`提示：AGENT_EFFORT=${effort} 在 compat 模式下不会发送（第三方端点不认识该参数）`));
+  }
+
   // 主观评分表：任务级 env 优先于领域包声明（rubric 是任务属性,包只提供缺省）
   const envRubric = process.env.AGENT_VERIFY_RUBRIC;
 
@@ -236,6 +251,7 @@ async function main(): Promise<void> {
     workdir: process.cwd(),
     ...(readRoots.length ? { readRoots } : {}),
     compat,
+    ...(effort ? { effort } : {}),
     contextTokenLimit,
     maxTokens,
     ...(maxTurns !== undefined ? { maxTurns } : {}),

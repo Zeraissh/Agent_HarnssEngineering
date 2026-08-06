@@ -44,7 +44,15 @@ export interface Tool {
 
 // ---------------------------------------------------------------- L0: 模型客户端
 
-export type Effort = "low" | "medium" | "high" | "xhigh";
+/**
+ * 思考预算档位，对应 Anthropic `output_config.effort`。
+ * "max" 自 SDK 0.115 起可用（升级窗口 7c8ae75 附带发现）。
+ * 仅在非 compat（原生 Claude 端点）下实际发送——第三方兼容端点不认识该字段。
+ */
+export type Effort = "low" | "medium" | "high" | "xhigh" | "max";
+
+/** 运行时校验用（CLI 解析 AGENT_EFFORT 等外部输入时使用） */
+export const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 
 export interface ModelRequest {
   system: Anthropic.TextBlockParam[];
