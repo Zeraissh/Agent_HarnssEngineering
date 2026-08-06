@@ -8,6 +8,7 @@
  * 导出：
  *   - reduceEvent: 纯 reducer
  *   - createInitialState: 初始状态工厂
+ *   - markApprovalResolved / expirePendingApprovals: 状态转换
  *   - renderRunList / renderRunDetail / renderEmptyState: DOM 渲染（浏览器端）
  */
 
@@ -50,8 +51,9 @@
  *   toolUseId: string,
  *   name: string,
  *   input: unknown,
- *   status: "pending"|"allowed"|"denied",
- *   reason?: string
+ *   status: "pending"|"allowed"|"denied"|"expired",
+ *   reason?: string,
+ *   decidedAt?: number
  * }} PendingApproval
  *
  * @typedef {{
@@ -215,10 +217,17 @@ function applyVerdict(state, event) {
 function applyDone(state, event) {
   const usage = event.usage && typeof event.usage === "object" ? /** @type {any} */ (event.usage) : null;
   const stopReason = /** @type {string} */ (event.stopReason);
+
+  // R-01: run 完成后所有仍 pending 的审批卡转为 expired
+  const expiredApprovals = state.pendingApprovals.map((a) =>
+    a.status === "pending" ? { ...a, status: /** @type {"expired"} */ ("expired") } : a,
+  );
+
   return {
     ...state,
     status: "done",
     error: stopReason === "error" ? "运行异常终止" : null,
+    pendingApprovals: expiredApprovals,
     usage: usage
       ? {
           turns: Number(usage.turns ?? 0),
@@ -246,7 +255,23 @@ export function markApprovalResolved(state, toolUseId, decision, reason) {
   return {
     ...state,
     pendingApprovals: state.pendingApprovals.map((a) =>
-      a.toolUseId === toolUseId ? { ...a, status: decision, reason } : a,
+      a.toolUseId === toolUseId
+        ? { ...a, status: decision, reason, decidedAt: Date.now() }
+        : a,
+    ),
+  };
+}
+
+/**
+ * 将 run 中所有 pending 审批转为 expired（run 结束/出错时由前端主动同步调用）。
+ * @param {RunState} state
+ * @returns {RunState}
+ */
+export function expirePendingApprovals(state) {
+  return {
+    ...state,
+    pendingApprovals: state.pendingApprovals.map((a) =>
+      a.status === "pending" ? { ...a, status: /** @type {"expired"} */ ("expired") } : a,
     ),
   };
 }
@@ -265,7 +290,7 @@ export function renderRunList(runs, selectedRunId, onSelect) {
   const listEl = document.getElementById("run-list");
   if (!listEl) return;
   if (runs.length === 0) {
-    listEl.innerHTML = '<div class="run-list-empty">暂无运行</div>';
+    listEl.innerHTML = '<div class="run-list-empty">尚无运行。</div>';
     return;
   }
   listEl.innerHTML = runs
@@ -294,7 +319,7 @@ export function renderRunList(runs, selectedRunId, onSelect) {
 /**
  * 渲染单个 run 的详情视图。
  * @param {RunState} state
- * @param {{onAllow:(toolUseId:string)=>void, onDeny:(toolUseId:string)=>void, onDenyReason:(toolUseId:string,reason:string)=>void}} callbacks
+ * @param {{onAllow:(toolUseId:string)=>void, onDenyReason:(toolUseId:string,reason:string)=>void, showBack?:boolean, onBack?:()=>void}} callbacks
  */
 export function renderRunDetail(state, callbacks) {
   const mainEl = document.getElementById("main-area");
@@ -305,6 +330,12 @@ export function renderRunDetail(state, callbacks) {
   const statusText = isRunning ? "运行中" : state.error ? "异常终止" : "已完成";
 
   let html = "";
+
+  // 窄屏返回按钮
+  if (callbacks.showBack && callbacks.onBack) {
+    html += `<div class="back-bar"><button class="btn back-btn" id="back-to-list-btn">← 返回列表</button></div>`;
+  }
+
   html += `<div class="detail-header">`;
   html += `<h2 class="detail-task">${esc(state.task)}</h2>`;
   html += `<div class="detail-meta">`;
@@ -312,27 +343,47 @@ export function renderRunDetail(state, callbacks) {
   if (state.verify) html += `<span class="verify-badge">核查模式</span>`;
   html += `</div></div>`;
 
-  // 审批卡
+  // 审批卡（R-01：仅 pending + run 运行中才渲染操作按钮）
   if (state.pendingApprovals.length > 0) {
     html += `<div class="approval-cards">`;
     for (const app of state.pendingApprovals) {
-      const resolved = app.status !== "pending";
+      const isPending = app.status === "pending";
+      const operable = isPending && isRunning;
+      const resolved = !isPending;
+
       html += `<div class="approval-card ${resolved ? "approval-card--resolved" : ""}" data-tool-use-id="${esc(app.toolUseId)}">`;
       html += `<div class="approval-card-header">`;
       html += `<span class="approval-tool-name">🔔 ${esc(app.name)}</span>`;
+
       if (resolved) {
-        html += `<span class="approval-result ${app.status === "allowed" ? "approval-result--allow" : "approval-result--deny"}">${app.status === "allowed" ? "已允许" : "已拒绝"}</span>`;
+        const decisionLabel =
+          app.status === "allowed" ? "已允许" :
+          app.status === "denied" ? "已拒绝" : "已过期";
+        const decisionClass =
+          app.status === "allowed" ? "approval-result--allow" :
+          app.status === "denied" ? "approval-result--deny" : "approval-result--expired";
+        html += `<span class="approval-result ${decisionClass}">${decisionLabel}</span>`;
       }
       html += `</div>`;
+
+      // 输入/对象
       html += `<pre class="approval-input">${esc(formatInput(app.input))}</pre>`;
-      if (!resolved) {
+
+      if (operable) {
+        // 可操作：渲染按钮
         html += `<div class="approval-actions">`;
-        html += `<button class="btn btn--allow" data-action="allow" data-tool-use-id="${esc(app.toolUseId)}">允许</button>`;
-        html += `<button class="btn btn--deny" data-action="deny" data-tool-use-id="${esc(app.toolUseId)}">拒绝</button>`;
+        html += `<button class="btn btn--allow" data-action="allow" data-tool-use-id="${esc(app.toolUseId)}">允许本次</button>`;
+        html += `<button class="btn btn--deny" data-action="deny" data-tool-use-id="${esc(app.toolUseId)}">拒绝并说明</button>`;
         html += `<input class="deny-reason" data-tool-use-id="${esc(app.toolUseId)}" placeholder="拒绝理由（可选）" />`;
         html += `</div>`;
-      } else if (app.reason) {
-        html += `<div class="approval-reason">理由：${esc(app.reason)}</div>`;
+      } else if (resolved) {
+        // 只读记录：决策 + 时间 + 理由
+        if (app.decidedAt) {
+          html += `<div class="approval-meta">${formatTime(app.decidedAt)}</div>`;
+        }
+        if (app.reason) {
+          html += `<div class="approval-reason">理由：${esc(app.reason)}</div>`;
+        }
       }
       html += `</div>`;
     }
@@ -341,9 +392,9 @@ export function renderRunDetail(state, callbacks) {
 
   // 时间线
   html += `<div class="timeline-container">`;
-  html += renderTimeline(state.timeline, "主时间线");
+  html += renderTimeline(state.timeline, "Agent 执行");
   if (state.verifierTimeline.length > 0) {
-    html += renderTimeline(state.verifierTimeline, "核查过程", true);
+    html += renderTimeline(state.verifierTimeline, "核查 Agent", true);
   }
   html += `</div>`;
 
@@ -368,6 +419,14 @@ export function renderRunDetail(state, callbacks) {
   }
 
   mainEl.innerHTML = html;
+
+  // 绑定窄屏返回按钮
+  if (callbacks.showBack && callbacks.onBack) {
+    const backBtn = document.getElementById("back-to-list-btn");
+    if (backBtn) {
+      backBtn.addEventListener("click", callbacks.onBack);
+    }
+  }
 
   // 绑定审批按钮
   mainEl.querySelectorAll("[data-action='allow']").forEach((btn) => {
@@ -461,13 +520,17 @@ function renderVerdictCard(v) {
 
 /**
  * 渲染空态提示。
+ * @param {boolean} [hasRuns] - 列表是否已有运行记录
  */
-export function renderEmptyState() {
+export function renderEmptyState(hasRuns) {
   const mainEl = document.getElementById("main-area");
   if (mainEl) {
+    const msg = hasRuns
+      ? "选择左侧运行查看详情，或创建新任务。"
+      : "尚无运行。";
     mainEl.innerHTML = `<div class="empty-state">
       <div class="empty-icon">📋</div>
-      <p>尚无运行。提交一个任务开始。</p>
+      <p>${msg}</p>
     </div>`;
   }
 }
@@ -509,4 +572,15 @@ function formatInput(input) {
 function formatTokens(n) {
   if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
   return String(n);
+}
+
+/**
+ * 格式化毫秒时间戳为可读时间。
+ * @param {number} ms
+ * @returns {string}
+ */
+function formatTime(ms) {
+  const d = new Date(ms);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }

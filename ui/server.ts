@@ -41,8 +41,11 @@ interface StoredRun {
   task: string;
   status: "running" | "done";
   verify: boolean;
+  createdAt: number;
+  finishedAt?: number;
   events: SSEEvent[];
   pendingApprovals: Map<string, PendingApproval>;
+  respondedApprovals: Set<string>;
   sseClients: Set<ServerResponse>;
 }
 
@@ -199,6 +202,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   /** 标记 run 完成并关闭所有 SSE 连接 */
   function finalizeRun(run: StoredRun): void {
     run.status = "done";
+    run.finishedAt = Date.now();
     for (const client of run.sseClients) {
       try { client.end(); } catch { /* ignore */ }
     }
@@ -347,6 +351,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           task: r.task,
           status: r.status,
           verify: r.verify,
+          createdAt: r.createdAt,
+          finishedAt: r.finishedAt ?? null,
         }));
         return json(res, 200, list);
       }
@@ -374,8 +380,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           task: parsed.task,
           status: "running",
           verify,
+          createdAt: Date.now(),
           events: [],
           pendingApprovals: new Map(),
+          respondedApprovals: new Set(),
           sseClients: new Set(),
         };
         runs.set(id, run);
@@ -398,8 +406,23 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       case "approval": {
         const run = runs.get(route.runId);
         if (!run) return notFound(res, `Run not found: ${route.runId}`);
+
         const pending = run.pendingApprovals.get(route.toolUseId);
-        if (!pending) return notFound(res, `Approval not found: ${route.toolUseId}`);
+        if (!pending) {
+          // 不在 pending 中：检查是否已应答或 run 已结束（R-01 幂等 + 状态不允许）
+          if (run.respondedApprovals.has(route.toolUseId)) {
+            return json(res, 409, { error: "Approval already decided" });
+          }
+          if (run.status === "done") {
+            return json(res, 409, { error: "Run already finished; approvals are no longer accepted" });
+          }
+          return notFound(res, `Approval not found: ${route.toolUseId}`);
+        }
+
+        // R-01: 运行结束后任何审批 POST 返回 409
+        if (run.status === "done") {
+          return json(res, 409, { error: "Run already finished; approvals are no longer accepted" });
+        }
 
         let body: string;
         try {
@@ -418,6 +441,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         }
 
         pending.respond(parsed.decision, parsed.reason);
+        run.respondedApprovals.add(route.toolUseId);
         run.pendingApprovals.delete(route.toolUseId);
         return json(res, 200, { acknowledged: true });
       }

@@ -9,9 +9,30 @@
  *   4. 审批卡生命周期（出现→标记已处理）
  *   5. verdict 三值卡模型（issues/unverified/advisory 各自到位）
  *   6. done 事件的 usage 脚注提取
+ *
+ * 阶段一新增:
+ *   7. verifier 审批不进 pendingApprovals（F2 前端侧）
+ *   8. done 事件 error stopReason 产生 error 标记
+ *   9. api_retry 和 compaction 进入时间线
+ *   10. R-01: done 事件将 pending 审批转为 expired
+ *   11. R-01: markApprovalResolved 设置 decidedAt 时间戳（只读记录模型）
+ *   12. R-01: 状态一致性 — list/header/approval 均从同一 state 字段派生
+ *   13. R-01: expirePendingApprovals 独立函数
+ *   14. AC7 文案 — renderEmptyState 区分空列表/未选中
  */
 import { describe, expect, it } from "vitest";
-import { createInitialState, reduceEvent, markApprovalResolved } from "../ui/public/app.js";
+import {
+  createInitialState,
+  reduceEvent,
+  markApprovalResolved,
+  expirePendingApprovals,
+} from "../ui/public/app.js";
+import { readFileSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 // ---- helpers ----
 
@@ -198,7 +219,7 @@ describe("reduceEvent", () => {
     expect(state.usage.cacheHitRatio).toBe(0.15);
   });
 
-  // ---- 额外: verifier approval 不进 pendingApprovals（F2 前端侧） ----
+  // ---- 7. verifier approval 不进 pendingApprovals（F2 前端侧） ----
   it("7. verifier 审批: 不进 pendingApprovals（仅进 verifierTimeline）", () => {
     let state = createInitialState("r7", "verify with approval", true);
 
@@ -217,7 +238,7 @@ describe("reduceEvent", () => {
     expect(state.verifierTimeline[0].toolUseId).toBe("vtu_check");
   });
 
-  // ---- 额外: error stopReason 标记 ----
+  // ---- 8. error stopReason 标记 ----
   it("8. done 事件 error stopReason 产生 error 标记", () => {
     let state = createInitialState("r8", "error task", false);
 
@@ -230,7 +251,7 @@ describe("reduceEvent", () => {
     expect(state.error).toBe("运行异常终止");
   });
 
-  // ---- 额外: api_retry 和 compaction 黄色提示条 ----
+  // ---- 9. api_retry 和 compaction 进入时间线 ----
   it("9. api_retry 和 compaction 进入时间线", () => {
     let state = createInitialState("r9", "retry task", false);
 
@@ -243,5 +264,207 @@ describe("reduceEvent", () => {
     expect(state.timeline[0].reason).toBe("timeout");
     expect(state.timeline[1].type).toBe("compaction");
     expect(state.timeline[1].droppedBlocks).toBe(15);
+  });
+
+  // ================================================================
+  // 阶段一 新增测试
+  // ================================================================
+
+  // ---- 10. R-01: done 事件将 pending 审批转为 expired ----
+  it("10. R-01: done 事件将 pending 审批转为 expired", () => {
+    let state = createInitialState("r10", "approval then done", false);
+
+    // 添加一个 pending 审批
+    state = reduceEvent(state, sse("main", "approval_request", {
+      toolUseId: "tu_expire",
+      name: "bash",
+      input: { cmd: "rm" },
+    }));
+
+    expect(state.pendingApprovals).toHaveLength(1);
+    expect(state.pendingApprovals[0].status).toBe("pending");
+
+    // 发送 done 事件
+    state = reduceEvent(state, sse("main", "done", {
+      stopReason: "completed",
+      usage: { inputTokens: 100, outputTokens: 50, turns: 1, cacheHitRatio: 0 },
+    }));
+
+    // pending 审批变为 expired
+    expect(state.pendingApprovals).toHaveLength(1);
+    expect(state.pendingApprovals[0].status).toBe("expired");
+    // run status 变为 done
+    expect(state.status).toBe("done");
+  });
+
+  // ---- 11. R-01: markApprovalResolved 设置 decidedAt 时间戳（只读记录模型） ----
+  it("11. R-01: markApprovalResolved 设置 decidedAt 时间戳（只读记录模型）", () => {
+    let state = createInitialState("r11", "approval record", false);
+
+    state = reduceEvent(state, sse("main", "approval_request", {
+      toolUseId: "tu_rec",
+      name: "write_file",
+      input: { path: "/f" },
+    }));
+
+    const beforeMark = Date.now();
+
+    // 允许
+    state = markApprovalResolved(state, "tu_rec", "allowed", "ok");
+    expect(state.pendingApprovals[0].status).toBe("allowed");
+    expect(state.pendingApprovals[0].reason).toBe("ok");
+    expect(state.pendingApprovals[0].decidedAt).toBeTypeOf("number");
+    expect(state.pendingApprovals[0].decidedAt).toBeGreaterThanOrEqual(beforeMark);
+
+    // 拒绝场景
+    let state2 = createInitialState("r11b", "deny record", false);
+    state2 = reduceEvent(state2, sse("main", "approval_request", {
+      toolUseId: "tu_deny2",
+      name: "rm",
+      input: {},
+    }));
+    state2 = markApprovalResolved(state2, "tu_deny2", "denied", "too risky");
+    expect(state2.pendingApprovals[0].status).toBe("denied");
+    expect(state2.pendingApprovals[0].reason).toBe("too risky");
+    expect(state2.pendingApprovals[0].decidedAt).toBeTypeOf("number");
+  });
+
+  // ---- 12. R-01: 状态一致性 — list/header/approval 均从同一 state 字段派生 ----
+  it("12. R-01: 状态一致性 — status/pendingApprovals 来自同一 state 源", () => {
+    // 此测试验证 reducer 返回的 state 对象中，status 与 pendingApprovals
+    // 是同一数据源的不同字段，渲染层直接从 state 读取而非各自推断。
+    let state = createInitialState("r12", "consistency", false);
+
+    // 初始: running + 无审批
+    expect(state.status).toBe("running");
+    expect(state.pendingApprovals).toHaveLength(0);
+
+    // 添加审批
+    state = reduceEvent(state, sse("main", "approval_request", {
+      toolUseId: "tu_c1",
+      name: "tool1",
+      input: {},
+    }));
+    expect(state.status).toBe("running");
+    expect(state.pendingApprovals).toHaveLength(1);
+    expect(state.pendingApprovals[0].status).toBe("pending");
+
+    // done 后: status=done + 审批 expired（同一 atomic 转换）
+    state = reduceEvent(state, sse("main", "done", {
+      stopReason: "completed",
+      usage: { inputTokens: 0, outputTokens: 0, turns: 0, cacheHitRatio: 0 },
+    }));
+    expect(state.status).toBe("done");
+    expect(state.pendingApprovals[0].status).toBe("expired");
+
+    // 验证: 从同一个 state 对象读取，没有额外推断
+    // header 读取 state.status → "done"
+    // approval 卡片读取 state.pendingApprovals[0].status → "expired"
+    // 两者来自同一 reduction 步骤，不可能不一致
+    expect(state.status === "done" && state.pendingApprovals[0].status === "expired").toBe(true);
+  });
+
+  // ---- 13. R-01: expirePendingApprovals 独立函数 ----
+  it("13. R-01: expirePendingApprovals 将 pending 审批转为 expired，已处理的不变", () => {
+    let state = createInitialState("r13", "expire fn", false);
+
+    // 添加一个 pending + 一个 allowed
+    state = reduceEvent(state, sse("main", "approval_request", {
+      toolUseId: "tu_e1",
+      name: "a",
+      input: {},
+    }));
+    state = reduceEvent(state, sse("main", "approval_request", {
+      toolUseId: "tu_e2",
+      name: "b",
+      input: {},
+    }));
+    state = markApprovalResolved(state, "tu_e1", "allowed", "ok");
+
+    // 此时: tu_e1=allowed, tu_e2=pending
+    expect(state.pendingApprovals[0].status).toBe("allowed");
+    expect(state.pendingApprovals[1].status).toBe("pending");
+
+    // 调用 expirePendingApprovals
+    state = expirePendingApprovals(state);
+
+    // tu_e1 保持 allowed, tu_e2 变为 expired
+    expect(state.pendingApprovals[0].status).toBe("allowed");
+    expect(state.pendingApprovals[1].status).toBe("expired");
+  });
+
+  // ---- 14. 空态文案: 列表有记录时用"选择左侧运行…" ----
+  it("14. 空态文案: renderEmptyState 区分空列表 vs 有记录未选中", () => {
+    // 静态检查: app.js 源码中必须包含两版文案
+    const appPath = join(__dirname, "..", "ui", "public", "app.js");
+    const appSrc = readFileSync(appPath, "utf-8");
+
+    // 新文案存在
+    expect(appSrc).toContain("尚无运行。");
+    expect(appSrc).toContain("选择左侧运行查看详情，或创建新任务。");
+
+    // 旧文案不存在
+    expect(appSrc).not.toContain("尚无运行。提交一个任务开始。");
+  });
+});
+
+// ================================================================
+// AC6: 窄屏 CSS 静态断言
+// ================================================================
+
+describe("AC6 窄屏 CSS", () => {
+  it("styles.css 含 max-width:700px 媒体查询实现单栏", () => {
+    const cssPath = join(__dirname, "..", "ui", "public", "styles.css");
+    const css = readFileSync(cssPath, "utf-8");
+
+    // 媒体查询存在
+    expect(css).toContain("@media");
+    expect(css).toContain("max-width: 700px");
+
+    // 侧栏隐藏规则
+    expect(css).toContain("narrow-hidden");
+
+    // 单栏 flex-direction: column
+    expect(css).toContain("flex-direction: column");
+  });
+});
+
+// ================================================================
+// AC7: 第 12 节文案逐条落地（静态文本断言）
+// ================================================================
+
+describe("AC7 第 12 节文案", () => {
+  it("index.html / app.js 新文案存在、旧文案不存在", () => {
+    const htmlPath = join(__dirname, "..", "ui", "public", "index.html");
+    const appPath = join(__dirname, "..", "ui", "public", "app.js");
+    const html = readFileSync(htmlPath, "utf-8");
+    const app = readFileSync(appPath, "utf-8");
+    const combined = html + "\n" + app;
+
+    // 新文案必须存在
+    expect(combined).toContain("开启独立核查");
+    expect(combined).toContain("运行任务");
+    expect(combined).toContain("Agent 执行");
+    expect(combined).toContain("核查 Agent");
+    expect(combined).toContain("允许本次");
+    expect(combined).toContain("拒绝并说明");
+    expect(combined).toContain("选择左侧运行查看详情，或创建新任务。");
+
+    // 旧文案必须不存在
+    // 注意："核查" 可能作为 badge 出现，所以检查复选框 label 文本
+    // label 在 html 中为 <span>开启独立核查</span>，而旧文案是 <span>核查</span>
+    // 用更精确的断言
+    const checkboxLabel = html.match(/<span>(核查|开启独立核查)<\/span>/);
+    expect(checkboxLabel).not.toBeNull();
+    expect(checkboxLabel[1]).toBe("开启独立核查");
+
+    // "提交" 按钮旧文案
+    expect(html).not.toContain('>提交</button>');
+
+    // "主时间线" 旧文案
+    expect(app).not.toContain("主时间线");
+
+    // "核查过程" 旧文案
+    expect(app).not.toContain("核查过程");
   });
 });

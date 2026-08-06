@@ -9,7 +9,7 @@
 <body>
 
 <!-- 侧栏：运行列表 -->
-<aside class="sidebar">
+<aside class="sidebar" id="sidebar">
   <div class="sidebar-header">📋 运行列表</div>
   <div id="run-list" class="run-list">
     <div class="run-list-empty">加载中…</div>
@@ -17,22 +17,22 @@
 </aside>
 
 <!-- 主区 -->
-<main class="main">
+<main class="main" id="main-panel">
   <!-- 提交栏 -->
   <form id="submit-form" class="submit-bar" autocomplete="off">
     <textarea id="task-input" placeholder="输入任务描述…" rows="1"></textarea>
     <label>
       <input type="checkbox" id="verify-toggle" />
-      <span>核查</span>
+      <span>开启独立核查</span>
     </label>
-    <button type="submit" class="btn btn--primary" id="submit-btn">提交</button>
+    <button type="submit" class="btn btn--primary" id="submit-btn">运行任务</button>
   </form>
 
   <!-- 内容区 -->
   <div id="main-area" class="content-area">
     <div class="empty-state">
       <div class="empty-icon">📋</div>
-      <p>尚无运行。提交一个任务开始。</p>
+      <p>尚无运行。</p>
     </div>
   </div>
 </main>
@@ -47,6 +47,7 @@ import {
   createInitialState,
   reduceEvent,
   markApprovalResolved,
+  expirePendingApprovals,
   renderRunList,
   renderRunDetail,
   renderEmptyState,
@@ -56,7 +57,7 @@ import {
 /** @type {Map<string, import('/app.js').RunState>} */
 const runStates = new Map();
 let selectedRunId = /** @type {string|null} */ (null);
-let runs = /** @type {{runId:string, task:string, status:string, verify:boolean}[]} */ ([]);
+let runs = /** @type {{runId:string, task:string, status:string, verify:boolean, createdAt:number, finishedAt:number|null}[]} */ ([]);
 let eventSources = /** @type {Map<string, EventSource>} */ (new Map());
 
 // ---- DOM 引用 ----
@@ -64,6 +65,38 @@ const submitForm = /** @type {HTMLFormElement} */ (document.getElementById("subm
 const taskInput = /** @type {HTMLTextAreaElement} */ (document.getElementById("task-input"));
 const verifyToggle = /** @type {HTMLInputElement} */ (document.getElementById("verify-toggle"));
 const submitBtn = /** @type {HTMLButtonElement} */ (document.getElementById("submit-btn"));
+const sidebar = /** @type {HTMLElement} */ (document.getElementById("sidebar"));
+const mainPanel = /** @type {HTMLElement} */ (document.getElementById("main-panel"));
+
+// ---- 响应式：窄屏视图状态 ----
+const NARROW_BP = 700;
+function isNarrow() {
+  return window.innerWidth <= NARROW_BP;
+}
+
+/** 窄屏：切换到详情视图（隐藏侧栏） */
+function enterDetailMode() {
+  if (isNarrow()) {
+    sidebar.classList.add("narrow-hidden");
+    mainPanel.classList.add("narrow-full");
+  }
+}
+
+/** 窄屏：返回列表视图（显示侧栏） */
+function exitDetailMode() {
+  if (isNarrow()) {
+    sidebar.classList.remove("narrow-hidden");
+    mainPanel.classList.remove("narrow-full");
+    selectedRunId = null;
+    renderRunList(runs, null, selectRun);
+    renderEmptyState(runs.length > 0);
+  }
+}
+
+/** 返回列表按钮回调 */
+function backToList() {
+  exitDetailMode();
+}
 
 // ---- 加载运行列表 ----
 async function loadRuns() {
@@ -72,6 +105,10 @@ async function loadRuns() {
     if (!res.ok) return;
     runs = await res.json();
     renderRunList(runs, selectedRunId, selectRun);
+    // 更新空态文案（列表有记录但未选中 vs 列表为空）
+    if (!selectedRunId) {
+      renderEmptyState(runs.length > 0);
+    }
   } catch {
     // 服务器未就绪时静默
   }
@@ -85,7 +122,8 @@ function selectRun(runId) {
 
   const existing = runStates.get(runId);
   if (existing) {
-    renderRunDetail(existing, approvalCallbacks(runId));
+    renderRunDetail(existing, approvalCallbacks(runId, isNarrow()));
+    enterDetailMode();
     return;
   }
 
@@ -94,8 +132,9 @@ function selectRun(runId) {
   if (!info) return;
   const state = createInitialState(runId, info.task, info.verify);
   runStates.set(runId, state);
-  renderRunDetail(state, approvalCallbacks(runId));
+  renderRunDetail(state, approvalCallbacks(runId, isNarrow()));
 
+  enterDetailMode();
   subscribeSSE(runId);
 }
 
@@ -117,7 +156,7 @@ function subscribeSSE(runId) {
 
       // 仅当该 run 仍在查看时重渲染
       if (selectedRunId === runId) {
-        renderRunDetail(next, approvalCallbacks(runId));
+        renderRunDetail(next, approvalCallbacks(runId, isNarrow()));
       }
 
       // 完成后刷新运行列表
@@ -132,23 +171,29 @@ function subscribeSSE(runId) {
   es.addEventListener("error", () => {
     es.close();
     eventSources.delete(runId);
-    // 刷新列表以获取最终状态
+    // 刷新列表以获取最终状态；同时将本地 run state 中 pending 审批 expire
+    const state = runStates.get(runId);
+    if (state && state.status !== "done") {
+      const expired = expirePendingApprovals(state);
+      runStates.set(runId, expired);
+      if (selectedRunId === runId) {
+        renderRunDetail(expired, approvalCallbacks(runId, isNarrow()));
+      }
+    }
     loadRuns();
   });
 }
 
 // ---- 审批回调 ----
-function approvalCallbacks(runId) {
+function approvalCallbacks(runId, narrow) {
   return {
+    showBack: narrow,
+    onBack: backToList,
     onAllow(toolUseId) {
       postApproval(runId, toolUseId, "allow");
     },
-    onDeny(toolUseId) {
-      // 无理由也拒绝
-      postApproval(runId, toolUseId, "deny", "");
-    },
     onDenyReason(toolUseId, reason) {
-      postApproval(runId, toolUseId, "deny", reason);
+      postApproval(runId, toolUseId, "deny", reason || "");
     },
   };
 }
@@ -160,6 +205,8 @@ async function postApproval(runId, toolUseId, decision, reason) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ decision, reason }),
     });
+    // R-01: 409 表示幂等冲突或状态不允许，前端不更新状态
+    if (res.status === 409) return;
     if (!res.ok) return;
     // 本地标记已处理
     const state = runStates.get(runId);
@@ -172,7 +219,7 @@ async function postApproval(runId, toolUseId, decision, reason) {
       );
       runStates.set(runId, next);
       if (selectedRunId === runId) {
-        renderRunDetail(next, approvalCallbacks(runId));
+        renderRunDetail(next, approvalCallbacks(runId, isNarrow()));
       }
     }
   } catch {
@@ -207,10 +254,11 @@ submitForm.addEventListener("submit", async (e) => {
     runStates.set(runId, state);
 
     // 加入列表并选中
-    runs.unshift({ runId, task, status: "running", verify });
+    runs.unshift({ runId, task, status: "running", verify, createdAt: Date.now(), finishedAt: null });
     selectedRunId = runId;
     renderRunList(runs, selectedRunId, selectRun);
-    renderRunDetail(state, approvalCallbacks(runId));
+    renderRunDetail(state, approvalCallbacks(runId, isNarrow()));
+    enterDetailMode();
 
     // 订阅 SSE
     subscribeSSE(runId);
@@ -221,7 +269,7 @@ submitForm.addEventListener("submit", async (e) => {
     alert("提交失败：" + (err.message ?? "网络错误"));
   } finally {
     submitBtn.disabled = false;
-    submitBtn.textContent = "提交";
+    submitBtn.textContent = "运行任务";
   }
 });
 

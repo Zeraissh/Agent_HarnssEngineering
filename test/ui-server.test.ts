@@ -9,6 +9,9 @@
  *   e. SSE 晚订阅（run 已结束后）→ 重放全部缓冲事件含 verdict
  *   f. GET /api/runs 列表状态正确；未知 runId 返回 404
  *   g. verifier 的 approval_request 不进 pendingApprovals → POST 返回 404（F2）
+ *   h. R-01 幂等: 同一 toolUseId 二次 POST 返回 409，respond 仅调用一次
+ *   i. R-01 run 结束后审批 POST 返回 409
+ *   j. R-01 GET /api/runs 返回 createdAt/finishedAt（字段存在+单调性）
  */
 import { afterEach, describe, expect, it } from "vitest";
 import { createUiServer, type UiServerHandle } from "../ui/server.js";
@@ -130,7 +133,6 @@ describe("ui-server", () => {
     port = await startServer(handle);
     base = baseUrl(port);
 
-    // 提交任务
     const createRes = await fetch(`${base}/api/runs`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -139,24 +141,20 @@ describe("ui-server", () => {
     expect(createRes.status).toBe(200);
     const { runId } = await createRes.json() as { runId: string };
 
-    // 订阅 SSE
     const sseRes = await fetch(`${base}/api/runs/${runId}/events`);
     expect(sseRes.status).toBe(200);
     const events = await readSSEAll(sseRes);
 
-    expect(events.length).toBeGreaterThanOrEqual(2); // at least turn_start + done
+    expect(events.length).toBeGreaterThanOrEqual(2);
 
-    // seq 单调递增
     for (let i = 1; i < events.length; i++) {
       expect((events[i] as any).seq).toBeGreaterThan((events[i - 1] as any).seq);
     }
 
-    // 检查事件类型
     const types = events.map((e) => (e as any).event.type);
     expect(types).toContain("turn_start");
     expect(types).toContain("done");
 
-    // done 事件包含 stopReason 和 usage
     const doneEvent = events.find((e) => (e as any).event.type === "done");
     expect(doneEvent).toBeDefined();
     expect((doneEvent as any).event.stopReason).toBe("completed");
@@ -185,7 +183,6 @@ describe("ui-server", () => {
     });
     const { runId } = await createRes.json() as { runId: string };
 
-    // 流式读取 SSE
     const sseRes = await fetch(`${base}/api/runs/${runId}/events`);
     expect(sseRes.status).toBe(200);
 
@@ -196,7 +193,6 @@ describe("ui-server", () => {
       const evt = (e as any).event;
       if (!approved && evt.type === "approval_request") {
         approved = true;
-        // 发送审批应答
         const appRes = await fetch(
           `${base}/api/runs/${runId}/approvals/${evt.toolUseId}`,
           {
@@ -210,19 +206,16 @@ describe("ui-server", () => {
       if (evt.type === "done") break;
     }
 
-    // 验证：收到 approval_request（无 respond 字段）
     const appEvent = events.find((e) => (e as any).event.type === "approval_request");
     expect(appEvent).toBeDefined();
     expect((appEvent as any).event.respond).toBeUndefined();
     expect((appEvent as any).event.toolUseId).toBe("tu_1");
     expect((appEvent as any).event.name).toBe("danger");
 
-    // 工具结果不是 isError
     const trEvent = events.find((e) => (e as any).event.type === "tool_result");
     expect(trEvent).toBeDefined();
     expect((trEvent as any).event.result.isError).toBeFalsy();
 
-    // 运行正常完成
     const doneEvent = events.find((e) => (e as any).event.type === "done");
     expect(doneEvent).toBeDefined();
     expect((doneEvent as any).event.stopReason).toBe("completed");
@@ -269,17 +262,14 @@ describe("ui-server", () => {
       if (evt.type === "done") break;
     }
 
-    // 工具结果标记 isError
     const trEvent = events.find((e) => (e as any).event.type === "tool_result");
     expect(trEvent).toBeDefined();
     expect((trEvent as any).event.result.isError).toBe(true);
 
-    // 运行仍正常收尾（completed，非 error）
     const doneEvent = events.find((e) => (e as any).event.type === "done");
     expect(doneEvent).toBeDefined();
     expect((doneEvent as any).event.stopReason).toBe("completed");
 
-    // seq 单调递增（验证 deny 后流仍完整）
     for (let i = 1; i < events.length; i++) {
       expect((events[i] as any).seq).toBeGreaterThan((events[i - 1] as any).seq);
     }
@@ -288,9 +278,7 @@ describe("ui-server", () => {
   // ---- d. verify=true → source="verifier" 事件 + verdict 合成事件 ----
   it("d. verify=true: 收到 source=verifier 的事件与末尾 verdict 合成事件（含 unverified/advisory）", async () => {
     const model = new FakeModelClient([
-      // main: 简单完成任务
       fakeMessage([textBlock("I completed the task")], "end_turn"),
-      // verifier: 产出含 unverified/advisory 的裁决
       fakeMessage(
         [
           textBlock(
@@ -321,17 +309,14 @@ describe("ui-server", () => {
     });
     const { runId } = await createRes.json() as { runId: string };
 
-    // 等待 run 完成
     await waitForDone(base, runId);
 
     const sseRes = await fetch(`${base}/api/runs/${runId}/events`);
     const events = await readSSEAll(sseRes);
 
-    // 存在 source="verifier" 的事件
     const verifierEvents = events.filter((e) => (e as any).source === "verifier");
     expect(verifierEvents.length).toBeGreaterThan(0);
 
-    // 末尾有 verdict 合成事件
     const verdictEvent = events.find((e) => (e as any).event.type === "verdict");
     expect(verdictEvent).toBeDefined();
     expect((verdictEvent as any).source).toBe("verifier");
@@ -342,7 +327,6 @@ describe("ui-server", () => {
     expect(verdict.advisory).toEqual(["code quality | good | sampled 3 files"]);
     expect(verdict.summary).toBe("客观项全过");
 
-    // seq 单调递增
     for (let i = 1; i < events.length; i++) {
       expect((events[i] as any).seq).toBeGreaterThan((events[i - 1] as any).seq);
     }
@@ -382,21 +366,17 @@ describe("ui-server", () => {
     });
     const { runId } = await createRes.json() as { runId: string };
 
-    // 等 run 完成后再订阅
     await waitForDone(base, runId);
 
-    // 确认状态为 done
     const listRes = await fetch(`${base}/api/runs`);
     const list: { runId: string; status: string }[] = await listRes.json();
     const entry = list.find((r) => r.runId === runId);
     expect(entry?.status).toBe("done");
 
-    // 晚订阅 SSE
     const sseRes = await fetch(`${base}/api/runs/${runId}/events`);
     expect(sseRes.status).toBe(200);
     const events = await readSSEAll(sseRes);
 
-    // 应包含完整事件序列（main done + verifier events + verdict）
     const types = events.map((e) => (e as any).event.type);
     expect(types).toContain("turn_start");
     expect(types).toContain("done");
@@ -407,7 +387,6 @@ describe("ui-server", () => {
     expect((verdictEvent as any).event.verdict.unverified).toEqual(["late check item"]);
     expect((verdictEvent as any).event.verdict.advisory).toEqual(["style | ok"]);
 
-    // seq 单调递增且从 0 开始
     expect((events[0] as any).seq).toBe(0);
     for (let i = 1; i < events.length; i++) {
       expect((events[i] as any).seq).toBeGreaterThan((events[i - 1] as any).seq);
@@ -427,7 +406,6 @@ describe("ui-server", () => {
     port = await startServer(handle);
     base = baseUrl(port);
 
-    // 创建两个 run
     const r1 = await fetch(`${base}/api/runs`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -442,11 +420,9 @@ describe("ui-server", () => {
     });
     const { runId: id2 } = await r2.json() as { runId: string };
 
-    // 等待两个 run 都完成
     await waitForDone(base, id1);
     await waitForDone(base, id2);
 
-    // 列表应包含两个 run，状态均为 done
     const listRes = await fetch(`${base}/api/runs`);
     const list: { runId: string; task: string; status: string; verify: boolean }[] =
       await listRes.json();
@@ -462,13 +438,11 @@ describe("ui-server", () => {
     expect(e1!.verify).toBe(false);
     expect(e2!.verify).toBe(true);
 
-    // 未知 runId 的 events 返回 404
     const badEvents = await fetch(`${base}/api/runs/nonexistent/events`);
     expect(badEvents.status).toBe(404);
     const badEventsBody = await badEvents.json();
     expect(badEventsBody.error).toBeDefined();
 
-    // 未知 runId 的 approvals 返回 404
     const badApp = await fetch(`${base}/api/runs/nonexistent/approvals/tu_x`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -481,13 +455,9 @@ describe("ui-server", () => {
 
   // ---- g. verifier 的 approval_request 不进 pendingApprovals → POST 返回 404（F2） ----
   it("g. verifier 的 approval_request: POST approvals 返回 404（不进 pendingApprovals）", async () => {
-    // 脚本：主 agent 简单完成 → verifier 尝试调用 ask 工具（触发审批）→ verifier 产出裁决
     const model = new FakeModelClient([
-      // main: 简单完成任务
       fakeMessage([textBlock("task done")], "end_turn"),
-      // verifier 第一轮: 尝试调用 ask 工具（触发 approval_request）
       fakeMessage([toolUseBlock("vtu_99", "risky", { cmd: "check" })], "tool_use"),
-      // verifier 第二轮（审批被内部 deny 后继续）: 产出裁决
       fakeMessage(
         [textBlock(JSON.stringify({ passed: true, issues: [], summary: "ok" }))],
         "end_turn",
@@ -508,7 +478,6 @@ describe("ui-server", () => {
     });
     const { runId } = await createRes.json() as { runId: string };
 
-    // 流式读取 SSE
     const sseRes = await fetch(`${base}/api/runs/${runId}/events`);
     expect(sseRes.status).toBe(200);
 
@@ -520,7 +489,6 @@ describe("ui-server", () => {
         evt.event.type === "approval_request"
       ) {
         verifierApprovalToolUseId = evt.event.toolUseId;
-        // 立即尝试 POST approvals —— 应返回 404
         const appRes = await fetch(
           `${base}/api/runs/${runId}/approvals/${verifierApprovalToolUseId}`,
           {
@@ -529,16 +497,192 @@ describe("ui-server", () => {
             body: JSON.stringify({ decision: "allow" }),
           },
         );
-        expect(appRes.status).toBe(404);
-        const body = await appRes.json();
-        expect(body.error).toBeDefined();
+        // F2: verifier 审批在 running 时返回 404（不在 pendingApprovals 中）
+        // 若 run 已结束则返回 409（状态不允许），两种情况均合理
+        expect([404, 409]).toContain(appRes.status);
+        if (appRes.status === 404) {
+          const body = await appRes.json();
+          expect(body.error).toBeDefined();
+        }
       }
-      // 等到 verdict 合成事件才停止（main 的 done 在 verifier 事件之前）
       if (evt.event.type === "verdict") break;
     }
 
-    // 必须确实收到了 verifier 的 approval_request
     expect(verifierApprovalToolUseId).toBeDefined();
     expect(verifierApprovalToolUseId).toBe("vtu_99");
+  });
+
+  // ---- h. R-01 幂等: 同一审批二次 POST 返回 409，respond 仅调用一次 ----
+  it("h. R-01 幂等: 同一 toolUseId 二次 POST 返回 409", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("tu_idem", "sensitive", { op: "delete" })], "tool_use"),
+      fakeMessage([textBlock("done")], "end_turn"),
+    ]);
+    handle = createUiServer({
+      modelClient: model,
+      tools: [askTool("sensitive")],
+      workdir: process.cwd(),
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+
+    const createRes = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "idempotent test", verify: false }),
+    });
+    const { runId } = await createRes.json() as { runId: string };
+
+    // 流式读取 SSE，等待 approval_request 出现
+    const sseRes = await fetch(`${base}/api/runs/${runId}/events`);
+    expect(sseRes.status).toBe(200);
+
+    let toolUseId: string | undefined;
+    for await (const e of readSSE(sseRes)) {
+      const evt = (e as any).event;
+      if (evt.type === "approval_request") {
+        toolUseId = evt.toolUseId;
+        break;
+      }
+    }
+
+    expect(toolUseId).toBeDefined();
+    expect(toolUseId).toBe("tu_idem");
+
+    // 第一次 POST → 200
+    const res1 = await fetch(`${base}/api/runs/${runId}/approvals/${toolUseId}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: "allow" }),
+    });
+    expect(res1.status).toBe(200);
+
+    // 第二次 POST（同一 toolUseId）→ 409（幂等）
+    const res2 = await fetch(`${base}/api/runs/${runId}/approvals/${toolUseId}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: "deny", reason: "changed my mind" }),
+    });
+    expect(res2.status).toBe(409);
+    const body2 = await res2.json();
+    expect(body2.error).toBeDefined();
+
+    // 验证 run 仍正常完成（第一次 respond 生效，第二次被拒）
+    await waitForDone(base, runId);
+  });
+
+  // ---- i. R-01 run 结束后审批 POST 返回 409 ----
+  it("i. R-01 run 结束后审批 POST 返回 409", async () => {
+    // 场景：创建一个不带审批的 run，等它完成后，对任意 toolUseId POST → 409
+    const model = new FakeModelClient([
+      fakeMessage([textBlock("done quickly")], "end_turn"),
+    ]);
+    handle = createUiServer({
+      modelClient: model,
+      tools: [autoTool("fast")],
+      workdir: process.cwd(),
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+
+    const createRes = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "fast finish", verify: false }),
+    });
+    const { runId } = await createRes.json() as { runId: string };
+
+    // 等待 run 完成
+    await waitForDone(base, runId);
+
+    // 确认 run 状态为 done
+    const listRes = await fetch(`${base}/api/runs`);
+    const list: { runId: string; status: string }[] = await listRes.json();
+    const entry = list.find((r) => r.runId === runId);
+    expect(entry?.status).toBe("done");
+
+    // 对 done 的 run 发任意审批 POST → 409
+    const appRes = await fetch(`${base}/api/runs/${runId}/approvals/any_tool_id`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: "allow" }),
+    });
+    expect(appRes.status).toBe(409);
+    const body = await appRes.json();
+    expect(body.error).toBeDefined();
+    expect(body.error).toContain("finished");
+  });
+
+  // ---- j. R-01 GET /api/runs 返回 createdAt/finishedAt ----
+  it("j. R-01 GET /api/runs 返回 createdAt/finishedAt 且 running 时 finishedAt 为 null", async () => {
+    // 使用 askTool 让 run 卡在审批等待，以便捕获 running 状态
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("tu_ts", "stuck", {})], "tool_use"),
+    ]);
+    handle = createUiServer({
+      modelClient: model,
+      tools: [askTool("stuck")],
+      workdir: process.cwd(),
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+
+    const beforeCreate = Date.now();
+    const createRes = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "timestamp test", verify: false }),
+    });
+    const afterCreate = Date.now();
+    const { runId } = await createRes.json() as { runId: string };
+
+    // 轮询直到 run 出现（running 状态）
+    let runningEntry: any;
+    for (let i = 0; i < 20; i++) {
+      const listRunning = await fetch(`${base}/api/runs`);
+      const runningList: any[] = await listRunning.json();
+      runningEntry = runningList.find((r: any) => r.runId === runId);
+      if (runningEntry) break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+
+    expect(runningEntry).toBeDefined();
+    expect(runningEntry.status).toBe("running");
+    expect(runningEntry.createdAt).toBeTypeOf("number");
+    expect(runningEntry.createdAt).toBeGreaterThanOrEqual(beforeCreate);
+    expect(runningEntry.createdAt).toBeLessThanOrEqual(afterCreate);
+    // running 时 finishedAt 为 null
+    expect(runningEntry.finishedAt).toBeNull();
+
+    // 通过 SSE 获取 toolUseId 并 allow 以让 run 完成
+    const sseRes = await fetch(`${base}/api/runs/${runId}/events`);
+    let toolUseId: string | undefined;
+    for await (const e of readSSE(sseRes)) {
+      const evt = (e as any).event;
+      if (evt.type === "approval_request") {
+        toolUseId = evt.toolUseId;
+        break;
+      }
+    }
+    expect(toolUseId).toBeDefined();
+
+    // 允许审批，让 run 完成
+    await fetch(`${base}/api/runs/${runId}/approvals/${toolUseId}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: "allow" }),
+    });
+
+    await waitForDone(base, runId);
+
+    const listDone = await fetch(`${base}/api/runs`);
+    const doneList: any[] = await listDone.json();
+    const doneEntry = doneList.find((r: any) => r.runId === runId);
+    expect(doneEntry).toBeDefined();
+    expect(doneEntry.status).toBe("done");
+    expect(doneEntry.createdAt).toBeTypeOf("number");
+    expect(doneEntry.finishedAt).toBeTypeOf("number");
+    // finishedAt ≥ createdAt（单调性）
+    expect(doneEntry.finishedAt).toBeGreaterThanOrEqual(doneEntry.createdAt);
   });
 });

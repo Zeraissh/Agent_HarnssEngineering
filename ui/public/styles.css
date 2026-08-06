@@ -191,6 +191,16 @@ body {
   padding: 16px;
 }
 
+/* ---- 窄屏返回栏 ---- */
+
+.back-bar {
+  margin-bottom: 8px;
+}
+
+.back-btn {
+  font-size: 12px;
+}
+
 /* ---- 详情头 ---- */
 
 .detail-header { margin-bottom: 16px; }
@@ -230,7 +240,14 @@ body {
 
 .approval-result { font-size: 11px; padding: 1px 6px; border-radius: 3px; }
 .approval-result--allow { background: #1a3a1a; color: var(--green); }
-.approval-result--deny { background: #3a1a1a; color: var(--red); }
+.approval-result--deny { background: #3a3a1a; color: var(--red); }
+.approval-result--expired { background: var(--bg3); color: var(--fg2); }
+
+.approval-meta {
+  font-size: 11px;
+  color: var(--fg2);
+  margin-top: 4px;
+}
 
 .approval-input {
   font-size: 11px;
@@ -434,3 +451,70 @@ body {
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--fg2); }
+
+/* ================================================================
+   R-02: 窄屏单栏布局（≤700px）
+   ================================================================ */
+
+@media (max-width: 700px) {
+  body {
+    flex-direction: column;
+    overflow: auto;
+    height: auto;
+    min-height: 100vh;
+  }
+
+  /* 侧栏：默认全宽显示运行列表 */
+  .sidebar {
+    width: 100%;
+    min-width: 0;
+    max-height: none;
+    flex: none;
+  }
+
+  /* 窄屏详情模式：隐藏侧栏 */
+  .sidebar.narrow-hidden {
+    display: none;
+  }
+
+  /* 主区：默认与侧栏分层 */
+  .main {
+    width: 100%;
+    flex: 1;
+    min-height: 0;
+  }
+
+  /* 窄屏详情模式：主区全高 */
+  .main.narrow-full {
+    flex: 1;
+  }
+
+  /* 提交栏自适应 */
+  .submit-bar {
+    flex-wrap: wrap;
+  }
+
+  .submit-bar textarea {
+    min-width: 120px;
+  }
+
+  /* 时间线在窄屏下堆叠 */
+  .timeline-container {
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .timeline {
+    min-width: 0;
+  }
+
+  /* 审批卡片窄屏优化 */
+  .approval-actions {
+    flex-wrap: wrap;
+  }
+
+  .approval-actions .btn {
+    flex: 1;
+    min-width: 80px;
+  }
+}
