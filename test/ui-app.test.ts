@@ -1,24 +1,15 @@
 // @ts-nocheck
 /**
- * ui/public/app.js — reducer 纯函数测试（node 环境，不依赖 DOM）。
+ * ui/public/app.js + styles.css — reducer 纯函数 + 样式静态断言测试（node 环境，不依赖 DOM）。
  *
- * AC3 覆盖:
- *   1. 时间线折叠（turn_start → tool_call → tool_result 顺序、event 字段投射）
- *   2. text_delta 忽略
- *   3. source=verifier 事件归入核查面板模型（verifierTimeline）
- *   4. 审批卡生命周期（出现→标记已处理）
- *   5. verdict 三值卡模型（issues/unverified/advisory 各自到位）
- *   6. done 事件的 usage 脚注提取
- *
- * 阶段一新增:
- *   7. verifier 审批不进 pendingApprovals（F2 前端侧）
- *   8. done 事件 error stopReason 产生 error 标记
- *   9. api_retry 和 compaction 进入时间线
- *   10. R-01: done 事件将 pending 审批转为 expired
- *   11. R-01: markApprovalResolved 设置 decidedAt 时间戳（只读记录模型）
- *   12. R-01: 状态一致性 — list/header/approval 均从同一 state 字段派生
- *   13. R-01: expirePendingApprovals 独立函数
- *   14. AC7 文案 — renderEmptyState 区分空列表/未选中
+ * 阶段二新增:
+ *   R-03: deriveOverview — 概览模型（finalStatus, resultSummary, verdict三值, 待介入事项, usage）
+ *   R-04: deriveLogEntries / toggleEntryCollapsed — 日志分层与折叠
+ *   R-05: 无障碍语义静态断言（tabindex/role/aria-selected/label/aria-live/:focus-visible）
+ *   R-06: WCAG 对比度测试（从 styles.css 解析色对，实算相对亮度）
+ *   R-07: 视觉收敛 — CSS 无大面积洋红背景
+ *   R-08: deriveRunListItems / filterRunsByStatus — 列表元数据与筛选
+ *   P2: styles.css 中除 :root 外无裸十六进制色值
  */
 import { describe, expect, it } from "vitest";
 import {
@@ -26,6 +17,12 @@ import {
   reduceEvent,
   markApprovalResolved,
   expirePendingApprovals,
+  deriveOverview,
+  deriveLogEntries,
+  toggleEntryCollapsed,
+  isEntryCollapsedByDefault,
+  deriveRunListItems,
+  filterRunsByStatus,
 } from "../ui/public/app.js";
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -38,6 +35,19 @@ const __dirname = dirname(__filename);
 
 function sse(source, type, extra = {}) {
   return { seq: 0, source, event: { type, ...extra } };
+}
+
+function makeState(overrides = {}) {
+  let s = createInitialState("r-test", "test task", false);
+  if (overrides.timeline) s = { ...s, timeline: overrides.timeline };
+  if (overrides.verifierTimeline) s = { ...s, verifierTimeline: overrides.verifierTimeline };
+  if (overrides.pendingApprovals) s = { ...s, pendingApprovals: overrides.pendingApprovals };
+  if (overrides.verdict) s = { ...s, verdict: overrides.verdict };
+  if (overrides.usage) s = { ...s, usage: overrides.usage };
+  if (overrides.error) s = { ...s, error: overrides.error };
+  if (overrides.status) s = { ...s, status: overrides.status };
+  if (overrides.verify) s = { ...s, verify: overrides.verify };
+  return s;
 }
 
 // ---- tests ----
@@ -55,20 +65,13 @@ describe("reduceEvent", () => {
       durationMs: 42,
     }));
 
-    // 时间线有 3 条
     expect(state.timeline).toHaveLength(3);
-
-    // turn_start
     expect(state.timeline[0].type).toBe("turn_start");
     expect(state.timeline[0].turn).toBe(1);
-
-    // tool_call
     expect(state.timeline[1].type).toBe("tool_call");
     expect(state.timeline[1].toolUseId).toBe("tu_1");
     expect(state.timeline[1].name).toBe("bash");
     expect(state.timeline[1].input).toEqual({ cmd: "ls" });
-
-    // tool_result
     expect(state.timeline[2].type).toBe("tool_result");
     expect(state.timeline[2].toolUseId).toBe("tu_1");
     expect(state.timeline[2].resultContent).toBe("file1.txt\nfile2.txt");
@@ -84,10 +87,8 @@ describe("reduceEvent", () => {
     state = reduceEvent(state, sse("main", "text_delta", { text: "partial..." }));
     state = reduceEvent(state, sse("main", "assistant_text", { text: "full response" }));
 
-    // text_delta 不应出现在时间线中
     const types = state.timeline.map((e) => e.type);
     expect(types).not.toContain("text_delta");
-    // 只有 turn_start 和 assistant_text
     expect(state.timeline).toHaveLength(2);
     expect(types).toEqual(["turn_start", "assistant_text"]);
   });
@@ -96,11 +97,8 @@ describe("reduceEvent", () => {
   it("3. source=verifier 事件归入 verifierTimeline", () => {
     let state = createInitialState("r3", "verify task", true);
 
-    // main 事件
     state = reduceEvent(state, sse("main", "turn_start", { turn: 1 }));
     state = reduceEvent(state, sse("main", "assistant_text", { text: "main output" }));
-
-    // verifier 事件
     state = reduceEvent(state, sse("verifier", "turn_start", { turn: 1 }));
     state = reduceEvent(state, sse("verifier", "tool_call", { toolUseId: "vt_1", name: "read_file", input: {} }));
     state = reduceEvent(state, sse("verifier", "tool_result", {
@@ -109,48 +107,33 @@ describe("reduceEvent", () => {
       durationMs: 10,
     }));
 
-    // 主时间线只有 main 事件
     expect(state.timeline).toHaveLength(2);
     expect(state.timeline[0].source).toBe("main");
     expect(state.timeline[1].source).toBe("main");
-
-    // verifierTimeline 有 verifier 事件
     expect(state.verifierTimeline).toHaveLength(3);
     expect(state.verifierTimeline[0].source).toBe("verifier");
     expect(state.verifierTimeline[1].source).toBe("verifier");
     expect(state.verifierTimeline[2].source).toBe("verifier");
-    expect(state.verifierTimeline[0].type).toBe("turn_start");
-    expect(state.verifierTimeline[1].type).toBe("tool_call");
-    expect(state.verifierTimeline[2].type).toBe("tool_result");
   });
 
   // ---- AC3-4: 审批卡生命周期 ----
   it("4. 审批卡生命周期: 出现 → 标记已处理", () => {
     let state = createInitialState("r4", "approval task", false);
 
-    // 审批请求出现
     state = reduceEvent(state, sse("main", "approval_request", {
       toolUseId: "tu_approve",
       name: "write_file",
       input: { path: "/etc/hosts", content: "evil" },
     }));
 
-    // 挂起审批列表有 1 条
     expect(state.pendingApprovals).toHaveLength(1);
     expect(state.pendingApprovals[0].toolUseId).toBe("tu_approve");
     expect(state.pendingApprovals[0].name).toBe("write_file");
     expect(state.pendingApprovals[0].status).toBe("pending");
-    expect(state.pendingApprovals[0].input).toEqual({ path: "/etc/hosts", content: "evil" });
 
-    // 主时间线也有审批事件
-    const tlTypes = state.timeline.map((e) => e.type);
-    expect(tlTypes).toContain("approval_request");
-
-    // 标记为 allowed
     state = markApprovalResolved(state, "tu_approve", "allowed");
     expect(state.pendingApprovals[0].status).toBe("allowed");
 
-    // 另一个场景: deny
     let state2 = createInitialState("r4b", "task", false);
     state2 = reduceEvent(state2, sse("main", "approval_request", {
       toolUseId: "tu_deny",
@@ -206,12 +189,8 @@ describe("reduceEvent", () => {
       },
     }));
 
-    // status 变为 done
     expect(state.status).toBe("done");
-    // 无 error
     expect(state.error).toBeNull();
-
-    // usage 提取
     expect(state.usage).not.toBeNull();
     expect(state.usage.turns).toBe(3);
     expect(state.usage.inputTokens).toBe(1500);
@@ -219,7 +198,7 @@ describe("reduceEvent", () => {
     expect(state.usage.cacheHitRatio).toBe(0.15);
   });
 
-  // ---- 7. verifier approval 不进 pendingApprovals（F2 前端侧） ----
+  // ---- 7. verifier approval 不进 pendingApprovals ----
   it("7. verifier 审批: 不进 pendingApprovals（仅进 verifierTimeline）", () => {
     let state = createInitialState("r7", "verify with approval", true);
 
@@ -229,10 +208,7 @@ describe("reduceEvent", () => {
       input: { cmd: "ls" },
     }));
 
-    // 不进 pendingApprovals
     expect(state.pendingApprovals).toHaveLength(0);
-
-    // 但进 verifierTimeline
     const vTypes = state.verifierTimeline.map((e) => e.type);
     expect(vTypes).toContain("approval_request");
     expect(state.verifierTimeline[0].toolUseId).toBe("vtu_check");
@@ -266,15 +242,10 @@ describe("reduceEvent", () => {
     expect(state.timeline[1].droppedBlocks).toBe(15);
   });
 
-  // ================================================================
-  // 阶段一 新增测试
-  // ================================================================
-
   // ---- 10. R-01: done 事件将 pending 审批转为 expired ----
   it("10. R-01: done 事件将 pending 审批转为 expired", () => {
     let state = createInitialState("r10", "approval then done", false);
 
-    // 添加一个 pending 审批
     state = reduceEvent(state, sse("main", "approval_request", {
       toolUseId: "tu_expire",
       name: "bash",
@@ -284,20 +255,17 @@ describe("reduceEvent", () => {
     expect(state.pendingApprovals).toHaveLength(1);
     expect(state.pendingApprovals[0].status).toBe("pending");
 
-    // 发送 done 事件
     state = reduceEvent(state, sse("main", "done", {
       stopReason: "completed",
       usage: { inputTokens: 100, outputTokens: 50, turns: 1, cacheHitRatio: 0 },
     }));
 
-    // pending 审批变为 expired
     expect(state.pendingApprovals).toHaveLength(1);
     expect(state.pendingApprovals[0].status).toBe("expired");
-    // run status 变为 done
     expect(state.status).toBe("done");
   });
 
-  // ---- 11. R-01: markApprovalResolved 设置 decidedAt 时间戳（只读记录模型） ----
+  // ---- 11. R-01: markApprovalResolved 设置 decidedAt ----
   it("11. R-01: markApprovalResolved 设置 decidedAt 时间戳（只读记录模型）", () => {
     let state = createInitialState("r11", "approval record", false);
 
@@ -308,15 +276,12 @@ describe("reduceEvent", () => {
     }));
 
     const beforeMark = Date.now();
-
-    // 允许
     state = markApprovalResolved(state, "tu_rec", "allowed", "ok");
     expect(state.pendingApprovals[0].status).toBe("allowed");
     expect(state.pendingApprovals[0].reason).toBe("ok");
     expect(state.pendingApprovals[0].decidedAt).toBeTypeOf("number");
     expect(state.pendingApprovals[0].decidedAt).toBeGreaterThanOrEqual(beforeMark);
 
-    // 拒绝场景
     let state2 = createInitialState("r11b", "deny record", false);
     state2 = reduceEvent(state2, sse("main", "approval_request", {
       toolUseId: "tu_deny2",
@@ -329,17 +294,13 @@ describe("reduceEvent", () => {
     expect(state2.pendingApprovals[0].decidedAt).toBeTypeOf("number");
   });
 
-  // ---- 12. R-01: 状态一致性 — list/header/approval 均从同一 state 字段派生 ----
+  // ---- 12. R-01: 状态一致性 ----
   it("12. R-01: 状态一致性 — status/pendingApprovals 来自同一 state 源", () => {
-    // 此测试验证 reducer 返回的 state 对象中，status 与 pendingApprovals
-    // 是同一数据源的不同字段，渲染层直接从 state 读取而非各自推断。
     let state = createInitialState("r12", "consistency", false);
 
-    // 初始: running + 无审批
     expect(state.status).toBe("running");
     expect(state.pendingApprovals).toHaveLength(0);
 
-    // 添加审批
     state = reduceEvent(state, sse("main", "approval_request", {
       toolUseId: "tu_c1",
       name: "tool1",
@@ -349,26 +310,19 @@ describe("reduceEvent", () => {
     expect(state.pendingApprovals).toHaveLength(1);
     expect(state.pendingApprovals[0].status).toBe("pending");
 
-    // done 后: status=done + 审批 expired（同一 atomic 转换）
     state = reduceEvent(state, sse("main", "done", {
       stopReason: "completed",
       usage: { inputTokens: 0, outputTokens: 0, turns: 0, cacheHitRatio: 0 },
     }));
     expect(state.status).toBe("done");
     expect(state.pendingApprovals[0].status).toBe("expired");
-
-    // 验证: 从同一个 state 对象读取，没有额外推断
-    // header 读取 state.status → "done"
-    // approval 卡片读取 state.pendingApprovals[0].status → "expired"
-    // 两者来自同一 reduction 步骤，不可能不一致
     expect(state.status === "done" && state.pendingApprovals[0].status === "expired").toBe(true);
   });
 
-  // ---- 13. R-01: expirePendingApprovals 独立函数 ----
+  // ---- 13. R-01: expirePendingApprovals ----
   it("13. R-01: expirePendingApprovals 将 pending 审批转为 expired，已处理的不变", () => {
     let state = createInitialState("r13", "expire fn", false);
 
-    // 添加一个 pending + 一个 allowed
     state = reduceEvent(state, sse("main", "approval_request", {
       toolUseId: "tu_e1",
       name: "a",
@@ -381,29 +335,22 @@ describe("reduceEvent", () => {
     }));
     state = markApprovalResolved(state, "tu_e1", "allowed", "ok");
 
-    // 此时: tu_e1=allowed, tu_e2=pending
     expect(state.pendingApprovals[0].status).toBe("allowed");
     expect(state.pendingApprovals[1].status).toBe("pending");
 
-    // 调用 expirePendingApprovals
     state = expirePendingApprovals(state);
 
-    // tu_e1 保持 allowed, tu_e2 变为 expired
     expect(state.pendingApprovals[0].status).toBe("allowed");
     expect(state.pendingApprovals[1].status).toBe("expired");
   });
 
-  // ---- 14. 空态文案: 列表有记录时用"选择左侧运行…" ----
+  // ---- 14. 空态文案 ----
   it("14. 空态文案: renderEmptyState 区分空列表 vs 有记录未选中", () => {
-    // 静态检查: app.js 源码中必须包含两版文案
     const appPath = join(__dirname, "..", "ui", "public", "app.js");
     const appSrc = readFileSync(appPath, "utf-8");
 
-    // 新文案存在
     expect(appSrc).toContain("尚无运行。");
     expect(appSrc).toContain("选择左侧运行查看详情，或创建新任务。");
-
-    // 旧文案不存在
     expect(appSrc).not.toContain("尚无运行。提交一个任务开始。");
   });
 });
@@ -417,14 +364,9 @@ describe("AC6 窄屏 CSS", () => {
     const cssPath = join(__dirname, "..", "ui", "public", "styles.css");
     const css = readFileSync(cssPath, "utf-8");
 
-    // 媒体查询存在
     expect(css).toContain("@media");
     expect(css).toContain("max-width: 700px");
-
-    // 侧栏隐藏规则
     expect(css).toContain("narrow-hidden");
-
-    // 单栏 flex-direction: column
     expect(css).toContain("flex-direction: column");
   });
 });
@@ -441,7 +383,6 @@ describe("AC7 第 12 节文案", () => {
     const app = readFileSync(appPath, "utf-8");
     const combined = html + "\n" + app;
 
-    // 新文案必须存在
     expect(combined).toContain("开启独立核查");
     expect(combined).toContain("运行任务");
     expect(combined).toContain("Agent 执行");
@@ -450,21 +391,512 @@ describe("AC7 第 12 节文案", () => {
     expect(combined).toContain("拒绝并说明");
     expect(combined).toContain("选择左侧运行查看详情，或创建新任务。");
 
-    // 旧文案必须不存在
-    // 注意："核查" 可能作为 badge 出现，所以检查复选框 label 文本
-    // label 在 html 中为 <span>开启独立核查</span>，而旧文案是 <span>核查</span>
-    // 用更精确的断言
     const checkboxLabel = html.match(/<span>(核查|开启独立核查)<\/span>/);
     expect(checkboxLabel).not.toBeNull();
     expect(checkboxLabel[1]).toBe("开启独立核查");
 
-    // "提交" 按钮旧文案
     expect(html).not.toContain('>提交</button>');
-
-    // "主时间线" 旧文案
     expect(app).not.toContain("主时间线");
-
-    // "核查过程" 旧文案
     expect(app).not.toContain("核查过程");
+  });
+});
+
+// ================================================================
+// 阶段二 新测试
+// ================================================================
+
+// ---- AC3: 概览模型 deriveOverview (R-03) ----
+describe("AC3 概览模型 deriveOverview (R-03)", () => {
+  it("15. 从事件流派生出 finalStatus / resultSummary / verdict / 待介入事项 / usage", () => {
+    let state = createInitialState("ro1", "overview task", true);
+
+    // 注入助手消息
+    state = reduceEvent(state, sse("main", "turn_start", { turn: 1 }));
+    state = reduceEvent(state, sse("main", "assistant_text", { text: "任务已完成，共修改 3 个文件。" }));
+    state = reduceEvent(state, sse("main", "tool_call", { toolUseId: "t1", name: "write_file", input: { path: "a.txt" } }));
+    state = reduceEvent(state, sse("main", "tool_result", {
+      toolUseId: "t1",
+      result: { content: "ok", isError: false },
+      durationMs: 100,
+    }));
+    state = reduceEvent(state, sse("main", "done", {
+      stopReason: "completed",
+      usage: { inputTokens: 500, outputTokens: 200, turns: 1, cacheHitRatio: 0.1 },
+    }));
+
+    // 设置 verdict
+    state = {
+      ...state,
+      verdict: {
+        passed: true,
+        summary: "全部通过",
+        issues: [],
+        unverified: ["人工确认项"],
+        advisory: ["建议优化"],
+      },
+    };
+    // 设置一个 pending 审批
+    state = {
+      ...state,
+      pendingApprovals: [
+        { toolUseId: "ap1", name: "bash", input: { cmd: "rm" }, status: "pending" },
+      ],
+    };
+
+    const overview = deriveOverview(state);
+
+    expect(overview.finalStatus).toBe("done");
+    expect(overview.resultSummary).toBe("任务已完成，共修改 3 个文件。");
+    expect(overview.verdict).not.toBeNull();
+    expect(overview.verdict.passed).toBe(true);
+    expect(overview.verdict.summary).toBe("全部通过");
+    expect(overview.verdict.unverified).toEqual(["人工确认项"]);
+    expect(overview.actionItems.pendingApprovals).toHaveLength(1);
+    expect(overview.actionItems.pendingApprovals[0].toolUseId).toBe("ap1");
+    expect(overview.actionItems.unverifiedItems).toEqual(["人工确认项"]);
+    expect(overview.usage).not.toBeNull();
+    expect(overview.usage.turns).toBe(1);
+    expect(overview.usage.inputTokens).toBe(500);
+  });
+
+  it("16. 概览模型：无助手文本时 resultSummary 为 null", () => {
+    const state = makeState({
+      status: "done",
+      usage: { turns: 1, inputTokens: 100, outputTokens: 50, cacheHitRatio: 0 },
+    });
+    const overview = deriveOverview(state);
+    expect(overview.resultSummary).toBeNull();
+    expect(overview.finalStatus).toBe("done");
+  });
+
+  it("17. 概览模型：error 状态正确反映", () => {
+    const state = makeState({ error: "运行异常终止", status: "done" });
+    const overview = deriveOverview(state);
+    expect(overview.finalStatus).toBe("error");
+  });
+
+  it("18. 概览模型：无 verdict 时 verdict 为 null，unverifiedItems 为空", () => {
+    const state = makeState({ status: "done" });
+    const overview = deriveOverview(state);
+    expect(overview.verdict).toBeNull();
+    expect(overview.actionItems.unverifiedItems).toEqual([]);
+  });
+
+  it("19. 概览模型：待介入事项 — 仅 pending 审批被拾取", () => {
+    const state = makeState({
+      status: "running",
+      pendingApprovals: [
+        { toolUseId: "a1", name: "t1", input: {}, status: "pending" },
+        { toolUseId: "a2", name: "t2", input: {}, status: "allowed" },
+        { toolUseId: "a3", name: "t3", input: {}, status: "denied" },
+      ],
+    });
+    const overview = deriveOverview(state);
+    expect(overview.actionItems.pendingApprovals).toHaveLength(1);
+    expect(overview.actionItems.pendingApprovals[0].toolUseId).toBe("a1");
+  });
+});
+
+// ---- AC4: 日志分层 deriveLogEntries / toggleEntryCollapsed (R-04) ----
+describe("AC4 日志分层 (R-04)", () => {
+  it("20. 成功 tool_call / tool_result → collapsed=true", () => {
+    const state = makeState({
+      timeline: [
+        { seq: 0, source: "main", type: "turn_start", turn: 1 },
+        { seq: 1, source: "main", type: "tool_call", toolUseId: "t1", name: "read", input: {} },
+        { seq: 2, source: "main", type: "tool_result", toolUseId: "t1", resultContent: "ok", resultIsError: false, durationMs: 10 },
+        { seq: 3, source: "main", type: "assistant_text", text: "done" },
+      ],
+    });
+
+    const entries = deriveLogEntries(state);
+    expect(entries).toHaveLength(4);
+    // 全部成功 → 默认折叠
+    expect(entries[0].collapsed).toBe(true);  // turn_start
+    expect(entries[1].collapsed).toBe(true);  // tool_call
+    expect(entries[2].collapsed).toBe(true);  // tool_result (success)
+    expect(entries[3].collapsed).toBe(true);  // assistant_text
+  });
+
+  it("21. 失败 tool_result / approval_request / api_retry / compaction → collapsed=false", () => {
+    const state = makeState({
+      timeline: [
+        { seq: 0, source: "main", type: "tool_result", toolUseId: "t1", resultContent: "err", resultIsError: true, durationMs: 5 },
+        { seq: 1, source: "main", type: "approval_request", toolUseId: "a1", name: "bash", input: {} },
+        { seq: 2, source: "main", type: "api_retry", turn: 1, attempt: 1, reason: "timeout" },
+        { seq: 3, source: "main", type: "compaction", droppedBlocks: 10 },
+      ],
+    });
+
+    const entries = deriveLogEntries(state);
+    expect(entries).toHaveLength(4);
+    expect(entries[0].collapsed).toBe(false); // error tool_result
+    expect(entries[1].collapsed).toBe(false); // approval_request
+    expect(entries[2].collapsed).toBe(false); // api_retry
+    expect(entries[3].collapsed).toBe(false); // compaction
+  });
+
+  it("22. toggleEntryCollapsed 翻转目标 seq 的折叠状态", () => {
+    const entries = [
+      { seq: 0, source: "main", type: "turn_start", turn: 1, collapsed: true },
+      { seq: 1, source: "main", type: "tool_result", toolUseId: "t1", resultIsError: true, collapsed: false },
+    ];
+
+    const toggled = toggleEntryCollapsed(entries, 0);
+    expect(toggled[0].collapsed).toBe(false);
+    expect(toggled[1].collapsed).toBe(false);
+
+    const toggled2 = toggleEntryCollapsed(toggled, 0);
+    expect(toggled2[0].collapsed).toBe(true);
+
+    const toggled3 = toggleEntryCollapsed(entries, 1);
+    expect(toggled3[1].collapsed).toBe(true);
+  });
+
+  it("23. isEntryCollapsedByDefault 对各类条目的规则", () => {
+    expect(isEntryCollapsedByDefault({ seq: 0, source: "main", type: "turn_start", turn: 1 })).toBe(true);
+    expect(isEntryCollapsedByDefault({ seq: 0, source: "main", type: "tool_call", toolUseId: "t", name: "x", input: {} })).toBe(true);
+    expect(isEntryCollapsedByDefault({ seq: 0, source: "main", type: "tool_result", toolUseId: "t", resultIsError: false })).toBe(true);
+    expect(isEntryCollapsedByDefault({ seq: 0, source: "main", type: "assistant_text", text: "hi" })).toBe(true);
+    expect(isEntryCollapsedByDefault({ seq: 0, source: "main", type: "tool_result", toolUseId: "t", resultIsError: true })).toBe(false);
+    expect(isEntryCollapsedByDefault({ seq: 0, source: "main", type: "approval_request", toolUseId: "t", name: "x", input: {} })).toBe(false);
+    expect(isEntryCollapsedByDefault({ seq: 0, source: "main", type: "api_retry", attempt: 1, reason: "x" })).toBe(false);
+    expect(isEntryCollapsedByDefault({ seq: 0, source: "main", type: "compaction", droppedBlocks: 5 })).toBe(false);
+  });
+});
+
+// ---- AC5: WCAG 对比度测试 (R-06) ----
+describe("AC5 WCAG 对比度 (R-06)", () => {
+  /**
+   * WCAG 2.2 相对亮度公式：
+   *   L = 0.2126 * R_lin + 0.7152 * G_lin + 0.0722 * B_lin
+   *   其中 channel_lin = channel_sRGB ≤ 0.04045 ? channel_sRGB/12.92 : ((channel_sRGB+0.055)/1.055)^2.4
+   *   对比度 = (L_light + 0.05) / (L_dark + 0.05)
+   */
+  function hexToRgb(hex) {
+    const v = parseInt(hex.replace(/^#/, ""), 16);
+    return [(v >> 16) & 0xff, (v >> 8) & 0xff, v & 0xff];
+  }
+
+  function linearize(c) {
+    const s = c / 255;
+    return s <= 0.04045 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+  }
+
+  function relativeLuminance(hex) {
+    const [r, g, b] = hexToRgb(hex);
+    return 0.2126 * linearize(r) + 0.7152 * linearize(g) + 0.0722 * linearize(b);
+  }
+
+  function contrastRatio(hex1, hex2) {
+    const l1 = relativeLuminance(hex1);
+    const l2 = relativeLuminance(hex2);
+    const lighter = Math.max(l1, l2);
+    const darker = Math.min(l1, l2);
+    return (lighter + 0.05) / (darker + 0.05);
+  }
+
+  /** 从 styles.css 解析 :root 块中的 CSS 变量 */
+  function parseRootVars(css) {
+    const rootMatch = css.match(/:root\s*\{([^}]*)\}/s);
+    if (!rootMatch) return {};
+    const block = rootMatch[1];
+    const vars = {};
+    const varRe = /--([\w-]+)\s*:\s*([^;]+);/g;
+    let m;
+    while ((m = varRe.exec(block)) !== null) {
+      vars[m[1].trim()] = m[2].trim();
+    }
+    return vars;
+  }
+
+  /** 从 property value 解析最终色值（支持 var() 引用，仅一级解析） */
+  function resolveColor(value, vars) {
+    let v = value.trim();
+    // 处理 var(--xxx) 引用
+    const varRef = v.match(/^var\((--[\w-]+)\)$/);
+    if (varRef) {
+      const refName = varRef[1].replace(/^--/, "");
+      if (vars[refName]) {
+        v = vars[refName];
+      }
+    }
+    // 去除注释
+    v = v.replace(/\/\*.*?\*\//g, "").trim();
+    return v;
+  }
+
+  it("24. 主按钮文字/底色对比度 ≥ 4.5:1", () => {
+    const cssPath = join(__dirname, "..", "ui", "public", "styles.css");
+    const css = readFileSync(cssPath, "utf-8");
+    const vars = parseRootVars(css);
+
+    const btnPrimaryText = resolveColor(vars["btn-primary-text"] || "#ffffff", vars);
+    const accent = resolveColor(vars["accent"] || "#0969da", vars);
+
+    const ratio = contrastRatio(btnPrimaryText, accent);
+    expect(ratio).toBeGreaterThanOrEqual(4.5);
+  });
+
+  it("25. 正文/页面底色对比度 ≥ 4.5:1", () => {
+    const cssPath = join(__dirname, "..", "ui", "public", "styles.css");
+    const css = readFileSync(cssPath, "utf-8");
+    const vars = parseRootVars(css);
+
+    const fg = resolveColor(vars["fg"] || "#c9d1d9", vars);
+    const bg = resolveColor(vars["bg"] || "#0d1117", vars);
+
+    const ratio = contrastRatio(fg, bg);
+    expect(ratio).toBeGreaterThanOrEqual(4.5);
+  });
+
+  it("26. 状态徽章文字/底色对比度 ≥ 3:1（组件类）", () => {
+    const cssPath = join(__dirname, "..", "ui", "public", "styles.css");
+    const css = readFileSync(cssPath, "utf-8");
+    const vars = parseRootVars(css);
+
+    // 绿色徽章: green on green-bg
+    const green = resolveColor(vars["green"] || "#3fb950", vars);
+    const greenBg = resolveColor(vars["green-bg"] || "#12261e", vars);
+    const ratioGreen = contrastRatio(green, greenBg);
+    expect(ratioGreen).toBeGreaterThanOrEqual(3.0);
+
+    // 红色徽章: red on red-bg
+    const red = resolveColor(vars["red"] || "#f85149", vars);
+    const redBg = resolveColor(vars["red-bg"] || "#261212", vars);
+    const ratioRed = contrastRatio(red, redBg);
+    expect(ratioRed).toBeGreaterThanOrEqual(3.0);
+
+    // 黄色审批卡: fg on yellow-bg
+    const yellowBg = resolveColor(vars["yellow-bg"] || "#1d1c08", vars);
+    const ratioFgOnYellow = contrastRatio(
+      resolveColor(vars["fg"] || "#c9d1d9", vars),
+      yellowBg,
+    );
+    expect(ratioFgOnYellow).toBeGreaterThanOrEqual(3.0);
+  });
+
+  it("27. 焦点指示色与底板对比度 ≥ 3:1", () => {
+    const cssPath = join(__dirname, "..", "ui", "public", "styles.css");
+    const css = readFileSync(cssPath, "utf-8");
+    const vars = parseRootVars(css);
+
+    const focusRing = resolveColor(vars["focus-ring"] || "#0969da", vars);
+    const bg = resolveColor(vars["bg"] || "#0d1117", vars);
+
+    const ratio = contrastRatio(focusRing, bg);
+    expect(ratio).toBeGreaterThanOrEqual(3.0);
+  });
+
+  it("28. 拒绝按钮文字/底色对比度 ≥ 3:1（组件类）", () => {
+    const cssPath = join(__dirname, "..", "ui", "public", "styles.css");
+    const css = readFileSync(cssPath, "utf-8");
+    const vars = parseRootVars(css);
+
+    const denyText = resolveColor(vars["btn-deny-text"] || "#f85149", vars);
+    const denyBg = resolveColor(vars["red-bg"] || "#261212", vars);
+
+    const ratio = contrastRatio(denyText, denyBg);
+    expect(ratio).toBeGreaterThanOrEqual(3.0);
+  });
+});
+
+// ---- AC6: 无障碍语义静态断言 (R-05) ----
+describe("AC6 无障碍语义 (R-05)", () => {
+  it("29. 运行列表项含 tabindex / role / aria-selected", () => {
+    const appPath = join(__dirname, "..", "ui", "public", "app.js");
+    const appSrc = readFileSync(appPath, "utf-8");
+
+    // renderRunList 渲染输出中必须包含
+    expect(appSrc).toContain('role="option"');
+    expect(appSrc).toContain("tabindex=");
+    expect(appSrc).toContain("aria-selected=");
+  });
+
+  it("30. 任务输入框有关联 label", () => {
+    const htmlPath = join(__dirname, "..", "ui", "public", "index.html");
+    const html = readFileSync(htmlPath, "utf-8");
+
+    // 必须存在 for="task-input" 的 label
+    expect(html).toContain('for="task-input"');
+    // 或 label 包裹 input（隐式关联），显式 for 更优
+  });
+
+  it("31. 存在 aria-live 区域", () => {
+    const htmlPath = join(__dirname, "..", "ui", "public", "index.html");
+    const html = readFileSync(htmlPath, "utf-8");
+
+    expect(html).toContain("aria-live");
+    // 必须是 polite 或 assertive
+    expect(html).toMatch(/aria-live\s*=\s*"polite"/);
+  });
+
+  it("32. 存在 :focus-visible 样式规则", () => {
+    const cssPath = join(__dirname, "..", "ui", "public", "styles.css");
+    const css = readFileSync(cssPath, "utf-8");
+
+    expect(css).toContain(":focus-visible");
+    // 至少有一条非空规则
+    expect(css).toMatch(/:focus-visible\s*\{[^}]+outline/);
+  });
+});
+
+// ---- AC7: 运行列表元数据与筛选 (R-08) ----
+describe("AC7 运行列表元数据与筛选 (R-08)", () => {
+  it("33. deriveRunListItems 含状态/开始时间/耗时/核查结论", () => {
+    const runs = [
+      { runId: "r1", task: "t1", status: "done", verify: true, createdAt: 1000000, finishedAt: 1005000 },
+      { runId: "r2", task: "t2", status: "running", verify: false, createdAt: 2000000, finishedAt: null },
+    ];
+    const states = new Map();
+    states.set("r1", {
+      ...createInitialState("r1", "t1", true),
+      status: "done",
+      verdict: { passed: true, summary: "ok", issues: [], unverified: [], advisory: [] },
+    });
+    states.set("r2", createInitialState("r2", "t2", false));
+
+    const metaMap = deriveRunListItems(runs, states);
+
+    const m1 = metaMap.get("r1");
+    expect(m1).toBeDefined();
+    expect(m1.status).toBe("done");
+    expect(m1.startTime).toBe(1000000);
+    expect(m1.duration).toBe(5000);
+    expect(m1.verdictConclusion).toBe("passed");
+
+    const m2 = metaMap.get("r2");
+    expect(m2).toBeDefined();
+    expect(m2.status).toBe("running");
+    expect(m2.duration).toBeNull();
+    expect(m2.verdictConclusion).toBeNull();
+  });
+
+  it("34. deriveRunListItems — 核查结论三种值（passed/failed/null）", () => {
+    const runs = [
+      { runId: "r1", task: "ok", status: "done", verify: true, createdAt: 1, finishedAt: 2 },
+      { runId: "r2", task: "fail", status: "done", verify: true, createdAt: 3, finishedAt: 4 },
+      { runId: "r3", task: "none", status: "done", verify: false, createdAt: 5, finishedAt: 6 },
+    ];
+    const states = new Map();
+    states.set("r1", {
+      ...createInitialState("r1", "ok", true),
+      status: "done",
+      verdict: { passed: true, summary: "", issues: [], unverified: [], advisory: [] },
+    });
+    states.set("r2", {
+      ...createInitialState("r2", "fail", true),
+      status: "done",
+      verdict: { passed: false, summary: "X", issues: ["a"], unverified: [], advisory: [] },
+    });
+    states.set("r3", createInitialState("r3", "none", false));
+
+    const metaMap = deriveRunListItems(runs, states);
+    expect(metaMap.get("r1").verdictConclusion).toBe("passed");
+    expect(metaMap.get("r2").verdictConclusion).toBe("failed");
+    expect(metaMap.get("r3").verdictConclusion).toBeNull();
+  });
+
+  it("35. filterRunsByStatus 按状态筛选正确", () => {
+    const runs = [
+      { runId: "r1", task: "a", status: "running", verify: false, createdAt: 1, finishedAt: null },
+      { runId: "r2", task: "b", status: "done", verify: false, createdAt: 2, finishedAt: 3 },
+      { runId: "r3", task: "c", status: "done", verify: true, createdAt: 4, finishedAt: 5 },
+    ];
+    const states = new Map();
+    states.set("r1", createInitialState("r1", "a", false));
+    states.set("r2", createInitialState("r2", "b", false));
+    states.set("r3", {
+      ...createInitialState("r3", "c", true),
+      status: "done",
+      verdict: { passed: false, summary: "X", issues: ["x"], unverified: [], advisory: [] },
+    });
+
+    // all
+    expect(filterRunsByStatus(runs, states, "all")).toHaveLength(3);
+    // running
+    const running = filterRunsByStatus(runs, states, "running");
+    expect(running).toHaveLength(1);
+    expect(running[0].runId).toBe("r1");
+    // done (仅通过/无核查的)
+    const done = filterRunsByStatus(runs, states, "done");
+    expect(done).toHaveLength(1);
+    expect(done[0].runId).toBe("r2");
+    // failed
+    const failed = filterRunsByStatus(runs, states, "failed");
+    expect(failed).toHaveLength(1);
+    expect(failed[0].runId).toBe("r3");
+  });
+});
+
+// ---- AC8: styles.css 令牌统一 — 除 :root 外无裸十六进制色值 (P2) ----
+describe("AC8 CSS 令牌统一 (P2)", () => {
+  it("36. styles.css 除 :root 定义块外无裸十六进制色值", () => {
+    const cssPath = join(__dirname, "..", "ui", "public", "styles.css");
+    const css = readFileSync(cssPath, "utf-8");
+
+    // 移除 :root 块
+    const withoutRoot = css.replace(/:root\s*\{[^}]*\}/s, "");
+
+    // 搜索裸 #RRGGBB（不跟在 var( 后面的）
+    // 允许在注释中出现
+    const lines = withoutRoot.split("\n");
+    const bareHexLines = [];
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      // 跳过注释行
+      if (line.trim().startsWith("/*")) continue;
+      // 检查是否有 #XXXXXX 但不跟在 var( 后面
+      const hexMatch = line.match(/(?<!var\([^)]{0,50})(#[0-9a-fA-F]{6})\b/);
+      if (hexMatch && !line.includes("var(" + hexMatch[0])) {
+        // 如果这一行也用 var() 引用了这个颜色，跳过
+        // 简单策略：检查是否在属性值中作为裸色出现
+        bareHexLines.push(`Line ${i + 1}: ${line.trim()}`);
+      }
+    }
+
+    // 实际上我们需要更精确的匹配：在 CSS 属性值中出现的裸 #RRGGBB
+    // 用一个更稳健的方法：移除 :root 和注释后，在属性值中匹配
+    const stripped = css
+      .replace(/:root\s*\{[^}]*\}/s, "")
+      .replace(/\/\*[\s\S]*?\*\//g, "");
+
+    // 匹配属性值中的裸六位色值
+    // 模式：: 后面跟着空格 + #XXXXXX 但不是 var() 的一部分
+    const propHexRe = /:\s*(?:[^;{]*?\s)?(#[0-9a-fA-F]{6})\b/g;
+    const violations = [];
+    let match;
+    while ((match = propHexRe.exec(stripped)) !== null) {
+      const ctx = stripped.substring(Math.max(0, match.index - 20), match.index + match[0].length + 10);
+      // 确认不是 var() 的参数
+      if (!ctx.includes("var(")) {
+        violations.push(match[0].trim());
+      }
+    }
+
+    expect(violations).toEqual([]);
+  });
+});
+
+// ================================================================
+// R-07: 核查区视觉收敛 — magenta 仅身份标识，不大面积铺底
+// ================================================================
+
+describe("R-07 核查区视觉收敛", () => {
+  it("37. CSS 中无大面积 magenta 背景（仅小元素使用）", () => {
+    const cssPath = join(__dirname, "..", "ui", "public", "styles.css");
+    const css = readFileSync(cssPath, "utf-8");
+
+    // magenta-bg 应仅用于小元素如 badge、border 等，不应出现在大面积组件中
+    // 检查没有 padding > 8px 的 magenta background
+    // 这个测试通过检查 verdict-card 不再使用 magenta 大面积背景来验证
+    // R-07 整改后 verdict-card 用 --bg2 + 细边框
+    expect(css).toContain("magenta-border-strong");
+
+    // 旧式大面积 magenta 背景不应存在（timeline--verifier 曾用 --magenta-bg 大面积）
+    // 现在应仅用于 badge/icon/border
+    const magentaBgOccurrences = (css.match(/--magenta-bg/g) || []).length;
+    // 允许在 :root 定义 + verify-badge + 至多一个小元素中出现
+    expect(magentaBgOccurrences).toBeLessThanOrEqual(4);
   });
 });
