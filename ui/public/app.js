@@ -2039,6 +2039,8 @@ function renderToolsTab(tools) {
     html += row("执行者模型", rm.executor ?? "—");
     html += row("核查者模型", rm.verifier ?? "（与执行者同一个）");
     html += row("planner 模型", rm.planner ?? "（与执行者同一个）");
+    // 没配视觉模型时说清"看不了图"，而不是不提——执行者不知道自己缺这个能力
+    html += row("视觉模型", rm.vision ?? "（未配置：本次运行看不了图）");
   }
   html += row("额外只读根", tools.readRoots.length ? tools.readRoots.join("；") : "（无）");
   if (tools.guardrails) {

@@ -21,6 +21,7 @@ import { getPack, selectPackTools, PACKS } from "../src/presets.js";
 import type { Plan, SubTask } from "../src/planner.js";
 import type Anthropic from "@anthropic-ai/sdk";
 import { bashTool, SHELL_DESC } from "../src/tools/bash.js";
+import { createDescribeImageTool } from "../src/tools/describe-image.js";
 import { fetchUrlTool } from "../src/tools/fetch-url.js";
 import { readFileTool } from "../src/tools/read-file.js";
 import { writeFileTool } from "../src/tools/write-file.js";
@@ -287,6 +288,15 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
   const verifierRole = resolveRole("VERIFIER");
   const plannerRole = resolveRole("PLANNER");
+  /**
+   * 视觉模型是第四个角色（V-31）。配了才有 describe_image 工具——
+   * 没配就不该在工具面上摆一个一调用就报错的工具，那是在骗模型。
+   */
+  const visionRole = resolveRole("VISION");
+  const visionTool = visionRole
+    ? createDescribeImageTool({ client: visionRole.provider.client, modelName: visionRole.name })
+    : null;
+  const toolPool: Tool[] = visionTool ? [...BUILTIN_POOL, visionTool] : BUILTIN_POOL;
 
   const runs = new Map<string, StoredRun>();
 
@@ -397,8 +407,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     const runWorkdir = run?.workdir ?? workdir;
     const systemPrompt = runPack?.systemPrompt ?? DEFAULT_SYSTEM_PROMPT;
     const tools = injectedTools ?? (runPack
-      ? selectPackTools(runPack, BUILTIN_POOL, [])
-      : BUILTIN_POOL);
+      ? selectPackTools(runPack, toolPool, [])
+      : toolPool);
     return {
       systemPrompt,
       tools,
@@ -952,6 +962,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         // 报的是本 run 实际用了什么，而不是配了什么——两者可以不同
         verifier: verifierRole && (run.useVerifierModel ?? true) ? verifierRole.name : null,
         planner: plannerRole && (run.usePlannerModel ?? true) ? plannerRole.name : null,
+        vision: visionRole?.name ?? null,
       },
       guardrails: {
         maxTurns: cfg.maxTurns ?? null,
@@ -962,7 +973,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         name: t.name,
         permission: t.permission,
         parallelSafe: t.parallelSafe,
-        origin: BUILTIN_POOL.some((b) => b.name === t.name) ? "builtin" : "mcp",
+        origin: toolPool.some((b) => b.name === t.name) ? "builtin" : "mcp",
       })),
     });
   }
@@ -1008,6 +1019,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         planner: plannerRole
           ? { model: plannerRole.name, provider: plannerRole.provider.provider, configured: true }
           : { configured: false },
+        vision: visionRole
+          ? { model: visionRole.name, provider: visionRole.provider.provider, configured: true }
+          : { configured: false },
       },
       // 核查预算与执行者解耦，硬编码在 src/verifier.ts
       verifierBudgetTurns: 15,
@@ -1016,7 +1030,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         name: t.name,
         permission: t.permission,
         parallelSafe: t.parallelSafe,
-        origin: BUILTIN_POOL.some((b) => b.name === t.name) ? "builtin" : "mcp",
+        origin: toolPool.some((b) => b.name === t.name) ? "builtin" : "mcp",
       })),
       mcp: mcpStatus,
     };

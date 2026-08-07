@@ -1781,6 +1781,46 @@ describe("ui-server", () => {
     }
   });
 
+  // ---- V-31 视觉模型（第四个角色） ----
+  it("v2-28. 配了 AGENT_VISION_MODEL 才注册 describe_image；没配就不该摆在工具面上", async () => {
+    // 没配：工具面里不该出现一个一调用就报错的工具，那是在骗模型说自己能看图
+    handle = createUiServer({ modelClient: new FakeModelClient([]), workdir: process.cwd() });
+    port = await startServer(handle);
+    let snap = await (await fetch(`${baseUrl(port)}/api/harness`)).json() as any;
+    expect(snap.tools.map((t: any) => t.name)).not.toContain("describe_image");
+    expect(snap.roleModels.vision.configured).toBe(false);
+    await handle.close();
+
+    // 配上（Kimi 形态：OpenAI 兼容端点）
+    process.env.AGENT_VISION_MODEL = "moonshot-v1-8k-vision-preview";
+    process.env.AGENT_VISION_PROVIDER = "openai";
+    process.env.AGENT_VISION_BASE_URL = "https://api.moonshot.cn/v1";
+    process.env.AGENT_VISION_API_KEY = "sk-vision-must-not-leak";
+    try {
+      handle = createUiServer({ modelClient: new FakeModelClient([]), workdir: process.cwd() });
+      port = await startServer(handle);
+      const raw = await (await fetch(`${baseUrl(port)}/api/harness`)).text();
+      snap = JSON.parse(raw);
+
+      const vision = snap.tools.find((t: any) => t.name === "describe_image");
+      expect(vision, "配了视觉模型却没注册工具").toBeDefined();
+      expect(vision.origin).toBe("builtin");
+      // 把本地文件送到另一个端点，属于要审批的动作
+      expect(vision.permission).toBe("ask");
+
+      expect(snap.roleModels.vision).toEqual({
+        model: "moonshot-v1-8k-vision-preview", provider: "openai", configured: true,
+      });
+      // 密钥与端点一律不下发
+      expect(raw).not.toContain("sk-vision-must-not-leak");
+      expect(raw).not.toContain("api.moonshot.cn");
+    } finally {
+      for (const k of ["MODEL", "PROVIDER", "BASE_URL", "API_KEY"]) {
+        delete process.env[`AGENT_VISION_${k}`];
+      }
+    }
+  });
+
   // ---- V-10 全局生命周期流（取代 3 秒轮询）----
   it("v2-12. /api/stream 先发快照，再推 run_created / run_finished", async () => {
     handle = createUiServer({

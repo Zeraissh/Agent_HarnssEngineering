@@ -148,3 +148,66 @@ describe("fromAccumulated（OpenAI → ModelTurn 响应翻译）", () => {
     expect(toolUse.input).toHaveProperty("__malformed_arguments");
   });
 });
+
+describe("图像块 → OpenAI image_url（视觉模型走 compat 端点的前提）", () => {
+  const img = (data = "AAAA") => ({
+    type: "image" as const,
+    source: { type: "base64" as const, media_type: "image/png" as const, data },
+  });
+
+  /**
+   * 此前图像块和 thinking 一样被静默丢弃。后果不是"少了点信息"——
+   * 是把一次看图请求变成空请求：视觉模型只收到提示词、没有图，然后
+   * 一本正经编一段描述出来。静默降级比报错危险得多，所以这条必须锁死。
+   *
+   * 现实场景：Kimi / Qwen-VL / GLM-4V 这些能看图的模型都走 OpenAI 兼容端点，
+   * 也就是说视觉能力**必然**经过这条翻译路径。
+   */
+  it("图像块被翻译为 data URI 的 image_url，不再丢弃", () => {
+    const out = toOpenAIMessages(
+      baseReq([{ role: "user", content: [img("iVBORw0KGgo="), { type: "text", text: "这是什么？" }] }]),
+    );
+    const user = out.find((m) => m.role === "user")!;
+    expect(Array.isArray(user.content), "有图时必须用内容块数组而不是纯字符串").toBe(true);
+
+    const parts = user.content as any[];
+    const image = parts.find((p) => p.type === "image_url");
+    expect(image, "图像块被丢弃了").toBeDefined();
+    expect(image.image_url.url).toBe("data:image/png;base64,iVBORw0KGgo=");
+    expect(parts.find((p) => p.type === "text").text).toBe("这是什么？");
+  });
+
+  it("多张图全部保留，顺序不变", () => {
+    const out = toOpenAIMessages(
+      baseReq([{ role: "user", content: [img("one"), img("two"), { type: "text", text: "比较" }] }]),
+    );
+    const parts = (out.find((m) => m.role === "user")!.content as any[]).filter(
+      (p) => p.type === "image_url",
+    );
+    expect(parts.map((p) => p.image_url.url.split(",")[1])).toEqual(["one", "two"]);
+  });
+
+  it("无图时仍走纯字符串——不给不需要图的请求平白加一层数组", () => {
+    const out = toOpenAIMessages(baseReq([{ role: "user", content: [{ type: "text", text: "纯文本" }] }]));
+    expect(out.find((m) => m.role === "user")!.content).toBe("纯文本");
+  });
+
+  it("图与 tool_result 混在同一条 user 消息时，tool_result 仍单独成 role:tool", () => {
+    const out = toOpenAIMessages(
+      baseReq([
+        { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "x", input: {} }] },
+        {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "t1", content: "ok" },
+            img("zzz"),
+            { type: "text", text: "看这张" },
+          ],
+        },
+      ]),
+    );
+    expect(out.find((m) => m.role === "tool")).toBeDefined();
+    const user = out.filter((m) => m.role === "user").at(-1)!;
+    expect((user.content as any[]).some((p) => p.type === "image_url")).toBe(true);
+  });
+});

@@ -119,6 +119,7 @@ export function toOpenAIMessages(
     // user 消息：tool_result 块 → 逐条 role:"tool"（OpenAI 要求紧跟 assistant tool_calls）；
     // 其余 text 块合并为一条 user 消息，排在 tool 消息之后
     const texts: string[] = [];
+    const images: OpenAI.Chat.Completions.ChatCompletionContentPartImage[] = [];
     for (const b of m.content) {
       if (b.type === "tool_result") {
         const body = typeof b.content === "string" ? b.content : JSON.stringify(b.content);
@@ -129,10 +130,29 @@ export function toOpenAIMessages(
         });
       } else if (b.type === "text") {
         texts.push(b.text);
+      } else if (b.type === "image" && b.source.type === "base64") {
+        // 图像块必须转成 OpenAI 的 image_url（data URI 形式）。
+        // 此前和 thinking 一样被丢弃——后果不是"少了点信息"，而是把一次
+        // 看图请求静默变成空请求：视觉模型收到的只有提示词，没有图，
+        // 然后一本正经地编一段描述出来。静默降级比报错危险得多。
+        images.push({
+          type: "image_url",
+          image_url: { url: `data:${b.source.media_type};base64,${b.source.data}` },
+        });
       }
       // thinking / 其他块类型：OpenAI 协议无对应物，丢弃
     }
-    if (texts.length > 0) {
+    if (images.length > 0) {
+      out.push({
+        role: "user",
+        content: [
+          ...images,
+          ...(texts.length > 0
+            ? [{ type: "text" as const, text: texts.join("\n\n") }]
+            : []),
+        ],
+      });
+    } else if (texts.length > 0) {
       out.push({ role: "user", content: texts.join("\n\n") });
     }
   }

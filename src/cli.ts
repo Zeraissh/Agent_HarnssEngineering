@@ -16,6 +16,10 @@
  *   OPENAI_API_KEY      provider=openai 时的 key，缺省复用 ANTHROPIC_API_KEY
  *   AGENT_MODEL         可选，模型名，默认 claude-opus-4-8；
  *                       非 claude-* 模型自动进入 compat 模式（去掉 Claude 专属参数）
+ *   AGENT_VISION_MODEL  可选，视觉模型（+ _PROVIDER / _BASE_URL / _API_KEY）：
+ *                       配了才注册 describe_image 工具，让纯文本执行者（DeepSeek/
+ *                       Kimi 等）间接获得看图能力。若执行者自己必须看图才能推理
+ *                       （如照着截图改 CSS），正解是换执行者模型而不是加这个工具
  *   AGENT_VERIFIER_MODEL 可选，--verify 时 verifier 用的独立模型（应 ≥ 执行者强度）；
  *                       配套 AGENT_VERIFIER_PROVIDER / _BASE_URL / _API_KEY 可指向
  *                       不同端点，缺省沿用执行者的端点配置
@@ -45,6 +49,7 @@ import { getPack, PACKS, RULE_PRECEDENCE_DISCIPLINE, selectPackTools } from "./p
 import { routeToPack } from "./router.js";
 import { createModelClientFromEnv } from "./provider.js";
 import { bashTool, SHELL_DESC } from "./tools/bash.js";
+import { createDescribeImageTool } from "./tools/describe-image.js";
 import { fetchUrlTool } from "./tools/fetch-url.js";
 import { readFileTool } from "./tools/read-file.js";
 import { writeFileTool } from "./tools/write-file.js";
@@ -212,9 +217,31 @@ async function main(): Promise<void> {
     }
   }
 
+  /**
+   * 视觉模型（第四个角色模型）。配了才注册 describe_image——没配就不该在
+   * 工具面上摆一个一调用就报错的工具，那是在骗模型说自己能看图。
+   * 用途：DeepSeek / Kimi 这类纯文本执行者靠它间接获得视觉能力。
+   */
+  const visionModelName = process.env.AGENT_VISION_MODEL;
+  const visionProvider = visionModelName
+    ? createModelClientFromEnv(visionModelName, {
+        ...(process.env.AGENT_VISION_PROVIDER
+          ? { provider: process.env.AGENT_VISION_PROVIDER as "anthropic" | "openai" }
+          : {}),
+        ...(process.env.AGENT_VISION_BASE_URL ? { baseURL: process.env.AGENT_VISION_BASE_URL } : {}),
+        ...(process.env.AGENT_VISION_API_KEY ? { apiKey: process.env.AGENT_VISION_API_KEY } : {}),
+      })
+    : undefined;
+  if (visionProvider) console.log(c.dim(`vision model: ${visionModelName}`));
+  const visionTool = visionProvider
+    ? createDescribeImageTool({ client: visionProvider.client, modelName: visionModelName! })
+    : undefined;
+
   // 内置工具按包名单装配（缺省全带）——领域包只带用得上的，减少触发面噪声
   const builtinByName = new Map(
-    [bashTool, fetchUrlTool, readFileTool, writeFileTool].map((t) => [t.name, t]),
+    [bashTool, fetchUrlTool, readFileTool, writeFileTool, ...(visionTool ? [visionTool] : [])].map(
+      (t) => [t.name, t],
+    ),
   );
   const builtinNames = pack?.builtinTools ?? [...builtinByName.keys()];
   const builtins = builtinNames.map((n) => {
@@ -325,7 +352,7 @@ async function main(): Promise<void> {
 
   if (withPlan) {
     // 三角编排：planner 拆解 → 逐子任务(执行→核查→返工) → 交接下游
-    const builtinPool = [bashTool, fetchUrlTool, readFileTool, writeFileTool];
+    const builtinPool = [bashTool, fetchUrlTool, readFileTool, writeFileTool, ...(visionTool ? [visionTool] : [])];
     const mcpPool = mcp?.tools ?? [];
     let currentStep = "";
     let planRef: Awaited<ReturnType<typeof runPlanned>>["plan"];
