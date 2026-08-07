@@ -426,6 +426,7 @@ function renderDetailWithState(state) {
     logEntries,
     onToggleEntry: handleToggleEntry,
     harness: harnessSnapshot,
+    liveText: liveTexts.get(runId) ?? "",
     loopView: loopViews.get(runId) ?? "events",
     transcript: transcripts.get(runId) ?? null,
     onSwitchView: (view) => switchLoopView(runId, view),
@@ -547,10 +548,53 @@ async function loadHarness() {
  */
 // ---- 事件批处理（V-10）----
 // 调度细节见 core/batch.js（含"隐藏标签页 rAF 不触发"那个坑的处理）
+/**
+ * 文本流式的接收端（backlog §4）。
+ *
+ * 服务端 R2 起就在推 `event: delta` 命名通道，前端一直丢弃——直播条显示的是
+ * 上一条【完整】assistant_text，不是逐字。（AC2-06 那次真机跑，一次约 90 秒的
+ * 运行流了 1133 条 delta，全被扔掉。）
+ *
+ * 它**不进 RunState**：delta 不占 seq、不进服务端事件缓冲（V-15 的设计），
+ * 重连重放时根本不存在。放进 state 会打破 reducer 的重放幂等性。所以按
+ * connectionStates 的同款办法，由控制器单独持有、渲染时作为参数传入。
+ *
+ * @type {Map<string, string>}
+ */
+const liveTexts = new Map();
+/** 缓冲上限：只用来显示尾部 80 字，没必要为一次长生成攒下几十 KB */
+const LIVE_TEXT_CAP = 2000;
+
+/**
+ * delta 自己一个 batcher：它走的不是 reduce 那条路，但节流与"隐藏标签页
+ * rAF 不触发"那个坑同样适用，所以复用同一个调度器实现而不是自己写节流。
+ */
+const deltaBatcher = createBatcher((batches) => {
+  for (const [runId, chunks] of batches) {
+    const merged = (liveTexts.get(runId) ?? "") + chunks.join("");
+    liveTexts.set(runId, merged.length > LIVE_TEXT_CAP ? merged.slice(-LIVE_TEXT_CAP) : merged);
+    if (selectedRunId !== runId) continue;
+    const state = runStates.get(runId);
+    if (state) renderDetailWithState(state);
+  }
+});
+
 const batcher = createBatcher((batches) => {
   for (const [runId, queue] of batches) {
     const state = runStates.get(runId);
     if (!state) continue;
+
+    // 文本阶段的边界：新一轮开始、模型转去调工具、或整段结束——
+    // 三者都意味着"正在流入的那段文本"已经不是此刻在发生的事了，让位给
+    // 工具标签/最终文本。不在 assistant_text 处清：那条只是把同一段文本
+    // 完整地又给了一遍，清了会让直播条闪一下。
+    for (const item of queue) {
+      const t = item?.event?.type;
+      if (t === "turn_start" || t === "tool_call" || t === "done") {
+        liveTexts.delete(runId);
+        break;
+      }
+    }
 
     const next = reduceEvents(state, queue);
     runStates.set(runId, next);
@@ -559,6 +603,7 @@ const batcher = createBatcher((batches) => {
 
     // run_end 是唯一的"可以收工"信号：此时主动 close，浏览器才不会再自动重连
     if (next.status === "done") {
+      liveTexts.delete(runId); // 运行结束，直播条隐藏，缓冲没有留存意义
       const es = eventSources.get(runId);
       if (es) {
         es.close();
@@ -576,7 +621,10 @@ const enqueueEvent = (runId, sseEvent) => batcher.push(runId, sseEvent);
 
 // 切回前台时立刻补齐一次，不必等下一个节拍
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible") batcher.flushNow();
+  if (document.visibilityState === "visible") {
+    batcher.flushNow();
+    deltaBatcher.flushNow();
+  }
 });
 
 function ensureSubscription(runId) {
@@ -592,6 +640,18 @@ function ensureSubscription(runId) {
       enqueueEvent(runId, JSON.parse(msg.data));
     } catch {
       // 解析失败静默
+    }
+  });
+
+  // 文本流式：命名通道，不占 seq、不进事件缓冲（V-15）。
+  // 只取 main 来源——verifier/planner 的思考流不该抢占委托方的直播条。
+  es.addEventListener("delta", (msg) => {
+    try {
+      const { source, text } = JSON.parse(msg.data);
+      if (source !== "main" || typeof text !== "string" || text === "") return;
+      deltaBatcher.push(runId, text);
+    } catch {
+      // 解析失败静默：直播条是锦上添花，不能因为一条坏帧影响主流程
     }
   });
 

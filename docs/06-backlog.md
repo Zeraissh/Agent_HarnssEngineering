@@ -150,12 +150,25 @@
 
 ## 四、流式（管道已通，Web 没接）
 
-- **文本流式已有**：`stream.on("text")` → `onDelta` → `text_delta` 事件，
-  CLI 实时打印。R2 把它改成了 SSE 命名通道（不占 seq、不进缓冲）。
-  **但 Web UI 至今丢弃它**——LiveStrip 显示的是上一条完整 `assistant_text`，
-  不是逐字。前端消费即可。
-- **思考流式没有**：`stream.on("text")` 只接文本增量，`thinking_delta` 没接，
-  所以思考块是整轮结束才到。要逐字显示思考过程需在 `model-client.ts` 补接。
+- ~~**文本流式 Web 没接**~~ **✅ 已实施（2026-08-07）**：`index.html` 订阅
+  `event: delta` 命名通道 → 控制器侧 `liveTexts` 缓冲（**不进 RunState**：delta
+  不占 seq、重放时不存在，进 state 会打破 reducer 的重放幂等）→ 作为
+  `renderRunDetail` 的 `liveText` 入参喂给直播条，显示尾部 80 字。
+  delta 单独一个 `createBatcher`（复用同款调度，含"隐藏标签页 rAF 不触发"那个坑）。
+  只取 `source === "main"`——verifier/planner 的流不该抢委托方的直播条。
+  文本阶段边界在 `turn_start` / `tool_call` / `done` 处清空缓冲。6 条渲染锁。
+
+  **真机验证**：运行中选中一个在飞的 run → 直播条 18/18 采样 `hidden: false`、
+  670 帧 delta、12 个不同的流式文本随流推进，结束时正确隐藏。
+  （踩了一次自己的坑：第一轮"验证失败"其实是我在 run 结束后才点开它——
+  `ensureSubscription` 对终态 run 按设计不订阅，行为正确。**排查 UI 时先确认
+  自己观察的时机，再怀疑代码**。）
+
+- **思考流式仍没有**：`stream.on("text")` 只接文本增量，`thinking_delta` 没接。
+  接上文本流式之后这条**从文档里的一句话变成了肉眼可见的空窗**——真机实测
+  deepseek 开头约 3 秒 `deltas=0`、直播条停在"等待模型响应…"，那就是思考阶段
+  （effort 调高会更长）。要逐字显示需在 `model-client.ts` 补接。
+  注意 compat 端点未必吐 `thinking_delta`，需能力探测 + 降级。
 
 ---
 

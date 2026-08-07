@@ -213,7 +213,11 @@ export function reduceEvent(state, sseEvent) {
   const { seq, source, event } = sseEvent;
   const type = /** @type {string} */ (event.type);
 
-  // text_delta — 忽略不渲染（assistant_text 已含全文）
+  // text_delta 不进 state——它走 `event: delta` 命名通道、不占 seq、不进服务端
+  // 事件缓冲（V-15），重连重放时根本不存在；进了 state 就会打破"同批事件重放
+  // 两次状态深相等"。逐字显示由控制器单独持有缓冲、作为 renderRunDetail 的
+  // liveText 入参喂进直播条（backlog §4）。这条分支守的是"万一它混进了durable
+  // 流也不改状态"。
   if (type === "text_delta") return state;
 
   // ---- 路由 ----
@@ -1449,7 +1453,7 @@ export function renderRunDetail(state, callbacks) {
   patchDetailHeader(parts, state, isRunning, faces);
   patchApprovalRail(parts, state, isRunning, callbacks);
   patchUnverifiedRail(parts, faces);
-  patchLiveStrip(parts, state, isRunning);
+  patchLiveStrip(parts, state, isRunning, callbacks.liveText ?? "");
   patchOutcomeCard(parts, state, overview, faces);
   patchFactorGrid(parts, faces, activeTab, callbacks);
   patchTabContent(parts, state, activeTab, overview, logEntries, callbacks, faces);
@@ -1635,21 +1639,34 @@ function patchUnverifiedRail(parts, faces) {
     '<p class="rail-note">核查者无法自行判定这些项，已移交委托方。不影响 passed，也不触发返工。</p>';
 }
 
-/** 直播条：运行中显示最近一次工具调用或最后一句输出 */
-function patchLiveStrip(parts, state, isRunning) {
+/**
+ * 直播条：运行中显示【正在流入的文本】，其次是最近一次工具调用，再次是最后一句输出。
+ *
+ * liveText 是逐字增量（`event: delta` 命名通道）。它**不在 RunState 里**，
+ * 由控制器单独持有并作为参数传入——delta 不占 seq、不进事件缓冲（V-15），
+ * 重放时根本不存在；塞进 state 会打破 reducer 的"同批事件重放两次状态深相等"。
+ *
+ * 优先级把 liveText 放第一：它描述的是【此刻正在发生】的事，而 tool_call /
+ * assistant_text 都是已经发生完的。控制器在 turn_start / tool_call / done
+ * 时清空缓冲，所以文本阶段一结束就自动让位给工具标签。
+ */
+function patchLiveStrip(parts, state, isRunning, liveText = "") {
   if (!isRunning) {
     setAttr(parts.liveStrip, "hidden", "");
     parts.sig.live = null;
     return;
   }
+  const streaming = String(liveText ?? "").trim();
   const recent = [...state.timeline].reverse();
   const call = recent.find((e) => e.type === "tool_call");
   const text = recent.find((e) => e.type === "assistant_text");
-  const label = call
-    ? `${call.name}(${summarizeInput(call.input)})`
-    : text
-      ? String(text.text ?? "").slice(0, 80)
-      : "等待模型响应…";
+  const label = streaming
+    ? tailOf(streaming, 80)
+    : call
+      ? `${call.name}(${summarizeInput(call.input)})`
+      : text
+        ? String(text.text ?? "").slice(0, 80)
+        : "等待模型响应…";
 
   const sig = signature([label]);
   if (parts.sig.live === sig) return;
@@ -1658,6 +1675,15 @@ function patchLiveStrip(parts, state, isRunning) {
   parts.liveStrip.innerHTML =
     '<span class="live-dot"></span><span class="live-text"></span>';
   setText(parts.liveStrip.querySelector(".live-text"), label);
+}
+
+/**
+ * 取尾部 n 字（流式文本要看的是最新写出来的那截，不是开头）。
+ * 换行折成空格：直播条是单行，原样塞进去会把布局撑开。
+ */
+export function tailOf(s, n) {
+  const flat = String(s ?? "").replace(/\s+/g, " ").trim();
+  return flat.length <= n ? flat : `…${flat.slice(flat.length - n)}`;
 }
 
 function summarizeInput(input) {

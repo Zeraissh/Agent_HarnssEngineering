@@ -474,3 +474,68 @@ describe("重试退避等待在界面上可见", () => {
     expect(body).not.toContain("undefined");
   });
 });
+
+// ================================================================
+// 文本流式（backlog §4）
+// ================================================================
+
+describe("直播条消费逐字增量", () => {
+  /**
+   * 服务端 R2 起就在推 `event: delta`，前端一直丢弃——直播条显示的是上一条
+   * **完整** assistant_text。这里锁的是"流入的文本优先于已发生完的事"。
+   * liveText 不进 RunState（delta 不占 seq、重放时不存在），所以它是 render
+   * 的入参而不是 state 的字段——这一点本身也由下面"重放幂等"那条守住。
+   */
+  function runningState() {
+    let s = createInitialState("run-s", "流式任务", false);
+    s = reduceEvents(s, [sse(0, "main", "turn_start", { turn: 1 })]);
+    return s;
+  }
+
+  const liveText = () =>
+    document.querySelector(".live-strip .live-text")?.textContent ?? "";
+
+  it("有增量时显示增量的尾部，而不是「等待模型响应…」", () => {
+    renderRunDetail(runningState(), { activeTab: "loop", liveText: "我先读一下 package.json" });
+    expect(liveText()).toContain("package.json");
+    expect(liveText()).not.toContain("等待模型响应");
+  });
+
+  it("超长增量取尾部——要看的是刚写出来的那截", () => {
+    const long = `${"甲".repeat(300)}结论在最后`;
+    renderRunDetail(runningState(), { activeTab: "loop", liveText: long });
+    expect(liveText()).toContain("结论在最后");
+    expect(liveText().length).toBeLessThan(100);
+  });
+
+  it("增量里的换行折成单行——直播条是单行，原样塞进去会撑开布局", () => {
+    renderRunDetail(runningState(), { activeTab: "loop", liveText: "第一行\n\n第二行" });
+    expect(liveText()).not.toContain("\n");
+    expect(liveText()).toContain("第一行 第二行");
+  });
+
+  it("增量为空时退回原行为（最近一次工具调用）", () => {
+    let s = runningState();
+    s = reduceEvents(s, [
+      sse(1, "main", "tool_call", { toolUseId: "t1", name: "read_file", input: { path: "a.ts" } }),
+    ]);
+    renderRunDetail(s, { activeTab: "loop", liveText: "" });
+    expect(liveText()).toContain("read_file");
+  });
+
+  it("不传 liveText 时行为与接入前完全一致（老调用方不受影响）", () => {
+    renderRunDetail(runningState(), { activeTab: "loop" });
+    expect(liveText()).toContain("等待模型响应");
+  });
+
+  it("运行已结束时直播条隐藏，增量不能把它拉回来", () => {
+    let s = runningState();
+    s = reduceEvents(s, [
+      sse(1, "main", "done", { stopReason: "completed", messageCount: 2, usage: {} }),
+      sse(2, "host", "run_end", { outcome: "completed" }),
+    ]);
+    renderRunDetail(s, { activeTab: "loop", liveText: "还在流的残留文本" });
+    const strip = document.querySelector(".live-strip") as HTMLElement;
+    expect(strip.hasAttribute("hidden")).toBe(true);
+  });
+});
