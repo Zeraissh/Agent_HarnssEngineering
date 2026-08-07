@@ -155,5 +155,6 @@ export type TurnEvent =
     }
   | { type: "usage"; turn: number; usage: Anthropic.Usage }
   | { type: "compaction"; droppedBlocks: number }
-  | { type: "api_retry"; turn: number; attempt: number; reason: string }
+  /** backoffMs = 本次实际等待毫秒（含抖动）——不带它宿主就看不出重试到底等了多久 */
+  | { type: "api_retry"; turn: number; attempt: number; reason: string; backoffMs: number }
   | { type: "done"; result: AgentRunResult };

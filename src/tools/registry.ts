@@ -3,6 +3,7 @@
  */
 import type Anthropic from "@anthropic-ai/sdk";
 import type { Tool, ToolResult } from "../types.js";
+import { validateToolInput } from "./validate-input.js";
 
 export class ToolRegistry {
   private tools = new Map<string, Tool>();
@@ -105,6 +106,23 @@ export class ToolExecutor {
           .join(", ")}`,
         isError: true,
       };
+    }
+
+    /**
+     * 入参校验（P6：护栏是宿主的责任）——在【审批门之前】。
+     *
+     * 顺序是有意的：入参就不合法的调用不该去打扰人做授权决定。人看到审批卡时
+     * 应当只需判断"要不要授权这个动作"，而不是先替宿主检查参数形状对不对。
+     * 校验器本身失败开放（只拒认得的构造被明确违反），见 validate-input.ts。
+     *
+     * 各工具自己的 typeof 检查保留不动：Tool.execute 是可被直接调用的公开面
+     * （测试就这么用），工具守住自己的前置条件是本分，不是这一层的冗余。
+     * 分工是：这一层执行【声明过的 schema】，工具那一层管 schema 表达不了的
+     * 语义约束（非空、必须 https://）。
+     */
+    const invalid = validateToolInput(tool.inputSchema, block.input);
+    if (invalid) {
+      return { content: invalid, isError: true };
     }
 
     if (tool.permission === "ask") {

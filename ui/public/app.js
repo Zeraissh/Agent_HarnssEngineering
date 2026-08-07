@@ -468,6 +468,9 @@ function buildTimelineEntry(seq, source, type, event) {
         turn: /** @type {number} */ (event.turn),
         attempt: /** @type {number} */ (event.attempt),
         reason: /** @type {string} */ (event.reason),
+        // 抖动上线后同一 attempt 的等待不再是定值；旧 run 没有这个字段，
+        // 只在存在时带上（渲染层据此决定显不显示，不能显示 undefined）
+        ...(typeof event.backoffMs === "number" ? { backoffMs: event.backoffMs } : {}),
       };
     case "compaction":
       return { ...base, droppedBlocks: /** @type {number} */ (event.droppedBlocks) };
@@ -2831,7 +2834,11 @@ function renderLogEntryBody(e) {
     case "approval_request":
       return `<pre class="log-entry-body">${esc(formatInput(e.input))}</pre>`;
     case "api_retry":
-      return `<div class="log-entry-body">原因：${esc(e.reason ?? "")}</div>`;
+      // 等待时长要看得见：抖动之后同一 attempt 的等待不再是定值，
+      // 只显示"第几次重试"会让人以为退避是固定的
+      return `<div class="log-entry-body">原因：${esc(e.reason ?? "")}${
+        typeof e.backoffMs === "number" ? `<br>退避等待：${esc(formatDuration(e.backoffMs))}（含抖动）` : ""
+      }</div>`;
     case "compaction":
       return `<div class="log-entry-body">丢弃 ${e.droppedBlocks ?? "?"} 个块</div>`;
     default:

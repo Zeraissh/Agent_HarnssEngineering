@@ -23,6 +23,22 @@
 **接手启示**：遇到"这个功能没有"，先去 `src/` 找一遍再动手写。这个 harness
 比它的宿主走得远得多。
 
+**2026-08-07 补两例，规律要改写**：
+
+| 能力 | 早就在 | 状态 |
+|---|---|---|
+| 文本流式 `text_delta` | R2 就改成了 SSE 命名通道 | 前端 `app.js:216` 一行直接丢弃（AC2-06 那次跑实测 **1133 条 delta 在流**）|
+| `api_retry.backoffMs` | 本轮刚加 | reducer 白名单投影当场丢掉，**加字段的同一个提交里就发生了** |
+
+第二例说明这不只是"旧宿主落后于新 harness"——**只要 harness 加字段而不同时接
+宿主，缺口就即刻生成**。前端 reducer 是按事件类型逐字段白名单投影的，任何新字段
+默认被丢，且不会有任何报错。所以纪律不是"回头补"，而是：
+
+> **harness 加一个字段 = 同一个提交里把宿主那一侧一起接上，并加一条渲染锁。**
+
+本轮那条锁（`test/ui-patch.test.ts` 的"重试退避等待在界面上可见"）就是这么抓到
+自己刚造的缺口的——肉眼看不出来，因为界面并不报错，只是少显示一行。
+
 ---
 
 ## 一、R6 收尾（v2 未闭合项）
@@ -30,9 +46,13 @@
 1. **v1 九条 + AC-01~10 逐条复验未回退**（AC2-18）。基线在
    [`ui/remediation-v1.md`](../ui/remediation-v1.md)，状态表在
    [`ui/remediation-status.md`](../ui/remediation-status.md)。
-2. **真实模型端到端确认 rubric 产出非空 advisory**（AC2-06 的缺口）。
-   需 API key。`AGENT_PACK=ts-coding` + `AGENT_VERIFY_RUBRIC` 注入评分表，
-   确认 advisory 不为空——Web 路径下此前恒为空，R2 修了装配但没做真机端到端。
+2. ~~**真实模型端到端确认 rubric 产出非空 advisory**（AC2-06 的缺口）~~
+   **已关闭（2026-08-07）**：deepseek-v4-pro 走 compat 路径，Web 宿主
+   `pack=ts-coding` + 四维度 rubric → `advisory` 4 条、逐条对上维度且可追溯到实物；
+   `passed=true` / `reworks=0`（advisory 不影响裁决）。**双向自检**：同任务同包、
+   唯一变量为"不注入 rubric"的对照臂 → `advisory=0`。装配链纸面即通
+   （`ui/server.ts:449` → `orchestrate.ts:163` → `verifier.ts:297`），真机确认无偏差。
+   证据见 [`ui/remediation-v2-status.md`](../ui/remediation-v2-status.md) AC2-06 行。
 3. **单帧毫秒量化**（AC2-11 的缺口）。目前只锁住"1000 事件只触发 1 次 flush"，
    真实浏览器的单帧耗时没测过。
 4. **案例文档更新**：`docs/cases/case-07-web-host-ui.md` 更新至 v2 全案；
@@ -59,20 +79,40 @@
 
 注意 compat 端点未必都支持 `response_format`，需要能力探测 + 降级回现有解析路径。
 
-### 2.2 工具入参 schema 校验
+### 2.2 工具入参 schema 校验 —— ✅ 已实施（2026-08-07）
 
-`inputSchema` 声明了、发给模型了，但**运行时从不校验**——各工具自己手写
-`typeof p !== "string"`（见 `src/tools/write-file.ts:23`）。
+落地：`src/tools/validate-input.ts`（`validateToolInput`）+ `ToolExecutor` 在
+**审批门之前**统一拦（`src/tools/registry.ts:111`）。23 条单测。不引入 zod/ajv。
 
-**项目自己的 P6 在反对现状**：「护栏是宿主的责任，不是模型的自觉」。
-现在 schema 的遵守完全靠模型自觉：宿主声明了契约，然后不检查。
+三条实施时才看清、值得记下的东西：
 
-做法：最小 JSONSchema 子集校验器（约百来行，只覆盖自己声明过的那些形态），
-在 `ToolExecutor` 统一拦，错误消息写给模型看（P5）。
-`parseVerdict` / `parsePlan` 的手写字段校验是同一类问题的第二个现场。
+1. **MCP 是硬理由，不是风格偏好**。`src/mcp.ts:75` 把外部 server 声明的 schema
+   原样 `as JSONSchema` 收下，`execute` 再把 `input ?? {}` 直接转发——那些工具
+   **没有任何位置可以手写检查**。而 `mcp.json` 里 stm32 是 `permission: "auto"`，
+   含 `write_memory` / `flash_firmware`。手写路线从结构上盖不住 MCP。
+2. **早有一处现场在等这一层**。`src/model-client-openai.ts` 的 `safeParseArgs`
+   注释写着「解析失败回传空对象，**让工具的输入校验层**给出可操作报错」——
+   代码一直在向一个从未建成的层交接。今天残缺 JSON 会以
+   `{__malformed_arguments: "..."}` 原样转发给 MCP server。
+3. **失败开放是这个校验器的核心纪律**，比查得严重要。只在【认得的构造被明确
+   违反】时拒绝；`oneOf`/`anyOf`/`$ref`/未知 type 一律放行，也**不**强制
+   `additionalProperties`。理由：schema 来自外部服务端，"看不懂就拒"是亲手造出
+   fail-closed 那一类新失败模式——项目已有三种误伤形态的教训。required 缺失
+   检查已经能抓到拼错的键名（错误消息会把实收键名一并列出）。
 
-**不要引入 zod/ajv**：与"从零手写、刻意不用现成框架"的立项动机冲突，
-而且我们只需要很小的子集。
+**审批门之前**是有意的：入参就不合法的调用不该去打扰人做授权决定。
+
+各工具自己的 `typeof` 检查**保留**：`Tool.execute` 是可直接调用的公开面（测试
+就这么用）。分工是——这一层执行【声明过的 schema】，工具那层管 schema 表达不了
+的语义约束（非空、必须 `https://`）。
+
+**真机验证**：deepseek-v4-pro 走 Web 宿主完整跑一轮，26 次真实工具调用穿过
+校验器零误拒，run 正常收尾（这一层坐在每次工具调用的热路径上，单测全绿不足以
+说明它不误伤）。
+
+**未做**：`parseVerdict` / `parsePlan` 的手写字段校验是同一类问题的第二个现场，
+校验器已可复用，但裁决 JSON 的形状约束与工具入参不同（需要的是"缺字段时如何
+降级"而不是"拒绝"），值得单独想清再动。
 
 ---
 
@@ -85,9 +125,21 @@
 
 **两个缺口**：
 
-1. **退避无抖动**：`errorRetryBackoffMs * (attempt + 1)` 是线性的。
-   **V-27 接入并行编排之后**，三个并发子任务同时撞 429 会同步重试——
-   这是新引入的触发条件。加抖动即可。
+1. ~~**退避无抖动**~~ **✅ 已实施（2026-08-07）**：`backoffWithJitter`
+   （`src/loop.ts`）用**等量抖动**——`ceiling/2 + random*ceiling/2`，不是全抖动。
+   全抖动取 `[0, ceiling]`，有可能几乎立刻重试，而 429 是服务端明说"你太快了"，
+   立刻重发是错误响应；等量抖动保证至少等到一半，同时给出 2:1 散布窗口，
+   对 `AUTO_CONCURRENCY_CAP=3` 足够拉开三条轨。
+
+   **两条实施笔记**：
+   - 纯函数测试覆不住调用点——把 `loop.ts` 改回线性，那 4 条纯函数测试照样全绿。
+     另加了一条走 loop 的行为锁（20 次重试的等待不全相等），反向自检立即失败。
+     为此给 `api_retry` 事件加了 `backoffMs`（抖动后等待不再是定值，界面只显示
+     "第几次重试"会让人以为退避固定）。
+   - **加字段时当场又撞上第零节那条规律**：`app.js` 的 reducer 按字段白名单投影
+     事件，`backoffMs` 在那一层就被丢掉了——harness 发了、宿主半路扔。是 UI 静态锁
+     抓到的，不是肉眼。**新字段落地时就要连宿主一起接**，否则它自动变成下一条
+     "harness 有、宿主没接"。
 2. **无模型降级**：V-30 建好角色模型框架之后，"执行者失败降级到备用模型"
    变得很便宜。
 

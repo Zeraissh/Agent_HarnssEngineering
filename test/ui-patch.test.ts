@@ -438,3 +438,39 @@ describe("侧栏重渲染下的焦点存活 (V-10)", () => {
     ).toEqual(["r0", "r1", "r2"]);
   });
 });
+
+// ================================================================
+// api_retry 的退避等待要看得见
+// ================================================================
+
+describe("重试退避等待在界面上可见", () => {
+  /**
+   * 抖动上线后，同一 attempt 的等待不再是定值——界面若仍只显示"第几次重试"，
+   * 人会以为退避是固定的。这是这个项目反复踩的那条"harness 有、宿主没接"，
+   * 新字段落地时就该锁住，而不是等第七次再补。
+   */
+  function stateWithRetry(extra: Record<string, unknown>) {
+    let s = createInitialState("run-r", "重试任务", false);
+    s = reduceEvents(s, [
+      sse(0, "main", "turn_start", { turn: 1 }),
+      sse(1, "main", "api_retry", { turn: 1, attempt: 1, reason: "限流", ...extra }),
+    ]);
+    return s;
+  }
+
+  it("带 backoffMs 时渲染出实际等待时长", () => {
+    renderRunDetail(stateWithRetry({ backoffMs: 2250 }), { activeTab: "loop" });
+    const body = document.querySelector(".log-entries")?.textContent ?? "";
+    expect(body).toContain("限流");
+    expect(body).toContain("2.3s"); // formatDuration(2250)
+    expect(body).toContain("抖动");
+  });
+
+  it("旧事件没有 backoffMs 时不渲染空占位（重放旧 run 不能显示 undefined）", () => {
+    renderRunDetail(stateWithRetry({}), { activeTab: "loop" });
+    const body = document.querySelector(".log-entries")?.textContent ?? "";
+    expect(body).toContain("限流");
+    expect(body).not.toContain("退避等待");
+    expect(body).not.toContain("undefined");
+  });
+});

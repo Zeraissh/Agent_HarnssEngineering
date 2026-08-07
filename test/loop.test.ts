@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type Anthropic from "@anthropic-ai/sdk";
-import { AgentLoop } from "../src/loop.js";
+import { AgentLoop, backoffWithJitter } from "../src/loop.js";
 import type { AgentRunResult, ModelClient, ModelTurn, TurnEvent } from "../src/types.js";
 import { FakeModelClient, fakeMessage, makeTool, textBlock, toolUseBlock } from "./helpers.js";
 
@@ -285,5 +285,52 @@ describe("瞬时 API 错误的同轮重试", () => {
     const { result } = await collect(loop.run("t"));
     expect(result.stopReason).toBe("error");
     expect(model.calls).toBe(1);
+  });
+
+  it("重试【调用点】真的用了抖动——20 次重试的等待不全相等", async () => {
+    // 只测纯函数覆不住调用点：把 loop.ts 改回 `backoffMs * (attempt+1)`，
+    // 纯函数那几条照样全绿。这条锁的是"loop 确实按抖动值等待"——
+    // 反向自检：改回线性后它立即失败（20 次会全部等于 BASE）。
+    const BASE = 8;
+    const observed: number[] = [];
+    for (let i = 0; i < 20; i++) {
+      const model = new FlakyClient(1, transient(), fakeMessage([textBlock("ok")], "end_turn"));
+      const loop = new AgentLoop({ ...baseConfig, tools: [], errorRetryBackoffMs: BASE }, model);
+      const { events } = await collect(loop.run("t"));
+      const retry = events.find((e) => e.type === "api_retry");
+      expect(retry).toBeDefined();
+      observed.push((retry as Extract<TurnEvent, { type: "api_retry" }>).backoffMs);
+    }
+    // 等量抖动值域：[ceiling/2, ceiling]，attempt=0 时 ceiling = BASE
+    expect(Math.min(...observed)).toBeGreaterThanOrEqual(BASE / 2);
+    expect(Math.max(...observed)).toBeLessThanOrEqual(BASE);
+    expect(new Set(observed).size).toBeGreaterThan(1);
+  });
+});
+
+describe("退避抖动（V-27 并行编排引入的触发条件）", () => {
+  it("等量抖动：恒在 [ceiling/2, ceiling]，且随 attempt 递增", () => {
+    for (const attempt of [0, 1, 2]) {
+      const ceiling = 1500 * (attempt + 1);
+      expect(backoffWithJitter(1500, attempt, () => 0)).toBe(ceiling / 2);
+      expect(backoffWithJitter(1500, attempt, () => 1)).toBe(ceiling);
+      expect(backoffWithJitter(1500, attempt, () => 0.5)).toBe(Math.round(ceiling * 0.75));
+    }
+  });
+
+  it("绝不返回接近 0 的等待——429 说的是「你太快了」，全抖动在这里是错的", () => {
+    // 全抖动取 [0, ceiling]，random()→0 时几乎立刻重发；等量抖动保证等到一半
+    expect(backoffWithJitter(1500, 0, () => 0)).toBe(750);
+  });
+
+  it("三条同时开始的重试轨被真正拉开（不是整体推后）", () => {
+    // V-27 之前只有一条轨，线性退避无害；cap=3 并行后同时撞 429 会同步重试
+    const rails = [0.05, 0.5, 0.95].map((r) => backoffWithJitter(1500, 0, () => r));
+    expect(new Set(rails).size).toBe(3);
+    expect(Math.max(...rails) - Math.min(...rails)).toBeGreaterThan(600);
+  });
+
+  it("backoffMs=0 仍然是 0（既有测试靠这条零延迟跑）", () => {
+    expect(backoffWithJitter(0, 3, () => 0.9)).toBe(0);
   });
 });

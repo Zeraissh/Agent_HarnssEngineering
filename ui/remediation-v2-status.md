@@ -57,7 +57,7 @@
 | AC2-03 同 id 跨轮不串卡 | ✅ | reducer 测试两条（`approval_resolved` 按 requestSeq；`markApprovalResolved` 裸 id 只命中最新挂起卡）+ 契约测试 v2-6 |
 | AC2-04 stopReason 六值分档 | ✅ | `classifyStopReason` 六值测试 + "四种非 error 终止不再被当作成功" + `done.error.message` 透出（契约测试 v2-4）；呈现层徽章与提示已接入，完整版式随 R4 的 OutcomeCard |
 | AC2-05 SSE 重连与重放幂等 | ✅ | 契约测试 v2-5（Last-Event-ID 只补发 seq 更大的事件）+ reducer 幂等/批量等价/乱序丢弃三条 |
-| AC2-06 pack 核查三件套真实生效 | ⚠️ 程序化部分已闭合 | 契约测试 v2-7（白名单命令被放行，抽掉即失败）+ v2-8（`/api/harness` 的护栏/白名单与 `src/presets.ts` 声明同源逐字段一致）。**尚缺**：真实模型端到端跑一次确认 rubric 产出非空 advisory（需 API key，留 R6） |
+| AC2-06 pack 核查三件套真实生效 | ✅ | 契约测试 v2-7（白名单命令被放行，抽掉即失败）+ v2-8（`/api/harness` 的护栏/白名单与 `src/presets.ts` 声明同源逐字段一致）。**真机端到端已补齐**（2026-08-07，deepseek-v4-pro，`ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic`，compat 路径）：Web 宿主 `POST /api/runs` 带 `pack=ts-coding` + 四维度 rubric 跑同一 TS 交付任务，裁决 `advisory` **4 条**、逐条对上一个维度且格式为提示词要求的「维度 \| 结论 \| 依据与判法」，内容可追溯到实物（"1000 与 60000 以数值字面量显式出现在 if 条件中"、"仅一句 JSDoc 未解释分档缘由"均与源码相符）；`passed=true`、`issues=[]`、`reworks=0`——advisory 不影响裁决、不触发返工，符合案例 #1/#6 定论。**双向自检**：重置 fixture 后跑唯一变量为"不注入 rubric"的对照臂 → `advisory=0`。**顺带实证 V-06 白名单**：verifier 自己发起 12 次工具调用 / 6 次审批请求，summary 带第一手数字（"vitest 11/11 通过、tsc 零错误"），不是看报告 |
 | AC2-07 数字带口径 / executionUsage | ✅ | 契约测试 v2-9 + reducer 测试「run_end 带来 executionUsage / reworks / finalPassed」；脚注文案明写"执行（全部轮次合计）/ 核查 / 本段" |
 | AC2-08 逐轮裁决实时可见 | ✅ | `onVerification` + `verification` 事件；契约测试 v2-9 与 reducer 测试各一条 |
 | AC2-09 上下文水位口径正确 | ✅ | `deriveContextUsage` 三条测试，其中「水位口径 = 最近一轮输入 / 上限，不是全 run 累计」直接锁住那个会产生假警报的错误口径 |

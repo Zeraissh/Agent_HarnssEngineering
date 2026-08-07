@@ -25,6 +25,32 @@ const DEFAULTS = {
   maxTurns: 50,
 } as const;
 
+/**
+ * 重试退避 + 抖动。
+ *
+ * 为什么需要抖动（V-27 并行编排引入的新触发条件）：原实现是纯线性
+ * `backoffMs * (attempt + 1)`，单 agent 时无害——只有一条重试轨。接入 DAG 并行
+ * 调度（cap=3）之后，同一时刻在飞的多个子任务共享同一个端点，一旦撞上 429，
+ * 它们会在【同一毫秒】发起重试，并在后续每一轮继续保持同步——线性退避对
+ * "同时开始的多条轨"完全不做解耦，只是把碰撞整体推后。
+ *
+ * 用等量抖动（equal jitter）而非全抖动（full jitter）：全抖动取 [0, ceiling]，
+ * 有可能几乎立刻重试——对 429 这种"服务端明说你太快了"的信号是错误的响应。
+ * 等量抖动保证至少等到一半的既定退避，同时给出 2:1 的散布窗口；并发上限是 3
+ * （AUTO_CONCURRENCY_CAP），2:1 的散布足够把三条轨拉开。
+ *
+ * 纯函数 + 可注入 random：抖动不能让重试行为变得不可测试（P2 按需晋升——
+ * 这里不需要重试策略 DSL，只需要这一个函数是可断言的）。
+ */
+export function backoffWithJitter(
+  baseMs: number,
+  attempt: number,
+  random: () => number = Math.random,
+): number {
+  const ceiling = baseMs * (attempt + 1);
+  return Math.round(ceiling / 2 + (random() * ceiling) / 2);
+}
+
 /** push 式异步事件队列：让 loop 在 await 模型/工具期间也能实时发事件 */
 class AsyncEventQueue<T> implements AsyncIterable<T> {
   private buffer: T[] = [];
@@ -188,13 +214,15 @@ export class AgentLoop {
           if (signal.aborted || !isTransientApiError(err) || attempt >= this.errorRetries) {
             return finish("error", new Error(classifyApiError(err)));
           }
+          const backoffMs = backoffWithJitter(this.errorRetryBackoffMs, attempt);
           q.push({
             type: "api_retry",
             turn,
             attempt: attempt + 1,
             reason: classifyApiError(err),
+            backoffMs,
           });
-          await delay(this.errorRetryBackoffMs * (attempt + 1));
+          await delay(backoffMs);
         }
       }
 

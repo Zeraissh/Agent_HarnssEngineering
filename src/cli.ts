@@ -398,7 +398,9 @@ async function main(): Promise<void> {
           console.log(c.yellow(`${tag} ⚠ context compacted: dropped ${event.droppedBlocks} blocks`));
           break;
         case "api_retry":
-          console.log(c.yellow(`${tag} ⟳ API 瞬时错误，同轮重试 #${event.attempt}`));
+          console.log(
+            c.yellow(`${tag} ⟳ API 瞬时错误，同轮重试 #${event.attempt}（等待 ${event.backoffMs}ms）`),
+          );
           break;
         case "done": {
           const u = event.result.usage;
@@ -603,7 +605,9 @@ async function main(): Promise<void> {
         break;
       case "api_retry":
         endStreamLine();
-        console.log(c.yellow(`⟳ API 瞬时错误，同轮重试 #${event.attempt}：${event.reason}`));
+        console.log(
+          c.yellow(`⟳ API 瞬时错误，同轮重试 #${event.attempt}（等待 ${event.backoffMs}ms）：${event.reason}`),
+        );
         break;
       case "compaction":
         console.log(c.yellow(`⚠ context compacted: dropped ${event.droppedBlocks} blocks`));
