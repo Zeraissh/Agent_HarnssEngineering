@@ -143,6 +143,33 @@ export function keepScrollAnchored(scroller, mutate, threshold = 40) {
   return pinned;
 }
 
+/**
+ * 视口锚定：一次会改变元素高度的补丁前后，让 `anchor` 在视口中的位置保持不变。
+ *
+ * 动机（委托方反馈）：审批栏在页面顶部，它一变高变矮，下面的全部内容就跟着
+ * 平移——用户点一下"允许"，正在看的地方就被甩走了。`keepScrollAnchored` 解决
+ * 的是另一件事（日志贴底跟随），这里要的是"别动我正在看的东西"。
+ *
+ * 做法是标准的 scroll anchoring：记下锚点相对视口的位置，补丁后按位移反向
+ * 补偿 scrollTop。锚点应选在会变高的区域【下方】——那才是用户在读的内容。
+ *
+ * @param {HTMLElement} scroller 滚动容器
+ * @param {HTMLElement} anchor   锚点元素（取其 getBoundingClientRect().top）
+ * @param {() => void} mutate
+ */
+export function keepViewportAnchored(scroller, anchor, mutate) {
+  if (!scroller || !anchor || typeof anchor.getBoundingClientRect !== "function") {
+    mutate();
+    return 0;
+  }
+  const before = anchor.getBoundingClientRect().top;
+  mutate();
+  const delta = anchor.getBoundingClientRect().top - before;
+  // jsdom 里 rect 恒为 0，delta 恒为 0——这条在单测里是空操作，真机才有效
+  if (delta) scroller.scrollTop += delta;
+  return delta;
+}
+
 /** CSS.escape 的最小替身（jsdom 里不一定有） */
 function cssEscape(s) {
   if (typeof CSS !== "undefined" && CSS.escape) return CSS.escape(s);

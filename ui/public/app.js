@@ -1,5 +1,6 @@
 import { createBatcher } from "./core/batch.js";
 import { diffKeyed, signature } from "./core/diff.js";
+import { renderMarkdown, renderMarkdownInline } from "./core/markdown.js";
 import {
   patchList,
   appendOnly,
@@ -7,11 +8,12 @@ import {
   setAttr,
   setClass,
   keepScrollAnchored,
+  keepViewportAnchored,
   withFocusPreserved,
 } from "./dom/patch.js";
 
 // 桶文件转出：现有 import 路径（测试与控制器都从 /app.js 取）保持不变
-export { createBatcher, diffKeyed, signature, patchList, appendOnly, setText, setAttr, setClass, keepScrollAnchored, withFocusPreserved };
+export { createBatcher, diffKeyed, signature, patchList, appendOnly, setText, setAttr, setClass, keepScrollAnchored, keepViewportAnchored, withFocusPreserved };
 
 /**
  * Harness Web UI — 纯函数 reducer + DOM 渲染层。
@@ -1524,9 +1526,16 @@ export function renderRunDetail(state, callbacks) {
   const parts = ensureDetailSkeleton(mainEl, state, callbacks);
 
   patchDetailHeader(parts, state, isRunning, faces);
-  patchPlanGate(parts, state, faces, callbacks);
-  patchApprovalRail(parts, state, isRunning, callbacks);
-  patchUnverifiedRail(parts, faces);
+  /**
+   * 需你决定区（签字位 + 审批栏 + 待复核）在页面顶部，它一变高变矮，下面的
+   * 内容就整体平移——委托方反馈"点一下允许就被弹到最上方"。锚点取结果卡
+   * （紧邻 rail 下方、始终存在），补丁后按位移反向补偿滚动位置。
+   */
+  keepViewportAnchored(mainEl, parts.outcome, () => {
+    patchPlanGate(parts, state, faces, callbacks);
+    patchApprovalRail(parts, state, isRunning, callbacks);
+    patchUnverifiedRail(parts, faces);
+  });
   patchLiveStrip(parts, state, isRunning, callbacks.liveText ?? "");
   patchOutcomeCard(parts, state, overview, faces);
   patchFactorGrid(parts, faces, activeTab, callbacks);
@@ -1576,6 +1585,8 @@ function ensureDetailSkeleton(mainEl, state, callbacks) {
     // 签字位排在审批卡之前：它挂起时一个子任务都还没发射，此刻决定成本最低
     '<div class="plan-gate" hidden></div>' +
     '<div class="approval-cards" hidden></div>' +
+    // 已处理的折叠成一行，不与待处理的混排（委托方反馈：无限堆叠难读难操作）
+    '<div class="approval-cards-done" hidden></div>' +
     '<div class="unverified-rail" hidden></div>' +
     "</div>" +
     '<div class="live-strip" hidden aria-live="polite"></div>' +
@@ -1601,6 +1612,7 @@ function ensureDetailSkeleton(mainEl, state, callbacks) {
     actionRail: mainEl.querySelector(".action-rail"),
     planGate: mainEl.querySelector(".plan-gate"),
     approvals: mainEl.querySelector(".approval-cards"),
+    approvalsDone: mainEl.querySelector(".approval-cards-done"),
     unverified: mainEl.querySelector(".unverified-rail"),
     liveStrip: mainEl.querySelector(".live-strip"),
     outcome: mainEl.querySelector(".outcome-card"),
@@ -1757,7 +1769,7 @@ function patchUnverifiedRail(parts, faces) {
   parts.unverified.innerHTML =
     `<h3 class="rail-title">⋯ ${items.length} 项待你复核</h3>` +
     '<ul class="unverified-list">' +
-    items.map((i) => `<li class="unverified-item">${esc(i)}</li>`).join("") +
+    items.map((i) => `<li class="unverified-item md-inline">${renderMarkdownInline(i)}</li>`).join("") +
     "</ul>" +
     '<p class="rail-note">核查者无法自行判定这些项，已移交委托方。不影响 passed，也不触发返工。</p>';
 }
@@ -1824,7 +1836,21 @@ function summarizeInput(input) {
  * 旧实现下这个输入框根本没法用。
  */
 function patchApprovalRail(parts, state, isRunning, callbacks) {
-  const list = state.pendingApprovals;
+  /**
+   * **只有待处理的进 rail**（委托方反馈）。
+   *
+   * 此前这里渲染 `state.pendingApprovals` 全量——那个数组同时装着已决的，
+   * 于是长运行下审批卡无限堆叠、已处理与未处理混在一起，既难读又难操作。
+   * 已决的本来就在概览「审批记录」里有留档，留在 rail 上是同一条在两处
+   * 重复展示（V-16 修过的同一个毛病），而 rail 的语义是"需你现在决定"。
+   *
+   * 但也不能点完就凭空消失——那样人不确定自己那一下有没有生效。
+   * 折中：已决的折叠成一行摘要留在 rail 底部，展开是紧凑列表而不是完整卡片。
+   */
+  const list = state.pendingApprovals.filter((a) => a.status === "pending");
+  const resolved = state.pendingApprovals.filter((a) => a.status !== "pending");
+  patchResolvedSummary(parts, resolved);
+
   setAttr(parts.approvals, "hidden", list.length > 0 ? null : "");
   if (list.length === 0) {
     patchList(parts.approvals, [], { key: (a) => a.approvalId || a.toolUseId, create: () => document.createElement("div") });
@@ -1865,6 +1891,48 @@ function patchApprovalRail(parts, state, isRunning, callbacks) {
     },
     update: (card, a) => updateApprovalCard(card, a, isRunning),
   });
+}
+
+/**
+ * 已处理审批的折叠摘要：一行统计 + 可展开的紧凑列表。
+ * 展开态用 `<details>` 原生实现——它自带键盘可达与展开状态保持，
+ * 比自己拿 button + hidden 拼一套稳。
+ */
+function patchResolvedSummary(parts, resolved) {
+  const host = parts.approvalsDone;
+  if (!host) return;
+  if (resolved.length === 0) {
+    setAttr(host, "hidden", "");
+    host.innerHTML = "";
+    parts.sig.approvalsDone = null;
+    return;
+  }
+  const counts = { allowed: 0, denied: 0, expired: 0 };
+  for (const a of resolved) counts[a.status] = (counts[a.status] ?? 0) + 1;
+  const sig = signature([resolved.length, counts.allowed, counts.denied, counts.expired]);
+  if (parts.sig.approvalsDone === sig) return;
+  parts.sig.approvalsDone = sig;
+
+  setAttr(host, "hidden", null);
+  const parts_ = [];
+  if (counts.allowed) parts_.push(`允许 ${counts.allowed}`);
+  if (counts.denied) parts_.push(`拒绝 ${counts.denied}`);
+  if (counts.expired) parts_.push(`过期 ${counts.expired}`);
+  // details/summary 的展开态由浏览器保持，重渲染时不会被合上
+  const wasOpen = host.querySelector("details")?.open ?? false;
+  host.innerHTML =
+    `<details class="approvals-done"${wasOpen ? " open" : ""}>` +
+    `<summary>已处理 ${resolved.length} 项 · ${esc(parts_.join(" · "))}</summary>` +
+    '<ul class="approvals-done-list">' +
+    resolved
+      .map((a) => {
+        const label = a.status === "allowed" ? "✓ 允许" : a.status === "denied" ? "✗ 拒绝" : "⋯ 过期";
+        const when = a.decidedAt ? ` · ${new Date(a.decidedAt).toLocaleTimeString()}` : "";
+        const why = a.reason ? ` · ${esc(a.reason)}` : "";
+        return `<li><span class="approvals-done-mark">${esc(label)}</span> ${esc(a.name)}${esc(when)}${why}</li>`;
+      })
+      .join("") +
+    "</ul></details>";
 }
 
 function updateApprovalCard(card, a, isRunning) {
@@ -1939,7 +2007,7 @@ function patchOutcomeCard(parts, state, overview, faces) {
     html += `<span class="outcome-verdict-note">${esc(reworkNote)}</span>`;
     html += "</div>";
     if (v.verdict.summary) {
-      html += `<p class="outcome-verdict-summary">${esc(v.verdict.summary)}</p>`;
+      html += `<p class="outcome-verdict-summary md-inline">${renderMarkdownInline(v.verdict.summary)}</p>`;
     }
     if (v.verdict.issues.length > 0) {
       // V-19：passed=true 时 issues 降级为黄色备注而不是红色不符——
@@ -1947,7 +2015,7 @@ function patchOutcomeCard(parts, state, overview, faces) {
       const mark = v.verdict.passed ? "⚠" : "✗";
       const tone = v.verdict.passed ? "warn" : "bad";
       html += `<ul class="outcome-issues outcome-issues--${tone}">`;
-      html += v.verdict.issues.map((i) => `<li>${mark} ${esc(i)}</li>`).join("");
+      html += v.verdict.issues.map((i) => `<li class="md-inline">${mark} ${renderMarkdownInline(i)}</li>`).join("");
       html += "</ul>";
     }
   }
@@ -2715,13 +2783,13 @@ function renderChatMessage(msg) {
     html +=
       '<details class="chat-thinking">' +
       `<summary>✽ 思考过程 <span class="aside-peek">${t.length} 字</span></summary>` +
-      `<div class="chat-body chat-body--text">${esc(t)}</div>` +
+      `<div class="chat-body chat-body--text md">${renderMarkdown(t)}</div>` +
       "</details>";
   }
 
   for (const b of speech) {
     if (b.type === "text") {
-      html += `<div class="chat-body chat-body--text">${esc(b.text ?? "")}</div>`;
+      html += `<div class="chat-body chat-body--text md">${renderMarkdown(b.text ?? "")}</div>`;
     } else {
       const input = formatInput(b.input);
       html +=
@@ -2999,7 +3067,9 @@ function renderLogEntryBody(e) {
     case "tool_result":
       return `<pre class="log-entry-body">${esc(e.resultContent ?? "")}</pre>`;
     case "assistant_text":
-      return `<div class="log-entry-body log-entry-text">${esc(e.text ?? "")}</div>`;
+      // 模型散文走 Markdown 渲染（委托方反馈：原样显示 **粗体**/- 列表是噪声）。
+      // renderMarkdown 内部先整体转义再变换，此处不能再 esc 一次——那会双重转义（V-16）
+      return `<div class="log-entry-body log-entry-text md">${renderMarkdown(e.text ?? "")}</div>`;
     case "approval_request":
       return `<pre class="log-entry-body">${esc(formatInput(e.input))}</pre>`;
     case "api_retry":
@@ -3174,7 +3244,7 @@ function renderVerdictCard(v) {
     ? '<span class="verdict-badge verdict-badge--pass">✔ 核查通过</span>'
     : '<span class="verdict-badge verdict-badge--fail">✘ 核查未通过</span>';
   let html = `<div class="verdict-card">`;
-  html += `<div class="verdict-header">${badge}<span class="verdict-summary">${esc(v.summary)}</span></div>`;
+  html += `<div class="verdict-header">${badge}<span class="verdict-summary md-inline">${renderMarkdownInline(v.summary)}</span></div>`;
 
   if (v.issues.length > 0) {
     html += `<div class="verdict-section verdict-section--issues">`;
@@ -3191,7 +3261,7 @@ function renderVerdictCard(v) {
   if (v.advisory.length > 0) {
     html += `<div class="verdict-section verdict-section--advisory">`;
     html += `<div class="verdict-section-title">◈ 评审意见</div>`;
-    html += `<ul>${v.advisory.map((s) => `<li>◈ ${esc(s)}</li>`).join("")}</ul>`;
+    html += `<ul>${v.advisory.map((s) => `<li class="md-inline">◈ ${renderMarkdownInline(s)}</li>`).join("")}</ul>`;
     html += `</div>`;
   }
 

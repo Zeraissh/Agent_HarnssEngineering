@@ -340,11 +340,60 @@ describe("详情页重渲染下的状态存活 (V-10)", () => {
     ]);
     renderRunDetail(s, { activeTab: "overview" });
 
+    /**
+     * V-03 的不变量是「同一 toolUseId 跨返工轮不串卡」——按裸 toolUseId 存会让
+     * 后一轮覆盖前一轮。表达它的方式随设计调整过：已决的审批不再留在待办区
+     * （委托方反馈：无限堆叠、已处理与未处理混排），所以现在断言的是
+     * "待办区里只剩本轮那张【新的】卡，且它不是上一轮那张节点"。
+     * 上一轮那张的归宿在下面"已处理折叠摘要"一组里锁。
+     */
     const cards = [...document.querySelectorAll(".approval-card")];
-    expect(cards).toHaveLength(2);
-    expect(cards[0]).toBe(firstCard); // 第一轮那张原地存活
-    expect(cards[0].querySelector(".approval-result")!.textContent).toBe("已允许");
-    expect(cards[1].querySelector("[data-action='allow']")).toBeTruthy(); // 新的一张可操作
+    expect(cards).toHaveLength(1);
+    expect(cards[0], "返工轮的卡必须是新节点，不能复用上一轮那张").not.toBe(firstCard);
+    expect(cards[0].querySelector("[data-action='allow']")).toBeTruthy(); // 新的一张可操作
+    expect(cards[0].getAttribute("data-approval-id")).toBe("tu_w#5");
+  });
+
+  it("已处理的审批离开待办区，折叠成一行摘要（委托方反馈：堆叠难读难操作）", () => {
+    let s = stateWithPendingApproval();
+    s = reduceEvents(s, [
+      sse(2, "host", "approval_resolved", {
+        requestSeq: 1, toolUseId: "tu_w", decision: "allow", at: 1700000000000,
+      }),
+    ]);
+    renderRunDetail(s, { activeTab: "overview" });
+
+    // 待办区空了——已决的不再占位
+    expect(document.querySelectorAll(".approval-card")).toHaveLength(0);
+    // 但没有凭空消失：折叠摘要给出即时反馈，展开是紧凑列表
+    const done = document.querySelector(".approvals-done");
+    expect(done).toBeTruthy();
+    expect(done!.querySelector("summary")!.textContent).toContain("已处理 1 项");
+    expect(done!.querySelector("summary")!.textContent).toContain("允许 1");
+    expect(done!.querySelectorAll(".approvals-done-list li")).toHaveLength(1);
+    expect(done!.querySelector(".approvals-done-list li")!.textContent).toContain("write_file");
+  });
+
+  it("摘要展开态在重渲染后保持（details 的 open 不能被补丁合上）", () => {
+    let s = stateWithPendingApproval();
+    s = reduceEvents(s, [
+      sse(2, "host", "approval_resolved", { requestSeq: 1, toolUseId: "tu_w", decision: "allow", at: 1 }),
+    ]);
+    renderRunDetail(s, { activeTab: "overview" });
+    const details = document.querySelector(".approvals-done") as HTMLDetailsElement;
+    details.open = true;
+
+    // 再来一条已决项 → 摘要必须重建，但展开态要留着
+    s = reduceEvents(s, [
+      sse(3, "main", "approval_request", { toolUseId: "tu_b", name: "bash", input: { command: "ls" } }),
+      sse(4, "host", "approval_resolved", { requestSeq: 3, toolUseId: "tu_b", decision: "deny", at: 2, reason: "不需要" }),
+    ]);
+    renderRunDetail(s, { activeTab: "overview" });
+
+    const next = document.querySelector(".approvals-done") as HTMLDetailsElement;
+    expect(next.open, "重渲染把用户展开的摘要合上了").toBe(true);
+    expect(next.querySelector("summary")!.textContent).toContain("已处理 2 项");
+    expect(next.textContent).toContain("不需要"); // 拒绝理由留档
   });
 
   it("同一状态连续渲染两次：DOM 不变且节点引用不变（幂等）", () => {
