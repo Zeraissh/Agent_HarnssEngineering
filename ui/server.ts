@@ -18,6 +18,7 @@ import {
 } from "../src/orchestrate.js";
 import { createModelClientFromEnv, type ResolvedProvider } from "../src/provider.js";
 import { getPack, selectPackTools, PACKS } from "../src/presets.js";
+import { connectMcpServers, loadMcpConfig, type McpRuntime } from "../src/mcp.js";
 import type { Plan, SubTask } from "../src/planner.js";
 import type Anthropic from "@anthropic-ai/sdk";
 import { bashTool, SHELL_DESC } from "../src/tools/bash.js";
@@ -434,15 +435,64 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    * 害得整块板子连不上的那种形态。要用就显式开，用完关掉宿主。
    */
   const mcpEnabled = process.env.AGENT_UI_MCP === "1";
-  const mcpStatus: Record<string, unknown> = {
-    configured: existsSync(process.env.AGENT_MCP_CONFIG ?? join(workdir, "mcp.json")),
-    enabled: mcpEnabled,
-    connected: false,
-    servers: [] as unknown[],
-    ...(mcpEnabled
-      ? {}
-      : { reason: "Web 宿主默认不接 MCP（设 AGENT_UI_MCP=1 开启）——常驻进程持有独占资源有风险" }),
-  };
+  const mcpConfigPath = process.env.AGENT_MCP_CONFIG ?? join(workdir, "mcp.json");
+
+  /**
+   * MCP 运行时（**懒连接**）。
+   *
+   * 此前这里只有一个布尔量在装样子：`ui/server.ts` 连 `src/mcp.js` 都没 import，
+   * `selectPackTools(pack, POOL, [])` 永远传空的 MCP 工具表——`AGENT_UI_MCP=1`
+   * 只是把状态快照里的一句 reason 去掉。后果不是"少个功能"：**stm32-debug 这类
+   * 全 MCP 工具面的包在 Web 宿主下等于废的**，agent 只拿得到 read_file/write_file。
+   * （案例 #8 开跑前撞出来的，第七个"harness 有、宿主没接"。）
+   *
+   * 为什么是懒连接而不是启动即连：上面那条独占资源的顾虑成立——stm32-debug 声明
+   * swd-probe，MCP server 进程一起来就有机会攥住探针。首个真正需要 MCP 的运行
+   * 开始时才连，把常驻进程持有独占资源的窗口压到最短。用完仍要关宿主。
+   */
+  let mcpRuntime: McpRuntime | undefined;
+  let mcpTools: Tool[] = [];
+  let mcpConnecting: Promise<void> | undefined;
+  let mcpError: string | undefined;
+
+  async function ensureMcp(): Promise<void> {
+    if (!mcpEnabled || mcpRuntime || mcpError) return;
+    mcpConnecting ??= (async () => {
+      try {
+        const cfg = await loadMcpConfig(mcpConfigPath);
+        if (!cfg) {
+          mcpError = `未找到 MCP 配置：${mcpConfigPath}`;
+          return;
+        }
+        const warnings: string[] = [];
+        mcpRuntime = await connectMcpServers(cfg, (m) => warnings.push(m));
+        mcpTools = mcpRuntime.tools;
+        if (warnings.length) mcpError = warnings.join("；");
+      } catch (err) {
+        mcpError = err instanceof Error ? err.message : String(err);
+      }
+    })();
+    await mcpConnecting;
+  }
+
+  function mcpSnapshot(): Record<string, unknown> {
+    return {
+      configured: existsSync(mcpConfigPath),
+      configPath: mcpConfigPath,
+      enabled: mcpEnabled,
+      connected: Boolean(mcpRuntime),
+      servers: mcpRuntime ? Object.entries(mcpRuntime.summary).map(([name, n]) => ({ name, tools: n })) : [],
+      toolCount: mcpTools.length,
+      ...(mcpError ? { error: mcpError } : {}),
+      // reason 三态互斥，不能含糊：没开 / 开了还没轮到 / 试过了但失败。
+      // 失败时若还显示"尚未连接"，人会以为再等等就好——那是在骗人（V-04 同族）
+      ...(!mcpEnabled
+        ? { reason: "Web 宿主默认不接 MCP（设 AGENT_UI_MCP=1 开启）——常驻进程持有独占资源有风险" }
+        : mcpRuntime || mcpError
+          ? {}
+          : { reason: "已开启，但尚未连接——首个需要 MCP 的运行开始时才连（缩短常驻进程持有独占资源的窗口）" }),
+    };
+  }
 
   /**
    * 装配一次运行的配置。
@@ -456,9 +506,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     const runEffort = run?.effort ?? effort;
     const runWorkdir = run?.workdir ?? workdir;
     const systemPrompt = runPack?.systemPrompt ?? DEFAULT_SYSTEM_PROMPT;
+    // MCP 工具按包的 includeTools 收窄（selectPackTools 负责）。mcpTools 在
+    // ensureMcp 之后才非空——所有 start*Run 都先 await 它，不会拿到半截工具面
     const tools = injectedTools ?? (runPack
-      ? selectPackTools(runPack, toolPool, [])
-      : toolPool);
+      ? selectPackTools(runPack, toolPool, mcpTools)
+      : [...toolPool, ...mcpTools]);
     return {
       systemPrompt,
       tools,
@@ -698,6 +750,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
   /** 启动一次不带核查的运行 */
   async function startPlainRun(run: StoredRun): Promise<void> {
+    await ensureMcp(); // 必须在 buildConfig 之前：工具面要么齐要么别开跑
     pushRunConfig(run);
     const cfg = buildConfig(run);
     // V-28：实例留给后续对话轮复用——重建的话 ContextManager 的 lastInputTokens
@@ -797,6 +850,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    *      不显式发出来前端就永远看不到 DAG 与并行收益。
    */
   async function startPlannedRun(run: StoredRun): Promise<void> {
+    await ensureMcp();
     pushRunConfig(run);
     const baseCfg = buildConfig(run);
     const startedAt = Date.now();
@@ -853,7 +907,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             cfg: {
               ...baseCfg,
               systemPrompt: sp?.systemPrompt ?? baseCfg.systemPrompt,
-              tools: injectedTools ?? selectPackTools(sp, BUILTIN_POOL, []),
+              // 逐子任务按各自的包收窄 MCP 工具面：stm32-coding 的 mcp:false
+              // 拿不到任何 MCP 工具，stm32-debug 才拿到它 includeTools 里那些
+              tools: injectedTools ?? selectPackTools(sp, BUILTIN_POOL, mcpTools),
               ...(sp?.guardrails?.maxTurns !== undefined ? { maxTurns: sp.guardrails.maxTurns } : {}),
               ...(sp?.guardrails?.maxTokens !== undefined && maxTokens === undefined
                 ? { maxTokens: sp.guardrails.maxTokens }
@@ -936,6 +992,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
   /** 启动一次带核查的运行 */
   async function startVerifiedRun(run: StoredRun): Promise<void> {
+    await ensureMcp();
     pushRunConfig(run);
     const cfg = buildConfig(run);
     let mainStopReason: string | undefined;
@@ -1139,7 +1196,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         parallelSafe: t.parallelSafe,
         origin: toolPool.some((b) => b.name === t.name) ? "builtin" : "mcp",
       })),
-      mcp: mcpStatus,
+      mcp: mcpSnapshot(),
     };
   }
 
@@ -1682,6 +1739,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           finalizeRun(run, { outcome: "closed" });
         }
         runs.clear();
+        // MCP 子进程必须显式断开：留着就是常驻的僵尸 server，stm32 那种还攥着
+        // 探针（案例 #3 的事故原型）。close() 不等它完成——服务器该关就关，
+        // 但断开动作要发出去
+        void mcpRuntime?.close().catch(() => {});
         server.close((err) => (err ? reject(err) : resolve()));
       });
     },

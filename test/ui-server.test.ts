@@ -1776,6 +1776,61 @@ describe("ui-server", () => {
     })).status).toBe(409);
   });
 
+  // ---- Web 宿主的 MCP 接线（案例 #8 前置修复）----
+
+  it("v2-35. 默认不接 MCP，且快照如实说明原因（不是假装连上）", async () => {
+    handle = createUiServer({ modelClient: new FakeModelClient([]), tools: [], workdir: process.cwd() });
+    port = await startServer(handle);
+    base = baseUrl(port);
+    const snap = await (await fetch(`${base}/api/harness`)).json() as any;
+    expect(snap.mcp.enabled).toBe(false);
+    expect(snap.mcp.connected).toBe(false);
+    expect(snap.mcp.toolCount).toBe(0);
+    expect(String(snap.mcp.reason)).toContain("AGENT_UI_MCP");
+  });
+
+  it("v2-36. 开了 MCP 但配置读不到：失败必须看得见，不静默给出空工具面", async () => {
+    /**
+     * 这条锁的正是修复前的形态：`AGENT_UI_MCP=1` 只改快照文案，
+     * `selectPackTools(pack, POOL, [])` 永远传空——于是 stm32-debug 那种
+     * 全 MCP 工具面的包在 Web 宿主下静默变成"只有 read_file/write_file"，
+     * 而界面还显示 MCP 已开启。静默降级比报错难查得多。
+     */
+    process.env.AGENT_UI_MCP = "1";
+    process.env.AGENT_MCP_CONFIG = join(tmpdir(), "__no_such_mcp_config__.json");
+    try {
+      handle = createUiServer({
+        modelClient: new FakeModelClient([fakeMessage([textBlock("done")], "end_turn")]),
+        tools: [autoTool("noop")],
+        workdir: process.cwd(),
+      });
+      port = await startServer(handle);
+      base = baseUrl(port);
+
+      // 连接是懒的：首个运行开始时才尝试
+      const before = await (await fetch(`${base}/api/harness`)).json() as any;
+      expect(before.mcp.enabled).toBe(true);
+      expect(before.mcp.connected).toBe(false);
+      expect(String(before.mcp.reason)).toContain("尚未连接");
+
+      const { runId } = await (await fetch(`${base}/api/runs`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task: "触发一次连接尝试" }),
+      })).json() as { runId: string };
+      await waitForDone(base, runId);
+
+      const after = await (await fetch(`${base}/api/harness`)).json() as any;
+      expect(after.mcp.connected).toBe(false);
+      expect(after.mcp.error, "配置读不到必须在快照里说出来").toBeDefined();
+      expect(String(after.mcp.error)).toContain("MCP 配置");
+      // 且不能再显示"尚未连接"——那会让人以为还没轮到它
+      expect(after.mcp.reason).toBeUndefined();
+    } finally {
+      delete process.env.AGENT_UI_MCP;
+      delete process.env.AGENT_MCP_CONFIG;
+    }
+  });
+
   it("v2-34. 宿主关停时计划门被宣告过期（挂着不解除，编排协程会永远吊在 onPlan）", async () => {
     const runId = await startGatedRun();
     await waitForPlanGate(runId);
