@@ -522,6 +522,76 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
 
 .knob-hint { font-size: var(--font-sm); color: var(--text-3); }
 
+/* --- 编排面板（V-27）--- */
+.plan-meta { font-size: var(--font-sm); color: var(--text-2); margin-bottom: var(--space-md); }
+
+.plan-layers { list-style: none; margin: 0 0 var(--space-lg); padding: 0; }
+
+.plan-layer { margin-bottom: var(--space-md); }
+
+.plan-layer-label {
+  display: block;
+  font-size: var(--font-sm);
+  color: var(--text-3);
+  margin-bottom: var(--space-xs);
+}
+
+/* 同层横向并列 = 可并发；换层即依赖推进。布局本身就是调度语义 */
+.plan-nodes {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: var(--space-sm);
+}
+
+.plan-node {
+  border: 1px solid var(--border-1);
+  border-left-width: 3px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-1);
+  padding: var(--space-sm) var(--space-md);
+}
+
+.plan-node--passed { border-left-color: var(--status-ok); }
+.plan-node--failed { border-left-color: var(--status-bad); }
+.plan-node--running { border-left-color: var(--accent); }
+.plan-node--skipped { border-left-color: var(--border-2); opacity: 0.65; }
+.plan-node--pending { border-left-color: var(--border-1); }
+
+.plan-node-head { display: flex; align-items: baseline; gap: var(--space-xs); }
+.plan-node-mark { font-weight: 700; }
+.plan-node--passed .plan-node-mark { color: var(--status-ok); }
+.plan-node--failed .plan-node-mark { color: var(--status-bad); }
+.plan-node--running .plan-node-mark { color: var(--accent); }
+.plan-node-id { font-size: var(--font-sm); color: var(--text-2); }
+.plan-node-title { font-size: var(--font-md); }
+
+.plan-node-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-sm);
+  margin-top: var(--space-xs);
+  font-size: var(--font-sm);
+  color: var(--text-3);
+}
+
+.plan-node-res { color: var(--status-warn); }
+
+.plan-bar {
+  height: 4px;
+  margin-top: var(--space-sm);
+  border-radius: var(--radius-xs);
+  background: var(--meter-track);
+  overflow: hidden;
+}
+
+.plan-bar-fill { height: 100%; background: var(--accent); }
+
+.plan-acceptance { margin: var(--space-xs) 0 0; padding-left: var(--space-lg); }
+
+.plan-timing { margin-top: var(--space-md); }
+
+.segment-step { font-size: var(--font-sm); color: var(--accent); }
+
 /* --- 侧栏搜索 --- */
 .sidebar-search {
   padding: var(--space-sm) var(--space-lg);
@@ -1515,5 +1585,25 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
 
   .rework-chain {
     font-size: var(--font-xs);
+  }
+
+  /* 编排面板：minmax(260px,1fr) 在 390px 下放不下，单列排 */
+  .plan-nodes {
+    grid-template-columns: 1fr;
+  }
+
+  .plan-node-meta {
+    gap: var(--space-xs);
+  }
+
+  .plan-timing,
+  .boundary-list {
+    grid-template-columns: 1fr;
+    gap: 2px var(--space-md);
+  }
+
+  .plan-timing dt,
+  .boundary-list dt {
+    margin-top: var(--space-sm);
   }
 }

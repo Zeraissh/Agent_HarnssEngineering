@@ -18,6 +18,7 @@ import {
   deriveActionState,
   deriveLogEntries,
   buildFactorCards,
+  derivePlanFace,
   normalizeTab,
   filterRunsByQuery,
   VERDICT_PARSE_FAIL,
@@ -494,5 +495,134 @@ describe("逐 run 装配优先于进程级快照 (V-24)", () => {
     const s = feed([ev("main", { type: "turn_start", turn: 1 })]);
     expect(deriveToolsFace(s, HARNESS).pack.name).toBe("python-coding");
     expect(deriveLoopFace(s, HARNESS).maxTurns).toBe(40);
+  });
+});
+
+// ================================================================
+// v2 R7：编排面 (V-27)
+// ================================================================
+
+describe("derivePlanFace", () => {
+  const planEvent = (subtasks: any[], over = {}) => ({
+    seq: 0, source: "host",
+    event: { type: "plan", concurrency: 3, concurrencyMode: "auto", plannerMs: 8000, subtasks, ...over },
+  });
+
+  const SUBS = [
+    { id: "s1", title: "查资料", pack: null, description: "", acceptance: ["产出 md"], dependsOn: [], resources: [] },
+    { id: "s2", title: "写固件", pack: "stm32-coding", description: "", acceptance: [], dependsOn: [], resources: ["swd-probe"] },
+    { id: "s3", title: "汇总", pack: null, description: "", acceptance: [], dependsOn: ["s1", "s2"], resources: [] },
+  ];
+
+  it("非编排运行返回 null——调用方据此决定要不要渲染这一块", () => {
+    expect(derivePlanFace(feed([ev("main", { type: "turn_start", turn: 1 })]))).toBeNull();
+  });
+
+  /**
+   * 分层就是调度语义：同层 = 互不依赖 = 可并发，换层 = 依赖推进。
+   * 这也是"为什么能省时间"的解释——比画自由图更贴近真实决策。
+   */
+  it("按依赖深度分层，层宽即理论最大并发", () => {
+    seq = 0;
+    let s = createInitialState("r", "t", true);
+    s = reduceEvents(s, [planEvent(SUBS)]);
+    const f = derivePlanFace(s)!;
+    expect(f.layers).toHaveLength(2);
+    expect(f.layers[0].map((n: any) => n.id)).toEqual(["s1", "s2"]);
+    expect(f.layers[1].map((n: any) => n.id)).toEqual(["s3"]);
+    expect(f.parallelWidth).toBe(2);
+    expect(f.concurrency).toBe(3);
+  });
+
+  it("子任务状态：pending → running（有 sN/ 前缀事件）→ passed/failed/skipped", () => {
+    seq = 0;
+    let s = createInitialState("r", "t", true);
+    s = reduceEvents(s, [planEvent(SUBS)]);
+    expect(derivePlanFace(s)!.nodes.every((n: any) => n.status === "pending")).toBe(true);
+
+    s = reduceEvents(s, [{ seq: 1, source: "s1/main", event: { type: "turn_start", turn: 1 } }]);
+    expect(derivePlanFace(s)!.nodes.find((n: any) => n.id === "s1").status).toBe("running");
+
+    s = reduceEvents(s, [{
+      seq: 2, source: "host",
+      event: {
+        type: "plan_result", completed: false, planned: true,
+        steps: [{ id: "s1", title: "查资料", durationMs: 5000, passed: true, reworks: 0 },
+                { id: "s2", title: "写固件", durationMs: 9000, passed: false, reworks: 1 }],
+        skipped: [{ id: "s3", title: "汇总" }],
+        timing: { totalMs: 20000, plannerMs: 8000, subtaskWallMs: 9000, stepSumMs: 14000, savedMs: 5000 },
+      },
+    }]);
+    const f = derivePlanFace(s)!;
+    expect(f.nodes.find((n: any) => n.id === "s1").status).toBe("passed");
+    expect(f.nodes.find((n: any) => n.id === "s2").status).toBe("failed");
+    expect(f.nodes.find((n: any) => n.id === "s3").status).toBe("skipped");
+    expect(f.nodes.find((n: any) => n.id === "s2").reworks).toBe(1);
+    expect(f.timing.savedMs).toBe(5000);
+  });
+
+  it("独占资源随子任务透出——那是「为什么这两个没并发」的唯一解释", () => {
+    seq = 0;
+    let s = createInitialState("r", "t", true);
+    s = reduceEvents(s, [planEvent(SUBS)]);
+    expect(derivePlanFace(s)!.nodes.find((n: any) => n.id === "s2").resources).toEqual(["swd-probe"]);
+  });
+
+  it("planner 出不了可解析计划时标 planned=false（fail-closed，未执行任何子任务）", () => {
+    seq = 0;
+    let s = createInitialState("r", "t", true);
+    s = reduceEvents(s, [
+      planEvent([]),
+      { seq: 1, source: "host", event: { type: "plan_result", completed: false, planned: false, plannerRaw: "抱歉…", steps: [], skipped: [] } },
+    ]);
+    const f = derivePlanFace(s)!;
+    expect(f.planned).toBe(false);
+    expect(f.plannerRaw).toContain("抱歉");
+  });
+
+  it("未知领域包的降级被记录，不静默吞掉", () => {
+    seq = 0;
+    let s = createInitialState("r", "t", true);
+    s = reduceEvents(s, [
+      planEvent(SUBS),
+      { seq: 1, source: "host", event: { type: "plan_warning", subtaskId: "s2", message: '未知领域包 "nope"' } },
+    ]);
+    expect(derivePlanFace(s)!.warnings).toEqual([{ subtaskId: "s2", message: '未知领域包 "nope"' }]);
+  });
+
+  it("依赖成环不把前端搞崩（服务端已 fail-closed，这里是第二道防御）", () => {
+    seq = 0;
+    let s = createInitialState("r", "t", true);
+    s = reduceEvents(s, [planEvent([
+      { id: "a", title: "A", dependsOn: ["b"], acceptance: [], description: "", pack: null, resources: [] },
+      { id: "b", title: "B", dependsOn: ["a"], acceptance: [], description: "", pack: null, resources: [] },
+    ])]);
+    expect(() => derivePlanFace(s)).not.toThrow();
+    expect(derivePlanFace(s)!.nodes).toHaveLength(2);
+  });
+});
+
+describe("编排模式下的分段与轮次口径", () => {
+  it("sN/main 前缀被归类为 main，且段分界能认出子任务", () => {
+    seq = 0;
+    const s = feed([
+      ev("planner", { type: "turn_start", turn: 1 }),
+      ev("s1/main", { type: "turn_start", turn: 1 }),
+      ev("s1/verifier", { type: "turn_start", turn: 1 }),
+      ev("s2/main", { type: "turn_start", turn: 1 }),
+    ]);
+    const segs = deriveSegments(s);
+    expect(segs.map((x) => x.role)).toEqual(["planner", "main", "verifier", "main"]);
+    expect(segs[1].source).toBe("s1/main");
+    expect(segs[3].source).toBe("s2/main");
+  });
+
+  it("planner 的轮次不并入执行者水位——它的预算与执行者解耦", () => {
+    seq = 0;
+    const s = feed([
+      ev("planner", { type: "turn_start", turn: 9 }),
+      ev("s1/main", { type: "turn_start", turn: 2 }),
+    ]);
+    expect(deriveLoopFace(s, HARNESS).turn).toBe(2);
   });
 });

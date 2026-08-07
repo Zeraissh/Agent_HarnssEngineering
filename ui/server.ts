@@ -9,9 +9,16 @@ import { join, extname, dirname, delimiter } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { AgentLoop } from "../src/loop.js";
-import { runVerified, type VerifiedRunResult } from "../src/orchestrate.js";
+import {
+  runVerified,
+  runPlanned,
+  planParallelWidth,
+  AUTO_CONCURRENCY_CAP,
+  type VerifiedRunResult,
+} from "../src/orchestrate.js";
 import { createModelClientFromEnv } from "../src/provider.js";
 import { getPack, selectPackTools, PACKS } from "../src/presets.js";
+import type { Plan, SubTask } from "../src/planner.js";
 import { bashTool, SHELL_DESC } from "../src/tools/bash.js";
 import { fetchUrlTool } from "../src/tools/fetch-url.js";
 import { readFileTool } from "../src/tools/read-file.js";
@@ -92,6 +99,9 @@ interface StoredRun {
   packName?: string;
   effort?: Effort;
   rubric?: string;
+  /** V-27：编排模式。plan = 走 runPlanned（planner 拆解 + 依赖调度 + 并行） */
+  mode?: "single" | "plan";
+  concurrency?: number | "auto";
 }
 
 /** 审批唯一键：同一 toolUseId 在返工轮再次出现时，靠 requestSeq 区分 */
@@ -545,6 +555,139 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     }
   }
 
+  /**
+   * 启动一次编排运行（V-27）。
+   *
+   * runPlanned 一直存在却从没接过——服务端只 import 了 runVerified。
+   * 三件事必须由宿主装配，缺一个都会让编排退化：
+   *   ① packs：planner 的菜单，也是子任务 pack 名的校验依据
+   *   ② resolveSubtask：按子任务的包换工具面/prompt/护栏/独占资源。
+   *      不给的话每个子任务都用同一份基础配置，"按域分工"就名存实亡；
+   *      resources 更是真机域的安全线——同标签子任务必须强制串行，
+   *      无锁并发 = 抢探针事故（案例 #3 实录）。
+   *   ③ onPlan / 结果合成事件：计划与调度结果不进 TurnEvent 流，
+   *      不显式发出来前端就永远看不到 DAG 与并行收益。
+   */
+  async function startPlannedRun(run: StoredRun): Promise<void> {
+    pushRunConfig(run);
+    const baseCfg = buildConfig(run);
+    const startedAt = Date.now();
+    let planReadyAt = startedAt;
+    const concurrency = run.concurrency ?? "auto";
+    let effectiveConcurrency = typeof concurrency === "number" ? concurrency : 1;
+    let mainStopReason: string | undefined;
+
+    try {
+      const outcome = await runPlanned(baseCfg, modelClient, run.task, {
+        packs: Object.values(PACKS),
+        concurrency,
+        onPlan: (plan: Plan) => {
+          planReadyAt = Date.now();
+          if (concurrency === "auto") {
+            effectiveConcurrency = Math.min(AUTO_CONCURRENCY_CAP, planParallelWidth(plan.subtasks));
+          }
+          pushSyntheticEvent(run, "host", {
+            type: "plan",
+            concurrency: effectiveConcurrency,
+            concurrencyMode: concurrency === "auto" ? "auto" : "fixed",
+            plannerMs: planReadyAt - startedAt,
+            subtasks: plan.subtasks.map((t) => ({
+              id: t.id,
+              title: t.title,
+              pack: t.pack ?? null,
+              description: t.description,
+              acceptance: t.acceptance,
+              dependsOn: t.dependsOn,
+              resources: t.resources ?? (t.pack ? getPack(t.pack)?.resources ?? [] : []),
+            })),
+          });
+        },
+        resolveSubtask: (sub: SubTask) => {
+          const sp = sub.pack ? getPack(sub.pack) : undefined;
+          if (sub.pack && !sp) {
+            // 未知包不静默吞：降级用默认配置，但必须让界面看见这次降级
+            pushSyntheticEvent(run, "host", {
+              type: "plan_warning",
+              subtaskId: sub.id,
+              message: `未知领域包 "${sub.pack}"，该子任务用默认配置执行`,
+            });
+          }
+          const runRubric = run.rubric || rubric || sp?.verify.rubric;
+          return {
+            cfg: {
+              ...baseCfg,
+              systemPrompt: sp?.systemPrompt ?? baseCfg.systemPrompt,
+              tools: injectedTools ?? selectPackTools(sp, BUILTIN_POOL, []),
+              ...(sp?.guardrails?.maxTurns !== undefined ? { maxTurns: sp.guardrails.maxTurns } : {}),
+              ...(sp?.guardrails?.maxTokens !== undefined && maxTokens === undefined
+                ? { maxTokens: sp.guardrails.maxTokens }
+                : {}),
+            },
+            verify: {
+              ...(sp?.verify.instructions ? { verifyInstructions: sp.verify.instructions } : {}),
+              ...(sp?.verify.readOnlyCommands ? { verifyReadOnlyCommands: sp.verify.readOnlyCommands } : {}),
+              ...(runRubric ? { verifyRubric: runRubric } : {}),
+            },
+            // 独占资源：调度器对同标签子任务强制串行。真机域的探针是全局单件
+            ...(sub.resources ?? sp?.resources ? { resources: sub.resources ?? sp!.resources! } : {}),
+          };
+        },
+        onEvent: (source, event) => {
+          pushEvent(run, source, event);
+        },
+      });
+
+      const finishedAt = Date.now();
+      const stepSum = outcome.steps.reduce((n, st) => n + st.durationMs, 0);
+      const subtaskWall = finishedAt - planReadyAt;
+      mainStopReason = outcome.completed ? "completed" : "error";
+
+      // 并行收益的口径必须写清：子任务阶段墙钟排除 planner，"节省"是相对
+      // 串行全序和而言的。不标口径的数字等于没有数字。
+      pushSyntheticEvent(run, "host", {
+        type: "plan_result",
+        completed: outcome.completed,
+        planned: Boolean(outcome.plan),
+        plannerRaw: outcome.plan ? undefined : outcome.planOutcome.raw.slice(0, 400),
+        plannerUsage: outcome.planOutcome.usage,
+        ...(outcome.planOutcome.inventory ? { inventory: outcome.planOutcome.inventory } : {}),
+        steps: outcome.steps.map((st) => ({
+          id: st.sub.id,
+          title: st.sub.title,
+          pack: st.sub.pack ?? null,
+          durationMs: st.durationMs,
+          passed: st.result.finalPassed,
+          reworks: st.result.reworks,
+          verdict: st.result.verifications.at(-1)?.verdict ?? null,
+          usage: st.result.executionUsage,
+        })),
+        skipped: outcome.skipped.map((t) => ({ id: t.id, title: t.title })),
+        timing: {
+          totalMs: finishedAt - startedAt,
+          plannerMs: planReadyAt - startedAt,
+          subtaskWallMs: subtaskWall,
+          stepSumMs: stepSum,
+          savedMs: Math.max(0, stepSum - subtaskWall),
+        },
+      });
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      mainStopReason = "error";
+      pushSyntheticEvent(run, "main", {
+        type: "done",
+        stopReason: "error",
+        error: { name: "Error", message: errorMsg },
+        messageCount: 0,
+        usage: { inputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputTokens: 0, turns: 0, cacheHitRatio: 0 },
+      });
+    } finally {
+      finalizeRun(run, {
+        outcome: mainStopReason === "error" ? "error" : "completed",
+        ...(mainStopReason ? { mainStopReason } : {}),
+      });
+    }
+  }
+
   /** 启动一次带核查的运行 */
   async function startVerifiedRun(run: StoredRun): Promise<void> {
     pushRunConfig(run);
@@ -877,7 +1020,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         } catch {
           return badRequest(res, "Failed to read request body");
         }
-        let parsed: { task?: string; verify?: boolean; pack?: string; effort?: string; rubric?: string };
+        let parsed: {
+          task?: string; verify?: boolean; pack?: string; effort?: string; rubric?: string;
+          mode?: string; concurrency?: number | string;
+        };
         try {
           parsed = JSON.parse(body);
         } catch {
@@ -899,6 +1045,21 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           return badRequest(res, `effort "${parsed.effort}" 无效。可选：${EFFORT_LEVELS.join(" | ")}`);
         }
 
+        if (parsed.mode !== undefined && parsed.mode !== "single" && parsed.mode !== "plan") {
+          return badRequest(res, `mode "${parsed.mode}" 无效。可选：single | plan`);
+        }
+        let concurrency: number | "auto" | undefined;
+        if (parsed.concurrency !== undefined && parsed.concurrency !== "") {
+          if (parsed.concurrency === "auto") concurrency = "auto";
+          else {
+            const n = Number(parsed.concurrency);
+            if (!Number.isInteger(n) || n < 1 || n > 8) {
+              return badRequest(res, `concurrency "${parsed.concurrency}" 无效。可选：auto 或 1..8`);
+            }
+            concurrency = n;
+          }
+        }
+
         const verify = parsed.verify === true;
         const id = randomUUID();
         const run: StoredRun = {
@@ -917,11 +1078,15 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           ...(parsed.pack ? { packName: parsed.pack } : {}),
           ...(parsed.effort ? { effort: parsed.effort as Effort } : {}),
           ...(parsed.rubric ? { rubric: parsed.rubric } : {}),
+          ...(parsed.mode === "plan" ? { mode: "plan" as const } : {}),
+          ...(concurrency !== undefined ? { concurrency } : {}),
         };
         runs.set(id, run);
         broadcastLifecycle("run_created", run);
 
-        if (verify) {
+        if (run.mode === "plan") {
+          void startPlannedRun(run);
+        } else if (verify) {
           void startVerifiedRun(run);
         } else {
           void startPlainRun(run);

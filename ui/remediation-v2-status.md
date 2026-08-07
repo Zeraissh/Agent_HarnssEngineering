@@ -38,6 +38,7 @@
 | V-24 harness 旋钮不可调 | P2 | R6a | ✅ | 提交栏加可折叠「装配」区：领域包下拉、思考预算、主观评分表；可选值由 `/api/harness` 的 `availablePacks` / `effortLevels` 提供，前端不硬编码。`POST /api/runs` 接 pack/effort/rubric，**非法值当场 400 而非静默降级**（口径同 `src/cli.ts` 对 AGENT_EFFORT 的处理）。`buildConfig`/`buildVerifyOptions` 从进程级常量改为逐 run 可覆盖。**顺带修掉一个自己引入的说谎**：pack 可逐 run 换之后，Tools 面若继续读进程级 `/api/harness`，用户选了 ts-coding 却会看到默认包的工具面与白名单。新增 `run_config` 合成事件承载本 run 实际装配，四个面一律优先读它。**浏览器实证**：选 ts-coding + effort low 提交后，Tools 卡显示「包 ts-coding · 3 个工具」、边界清单是 ts-coding 的真实白名单、Loop 卡显示「1/40 轮 · effort low」|
 | V-26 装配面板挤垮提交栏（截图暴露） | P1 | R6a | ✅ | `.run-knobs` 是 `flex-basis:100%` 的整行子项，而 `.submit-bar` 在桌面态没有 `flex-wrap`（只有窄屏媒体查询里写了）。结果它和输入框挤在同一行，把 textarea 压成一条几像素宽的缝——委托方截图里那个「这里是什么意思？」的小方块就是任务输入框。已给 `.submit-bar` 补 `flex-wrap: wrap`、给 textarea 补 `flex: 1 1 260px; min-width: 200px`。**浏览器实证**：1280px 下装配面板展开前后输入框恒为 702px，面板落在自己那一行。三条静态锁防复发 |
 | V-25 侧栏无搜索 | P2 | R6a | ✅ | 新增纯函数 `filterRunsByQuery`（按任务描述子串，大小写与首尾空白无关）+ 侧栏搜索框。列表走键控补丁，边打字边过滤不打断输入焦点（实证）|
+| V-27 并行编排从未接入 | P2 | R7 | ✅ | `runPlanned` 一直存在却从没接过——服务端只 import 了 `runVerified`。补 `mode=plan` 走编排，宿主必须装配的三件缺一不可：**packs**（planner 的菜单兼子任务包名校验）、**resolveSubtask**（按子任务的包换工具面/prompt/护栏，并透传**独占资源**——同标签强制串行是真机域的安全线，无锁并发 = 抢探针事故，案例 #3 实录）、**plan / plan_result 合成事件**（计划与调度结果不在 TurnEvent 流里，不显式发就永远看不见）。前端新增 `derivePlanFace`：依赖按**层**呈现（同层 = 互不依赖 = 可并发，换层 = 依赖推进——这正是调度器在做的决策，比画自由图更贴近真相），配甘特条与四态节点；日志段分界带上子任务 id（并行下多路交错，不标就读不懂谁在说话）；planner 轮次不并入执行者水位。**浏览器实证**：三子任务计划（s1/s2 互不依赖、s3 汇总）下 auto 解析为并行度 2、层宽 2；**并行节省 1.32s / 42%**，且 `子任务阶段墙钟 1820ms ≈ max(1322, 1818) + 汇总 1ms` ——E3 命题「并行墙钟精确等于关键路径」在真实调度上逐毫秒吻合；390px 双主题零溢出；axe 双主题零 violations |
 | V-21 缺 launcher | P2 | R1 | ✅ | 新建 `ui/serve.ts` + `npm run ui`；默认绑 `127.0.0.1`（该宿主能执行 bash 并批准写文件，非本地地址会打警告）；SIGINT/SIGTERM 优雅关停。顺带把 `ui` 纳入 tsconfig `include`——此前 `ui/serve.ts` 这类未被测试导入的文件根本不受类型检查 |
 
 ## 验收标准（AC2-01 ~ AC2-18）
@@ -73,7 +74,8 @@
 | R3 细粒度渲染 | 285 | +29：新增 `test/ui-patch.test.ts` 24（`diffKeyed` 6 / `patchList`·`appendOnly` 5 / 滚动锚定 2 / `createBatcher` 4 / 详情页与侧栏状态存活 7）+ 服务端契约 1（`/api/stream`）+ 由源码扫描升级为真实 DOM 断言 4 |
 | R4 新信息架构 | 321 | +36：新增 `test/ui-faces.test.ts` 33（段切分 3 / Loop 面 6 / Context 面 4 / Tools 面 5 / Verification 面 5 / ActionRail 2 / 因子卡 4 / 标签归一 2 / 工具名回填 2）+ a11y 画面随新 IA 扩为 8 个并新增「旧标签 id 归一」1 条 |
 | R5 视觉语言 | 395 | +21：对比度门禁 5 → 46（2 主题 × 23 色对，净 +41 断言归入 4 个 `it.each`）+ 主题结构门禁 3（令牌名集合一致 / 暗色块防漂移 / 组件层不碰 `--p-*`）+ 字体阶梯 4 + a11y 双主题 16 画面与 ARIA 快照一致 1 + emoji 门禁 3 与 hidden 兜底 2 + 卡片即标签/Verification 恒在/搜索 8（两轮截图反馈）|
-| R6a 对话视图 + 装配旋钮 | 420 | +19：对话渲染 7（含「tool_result 在 user 角色下」这条要害与双主题 axe）+ 服务端契约 4（transcript 按需拉且不进 SSE / 404 / 逐 run 装配非法值 400 / 快照列包与档位）+ 逐 run 装配优先级 4 + 搜索 4 + 对话重排与思考过程 3 + 提交栏布局 3（截图反馈后补）|
+| R6a 对话视图 + 装配旋钮 | 420 |
+| R7 并行编排 | 437 | +17：`derivePlanFace` 9（分层/四态/资源/fail-closed/成环防御）+ 编排分段与轮次口径 2 + 服务端契约 3（plan 与 plan_result 全字段、planner fail-closed 零执行、mode/concurrency 非法值 400）+ 编排面板 a11y 5 | +19：对话渲染 7（含「tool_result 在 user 角色下」这条要害与双主题 axe）+ 服务端契约 4（transcript 按需拉且不进 SSE / 404 / 逐 run 装配非法值 400 / 快照列包与档位）+ 逐 run 装配优先级 4 + 搜索 4 + 对话重排与思考过程 3 + 提交栏布局 3（截图反馈后补）|
 
 ## R3 把两条静态断言升级为真实 DOM 断言
 

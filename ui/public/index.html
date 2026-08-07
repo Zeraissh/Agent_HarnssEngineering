@@ -89,6 +89,25 @@
         </select>
         <span class="knob-hint" id="effort-hint"></span>
       </div>
+      <div class="knob">
+        <label for="mode-select">编排模式</label>
+        <select id="mode-select">
+          <option value="single">单任务（直接执行）</option>
+          <option value="plan">计划编排（拆解 + 依赖调度）</option>
+        </select>
+        <span class="knob-hint" id="mode-hint">单领域任务上编排是纯开销——它的价值在跨领域交接。</span>
+      </div>
+      <div class="knob">
+        <label for="concurrency-select">并行度</label>
+        <select id="concurrency-select" disabled>
+          <option value="auto">auto（min(3, 层宽)）</option>
+          <option value="1">1（串行）</option>
+          <option value="2">2</option>
+          <option value="3">3</option>
+          <option value="4">4</option>
+        </select>
+        <span class="knob-hint">并行买的是时间不是 token。cap=3 是收益曲线拐点。</span>
+      </div>
       <div class="knob knob--wide">
         <label for="rubric-input">主观评分表</label>
         <textarea id="rubric-input" rows="2" placeholder="逐条列出评分项，核查者按表评估进 advisory——不影响 passed，也不触发返工"></textarea>
@@ -168,6 +187,8 @@ const runKnobs = /** @type {HTMLElement} */ (document.getElementById("run-knobs"
 const packSelect = /** @type {HTMLSelectElement} */ (document.getElementById("pack-select"));
 const effortSelect = /** @type {HTMLSelectElement} */ (document.getElementById("effort-select"));
 const rubricInput = /** @type {HTMLTextAreaElement} */ (document.getElementById("rubric-input"));
+const modeSelect = /** @type {HTMLSelectElement} */ (document.getElementById("mode-select"));
+const concurrencySelect = /** @type {HTMLSelectElement} */ (document.getElementById("concurrency-select"));
 const sidebar = /** @type {HTMLElement} */ (document.getElementById("sidebar"));
 const mainPanel = /** @type {HTMLElement} */ (document.getElementById("main-panel"));
 const runFilter = /** @type {HTMLSelectElement} */ (document.getElementById("run-filter"));
@@ -569,6 +590,9 @@ submitForm.addEventListener("submit", async (e) => {
         ...(packSelect?.value ? { pack: packSelect.value } : {}),
         ...(effortSelect?.value ? { effort: effortSelect.value } : {}),
         ...(rubricInput?.value.trim() ? { rubric: rubricInput.value.trim() } : {}),
+        ...(modeSelect?.value === "plan"
+          ? { mode: "plan", ...(concurrencySelect?.value ? { concurrency: concurrencySelect.value } : {}) }
+          : {}),
       }),
     });
     if (!res.ok) {
@@ -696,6 +720,21 @@ function updatePackHint() {
 }
 
 if (packSelect) packSelect.addEventListener("change", updatePackHint);
+
+// 并行度只在编排模式下有意义——单任务模式下禁用而不是藏起来，
+// 让"这个旋钮属于哪个模式"这件事本身可见
+if (modeSelect && concurrencySelect) {
+  modeSelect.addEventListener("change", () => {
+    const isPlan = modeSelect.value === "plan";
+    concurrencySelect.disabled = !isPlan;
+    const hint = document.getElementById("mode-hint");
+    if (hint) {
+      hint.textContent = isPlan
+        ? "planner 先拆解出带依赖图的子任务，再按就绪顺序调度；每个子任务各自核查。"
+        : "单领域任务上编排是纯开销——它的价值在跨领域交接。";
+    }
+  });
+}
 
 if (knobsToggle && runKnobs) {
   knobsToggle.addEventListener("click", () => {

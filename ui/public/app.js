@@ -141,6 +141,10 @@ export function createInitialState(runId, task, verify) {
      * 快照——两者不一致时以这个为准，否则 Tools 面会展示另一个包的边界。
      */
     runConfig: null,
+    /** V-27 编排：计划、调度结果、降级告警 */
+    plan: null,
+    planResult: null,
+    planWarnings: [],
   };
 }
 
@@ -228,6 +232,26 @@ export function reduceEvent(state, sseEvent) {
   }
   if (type === "approval_expired") {
     return applyApprovalExpired(state, event);
+  }
+  if (type === "plan") {
+    return {
+      ...state,
+      plan: {
+        concurrency: Number(event.concurrency ?? 1),
+        concurrencyMode: String(event.concurrencyMode ?? "fixed"),
+        plannerMs: Number(event.plannerMs ?? 0),
+        subtasks: Array.isArray(event.subtasks) ? event.subtasks : [],
+      },
+    };
+  }
+  if (type === "plan_result") {
+    return { ...state, planResult: { ...event, type: undefined } };
+  }
+  if (type === "plan_warning") {
+    return {
+      ...state,
+      planWarnings: [...state.planWarnings, { subtaskId: event.subtaskId, message: event.message }],
+    };
   }
   if (type === "run_config") {
     return {
@@ -645,6 +669,7 @@ const WRITE_TOOLS = new Set(["write_file", "memory_write", "bash"]);
 
 /** source → 角色。前缀式来源（"s1/main"）为并行编排预留 */
 function segmentRole(source) {
+  if (source === "planner") return "planner";
   if (isVerifierSource(source)) return "verifier";
   const tail = typeof source === "string" && source.includes("/")
     ? source.slice(source.lastIndexOf("/") + 1)
@@ -690,6 +715,90 @@ export function deriveSegments(state) {
 }
 
 /**
+ * 编排面（V-27）：依赖图、每个子任务的状态与耗时、并行收益。
+ *
+ * 依赖图按**层**呈现而不是画自由图：层 = 依赖深度，同层意味着互不依赖、
+ * 可并发。这正是并行调度真正在做的决策，也是"为什么能省时间"的解释。
+ * 手写图布局既贵又不会更清楚。
+ *
+ * 返回 null 表示这次运行不是编排模式——调用方据此决定要不要渲染这一块。
+ */
+export function derivePlanFace(state) {
+  const plan = state.plan;
+  if (!plan) return null;
+
+  const subs = plan.subtasks;
+  const byId = new Map(subs.map((t) => [t.id, t]));
+  const result = state.planResult;
+  const stepById = new Map((result?.steps ?? []).map((st) => [st.id, st]));
+  const skipped = new Set((result?.skipped ?? []).map((x) => x.id));
+
+  // 哪些子任务已经开跑：来源形如 "s1/main"，前缀即子任务 id
+  const started = new Set();
+  for (const e of [...state.timeline, ...state.verifierTimeline]) {
+    const src = String(e.source ?? "");
+    if (src.includes("/")) started.add(src.slice(0, src.indexOf("/")));
+  }
+
+  const statusOf = (id) => {
+    const st = stepById.get(id);
+    if (st) return st.passed ? "passed" : "failed";
+    if (skipped.has(id)) return "skipped";
+    if (started.has(id)) return "running";
+    return "pending";
+  };
+
+  // 依赖深度 = 层号。带记忆的深度优先，环在服务端已 fail-closed 挡掉，
+  // 这里仍留一道访问标记防御——前端不该因为一份脏数据栈溢出
+  const depth = new Map();
+  const computing = new Set();
+  const depthOf = (id) => {
+    if (depth.has(id)) return depth.get(id);
+    if (computing.has(id)) return 0;
+    computing.add(id);
+    const t = byId.get(id);
+    const d = !t || t.dependsOn.length === 0
+      ? 0
+      : Math.max(...t.dependsOn.map((p) => depthOf(p) + 1));
+    computing.delete(id);
+    depth.set(id, d);
+    return d;
+  };
+
+  const nodes = subs.map((t) => ({
+    ...t,
+    depth: depthOf(t.id),
+    status: statusOf(t.id),
+    durationMs: stepById.get(t.id)?.durationMs ?? null,
+    reworks: stepById.get(t.id)?.reworks ?? null,
+    verdict: stepById.get(t.id)?.verdict ?? null,
+  }));
+
+  const layers = [];
+  for (const n of nodes) {
+    (layers[n.depth] ??= []).push(n);
+  }
+
+  const maxDuration = Math.max(1, ...nodes.map((n) => n.durationMs ?? 0));
+  return {
+    concurrency: plan.concurrency,
+    concurrencyMode: plan.concurrencyMode,
+    plannerMs: plan.plannerMs,
+    nodes,
+    layers: layers.map((l) => l ?? []),
+    // 层宽 = 理论最大并发；与实际并行度并列显示才看得出调度有没有吃满
+    parallelWidth: Math.max(1, ...layers.map((l) => (l ?? []).length)),
+    maxDuration,
+    timing: result?.timing ?? null,
+    completed: result?.completed ?? null,
+    planned: result ? result.planned !== false : null,
+    plannerRaw: result?.plannerRaw ?? null,
+    warnings: state.planWarnings,
+    skipped: result?.skipped ?? [],
+  };
+}
+
+/**
  * Loop 面：轮次水位、六值终止、返工裁决序列。
  * @param {RunState} state
  * @param {object|null} harness `/api/harness` 快照
@@ -703,6 +812,8 @@ export function deriveLoopFace(state, harness) {
   // 轮次取执行侧（main/rework）的最大 turn_start——核查轮预算独立，不该混进来
   let turn = 0;
   for (const e of state.timeline) {
+    // planner 是只读拆解，预算与执行者解耦，不并入轮次水位
+    if (e.source === "planner") continue;
     if (e.type === "turn_start" && typeof e.turn === "number" && e.turn > turn) turn = e.turn;
   }
 
@@ -1255,6 +1366,7 @@ export function renderRunDetail(state, callbacks) {
     tools: deriveToolsFace(state, harness),
     verification: deriveVerificationFace(state, harness),
     action: deriveActionState(state),
+    plan: derivePlanFace(state),
   };
 
   // V-10：骨架建一次，之后逐区补丁。此前每条 SSE 事件重建整页 innerHTML——
@@ -1743,6 +1855,7 @@ function patchTabContent(parts, state, activeTab, overview, logEntries, callback
         '<button type="button" class="view-btn" data-view="events">事件流</button>' +
         '<button type="button" class="view-btn" data-view="chat">对话</button>' +
         "</div>" +
+        '<div class="plan-board"></div>' +
         '<h3 class="overview-section-title">Agent 执行</h3>' +
         '<div class="rework-chain"></div>' +
         '<div class="log-entries"></div>' +
@@ -1757,6 +1870,7 @@ function patchTabContent(parts, state, activeTab, overview, logEntries, callback
   }
 
   if (activeTab === "loop") {
+    patchPlanBoard(parts, container.querySelector(".plan-board"), faces.plan);
     patchReworkChain(container.querySelector(".rework-chain"), faces.loop);
     patchLoopView(parts, container, state, logEntries, callbacks);
     return;
@@ -2015,6 +2129,107 @@ function patchLogPanel(container, logEntries, callbacks, state) {
   });
 }
 
+/** 编排面板：依赖分层 + 甘特 + 并行收益（V-27） */
+function patchPlanBoard(parts, host, plan) {
+  if (!host) return;
+  if (!plan) {
+    setAttr(host, "hidden", "");
+    host.innerHTML = "";
+    parts.sig.plan = null;
+    return;
+  }
+  setAttr(host, "hidden", null);
+  const sig = signature([
+    plan.nodes.map((n) => `${n.id}:${n.status}:${n.durationMs ?? ""}`).join(","),
+    plan.timing ? JSON.stringify(plan.timing) : "",
+    plan.warnings.length,
+  ]);
+  if (parts.sig.plan === sig) return;
+  parts.sig.plan = sig;
+
+  let html = '<h3 class="overview-section-title">编排计划</h3>';
+
+  if (plan.planned === false) {
+    // fail-closed：planner 产不出可解析计划时一个子任务都不执行。
+    // 这不是"没结果"，是一个明确的结论，必须说清。
+    html += '<div class="callout callout--bad"><strong>planner 未能产出可解析计划</strong>' +
+      "<p>整份计划作废，没有执行任何子任务（fail-closed）。下面是 planner 的原始输出片段。</p>" +
+      (plan.plannerRaw ? `<pre class="chat-body">${esc(plan.plannerRaw)}</pre>` : "") +
+      "</div>";
+    host.innerHTML = html;
+    return;
+  }
+
+  html += '<p class="plan-meta">';
+  html += `并行度 ${plan.concurrency}${plan.concurrencyMode === "auto" ? "（auto）" : ""}`;
+  html += ` · 层宽 ${plan.parallelWidth}`;
+  html += ` · ${plan.nodes.length} 个子任务`;
+  if (plan.plannerMs) html += ` · 拆解耗时 ${formatDuration(plan.plannerMs)}`;
+  html += "</p>";
+
+  for (const w of plan.warnings) {
+    html += `<div class="callout callout--warn"><strong>⚠ ${esc(w.subtaskId)}</strong><p>${esc(w.message)}</p></div>`;
+  }
+
+  // 依赖分层：同层 = 互不依赖 = 可并发。这正是调度器在做的决策
+  html += '<ol class="plan-layers">';
+  plan.layers.forEach((layer, i) => {
+    html += `<li class="plan-layer"><span class="plan-layer-label">第 ${i + 1} 层${layer.length > 1 ? `（${layer.length} 个可并发）` : ""}</span>`;
+    html += '<div class="plan-nodes">';
+    for (const n of layer) html += renderPlanNode(n, plan.maxDuration);
+    html += "</div></li>";
+  });
+  html += "</ol>";
+
+  if (plan.timing) {
+    const t = plan.timing;
+    // 口径写全：子任务阶段墙钟排除 planner，"节省"是相对串行全序和而言
+    html += '<dl class="boundary-list plan-timing">';
+    html += `<dt>全程</dt><dd>${formatDuration(t.totalMs)}</dd>`;
+    html += `<dt>拆解</dt><dd>${formatDuration(t.plannerMs)}</dd>`;
+    html += `<dt>子任务阶段墙钟</dt><dd>${formatDuration(t.subtaskWallMs)}（排除拆解）</dd>`;
+    html += `<dt>子任务合计</dt><dd>${formatDuration(t.stepSumMs)}（各步耗时之和 = 串行基线）</dd>`;
+    html += `<dt>并行节省</dt><dd>${formatDuration(t.savedMs)}${
+      t.stepSumMs > 0 ? `（${((t.savedMs / t.stepSumMs) * 100).toFixed(0)}%）` : ""
+    }</dd>`;
+    html += "</dl>";
+    html += '<p class="rail-note">并行买的是时间不是 token：token 成本是结构性的，不随并行度下降。</p>';
+  }
+
+  if (plan.skipped.length > 0) {
+    html += `<div class="callout callout--warn"><strong>${plan.skipped.length} 个子任务未执行</strong>` +
+      "<p>某一步核查未通过后调度停止发射新任务（在飞的照常跑完）——整体已败，续跑只是烧 token。</p><ul>" +
+      plan.skipped.map((x) => `<li><code>${esc(x.id)}</code> ${esc(x.title)}</li>`).join("") +
+      "</ul></div>";
+  }
+  host.innerHTML = html;
+}
+
+/** @returns {string} */
+function renderPlanNode(n, maxDuration) {
+  const mark = { passed: "✔", failed: "✘", skipped: "－", running: "●", pending: "○" }[n.status];
+  const pct = n.durationMs ? Math.max(2, Math.round((n.durationMs / maxDuration) * 100)) : 0;
+  let html = `<div class="plan-node plan-node--${n.status}">`;
+  html += `<div class="plan-node-head"><span class="plan-node-mark">${mark}</span>`;
+  html += `<code class="plan-node-id">${esc(n.id)}</code> <span class="plan-node-title">${esc(n.title)}</span></div>`;
+  html += '<div class="plan-node-meta">';
+  if (n.pack) html += `<span class="chip-perm">包 ${esc(n.pack)}</span>`;
+  if (n.dependsOn.length) html += `<span>⇐ ${esc(n.dependsOn.join(", "))}</span>`;
+  // 独占资源要显眼：同标签强制串行，是"为什么这两个没并发"的唯一解释
+  if (n.resources?.length) html += `<span class="plan-node-res">⊘ 独占 ${esc(n.resources.join("、"))}</span>`;
+  if (n.reworks) html += `<span>↺ 返工 ${n.reworks} 轮</span>`;
+  if (n.durationMs != null) html += `<span>${formatDuration(n.durationMs)}</span>`;
+  html += "</div>";
+  if (pct > 0) html += `<div class="plan-bar"><div class="plan-bar-fill" style="width:${pct}%"></div></div>`;
+  if (n.acceptance?.length) {
+    html += `<details class="chat-aside"><summary>验收 ${n.acceptance.length} 条</summary><ul class="plan-acceptance">`;
+    html += n.acceptance.map((a) => `<li>${esc(a)}</li>`).join("");
+    html += "</ul></details>";
+  }
+  html += "</div>";
+  return html;
+}
+
 /** Loop 面的两种读法之间切换 */
 function patchLoopView(parts, container, state, logEntries, callbacks) {
   const view = callbacks.loopView === "chat" ? "chat" : "events";
@@ -2165,10 +2380,16 @@ function renderSegmentBoundary(seg) {
   const label = {
     verifier: "核查 Agent 独立复核（全新上下文）",
     rework: `核查未通过，开始返工（第 ${seg.round} 轮）`,
+    planner: "计划单元（planner，只读拆解）",
     main: "Agent 执行",
   }[seg.role];
-  const mark = seg.role === "rework" ? "↺" : seg.role === "verifier" ? "◆" : "▸";
-  return `<div class="segment-boundary segment-boundary--${seg.role}"><span class="segment-mark">${mark}</span><span class="segment-label">${esc(label)}</span></div>`;
+  const mark = seg.role === "rework" ? "↺" : seg.role === "verifier" ? "◆" : seg.role === "planner" ? "❑" : "▸";
+  // 编排模式下来源形如 "s1/main"：并行时多个子任务的日志按 seq 交错，
+  // 不标出子任务 id 就完全读不懂谁在说话
+  const src = String(seg.source ?? "");
+  const stepId = src.includes("/") ? src.slice(0, src.indexOf("/")) : null;
+  const step = stepId ? `<code class="segment-step">${esc(stepId)}</code> ` : "";
+  return `<div class="segment-boundary segment-boundary--${seg.role}"><span class="segment-mark">${mark}</span>${step}<span class="segment-label">${esc(label)}</span></div>`;
 }
 
 function patchUsageFooter(parts, state) {

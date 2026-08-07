@@ -657,3 +657,87 @@ describe("对话视图", () => {
     }
   });
 });
+
+// ================================================================
+// v2 R7：编排面板 (V-27)
+// ================================================================
+
+describe("编排面板", () => {
+  function planState() {
+    let s = createInitialState("run-plan", "跨领域交付", true);
+    const push = (seq: number, source: string, event: Record<string, unknown>) => {
+      s = reduceEvent(s, { seq, source, event });
+    };
+    push(0, "host", {
+      type: "plan", concurrency: 2, concurrencyMode: "auto", plannerMs: 8000,
+      subtasks: [
+        { id: "s1", title: "整理资料", pack: null, description: "", acceptance: ["产出 refs.md"], dependsOn: [], resources: [] },
+        { id: "s2", title: "写固件", pack: "stm32-debug", description: "", acceptance: [], dependsOn: [], resources: ["swd-probe"] },
+        { id: "s3", title: "汇总", pack: null, description: "", acceptance: [], dependsOn: ["s1", "s2"], resources: [] },
+      ],
+    });
+    push(1, "planner", { type: "turn_start", turn: 1 });
+    push(2, "s1/main", { type: "turn_start", turn: 1 });
+    push(3, "s2/main", { type: "turn_start", turn: 1 });
+    push(4, "host", {
+      type: "plan_result", completed: false, planned: true,
+      steps: [
+        { id: "s1", title: "整理资料", durationMs: 5000, passed: true, reworks: 0 },
+        { id: "s2", title: "写固件", durationMs: 9000, passed: false, reworks: 1 },
+      ],
+      skipped: [{ id: "s3", title: "汇总" }],
+      timing: { totalMs: 20000, plannerMs: 8000, subtaskWallMs: 9000, stepSumMs: 14000, savedMs: 5000 },
+    });
+    return s;
+  }
+
+  it("依赖分层渲染：同层并列、跨层标依赖、独占资源可见", () => {
+    renderRunDetail(planState(), { activeTab: "loop", harness: FAKE_HARNESS });
+    const board = document.querySelector(".plan-board")!;
+    const layers = [...board.querySelectorAll(".plan-layer")];
+    expect(layers).toHaveLength(2);
+    expect(layers[0].textContent).toContain("2 个可并发");
+    expect(board.querySelector('.plan-node--passed .plan-node-id')!.textContent).toBe("s1");
+    expect(board.querySelector(".plan-node--failed")!.textContent).toContain("s2");
+    expect(board.querySelector(".plan-node--skipped, .callout")!.textContent).toContain("汇总");
+    // 独占资源是"为什么这两个没并发"的唯一解释，必须显式可见
+    expect(board.textContent).toContain("swd-probe");
+  });
+
+  it("并行收益的每个数字都带口径", () => {
+    renderRunDetail(planState(), { activeTab: "loop", harness: FAKE_HARNESS });
+    const t = document.querySelector(".plan-timing")!.textContent!;
+    expect(t).toContain("排除拆解");
+    expect(t).toContain("串行基线");
+    expect(document.querySelector(".plan-board")!.textContent).toContain("并行买的是时间不是 token");
+  });
+
+  it("planner 失败时说清 fail-closed，而不是显示成空计划", () => {
+    let s = createInitialState("r", "t", true);
+    s = reduceEvent(s, { seq: 0, source: "host", event: { type: "plan", concurrency: 1, subtasks: [] } });
+    s = reduceEvent(s, {
+      seq: 1, source: "host",
+      event: { type: "plan_result", planned: false, completed: false, plannerRaw: "我觉得不用拆", steps: [], skipped: [] },
+    });
+    renderRunDetail(s, { activeTab: "loop", harness: FAKE_HARNESS });
+    const board = document.querySelector(".plan-board")!;
+    expect(board.textContent).toContain("未能产出可解析计划");
+    expect(board.textContent).toContain("我觉得不用拆");
+  });
+
+  it("非编排运行不渲染编排面板", () => {
+    renderRunDetail(buildRichState(), { activeTab: "loop", harness: FAKE_HARNESS });
+    const board = document.querySelector(".plan-board") as HTMLElement;
+    expect(board.hidden).toBe(true);
+  });
+
+  it("编排面板零 violations（两套主题）", async () => {
+    for (const theme of ["light", "dark"]) {
+      document.body.innerHTML = loadSkeleton();
+      document.documentElement.setAttribute("data-theme", theme);
+      renderRunDetail(planState(), { activeTab: "loop", harness: FAKE_HARNESS });
+      const violations = await runAxe();
+      expect(violations, `${theme}: ${JSON.stringify(violations, null, 2)}`).toEqual([]);
+    }
+  });
+});

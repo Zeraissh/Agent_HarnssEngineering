@@ -1473,6 +1473,107 @@ describe("ui-server", () => {
     expect(snap.effortLevels).toEqual(["low", "medium", "high", "xhigh", "max"]);
   });
 
+  // ---- V-27 计划编排 ----
+  it("v2-17. mode=plan 走 runPlanned：发出 plan / plan_result，来源带子任务前缀", async () => {
+    const planJson = JSON.stringify({
+      subtasks: [
+        { id: "s1", title: "第一步", description: "做 A", acceptance: ["A 完成"], dependsOn: [] },
+        { id: "s2", title: "第二步", description: "做 B", acceptance: ["B 完成"], dependsOn: ["s1"] },
+      ],
+    });
+    // runPlanned 对**每个**子任务都跑 runVerified —— 核查是编排的固有环节，
+    // 不受请求体里的 verify 开关影响。所以脚本必须为每个子任务备好
+    // 「执行一发 + 合法裁决一发」，否则裁决解析失败会 fail-closed 触发快速
+    // 失败，下游子任务被 skipped（初稿正是这么写错的：给了八条"完成"，
+    // 于是 s1 判未通过、s2 根本没跑）。
+    const pass = () =>
+      fakeMessage([textBlock(JSON.stringify({ passed: true, issues: [], summary: "通过" }))], "end_turn");
+    const script = [
+      fakeMessage([textBlock(["```json", planJson, "```"].join("\n"))], "end_turn"),
+      fakeMessage([textBlock("s1 完成")], "end_turn"), pass(),
+      fakeMessage([textBlock("s2 完成")], "end_turn"), pass(),
+    ];
+    handle = createUiServer({
+      modelClient: new FakeModelClient(script),
+      tools: [autoTool("noop")],
+      workdir: process.cwd(),
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "两步任务", verify: false, mode: "plan", concurrency: 2 }),
+    })).json() as { runId: string };
+    await waitForDone(base, runId);
+
+    const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+
+    const plan = events.find((e: any) => e.event.type === "plan") as any;
+    expect(plan, "未发出 plan 事件").toBeDefined();
+    expect(plan.event.subtasks.map((t: any) => t.id)).toEqual(["s1", "s2"]);
+    expect(plan.event.subtasks[1].dependsOn).toEqual(["s1"]);
+    expect(plan.event.concurrency).toBe(2);
+
+    // 来源必须带子任务前缀，否则并行下的日志完全读不懂谁在说话
+    const sources = new Set(events.map((e: any) => e.source));
+    expect([...sources].some((x) => String(x).startsWith("s1/"))).toBe(true);
+    expect(sources.has("planner")).toBe(true);
+
+    const result = events.find((e: any) => e.event.type === "plan_result") as any;
+    expect(result, "未发出 plan_result 事件").toBeDefined();
+    expect(result.event.steps.map((st: any) => st.id)).toEqual(["s1", "s2"]);
+    // 每个数字都要有口径：子任务阶段墙钟排除 planner，节省是相对串行全序和
+    for (const k of ["totalMs", "plannerMs", "subtaskWallMs", "stepSumMs", "savedMs"]) {
+      expect(typeof result.event.timing[k], `timing.${k} 缺失`).toBe("number");
+    }
+    expect(result.event.timing.totalMs).toBeGreaterThanOrEqual(result.event.timing.subtaskWallMs);
+  });
+
+  it("v2-18. planner 产不出可解析计划时 fail-closed：planned=false 且零子任务执行", async () => {
+    handle = createUiServer({
+      modelClient: new FakeModelClient([
+        fakeMessage([textBlock("我觉得这个任务不需要拆分。")], "end_turn"),
+        fakeMessage([textBlock("还是不拆。")], "end_turn"),
+      ]),
+      tools: [autoTool("noop")],
+      workdir: process.cwd(),
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "不可拆的任务", mode: "plan" }),
+    })).json() as { runId: string };
+    await waitForDone(base, runId);
+
+    const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+    const result = events.find((e: any) => e.event.type === "plan_result") as any;
+    expect(result.event.planned).toBe(false);
+    expect(result.event.steps).toEqual([]);
+    // 原始输出要留给人看——"为什么没拆"是可诊断的，不该只剩一个空结果
+    expect(typeof result.event.plannerRaw).toBe("string");
+    // 计划作废即一个子任务都不执行
+    expect(events.some((e: any) => String(e.source).includes("/"))).toBe(false);
+  });
+
+  it("v2-19. mode / concurrency 非法值当场 400", async () => {
+    handle = createUiServer({ modelClient: new FakeModelClient([]), tools: [], workdir: process.cwd() });
+    port = await startServer(handle);
+    base = baseUrl(port);
+    const post = (body: unknown) =>
+      fetch(`${base}/api/runs`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+      });
+
+    expect((await post({ task: "t", mode: "turbo" })).status).toBe(400);
+    expect((await post({ task: "t", mode: "plan", concurrency: 99 })).status).toBe(400);
+    expect((await post({ task: "t", mode: "plan", concurrency: "many" })).status).toBe(400);
+  });
+
   // ---- V-10 全局生命周期流（取代 3 秒轮询）----
   it("v2-12. /api/stream 先发快照，再推 run_created / run_finished", async () => {
     handle = createUiServer({
