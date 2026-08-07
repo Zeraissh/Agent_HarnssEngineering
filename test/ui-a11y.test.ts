@@ -900,3 +900,133 @@ describe("续跑返回累计正史时的去重 (V-28)", () => {
     expect(host.querySelectorAll(".segment-boundary").length).toBeGreaterThanOrEqual(2);
   });
 });
+
+// ================================================================
+// v2 R11：侧栏分组 + 常驻水位 (V-32 / V-33)
+// ================================================================
+
+describe("侧栏按工作目录分组", () => {
+  const meta = new Map();
+  const runs = (dirs: string[]) =>
+    dirs.map((d, i) => ({ runId: `r${i}`, task: `任务 ${i}`, status: "done", verify: false, workdir: d }));
+
+  it("只有一个工作目录时自动摊平——不制造无意义的层级", () => {
+    renderRunList(runs(["D:\\proj-a", "D:\\proj-a"]), null, () => {}, meta);
+    expect(document.querySelectorAll('#run-list [role="group"]')).toHaveLength(0);
+    expect(document.querySelectorAll("#run-list .run-item")).toHaveLength(2);
+  });
+
+  // 两种分隔符都要覆盖：宿主主要跑在 Windows（反斜杠），但路径也可能是 posix 风格。
+  // 只切 `/` 的话 Windows 路径切不开，组名会退化成整条绝对路径——初版正是这个 bug。
+  it.each([
+    ["Windows 反斜杠", ["D:\\work\\proj-a", "D:\\work\\proj-b", "D:\\work\\proj-a"]],
+    ["posix 斜杠", ["/home/u/proj-a", "/home/u/proj-b", "/home/u/proj-a"]],
+  ])("多个工作目录时分组，组名取路径末段（%s）", (_label, dirs) => {
+    renderRunList(runs(dirs as string[]), null, () => {}, meta);
+    const groups = [...document.querySelectorAll('#run-list [role="group"]')];
+    expect(groups).toHaveLength(2);
+    expect(groups.map((g) => g.getAttribute("aria-label"))).toEqual(["proj-a", "proj-b"]);
+    // 分组不改变 option 总数，也不改变 listbox 身份
+    expect(document.querySelectorAll("#run-list .run-item")).toHaveLength(3);
+    expect(document.getElementById("run-list")!.getAttribute("role")).toBe("listbox");
+  });
+
+  it("分组后 option 仍在 listbox 的合法子树内（axe 零 violations）", async () => {
+    renderRunList(runs(["D:\\work\\a", "D:\\work\\b"]), "r0", () => {}, meta);
+    const violations = await runAxe();
+    expect(violations, JSON.stringify(violations, null, 2)).toEqual([]);
+  });
+
+  it("分组渲染同样复用节点，焦点不丢", () => {
+    const list = runs(["D:\\work\\a", "D:\\work\\b"]);
+    renderRunList(list, null, () => {}, meta);
+    const item = document.querySelector("#run-list .run-item") as HTMLElement;
+    item.focus();
+    renderRunList(list, "r0", () => {}, meta);
+    expect(document.querySelector("#run-list .run-item")).toBe(item);
+    expect(document.activeElement).toBe(item);
+  });
+});
+
+describe("常驻上下文水位", () => {
+  function stateWithUsage(input: number, compactions = 0) {
+    let s = createInitialState("run-c", "任务", false);
+    s = reduceEvent(s, {
+      seq: 0, source: "main",
+      event: { type: "usage", turn: 1, usage: { input_tokens: input, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } },
+    });
+    for (let i = 0; i < compactions; i++) {
+      s = reduceEvent(s, { seq: 10 + i, source: "main", event: { type: "compaction", droppedBlocks: 3 } });
+    }
+    return s;
+  }
+
+  const H = { ...FAKE_HARNESS, guardrails: { ...FAKE_HARNESS.guardrails, contextTokenLimit: 1000 } };
+
+  it("无用量时不显示——不给一个恒为 0% 的摆设", () => {
+    renderRunDetail(createInitialState("r", "t", false), { activeTab: "loop", harness: H });
+    expect((document.querySelector(".ctx-gauge") as HTMLElement).hidden).toBe(true);
+  });
+
+  it("显示百分比与刻度，无障碍名称说全口径", () => {
+    renderRunDetail(stateWithUsage(480), { activeTab: "loop", harness: H });
+    const g = document.querySelector(".ctx-gauge") as HTMLElement;
+    expect(g.hidden).toBe(false);
+    expect(g.textContent).toContain("48%");
+    const label = g.getAttribute("aria-label")!;
+    // 光念一个 48% 没有信息量——要说清分子分母是什么
+    expect(label).toContain("最近一轮输入");
+    expect(label).toContain("上限");
+  });
+
+  it("越过压缩水位转 warn 语域", () => {
+    renderRunDetail(stateWithUsage(900), { activeTab: "loop", harness: H });
+    expect(document.querySelector(".ctx-gauge")!.classList.contains("ctx-gauge--warn")).toBe(true);
+  });
+
+  /**
+   * 已压缩与"快满了"不是一个语域：前者是**已经不可逆地丢过东西**，
+   * 后者只是预警。共用一个颜色会让人对前者脱敏。
+   */
+  it("已发生压缩时走不可逆语域，并在名称里说明不可恢复", () => {
+    renderRunDetail(stateWithUsage(300, 2), { activeTab: "loop", harness: H });
+    const g = document.querySelector(".ctx-gauge")!;
+    expect(g.classList.contains("ctx-gauge--irreversible")).toBe(true);
+    expect(g.textContent).toContain("⊟2");
+    expect(g.getAttribute("aria-label")).toContain("不可恢复");
+  });
+
+  it("点击跳到 Context 面——图标是入口不是死数字", () => {
+    const seen: string[] = [];
+    document.addEventListener("tab-switch", (e) => seen.push((e as CustomEvent).detail.tab));
+    renderRunDetail(stateWithUsage(480), { activeTab: "loop", harness: H });
+    (document.querySelector(".ctx-gauge") as HTMLElement).click();
+    expect(seen).toEqual(["context"]);
+  });
+
+  /**
+   * 没配上限时不画刻度：五个空格看起来像"0%"，而事实是"不知道"。
+   * 用空刻度表达未知就是在说谎——这条和三值裁决里的 unverified 是同一个道理。
+   */
+  it("未配置上下文上限时只报绝对值，既不编造百分比也不画空刻度", () => {
+    renderRunDetail(stateWithUsage(480), {
+      activeTab: "loop", harness: { ...FAKE_HARNESS, guardrails: {} },
+    });
+    const g = document.querySelector(".ctx-gauge")!;
+    expect(g.textContent).not.toContain("%");
+    expect(g.textContent).not.toContain("▯");
+    expect(g.textContent).not.toContain("▮");
+    expect(g.textContent).toContain("上下文");
+    expect(g.getAttribute("aria-label")).toContain("未配置上限");
+  });
+
+  it("配了上限时才画刻度，格数随水位增长", () => {
+    const H2 = { ...FAKE_HARNESS, guardrails: { ...FAKE_HARNESS.guardrails, contextTokenLimit: 1000 } };
+    renderRunDetail(stateWithUsage(150), { activeTab: "loop", harness: H2 });
+    const low = document.querySelector(".ctx-gauge")!.textContent!;
+    document.body.innerHTML = loadSkeleton();
+    renderRunDetail(stateWithUsage(950), { activeTab: "loop", harness: H2 });
+    const high = document.querySelector(".ctx-gauge")!.textContent!;
+    expect((low.match(/▮/g) ?? []).length).toBeLessThan((high.match(/▮/g) ?? []).length);
+  });
+});

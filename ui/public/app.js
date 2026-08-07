@@ -1284,10 +1284,61 @@ export function renderRunList(runs, selectedRunId, onSelect, metaMap) {
   const placeholder = listEl.querySelector(".run-list-empty");
   if (placeholder) placeholder.remove();
 
-  // V-10：键控补丁而非 innerHTML 重建。侧栏每 3 秒被刷新一次，整体重建会把
-  // 停在运行项上的键盘焦点直接摧毁（实测 3.6s 后 activeElement 变成 BODY）。
-  // 复用节点后，焦点、hover 态、CSS 过渡都得以保持。
-  patchList(listEl, runs, {
+  // V-32：按工作目录分组。只有一个组时**自动摊平**——凭空多一层标题
+  // 只会增加噪声，层级要在真有多个项目时才出现。
+  const groups = groupRunsByWorkdir(runs);
+  const grouped = groups.length > 1;
+
+  // 分组时用 listbox > group > option（ARIA 1.2 允许的结构）。
+  // 摊平时组容器不出现，option 直接挂在 listbox 下。
+  patchList(listEl, grouped ? groups : [{ key: "", label: "", runs }], {
+    key: (g) => g.key,
+    create: (g) => {
+      const box = document.createElement("div");
+      box.className = "run-group";
+      if (g.key) {
+        box.setAttribute("role", "group");
+        box.setAttribute("aria-label", g.label);
+        box.innerHTML = '<div class="run-group-label"></div><div class="run-group-items"></div>';
+        setText(box.querySelector(".run-group-label"), g.label);
+      } else {
+        box.innerHTML = '<div class="run-group-items"></div>';
+      }
+      patchRunItems(box.querySelector(".run-group-items"), g.runs, metaMap, selectedRunId, onSelect);
+      return box;
+    },
+    update: (box, g) => {
+      if (g.key) setText(box.querySelector(".run-group-label"), g.label);
+      patchRunItems(box.querySelector(".run-group-items"), g.runs, metaMap, selectedRunId, onSelect);
+    },
+  });
+}
+
+/**
+ * 按工作目录分组。workdir 是工具的写入圈禁边界——"这段工作触碰的范围"，
+ * 所以它是这个 harness 自己长出来的分组键，而不是从别家侧栏照搬的层级。
+ * 分组前后保持原有顺序（服务端已按 createdAt 降序）。
+ * @returns {{key:string,label:string,runs:any[]}[]}
+ */
+export function groupRunsByWorkdir(runs) {
+  const byDir = new Map();
+  for (const r of runs) {
+    const dir = r.workdir ?? "";
+    if (!byDir.has(dir)) byDir.set(dir, []);
+    byDir.get(dir).push(r);
+  }
+  return [...byDir.entries()].map(([dir, list]) => ({
+    key: dir || "(default)",
+    // 标签只取末段：完整绝对路径在窄侧栏里会挤掉一切，完整值在 Tools 面有
+    // 两种分隔符都要切：这个宿主主要跑在 Windows 上（反斜杠），但路径也可能
+    // 是 posix 风格。只切 `/` 的话 Windows 路径切不开，组名会变成整条绝对路径
+    label: dir ? dir.split(/[\\/]/).filter(Boolean).pop() ?? dir : "（默认工作目录）",
+    runs: list,
+  }));
+}
+
+function patchRunItems(host, runs, metaMap, selectedRunId, onSelect) {
+  patchList(host, runs, {
     key: (r) => r.runId,
     create: (r) => {
       const el = document.createElement("div");
@@ -1435,6 +1486,9 @@ function ensureDetailSkeleton(mainEl, state, callbacks) {
     '<div class="detail-meta">' +
     '<span class="status-badge"></span>' +
     '<span class="verify-badge" hidden>核查模式</span>' +
+    // V-33：上下文水位常驻页头。压缩是不可逆的（置换掉的 tool_result 原文
+    // 永不可恢复），所以"快满了"必须在第一屏就看得见，而不是要下钻才发现
+    '<button type="button" class="ctx-gauge" hidden aria-live="polite"></button>' +
     '<span class="detail-hint" hidden></span>' +
     "</div></div>" +
     '<div class="action-rail" hidden>' +
@@ -1459,6 +1513,7 @@ function ensureDetailSkeleton(mainEl, state, callbacks) {
     task: mainEl.querySelector(".detail-task"),
     statusBadge: mainEl.querySelector(".status-badge"),
     verifyBadge: mainEl.querySelector(".verify-badge"),
+    ctxGauge: mainEl.querySelector(".ctx-gauge"),
     hint: mainEl.querySelector(".detail-hint"),
     actionRail: mainEl.querySelector(".action-rail"),
     approvals: mainEl.querySelector(".approval-cards"),
@@ -1479,6 +1534,7 @@ function ensureDetailSkeleton(mainEl, state, callbacks) {
 function patchDetailHeader(parts, state, isRunning, faces) {
   const cls = classifyStopReason(isRunning ? null : state.stopReason);
   const loop = faces.loop;
+  patchContextGauge(parts, faces.context);
   const sig = signature([
     state.task, isRunning, state.stopReason, state.verify, loop.turn, loop.maxTurns,
   ]);
@@ -1495,6 +1551,59 @@ function patchDetailHeader(parts, state, isRunning, faces) {
   // 用户必须在第一屏就知道"通过也不代表任务做完"
   setAttr(parts.hint, "hidden", !isRunning && cls.hint ? null : "");
   if (!isRunning && cls.hint) setText(parts.hint, cls.hint);
+}
+
+/**
+ * 常驻上下文水位表（V-33）。
+ *
+ * Context 面里有完整的三分与逐轮明细，但那要下钻才看得到。压缩是**不可逆**的
+ * ——被置换的 tool_result 原文永不可恢复，模型只能重新调工具取回——所以
+ * "快满了"这件事必须在第一屏就可见，而不是事后在明细里发现。
+ *
+ * 点它跳到 Context 面：图标是入口，不是死数字。
+ */
+function patchContextGauge(parts, ctx) {
+  const el = parts.ctxGauge;
+  if (!el) return;
+  if (!ctx || ctx.lastInputTokens === 0) {
+    setAttr(el, "hidden", "");
+    return;
+  }
+  setAttr(el, "hidden", null);
+
+  const pct = ctx.ratio === null ? null : Math.round(ctx.ratio * 100);
+  const tone = ctx.compactions.length > 0 ? "irreversible" : ctx.nearWatermark ? "warn" : "ok";
+  el.className = `ctx-gauge ctx-gauge--${tone}`;
+
+  // 五格文本刻度：不依赖 SVG、能被屏幕阅读器念出来，也不会在窄屏里被挤没。
+  // 没配上限时**不画刻度**——五个空格看起来像"0%"，而事实是"不知道"，
+  // 用空刻度表达未知就是在说谎。这时只报绝对值。
+  const glyph =
+    pct === null
+      ? ""
+      : "▮".repeat(Math.min(5, Math.max(1, Math.ceil(pct / 20)))) +
+        "▯".repeat(5 - Math.min(5, Math.max(1, Math.ceil(pct / 20))));
+  const label = pct === null ? `上下文 ${formatTokens(ctx.lastInputTokens)}` : `${pct}%`;
+  const compacted = ctx.compactions.length > 0 ? ` ⊟${ctx.compactions.length}` : "";
+  setText(el, `${glyph ? `${glyph} ` : ""}${label}${compacted}`);
+
+  // 无障碍名称要说全口径与后果——光念"48%"没有信息量
+  const parts2 = [
+    pct === null
+      ? `上下文最近一轮输入 ${formatTokens(ctx.lastInputTokens)}（未配置上限）`
+      : `上下文水位 ${pct}%，最近一轮输入 ${formatTokens(ctx.lastInputTokens)} / 上限 ${formatTokens(ctx.limit)}`,
+    ctx.compactions.length > 0
+      ? `已压缩 ${ctx.compactions.length} 次，置换 ${ctx.droppedBlocks} 个 tool_result 原文，不可恢复`
+      : null,
+    "查看上下文详情",
+  ].filter(Boolean);
+  setAttr(el, "aria-label", parts2.join("；"));
+  setAttr(el, "title", parts2.join("\n"));
+
+  if (!el.__bound) {
+    el.__bound = true;
+    el.addEventListener("click", () => switchToFace("context"));
+  }
 }
 
 /**

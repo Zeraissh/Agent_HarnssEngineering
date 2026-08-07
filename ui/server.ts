@@ -3,9 +3,9 @@
  * 并支持任务提交与审批应答。Node 内置模块，零第三方依赖。
  */
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { join, extname, dirname, delimiter, resolve } from "node:path";
+import { join, extname, dirname, delimiter, resolve, basename, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { AgentLoop } from "../src/loop.js";
@@ -241,6 +241,10 @@ function serializeEvent(
 }
 
 const BUILTIN_POOL: Tool[] = [bashTool, fetchUrlTool, readFileTool, writeFileTool];
+
+/** 上传落点：工作目录下的固定子目录，便于人和 agent 都一眼知道东西在哪 */
+const UPLOAD_SUBDIR = "uploads";
+const UPLOAD_MAX_BYTES = 20_000_000;
 const DEFAULT_SYSTEM_PROMPT = `You are a capable autonomous agent operating in a local working directory.
 Complete the user's task end to end using the available tools.
 Ground every claim of progress in an actual tool result.`;
@@ -254,8 +258,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   const resolved = createModelClientFromEnv(process.env.AGENT_MODEL ?? "claude-opus-4-8");
   const modelClient = options.modelClient ?? resolved.client;
   const envCompat = resolved.compat;
-  const workdir = options.workdir ?? process.cwd();
-  // 白名单一律规范化为绝对路径再比对——外部输入不能靠字符串相等判定边界
+  // 在源头就归一：workdir 参与白名单比对、侧栏分组键、工具圈禁根三处，
+  // 三处必须是同一个字符串形态。`D:/a/b` 与 `D:` 指同一个目录，
+  // 但字符串不等——不在源头 resolve 的话，默认路径会过不了自己的白名单
+  const workdir = resolve(options.workdir ?? process.cwd());
   const allowedWorkdirs = [...new Set([workdir, ...(options.workdirs ?? [])].map((d) => resolve(d)))];
   const pack = options.packName ? getPack(options.packName) : undefined;
   const injectedTools = options.tools;
@@ -330,6 +336,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       verdict: r.outcome?.verifications.at(-1)?.verdict ?? null,
       mode: r.mode ?? "single",
       conversationTurn: r.conversationTurn,
+      // V-32：侧栏按工作目录分组。workdir 是工具的写入圈禁边界，
+      // 也就是"这段工作触碰的范围"——它是这个 harness 自己长出来的分组键，
+      // 不是从别家侧栏照搬来的层级
+      workdir: r.workdir ?? workdir,
       // 能否追加：让界面据此决定要不要显示输入框，而不是点了才报错
       canContinue:
         r.status === "done" && !r.verify && r.mode !== "plan" && Boolean(r.loop && r.history?.length),
@@ -997,6 +1007,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         contextTokenLimit: contextTokenLimit ?? null,
       },
       compactWatermark: 0.8,
+      uploadSubdir: UPLOAD_SUBDIR,
+      uploadMaxBytes: UPLOAD_MAX_BYTES,
       // V-24：提交表单要能列出可选领域包。只给名字与描述，不泄露 systemPrompt
       availablePacks: Object.entries(PACKS).map(([name, p]) => ({
         name,
@@ -1071,6 +1083,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     | { type: "lifecycleStream" }
     | { type: "transcript"; runId: string }
     | { type: "followUp"; runId: string }
+    | { type: "upload" }
     | { type: "createRun" }
     | { type: "events"; runId: string }
     | { type: "approval"; runId: string; toolUseId: string }
@@ -1099,6 +1112,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     const transcriptMatch = method === "GET" && url.match(/^\/api\/runs\/([^/]+)\/transcript$/);
     if (transcriptMatch) {
       return { type: "transcript", runId: transcriptMatch[1]! };
+    }
+
+    if (method === "POST" && url === "/api/upload") {
+      return { type: "upload" };
     }
 
     const followUpMatch = method === "POST" && url.match(/^\/api\/runs\/([^/]+)\/messages$/);
@@ -1152,6 +1169,79 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           .sort((a, b) => b.createdAt - a.createdAt)
           .map(runSummary);
         return json(res, 200, list);
+      }
+
+      case "upload": {
+        /**
+         * V-34 上传：文件一律落进**工作目录之内**，而且只落在白名单声明过的
+         * 那些目录里。上传是宿主侧的写入（用户自己在写，不是 agent），所以
+         * 不走审批门；但写入边界一步都不能放松——它和工具的圈禁根是同一条线。
+         */
+        let body: string;
+        try {
+          body = await readBody(req);
+        } catch {
+          return badRequest(res, "Failed to read request body");
+        }
+        let parsed: { name?: string; data?: string; workdir?: string };
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          return badRequest(res, "Invalid JSON body");
+        }
+        if (typeof parsed.name !== "string" || !parsed.name.trim()) {
+          return badRequest(res, 'Missing or invalid "name" field');
+        }
+        if (typeof parsed.data !== "string") {
+          return badRequest(res, 'Missing or invalid "data" field (base64)');
+        }
+
+        // 默认值也必须 resolve：allowedWorkdirs 存的是规范化后的绝对路径，
+        // 而 options.workdir 可能是 `D:/a/b` 这种正斜杠写法——不归一的话
+        // 默认路径会过不了自己的白名单（实测踩到，单测因为 mkdtemp 本来就
+        // 返回规范化路径而没抓到）
+        const target = resolve(parsed.workdir || workdir);
+        if (!allowedWorkdirs.includes(target)) {
+          return badRequest(res, `工作目录不在白名单内：${target}`);
+        }
+
+        // 文件名消毒：只留基名，剥掉一切分隔符与 `..`。
+        // 用户可控字符串直接拼路径是最经典的穿越面——这里不给它任何机会。
+        const safeName = basename(parsed.name).replace(/[\/:*?"<>|]/g, "_").replace(/^\.+/, "");
+        if (!safeName) return badRequest(res, "文件名无效");
+
+        let bytes: Buffer;
+        try {
+          bytes = Buffer.from(parsed.data, "base64");
+        } catch {
+          return badRequest(res, "data 不是合法的 base64");
+        }
+        if (bytes.length > UPLOAD_MAX_BYTES) {
+          return badRequest(
+            res,
+            `文件过大：${(bytes.length / 1_000_000).toFixed(1)}MB 超过 ${(UPLOAD_MAX_BYTES / 1_000_000).toFixed(0)}MB 上限`,
+          );
+        }
+
+        const dir = join(target, UPLOAD_SUBDIR);
+        const dest = join(dir, safeName);
+        // 双保险：消毒之后再验一次落点确实在目标目录内
+        if (!resolve(dest).startsWith(resolve(dir) + sep)) {
+          return badRequest(res, "文件名解析后逃出了上传目录");
+        }
+        try {
+          await mkdir(dir, { recursive: true });
+          await writeFile(dest, bytes);
+        } catch (err) {
+          return json(res, 500, { error: `写入失败：${err instanceof Error ? err.message : String(err)}` });
+        }
+
+        // 返回**相对工作目录**的路径——那正是 agent 的工具能直接用的形式
+        return json(res, 200, {
+          path: `${UPLOAD_SUBDIR}/${safeName}`,
+          absolutePath: dest,
+          bytes: bytes.length,
+        });
       }
 
       case "followUp": {

@@ -16,7 +16,9 @@
  *   l. 核查未通过: 末尾 verdict 合成事件 passed=false + issues 非空 + source="rework" 事件出现
  */
 import { afterEach, describe, expect, it } from "vitest";
-import { join, resolve } from "node:path";
+import { join, resolve, sep } from "node:path";
+import { tmpdir } from "node:os";
+import { mkdtemp, rm, readFile, readdir } from "node:fs/promises";
 import { createUiServer, type UiServerHandle } from "../ui/server.js";
 import {
   FakeModelClient,
@@ -1818,6 +1820,128 @@ describe("ui-server", () => {
       for (const k of ["MODEL", "PROVIDER", "BASE_URL", "API_KEY"]) {
         delete process.env[`AGENT_VISION_${k}`];
       }
+    }
+  });
+
+  // ---- V-34 附件上传 ----
+  it("v2-29. 上传落进工作目录下的 uploads/，返回相对路径", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "upload-"));
+    try {
+      handle = createUiServer({ modelClient: new FakeModelClient([]), tools: [], workdir: dir });
+      port = await startServer(handle);
+      base = baseUrl(port);
+
+      const res = await fetch(`${base}/api/upload`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: "shot.png", data: Buffer.from("hello").toString("base64") }),
+      });
+      expect(res.status).toBe(200);
+      const info = await res.json() as any;
+      // 返回相对路径——那正是 agent 的工具能直接用的形式
+      expect(info.path).toBe("uploads/shot.png");
+      expect(info.bytes).toBe(5);
+      expect(await readFile(join(dir, "uploads", "shot.png"), "utf8")).toBe("hello");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * 文件名是完全用户可控的字符串，直接拼路径是最经典的穿越面。
+   * 上传虽然是"用户自己在写"（不走审批门），但写入边界一步都不能放松——
+   * 它和工具的圈禁根是同一条线。
+   */
+  it("v2-30. 文件名穿越一律被消毒，写不出 uploads/ 之外", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "upload-"));
+    try {
+      handle = createUiServer({ modelClient: new FakeModelClient([]), tools: [], workdir: dir });
+      port = await startServer(handle);
+      base = baseUrl(port);
+      const put = (name: string) =>
+        fetch(`${baseUrl(port)}/api/upload`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name, data: Buffer.from("x").toString("base64") }),
+        });
+
+      for (const evil of ["../escaped.txt", "../../escaped.txt", "sub/dir/escaped.txt", "..\\escaped.txt"]) {
+        const r = await put(evil);
+        expect([200, 400], `${evil} 应被消毒或拒绝`).toContain(r.status);
+        if (r.status === 200) {
+          const info = await r.json() as any;
+          expect(info.path.startsWith("uploads/"), `${evil} 逃出了 uploads/`).toBe(true);
+          expect(info.path).not.toContain("..");
+          expect(resolve(info.absolutePath).startsWith(resolve(join(dir, "uploads")))).toBe(true);
+        }
+      }
+      // 工作目录里除 uploads/ 外不该多出任何东西
+      const top = await readdir(dir);
+      expect(top).toEqual(["uploads"]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("v2-31. 上传目标目录也受白名单约束", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "upload-"));
+    try {
+      handle = createUiServer({ modelClient: new FakeModelClient([]), tools: [], workdir: dir });
+      port = await startServer(handle);
+      const res = await fetch(`${baseUrl(port)}/api/upload`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: "a.txt", data: "eA==", workdir: tmpdir() }),
+      });
+      expect(res.status).toBe(400);
+      expect((await res.json() as any).error).toContain("白名单");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("v2-32. 超限与畸形输入给出可读拒绝", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "upload-"));
+    try {
+      handle = createUiServer({ modelClient: new FakeModelClient([]), tools: [], workdir: dir });
+      port = await startServer(handle);
+      const post = (body: unknown) =>
+        fetch(`${baseUrl(port)}/api/upload`, {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+        });
+
+      expect((await post({ data: "eA==" })).status).toBe(400);
+      expect((await post({ name: "a.txt" })).status).toBe(400);
+      const big = await post({ name: "big.bin", data: Buffer.alloc(21_000_000).toString("base64") });
+      expect(big.status).toBe(400);
+      expect((await big.json() as any).error).toContain("过大");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * 实测踩到的：allowedWorkdirs 存的是 resolve() 后的绝对路径，而 options.workdir
+   * 可能写成 `D:/a/b`（正斜杠）。不在源头归一的话，**默认工作目录会过不了
+   * 自己的白名单**。单测此前没抓到，是因为 mkdtemp 本来就返回规范化路径。
+   */
+  it("v2-33. 非规范写法的 workdir 在源头归一，默认路径不会自己拒绝自己", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "norm-"));
+    try {
+      // 故意用正斜杠 + 末尾斜杠的写法
+      const messy = dir.split(sep).join("/") + "/";
+      handle = createUiServer({ modelClient: new FakeModelClient([]), tools: [], workdir: messy });
+      port = await startServer(handle);
+      base = baseUrl(port);
+
+      const snap = await (await fetch(`${base}/api/harness`)).json() as any;
+      expect(snap.availableWorkdirs).toEqual([resolve(dir)]);
+
+      // 不传 workdir 的上传必须成功——这正是之前失败的那条路径
+      const res = await fetch(`${base}/api/upload`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: "a.txt", data: "eA==" }),
+      });
+      expect(res.status, await res.text()).toBe(200);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
     }
   });
 

@@ -39,6 +39,7 @@
     <button type="button" class="theme-toggle" id="theme-toggle" aria-label="切换配色主题">◐</button>
   </div>
   <div class="sidebar-search">
+    <button type="button" class="btn btn--primary new-chat-btn" id="new-chat-btn">＋ 新建对话</button>
     <label for="run-search" class="sr-only">搜索运行</label>
     <input type="search" id="run-search" class="run-search" placeholder="搜索任务描述…" autocomplete="off" />
   </div>
@@ -69,8 +70,11 @@
       <span>开启独立核查</span>
     </label>
     <button type="submit" class="btn btn--primary" id="submit-btn">运行任务</button>
+    <label class="btn btn--ghost upload-label" for="file-upload">＋ 附件</label>
+    <input type="file" id="file-upload" class="sr-only" multiple />
     <button type="button" class="btn btn--ghost" id="knobs-toggle" aria-expanded="false" aria-controls="run-knobs">装配 ▾</button>
     <p id="submit-error" class="inline-error" role="alert" hidden></p>
+    <ul id="upload-list" class="upload-list" hidden></ul>
 
     <!-- V-24：harness 的旋钮此前只能靠重启换环境变量。默认折叠，不打扰
          "填个任务就跑"的主路径 -->
@@ -219,6 +223,9 @@ const mainPanel = /** @type {HTMLElement} */ (document.getElementById("main-pane
 const runFilter = /** @type {HTMLSelectElement} */ (document.getElementById("run-filter"));
 const runSearch = /** @type {HTMLInputElement} */ (document.getElementById("run-search"));
 const statusAnnouncer = /** @type {HTMLElement} */ (document.getElementById("status-announcer"));
+const newChatBtn = /** @type {HTMLButtonElement} */ (document.getElementById("new-chat-btn"));
+const fileUpload = /** @type {HTMLInputElement} */ (document.getElementById("file-upload"));
+const uploadList = /** @type {HTMLElement} */ (document.getElementById("upload-list"));
 
 // ---- 响应式：窄屏视图状态 ----
 const NARROW_BP = 700;
@@ -868,6 +875,98 @@ if (knobsToggle && runKnobs) {
     runKnobs.hidden = !open;
     knobsToggle.setAttribute("aria-expanded", String(open));
     knobsToggle.textContent = open ? "装配 ▴" : "装配 ▾";
+  });
+}
+
+/**
+ * 新建对话（V-32）。
+ *
+ * 委托方报告 §10 点过"任务输入不区分创建新任务和追加指令"。现在两者已经靠
+ * 位置区分（顶栏 = 新建，对话底部 = 追加），这个按钮再把它显式化：
+ * 退出当前详情、清空输入、把焦点交给任务框。选哪个工作目录仍在装配面板里，
+ * 因为那是一次运行的护栏，不该藏在一个按钮的副作用里。
+ */
+if (newChatBtn) {
+  newChatBtn.addEventListener("click", () => {
+    selectedRunId = null;
+    writeHash(null, null);
+    refreshRunListView();
+    renderEmptyState(runs.length > 0);
+    sidebar.classList.remove("narrow-hidden");
+    mainPanel.classList.remove("narrow-full");
+    taskInput.value = "";
+    taskInput.focus();
+    announceStatus("已开始新对话，请输入任务描述");
+  });
+}
+
+/**
+ * 附件上传（V-34）。
+ *
+ * 文件落进工作目录下的 uploads/，服务端返回**相对工作目录的路径**——那正是
+ * agent 的工具能直接用的形式。上传完把路径追加进任务描述，模型才知道东西在
+ * 哪；否则文件躺在磁盘上而它无从得知。
+ *
+ * 配了视觉模型时，图片可以直接让 describe_image 去看；没配的话上传仍然有用
+ * （bash / read_file 处理文本与数据文件），只是看不了图。
+ */
+const uploaded = [];
+
+function renderUploads() {
+  if (!uploadList) return;
+  uploadList.hidden = uploaded.length === 0;
+  uploadList.innerHTML = uploaded
+    .map((u) => `<li><code>${escapeHtml(u.path)}</code> <span class="knob-hint">${(u.bytes / 1024).toFixed(0)} KB</span></li>`)
+    .join("");
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+}
+
+async function uploadFiles(files) {
+  showSubmitError(null);
+  for (const file of files) {
+    try {
+      const buf = await file.arrayBuffer();
+      // 大文件用 chunk 转 base64——一次性 apply 整个数组会爆调用栈
+      let binary = "";
+      const view = new Uint8Array(buf);
+      for (let i = 0; i < view.length; i += 0x8000) {
+        binary += String.fromCharCode(...view.subarray(i, i + 0x8000));
+      }
+      const res = await fetch("/api/upload", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: file.name,
+          data: btoa(binary),
+          ...(workdirSelect?.value ? { workdir: workdirSelect.value } : {}),
+        }),
+      });
+      if (!res.ok) {
+        const b = await res.json().catch(() => ({}));
+        showSubmitError(b.error ?? `上传失败（HTTP ${res.status}）`);
+        continue;
+      }
+      const info = await res.json();
+      uploaded.push(info);
+      // 把路径写进任务描述——模型只有看到路径才知道文件存在
+      const line = `附件：${info.path}`;
+      taskInput.value = taskInput.value ? `${taskInput.value}
+${line}` : line;
+    } catch (err) {
+      showSubmitError(`上传失败：${err.message ?? "未知错误"}`);
+    }
+  }
+  renderUploads();
+}
+
+if (fileUpload) {
+  fileUpload.addEventListener("change", () => {
+    if (fileUpload.files?.length) void uploadFiles([...fileUpload.files]);
+    fileUpload.value = "";
   });
 }
 

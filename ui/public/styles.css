@@ -485,6 +485,17 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
 
 .chat-thinking--redacted { color: var(--text-3); }
 
+/* --- 附件 --- */
+.upload-label { cursor: pointer; }
+
+.upload-list {
+  flex-basis: 100%;
+  margin: var(--space-sm) 0 0;
+  padding-left: var(--space-lg);
+  font-size: var(--font-sm);
+  color: var(--text-2);
+}
+
 /* --- 角色模型开关 --- */
 .role-toggles { display: flex; flex-direction: column; gap: var(--space-xs); }
 .role-toggles .checkbox-label { font-size: var(--font-md); }
@@ -630,8 +641,27 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
 
 /* --- 侧栏搜索 --- */
 .sidebar-search {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
   padding: var(--space-sm) var(--space-lg);
   border-bottom: 1px solid var(--border-1);
+}
+
+.new-chat-btn { width: 100%; }
+
+/* --- 侧栏分组（V-32）--- */
+.run-group + .run-group { margin-top: var(--space-sm); }
+
+.run-group-label {
+  padding: var(--space-xs) var(--space-lg);
+  font-size: var(--font-sm);
+  color: var(--text-3);
+  border-bottom: 1px solid var(--border-1);
+  position: sticky;
+  top: 0;
+  background: var(--surface-1);
+  z-index: 1;
 }
 
 .run-search {
@@ -1161,6 +1191,24 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
   font-size: var(--font-sm);
   color: var(--fg2);
 }
+
+/* --- 常驻上下文水位（V-33）--- */
+.ctx-gauge {
+  border: 1px solid var(--border-1);
+  border-radius: var(--radius-sm);
+  background: var(--surface-0);
+  color: var(--text-2);
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: var(--font-sm);
+  padding: 2px var(--space-sm);
+  letter-spacing: 1px;
+}
+
+.ctx-gauge:hover { background: var(--surface-2); color: var(--text-1); }
+.ctx-gauge--warn { color: var(--status-warn); border-color: var(--status-warn); }
+/* 已发生压缩 = 已经不可逆地丢过东西，与"快满了"不是一个语域 */
+.ctx-gauge--irreversible { color: var(--irreversible); border-color: var(--irreversible); }
 
 /* --- 需你决定：审批 + 待复核 --- */
 .action-rail {
