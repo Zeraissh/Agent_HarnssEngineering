@@ -485,6 +485,38 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
 
 .chat-thinking--redacted { color: var(--text-3); }
 
+/* --- 追加指令（V-28）--- */
+.followup {
+  margin-top: var(--space-lg);
+  padding-top: var(--space-md);
+  border-top: 1px dashed var(--border-2);
+}
+
+.followup-input {
+  width: 100%;
+  border: 1px solid var(--border-1);
+  border-radius: var(--radius-sm);
+  background: var(--surface-0);
+  color: var(--text-1);
+  font: inherit;
+  font-size: var(--font-lg);
+  padding: var(--space-sm);
+  resize: vertical;
+}
+
+.followup-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  margin-top: var(--space-sm);
+}
+
+.followup-blocked {
+  margin-top: var(--space-lg);
+  padding-top: var(--space-md);
+  border-top: 1px dashed var(--border-2);
+}
+
 /* --- 提交栏旋钮 --- */
 .btn--ghost {
   background: transparent;

@@ -741,3 +741,162 @@ describe("编排面板", () => {
     }
   });
 });
+
+// ================================================================
+// v2 R8：多轮对话 (V-28)
+// ================================================================
+
+describe("追加指令", () => {
+  function doneState() {
+    let s = createInitialState("run-mt", "记住暗号", false);
+    s = reduceEvent(s, { seq: 0, source: "main", event: { type: "turn_start", turn: 1 } });
+    s = reduceEvent(s, {
+      seq: 1, source: "main",
+      event: { type: "done", stopReason: "completed", usage: { turns: 1 } },
+    });
+    return s;
+  }
+
+  const transcript = {
+    segments: [{
+      index: 0, source: "main",
+      messages: [
+        { role: "user", content: "记住暗号 alpha-7" },
+        { role: "assistant", content: [{ type: "text", text: "记住了。" }] },
+      ],
+    }],
+  };
+
+  it("可续跑时给出输入框；不可续跑时说清为什么，而不是只是没有输入框", () => {
+    renderRunDetail(doneState(), {
+      activeTab: "loop", harness: FAKE_HARNESS, loopView: "chat", transcript, canContinue: true,
+    });
+    expect(document.querySelector(".followup-input")).toBeTruthy();
+    expect(document.querySelector(".followup-send")).toBeTruthy();
+    // 轮次预算每轮重新起算，不说清用户会以为 maxTurns 是整场对话的总额
+    expect(document.querySelector(".followup")!.textContent).toContain("每轮重新起算");
+
+    document.body.innerHTML = loadSkeleton();
+    renderRunDetail(doneState(), {
+      activeTab: "loop", harness: FAKE_HARNESS, loopView: "chat", transcript,
+      canContinue: false, followUpBlockedReason: "开启独立核查的运行不支持追加指令：追加会绕过已出具的裁决。",
+    });
+    expect(document.querySelector(".followup-input")).toBeNull();
+    expect(document.querySelector(".followup-blocked")!.textContent).toContain("绕过已出具的裁决");
+  });
+
+  it("点击发送把文本交给回调", () => {
+    const seen: string[] = [];
+    renderRunDetail(doneState(), {
+      activeTab: "loop", harness: FAKE_HARNESS, loopView: "chat", transcript,
+      canContinue: true, onFollowUp: (t: string) => seen.push(t),
+    });
+    const input = document.querySelector(".followup-input") as HTMLTextAreaElement;
+    input.value = "  暗号是什么？  ";
+    (document.querySelector(".followup-send") as HTMLElement).click();
+    expect(seen).toEqual(["暗号是什么？"]);
+  });
+
+  it("Ctrl+Enter 发送，单独 Enter 不发（多行指令是常态）", () => {
+    const seen: string[] = [];
+    renderRunDetail(doneState(), {
+      activeTab: "loop", harness: FAKE_HARNESS, loopView: "chat", transcript,
+      canContinue: true, onFollowUp: (t: string) => seen.push(t),
+    });
+    const input = document.querySelector(".followup-input") as HTMLTextAreaElement;
+    input.value = "继续";
+    input.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    expect(seen).toHaveLength(0);
+    input.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Enter", ctrlKey: true, bubbles: true }));
+    expect(seen).toEqual(["继续"]);
+  });
+
+  /**
+   * transcript 只在每一段结束时落盘。追加的那句话此刻只存在于事件流里，
+   * 不补上的话用户会看到自己刚发的消息凭空消失。
+   */
+  it("进行中的这一轮：追加的指令先从事件流补进对话，并说明尚未落盘", () => {
+    let s = doneState();
+    s = reduceEvent(s, {
+      seq: 2, source: "host",
+      event: { type: "user_message", turn: 2, text: "暗号是什么？", at: 1 },
+    });
+    expect(s.status, "user_message 应把 run 从终态拉回运行中").toBe("running");
+
+    renderRunDetail(s, { activeTab: "loop", harness: FAKE_HARNESS, loopView: "chat", transcript });
+    const chat = document.querySelector(".chat-view")!;
+    expect(chat.textContent).toContain("暗号是什么？");
+    expect(chat.textContent).toContain("本轮结束后落盘");
+    // 运行中不给输入框——两条指令并发进同一个会话会互相踩
+    expect(document.querySelector(".followup-input")).toBeNull();
+  });
+
+  it("追加失败的报错就地显示，不吞掉", () => {
+    renderRunDetail(doneState(), {
+      activeTab: "loop", harness: FAKE_HARNESS, loopView: "chat", transcript,
+      canContinue: true, followUpError: "运行进行中，请等它这一轮结束再追加指令",
+    });
+    expect(document.querySelector(".followup .inline-error")!.textContent).toContain("请等它这一轮结束");
+  });
+
+  it("追加输入框零 violations（两套主题）", async () => {
+    for (const theme of ["light", "dark"]) {
+      document.body.innerHTML = loadSkeleton();
+      document.documentElement.setAttribute("data-theme", theme);
+      renderRunDetail(doneState(), {
+        activeTab: "loop", harness: FAKE_HARNESS, loopView: "chat", transcript, canContinue: true,
+      });
+      const violations = await runAxe();
+      expect(violations, `${theme}: ${JSON.stringify(violations, null, 2)}`).toEqual([]);
+    }
+  });
+});
+
+describe("续跑返回累计正史时的去重 (V-28)", () => {
+  /**
+   * runContinuation 返回的是**累计**正史：第 2 轮那一段的 messages 包含
+   * 第 1 轮的全部消息。逐段全量渲染会把前面几轮重复画一遍——实测第一次
+   * 就撞上了（seg0 两条、seg1 四条，前两条完全相同）。
+   */
+  it("同源且构成前缀的后续段只渲染增量", () => {
+    const t1 = { role: "user", content: "记住暗号 alpha-7" };
+    const t2 = { role: "assistant", content: [{ type: "text", text: "记住了。" }] };
+    const t3 = { role: "user", content: "暗号是什么？" };
+    const t4 = { role: "assistant", content: [{ type: "text", text: "是 alpha-7。" }] };
+
+    const host = document.createElement("div");
+    host.innerHTML = renderConversation(
+      {
+        segments: [
+          { index: 0, source: "main", messages: [t1, t2] },
+          { index: 1, source: "main", messages: [t1, t2, t3, t4] },
+        ],
+      },
+      { lastSeq: 0, timeline: [] },
+    );
+    document.body.appendChild(host);
+
+    const all = host.textContent!;
+    expect(all.split("记住暗号 alpha-7").length - 1, "第一轮被重复渲染").toBe(1);
+    expect(all.split("记住了。").length - 1).toBe(1);
+    expect(all).toContain("暗号是什么？");
+    expect(all).toContain("是 alpha-7。");
+  });
+
+  it("不构成前缀的段（如 fresh 返工）照常整段渲染并加分界", () => {
+    const host = document.createElement("div");
+    host.innerHTML = renderConversation(
+      {
+        segments: [
+          { index: 0, source: "main", messages: [{ role: "user", content: "原任务" }] },
+          { index: 1, source: "rework", messages: [{ role: "user", content: "返工任务" }] },
+        ],
+      },
+      { lastSeq: 0, timeline: [] },
+    );
+    document.body.appendChild(host);
+    expect(host.textContent).toContain("原任务");
+    expect(host.textContent).toContain("返工任务");
+    expect(host.querySelectorAll(".segment-boundary").length).toBeGreaterThanOrEqual(2);
+  });
+});

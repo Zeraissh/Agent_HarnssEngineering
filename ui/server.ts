@@ -19,6 +19,7 @@ import {
 import { createModelClientFromEnv } from "../src/provider.js";
 import { getPack, selectPackTools, PACKS } from "../src/presets.js";
 import type { Plan, SubTask } from "../src/planner.js";
+import type Anthropic from "@anthropic-ai/sdk";
 import { bashTool, SHELL_DESC } from "../src/tools/bash.js";
 import { fetchUrlTool } from "../src/tools/fetch-url.js";
 import { readFileTool } from "../src/tools/read-file.js";
@@ -102,6 +103,16 @@ interface StoredRun {
   /** V-27：编排模式。plan = 走 runPlanned（planner 拆解 + 依赖调度 + 并行） */
   mode?: "single" | "plan";
   concurrency?: number | "auto";
+  /**
+   * V-28 多轮对话：会话正史与复用的 loop 实例。
+   *
+   * loop 留着而不是每轮新建，是为了让 ContextManager 的水位记忆延续——
+   * 新建实例的 lastInputTokens 归零，压缩判据会在续跑第一轮失准。
+   */
+  loop?: AgentLoop;
+  history?: Anthropic.MessageParam[];
+  /** 已进行的对话轮数（第 1 轮 = 建 run 时那次提交） */
+  conversationTurn: number;
 }
 
 /** 审批唯一键：同一 toolUseId 在返工轮再次出现时，靠 requestSeq 区分 */
@@ -262,6 +273,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       reworks: r.outcome?.reworks ?? null,
       pendingApprovals: r.pendingApprovals.size,
       verdict: r.outcome?.verifications.at(-1)?.verdict ?? null,
+      mode: r.mode ?? "single",
+      conversationTurn: r.conversationTurn,
+      // 能否追加：让界面据此决定要不要显示输入框，而不是点了才报错
+      canContinue:
+        r.status === "done" && !r.verify && r.mode !== "plan" && Boolean(r.loop && r.history?.length),
     };
   }
 
@@ -435,6 +451,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         messages: event.result.messages ?? [],
       });
       run.segmentIndex += 1;
+      // V-28：留下会话正史，下一轮 runContinuation 要接在它后面。
+      // 只认主线（main）——verifier 是全新上下文的独立复核，它的正史不属于对话
+      if (source === "main" && event.result.messages?.length) {
+        run.history = event.result.messages;
+      }
     }
 
     // 推送给在线 SSE 客户端
@@ -527,7 +548,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   async function startPlainRun(run: StoredRun): Promise<void> {
     pushRunConfig(run);
     const cfg = buildConfig(run);
+    // V-28：实例留给后续对话轮复用——重建的话 ContextManager 的 lastInputTokens
+    // 归零，续跑第一轮的压缩判据会失准
     const loop = new AgentLoop(cfg, modelClient);
+    run.loop = loop;
     let mainStopReason: string | undefined;
     try {
       for await (const event of loop.run(run.task)) {
@@ -547,6 +571,58 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       };
       mainStopReason = "error";
       pushEvent(run, "main", errorEvent);
+    } finally {
+      finalizeRun(run, {
+        outcome: mainStopReason === "error" ? "error" : "completed",
+        ...(mainStopReason ? { mainStopReason } : {}),
+      });
+    }
+  }
+
+  /**
+   * 追加一轮对话（V-28）。
+   *
+   * `AgentLoop.runContinuation` 早就存在——它是为返工的 inherit 模式建的，
+   * 文档字符串写着"在已有会话正史之上追加一条 user 反馈继续执行"。
+   * 也就是说多轮对话在 harness 层一直可行，只是 Web 宿主从没接。
+   *
+   * 轮次预算按 runContinuation 的既有语义**每轮重新起算**（不是累计），
+   * 这一点必须让界面说清楚，否则用户会误以为 maxTurns 是整场对话的总额。
+   */
+  async function startContinuation(run: StoredRun, feedback: string): Promise<void> {
+    const loop = run.loop;
+    const history = run.history;
+    if (!loop || !history) return;
+
+    run.status = "running";
+    delete run.finishedAt;
+    run.conversationTurn += 1;
+
+    // 追加的这句话本身要进事件流：它是会话的一部分，也是"这一段为什么开始"的解释
+    pushSyntheticEvent(run, "host", {
+      type: "user_message",
+      turn: run.conversationTurn,
+      text: feedback,
+      at: Date.now(),
+    });
+    broadcastLifecycle("run_updated", run);
+
+    let mainStopReason: string | undefined;
+    try {
+      for await (const event of loop.runContinuation(history, feedback)) {
+        if (event.type === "done") mainStopReason = event.result.stopReason;
+        pushEvent(run, "main", event);
+      }
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      mainStopReason = "error";
+      pushSyntheticEvent(run, "main", {
+        type: "done",
+        stopReason: "error",
+        error: { name: "Error", message: errorMsg },
+        messageCount: 0,
+        usage: { inputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputTokens: 0, turns: 0, cacheHitRatio: 0 },
+      });
     } finally {
       finalizeRun(run, {
         outcome: mainStopReason === "error" ? "error" : "completed",
@@ -903,6 +979,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     | { type: "runsList" }
     | { type: "lifecycleStream" }
     | { type: "transcript"; runId: string }
+    | { type: "followUp"; runId: string }
     | { type: "createRun" }
     | { type: "events"; runId: string }
     | { type: "approval"; runId: string; toolUseId: string }
@@ -931,6 +1008,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     const transcriptMatch = method === "GET" && url.match(/^\/api\/runs\/([^/]+)\/transcript$/);
     if (transcriptMatch) {
       return { type: "transcript", runId: transcriptMatch[1]! };
+    }
+
+    const followUpMatch = method === "POST" && url.match(/^\/api\/runs\/([^/]+)\/messages$/);
+    if (followUpMatch) {
+      return { type: "followUp", runId: followUpMatch[1]! };
     }
 
     if (method === "POST" && url === "/api/runs") {
@@ -979,6 +1061,52 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           .sort((a, b) => b.createdAt - a.createdAt)
           .map(runSummary);
         return json(res, 200, list);
+      }
+
+      case "followUp": {
+        const run = runs.get(route.runId);
+        if (!run) return notFound(res, `Run not found: ${route.runId}`);
+
+        // 边界要说清，不能含糊地失败：
+        //  · 运行中不接受追加——两条指令并发进同一个会话会互相踩
+        //  · 核查/编排模式没有续跑入口（runVerified / runPlanned 都从头开始），
+        //    这是本轮明确不做的部分，不是 bug，界面要照实说
+        if (run.status === "running") {
+          return json(res, 409, { error: "运行进行中，请等它这一轮结束再追加指令" });
+        }
+        if (run.mode === "plan") {
+          return json(res, 409, {
+            error: "计划编排的运行不支持追加指令：runPlanned 每次都从拆解开始，没有续跑入口",
+          });
+        }
+        if (run.verify) {
+          return json(res, 409, {
+            error: "开启独立核查的运行不支持追加指令：runVerified 无续跑入口，追加会绕过已出具的裁决",
+          });
+        }
+        if (!run.loop || !run.history?.length) {
+          return json(res, 409, { error: "该运行没有可续跑的会话正史（可能是执行阶段就失败了）" });
+        }
+
+        let body: string;
+        try {
+          body = await readBody(req);
+        } catch {
+          return badRequest(res, "Failed to read request body");
+        }
+        let parsed: { text?: string };
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          return badRequest(res, "Invalid JSON body");
+        }
+        if (!parsed.text || typeof parsed.text !== "string" || !parsed.text.trim()) {
+          return badRequest(res, 'Missing or invalid "text" field');
+        }
+
+        // startContinuation 在第一个 await 之前就把轮数加过了，这里不能再 +1
+        void startContinuation(run, parsed.text.trim());
+        return json(res, 200, { runId: run.id, conversationTurn: run.conversationTurn });
       }
 
       case "transcript": {
@@ -1075,6 +1203,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           sseClients: new Set(),
           segmentIndex: 0,
           transcript: [],
+          conversationTurn: 1,
           ...(parsed.pack ? { packName: parsed.pack } : {}),
           ...(parsed.effort ? { effort: parsed.effort as Effort } : {}),
           ...(parsed.rubric ? { rubric: parsed.rubric } : {}),

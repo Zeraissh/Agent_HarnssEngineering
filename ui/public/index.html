@@ -174,6 +174,9 @@ let currentQuery = "";
 const loopViews = new Map();
 /** @type {Map<string, any>} */
 const transcripts = new Map();
+/** V-28：追加指令的报错，逐 run 独立 */
+/** @type {Map<string, string>} */
+const followUpErrors = new Map();
 
 // ---- DOM 引用 ----
 const submitForm = /** @type {HTMLFormElement} */ (document.getElementById("submit-form"));
@@ -397,6 +400,8 @@ function renderDetailWithState(state) {
     loopView: loopViews.get(runId) ?? "events",
     transcript: transcripts.get(runId) ?? null,
     onSwitchView: (view) => switchLoopView(runId, view),
+    ...followUpAffordance(runId),
+    onFollowUp: (text) => postFollowUp(runId, text),
   });
 }
 
@@ -428,6 +433,63 @@ function refreshTranscriptIfWatching(runId) {
   if (loopViews.get(runId) !== "chat") return;
   transcripts.delete(runId);
   void loadTranscript(runId);
+}
+
+/**
+ * 能否追加指令，以及不能的话为什么（V-28）。
+ *
+ * 服务端在列表里算好了 canContinue——界面据此决定要不要显示输入框，
+ * 而不是让用户点了才吃一个 409。不能追加时把原因写出来，别只是没有输入框。
+ */
+function followUpAffordance(runId) {
+  const info = runs.find((r) => r.runId === runId);
+  const state = runStates.get(runId);
+  if (!info) return { canContinue: false };
+  if (info.canContinue) return { canContinue: true, followUpError: followUpErrors.get(runId) ?? null };
+
+  let reason = null;
+  if (state?.status === "running") reason = "运行进行中，等这一轮结束后可以追加指令。";
+  else if (info.mode === "plan") reason = "计划编排的运行不支持追加指令：runPlanned 每次都从拆解开始，没有续跑入口。";
+  else if (info.verify) reason = "开启独立核查的运行不支持追加指令：追加会绕过已出具的裁决。";
+  else reason = "该运行没有可续跑的会话正史（可能是执行阶段就失败了）。";
+  return { canContinue: false, followUpBlockedReason: reason };
+}
+
+async function postFollowUp(runId, text) {
+  followUpErrors.delete(runId);
+  try {
+    const res = await fetch(`/api/runs/${runId}/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+    if (!res.ok) {
+      let detail = `HTTP ${res.status}`;
+      try {
+        const b = await res.json();
+        if (b?.error) detail = b.error;
+      } catch { /* 非 JSON 响应体，保留状态码 */ }
+      followUpErrors.set(runId, detail);
+      const st = runStates.get(runId);
+      if (st) renderDetailWithState(st);
+      return;
+    }
+    // run 从终态回到运行中：本地先置位再重订阅。事件流里的 user_message 会
+    // 把状态坐实，reduceEvents 的 seq 闸门保证重放不产生重复条目
+    const st = runStates.get(runId);
+    if (st) runStates.set(runId, { ...st, status: "running", runEnd: null });
+    const info = runs.find((r) => r.runId === runId);
+    if (info) info.status = "running";
+    transcripts.delete(runId);
+    refreshRunListView();
+    ensureSubscription(runId);
+    const cur = runStates.get(runId);
+    if (cur) renderDetailWithState(cur);
+  } catch (err) {
+    followUpErrors.set(runId, `追加失败：${err.message ?? "网络错误"}`);
+    const st = runStates.get(runId);
+    if (st) renderDetailWithState(st);
+  }
 }
 
 // ---- 宿主真相快照（Tools/Context/Loop 面的数据源）----
@@ -474,6 +536,8 @@ const batcher = createBatcher((batches) => {
         eventSources.delete(runId);
         announceStatus(`运行已完成：${next.task}`);
         refreshTranscriptIfWatching(runId);
+        // canContinue 由服务端算，run 收尾后要拉一次列表才知道能不能追加
+        void loadRuns();
       }
     }
   }

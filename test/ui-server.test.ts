@@ -1574,6 +1574,104 @@ describe("ui-server", () => {
     expect((await post({ task: "t", mode: "plan", concurrency: "many" })).status).toBe(400);
   });
 
+  // ---- V-28 多轮对话 ----
+  it("v2-20. 追加指令续跑同一会话：正史被带上，且第二轮能看到第一轮说过的话", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([textBlock("第一轮：我记住了暗号 alpha-7")], "end_turn"),
+      fakeMessage([textBlock("第二轮：暗号是 alpha-7")], "end_turn"),
+    ]);
+    handle = createUiServer({ modelClient: model, tools: [autoTool("noop")], workdir: process.cwd() });
+    port = await startServer(handle);
+    base = baseUrl(port);
+
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "记住暗号 alpha-7", verify: false }),
+    })).json() as { runId: string };
+    await waitForDone(base, runId);
+
+    // 列表应报出"可以追加"——界面据此决定显示输入框，而不是点了才吃 409
+    const list1 = await (await fetch(`${base}/api/runs`)).json() as any[];
+    expect(list1.find((r) => r.runId === runId).canContinue).toBe(true);
+    expect(list1.find((r) => r.runId === runId).conversationTurn).toBe(1);
+
+    const res = await fetch(`${base}/api/runs/${runId}/messages`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "暗号是什么？" }),
+    });
+    expect(res.status).toBe(200);
+    await waitForDone(base, runId);
+
+    // 要害：第二次请求必须带着第一轮的正史，否则"多轮"只是两次独立单轮
+    const secondReq = model.requests.at(-1)!;
+    const flat = JSON.stringify(secondReq.messages);
+    expect(flat, "第二轮没带上第一轮的正史").toContain("alpha-7");
+    expect(flat).toContain("暗号是什么？");
+
+    const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+    const um = events.find((e: any) => e.event.type === "user_message") as any;
+    expect(um, "追加的指令必须自己进事件流").toBeDefined();
+    expect(um.event.text).toBe("暗号是什么？");
+    expect(um.event.turn).toBe(2);
+
+    const t = await (await fetch(`${base}/api/runs/${runId}/transcript`)).json() as any;
+    expect(t.segments.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("v2-21. 追加的边界一律显式 409，并说清为什么", async () => {
+    // ① 核查模式：runVerified 无续跑入口，追加会绕过已出具的裁决
+    handle = createUiServer({
+      modelClient: new FakeModelClient([
+        fakeMessage([textBlock("done")], "end_turn"),
+        fakeMessage([textBlock(JSON.stringify({ passed: true, issues: [], summary: "ok" }))], "end_turn"),
+      ]),
+      tools: [autoTool("noop")], workdir: process.cwd(),
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "带核查", verify: true }),
+    })).json() as { runId: string };
+    await waitForDone(base, runId);
+
+    const res = await fetch(`${base}/api/runs/${runId}/messages`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "再改一点" }),
+    });
+    expect(res.status).toBe(409);
+    expect((await res.json() as any).error).toContain("裁决");
+
+    const list = await (await fetch(`${base}/api/runs`)).json() as any[];
+    expect(list.find((r) => r.runId === runId).canContinue).toBe(false);
+  });
+
+  it("v2-22. 空文本 400、未知 run 404", async () => {
+    handle = createUiServer({
+      modelClient: new FakeModelClient([fakeMessage([textBlock("ok")], "end_turn")]),
+      tools: [autoTool("noop")], workdir: process.cwd(),
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "t", verify: false }),
+    })).json() as { runId: string };
+    await waitForDone(base, runId);
+
+    const empty = await fetch(`${base}/api/runs/${runId}/messages`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "   " }),
+    });
+    expect(empty.status).toBe(400);
+
+    const missing = await fetch(`${base}/api/runs/nope/messages`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "x" }),
+    });
+    expect(missing.status).toBe(404);
+  });
+
   // ---- V-10 全局生命周期流（取代 3 秒轮询）----
   it("v2-12. /api/stream 先发快照，再推 run_created / run_finished", async () => {
     handle = createUiServer({

@@ -145,6 +145,8 @@ export function createInitialState(runId, task, verify) {
     plan: null,
     planResult: null,
     planWarnings: [],
+    /** V-28：已进行的对话轮数（第 1 轮 = 建 run 时那次提交） */
+    conversationTurn: 1,
   };
 }
 
@@ -232,6 +234,19 @@ export function reduceEvent(state, sseEvent) {
   }
   if (type === "approval_expired") {
     return applyApprovalExpired(state, event);
+  }
+  if (type === "user_message") {
+    // 追加的这句话既是会话内容，也标志 run 从终态回到运行中——
+    // 状态由事件本身驱动，客户端不必另写一套特判
+    return {
+      ...state,
+      status: "running",
+      runEnd: null,
+      stopReason: null,
+      error: null,
+      conversationTurn: Number(event.turn ?? state.conversationTurn + 1),
+      timeline: [...state.timeline, { seq, source, type: "user_message", text: String(event.text ?? ""), turn: Number(event.turn ?? 0) }],
+    };
   }
   if (type === "plan") {
     return {
@@ -2249,10 +2264,55 @@ function patchLoopView(parts, container, state, logEntries, callbacks) {
     return;
   }
 
-  const sig = signature([callbacks.transcript ? callbacks.transcript.segments.length : -1, state.lastSeq]);
+  const canContinue = Boolean(callbacks.canContinue) && state.status !== "running";
+  const sig = signature([
+    callbacks.transcript ? callbacks.transcript.segments.length : -1,
+    state.lastSeq, canContinue, callbacks.followUpError ?? "",
+  ]);
   if (parts.sig.chat === sig) return;
   parts.sig.chat = sig;
-  chatHost.innerHTML = renderConversation(callbacks.transcript, state);
+
+  chatHost.innerHTML =
+    renderConversation(callbacks.transcript, state) +
+    renderFollowUpComposer(canContinue, callbacks);
+
+  const input = chatHost.querySelector(".followup-input");
+  const send = chatHost.querySelector(".followup-send");
+  if (input && send) {
+    const submit = () => {
+      const text = input.value.trim();
+      if (text) callbacks.onFollowUp?.(text);
+    };
+    send.addEventListener("click", submit);
+    // Ctrl/Cmd+Enter 发送——单独 Enter 留给换行，多行指令是常态
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        submit();
+      }
+    });
+  }
+}
+
+/** @returns {string} */
+function renderFollowUpComposer(canContinue, callbacks) {
+  if (!canContinue) {
+    const why = callbacks.followUpBlockedReason;
+    return why ? `<p class="empty-note followup-blocked">${esc(why)}</p>` : "";
+  }
+  const err = callbacks.followUpError
+    ? `<p class="inline-error" role="alert">${esc(callbacks.followUpError)}</p>`
+    : "";
+  return (
+    '<div class="followup">' +
+    '<label class="sr-only" for="followup-input">追加指令</label>' +
+    '<textarea id="followup-input" class="followup-input" rows="2" placeholder="追加一条指令，接着这次会话继续…"></textarea>' +
+    '<div class="followup-actions">' +
+    '<button type="button" class="btn btn--primary followup-send">继续对话</button>' +
+    // 轮次预算每轮重新起算，不说清楚用户会以为 maxTurns 是整场对话的总额
+    '<span class="knob-hint">Ctrl+Enter 发送 · 轮次预算每轮重新起算</span>' +
+    "</div>" + err + "</div>"
+  );
 }
 
 /**
@@ -2277,14 +2337,36 @@ export function renderConversation(transcript, state) {
   }
 
   let html = "";
+  let prev = null;
   for (const seg of segments) {
     const role = segmentRole(seg.source);
-    if (segments.length > 1) {
+    const msgs = seg.messages ?? [];
+
+    // 续跑返回的是**累计**正史：第 2 轮那一段包含第 1 轮的全部消息。
+    // 直接逐段全量渲染会把前面几轮重复画一遍。同源且构成前缀时只渲染增量。
+    let start = 0;
+    if (prev && prev.source === seg.source && isPrefix(prev.messages ?? [], msgs)) {
+      start = (prev.messages ?? []).length;
+    }
+    if (segments.length > 1 && start === 0) {
       html += renderSegmentBoundary({ role, round: seg.index, source: seg.source });
     }
-    for (const msg of seg.messages ?? []) {
+    for (const msg of msgs.slice(start)) {
       html += renderChatMessage(msg);
     }
+    prev = seg;
+  }
+
+  // V-28：正在进行的这一轮还没落盘（transcript 只在段结束时写），
+  // 但追加的指令已经在事件流里——不补上的话，用户会看到自己刚发的话凭空消失
+  const pendingTurns = (state?.timeline ?? []).filter(
+    (e) => e.type === "user_message" && !JSON.stringify(segments).includes(e.text),
+  );
+  for (const t of pendingTurns) {
+    html += renderChatMessage({ role: "user", content: t.text });
+  }
+  if (state?.status === "running" && pendingTurns.length > 0) {
+    html += '<p class="empty-note">这一轮进行中，完整会话在本轮结束后落盘。</p>';
   }
   return html || '<p class="empty-note">会话为空。</p>';
 }
@@ -2364,6 +2446,15 @@ function renderChatMessage(msg) {
 function firstLine(text, max) {
   const line = String(text ?? "").split(/\r?\n/).find((l) => l.trim()) ?? "";
   return truncate(line.trim(), max);
+}
+
+/** a 是否为 b 的前缀（逐条深比对——消息里含内容块数组，浅比会漏判） */
+function isPrefix(a, b) {
+  if (a.length === 0 || a.length > b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (JSON.stringify(a[i]) !== JSON.stringify(b[i])) return false;
+  }
+  return true;
 }
 
 /** tool_result 的 content 可能是字符串，也可能是内容块数组 */
@@ -2645,6 +2736,7 @@ function entryIcon(type, isError) {
     // CLI 对压缩也用 ⚠，这里刻意分开：V-19 要求不可逆自成语域，
     // 与普通警告共用符号会让人对它脱敏
     case "compaction": return "⊟";
+    case "user_message": return "✎";
     default: return "·";
   }
 }
@@ -2662,6 +2754,7 @@ function entryActionLabel(e) {
     case "api_retry": return `API 重试（第${e.attempt ?? "?"}次）`;
     case "compaction": return "上下文压缩";
     case "usage": return "本轮用量";
+    case "user_message": return `追加指令（第 ${e.turn ?? "?"} 轮对话）`;
     default: return e.type;
   }
 }
@@ -2679,6 +2772,8 @@ function entryDetail(e) {
       return truncate(formatInput(e.input), 60);
     case "api_retry":
       return e.reason ?? "";
+    case "user_message":
+      return truncate(e.text ?? "", 80);
     default:
       return "";
   }
