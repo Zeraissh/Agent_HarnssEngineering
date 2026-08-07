@@ -145,6 +145,11 @@ export function createInitialState(runId, task, verify) {
     plan: null,
     planResult: null,
     planWarnings: [],
+    /**
+     * 计划确认门（backlog §5.1）。null = 本 run 没开门。
+     * status: pending 等签字 | approved | rejected | expired（run 收尾时未应答）
+     */
+    planApproval: null,
     /** V-28：已进行的对话轮数（第 1 轮 = 建 run 时那次提交） */
     conversationTurn: 1,
   };
@@ -189,6 +194,19 @@ export function classifyStopReason(stopReason) {
       };
     case "refusal":
       return { tone: "bad", label: "模型拒答", hint: "模型拒绝继续，需要改写任务描述" };
+    case "plan_rejected":
+      // 不是失败，是决定——所以 warn 不是 bad，文案也不说"终止/异常"
+      return {
+        tone: "warn",
+        label: "计划未获批准",
+        hint: "计划确认门被否决，一个子任务都没有发射——没有任何副作用",
+      };
+    case "plan_gate_expired":
+      return {
+        tone: "warn",
+        label: "计划门未应答",
+        hint: "运行收尾时确认门仍在等待，未执行任何子任务",
+      };
     case "error":
       return { tone: "bad", label: "异常终止", hint: "宿主级失败，核查不会运行" };
     case null:
@@ -225,7 +243,7 @@ export function reduceEvent(state, sseEvent) {
     return applyVerdict(state, event);
   }
   if (type === "done") {
-    return applySegmentDone(state, event);
+    return applySegmentDone(state, event, source);
   }
   if (type === "run_end") {
     return applyRunEnd(state, event);
@@ -260,7 +278,32 @@ export function reduceEvent(state, sseEvent) {
         concurrencyMode: String(event.concurrencyMode ?? "fixed"),
         plannerMs: Number(event.plannerMs ?? 0),
         subtasks: Array.isArray(event.subtasks) ? event.subtasks : [],
+        // 门开着时这份计划还在等签字，界面不能显得像已经在跑
+        gated: Boolean(event.gated),
       },
+    };
+  }
+  // ---- 计划确认门（§5.1）。三条事件都是 durable 合成事件，重连重放即复原 ----
+  if (type === "plan_approval_request") {
+    return { ...state, planApproval: { status: "pending", seq, at: Number(event.at ?? 0) } };
+  }
+  if (type === "plan_approval_resolved") {
+    return {
+      ...state,
+      planApproval: {
+        status: event.decision === "approve" ? "approved" : "rejected",
+        seq: Number(event.requestSeq ?? seq),
+        at: Number(event.at ?? 0),
+        actor: String(event.actor ?? "user"),
+      },
+    };
+  }
+  if (type === "plan_approval_expired") {
+    // 只有仍在 pending 时才转过期：已签过的决策是审计记录，不能被覆盖
+    if (state.planApproval && state.planApproval.status !== "pending") return state;
+    return {
+      ...state,
+      planApproval: { status: "expired", seq: Number(event.requestSeq ?? seq), at: 0 },
     };
   }
   if (type === "plan_result") {
@@ -596,7 +639,7 @@ function applyVerdict(state, event) {
  *
  * @returns {RunState}
  */
-function applySegmentDone(state, event) {
+function applySegmentDone(state, event, source = "main") {
   const usage = event.usage && typeof event.usage === "object" ? /** @type {any} */ (event.usage) : null;
   const stopReason = /** @type {string} */ (event.stopReason);
   const errorMessage =
@@ -619,8 +662,20 @@ function applySegmentDone(state, event) {
       : state.usage,
   };
 
-  // 单段运行的快路径：非核查模式下不会再有后续段，done 即终止
-  if (!state.verify) {
+  /**
+   * 单段运行的快路径：非核查模式下不会再有后续段，done 即终止。
+   *
+   * **必须限定 source === "main"**（真机实测抓到的缺陷）：编排模式下 planner
+   * 自己那一轮也发 `done(completed)`，各子任务发 `sN/main` 的 done。不限定来源，
+   * 客户端会在 planner 一结束就判定整个 run 结束——控制器随即 `es.close()`，
+   * 之后的 plan / plan_result / 子任务进度 / run_end 全部收不到，界面停在
+   * "已完成"并把 planner 的 JSON 当成执行者报告展示。
+   *
+   * 这就是 V-01 那条「段终止 ≠ run 终止」，当时在事件层修过（`done` 只记段，
+   * run 级收敛由 `run_end` 宣告），reducer 侧这个快路径漏掉了同一条。
+   * 触发条件是 mode=plan 且未勾核查——而那正是选了"计划编排"后的默认组合。
+   */
+  if (!state.verify && source === "main") {
     return { ...next, status: "done", pendingApprovals: expireAll(next.pendingApprovals) };
   }
   return next;
@@ -819,6 +874,10 @@ export function derivePlanFace(state) {
     plannerRaw: result?.plannerRaw ?? null,
     warnings: state.planWarnings,
     skipped: result?.skipped ?? [],
+    // 计划确认门的审计记录（§5.1）。挂起态归 ActionRail（那是"需你现在决定"
+    // 的地方）；已决/过期归这里——它是这份计划的历史，不是待办事项。
+    // 两处不重复展示同一条，口径同 V-16。
+    gate: state.planApproval ?? null,
   };
 }
 
@@ -1022,10 +1081,15 @@ export function deriveVerificationFace(state, harness) {
 export function deriveActionState(state) {
   const pending = state.pendingApprovals.filter((a) => a.status === "pending");
   const unverified = state.verdict ? state.verdict.unverified : [];
+  // 计划确认门（§5.1）：签字位也是"需你决定"，而且是最靠前的那一件——
+  // 它挂起时一个子任务都还没发射，此刻的决定成本最低
+  const planPending = state.planApproval?.status === "pending";
   return {
     pendingApprovals: pending,
     unverifiedItems: unverified,
-    needsAttention: pending.length > 0 || unverified.length > 0,
+    planApproval: state.planApproval ?? null,
+    awaitingPlan: planPending,
+    needsAttention: planPending || pending.length > 0 || unverified.length > 0,
   };
 }
 
@@ -1451,6 +1515,7 @@ export function renderRunDetail(state, callbacks) {
   const parts = ensureDetailSkeleton(mainEl, state, callbacks);
 
   patchDetailHeader(parts, state, isRunning, faces);
+  patchPlanGate(parts, state, faces, callbacks);
   patchApprovalRail(parts, state, isRunning, callbacks);
   patchUnverifiedRail(parts, faces);
   patchLiveStrip(parts, state, isRunning, callbacks.liveText ?? "");
@@ -1499,6 +1564,8 @@ function ensureDetailSkeleton(mainEl, state, callbacks) {
     '<span class="detail-hint" hidden></span>' +
     "</div></div>" +
     '<div class="action-rail" hidden>' +
+    // 签字位排在审批卡之前：它挂起时一个子任务都还没发射，此刻决定成本最低
+    '<div class="plan-gate" hidden></div>' +
     '<div class="approval-cards" hidden></div>' +
     '<div class="unverified-rail" hidden></div>' +
     "</div>" +
@@ -1523,6 +1590,7 @@ function ensureDetailSkeleton(mainEl, state, callbacks) {
     ctxGauge: mainEl.querySelector(".ctx-gauge"),
     hint: mainEl.querySelector(".detail-hint"),
     actionRail: mainEl.querySelector(".action-rail"),
+    planGate: mainEl.querySelector(".plan-gate"),
     approvals: mainEl.querySelector(".approval-cards"),
     unverified: mainEl.querySelector(".unverified-rail"),
     liveStrip: mainEl.querySelector(".live-strip"),
@@ -1619,6 +1687,52 @@ function patchContextGauge(parts, ctx) {
  * 只在这里出现一次。V-16：此前概览的"裁决卡"与"需介入事项"把同一批列了两遍，
  * 用户以为有两组待办。裁决卡里的那份现在是下钻详情，不是第二份清单。
  */
+/**
+ * 计划确认门（§5.1）——"一人公司"路线里的签字位。
+ *
+ * 挂起时计划已经产出、但一个子任务都还没发射，所以否决是零副作用的。
+ * 决策做出后不隐藏，转成只读的审计记录留在原地——与审批卡同款口径（V-02）：
+ * "我到底批没批、什么时候批的"必须刷新后还看得见。
+ */
+function patchPlanGate(parts, state, faces, callbacks) {
+  const gate = faces.action.planApproval;
+  if (!gate) {
+    setAttr(parts.planGate, "hidden", "");
+    parts.sig.planGate = null;
+    parts.planGate.innerHTML = "";
+    return;
+  }
+  // 已决/过期不留在 rail 上——那是"需你现在决定"的位置。审计记录归 Plan 面。
+  if (gate.status !== "pending") {
+    setAttr(parts.planGate, "hidden", "");
+    parts.sig.planGate = null;
+    parts.planGate.innerHTML = "";
+    return;
+  }
+
+  const count = state.plan?.subtasks?.length ?? 0;
+  const sig = signature(["pending", count]);
+  if (parts.sig.planGate === sig) return;
+  parts.sig.planGate = sig;
+  setAttr(parts.planGate, "hidden", null);
+
+  parts.planGate.innerHTML =
+    '<div class="plan-gate-card">' +
+    '<h3 class="rail-title">◈ 计划待你签字</h3>' +
+    `<p class="plan-gate-body">planner 已拆出 <strong>${count}</strong> 个子任务（详见 Plan 面）。` +
+    "批准后才会发射第一个子任务；此刻否决没有任何副作用。</p>" +
+    '<div class="plan-gate-actions">' +
+    '<button class="btn btn--allow" data-action="approve">批准并开跑</button>' +
+    '<button class="btn btn--deny" data-action="reject">否决（中止本次运行）</button>' +
+    "</div></div>";
+  parts.planGate
+    .querySelector("[data-action='approve']")
+    .addEventListener("click", () => callbacks.onPlanDecision?.("approve"));
+  parts.planGate
+    .querySelector("[data-action='reject']")
+    .addEventListener("click", () => callbacks.onPlanDecision?.("reject"));
+}
+
 function patchUnverifiedRail(parts, faces) {
   const items = faces.action.unverifiedItems;
   const sig = signature([items.length, items.join("|")]);
@@ -2309,11 +2423,31 @@ function patchPlanBoard(parts, host, plan) {
     plan.nodes.map((n) => `${n.id}:${n.status}:${n.durationMs ?? ""}`).join(","),
     plan.timing ? JSON.stringify(plan.timing) : "",
     plan.warnings.length,
+    plan.gate ? `${plan.gate.status}:${plan.gate.at}` : "",
   ]);
   if (parts.sig.plan === sig) return;
   parts.sig.plan = sig;
 
   let html = '<h3 class="overview-section-title">编排计划</h3>';
+
+  // 签字位的审计记录（§5.1）：谁在什么时候批的，刷新后仍在
+  if (plan.gate && plan.gate.status !== "pending") {
+    const g = plan.gate;
+    const tone = g.status === "approved" ? "ok" : "warn";
+    const label =
+      g.status === "approved"
+        ? "✓ 计划已批准"
+        : g.status === "rejected"
+          ? "✗ 计划被否决"
+          : "⋯ 计划门未应答";
+    const detail =
+      g.status === "expired"
+        ? "运行收尾时确认门仍在等待，未执行任何子任务。"
+        : g.status === "rejected"
+          ? `由委托方否决${g.at ? ` · ${new Date(g.at).toLocaleString()}` : ""}——一个子任务都没有发射。`
+          : `由委托方批准${g.at ? ` · ${new Date(g.at).toLocaleString()}` : ""}`;
+    html += `<div class="callout callout--${tone}"><strong>${esc(label)}</strong><p>${esc(detail)}</p></div>`;
+  }
 
   if (plan.planned === false) {
     // fail-closed：planner 产不出可解析计划时一个子任务都不执行。

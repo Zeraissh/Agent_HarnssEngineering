@@ -63,8 +63,12 @@ interface ResolvedApproval {
 
 /** run 级终止信息，由 startPlainRun/startVerifiedRun 算出后交给 finalizeRun */
 interface RunEndInfo {
-  /** closed = 宿主关停导致的终止（run 本身没跑完），与 run 自己跑完区分开 */
-  outcome: "completed" | "error" | "closed";
+  /**
+   * closed = 宿主关停导致的终止（run 本身没跑完），与 run 自己跑完区分开；
+   * rejected = 计划确认门被否决——**不是 error**：那是委托方的决定，不是失败。
+   * 混进 error 会让界面说谎（V-04 的教训：stopReason 不能压值域）。
+   */
+  outcome: "completed" | "error" | "closed" | "rejected";
   mainStopReason?: string;
 }
 
@@ -119,6 +123,37 @@ interface StoredRun {
   /** V-30：本次运行是否启用已配置的独立角色模型 */
   useVerifierModel?: boolean;
   usePlannerModel?: boolean;
+  /**
+   * 计划确认门（backlog §5.1）：planner 出计划后阻塞，等委托方批准才开跑。
+   *
+   * **默认关**，逐 run 显式开。不默认开的理由是宿主也被脚本化驱动（eval、
+   * 契约测试、无人值守跑批）——默认阻塞会把那些场景全部挂死，而"挂死等人"
+   * 正是 V-01 修掉的那类失效。
+   *
+   * 语义上这是 docs 里"一人公司"那条路线的签字位：人上移为定义任务、
+   * 定验收标准、担责，可程序化的执行交给 agent。`runPlanned` 的 onPlan
+   * 本来就是 await 的（orchestrate.ts），文档字符串写着"宿主可展示计划、
+   * 做人工把关"——harness 侧零改动，缺的一直只是宿主接这条线。
+   */
+  planGate?: boolean;
+  /** 计划门挂起态；同一 run 至多一次（计划只出一次，不像审批会跨返工轮复用） */
+  pendingPlan?: PendingPlan;
+  planDecision?: { decision: "approve" | "reject"; at: number };
+}
+
+interface PendingPlan {
+  requestSeq: number;
+  at: number;
+  /** 由 waitForPlanDecision 装填：应答或过期时结束等待 */
+  settle: (decision: "approve" | "reject" | "expired") => void;
+}
+
+/** 计划被否决的哨兵——不是错误，是决定，所以要与 error 路径区分开 */
+class PlanRejectedError extends Error {
+  constructor(readonly cause_: "rejected" | "expired") {
+    super(cause_ === "rejected" ? "计划被委托方否决" : "计划确认门未应答即结束");
+    this.name = "PlanRejectedError";
+  }
 }
 
 /** 审批唯一键：同一 toolUseId 在返工轮再次出现时，靠 requestSeq 区分 */
@@ -333,6 +368,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       finalPassed: r.outcome?.finalPassed ?? null,
       reworks: r.outcome?.reworks ?? null,
       pendingApprovals: r.pendingApprovals.size,
+      // V-14 口径：需要人介入的事项由服务端持有，不取决于该 run 有没有被订阅过。
+      // 计划门挂起时侧栏就该显示"需你决定"，而不是点进去才发现
+      planGate: Boolean(r.planGate),
+      awaitingPlanApproval: Boolean(r.pendingPlan),
+      planDecision: r.planDecision?.decision ?? null,
       verdict: r.outcome?.verifications.at(-1)?.verdict ?? null,
       mode: r.mode ?? "single",
       conversationTurn: r.conversationTurn,
@@ -459,6 +499,36 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     };
   }
 
+  /**
+   * 计划确认门：发出请求事件并挂起，直到委托方应答或 run 收尾。
+   *
+   * 挂起点选在 onPlan 里（orchestrate 的 `await opts.onPlan?.(plan)`），
+   * 所以此时**一个子任务都还没发射**——否决 = 零副作用地停下，这正是
+   * 签字位应有的位置。
+   *
+   * 与工具审批共用的硬性质（都是 V-01/V-02/V-05 的教训）：
+   *   · 决策必须进事件流，刷新/重连后仍能看到谁在什么时候批的；
+   *   · run 收尾时必须宣告过期并解除挂起，否则编排协程永远吊在这里。
+   */
+  function waitForPlanDecision(run: StoredRun): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const requestSeq = pushSyntheticEvent(run, "host", {
+        type: "plan_approval_request",
+        at: Date.now(),
+      });
+      run.pendingPlan = {
+        requestSeq,
+        at: Date.now(),
+        settle: (decision) => {
+          delete run.pendingPlan;
+          if (decision === "approve") resolve();
+          else reject(new PlanRejectedError(decision === "reject" ? "rejected" : "expired"));
+        },
+      };
+      broadcastLifecycle("run_updated", run);
+    });
+  }
+
   /** 向 run 的所有 SSE 客户端推送一条事件 */
   function broadcastSSE(run: StoredRun, data: string): void {
     for (const client of run.sseClients) {
@@ -563,6 +633,17 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       });
     }
     run.pendingApprovals.clear();
+
+    // 计划门同理：挂着不解除，编排协程会永远吊在 onPlan 里（V-01 那类失效）
+    if (run.pendingPlan) {
+      const pendingPlan = run.pendingPlan;
+      pushSyntheticEvent(run, "host", {
+        type: "plan_approval_expired",
+        requestSeq: pendingPlan.requestSeq,
+        cause: "run_finished",
+      });
+      pendingPlan.settle("expired");
+    }
 
     run.status = "done";
     run.finishedAt = Date.now();
@@ -732,7 +813,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         ...(plannerRole && usePlanner
           ? { plannerModel: { client: plannerRole.provider.client, compat: plannerRole.provider.compat } }
           : {}),
-        onPlan: (plan: Plan) => {
+        onPlan: async (plan: Plan) => {
           planReadyAt = Date.now();
           if (concurrency === "auto") {
             effectiveConcurrency = Math.min(AUTO_CONCURRENCY_CAP, planParallelWidth(plan.subtasks));
@@ -751,7 +832,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
               dependsOn: t.dependsOn,
               resources: t.resources ?? (t.pack ? getPack(t.pack)?.resources ?? [] : []),
             })),
+            /** 门开着时前端要知道"这份计划还在等签字"，而不是以为已经在跑了 */
+            gated: Boolean(run.planGate),
           });
+          // 签字位：计划已发出、一个子任务都还没发射，此时停下是零副作用的
+          if (run.planGate) await waitForPlanDecision(run);
         },
         resolveSubtask: (sub: SubTask) => {
           const sp = sub.pack ? getPack(sub.pack) : undefined;
@@ -823,17 +908,27 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       });
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
-      mainStopReason = "error";
+      // 计划被否决不是失败，是决定——单独一个终止原因，不混进 error。
+      // 混进去界面会显示"异常终止"，那是在对委托方自己的决定说谎（V-04）。
+      mainStopReason = err instanceof PlanRejectedError ? "plan_rejected" : "error";
       pushSyntheticEvent(run, "main", {
         type: "done",
-        stopReason: "error",
-        error: { name: "Error", message: errorMsg },
+        stopReason: mainStopReason,
+        ...(err instanceof PlanRejectedError
+          ? {}
+          : { error: { name: "Error", message: errorMsg } }),
+        ...(err instanceof PlanRejectedError ? { reason: errorMsg } : {}),
         messageCount: 0,
         usage: { inputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputTokens: 0, turns: 0, cacheHitRatio: 0 },
       });
     } finally {
       finalizeRun(run, {
-        outcome: mainStopReason === "error" ? "error" : "completed",
+        outcome:
+          mainStopReason === "error"
+            ? "error"
+            : mainStopReason === "plan_rejected"
+              ? "rejected"
+              : "completed",
         ...(mainStopReason ? { mainStopReason } : {}),
       });
     }
@@ -1087,6 +1182,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     | { type: "createRun" }
     | { type: "events"; runId: string }
     | { type: "approval"; runId: string; toolUseId: string }
+    | { type: "planApproval"; runId: string }
     | { type: "malformed" } {
     if (method === "GET" && (url === "/" || url === "/index.html")) {
       return { type: "static", filePath: "index.html" };
@@ -1130,6 +1226,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     const eventsMatch = method === "GET" && url.match(/^\/api\/runs\/([^/]+)\/events$/);
     if (eventsMatch) {
       return { type: "events", runId: eventsMatch[1]! };
+    }
+
+    const planApprovalMatch = method === "POST" && url.match(/^\/api\/runs\/([^/]+)\/plan-approval$/);
+    if (planApprovalMatch) {
+      return { type: "planApproval", runId: planApprovalMatch[1]! };
     }
 
     const approvalMatch = method === "POST" && url.match(/^\/api\/runs\/([^/]+)\/approvals\/([^/]+)$/);
@@ -1333,6 +1434,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           task?: string; verify?: boolean; pack?: string; effort?: string; rubric?: string;
           mode?: string; concurrency?: number | string;
           workdir?: string; useVerifierModel?: boolean; usePlannerModel?: boolean;
+          planGate?: boolean;
         };
         try {
           parsed = JSON.parse(body);
@@ -1357,6 +1459,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
         if (parsed.mode !== undefined && parsed.mode !== "single" && parsed.mode !== "plan") {
           return badRequest(res, `mode "${parsed.mode}" 无效。可选：single | plan`);
+        }
+        // 计划门只在编排模式下有意义（单跑没有计划这一步）。不静默忽略——
+        // 静默会让"我明明勾了确认门"与实际行为长期不一致（口径同 V-24）
+        if (parsed.planGate === true && parsed.mode !== "plan") {
+          return badRequest(res, "planGate 仅在 mode=plan 下有意义：单跑模式没有计划这一步");
         }
         let concurrency: number | "auto" | undefined;
         if (parsed.concurrency !== undefined && parsed.concurrency !== "") {
@@ -1408,6 +1515,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           ...(runWorkdir ? { workdir: runWorkdir } : {}),
           ...(parsed.useVerifierModel === false ? { useVerifierModel: false } : {}),
           ...(parsed.usePlannerModel === false ? { usePlannerModel: false } : {}),
+          ...(parsed.planGate === true ? { planGate: true } : {}),
         };
         runs.set(id, run);
         broadcastLifecycle("run_created", run);
@@ -1427,6 +1535,51 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         const run = runs.get(route.runId);
         if (!run) return notFound(res, `Run not found: ${route.runId}`);
         return serveSSE(req, res, run);
+      }
+
+      case "planApproval": {
+        const run = runs.get(route.runId);
+        if (!run) return notFound(res, `Run not found: ${route.runId}`);
+
+        // 幂等与状态门，口径同工具审批（R-01）：已决 / 已收尾一律 409，
+        // 不是静默成功——签字位上"我到底批没批"必须有确定答案
+        if (run.planDecision) {
+          return json(res, 409, { error: "Plan already decided" });
+        }
+        if (run.status === "done" || !run.pendingPlan) {
+          return json(res, 409, { error: "No plan awaiting approval for this run" });
+        }
+
+        let body: string;
+        try {
+          body = await readBody(req);
+        } catch {
+          return badRequest(res, "Failed to read request body");
+        }
+        let parsed: { decision?: string };
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          return badRequest(res, "Invalid JSON body");
+        }
+        if (parsed.decision !== "approve" && parsed.decision !== "reject") {
+          return badRequest(res, 'decision must be "approve" or "reject"');
+        }
+
+        const pendingPlan = run.pendingPlan;
+        const at = Date.now();
+        run.planDecision = { decision: parsed.decision, at };
+        // 决策进事件流：刷新/重连后仍能看到谁在什么时候签的（V-02 的口径）
+        pushSyntheticEvent(run, "host", {
+          type: "plan_approval_resolved",
+          requestSeq: pendingPlan.requestSeq,
+          decision: parsed.decision,
+          actor: "user",
+          at,
+        });
+        pendingPlan.settle(parsed.decision);
+        broadcastLifecycle("run_updated", run);
+        return json(res, 200, { acknowledged: true });
       }
 
       case "approval": {

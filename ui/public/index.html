@@ -131,6 +131,14 @@
         </select>
         <span class="knob-hint">并行买的是时间不是 token。cap=3 是收益曲线拐点。</span>
       </div>
+      <div class="knob">
+        <label id="plan-gate-label">计划确认门</label>
+        <label class="checkbox-label">
+          <input type="checkbox" id="plan-gate-toggle" disabled />
+          <span>计划产出后等我签字再开跑</span>
+        </label>
+        <span class="knob-hint">挂起点在第一个子任务发射之前——此时否决零副作用。仅编排模式可用。</span>
+      </div>
       <div class="knob knob--wide">
         <label for="rubric-input">主观评分表</label>
         <textarea id="rubric-input" rows="2" placeholder="逐条列出评分项，核查者按表评估进 advisory——不影响 passed，也不触发返工"></textarea>
@@ -215,6 +223,7 @@ const effortSelect = /** @type {HTMLSelectElement} */ (document.getElementById("
 const rubricInput = /** @type {HTMLTextAreaElement} */ (document.getElementById("rubric-input"));
 const modeSelect = /** @type {HTMLSelectElement} */ (document.getElementById("mode-select"));
 const concurrencySelect = /** @type {HTMLSelectElement} */ (document.getElementById("concurrency-select"));
+const planGateToggle = /** @type {HTMLInputElement} */ (document.getElementById("plan-gate-toggle"));
 const workdirSelect = /** @type {HTMLSelectElement} */ (document.getElementById("workdir-select"));
 const useVerifierModel = /** @type {HTMLInputElement} */ (document.getElementById("use-verifier-model"));
 const usePlannerModel = /** @type {HTMLInputElement} */ (document.getElementById("use-planner-model"));
@@ -427,6 +436,7 @@ function renderDetailWithState(state) {
     onToggleEntry: handleToggleEntry,
     harness: harnessSnapshot,
     liveText: liveTexts.get(runId) ?? "",
+    onPlanDecision: (decision) => postPlanDecision(runId, decision),
     loopView: loopViews.get(runId) ?? "events",
     transcript: transcripts.get(runId) ?? null,
     onSwitchView: (view) => switchLoopView(runId, view),
@@ -690,6 +700,26 @@ function setConnectionState(runId, next) {
  *   toolUseId，只有带请求序号才能指明是哪一轮的那张卡（V-03）。
  *   `#` 是 URL 片段分隔符，必须编码后再拼路径。
  */
+/**
+ * 计划确认门应答（§5.1）。与工具审批同款口径：409 静默（幂等），不做乐观更新
+ * ——服务端随后推 `plan_approval_resolved`，那条才是权威审计记录。
+ */
+async function postPlanDecision(runId, decision) {
+  try {
+    const res = await fetch(`/api/runs/${runId}/plan-approval`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision }),
+    });
+    if (res.status === 409) return; // 已决或已收尾——重复点击不该报错
+    if (!res.ok) {
+      showSubmitError(`计划门应答失败（HTTP ${res.status}）：${await res.text()}`);
+    }
+  } catch (err) {
+    showSubmitError(`计划门应答失败：${err && err.message ? err.message : err}`);
+  }
+}
+
 async function postApproval(runId, approvalId, decision, reason) {
   try {
     const res = await fetch(
@@ -744,7 +774,12 @@ submitForm.addEventListener("submit", async (e) => {
         ...(effortSelect?.value ? { effort: effortSelect.value } : {}),
         ...(rubricInput?.value.trim() ? { rubric: rubricInput.value.trim() } : {}),
         ...(modeSelect?.value === "plan"
-          ? { mode: "plan", ...(concurrencySelect?.value ? { concurrency: concurrencySelect.value } : {}) }
+          ? {
+              mode: "plan",
+              ...(concurrencySelect?.value ? { concurrency: concurrencySelect.value } : {}),
+              // 只在编排模式下带上：服务端对 single + planGate 会 400（不静默忽略）
+              ...(planGateToggle?.checked ? { planGate: true } : {}),
+            }
           : {}),
         ...(workdirSelect?.value ? { workdir: workdirSelect.value } : {}),
         // 只在显式关掉时才传：默认"配了就用"，与 CLI 口径一致
@@ -920,6 +955,12 @@ if (modeSelect && concurrencySelect) {
   modeSelect.addEventListener("change", () => {
     const isPlan = modeSelect.value === "plan";
     concurrencySelect.disabled = !isPlan;
+    if (planGateToggle) {
+      planGateToggle.disabled = !isPlan;
+      // 切回单任务时把勾去掉：留着一个"勾了但不生效"的复选框，就是
+      // 界面与实际行为不一致——这个项目为此单独立过一条纪律（V-24）
+      if (!isPlan) planGateToggle.checked = false;
+    }
     const hint = document.getElementById("mode-hint");
     if (hint) {
       hint.textContent = isPlan

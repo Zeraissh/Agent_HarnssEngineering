@@ -208,6 +208,37 @@ describe("axe 自动扫描：空态 / 列表 / 详情三种画面零 violations"
     const violations = await runAxe();
     expect(violations, JSON.stringify(violations, null, 2)).toEqual([]);
   });
+
+  // §5.1：签字位是新的可交互区域，且是**阻塞**的——用户不点它运行就不动。
+  // 键盘/读屏用不了它 = 整个运行卡死，比一般的可及性缺陷后果更重。
+  it("计划确认门挂起态零 violations（阻塞式交互，读屏用不了就等于卡死）", async () => {
+    let s = createInitialState("run-g", "跨领域任务", false);
+    let n = 0;
+    const push = (source: string, event: Record<string, unknown>) => {
+      s = reduceEvent(s, { seq: n++, source, event });
+    };
+    push("host", { type: "turn_start", turn: 1 });
+    push("host", {
+      type: "plan",
+      concurrency: 2,
+      concurrencyMode: "auto",
+      plannerMs: 120,
+      gated: true,
+      subtasks: [
+        { id: "s1", title: "写固件", description: "", acceptance: [], dependsOn: [] },
+        { id: "s2", title: "烧录验证", description: "", acceptance: [], dependsOn: ["s1"] },
+      ],
+    });
+    push("host", { type: "plan_approval_request", at: 1000 });
+
+    renderRunDetail(s, { activeTab: "loop", harness: FAKE_HARNESS });
+    // 先确认它真的渲染出来了——否则这条会变成"什么都没扫也算通过"的假绿
+    expect(document.querySelector(".plan-gate")?.hasAttribute("hidden")).toBe(false);
+    expect(document.querySelectorAll(".plan-gate button")).toHaveLength(2);
+
+    const violations = await runAxe();
+    expect(violations, JSON.stringify(violations, null, 2)).toEqual([]);
+  });
 });
 
 describe("运行列表的 ARIA 语义（真实 DOM 断言，取代原先的源码字符串扫描）", () => {

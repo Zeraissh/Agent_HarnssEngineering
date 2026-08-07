@@ -626,3 +626,126 @@ describe("编排模式下的分段与轮次口径", () => {
     expect(deriveLoopFace(s, HARNESS).turn).toBe(2);
   });
 });
+
+// ================================================================
+// 计划确认门（§5.1）
+// ================================================================
+
+describe("计划确认门", () => {
+  const planEvent = (gated: boolean) =>
+    ev("host", {
+      type: "plan",
+      concurrency: 2,
+      concurrencyMode: "auto",
+      plannerMs: 100,
+      gated,
+      subtasks: [
+        { id: "s1", title: "一", description: "", acceptance: [], dependsOn: [] },
+        { id: "s2", title: "二", description: "", acceptance: [], dependsOn: ["s1"] },
+      ],
+    });
+
+  it("挂起时进 ActionRail 的「需你决定」，且排在最前（此刻决定成本最低）", () => {
+    seq = 0;
+    const s = feed([planEvent(true), ev("host", { type: "plan_approval_request", at: 111 })]);
+    const action = deriveActionState(s);
+    expect(action.awaitingPlan).toBe(true);
+    expect(action.needsAttention).toBe(true);
+    expect(action.planApproval.status).toBe("pending");
+  });
+
+  it("没开门的 run 完全不产生这一项（默认关，不打扰主路径）", () => {
+    seq = 0;
+    const s = feed([planEvent(false)]);
+    expect(deriveActionState(s).planApproval).toBeNull();
+    expect(deriveActionState(s).awaitingPlan).toBe(false);
+    expect(derivePlanFace(s).gate).toBeNull();
+  });
+
+  it("已决后离开待办，转成 Plan 面的审计记录（同一条不在两处重复展示）", () => {
+    seq = 0;
+    const s = feed([
+      planEvent(true),
+      ev("host", { type: "plan_approval_request", at: 111 }),
+      ev("host", { type: "plan_approval_resolved", requestSeq: 1, decision: "approve", actor: "user", at: 222 }),
+    ]);
+    const action = deriveActionState(s);
+    expect(action.awaitingPlan).toBe(false);
+    expect(action.needsAttention).toBe(false);
+    const gate = derivePlanFace(s).gate;
+    expect(gate.status).toBe("approved");
+    expect(gate.at).toBe(222);
+    expect(gate.actor).toBe("user");
+  });
+
+  it("否决同样留下审计记录", () => {
+    seq = 0;
+    const s = feed([
+      planEvent(true),
+      ev("host", { type: "plan_approval_request", at: 1 }),
+      ev("host", { type: "plan_approval_resolved", requestSeq: 1, decision: "reject", actor: "user", at: 2 }),
+    ]);
+    expect(derivePlanFace(s).gate.status).toBe("rejected");
+  });
+
+  it("过期只能覆盖 pending——已签下的字是审计记录，不许被后到的过期事件抹掉", () => {
+    seq = 0;
+    const resolvedThenExpired = feed([
+      planEvent(true),
+      ev("host", { type: "plan_approval_request", at: 1 }),
+      ev("host", { type: "plan_approval_resolved", requestSeq: 1, decision: "approve", actor: "user", at: 2 }),
+      ev("host", { type: "plan_approval_expired", requestSeq: 1, cause: "run_finished" }),
+    ]);
+    expect(derivePlanFace(resolvedThenExpired).gate.status).toBe("approved");
+
+    seq = 0;
+    const neverAnswered = feed([
+      planEvent(true),
+      ev("host", { type: "plan_approval_request", at: 1 }),
+      ev("host", { type: "plan_approval_expired", requestSeq: 1, cause: "run_finished" }),
+    ]);
+    expect(derivePlanFace(neverAnswered).gate.status).toBe("expired");
+  });
+
+  it("plan 事件带 gated 标记——否则前端会以为计划已经在跑了", () => {
+    seq = 0;
+    expect(feed([planEvent(true)]).plan.gated).toBe(true);
+    expect(feed([planEvent(false)]).plan.gated).toBe(false);
+  });
+
+  /**
+   * 真机实测抓到的缺陷（先于计划门就存在）：编排模式下 planner 自己那一轮也发
+   * `done(completed)`。reducer 的"非核查模式 done 即终止"快路径不限定来源时，
+   * 客户端会在 planner 结束的那一刻判定整个 run 结束，控制器随即关掉 SSE——
+   * 之后的 plan / plan_result / 子任务进度 / run_end 全部收不到。
+   * 触发条件 mode=plan 且未勾核查，正是选"计划编排"后的默认组合。
+   */
+  it("planner 与子任务的 done 不终止整个 run——只有 main 段的 done 才是（V-01 同款）", () => {
+    seq = 0;
+    const afterPlanner = feed(
+      [
+        ev("planner", { type: "turn_start", turn: 1 }),
+        ev("planner", { type: "done", stopReason: "completed", messageCount: 2, usage: {} }),
+      ],
+      "编排任务",
+      false,
+    );
+    expect(afterPlanner.status).toBe("running");
+
+    seq = 0;
+    const afterSubtask = feed(
+      [ev("s1/main", { type: "done", stopReason: "completed", messageCount: 2, usage: {} })],
+      "编排任务",
+      false,
+    );
+    expect(afterSubtask.status).toBe("running");
+
+    seq = 0;
+    const afterMain = feed(
+      [ev("main", { type: "done", stopReason: "completed", messageCount: 2, usage: {} })],
+      "单跑任务",
+      false,
+    );
+    expect(afterMain.status).toBe("done"); // 单跑的快路径保持原样
+  });
+});

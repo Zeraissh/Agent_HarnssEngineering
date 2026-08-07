@@ -539,3 +539,86 @@ describe("直播条消费逐字增量", () => {
     expect(strip.hasAttribute("hidden")).toBe(true);
   });
 });
+
+// ================================================================
+// 计划确认门（§5.1）
+// ================================================================
+
+describe("计划确认门的签字位", () => {
+  const PLAN = {
+    type: "plan",
+    concurrency: 2,
+    concurrencyMode: "auto",
+    plannerMs: 100,
+    gated: true,
+    subtasks: [
+      { id: "s1", title: "一", description: "", acceptance: [], dependsOn: [] },
+      { id: "s2", title: "二", description: "", acceptance: [], dependsOn: ["s1"] },
+    ],
+  };
+
+  function gatedState(extra: any[] = []) {
+    let s = createInitialState("run-g", "编排任务", false);
+    return reduceEvents(s, [
+      sse(0, "host", "turn_start", { turn: 1 }),
+      { seq: 1, source: "host", event: PLAN },
+      sse(2, "host", "plan_approval_request", { at: 1000 }),
+      ...extra,
+    ]);
+  }
+
+  const rail = () => document.querySelector(".plan-gate") as HTMLElement;
+
+  it("挂起时渲染出可点的批准/否决，并说明此刻否决零副作用", () => {
+    renderRunDetail(gatedState(), { activeTab: "loop" });
+    expect(rail().hasAttribute("hidden")).toBe(false);
+    const text = rail().textContent ?? "";
+    expect(text).toContain("计划待你签字");
+    expect(text).toContain("2"); // 子任务数
+    expect(text).toContain("没有任何副作用");
+    expect(rail().querySelector("[data-action='approve']")).toBeTruthy();
+    expect(rail().querySelector("[data-action='reject']")).toBeTruthy();
+  });
+
+  it("点击真的把决定送出去（行为断言，不是「按钮在不在」）", () => {
+    const decisions: string[] = [];
+    renderRunDetail(gatedState(), {
+      activeTab: "loop",
+      onPlanDecision: (d: string) => decisions.push(d),
+    });
+    (rail().querySelector("[data-action='reject']") as HTMLElement).click();
+    expect(decisions).toEqual(["reject"]);
+    (rail().querySelector("[data-action='approve']") as HTMLElement).click();
+    expect(decisions).toEqual(["reject", "approve"]);
+  });
+
+  it("已决后从待办区消失——审计记录归 Plan 面，同一条不在两处重复", () => {
+    const s = gatedState([
+      sse(3, "host", "plan_approval_resolved", {
+        requestSeq: 2, decision: "approve", actor: "user", at: 1700000000000,
+      }),
+    ]);
+    renderRunDetail(s, { activeTab: "loop" });
+    expect(rail().hasAttribute("hidden")).toBe(true);
+    expect(rail().textContent).toBe("");
+  });
+
+  it("没开门的 run 不渲染签字位（默认关，不打扰主路径）", () => {
+    let s = createInitialState("run-p", "编排任务", false);
+    s = reduceEvents(s, [{ seq: 0, source: "host", event: { ...PLAN, gated: false } }]);
+    renderRunDetail(s, { activeTab: "loop" });
+    expect(rail().hasAttribute("hidden")).toBe(true);
+  });
+
+  it("否决收尾后页头说的是「计划未获批准」，不是「异常终止」", () => {
+    const s = gatedState([
+      sse(3, "host", "plan_approval_resolved", { requestSeq: 2, decision: "reject", actor: "user", at: 5 }),
+      sse(4, "main", "done", { stopReason: "plan_rejected", messageCount: 0, usage: {} }),
+      sse(5, "host", "run_end", { outcome: "rejected", mainStopReason: "plan_rejected" }),
+    ]);
+    renderRunDetail(s, { activeTab: "loop" });
+    const head = document.querySelector(".detail-head")?.textContent ?? document.body.textContent ?? "";
+    expect(head).toContain("计划未获批准");
+    expect(head).not.toContain("异常终止");
+  });
+});

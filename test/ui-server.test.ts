@@ -145,6 +145,54 @@ async function waitForEvent(
   return undefined;
 }
 
+/**
+ * 取一个**运行中** run 的已缓冲事件快照。
+ * readSSEAll 会一直读到流结束，对没跑完的 run 会挂到超时；这里读到静默即收。
+ */
+async function readSSESnapshot(
+  base: string,
+  runId: string,
+  quietMs = 250,
+): Promise<Record<string, unknown>[]> {
+  const res = await fetch(`${base}/api/runs/${runId}/events`);
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  const events: Record<string, unknown>[] = [];
+  let buffer = "";
+  let lastData = Date.now();
+  try {
+    while (Date.now() - lastData < quietMs) {
+      const chunk = await Promise.race([
+        reader.read(),
+        new Promise<{ value: undefined; done: false }>((r) =>
+          setTimeout(() => r({ value: undefined, done: false }), 50),
+        ),
+      ]);
+      if (chunk.value) {
+        buffer += decoder.decode(chunk.value, { stream: true });
+        lastData = Date.now();
+      }
+      let idx: number;
+      while ((idx = buffer.indexOf("\n\n")) !== -1) {
+        const block = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        const dataLines: string[] = [];
+        let eventName = "message";
+        for (const line of block.split("\n")) {
+          if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+          else if (line.startsWith("event:")) eventName = line.slice(6).trim();
+        }
+        if (dataLines.length === 0 || eventName !== "message") continue;
+        events.push(JSON.parse(dataLines.join("\n")));
+      }
+      if (chunk.done) break;
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+  return events;
+}
+
 /** 等待 run 变为 done */
 async function waitForDone(base: string, runId: string): Promise<void> {
   for (let i = 0; i < 50; i++) {
@@ -1575,6 +1623,202 @@ describe("ui-server", () => {
     expect((await post({ task: "t", mode: "turbo" })).status).toBe(400);
     expect((await post({ task: "t", mode: "plan", concurrency: 99 })).status).toBe(400);
     expect((await post({ task: "t", mode: "plan", concurrency: "many" })).status).toBe(400);
+    // planGate 只在编排模式下有意义——静默忽略会让界面与实际行为长期不一致
+    expect((await post({ task: "t", planGate: true })).status).toBe(400);
+    expect((await post({ task: "t", mode: "single", planGate: true })).status).toBe(400);
+  });
+
+  // ---- §5.1 计划确认门 ----
+
+  /** 两子任务计划 + 每个子任务「执行一发 + 合法裁决一发」的完整脚本 */
+  function gatedPlanScript() {
+    const planJson = JSON.stringify({
+      subtasks: [
+        { id: "s1", title: "第一步", description: "做 A", acceptance: ["A 完成"], dependsOn: [] },
+        { id: "s2", title: "第二步", description: "做 B", acceptance: ["B 完成"], dependsOn: ["s1"] },
+      ],
+    });
+    const pass = () =>
+      fakeMessage([textBlock(JSON.stringify({ passed: true, issues: [], summary: "通过" }))], "end_turn");
+    return [
+      fakeMessage([textBlock(["```json", planJson, "```"].join("\n"))], "end_turn"),
+      fakeMessage([textBlock("s1 完成")], "end_turn"), pass(),
+      fakeMessage([textBlock("s2 完成")], "end_turn"), pass(),
+    ];
+  }
+
+  async function startGatedRun() {
+    handle = createUiServer({
+      modelClient: new FakeModelClient(gatedPlanScript()),
+      tools: [autoTool("noop")],
+      workdir: process.cwd(),
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "需要签字的任务", mode: "plan", planGate: true }),
+    })).json() as { runId: string };
+    return runId;
+  }
+
+  /** 轮询直到计划门挂起（列表元数据由服务端持有，不必订阅 SSE——V-14 口径） */
+  async function waitForPlanGate(runId: string): Promise<void> {
+    for (let i = 0; i < 100; i++) {
+      const list = await (await fetch(`${base}/api/runs`)).json() as any[];
+      const r = list.find((x) => x.runId === runId);
+      if (r?.awaitingPlanApproval) return;
+      if (r?.status === "done") throw new Error("run 已收尾但从未挂起计划门");
+      await new Promise((r2) => setTimeout(r2, 20));
+    }
+    throw new Error("等待计划门超时");
+  }
+
+  it("v2-31. 计划门挂起时一个子任务都没发射；批准后照常跑完", async () => {
+    const runId = await startGatedRun();
+    await waitForPlanGate(runId);
+
+    // 关键断言：此刻计划已产出，但零副作用——来源里不该有任何子任务前缀
+    const midEvents = await readSSESnapshot(base, runId);
+    expect(midEvents.some((e: any) => e.event.type === "plan"), "计划应已发出").toBe(true);
+    expect(
+      midEvents.some((e: any) => String(e.source).includes("/")),
+      "签字前不得有任何子任务开跑",
+    ).toBe(false);
+    const req = midEvents.find((e: any) => e.event.type === "plan_approval_request");
+    expect(req, "未发出 plan_approval_request").toBeDefined();
+    // 门开着这件事要写进 plan 事件，否则前端会以为已经在跑了
+    expect((midEvents.find((e: any) => e.event.type === "plan") as any).event.gated).toBe(true);
+
+    const res = await fetch(`${base}/api/runs/${runId}/plan-approval`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: "approve" }),
+    });
+    expect(res.status).toBe(200);
+    await waitForDone(base, runId);
+
+    const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+    // 决策进事件流（V-02 口径）：刷新后仍看得到谁在什么时候批的
+    const resolved = events.find((e: any) => e.event.type === "plan_approval_resolved") as any;
+    expect(resolved.event.decision).toBe("approve");
+    expect(resolved.event.actor).toBe("user");
+    expect(typeof resolved.event.at).toBe("number");
+    // 批准之后子任务确实跑了
+    expect(events.some((e: any) => String(e.source).startsWith("s1/"))).toBe(true);
+    const result = events.find((e: any) => e.event.type === "plan_result") as any;
+    expect(result.event.steps.map((st: any) => st.id)).toEqual(["s1", "s2"]);
+  });
+
+  it("v2-32. 否决 = 零子任务执行，且终止原因是 plan_rejected 而不是 error", async () => {
+    const runId = await startGatedRun();
+    await waitForPlanGate(runId);
+
+    const res = await fetch(`${base}/api/runs/${runId}/plan-approval`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: "reject" }),
+    });
+    expect(res.status).toBe(200);
+    await waitForDone(base, runId);
+
+    const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+    expect(
+      events.some((e: any) => String(e.source).includes("/")),
+      "否决后不得有任何子任务执行",
+    ).toBe(false);
+
+    // 必须按 source 取：planner 自己那一轮也会发 done（stopReason=completed），
+    // 不限定来源会取到它，测试就变成在断言 planner 的终止原因
+    const done = events.find(
+      (e: any) => e.event.type === "done" && e.source === "main",
+    ) as any;
+    expect(done, "未发出 main 段的 done").toBeDefined();
+    // 否决是决定不是失败：混进 error 会让界面显示"异常终止"，那是对
+    // 委托方自己的决定说谎（V-04 的教训）
+    expect(done.event.stopReason).toBe("plan_rejected");
+    expect(done.event.error, "否决不该带 error 负载").toBeUndefined();
+
+    const end = events.find((e: any) => e.event.type === "run_end") as any;
+    expect(end.event.outcome).toBe("rejected");
+    expect(end.event.mainStopReason).toBe("plan_rejected");
+
+    const list = await (await fetch(`${base}/api/runs`)).json() as any[];
+    const summary = list.find((x) => x.runId === runId);
+    expect(summary.stopReason).toBe("plan_rejected");
+    expect(summary.planDecision).toBe("reject");
+    expect(summary.awaitingPlanApproval).toBe(false);
+  });
+
+  it("v2-33. 计划门幂等：二次应答 409，且不改已记录的决策", async () => {
+    const runId = await startGatedRun();
+    await waitForPlanGate(runId);
+
+    const post = (decision: string) =>
+      fetch(`${base}/api/runs/${runId}/plan-approval`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ decision }),
+      });
+
+    expect((await post("approve")).status).toBe(200);
+    // 抢答/重复点击不能翻转已经签下的字
+    expect((await post("reject")).status).toBe(409);
+    await waitForDone(base, runId);
+
+    const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+    const resolvedAll = events.filter((e: any) => e.event.type === "plan_approval_resolved");
+    expect(resolvedAll).toHaveLength(1);
+    expect((resolvedAll[0] as any).event.decision).toBe("approve");
+
+    expect((await post("approve")).status).toBe(409); // run 已收尾
+    expect((await fetch(`${base}/api/runs/${runId}/plan-approval`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: "maybe" }),
+    })).status).toBe(409);
+  });
+
+  it("v2-34. 宿主关停时计划门被宣告过期（挂着不解除，编排协程会永远吊在 onPlan）", async () => {
+    const runId = await startGatedRun();
+    await waitForPlanGate(runId);
+
+    // 关停前先把连接开着——过期与 run_end 是关停途中推的，事后再拉就没了
+    const res = await fetch(`${base}/api/runs/${runId}/events`);
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    const seen: Record<string, unknown>[] = [];
+    const drain = () => {
+      let idx: number;
+      while ((idx = buffer.indexOf("\n\n")) !== -1) {
+        const block = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        const data = block.split("\n").filter((l) => l.startsWith("data:"));
+        const name = block.split("\n").find((l) => l.startsWith("event:"));
+        if (data.length === 0 || name) continue;
+        seen.push(JSON.parse(data.map((l) => l.slice(5).trimStart()).join("\n")));
+      }
+    };
+    // 先把已缓冲的重放读掉，确认门确实挂着
+    const first = await reader.read();
+    if (first.value) buffer += decoder.decode(first.value, { stream: true });
+    drain();
+    expect(seen.some((e: any) => e.event.type === "plan_approval_request")).toBe(true);
+
+    await handle!.close();
+    handle = undefined; // afterEach 不要再关一次
+
+    // 读到流结束，收集关停途中推的事件
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (value) buffer += decoder.decode(value, { stream: true });
+      drain();
+      if (done) break;
+    }
+
+    const expired = seen.find((e: any) => e.event.type === "plan_approval_expired") as any;
+    expect(expired, "关停时未宣告计划门过期").toBeDefined();
+    expect(expired.event.cause).toBe("run_finished");
+    const end = seen.find((e: any) => e.event.type === "run_end") as any;
+    expect(end.event.outcome).toBe("closed");
   });
 
   // ---- V-28 多轮对话 ----
