@@ -30,6 +30,9 @@
  *                       仅原生 Claude 端点生效（compat 模式下该参数不发送）
  *   AGENT_VERIFY_RUBRIC 可选，主观评分表（任务级注入,优先于领域包的 verify.rubric）：
  *                       verifier 按表评估进裁决 advisory 字段,不影响 passed 不触发返工
+ *   AGENT_VERIFY_MAX_TURNS 可选，核查者轮次预算（env > 包 verify.maxTurns > 默认 15）。
+ *                       真机域每条验收要多次探针往返,15 装不下（案例 #8）;
+ *                       非法值退出码 1,不静默降级
  *   AGENT_READ_ROOTS    可选，额外只读根（分号/路径分隔符分隔的绝对路径）：
  *                       read_file 可读取这些目录（写类工具不受益）。用于工作区外的
  *                       领域素材库（如 KiCad 官方符号/封装库）
@@ -264,6 +267,23 @@ async function main(): Promise<void> {
 
   // 主观评分表：任务级 env 优先于领域包声明（rubric 是任务属性,包只提供缺省）
   const envRubric = process.env.AGENT_VERIFY_RUBRIC;
+  /**
+   * 核查轮次预算：env > 包 > 默认 15（口径同其它护栏）。
+   * 非法值当场退出而不是静默降级——静默会让"我明明调大了预算"与实际行为
+   * 长期不一致（口径同 AGENT_EFFORT）。
+   */
+  const envVerifyMaxTurns = (() => {
+    const raw = process.env.AGENT_VERIFY_MAX_TURNS;
+    if (raw === undefined || raw === "") return undefined;
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n < 1) {
+      console.error(c.red(`AGENT_VERIFY_MAX_TURNS "${raw}" 无效：需为 ≥1 的整数`));
+      process.exit(1);
+    }
+    return n;
+  })();
+  const verifyMaxTurnsOf = (p?: { verify: { maxTurns?: number } }): number | undefined =>
+    envVerifyMaxTurns ?? p?.verify.maxTurns;
 
   // 额外只读根：AGENT_READ_ROOTS（path.delimiter 分隔），read_file 专享
   const readRoots = (process.env.AGENT_READ_ROOTS ?? "")
@@ -460,6 +480,7 @@ async function main(): Promise<void> {
             ...(p?.verify.instructions ? { verifyInstructions: p.verify.instructions } : {}),
             ...(p?.verify.readOnlyCommands ? { verifyReadOnlyCommands: p.verify.readOnlyCommands } : {}),
             ...((envRubric ?? p?.verify.rubric) ? { verifyRubric: (envRubric ?? p?.verify.rubric)! } : {}),
+            ...(verifyMaxTurnsOf(p) !== undefined ? { verifyMaxTurns: verifyMaxTurnsOf(p)! } : {}),
             ...(verifierProvider
               ? { verifierModel: { client: verifierProvider.client, compat: verifierProvider.compat } }
               : {}),
@@ -528,6 +549,7 @@ async function main(): Promise<void> {
       ...(pack?.verify.instructions ? { verifyInstructions: pack.verify.instructions } : {}),
       ...(pack?.verify.readOnlyCommands ? { verifyReadOnlyCommands: pack.verify.readOnlyCommands } : {}),
       ...((envRubric ?? pack?.verify.rubric) ? { verifyRubric: (envRubric ?? pack?.verify.rubric)! } : {}),
+      ...(verifyMaxTurnsOf(pack) !== undefined ? { verifyMaxTurns: verifyMaxTurnsOf(pack)! } : {}),
       ...(verifierProvider
         ? { verifierModel: { client: verifierProvider.client, compat: verifierProvider.compat } }
         : {}),

@@ -325,6 +325,12 @@ export function reduceEvent(state, sseEvent) {
         effort: event.effort ?? null,
         effortApplies: Boolean(event.effortApplies),
         rubricSource: event.rubricSource ?? null,
+        // 核查预算逐 run 可不同（9.1：领域包用 verify.maxTurns 覆盖）。
+        // 这个分支是逐字段白名单投影——**新字段不在这里列出就会被静默丢弃**，
+        // 本轮已是第三次踩到（api_retry.backoffMs、这里）。加字段必查这三处：
+        // reduceEvent 的投影分支、派生函数、渲染分支。
+        verifierBudgetTurns: event.verifierBudgetTurns ?? null,
+        verifierBudgetSource: event.verifierBudgetSource ?? null,
         guardrails: event.guardrails ?? null,
         tools: Array.isArray(event.tools) ? event.tools : [],
       },
@@ -1063,7 +1069,10 @@ export function deriveVerificationFace(state, harness) {
     finalPassed: state.runEnd?.finalPassed ?? (v ? v.passed : null),
     whitelist,
     rubricSource: state.runConfig?.rubricSource ?? runPack?.verify?.rubricSource ?? null,
-    budgetTurns: harness?.verifierBudgetTurns ?? null,
+    // 逐 run 的 run_config 优先于进程级快照：编排下各子任务的包不同，
+    // 核查预算也不同（9.1），读进程级会显示另一个包的数
+    budgetTurns: state.runConfig?.verifierBudgetTurns ?? harness?.verifierBudgetTurns ?? null,
+    budgetSource: state.runConfig?.verifierBudgetSource ?? harness?.verifierBudgetSource ?? null,
     starvation: {
       noWhitelist: whitelist.length === 0 && verifierDenied,
       emptyRework,
@@ -3128,7 +3137,15 @@ function renderVerifyTab(state, face) {
   if (face) {
     html += '<h3 class="overview-section-title">核查者的边界</h3><dl class="boundary-list">';
     html += `<dt>只读白名单</dt><dd>${face.whitelist.length ? esc(face.whitelist.join("、")) : "（空——只能读文件，无法重跑门禁）"}</dd>`;
-    html += `<dt>核查预算</dt><dd>${face.budgetTurns ?? "—"} 轮（固定，与执行者的 maxTurns 解耦）</dd>`;
+    // 不再写"固定"：9.1 之后领域包可用 verify.maxTurns 覆盖，
+    // 而"这个数从哪来"决定了人要不要去改它
+    html += `<dt>核查预算</dt><dd>${face.budgetTurns ?? "—"} 轮${
+      face.budgetSource === "pack"
+        ? "（领域包声明）"
+        : face.budgetSource === "env"
+          ? "（AGENT_VERIFY_MAX_TURNS 覆盖）"
+          : "（默认；与执行者的 maxTurns 解耦）"
+    }</dd>`;
     html += `<dt>评分表来源</dt><dd>${face.rubricSource ? esc(face.rubricSource) : "（未注入——advisory 恒为空）"}</dd>`;
     html += "</dl>";
   }

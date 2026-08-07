@@ -53,6 +53,24 @@ export interface DomainPack {
      * 没有它 verifier 只能靠间接证据。只声明核查必需的最小集合。
      */
     readOnlyCommands?: string[];
+    /**
+     * 核查者的轮次预算（缺省 15，见 `src/verifier.ts`）。
+     *
+     * 为什么要按领域可覆盖（案例 #8 催生）：核查预算此前是写死的常量。当初把它
+     * 与执行者**解耦**（不再跟着执行者的 maxTurns 缩水）是对的，但**解耦还不够
+     * ——15 是按软件域定的数**。软件域核查一条验收往往一条命令就够
+     * （`npx vitest run` 一把拿到通过数）；真机域每条验收都要多次探针往返
+     * （连板 / self_check / load_symbols / 读多个变量 / 跑一段再读）。
+     *
+     * 案例 #8 实测：`stm32-debug` 的执行者有 40 轮护栏，核查者只有 15 轮，
+     * 两轮 verifier **都跑满 15 轮、都从未写出裁决**——最终消息是半截工具调用，
+     * 解析失败 → 重问找不到结论 → fail-closed。这是发现 6 的误伤形态②
+     * （核查预算耦合）在新领域复现。
+     *
+     * 加重情节：verifier 当时不是在空转，它读到 CRC=0 之后已经在 `debug_until`
+     * 到 CRC 代码附近追查真缺陷——**是预算把一次正当调查掐断在半路**。
+     */
+    maxTurns?: number;
   };
   /**
    * 独占资源标签（调度器互斥用）：声明本包子任务在飞期间独占的全局单件
@@ -247,6 +265,14 @@ export const PACKS: Record<string, DomainPack> = {
       enabled: true,
       mode: "programmatic",
       instructions: STM32_VERIFY_INSTRUCTIONS,
+      /**
+       * 真机核查的每条验收都要多次探针往返（连板 / self_check / load_symbols /
+       * 读多个变量 / 跑一段再读），缺省 15 轮装不下——案例 #8 实测两轮 verifier
+       * 都跑满 15 轮、都从未写出裁决，最终落到 fail-closed 兜底。
+       * 30 的依据：那次核查在第 15 轮时已经完成 5/6 条验收并在追查第 6 条，
+       * 约需一倍余量收口；执行者护栏是 40，核查者不应比它高。
+       */
+      maxTurns: 30,
     },
     resources: ["swd-probe"],
     guardrails: { maxTurns: 40 },

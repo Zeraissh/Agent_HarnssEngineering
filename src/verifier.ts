@@ -52,6 +52,14 @@ export interface VerifyOptions {
    * 不影响 passed——客观 side 条款照常按字面进 issues。
    */
   rubric?: string;
+  /**
+   * 核查轮次预算（缺省 `DEFAULT_VERIFIER_MAX_TURNS` = 15）。
+   *
+   * 与执行者的 maxTurns 解耦（REPS=5 复现批的教训），但**不是一个放之四海的常数**：
+   * 真机域每条验收都要多次探针往返，15 轮装不下（案例 #8 实测两轮 verifier
+   * 都跑满 15 轮且从未写出裁决）。领域包用 `verify.maxTurns` 声明自己需要多少。
+   */
+  maxTurns?: number;
 }
 
 export interface VerifyOutcome {
@@ -60,6 +68,12 @@ export interface VerifyOutcome {
   /** verifier 的原始最终输出（供审计） */
   raw: string;
 }
+
+/**
+ * 核查轮次预算的缺省值。与执行者解耦（不随其 maxTurns 缩水），
+ * 领域包可用 `verify.maxTurns` 按域覆盖——见 VerifyOptions.maxTurns。
+ */
+export const DEFAULT_VERIFIER_MAX_TURNS = 15;
 
 export async function runVerifier(
   cfg: AgentConfig,
@@ -70,10 +84,13 @@ export async function runVerifier(
 ): Promise<VerifyOutcome> {
   // 与父级同 system/tools（缓存前缀一致）。轮次预算与执行者解耦——REPS=5 复现批
   // 教训：执行者被压到 maxTurns=8 时 verifier 若跟着缩水，核查跑不完，最终消息是
-  // 半截引言 → fail-closed 噪声淹没实验信号。核查预算固定 15，不随执行者收紧。
-  const VERIFIER_MAX_TURNS = 15;
+  // 半截引言 → fail-closed 噪声淹没实验信号。
+  //
+  // 但解耦≠一个常数走天下（案例 #8）：15 是按软件域定的，真机域每条验收都要
+  // 多次探针往返，装不下。领域包可用 verify.maxTurns 声明自己需要多少。
+  const verifierMaxTurns = opts.maxTurns ?? DEFAULT_VERIFIER_MAX_TURNS;
   const first = await drainVerifierLoop(
-    new AgentLoop({ ...cfg, maxTurns: VERIFIER_MAX_TURNS }, model),
+    new AgentLoop({ ...cfg, maxTurns: verifierMaxTurns }, model),
     buildVerifierPrompt(opts),
     onEvent,
     opts.readOnlyCommands,

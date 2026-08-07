@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type Anthropic from "@anthropic-ai/sdk";
 import { runVerified } from "../src/orchestrate.js";
-import { parseVerdict, runVerifier } from "../src/verifier.js";
+import { DEFAULT_VERIFIER_MAX_TURNS, VERDICT_PARSE_FAIL, parseVerdict, runVerifier } from "../src/verifier.js";
+import { PACKS } from "../src/presets.js";
 import type { ModelClient, ModelRequest, ModelTurn } from "../src/types.js";
 import { FakeModelClient, fakeMessage, makeTool, textBlock, toolUseBlock } from "./helpers.js";
 
@@ -410,5 +411,96 @@ describe("rubric-verifier（三值裁决协议,案例 #6 催生）", () => {
     const v = outcome.verifications[0]!.verdict;
     expect(v.unverified).toEqual(["行数待复核"]);
     expect(v.advisory).toEqual(["提炼度 | 良 | 判法自陈"]);
+  });
+});
+
+// ================================================================
+// 核查预算按领域可覆盖（案例 #8 产出的 backlog 9.1）
+// ================================================================
+
+describe("核查轮次预算", () => {
+  /** 永远只调工具、从不收口的模型——用来数 verifier 到底被允许跑几轮 */
+  class NeverConcludes implements ModelClient {
+    calls = 0;
+    send(_req: ModelRequest): Promise<ModelTurn> {
+      this.calls += 1;
+      const m = fakeMessage([toolUseBlock(`tu_${this.calls}`, "probe", {})], "tool_use");
+      return Promise.resolve({ message: m, stopReason: m.stop_reason, usage: m.usage });
+    }
+  }
+
+  const probeCfg = { ...baseConfig, tools: [makeTool({ name: "probe" })] };
+
+  it("缺省 15 轮（与执行者解耦，不随其 maxTurns 缩水）", async () => {
+    const model = new NeverConcludes();
+    // 执行者被压到 2 轮也不该影响核查预算——REPS=5 复现批的教训
+    await runVerifier({ ...probeCfg, maxTurns: 2 }, model, { task: "t", executorReport: "r" });
+    expect(model.calls).toBe(DEFAULT_VERIFIER_MAX_TURNS);
+  });
+
+  it("opts.maxTurns 覆盖缺省——真机域每条验收要多次探针往返，15 装不下（案例 #8）", async () => {
+    const model = new NeverConcludes();
+    await runVerifier(probeCfg, model, { task: "t", executorReport: "r", maxTurns: 30 });
+    expect(model.calls).toBe(30);
+  });
+
+  it("stm32-debug 包声明了更大的核查预算，且不高于它自己的执行者护栏", () => {
+    const debugPack = PACKS["stm32-debug"]!;
+    expect(debugPack.verify.maxTurns).toBe(30);
+    // 核查者不该比执行者还能跑——那说明护栏的相对关系没想清楚
+    expect(debugPack.verify.maxTurns!).toBeLessThanOrEqual(debugPack.guardrails!.maxTurns!);
+    // 且必须真的比缺省大，否则这条声明没有意义
+    expect(debugPack.verify.maxTurns!).toBeGreaterThan(DEFAULT_VERIFIER_MAX_TURNS);
+  });
+
+  it("软件域的包不声明预算 → 仍走缺省（不是所有域都需要加码）", () => {
+    expect(PACKS["ts-coding"]!.verify.maxTurns).toBeUndefined();
+    expect(PACKS["python-coding"]!.verify.maxTurns).toBeUndefined();
+  });
+
+  it("runVerified 把 verifyMaxTurns 穿到 verifier（不只是字段传下去，是真的多跑了）", async () => {
+    /**
+     * 行为断言而非字段断言：让 verifier 直到第 24 轮才收口。
+     * 缺省 15 轮下它来不及写裁决 → 落 fail-closed；给到 30 轮就能通过。
+     * 这正是案例 #8 的形态——核查不是错了，是没来得及收口。
+     *
+     * 收口点要放到**重问也够不着**的地方：初稿设在第 18 轮，结果被重问机制
+     * （maxTurns 3）恰好救回，tight 臂反而通过了。那是重问在按设计工作，
+     * 不是预算够用——所以收口点必须 > 15 + 3。
+     */
+    function scriptedVerifier(concludeAtCall: number): ModelClient {
+      let n = 0;
+      return {
+        send(): Promise<ModelTurn> {
+          n += 1;
+          const m =
+            n === 1
+              ? fakeMessage([textBlock("执行完毕")], "end_turn") // 执行者那一轮
+              : n < concludeAtCall
+                ? fakeMessage([toolUseBlock(`tu_${n}`, "probe", {})], "tool_use")
+                : fakeMessage([textBlock('{"passed": true, "issues": [], "summary": "查完了"}')], "end_turn");
+          return Promise.resolve({ message: m, stopReason: m.stop_reason, usage: m.usage });
+        },
+      };
+    }
+
+    const CONCLUDE_AT = 25; // > 1(执行者) + 15(缺省核查) + 3(重问)
+    // 关掉返工：脚本模型是全局计数器，返工后已越过收口点，第二轮核查会立刻
+    // 通过——那验的是返工在起作用，不是预算够用。这里只比第一轮裁决。
+    const noRework = { maxReworks: 0 };
+
+    const tight = await runVerified(probeCfg, scriptedVerifier(CONCLUDE_AT), "任务", noRework);
+    expect(tight.finalPassed, "缺省 15 轮应当来不及收口").toBe(false);
+    // 撞满预算时最终消息是半截工具调用、文本为空 → 不触发重问（无可转写内容），
+    // 直接落解析失败那条 fail-closed。案例 #8 走的是另一条（verifier 产出过文本，
+    // 重问后仍无结论 → "核查未产出明确结论"）——两条都是没来得及收口的表型。
+    expect(tight.verifications[0]!.verdict.issues).toEqual([VERDICT_PARSE_FAIL]);
+
+    const roomy = await runVerified(probeCfg, scriptedVerifier(CONCLUDE_AT), "任务", {
+      ...noRework,
+      verifyMaxTurns: 30,
+    });
+    expect(roomy.finalPassed, "给到 30 轮就该拿到实质裁决").toBe(true);
+    expect(roomy.verifications[0]!.verdict.summary).toBe("查完了");
   });
 });

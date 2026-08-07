@@ -17,8 +17,9 @@ import {
   type VerifiedRunResult,
 } from "../src/orchestrate.js";
 import { createModelClientFromEnv, type ResolvedProvider } from "../src/provider.js";
-import { getPack, selectPackTools, PACKS } from "../src/presets.js";
+import { getPack, selectPackTools, PACKS, type DomainPack } from "../src/presets.js";
 import { connectMcpServers, loadMcpConfig, type McpRuntime } from "../src/mcp.js";
+import { DEFAULT_VERIFIER_MAX_TURNS } from "../src/verifier.js";
 import type { Plan, SubTask } from "../src/planner.js";
 import type Anthropic from "@anthropic-ai/sdk";
 import { bashTool, SHELL_DESC } from "../src/tools/bash.js";
@@ -535,6 +536,17 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    * 状态，bash 全被拒，只能靠间接证据核查，正是案例 #4 那个 22 轮空转的核查饥饿
    * 配置；rubric 失效则让 advisory 永远为空。
    */
+  /** 核查预算：env > 包 > 默认 15（口径同 src/cli.ts 与其它护栏） */
+  const envVerifyMaxTurns = process.env.AGENT_VERIFY_MAX_TURNS
+    ? Number(process.env.AGENT_VERIFY_MAX_TURNS)
+    : undefined;
+  const verifyMaxTurnsOf = (p?: DomainPack): number | undefined => {
+    if (envVerifyMaxTurns !== undefined && Number.isInteger(envVerifyMaxTurns) && envVerifyMaxTurns >= 1) {
+      return envVerifyMaxTurns;
+    }
+    return p?.verify.maxTurns;
+  };
+
   function buildVerifyOptions(run?: StoredRun) {
     const runPack = run?.packName ? getPack(run.packName) : pack;
     // rubric 是任务属性，包只提供缺省：逐 run > env > 包（口径同 src/cli.ts）
@@ -545,6 +557,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       ...(runPack?.verify.instructions ? { verifyInstructions: runPack.verify.instructions } : {}),
       ...(runPack?.verify.readOnlyCommands ? { verifyReadOnlyCommands: runPack.verify.readOnlyCommands } : {}),
       ...(runRubric ? { verifyRubric: runRubric } : {}),
+      ...(verifyMaxTurnsOf(runPack) !== undefined ? { verifyMaxTurns: verifyMaxTurnsOf(runPack)! } : {}),
       ...(verifierRole && useVerifier
         ? { verifierModel: { client: verifierRole.provider.client, compat: verifierRole.provider.compat } }
         : {}),
@@ -919,6 +932,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
               ...(sp?.verify.instructions ? { verifyInstructions: sp.verify.instructions } : {}),
               ...(sp?.verify.readOnlyCommands ? { verifyReadOnlyCommands: sp.verify.readOnlyCommands } : {}),
               ...(runRubric ? { verifyRubric: runRubric } : {}),
+              // 逐子任务按各自的包取核查预算：编排下 s1(coding) 与 s2(debug)
+              // 的核查工作量差一个量级，共用一个数就是案例 #8 那个失效
+              ...(verifyMaxTurnsOf(sp) !== undefined ? { verifyMaxTurns: verifyMaxTurnsOf(sp)! } : {}),
             },
             // 独占资源：调度器对同标签子任务强制串行。真机域的探针是全局单件
             ...(sub.resources ?? sp?.resources ? { resources: sub.resources ?? sp!.resources! } : {}),
@@ -1118,6 +1134,14 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       effort: run.effort ?? effort ?? null,
       effortApplies: Boolean(run.effort ?? effort) && !envCompat,
       rubricSource: run.rubric ? "run" : process.env.AGENT_VERIFY_RUBRIC ? "env" : runPack?.verify.rubric ? "pack" : null,
+      // 核查预算不再是常数（9.1）：逐 run 按各自的包取，并说明来源——
+      // 只报数字而不报来源，人就无法判断"这个值是不是我想要的那个"
+      verifierBudgetTurns: verifyMaxTurnsOf(runPack) ?? DEFAULT_VERIFIER_MAX_TURNS,
+      verifierBudgetSource: envVerifyMaxTurns !== undefined
+        ? "env"
+        : runPack?.verify.maxTurns !== undefined
+          ? "pack"
+          : "default",
       workdir: cfg.workdir,
       roleModels: {
         executor: process.env.AGENT_MODEL ?? "claude-opus-4-8",
@@ -1187,8 +1211,14 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           ? { model: visionRole.name, provider: visionRole.provider.provider, configured: true }
           : { configured: false },
       },
-      // 核查预算与执行者解耦，硬编码在 src/verifier.ts
-      verifierBudgetTurns: 15,
+      // 核查预算与执行者解耦，但**不是常数**（9.1）：领域包可用 verify.maxTurns
+      // 覆盖。这里报进程级默认包的值；逐 run 的真实值走 run_config
+      verifierBudgetTurns: verifyMaxTurnsOf(pack) ?? DEFAULT_VERIFIER_MAX_TURNS,
+      verifierBudgetSource: envVerifyMaxTurns !== undefined
+        ? "env"
+        : pack?.verify.maxTurns !== undefined
+          ? "pack"
+          : "default",
       pack: packView(pack),
       tools: tools.map((t) => ({
         name: t.name,

@@ -707,6 +707,33 @@ describe("计划确认门", () => {
     expect(derivePlanFace(neverAnswered).gate.status).toBe("expired");
   });
 
+  it("核查预算读逐 run 的 run_config，不读进程级快照（9.1）", () => {
+    /**
+     * 编排下各子任务的包不同、核查预算也不同（stm32-debug 30 vs 默认 15）。
+     * 读进程级 `/api/harness` 会显示另一个包的数——那正是 V-24 修过的形态
+     * （用户选了 ts-coding 却看到默认包的边界）。
+     */
+    seq = 0;
+    const processLevel = { ...HARNESS, verifierBudgetTurns: 15, verifierBudgetSource: "default" };
+    const s = feed([
+      ev("host", {
+        type: "run_config",
+        pack: { name: "stm32-debug" },
+        verifierBudgetTurns: 30,
+        verifierBudgetSource: "pack",
+      }),
+    ]);
+    const face = deriveVerificationFace(s, processLevel);
+    expect(face.budgetTurns).toBe(30);
+    expect(face.budgetSource).toBe("pack");
+
+    // 没有 run_config 时才回落到进程级快照
+    seq = 0;
+    const bare = deriveVerificationFace(feed([]), processLevel);
+    expect(bare.budgetTurns).toBe(15);
+    expect(bare.budgetSource).toBe("default");
+  });
+
   it("plan 事件带 gated 标记——否则前端会以为计划已经在跑了", () => {
     seq = 0;
     expect(feed([planEvent(true)]).plan.gated).toBe(true);

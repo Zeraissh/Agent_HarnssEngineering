@@ -33,6 +33,11 @@ export interface VerifiedRunOptions {
   /** 主观评分表（rubric 模式载体），见 VerifyOptions.rubric——意见进 advisory,不触发返工 */
   verifyRubric?: string;
   /**
+   * 核查者的轮次预算（缺省 15）。领域包用 `verify.maxTurns` 声明——
+   * 真机域每条验收要多次探针往返，15 轮装不下（案例 #8）。
+   */
+  verifyMaxTurns?: number;
+  /**
    * 独立的 verifier 模型（默认与执行者共用同一个 client）。
    * A/B 研究结论：verifier 必须 ≥ 执行者强度，否则假阴性返工是净负——
    * 这个口子就是为"弱执行者 + 强核查者"的正确形态开的。
@@ -161,6 +166,7 @@ async function runVerifierWithEvents(
       ...(opts.verifyInstructions ? { verifyInstructions: opts.verifyInstructions } : {}),
       ...(opts.verifyReadOnlyCommands ? { readOnlyCommands: opts.verifyReadOnlyCommands } : {}),
       ...(opts.verifyRubric ? { rubric: opts.verifyRubric } : {}),
+      ...(opts.verifyMaxTurns !== undefined ? { maxTurns: opts.verifyMaxTurns } : {}),
     },
     (event) => {
       if (event.type === "assistant_text" || event.type === "done") return;
@@ -204,7 +210,12 @@ export interface PlannedRunOptions {
     cfg: AgentConfig;
     verify?: Pick<
       VerifiedRunOptions,
-      "verifyInstructions" | "verifyReadOnlyCommands" | "verifierModel" | "reworkMode"
+      | "verifyInstructions"
+      | "verifyReadOnlyCommands"
+      | "verifyRubric"
+      | "verifyMaxTurns"
+      | "verifierModel"
+      | "reworkMode"
     >;
     /**
      * 独占资源标签（v1.1.1，领域包声明，如 ["swd-probe"]）：持有相同标签的
