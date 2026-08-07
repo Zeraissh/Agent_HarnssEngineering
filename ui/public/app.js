@@ -273,6 +273,8 @@ export function reduceEvent(state, sseEvent) {
       ...state,
       runConfig: {
         pack: event.pack ?? null,
+        workdir: event.workdir ?? null,
+        roleModels: event.roleModels ?? null,
         effort: event.effort ?? null,
         effortApplies: Boolean(event.effortApplies),
         rubricSource: event.rubricSource ?? null,
@@ -939,7 +941,9 @@ export function deriveToolsFace(state, harness) {
   return {
     pack: rc?.pack ?? harness?.pack ?? null,
     shell: harness?.shell ?? null,
-    workdir: harness?.workdir ?? null,
+    // 逐 run 可换工作目录，Tools 面必须报本 run 真正用的那个
+    workdir: rc?.workdir ?? harness?.workdir ?? null,
+    roleModels: rc?.roleModels ?? null,
     readRoots: harness?.readRoots ?? [],
     mcp: harness?.mcp ?? null,
     guardrails: rc?.guardrails ?? harness?.guardrails ?? null,
@@ -2029,6 +2033,13 @@ function renderToolsTab(tools) {
   }
   if (tools.shell) html += row("bash 运行时", tools.shell);
   if (tools.workdir) html += row("工作目录", tools.workdir);
+  if (tools.roleModels) {
+    // 报的是本 run 实际用了什么模型跑哪个角色——配了但这次没启用要看得出来
+    const rm = tools.roleModels;
+    html += row("执行者模型", rm.executor ?? "—");
+    html += row("核查者模型", rm.verifier ?? "（与执行者同一个）");
+    html += row("planner 模型", rm.planner ?? "（与执行者同一个）");
+  }
   html += row("额外只读根", tools.readRoots.length ? tools.readRoots.join("；") : "（无）");
   if (tools.guardrails) {
     const g = tools.guardrails;

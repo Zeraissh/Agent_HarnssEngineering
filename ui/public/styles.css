@@ -485,6 +485,10 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
 
 .chat-thinking--redacted { color: var(--text-3); }
 
+/* --- 角色模型开关 --- */
+.role-toggles { display: flex; flex-direction: column; gap: var(--space-xs); }
+.role-toggles .checkbox-label { font-size: var(--font-md); }
+
 /* --- 追加指令（V-28）--- */
 .followup {
   margin-top: var(--space-lg);

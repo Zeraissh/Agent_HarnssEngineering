@@ -5,7 +5,7 @@
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
 import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { join, extname, dirname, delimiter } from "node:path";
+import { join, extname, dirname, delimiter, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { AgentLoop } from "../src/loop.js";
@@ -16,7 +16,7 @@ import {
   AUTO_CONCURRENCY_CAP,
   type VerifiedRunResult,
 } from "../src/orchestrate.js";
-import { createModelClientFromEnv } from "../src/provider.js";
+import { createModelClientFromEnv, type ResolvedProvider } from "../src/provider.js";
 import { getPack, selectPackTools, PACKS } from "../src/presets.js";
 import type { Plan, SubTask } from "../src/planner.js";
 import type Anthropic from "@anthropic-ai/sdk";
@@ -113,6 +113,11 @@ interface StoredRun {
   history?: Anthropic.MessageParam[];
   /** 已进行的对话轮数（第 1 轮 = 建 run 时那次提交） */
   conversationTurn: number;
+  /** V-29：本次运行的工作目录（工具写入圈禁根），必来自白名单 */
+  workdir?: string;
+  /** V-30：本次运行是否启用已配置的独立角色模型 */
+  useVerifierModel?: boolean;
+  usePlannerModel?: boolean;
 }
 
 /** 审批唯一键：同一 toolUseId 在返工轮再次出现时，靠 requestSeq 区分 */
@@ -141,6 +146,15 @@ function safeDecode(s: string): string {
 export interface UiServerOptions {
   modelClient?: ModelClient;
   workdir?: string;
+  /**
+   * V-29：允许逐 run 选择的工作目录白名单。
+   *
+   * 为什么是白名单而不是自由输入：workdir 同时是**工具的写入圈禁边界**
+   * （ToolExecutor 拿它当根）。让浏览器随意指定等于让任何能访问 UI 的人
+   * 往任意目录写文件。按 P6「护栏是宿主的责任」，合法集合由宿主在启动时
+   * 声明，浏览器只在其中选。缺省 = 只有 workdir 一个。
+   */
+  workdirs?: string[];
   packName?: string;
   /** 测试注入：覆盖默认工具池 */
   tools?: Tool[];
@@ -240,8 +254,39 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   const modelClient = options.modelClient ?? resolved.client;
   const envCompat = resolved.compat;
   const workdir = options.workdir ?? process.cwd();
+  // 白名单一律规范化为绝对路径再比对——外部输入不能靠字符串相等判定边界
+  const allowedWorkdirs = [...new Set([workdir, ...(options.workdirs ?? [])].map((d) => resolve(d)))];
   const pack = options.packName ? getPack(options.packName) : undefined;
   const injectedTools = options.tools;
+
+  /**
+   * V-30 角色模型：verifier / planner 各自可用独立端点（口径与 src/cli.ts 一致）。
+   *
+   * 密钥只在服务端解析，**绝不下发浏览器**——快照里只报模型名与 provider。
+   * 浏览器能做的是"这次用不用独立角色模型"，不是"用哪个 key 连哪个端点"。
+   *
+   * 值得配的依据是实测而非直觉：D2 —— 强 verifier 的确定优势是核查效率
+   * （约 1/3 成本）。反过来 B3 已经证伪了"更强 planner 能稳住拆分摇摆"，
+   * 所以 planner 这一路留给实验，界面不该暗示它更好。
+   */
+  function resolveRole(prefix: string): { name: string; provider: ResolvedProvider } | null {
+    const name = process.env[`AGENT_${prefix}_MODEL`];
+    if (!name) return null;
+    const pv = process.env[`AGENT_${prefix}_PROVIDER`];
+    const baseURL = process.env[`AGENT_${prefix}_BASE_URL`];
+    const apiKey = process.env[`AGENT_${prefix}_API_KEY`];
+    return {
+      name,
+      provider: createModelClientFromEnv(name, {
+        ...(pv ? { provider: pv as "anthropic" | "openai" } : {}),
+        ...(baseURL ? { baseURL } : {}),
+        ...(apiKey ? { apiKey } : {}),
+      }),
+    };
+  }
+
+  const verifierRole = resolveRole("VERIFIER");
+  const plannerRole = resolveRole("PLANNER");
 
   const runs = new Map<string, StoredRun>();
 
@@ -349,6 +394,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   function buildConfig(run?: StoredRun): AgentConfig {
     const runPack = run?.packName ? getPack(run.packName) : pack;
     const runEffort = run?.effort ?? effort;
+    const runWorkdir = run?.workdir ?? workdir;
     const systemPrompt = runPack?.systemPrompt ?? DEFAULT_SYSTEM_PROMPT;
     const tools = injectedTools ?? (runPack
       ? selectPackTools(runPack, BUILTIN_POOL, [])
@@ -356,7 +402,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     return {
       systemPrompt,
       tools,
-      workdir,
+      workdir: runWorkdir,
       compat: envCompat,
       // 此前这里只设四个字段，pack 的护栏、只读根、effort 全部丢失
       ...(runEffort ? { effort: runEffort } : {}),
@@ -381,10 +427,15 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     const runPack = run?.packName ? getPack(run.packName) : pack;
     // rubric 是任务属性，包只提供缺省：逐 run > env > 包（口径同 src/cli.ts）
     const runRubric = run?.rubric || rubric || runPack?.verify.rubric;
+    // 角色模型默认启用（配了就用，口径同 CLI）；逐 run 可显式关掉做 A/B 对照
+    const useVerifier = run?.useVerifierModel ?? true;
     return {
       ...(runPack?.verify.instructions ? { verifyInstructions: runPack.verify.instructions } : {}),
       ...(runPack?.verify.readOnlyCommands ? { verifyReadOnlyCommands: runPack.verify.readOnlyCommands } : {}),
       ...(runRubric ? { verifyRubric: runRubric } : {}),
+      ...(verifierRole && useVerifier
+        ? { verifierModel: { client: verifierRole.provider.client, compat: verifierRole.provider.compat } }
+        : {}),
     };
   }
 
@@ -654,9 +705,13 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     let mainStopReason: string | undefined;
 
     try {
+      const usePlanner = run.usePlannerModel ?? true;
       const outcome = await runPlanned(baseCfg, modelClient, run.task, {
         packs: Object.values(PACKS),
         concurrency,
+        ...(plannerRole && usePlanner
+          ? { plannerModel: { client: plannerRole.provider.client, compat: plannerRole.provider.compat } }
+          : {}),
         onPlan: (plan: Plan) => {
           planReadyAt = Date.now();
           if (concurrency === "auto") {
@@ -891,6 +946,13 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       effort: run.effort ?? effort ?? null,
       effortApplies: Boolean(run.effort ?? effort) && !envCompat,
       rubricSource: run.rubric ? "run" : process.env.AGENT_VERIFY_RUBRIC ? "env" : runPack?.verify.rubric ? "pack" : null,
+      workdir: cfg.workdir,
+      roleModels: {
+        executor: process.env.AGENT_MODEL ?? "claude-opus-4-8",
+        // 报的是本 run 实际用了什么，而不是配了什么——两者可以不同
+        verifier: verifierRole && (run.useVerifierModel ?? true) ? verifierRole.name : null,
+        planner: plannerRole && (run.usePlannerModel ?? true) ? plannerRole.name : null,
+      },
       guardrails: {
         maxTurns: cfg.maxTurns ?? null,
         maxTokens: cfg.maxTokens ?? null,
@@ -932,6 +994,21 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         hasRubric: Boolean(p.verify.rubric),
       })),
       effortLevels: [...EFFORT_LEVELS],
+      // V-29：合法工作目录集合由宿主声明，浏览器只在其中选
+      availableWorkdirs: allowedWorkdirs,
+      /**
+       * V-30 角色模型。**只报模型名与 provider，绝不下发密钥或 baseURL** ——
+       * 浏览器能决定的是"这次用不用独立角色模型"，不是"用哪个 key 连哪个端点"。
+       */
+      roleModels: {
+        executor: { model: process.env.AGENT_MODEL ?? "claude-opus-4-8", provider: process.env.AGENT_PROVIDER ?? "anthropic" },
+        verifier: verifierRole
+          ? { model: verifierRole.name, provider: verifierRole.provider.provider, configured: true }
+          : { configured: false },
+        planner: plannerRole
+          ? { model: plannerRole.name, provider: plannerRole.provider.provider, configured: true }
+          : { configured: false },
+      },
       // 核查预算与执行者解耦，硬编码在 src/verifier.ts
       verifierBudgetTurns: 15,
       pack: packView(pack),
@@ -1151,6 +1228,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         let parsed: {
           task?: string; verify?: boolean; pack?: string; effort?: string; rubric?: string;
           mode?: string; concurrency?: number | string;
+          workdir?: string; useVerifierModel?: boolean; usePlannerModel?: boolean;
         };
         try {
           parsed = JSON.parse(body);
@@ -1188,6 +1266,20 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           }
         }
 
+        // V-29：工作目录必须命中白名单。规范化后逐条比对绝对路径——
+        // 只做字符串前缀判断会被 `..` 穿出去，而这是工具的写入边界
+        let runWorkdir: string | undefined;
+        if (parsed.workdir !== undefined && parsed.workdir !== "") {
+          const asked = resolve(parsed.workdir);
+          if (!allowedWorkdirs.includes(asked)) {
+            return badRequest(
+              res,
+              `工作目录不在白名单内。可选：${allowedWorkdirs.join(" | ")}（用 AGENT_UI_WORKDIRS 声明）`,
+            );
+          }
+          runWorkdir = asked;
+        }
+
         const verify = parsed.verify === true;
         const id = randomUUID();
         const run: StoredRun = {
@@ -1209,6 +1301,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           ...(parsed.rubric ? { rubric: parsed.rubric } : {}),
           ...(parsed.mode === "plan" ? { mode: "plan" as const } : {}),
           ...(concurrency !== undefined ? { concurrency } : {}),
+          ...(runWorkdir ? { workdir: runWorkdir } : {}),
+          ...(parsed.useVerifierModel === false ? { useVerifierModel: false } : {}),
+          ...(parsed.usePlannerModel === false ? { usePlannerModel: false } : {}),
         };
         runs.set(id, run);
         broadcastLifecycle("run_created", run);

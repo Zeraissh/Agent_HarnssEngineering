@@ -90,6 +90,25 @@
         <span class="knob-hint" id="effort-hint"></span>
       </div>
       <div class="knob">
+        <label for="workdir-select">工作目录</label>
+        <select id="workdir-select"></select>
+        <span class="knob-hint">工具的写入圈禁根。可选集合由宿主用 AGENT_UI_WORKDIRS 声明。</span>
+      </div>
+      <div class="knob" id="role-models-knob" hidden>
+        <label id="role-models-label">角色模型</label>
+        <div class="role-toggles" role="group" aria-labelledby="role-models-label">
+          <label class="checkbox-label" id="verifier-role-row" hidden>
+            <input type="checkbox" id="use-verifier-model" checked />
+            <span id="verifier-role-text"></span>
+          </label>
+          <label class="checkbox-label" id="planner-role-row" hidden>
+            <input type="checkbox" id="use-planner-model" checked />
+            <span id="planner-role-text"></span>
+          </label>
+        </div>
+        <span class="knob-hint" id="role-models-hint"></span>
+      </div>
+      <div class="knob">
         <label for="mode-select">编排模式</label>
         <select id="mode-select">
           <option value="single">单任务（直接执行）</option>
@@ -192,6 +211,9 @@ const effortSelect = /** @type {HTMLSelectElement} */ (document.getElementById("
 const rubricInput = /** @type {HTMLTextAreaElement} */ (document.getElementById("rubric-input"));
 const modeSelect = /** @type {HTMLSelectElement} */ (document.getElementById("mode-select"));
 const concurrencySelect = /** @type {HTMLSelectElement} */ (document.getElementById("concurrency-select"));
+const workdirSelect = /** @type {HTMLSelectElement} */ (document.getElementById("workdir-select"));
+const useVerifierModel = /** @type {HTMLInputElement} */ (document.getElementById("use-verifier-model"));
+const usePlannerModel = /** @type {HTMLInputElement} */ (document.getElementById("use-planner-model"));
 const sidebar = /** @type {HTMLElement} */ (document.getElementById("sidebar"));
 const mainPanel = /** @type {HTMLElement} */ (document.getElementById("main-panel"));
 const runFilter = /** @type {HTMLSelectElement} */ (document.getElementById("run-filter"));
@@ -657,6 +679,10 @@ submitForm.addEventListener("submit", async (e) => {
         ...(modeSelect?.value === "plan"
           ? { mode: "plan", ...(concurrencySelect?.value ? { concurrency: concurrencySelect.value } : {}) }
           : {}),
+        ...(workdirSelect?.value ? { workdir: workdirSelect.value } : {}),
+        // 只在显式关掉时才传：默认"配了就用"，与 CLI 口径一致
+        ...(useVerifierModel && !useVerifierModel.checked ? { useVerifierModel: false } : {}),
+        ...(usePlannerModel && !usePlannerModel.checked ? { usePlannerModel: false } : {}),
       }),
     });
     if (!res.ok) {
@@ -772,6 +798,42 @@ function populateKnobs(snap) {
   const eh = document.getElementById("effort-hint");
   // compat 端点不认识 output_config.effort——不说清楚，用户会以为自己设的档位生效了
   if (eh && snap.compat) eh.textContent = "compat 模式下该参数不会发送";
+
+  // V-29 工作目录：只列宿主声明过的，浏览器不给自由输入
+  if (workdirSelect && Array.isArray(snap.availableWorkdirs)) {
+    for (const d of snap.availableWorkdirs) {
+      const opt = document.createElement("option");
+      opt.value = d;
+      opt.textContent = d;
+      workdirSelect.appendChild(opt);
+    }
+    if (snap.workdir) workdirSelect.value = snap.workdir;
+    workdirSelect.disabled = snap.availableWorkdirs.length <= 1;
+  }
+
+  // V-30 角色模型：没配就整块不显示——显示一个永远灰着的开关只会让人困惑
+  const rm = snap.roleModels;
+  const knob = document.getElementById("role-models-knob");
+  if (rm && knob) {
+    const wire = (role, rowId, textId, hintWhenOff) => {
+      const row = document.getElementById(rowId);
+      if (!row || !rm[role]?.configured) return false;
+      row.hidden = false;
+      document.getElementById(textId).textContent =
+        `${role === "verifier" ? "核查者" : "planner"}用 ${rm[role].model}（${rm[role].provider}）`;
+      return true;
+    };
+    const anyVerifier = wire("verifier", "verifier-role-row", "verifier-role-text");
+    const anyPlanner = wire("planner", "planner-role-row", "planner-role-text");
+    knob.hidden = !anyVerifier && !anyPlanner;
+    const hint = document.getElementById("role-models-hint");
+    if (hint) {
+      // 有实测依据的才说"更好"：D2 支持强 verifier，B3 证伪了强 planner
+      hint.textContent = anyVerifier
+        ? "取消勾选即与执行者同一个模型——这正是 A/B 对照臂的做法。"
+        : "取消勾选即与执行者同一个模型。";
+    }
+  }
 }
 
 function updatePackHint() {

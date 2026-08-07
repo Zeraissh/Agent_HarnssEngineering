@@ -16,6 +16,7 @@
  *   l. 核查未通过: 末尾 verdict 合成事件 passed=false + issues 非空 + source="rework" 事件出现
  */
 import { afterEach, describe, expect, it } from "vitest";
+import { join, resolve } from "node:path";
 import { createUiServer, type UiServerHandle } from "../ui/server.js";
 import {
   FakeModelClient,
@@ -1670,6 +1671,114 @@ describe("ui-server", () => {
       body: JSON.stringify({ text: "x" }),
     });
     expect(missing.status).toBe(404);
+  });
+
+  // ---- V-29 工作目录白名单 ----
+  it("v2-23. 工作目录只能从白名单里选，穿越尝试一律 400", async () => {
+    const allowed = process.cwd();
+    handle = createUiServer({
+      modelClient: new FakeModelClient([fakeMessage([textBlock("ok")], "end_turn")]),
+      tools: [autoTool("noop")],
+      workdir: allowed,
+      workdirs: [join(allowed, "test")],
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+
+    const post = (body: unknown) =>
+      fetch(`${base}/api/runs`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+      });
+
+    // workdir 是工具的写入圈禁根——白名单外一律拒绝，且不能靠字符串前缀判定
+    const outside = await post({ task: "t", workdir: "C:\Windows\System32" });
+    expect(outside.status).toBe(400);
+    expect((await outside.json() as any).error).toContain("白名单");
+
+    // `..` 穿越必须在规范化后被挡住，而不是因为字面量不同才恰好被挡住
+    const traversal = await post({ task: "t", workdir: join(allowed, "test", "..", "..") });
+    expect(traversal.status).toBe(400);
+
+    // 白名单内的路径放行
+    expect((await post({ task: "t", workdir: join(allowed, "test") })).status).toBe(200);
+  });
+
+  it("v2-24. 快照列出合法工作目录；未声明时只有启动目录一个", async () => {
+    handle = createUiServer({ modelClient: new FakeModelClient([]), tools: [], workdir: process.cwd() });
+    port = await startServer(handle);
+    const snap = await (await fetch(`${baseUrl(port)}/api/harness`)).json() as any;
+    expect(snap.availableWorkdirs).toEqual([resolve(process.cwd())]);
+  });
+
+  it("v2-25. 本 run 的工作目录进 run_config，Tools 面据此报真值", async () => {
+    const allowed = process.cwd();
+    const sub = join(allowed, "test");
+    handle = createUiServer({
+      modelClient: new FakeModelClient([fakeMessage([textBlock("ok")], "end_turn")]),
+      tools: [autoTool("noop")], workdir: allowed, workdirs: [sub],
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "t", workdir: sub }),
+    })).json() as { runId: string };
+    await waitForDone(base, runId);
+
+    const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+    const rc = events.find((e: any) => e.event.type === "run_config") as any;
+    expect(rc.event.workdir).toBe(resolve(sub));
+  });
+
+  // ---- V-30 角色模型 ----
+  it("v2-26. 角色模型快照只报名字与 provider，绝不下发密钥或 baseURL", async () => {
+    process.env.AGENT_VERIFIER_MODEL = "strong-verifier";
+    process.env.AGENT_VERIFIER_API_KEY = "sk-must-not-leak";
+    process.env.AGENT_VERIFIER_BASE_URL = "https://secret.internal/v1";
+    try {
+      handle = createUiServer({ modelClient: new FakeModelClient([]), tools: [], workdir: process.cwd() });
+      port = await startServer(handle);
+      const raw = await (await fetch(`${baseUrl(port)}/api/harness`)).text();
+
+      const snap = JSON.parse(raw);
+      expect(snap.roleModels.verifier).toEqual({
+        model: "strong-verifier", provider: "anthropic", configured: true,
+      });
+      expect(snap.roleModels.planner.configured).toBe(false);
+      // 整份快照的字节里都不能出现密钥或内网端点
+      expect(raw).not.toContain("sk-must-not-leak");
+      expect(raw).not.toContain("secret.internal");
+    } finally {
+      delete process.env.AGENT_VERIFIER_MODEL;
+      delete process.env.AGENT_VERIFIER_API_KEY;
+      delete process.env.AGENT_VERIFIER_BASE_URL;
+    }
+  });
+
+  it("v2-27. run_config 报的是本 run 实际用的角色模型——关掉后应为 null", async () => {
+    process.env.AGENT_VERIFIER_MODEL = "strong-verifier";
+    try {
+      handle = createUiServer({
+        modelClient: new FakeModelClient([fakeMessage([textBlock("ok")], "end_turn")]),
+        tools: [autoTool("noop")], workdir: process.cwd(),
+      });
+      port = await startServer(handle);
+      base = baseUrl(port);
+      const start = async (body: unknown) => {
+        const { runId } = await (await fetch(`${base}/api/runs`, {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+        })).json() as { runId: string };
+        await waitForDone(base, runId);
+        const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+        return (events.find((e: any) => e.event.type === "run_config") as any).event.roleModels;
+      };
+
+      expect((await start({ task: "默认启用" })).verifier).toBe("strong-verifier");
+      // A/B 对照臂：显式关掉就该报"与执行者同一个"，配了什么不等于用了什么
+      expect((await start({ task: "显式关掉", useVerifierModel: false })).verifier).toBeNull();
+    } finally {
+      delete process.env.AGENT_VERIFIER_MODEL;
+    }
   });
 
   // ---- V-10 全局生命周期流（取代 3 秒轮询）----
