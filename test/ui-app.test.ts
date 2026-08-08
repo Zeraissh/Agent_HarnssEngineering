@@ -36,6 +36,7 @@ import {
   deriveRunListItems,
   filterRunsByStatus,
 } from "../ui/public/app.js";
+import { plannedStopReason } from "../src/orchestrate.js";
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -584,6 +585,16 @@ describe("v2 R1 · stopReason 六值分档 (V-04)", () => {
       expect(s.stopReason).toBe(r);
       // 旧实现只判 error，这四种一律绿色"已完成"
       expect(classifyStopReason(s.stopReason).tone).not.toBe("ok");
+    }
+  });
+
+  // B1 口径锁的编排半边：宿主写进台账/run_end 的编排 stopReason 必须是本函数
+  // 认识的具名值。未知值会落 default 分支（label 原样回显输入），具名值的
+  // label 是人话——靠这一点检出"自造新词"或对象串化（"[object Object]"）。
+  it("编排收尾的 stopReason 必须是 classifyStopReason 的具名值", () => {
+    for (const completed of [true, false]) {
+      const v = plannedStopReason({ completed });
+      expect(classifyStopReason(v).label).not.toBe(v);
     }
   });
 

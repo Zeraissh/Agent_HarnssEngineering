@@ -50,7 +50,7 @@ import readline from "node:readline/promises";
 import { AgentLoop } from "./loop.js";
 import { connectMcpServers, loadMcpConfig } from "./mcp.js";
 import { createMemoryTools, MemoryStore } from "./memory.js";
-import { AUTO_CONCURRENCY_CAP, planParallelWidth, runPlanned, runVerified } from "./orchestrate.js";
+import { AUTO_CONCURRENCY_CAP, plannedStopReason, planParallelWidth, runPlanned, runVerified } from "./orchestrate.js";
 import type { VerifyOutcome } from "./verifier.js";
 import { getPack, PACKS, RULE_PRECEDENCE_DISCIPLINE, selectPackTools } from "./presets.js";
 import { routeToPack } from "./router.js";
@@ -578,6 +578,18 @@ async function main(): Promise<void> {
     const totalWallMs = Date.now() - startedAt;
     const wallMs = Date.now() - planReadyAt; // 子任务阶段墙钟（排除 planner）
     console.log(c.cyan("\n═══ 三角编排结果 ═══"));
+    // 记账不分分支：计划不可解析（fail-closed）也是一次要归档的失败，只在
+    // plan 存在的分支赋值会让这类失败在台账里落 stopReason=null。
+    // steps 为空时各聚合项自然得 0/[]，不必按分支各写一份。
+    ledgerFacts = {
+      stopReason: plannedStopReason(outcome),
+      // 编排下 turns 取各子任务执行轮次之和：单看某一步没有意义
+      turns: outcome.steps.reduce((n, st) => n + st.result.executionUsage.turns, 0),
+      reworks: outcome.steps.reduce((n, st) => n + st.result.reworks, 0),
+      finalPassed: outcome.completed,
+      // 一次编排产生多次裁决——§2.1 的样本量正是这么攒起来的
+      verifications: outcome.steps.flatMap((st) => st.result.verifications),
+    };
     if (!outcome.plan) {
       console.log(c.red(`✘ planner 未能产出可解析计划：${outcome.planOutcome.raw.slice(0, 200)}`));
       // 9.2 的 planner 版：区分"胡言乱语"与"探索没来得及收口"，返工策略完全不同
@@ -599,15 +611,6 @@ async function main(): Promise<void> {
         }
       }
       const serialMs = outcome.steps.reduce((acc, s) => acc + s.durationMs, 0);
-      ledgerFacts = {
-        stopReason: outcome.completed ? "completed" : String(outcome.planOutcome),
-        // 编排下 turns 取各子任务执行轮次之和：单看某一步没有意义
-        turns: outcome.steps.reduce((n, st) => n + st.result.executionUsage.turns, 0),
-        reworks: outcome.steps.reduce((n, st) => n + st.result.reworks, 0),
-        finalPassed: outcome.completed,
-        // 一次编排产生多次裁决——§2.1 的样本量正是这么攒起来的
-        verifications: outcome.steps.flatMap((st) => st.result.verifications),
-      };
       const wallNote = `全程 ${(totalWallMs / 1000).toFixed(1)}s，子任务阶段墙钟 ${(wallMs / 1000).toFixed(1)}s，子任务合计 ${(serialMs / 1000).toFixed(1)}s${effectiveConcurrency > 1 ? `，并行节省 ${Math.max(0, (serialMs - wallMs) / 1000).toFixed(1)}s` : ""}`;
       console.log(
         outcome.completed

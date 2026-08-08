@@ -361,6 +361,21 @@ export interface PlannedRunResult {
 }
 
 /**
+ * 编排收尾写给台账/run_end 的 stopReason——CLI 与 Web 宿主共用这一个定义。
+ *
+ * 值域刻意只取 "completed" / "error" 两个前端具名值（ui/public/app.js 的
+ * classifyStopReason）：失败的细分（计划不可解析、某子任务未过核查）已由
+ * finalPassed 与 plan_result 事件承载，stopReason 再自造新词只会加剧
+ * backlog B1 记录的三处口径漂移。CLI 曾在失败分支写 String(planOutcome)，
+ * 台账里落的是 "[object Object]"——聚合值必须显式映射，不许兜底串化。
+ */
+export function plannedStopReason(
+  outcome: Pick<PlannedRunResult, "completed">,
+): "completed" | "error" {
+  return outcome.completed ? "completed" : "error";
+}
+
+/**
  * 三角编排：planner 拆解（带验收标准 + 依赖图）→ 子任务按依赖就绪调度
  * runVerified（执行→核查→返工）→ 直接依赖的执行摘要作为交接注入下游。
  *

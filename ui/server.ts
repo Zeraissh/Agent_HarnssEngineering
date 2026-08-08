@@ -13,6 +13,7 @@ import { AgentLoop } from "../src/loop.js";
 import {
   runVerified,
   runPlanned,
+  plannedStopReason,
   planParallelWidth,
   AUTO_CONCURRENCY_CAP,
   type VerifiedRunResult,
@@ -1134,7 +1135,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       const finishedAt = Date.now();
       const stepSum = outcome.steps.reduce((n, st) => n + st.durationMs, 0);
       const subtaskWall = finishedAt - planReadyAt;
-      mainStopReason = outcome.completed ? "completed" : "error";
+      mainStopReason = plannedStopReason(outcome);
 
       // 并行收益的口径必须写清：子任务阶段墙钟排除 planner，"节省"是相对
       // 串行全序和而言的。不标口径的数字等于没有数字。
