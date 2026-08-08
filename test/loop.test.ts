@@ -334,3 +334,59 @@ describe("退避抖动（V-27 并行编排引入的触发条件）", () => {
     expect(backoffWithJitter(0, 3, () => 0.9)).toBe(0);
   });
 });
+
+describe("思考过程透出（委托方反馈：运行中只有直播条一行，看不到模型在想什么）", () => {
+  const thinkingBlock = (t: string) =>
+    ({ type: "thinking", thinking: t, signature: "sig" }) as unknown as Anthropic.ContentBlock;
+  const redactedBlock = () =>
+    ({ type: "redacted_thinking", data: "xxx" }) as unknown as Anthropic.ContentBlock;
+
+  it("思考块发成事件，运行中即可见（此前只进会话正史，每段结束才落盘）", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([thinkingBlock("先读 package.json 再动手"), textBlock("好的")], "end_turn"),
+    ]);
+    const loop = new AgentLoop({ ...baseConfig, tools: [] }, model);
+    const { events } = await collect(loop.run("t"));
+
+    const think = events.find((e) => e.type === "assistant_thinking") as Extract<
+      TurnEvent,
+      { type: "assistant_thinking" }
+    >;
+    expect(think, "未发出 assistant_thinking 事件").toBeDefined();
+    expect(think.text).toBe("先读 package.json 再动手");
+    expect(think.redacted).toBe(false);
+    expect(think.turn).toBe(1);
+
+    // 顺序：思考在正文之前——它就是在正文之前发生的
+    const types = events.map((e) => e.type);
+    expect(types.indexOf("assistant_thinking")).toBeLessThan(types.indexOf("assistant_text"));
+  });
+
+  it("redacted_thinking 照实标注，不假装没有", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([redactedBlock(), textBlock("好的")], "end_turn"),
+    ]);
+    const { events } = await collect(new AgentLoop({ ...baseConfig, tools: [] }, model).run("t"));
+    const think = events.find((e) => e.type === "assistant_thinking") as Extract<
+      TurnEvent,
+      { type: "assistant_thinking" }
+    >;
+    expect(think.redacted).toBe(true);
+    expect(think.text).toBe("");
+  });
+
+  it("没有思考块时不发空事件（compat 端点多数不返回 thinking）", async () => {
+    const model = new FakeModelClient([fakeMessage([textBlock("直接答")], "end_turn")]);
+    const { events } = await collect(new AgentLoop({ ...baseConfig, tools: [] }, model).run("t"));
+    expect(events.some((e) => e.type === "assistant_thinking")).toBe(false);
+  });
+
+  it("思考块仍然完整进历史（发事件不能改变消息内容，否则第三方端点会 400）", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([thinkingBlock("想一想"), textBlock("答")], "end_turn"),
+    ]);
+    const { result } = await collect(new AgentLoop({ ...baseConfig, tools: [] }, model).run("t"));
+    const assistant = result.messages.find((m) => m.role === "assistant")!;
+    expect(JSON.stringify(assistant.content)).toContain("想一想");
+  });
+});

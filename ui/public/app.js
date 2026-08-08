@@ -537,6 +537,14 @@ function buildTimelineEntry(seq, source, type, event) {
       };
     case "assistant_text":
       return { ...base, text: /** @type {string} */ (event.text) };
+    case "assistant_thinking":
+      // 逐字段白名单投影：新字段不列出就静默丢弃（本轮第四次踩到这条）
+      return {
+        ...base,
+        turn: /** @type {number} */ (event.turn),
+        text: /** @type {string} */ (event.text ?? ""),
+        redacted: Boolean(event.redacted),
+      };
     case "api_retry":
       return {
         ...base,
@@ -3093,6 +3101,10 @@ function renderLogEntryBody(e) {
       return `<div class="log-entry-body log-entry-text md">${renderMarkdown(e.text ?? "")}</div>`;
     case "approval_request":
       return `<pre class="log-entry-body">${esc(formatInput(e.input))}</pre>`;
+    case "assistant_thinking":
+      return e.redacted
+        ? '<div class="log-entry-body log-thinking">服务端已加密该段思考（redacted），内容取不到——但它确实发生过。</div>'
+        : `<div class="log-entry-body log-thinking md">${renderMarkdown(e.text ?? "")}</div>`;
     case "segment_resume":
       return `<div class="log-entry-body">整段因瞬时故障终止，已带着之前 ${esc(String(e.priorTurns ?? "?"))} 轮的会话正史接着跑（不是从头重来）。<br>原因：${esc(e.reason ?? "")}</div>`;
     case "api_retry":
@@ -3122,6 +3134,7 @@ function entryIcon(type, isError) {
     case "tool_call": return "→";        // cli.ts:527
     case "tool_result": return isError ? "✗" : "✓"; // cli.ts:530-531
     case "assistant_text": return "¶";   // CLI 直接流式打印无标记，列表里需要一个
+    case "assistant_thinking": return "✽"; // 与对话视图同款，自成语域
     case "approval_request": return "⚠"; // cli.ts:539
     case "api_retry": return "⟳";        // cli.ts:563
     case "segment_resume": return "⟲";   // 与 ⟳(同轮重试) 区分：这是整段续跑
@@ -3142,6 +3155,8 @@ function entryActionLabel(e) {
     // name 由 deriveLogEntries 按 toolUseId 回填；真取不到才退回 id（V-12）
     case "tool_result": return `${e.name ?? e.toolUseId ?? ""} ${e.resultIsError ? "失败" : "成功"}`;
     case "assistant_text": return "助手消息";
+    case "assistant_thinking":
+      return e.redacted ? "思考过程（已加密）" : `思考过程（${(e.text ?? "").length} 字）`;
     case "approval_request": return `审批请求：${e.name ?? ""}`;
     case "api_retry": return `API 重试（第${e.attempt ?? "?"}次）`;
     case "segment_resume": return `瞬时失败后带正史续跑（已完成 ${e.priorTurns ?? "?"} 轮）`;

@@ -1780,3 +1780,11 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
 .md-inline a { color: var(--accent); }
 .md del,
 .md-inline del { color: var(--fg-dim); }
+
+/* 思考过程条目：与对话视图的 .chat-thinking 同一语域（深梅虚线），
+   既不与正文抢，也不与工具旁支混。默认折叠，展开才占版面。 */
+.log-thinking {
+  border-left: 2px dashed var(--identity-verifier);
+  padding-left: 10px;
+  color: var(--text-2);
+}

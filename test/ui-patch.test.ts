@@ -593,6 +593,33 @@ describe("直播条消费逐字增量", () => {
 // 计划确认门（§5.1）
 // ================================================================
 
+describe("思考过程进事件流", () => {
+  function withThinking(extra: Record<string, unknown>) {
+    let s = createInitialState("run-t", "任务", false);
+    return reduceEvents(s, [
+      sse(0, "main", "turn_start", { turn: 1 }),
+      sse(1, "main", "assistant_thinking", { turn: 1, text: "先读 **package.json**", redacted: false, ...extra }),
+    ]);
+  }
+
+  it("思考条目进日志、默认折叠、展开后按 Markdown 渲染", () => {
+    renderRunDetail(withThinking({}), { activeTab: "loop" });
+    const rows = [...document.querySelectorAll(".log-entries .log-entry")];
+    const think = rows.find((r) => (r.textContent ?? "").includes("思考过程"))!;
+    expect(think, "思考条目没进日志——大概率是 reducer 白名单投影又丢字段了").toBeTruthy();
+    // 标题带字数，正文默认折叠（思考比正文长得多，展开会淹没时间线）
+    expect(think.textContent).toContain("字");
+    expect(think.querySelector(".log-thinking")).toBeNull();
+  });
+
+  it("redacted 照实说明，不假装没发生过", () => {
+    const s = withThinking({ text: "", redacted: true });
+    renderRunDetail(s, { activeTab: "loop" });
+    const rows = [...document.querySelectorAll(".log-entries .log-entry")];
+    expect(rows.some((r) => (r.textContent ?? "").includes("已加密"))).toBe(true);
+  });
+});
+
 describe("计划确认门的签字位", () => {
   const PLAN = {
     type: "plan",

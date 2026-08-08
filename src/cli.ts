@@ -636,6 +636,18 @@ async function main(): Promise<void> {
           c.yellow(`⟳ API 瞬时错误，同轮重试 #${event.attempt}（等待 ${event.backoffMs}ms）：${event.reason}`),
         );
         break;
+      case "assistant_thinking":
+        // 思考走洋红（与 verifier 同族的"旁支"语域），折成一行摘要——
+        // 终端里全量打印思考会把真正的产出淹掉
+        endStreamLine();
+        console.log(
+          c.magenta(
+            event.redacted
+              ? "✽ 思考过程（服务端已加密）"
+              : `✽ 思考过程 ${event.text.length} 字：${event.text.replace(/\s+/g, " ").slice(0, 60)}…`,
+          ),
+        );
+        break;
       case "segment_resume":
         endStreamLine();
         console.log(

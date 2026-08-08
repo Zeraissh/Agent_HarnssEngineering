@@ -241,6 +241,28 @@ export class AgentLoop {
       // 完整 push assistant content（契约 1）：丢块会导致 400 或行为退化
       messages.push({ role: "assistant", content: modelTurn.message.content });
 
+      /**
+       * 思考块透出（委托方反馈：运行中只有直播条那一行，看不到模型在想什么）。
+       *
+       * 数据一直都在——`model-client.ts` 显式开了 adaptive thinking，思考块随
+       * `message.content` 完整进历史。但它此前只在【会话正史】里，而正史是每段
+       * `done` 之后才落盘的，所以运行过程中根本看不见。发成事件即可实时可见。
+       *
+       * 这是 turn 级而非流式：`stream.on("text")` 只接文本增量，`thinking_delta`
+       * 尚未接（见 docs/06-backlog.md 第四节）。所以思考在【每轮结束时】整块到达，
+       * 不是逐字——比没有强得多，但别把它当流式。
+       *
+       * redacted_thinking 照实标注，不假装没有：那是服务端加密过的思考，
+       * 内容取不到，但"这里有一段思考"这个事实本身要让人看见。
+       */
+      for (const block of modelTurn.message.content) {
+        if (block.type === "thinking" && block.thinking) {
+          q.push({ type: "assistant_thinking", turn, text: block.thinking, redacted: false });
+        } else if (block.type === "redacted_thinking") {
+          q.push({ type: "assistant_thinking", turn, text: "", redacted: true });
+        }
+      }
+
       const text = modelTurn.message.content
         .filter((b): b is Anthropic.TextBlock => b.type === "text")
         .map((b) => b.text)
