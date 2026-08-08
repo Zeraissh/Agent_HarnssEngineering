@@ -1825,6 +1825,7 @@ export function renderRunDetail(state, callbacks) {
   patchApprovalRail(parts, state, isRunning, callbacks);
   patchUnverifiedRail(parts, faces);
   patchLiveStrip(parts, state, isRunning, callbacks.liveText ?? "", callbacks.liveThinking ?? "");
+  patchConversation(parts, state);
   patchOutcomeCard(parts, state, overview, faces);
   patchFactorGrid(parts, faces, activeTab, callbacks);
   patchTabContent(parts, state, activeTab, overview, logEntries, callbacks, faces);
@@ -1904,13 +1905,28 @@ function ensureDetailSkeleton(mainEl, state, callbacks) {
     '<span class="detail-hint" hidden></span>' +
     "</div></div>" +
     '<div class="live-strip" hidden aria-live="polite"></div>' +
+    /**
+     * **对话是主干**（委托方："还是希望做成对话框的形式，对于用惯了其它 agent
+     * 的人来说过于难用"）。
+     *
+     * 此前首屏是仪表盘（四因子卡 + 下钻面），对话只是 Loop 面里的一个子视图，
+     * 而且只有段结束落盘后才有内容——等于把最像"用 agent"的那件事藏在两层之下。
+     * 现在反过来：对话铺在主干，工具调用 / 思考 / 审批痕迹 / 裁决**按发生时刻
+     * 就地织进这条流**；仪表盘退成默认收起的抽屉。
+     *
+     * 这不是把特色藏起来——恰恰相反：别家把 agent 的内部收进一个转圈图标，
+     * 我们把它按时间顺序织进对话里。低切换成本与"明显不同"在这个形态下不冲突。
+     */
+    '<div class="conversation" id="conversation"></div>' +
+    // 结果卡排在对话之后：它是这次运行的收尾，不是开场白
     '<div class="outcome-card"></div>' +
-    // 四张因子卡**本身就是标签栏**：它们既是四个决定因素的摘要，也是切到对应
-    // 下钻面的入口。此前卡片下面还另起一行同名标签，两排四个一模一样的词——
-    // 委托方一眼看出是重复。合并之后选中态由 aria-selected 天然承载。
+    '<div class="usage-footer" hidden></div>' +
+    // 仪表盘抽屉：四因子卡仍是标签栏，只是不再占首屏
+    '<details class="detail-drawer" id="detail-drawer">' +
+    '<summary class="drawer-summary">运行详情：Loop / 上下文 / 工具 / 核查</summary>' +
     '<div class="factor-grid" role="tablist" aria-label="四决定因素"></div>' +
     '<div class="tab-content" id="tab-content" role="tabpanel" tabindex="0"></div>' +
-    '<div class="usage-footer" hidden></div>';
+    "</details>";
 
   if (showBack) {
     mainEl.querySelector("#back-to-list-btn").addEventListener("click", callbacks.onBack);
@@ -1927,6 +1943,8 @@ function ensureDetailSkeleton(mainEl, state, callbacks) {
     // 它不随内容滚走，新审批出现在哪都看得见（委托方建议的结构解法）
     ...ensureActionDock(),
     liveStrip: mainEl.querySelector(".live-strip"),
+    conversation: mainEl.querySelector(".conversation"),
+    drawer: mainEl.querySelector(".detail-drawer"),
     outcome: mainEl.querySelector(".outcome-card"),
     factorGrid: mainEl.querySelector(".factor-grid"),
     tabContent: mainEl.querySelector(".tab-content"),
@@ -2312,6 +2330,21 @@ function updateApprovalCard(card, a, isRunning) {
  * 排序刻意把核查结论放在执行者报告之前——委托方 §6 的要求是"无需展开日志
  * 即可判断结果"，而执行者的自述与核查者的裁决不是一回事，后者才是结论。
  */
+/**
+ * 对话主干的补丁。
+ *
+ * 签名只看 `lastSeq` 与条目数：事件流单调追加，这两个数不变就没有新内容。
+ * 与日志面同款——重画整段对话会打断正在展开的 details 与用户的滚动位置。
+ */
+function patchConversation(parts, state) {
+  if (!parts.conversation) return;
+  const items = deriveChatItems(state);
+  const sig = signature([state.lastSeq, items.length, state.verifications.length, state.status]);
+  if (parts.sig.conversation === sig) return;
+  parts.sig.conversation = sig;
+  parts.conversation.innerHTML = renderChatStream(items, state);
+}
+
 function patchOutcomeCard(parts, state, overview, faces) {
   const v = faces.verification;
   const loop = faces.loop;
@@ -2529,29 +2562,21 @@ function patchTabContent(parts, state, activeTab, overview, logEntries, callback
     container.__tab = activeTab;
     parts.sig.tabBody = null;
     // 对话视图的签名也要一起作废。漏掉它的后果是：切走再切回 Loop 面时
-    // `.chat-view` 已被上面这行重建成空 div，而 patchLoopView 看签名没变
-    // 直接提前 return——整段对话白屏，且没有任何报错。
+    // 对话主干在抽屉之外、不随标签重建；这里保留清签名是防御性的
     parts.sig.chat = null;
     if (activeTab === "loop") {
-      // V-23：同一段执行的两种读法。事件流是"它做了什么"（逐工具、逐结果），
-      // 对话是"它当时在想什么"（user/assistant/tool 往返）。两者信息量不同，
-      // 不是换皮——回看一次失败时，往往要先看对话才知道它为什么那么做。
+      /**
+       * V-23 原本在这里放"事件流 / 对话"两种读法的切换。
+       * **对话已经升为主干**（在抽屉外、常驻、实时），这里只剩事件流——
+       * 同一件事有两个入口，用户就得先决定"该看哪个"，那正是委托方说的难用。
+       * 事件流留在这里的定位随之收窄：逐工具、逐结果的**取证视图**。
+       */
       container.innerHTML =
-        '<div class="view-switch" role="group" aria-label="执行视图">' +
-        '<button type="button" class="view-btn" data-view="events">事件流</button>' +
-        '<button type="button" class="view-btn" data-view="chat">对话</button>' +
-        "</div>" +
         '<div class="plan-board"></div>' +
-        '<h3 class="overview-section-title">Agent 执行</h3>' +
+        '<h3 class="overview-section-title">执行事件流</h3>' +
         '<div class="rework-chain"></div>' +
-        '<div class="log-entries"></div>' +
-        '<div class="chat-view" hidden></div>';
+        '<div class="log-entries"></div>';
       container.__logHost = container.querySelector(".log-entries");
-      container.querySelectorAll(".view-btn").forEach((btn) => {
-        btn.addEventListener("click", () => {
-          callbacks.onSwitchView?.(btn.getAttribute("data-view"));
-        });
-      });
     }
   }
 
@@ -2602,15 +2627,35 @@ function patchReworkChain(host, loop) {
   }
   setAttr(host, "hidden", null);
   const roleLabel = { main: "主轮", rework: "返工", verifier: "核查" };
-  host.innerHTML = loop.chain
+  host.innerHTML = foldChain(loop.chain)
     .map((c) => {
       const mark = c.role === "verifier" ? (c.passed === null ? "⋯" : c.passed ? "✔" : "✘") : "■";
       const tone = c.role === "verifier" ? (c.passed === null ? "pending" : c.passed ? "ok" : "bad") : "neutral";
       const label = c.role === "rework" ? `↺ ${roleLabel[c.role]}` : roleLabel[c.role];
       const round = c.role === "main" ? "" : ` ${c.round}`;
-      return `<span class="chain-node chain-node--${tone}">${mark} ${esc(label)}${round}</span>`;
+      const times = c.count > 1 ? ` ×${c.count}` : "";
+      return `<span class="chain-node chain-node--${tone}">${mark} ${esc(label)}${round}${times}</span>`;
     })
     .join('<span class="chain-arrow">▸</span>');
+}
+
+/**
+ * 连续的主轮折叠成一个带计数的节点。
+ *
+ * 这条链要表达的是"执行 → 核查 → 返工"的**交替结构**。多轮对话下会出现
+ * 二十几个连着的 main 段，逐个画出来就是一排一模一样的「■ 主轮」——
+ * 委托方截图里那一行占满整屏却零信息量。计数版既保住了结构，也说清了有多少轮。
+ *
+ * 只折叠 main：核查与返工每一次都是独立事件，合并会把"返工了三次"抹平成一个。
+ */
+export function foldChain(chain) {
+  const out = [];
+  for (const c of chain ?? []) {
+    const last = out[out.length - 1];
+    if (last && last.role === c.role && c.role === "main") last.count += 1;
+    else out.push({ ...c, count: 1 });
+  }
+  return out;
 }
 
 /** Context 面下钻：逐轮 token 与压缩点 */
@@ -2947,185 +2992,233 @@ function renderPlanNode(n, maxDuration) {
 
 /** Loop 面的两种读法之间切换 */
 function patchLoopView(parts, container, state, logEntries, callbacks) {
-  const view = callbacks.loopView === "chat" ? "chat" : "events";
-  const logHost = container.querySelector(".log-entries");
-  const chatHost = container.querySelector(".chat-view");
-
-  for (const btn of container.querySelectorAll(".view-btn")) {
-    const on = btn.getAttribute("data-view") === view;
-    setClass(btn, "view-btn--active", on);
-    setAttr(btn, "aria-pressed", String(on));
-  }
-  setAttr(logHost, "hidden", view === "events" ? null : "");
-  setAttr(chatHost, "hidden", view === "chat" ? null : "");
-
-  if (view === "events") {
-    patchLogPanel(container, logEntries, callbacks, state);
-    return;
-  }
-
-  // 对话视图现在只剩正史——追加框已经并进底栏那个共用的 composer。
-  // 签名里也随之去掉 canContinue/followUpError，顺手消掉"一条错误就把整段
-  // 对话重画一遍"这个噪音源。
-  const sig = signature([
-    callbacks.transcript ? callbacks.transcript.segments.length : -1,
-    state.lastSeq,
-  ]);
-  if (parts.sig.chat === sig) return;
-  parts.sig.chat = sig;
-
-  chatHost.innerHTML = renderConversation(callbacks.transcript, state);
+  // 对话升为主干之后这里只剩事件流一种读法（取证视图）
+  patchLogPanel(container, logEntries, callbacks, state);
 }
 
 /**
- * 会话正史视图。
+ * 从**事件流**派生对话条目——对话主干的数据源。
  *
- * 数据来自 GET /api/runs/:id/transcript——`AgentRunResult.messages` 一直存在，
- * 只是从没透出过（SSE 里只带 messageCount，几 MB 的会话不能进事件缓冲）。
+ * 为什么用事件而不是 transcript（委托方："还是希望做成对话框的形式"）：
+ * transcript 只在**每一段结束时**才落盘，于是"对话"在运行过程中根本是空的，
+ * 只能退回去看事件流——那正是它没法当主干的原因。而事件流里其实什么都有：
+ * `assistant_text` 全文、`assistant_thinking` 全文、`tool_call` 的完整入参、
+ * `tool_result` 的完整返回（`ui/server.ts` 的 default 分支原样透传）。
+ * 换成事件之后对话**天然实时**，且顺手消掉了两件麻烦事：按需拉 transcript 的
+ * 时序，以及续跑返回累计正史带来的逐段去重（V-28 那套前缀比对）——
+ * 事件流本来就不重复。
  *
- * 渲染上有一处容易搞错：**带 tool_result 的 user 消息不是用户说的话**。
- * Anthropic 的协议把工具返回值放在 user 角色里回传给模型，若照 role 直接画成
- * 用户气泡，界面会显示成"用户对着 agent 念了一堆命令输出"。这里按内容块
- * 类型分派，工具返回归到工具那一侧。
- * @returns {string}
+ * 产物是纯数据，渲染在 `renderChatStream`。这样"对话该长什么样"可以在
+ * node 里直测，不必依赖 DOM。
+ *
+ * @returns {{kind:string,[k:string]:any}[]}
  */
-export function renderConversation(transcript, state) {
-  if (!transcript) {
-    return '<p class="empty-note">正在载入会话…</p>';
-  }
-  const segments = transcript.segments ?? [];
-  if (segments.length === 0) {
-    return '<p class="empty-note">本次运行尚无完整会话记录——会话在每一段执行结束时落盘，运行中请先看事件流。</p>';
-  }
+export function deriveChatItems(state) {
+  const items = [];
+  /**
+   * 开场白：**任务本身就是第一条用户消息**。
+   *
+   * 它不在事件流里（它是 run 的入参，不是事件），所以要显式补上。
+   * 漏掉的后果很直白——打开一个运行，第一眼看不到自己当初要求了什么。
+   * （这条是改造时被一条既有测试当场抓出来的：对话里只有回答没有提问。）
+   */
+  if (state.task) items.push({ kind: "user", text: state.task, seq: -1 });
+  /** toolUseId → 该工具行在 items 里的下标，tool_result 回来时就地补上结果 */
+  const callAt = new Map();
+  let lastSource = null;
 
-  let html = "";
-  let prev = null;
-  for (const seg of segments) {
-    const role = segmentRole(seg.source);
-    const msgs = seg.messages ?? [];
-
-    // 续跑返回的是**累计**正史：第 2 轮那一段包含第 1 轮的全部消息。
-    // 直接逐段全量渲染会把前面几轮重复画一遍。同源且构成前缀时只渲染增量。
-    let start = 0;
-    if (prev && prev.source === seg.source && isPrefix(prev.messages ?? [], msgs)) {
-      start = (prev.messages ?? []).length;
-    }
-    if (segments.length > 1 && start === 0) {
-      html += renderSegmentBoundary({ role, round: seg.index, source: seg.source });
-    }
-    for (const msg of msgs.slice(start)) {
-      html += renderChatMessage(msg);
-    }
-    prev = seg;
-  }
-
-  // V-28：正在进行的这一轮还没落盘（transcript 只在段结束时写），
-  // 但追加的指令已经在事件流里——不补上的话，用户会看到自己刚发的话凭空消失
-  const pendingTurns = (state?.timeline ?? []).filter(
-    (e) => e.type === "user_message" && !JSON.stringify(segments).includes(e.text),
+  /**
+   * **两条时间线合起来按 seq 排。**
+   *
+   * 核查者的事件走 `verifierTimeline`（reducer 分流），只读 `timeline` 的话
+   * 对话里就完全看不到核查者做过什么——而"另一个上下文独立复核"恰恰是这个
+   * harness 最该被看见的东西。合并之后 `main → ◆ 核查 → ↺ 返工` 的交替
+   * 直接长在对话里。
+   */
+  const all = [...(state.timeline ?? []), ...(state.verifierTimeline ?? [])].sort(
+    (a, b) => a.seq - b.seq,
   );
-  for (const t of pendingTurns) {
-    html += renderChatMessage({ role: "user", content: t.text });
+  for (const e of all) {
+    // 段切换（main → verifier → rework、或编排下换子任务）插一条分界
+    if (e.source !== lastSource && CHAT_SOURCED.has(e.type)) {
+      items.push({ kind: "boundary", source: e.source, role: segmentRole(e.source), seq: e.seq });
+      lastSource = e.source;
+    }
+    switch (e.type) {
+      case "user_message":
+        items.push({ kind: "user", text: e.text, seq: e.seq });
+        break;
+      case "assistant_thinking":
+        if (e.text || e.redacted) {
+          items.push({ kind: "thinking", text: e.text ?? "", redacted: Boolean(e.redacted), seq: e.seq });
+        }
+        break;
+      case "assistant_text":
+        if (String(e.text ?? "").trim()) items.push({ kind: "text", text: e.text, seq: e.seq });
+        break;
+      case "tool_call":
+        callAt.set(e.toolUseId, items.length);
+        items.push({
+          kind: "tool", name: e.name, input: e.input, toolUseId: e.toolUseId,
+          status: "running", result: null, isError: false, durationMs: null, seq: e.seq,
+        });
+        break;
+      case "tool_result": {
+        const at = callAt.get(e.toolUseId);
+        if (at === undefined) break; // 没见过对应的调用（重放缺口），宁可不画也不伪造
+        items[at] = {
+          ...items[at],
+          status: e.resultIsError ? "error" : "ok",
+          result: e.resultContent ?? "",
+          isError: Boolean(e.resultIsError),
+          durationMs: e.durationMs ?? null,
+        };
+        break;
+      }
+      case "approval_request": {
+        const at = callAt.get(e.toolUseId);
+        // 审批卡本体在钉底坞里；对话里只留一条"这里等过人"的痕迹，
+        // 否则事后回看会看到工具凭空执行，读不出当时被拦过
+        if (at !== undefined) items[at] = { ...items[at], gated: true };
+        else items.push({ kind: "gate", name: e.name, seq: e.seq });
+        break;
+      }
+      default:
+        break;
+    }
   }
-  if (state?.status === "running" && pendingTurns.length > 0) {
-    html += '<p class="empty-note">这一轮进行中，完整会话在本轮结束后落盘。</p>';
+
+  // 裁决作为**这一段的收尾卡**排在末尾——它是对话的一部分，不是另一个页面
+  for (const v of state.verifications ?? []) {
+    items.push({ kind: "verdict", round: v.round, verdict: v.verdict, recovery: v.recovery ?? null });
   }
-  return html || '<p class="empty-note">会话为空。</p>';
+  return items;
+}
+
+/** 会引起"换段"的事件类型：turn_start 这类噪声不该产生分界 */
+const CHAT_SOURCED = new Set([
+  "user_message", "assistant_text", "assistant_thinking", "tool_call", "approval_request",
+]);
+
+/**
+ * 把对话条目渲染成 HTML。**对话是叙事，不是管道**：文字是主角，
+ * 工具调用与返回折叠成一行摘要，需要时能展开但不淹没"它当时在说什么"。
+ * @returns {string}
+ */
+export function renderChatStream(items, state) {
+  if (!items || items.length === 0) {
+    return state?.status === "running"
+      ? '<p class="empty-note">刚开始，还没有内容。</p>'
+      : '<p class="empty-note">这次运行没有产生对话内容。</p>';
+  }
+  let html = "";
+  for (const it of items) {
+    switch (it.kind) {
+      case "boundary":
+        html += renderSegmentBoundary({ role: it.role, round: it.round ?? 0, source: it.source });
+        break;
+      case "user":
+        html +=
+          '<div class="chat-msg chat-msg--user"><div class="chat-role">委托方</div>' +
+          `<div class="chat-body chat-body--text md">${renderMarkdown(it.text)}</div></div>`;
+        break;
+      case "text":
+        html +=
+          '<div class="chat-msg chat-msg--assistant"><div class="chat-role">¶ Agent</div>' +
+          `<div class="chat-body chat-body--text md">${renderMarkdown(it.text)}</div></div>`;
+        break;
+      case "thinking":
+        html += it.redacted
+          ? '<div class="chat-thinking chat-thinking--redacted">✽ 思考过程已被服务端加密（redacted），无法展示</div>'
+          : '<details class="chat-thinking">' +
+            `<summary>✽ 思考过程 <span class="aside-peek">${it.text.length} 字</span></summary>` +
+            `<div class="chat-body chat-body--text md">${renderMarkdown(it.text)}</div></details>`;
+        break;
+      case "tool":
+        html += renderToolRow(it);
+        break;
+      case "gate":
+        html += `<div class="chat-gate">⚠ ${esc(it.name)} 需要你放行</div>`;
+        break;
+      case "verdict":
+        html += renderVerdictInline(it);
+        break;
+      default:
+        break;
+    }
+  }
+  return html;
 }
 
 /**
- * 单条消息。
+ * 一次工具调用 = 一行。**摘要必须一眼认得出这是在干什么**。
  *
- * 排版原则：**对话是叙事，不是管道**。文字是主角，工具调用与返回值折叠成
- * 一行摘要——需要时能展开，但不该淹没"它当时在说什么、在想什么"。
- * 想看逐工具的完整过程，事件流视图本来就是干这个的。
- * @returns {string}
+ * 委托方截图里那行 `→ bash {` 就是反例：入参被 `JSON.stringify(…, null, 2)`
+ * 美化过，取首行自然只剩一个左花括号——等于什么都没说。
+ * 现在按工具的**主参数**取摘要（command / path / url / query…），取不到才退回紧凑 JSON。
  */
-function renderChatMessage(msg) {
-  const blocks = Array.isArray(msg?.content)
-    ? msg.content
-    : [{ type: "text", text: String(msg?.content ?? "") }];
+function renderToolRow(it) {
+  const cls = it.status === "error" ? " chat-tool--err" : it.status === "running" ? " chat-tool--live" : "";
+  const mark = it.status === "error" ? "✗" : it.status === "running" ? "⋯" : "✓";
+  const dur = it.durationMs != null ? `<span class="aside-peek">${it.durationMs}ms</span>` : "";
+  const gate = it.gated ? '<span class="chat-tool-gate" title="这一步曾等待人工放行">⚠ 经放行</span>' : "";
+  const peek = esc(truncate(toolPeek(it.name, it.input), 88));
+  const body = it.result
+    ? `<pre class="chat-body">${esc(truncate(String(it.result), 4000))}</pre>`
+    : `<pre class="chat-body">${esc(truncate(formatInput(it.input), 1200))}</pre>`;
+  return (
+    `<details class="chat-tool${cls}">` +
+    `<summary><span class="aside-mark">${mark}</span> <code>${esc(it.name ?? "")}</code> ` +
+    `<span class="aside-peek">${peek}</span> ${gate} ${dur}</summary>${body}</details>`
+  );
+}
 
-  // 工具返回块单独成组：协议上它们挂在 user 角色下，语义上属于工具
-  const toolResults = blocks.filter((b) => b && b.type === "tool_result");
-  const rest = blocks.filter((b) => !b || b.type !== "tool_result");
+/** 各工具的"主参数"——摘要行只说这一个，别的展开再看 */
+const TOOL_PEEK_KEYS = ["command", "path", "file_path", "url", "query", "name", "expression", "pattern"];
 
-  let html = "";
-  for (const b of toolResults) {
-    const text = extractBlockText(b.content);
-    const head = firstLine(text, 72);
-    html +=
-      `<details class="chat-aside${b.is_error ? " chat-aside--err" : ""}">` +
-      `<summary><span class="aside-mark">${b.is_error ? "✗" : "✓"}</span> 工具返回` +
-      (head ? ` <span class="aside-peek">${esc(head)}</span>` : "") +
-      "</summary>" +
-      `<pre class="chat-body">${esc(truncate(text, 4000))}</pre>` +
-      "</details>";
+export function toolPeek(name, input) {
+  if (input === null || input === undefined) return "";
+  if (typeof input === "string") return firstLine(input, 88);
+  if (typeof input !== "object") return String(input);
+  for (const k of TOOL_PEEK_KEYS) {
+    const v = /** @type {any} */ (input)[k];
+    if (typeof v === "string" && v.trim()) return firstLine(v, 88);
   }
+  // 没有已知主参数时给紧凑单行 JSON——至少不是一个孤零零的花括号
+  const compact = Object.entries(input)
+    .map(([k, v]) => `${k}=${typeof v === "string" ? v : JSON.stringify(v)}`)
+    .join(" ");
+  return firstLine(compact, 88);
+}
 
-  const thinking = rest.filter((b) => b && (b.type === "thinking" || b.type === "redacted_thinking"));
-  const speech = rest.filter((b) => b && (b.type === "text" || b.type === "tool_use"));
-  if (thinking.length === 0 && speech.length === 0) return html;
-
-  const who = msg?.role === "assistant" ? "assistant" : "user";
-  html += `<div class="chat-msg chat-msg--${who}">`;
-  html += `<div class="chat-role">${who === "assistant" ? "¶ Agent" : "委托方"}</div>`;
-
-  // 思考过程：数据一直在 transcript 里（src/model-client.ts:41 显式开了
-  // adaptive thinking，loop.ts:209 完整 push 了 content 块），此前只是没人渲染。
-  // 默认折叠——它是"为什么这么做"的证据，不是主线叙述。
-  for (const b of thinking) {
-    if (b.type === "redacted_thinking") {
-      html += '<div class="chat-thinking chat-thinking--redacted">✽ 思考过程已被服务端加密（redacted），无法展示</div>';
-      continue;
-    }
-    const t = String(b.thinking ?? "");
-    html +=
-      '<details class="chat-thinking">' +
-      `<summary>✽ 思考过程 <span class="aside-peek">${t.length} 字</span></summary>` +
-      `<div class="chat-body chat-body--text md">${renderMarkdown(t)}</div>` +
-      "</details>";
-  }
-
-  for (const b of speech) {
-    if (b.type === "text") {
-      html += `<div class="chat-body chat-body--text md">${renderMarkdown(b.text ?? "")}</div>`;
-    } else {
-      const input = formatInput(b.input);
-      html +=
-        '<details class="chat-aside chat-aside--call">' +
-        `<summary><span class="aside-mark">→</span> <code>${esc(b.name ?? "")}</code>` +
-        ` <span class="aside-peek">${esc(firstLine(input, 60))}</span></summary>` +
-        `<pre class="chat-body">${esc(truncate(input, 1200))}</pre>` +
-        "</details>";
-    }
-  }
-  html += "</div>";
-  return html;
+/** 裁决卡：一段的收尾，就地出现在对话里而不是另一个标签页 */
+function renderVerdictInline(it) {
+  const v = it.verdict ?? {};
+  const tone = v.passed ? (v.issues?.length ? "warn" : "ok") : "bad";
+  const label = v.passed ? (v.issues?.length ? "通过（有备注）" : "核查通过") : "核查未通过";
+  const list = (arr, mark, cls) =>
+    arr && arr.length
+      ? `<ul class="chat-verdict-list chat-verdict-list--${cls}">${arr
+          .map((x) => `<li class="md-inline">${mark} ${renderMarkdownInline(x)}</li>`)
+          .join("")}</ul>`
+      : "";
+  return (
+    `<div class="chat-verdict chat-verdict--${tone}">` +
+    `<div class="chat-verdict-head">◆ ${esc(label)}` +
+    (it.round ? `<span class="aside-peek">第 ${it.round} 轮</span>` : "") +
+    "</div>" +
+    (v.summary ? `<p class="md-inline chat-verdict-summary">${renderMarkdownInline(v.summary)}</p>` : "") +
+    list(v.issues, v.passed ? "⚠" : "✗", "bad") +
+    list(v.unverified, "?", "warn") +
+    list(v.advisory, "◈", "note") +
+    "</div>"
+  );
 }
 
 /** 取首行并截断——折叠摘要上给一眼能认出是什么的线索 */
 function firstLine(text, max) {
   const line = String(text ?? "").split(/\r?\n/).find((l) => l.trim()) ?? "";
   return truncate(line.trim(), max);
-}
-
-/** a 是否为 b 的前缀（逐条深比对——消息里含内容块数组，浅比会漏判） */
-function isPrefix(a, b) {
-  if (a.length === 0 || a.length > b.length) return false;
-  for (let i = 0; i < a.length; i++) {
-    if (JSON.stringify(a[i]) !== JSON.stringify(b[i])) return false;
-  }
-  return true;
-}
-
-/** tool_result 的 content 可能是字符串，也可能是内容块数组 */
-function extractBlockText(content) {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return String(content ?? "");
-  return content
-    .map((c) => (c && c.type === "text" ? c.text : typeof c === "string" ? c : JSON.stringify(c)))
-    .join("\n");
 }
 
 /** 段分界：main→verifier 用 ━，返工用 CLI 同款 ↺（src/cli.ts:449） */

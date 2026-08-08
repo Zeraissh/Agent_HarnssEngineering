@@ -26,7 +26,6 @@ import {
   renderRunList,
   renderRunDetail,
   renderEmptyState,
-  renderConversation,
   deriveComposerMode,
   composerSubmitPlan,
   patchComposer,
@@ -40,6 +39,19 @@ function loadSkeleton(): string {
   const html = readFileSync(join(UI_DIR, "index.html"), "utf-8");
   const body = html.match(/<body[^>]*>([\s\S]*)<\/body>/)?.[1] ?? "";
   return body.replace(/<script[\s\S]*?<\/script>/g, "");
+}
+
+/**
+ * 打开「运行详情」抽屉。
+ *
+ * 对话主干化之后，四因子卡与下钻面搬进了默认收起的 `<details>`——
+ * **axe 不扫收起的 details 里的内容**。也就是说不显式打开，下钻面的可访问性
+ * 就从"每次都扫"变成"一次都不扫"，而测试还是绿的。
+ * 这正是本轮 AC2-18 复验反复抓到的那类假绿，所以凡断言下钻面的用例都要先开抽屉。
+ */
+function openDrawer(): void {
+  const d = document.getElementById("detail-drawer") as HTMLDetailsElement | null;
+  if (d) d.open = true;
 }
 
 /** 宿主快照替身：护栏、工具面、包与白名单齐全，四决定因素才有东西可渲染 */
@@ -176,24 +188,28 @@ describe("axe 自动扫描：空态 / 列表 / 详情三种画面零 violations"
   // 的 violations 都会同时暴露 L2 与 L3 的问题。
   it("运行详情·Loop 面（返工链 + 分段日志 + 折叠条目）", async () => {
     renderRunDetail(buildRichState(), { activeTab: "loop", harness: FAKE_HARNESS });
+    openDrawer();
     const violations = await runAxe();
     expect(violations, JSON.stringify(violations, null, 2)).toEqual([]);
   });
 
   it("运行详情·Context 面（水位条 + token 三分 + 逐轮表）", async () => {
     renderRunDetail(buildRichState(), { activeTab: "context", harness: FAKE_HARNESS });
+    openDrawer();
     const violations = await runAxe();
     expect(violations, JSON.stringify(violations, null, 2)).toEqual([]);
   });
 
   it("运行详情·Tools 面（工具芯片 + 边界清单）", async () => {
     renderRunDetail(buildRichState(), { activeTab: "tools", harness: FAKE_HARNESS });
+    openDrawer();
     const violations = await runAxe();
     expect(violations, JSON.stringify(violations, null, 2)).toEqual([]);
   });
 
   it("运行详情·Verification 面（三值裁决 + 饥饿告警 + 边界）", async () => {
     renderRunDetail(buildRichState(), { activeTab: "verify", harness: FAKE_HARNESS });
+    openDrawer();
     const violations = await runAxe();
     expect(violations, JSON.stringify(violations, null, 2)).toEqual([]);
   });
@@ -202,12 +218,14 @@ describe("axe 自动扫描：空态 / 列表 / 详情三种画面零 violations"
     renderRunDetail(buildRichState(), {
       activeTab: "loop", showBack: true, onBack: () => {}, harness: FAKE_HARNESS,
     });
+    openDrawer();
     const violations = await runAxe();
     expect(violations, JSON.stringify(violations, null, 2)).toEqual([]);
   });
 
   it("宿主快照缺席时降级渲染仍零 violations", async () => {
     renderRunDetail(buildRichState(), { activeTab: "tools" });
+    openDrawer();
     const violations = await runAxe();
     expect(violations, JSON.stringify(violations, null, 2)).toEqual([]);
   });
@@ -235,6 +253,8 @@ describe("axe 自动扫描：空态 / 列表 / 详情三种画面零 violations"
     push("host", { type: "plan_approval_request", at: 1000 });
 
     renderRunDetail(s, { activeTab: "loop", harness: FAKE_HARNESS });
+
+    openDrawer();
     // 先确认它真的渲染出来了——否则这条会变成"什么都没扫也算通过"的假绿
     expect(document.querySelector(".plan-gate")?.hasAttribute("hidden")).toBe(false);
     expect(document.querySelectorAll(".plan-gate button")).toHaveLength(2);
@@ -291,6 +311,7 @@ describe("运行列表的 ARIA 语义（真实 DOM 断言，取代原先的源�
 describe("标签三件套（真实 DOM 断言，取代原先的源码字符串扫描）", () => {
   it("tab 三件套在真实 DOM 上闭环，且 aria-labelledby 随选中项更新", () => {
     renderRunDetail(buildRichState(), { activeTab: "loop", harness: FAKE_HARNESS });
+    openDrawer();
 
     const tablist = document.querySelector('[role="tablist"]')!;
     const panel = document.querySelector('[role="tabpanel"]')!;
@@ -306,6 +327,7 @@ describe("标签三件套（真实 DOM 断言，取代原先的源码字符串�
 
     // 切到另一个面后，引用必须跟着换
     renderRunDetail(buildRichState(), { activeTab: "context", harness: FAKE_HARNESS });
+    openDrawer();
     const panel2 = document.querySelector('[role="tabpanel"]')!;
     expect(panel2.getAttribute("aria-labelledby")).toBe("tab-context");
     expect(document.getElementById("tab-context")).toBeTruthy();
@@ -314,6 +336,7 @@ describe("标签三件套（真实 DOM 断言，取代原先的源码字符串�
   it("旧标签 id 归一到 Loop 面，深链不 404", () => {
     for (const legacy of ["overview", "log", undefined, "bogus"]) {
       renderRunDetail(buildRichState(), { activeTab: legacy, harness: FAKE_HARNESS });
+      openDrawer();
       const panel = document.querySelector('[role="tabpanel"]')!;
       expect(panel.getAttribute("aria-labelledby")).toBe("tab-loop");
     }
@@ -321,6 +344,7 @@ describe("标签三件套（真实 DOM 断言，取代原先的源码字符串�
 
   it("roving tabindex：仅选中项可 Tab 进入，其余为 -1", () => {
     renderRunDetail(buildRichState(), { activeTab: "loop", harness: FAKE_HARNESS });
+    openDrawer();
     const tabs = [...document.querySelectorAll('[role="tab"]')];
     const active = tabs.filter((t) => t.getAttribute("tabindex") === "0");
     expect(active).toHaveLength(1);
@@ -332,6 +356,7 @@ describe("标签三件套（真实 DOM 断言，取代原先的源码字符串�
 
   it("方向键在四个面之间移动——只加 roving 不加方向键比不改更糟（s3d 教训）", () => {
     renderRunDetail(buildRichState(), { activeTab: "loop", harness: FAKE_HARNESS });
+    openDrawer();
     const seen: string[] = [];
     document.addEventListener("tab-switch", (e) => seen.push((e as CustomEvent).detail.tab));
 
@@ -358,6 +383,8 @@ describe("标签三件套（真实 DOM 断言，取代原先的源码字符串�
     });
 
     renderRunDetail(s, { activeTab: "verify", harness: FAKE_HARNESS });
+
+    openDrawer();
     const tabs = [...document.querySelectorAll('[role="tab"]')].map((t) => t.getAttribute("data-tab"));
     expect(tabs).toEqual(expect.arrayContaining(["loop", "context", "tools", "verify"]));
 
@@ -381,6 +408,8 @@ describe("标签三件套（真实 DOM 断言，取代原先的源码字符串�
     });
 
     renderRunDetail(s, { activeTab: "verify", harness: FAKE_HARNESS });
+
+    openDrawer();
     const panel = document.querySelector('[role="tabpanel"]')!;
     expect(panel.textContent).toContain("核查未运行");
     // 这一句是要害：没有裁决不等于没有问题
@@ -389,6 +418,7 @@ describe("标签三件套（真实 DOM 断言，取代原先的源码字符串�
 
   it("当前查看的面在卡片上有选中标记（卡片即标签）", () => {
     renderRunDetail(buildRichState(), { activeTab: "tools", harness: FAKE_HARNESS });
+    openDrawer();
     const active = document.querySelector('.factor-card[aria-selected="true"]')!;
     expect(active.getAttribute("data-factor")).toBe("tools");
     expect(active.classList.contains("factor-card--active")).toBe(true);
@@ -398,6 +428,7 @@ describe("标签三件套（真实 DOM 断言，取代原先的源码字符串�
 
   it("不再存在与因子卡重复的第二排标签", () => {
     renderRunDetail(buildRichState(), { activeTab: "loop", harness: FAKE_HARNESS });
+    openDrawer();
     expect(document.querySelectorAll(".tab-nav")).toHaveLength(0);
     expect(document.querySelectorAll(".tab-btn")).toHaveLength(0);
     // tablist 只有一个，就是因子卡那一组
@@ -442,6 +473,7 @@ describe("扫描器双向自检：植入已知缺陷必须被抓到", () => {
     // 屏幕阅读器取不到面板名称。axe 把它归为"需人工复核"（引用元素可能后续动态出现），
     // 所以守护它的是上面那条 incomplete 白名单测试 —— 此处证明白名单确实拦得住。
     renderRunDetail(buildRichState(), { activeTab: "loop", harness: FAKE_HARNESS });
+    openDrawer();
     document.querySelector('[role="tabpanel"]')!.setAttribute("aria-labelledby", "tab-does-not-exist");
     const unexpected = (await incompleteIds()).filter((id) => !KNOWN_INCOMPLETE.has(id));
     expect(unexpected).toContain("aria-valid-attr-value");
@@ -451,6 +483,7 @@ describe("扫描器双向自检：植入已知缺陷必须被抓到", () => {
 describe("环境边界声明（防止把 incomplete 误当通过）", () => {
   it("详情页的待复核项不得超出已知白名单（新增 incomplete 必须有人看一眼）", async () => {
     renderRunDetail(buildRichState(), { activeTab: "loop", harness: FAKE_HARNESS });
+    openDrawer();
     renderRunList([{ runId: "run-1", task: "t", status: "done", verify: true }], "run-1", () => {}, new Map());
     const unexpected = (await incompleteIds()).filter((id) => !KNOWN_INCOMPLETE.has(id));
     expect(unexpected, `新出现的待复核规则: ${unexpected.join(", ")}`).toEqual([]);
@@ -458,6 +491,7 @@ describe("环境边界声明（防止把 incomplete 误当通过）", () => {
 
   it("color-contrast 在 jsdom 下不产出 violations —— 对比度由 ui-app.test.ts 的 WCAG 实算测试守护", async () => {
     renderRunDetail(buildRichState(), { activeTab: "loop", harness: FAKE_HARNESS });
+    openDrawer();
     const results = await axe.run(document, { runOnly: { type: "rule", values: ["color-contrast"] } });
     // 断言的是"这里不承担对比度判定"这一事实，而不是"对比度没问题"
     expect(results.violations).toEqual([]);
@@ -517,6 +551,7 @@ describe("双主题：data-theme 切换不改变结构语义", () => {
       document.documentElement.setAttribute("data-theme", theme);
       document.body.innerHTML = loadSkeleton();
       renderRunDetail(buildRichState(), { activeTab: "verify", harness: FAKE_HARNESS });
+      openDrawer();
       return [...document.querySelectorAll("[role],[aria-label],[aria-labelledby],[aria-selected]")]
         .map((el) =>
           [
@@ -534,166 +569,6 @@ describe("双主题：data-theme 切换不改变结构语义", () => {
 
 // ================================================================
 // v2 R6a：会话正史视图 (V-23)
-// ================================================================
-
-describe("对话视图", () => {
-  const transcript = {
-    segments: [
-      {
-        index: 0,
-        source: "main",
-        messages: [
-          { role: "user", content: "创建 demo.txt" },
-          {
-            role: "assistant",
-            content: [
-              { type: "thinking", thinking: "先确认路径是否在工作目录内，再决定用哪个工具。" },
-              { type: "text", text: "我先写文件。" },
-              { type: "tool_use", id: "t1", name: "write_file", input: { path: "demo.txt" } },
-            ],
-          },
-          {
-            role: "user",
-            content: [{ type: "tool_result", tool_use_id: "t1", content: "Wrote 5 bytes" }],
-          },
-          { role: "assistant", content: [{ type: "text", text: "已完成。" }] },
-        ],
-      },
-    ],
-  };
-
-  function mount(t: unknown) {
-    const host = document.createElement("div");
-    host.innerHTML = renderConversation(t, { lastSeq: 0 });
-    document.body.appendChild(host);
-    return host;
-  }
-
-  /**
-   * 这一条是整个视图最容易搞错的地方：Anthropic 协议把**工具返回值放在
-   * user 角色里**回传给模型。照 role 直接画气泡的话，界面会显示成
-   * "用户对着 agent 念了一堆命令输出"——完全不是发生过的事。
-   */
-  it("带 tool_result 的 user 消息渲染为工具返回，不是用户发言", () => {
-    const host = mount(transcript);
-    const userBubbles = [...host.querySelectorAll(".chat-msg--user")];
-    // 只有真正的那一句任务描述算用户发言
-    expect(userBubbles).toHaveLength(1);
-    expect(userBubbles[0].textContent).toContain("创建 demo.txt");
-
-    const asides = [...host.querySelectorAll(".chat-aside")];
-    const result = asides.find((a) => a.textContent!.includes("工具返回"))!;
-    expect(result).toBeTruthy();
-    expect(result.textContent).toContain("Wrote 5 bytes");
-    expect(result.closest(".chat-msg--user")).toBeNull();
-  });
-
-  /**
-   * 委托方要求：对话是叙事，不该被调用话术淹没。工具调用与返回折叠成一行
-   * 摘要（<details> 默认收起），正文用大一号字号——但信息不丢，展开就有。
-   */
-  it("工具调用与返回默认折叠，正文不折叠", () => {
-    const host = mount(transcript);
-    for (const d of host.querySelectorAll(".chat-aside")) {
-      expect((d as HTMLDetailsElement).open, "旁支不应默认展开").toBe(false);
-    }
-    const texts = [...host.querySelectorAll(".chat-body--text")];
-    expect(texts.some((t) => t.textContent!.includes("我先写文件"))).toBe(true);
-    // 正文不在 <details> 里——它是主线，不该需要点一下才看得到
-    expect(texts.filter((t) => t.closest("details.chat-aside")).length).toBe(0);
-  });
-
-  /**
-   * 思考过程的数据一直在：src/model-client.ts:41 显式开了 adaptive thinking，
-   * loop.ts:209 完整 push 了 content 块。此前只是没人渲染它。
-   */
-  it("渲染 thinking 块，默认折叠且自成语域", () => {
-    const host = mount(transcript);
-    const th = host.querySelector("details.chat-thinking") as HTMLDetailsElement;
-    expect(th).toBeTruthy();
-    expect(th.open).toBe(false);
-    expect(th.querySelector("summary")!.textContent).toContain("思考过程");
-    expect(th.textContent).toContain("先确认路径是否在工作目录内");
-    // 与工具旁支不是同一类东西，不得混用同一个视觉语域
-    expect(th.classList.contains("chat-aside")).toBe(false);
-  });
-
-  it("加密的 thinking 照实说明，不假装没有", () => {
-    const host = mount({
-      segments: [{
-        index: 0, source: "main",
-        messages: [{ role: "assistant", content: [{ type: "redacted_thinking", data: "xxx" }] }],
-      }],
-    });
-    expect(host.textContent).toContain("已被服务端加密");
-  });
-
-  it("assistant 的 text 与 tool_use 同框呈现", () => {
-    const host = mount(transcript);
-    const a = [...host.querySelectorAll(".chat-msg--assistant")];
-    expect(a).toHaveLength(2);
-    expect(a[0].textContent).toContain("我先写文件");
-    expect(a[0].querySelector(".chat-aside--call")!.textContent).toContain("write_file");
-  });
-
-  it("失败的工具返回带错误标记", () => {
-    const host = mount({
-      segments: [{
-        index: 0, source: "main",
-        messages: [{
-          role: "user",
-          content: [{ type: "tool_result", tool_use_id: "t", content: "boom", is_error: true }],
-        }],
-      }],
-    });
-    expect(host.querySelector(".chat-aside--err")).toBeTruthy();
-  });
-
-  it("tool_result 的 content 为内容块数组时同样能取出文本", () => {
-    const host = mount({
-      segments: [{
-        index: 0, source: "main",
-        messages: [{
-          role: "user",
-          content: [{ type: "tool_result", tool_use_id: "t", content: [{ type: "text", text: "块形式输出" }] }],
-        }],
-      }],
-    });
-    expect(host.querySelector(".chat-aside")!.textContent).toContain("块形式输出");
-  });
-
-  it("多段会话之间插入来源分界", () => {
-    const host = mount({
-      segments: [
-        { index: 0, source: "main", messages: [{ role: "user", content: "任务" }] },
-        { index: 1, source: "rework", messages: [{ role: "user", content: "返工" }] },
-      ],
-    });
-    const bounds = [...host.querySelectorAll(".segment-boundary")];
-    expect(bounds.length).toBeGreaterThanOrEqual(2);
-    expect(bounds.some((b) => b.textContent!.includes("返工"))).toBe(true);
-  });
-
-  it("未拉到 / 为空时给出解释而不是空白", () => {
-    expect(mount(null).textContent).toContain("正在载入会话");
-    expect(mount({ segments: [] }).textContent).toContain("尚无完整会话记录");
-  });
-
-  it("对话视图零 violations（两套主题）", async () => {
-    for (const theme of ["light", "dark"]) {
-      document.body.innerHTML = loadSkeleton();
-      document.documentElement.setAttribute("data-theme", theme);
-      renderRunDetail(buildRichState(), {
-        activeTab: "loop", harness: FAKE_HARNESS, loopView: "chat", transcript,
-      });
-      const violations = await runAxe();
-      expect(violations, `${theme}: ${JSON.stringify(violations, null, 2)}`).toEqual([]);
-    }
-  });
-});
-
-// ================================================================
-// v2 R7：编排面板 (V-27)
 // ================================================================
 
 describe("编排面板", () => {
@@ -727,6 +602,7 @@ describe("编排面板", () => {
 
   it("依赖分层渲染：同层并列、跨层标依赖、独占资源可见", () => {
     renderRunDetail(planState(), { activeTab: "loop", harness: FAKE_HARNESS });
+    openDrawer();
     const board = document.querySelector(".plan-board")!;
     const layers = [...board.querySelectorAll(".plan-layer")];
     expect(layers).toHaveLength(2);
@@ -740,6 +616,7 @@ describe("编排面板", () => {
 
   it("并行收益的每个数字都带口径", () => {
     renderRunDetail(planState(), { activeTab: "loop", harness: FAKE_HARNESS });
+    openDrawer();
     const t = document.querySelector(".plan-timing")!.textContent!;
     expect(t).toContain("排除拆解");
     expect(t).toContain("串行基线");
@@ -754,6 +631,7 @@ describe("编排面板", () => {
       event: { type: "plan_result", planned: false, completed: false, plannerRaw: "我觉得不用拆", steps: [], skipped: [] },
     });
     renderRunDetail(s, { activeTab: "loop", harness: FAKE_HARNESS });
+    openDrawer();
     const board = document.querySelector(".plan-board")!;
     expect(board.textContent).toContain("未能产出可解析计划");
     expect(board.textContent).toContain("我觉得不用拆");
@@ -761,6 +639,7 @@ describe("编排面板", () => {
 
   it("非编排运行不渲染编排面板", () => {
     renderRunDetail(buildRichState(), { activeTab: "loop", harness: FAKE_HARNESS });
+    openDrawer();
     const board = document.querySelector(".plan-board") as HTMLElement;
     expect(board.hidden).toBe(true);
   });
@@ -770,6 +649,7 @@ describe("编排面板", () => {
       document.body.innerHTML = loadSkeleton();
       document.documentElement.setAttribute("data-theme", theme);
       renderRunDetail(planState(), { activeTab: "loop", harness: FAKE_HARNESS });
+      openDrawer();
       const violations = await runAxe();
       expect(violations, `${theme}: ${JSON.stringify(violations, null, 2)}`).toEqual([]);
     }
@@ -953,6 +833,7 @@ describe("统一 composer：一个框，两种去向", () => {
     renderRunDetail(doneState(), {
       activeTab: "loop", harness: FAKE_HARNESS, loopView: "chat", transcript,
     });
+    openDrawer();
     expect(document.querySelectorAll("#task-input")).toHaveLength(1);
     expect(document.querySelectorAll("form")).toHaveLength(1);
     expect(document.querySelectorAll('[role="alert"]')).toHaveLength(1);
@@ -964,7 +845,12 @@ describe("统一 composer：一个框，两种去向", () => {
    * transcript 只在每一段结束时落盘。追加的那句话此刻只存在于事件流里，
    * 不补上的话用户会看到自己刚发的消息凭空消失。
    */
-  it("进行中的这一轮：追加的指令先从事件流补进对话，并说明尚未落盘", () => {
+  /**
+   * 对话改从**事件流**派生之后，"追加的话要不要补进去"这个问题本身消失了——
+   * 它本来就在事件流里。此前要靠一段特判把它塞进 transcript 的渲染结果里，
+   * 因为 transcript 只在段结束时才落盘。这条锁住新形态：追加即可见，且实时。
+   */
+  it("追加的指令立刻出现在对话主干里（不必等落盘）", () => {
     let s = doneState();
     s = reduceEvent(s, {
       seq: 2, source: "host",
@@ -972,10 +858,10 @@ describe("统一 composer：一个框，两种去向", () => {
     });
     expect(s.status, "user_message 应把 run 从终态拉回运行中").toBe("running");
 
-    renderRunDetail(s, { activeTab: "loop", harness: FAKE_HARNESS, loopView: "chat", transcript });
-    const chat = document.querySelector(".chat-view")!;
+    renderRunDetail(s, { activeTab: "loop", harness: FAKE_HARNESS });
+
+    const chat = document.querySelector(".conversation")!;
     expect(chat.textContent).toContain("暗号是什么？");
-    expect(chat.textContent).toContain("本轮结束后落盘");
   });
 
   it("composer 的两种模式各自零 violations（两套主题）", async () => {
@@ -990,6 +876,7 @@ describe("统一 composer：一个框，两种去向", () => {
         renderRunDetail(doneState(), {
           activeTab: "loop", harness: FAKE_HARNESS, loopView: "chat", transcript,
         });
+        openDrawer();
         // 必须先打补丁再扫：不打的话 axe 看到的永远是那份静态骨架，
         // 「禁用 + aria-describedby + note 可见」这个组合形态一眼都扫不到
         patchComposer(mode);
@@ -1000,59 +887,6 @@ describe("统一 composer：一个框，两种去向", () => {
     }
   });
 });
-
-describe("续跑返回累计正史时的去重 (V-28)", () => {
-  /**
-   * runContinuation 返回的是**累计**正史：第 2 轮那一段的 messages 包含
-   * 第 1 轮的全部消息。逐段全量渲染会把前面几轮重复画一遍——实测第一次
-   * 就撞上了（seg0 两条、seg1 四条，前两条完全相同）。
-   */
-  it("同源且构成前缀的后续段只渲染增量", () => {
-    const t1 = { role: "user", content: "记住暗号 alpha-7" };
-    const t2 = { role: "assistant", content: [{ type: "text", text: "记住了。" }] };
-    const t3 = { role: "user", content: "暗号是什么？" };
-    const t4 = { role: "assistant", content: [{ type: "text", text: "是 alpha-7。" }] };
-
-    const host = document.createElement("div");
-    host.innerHTML = renderConversation(
-      {
-        segments: [
-          { index: 0, source: "main", messages: [t1, t2] },
-          { index: 1, source: "main", messages: [t1, t2, t3, t4] },
-        ],
-      },
-      { lastSeq: 0, timeline: [] },
-    );
-    document.body.appendChild(host);
-
-    const all = host.textContent!;
-    expect(all.split("记住暗号 alpha-7").length - 1, "第一轮被重复渲染").toBe(1);
-    expect(all.split("记住了。").length - 1).toBe(1);
-    expect(all).toContain("暗号是什么？");
-    expect(all).toContain("是 alpha-7。");
-  });
-
-  it("不构成前缀的段（如 fresh 返工）照常整段渲染并加分界", () => {
-    const host = document.createElement("div");
-    host.innerHTML = renderConversation(
-      {
-        segments: [
-          { index: 0, source: "main", messages: [{ role: "user", content: "原任务" }] },
-          { index: 1, source: "rework", messages: [{ role: "user", content: "返工任务" }] },
-        ],
-      },
-      { lastSeq: 0, timeline: [] },
-    );
-    document.body.appendChild(host);
-    expect(host.textContent).toContain("原任务");
-    expect(host.textContent).toContain("返工任务");
-    expect(host.querySelectorAll(".segment-boundary").length).toBeGreaterThanOrEqual(2);
-  });
-});
-
-// ================================================================
-// v2 R11：侧栏分组 + 常驻水位 (V-32 / V-33)
-// ================================================================
 
 describe("侧栏按工作目录分组", () => {
   const meta = new Map();
@@ -1114,11 +948,13 @@ describe("常驻上下文水位", () => {
 
   it("无用量时不显示——不给一个恒为 0% 的摆设", () => {
     renderRunDetail(createInitialState("r", "t", false), { activeTab: "loop", harness: H });
+    openDrawer();
     expect((document.querySelector(".ctx-gauge") as HTMLElement).hidden).toBe(true);
   });
 
   it("显示百分比与刻度，无障碍名称说全口径", () => {
     renderRunDetail(stateWithUsage(480), { activeTab: "loop", harness: H });
+    openDrawer();
     const g = document.querySelector(".ctx-gauge") as HTMLElement;
     expect(g.hidden).toBe(false);
     expect(g.textContent).toContain("48%");
@@ -1130,6 +966,7 @@ describe("常驻上下文水位", () => {
 
   it("越过压缩水位转 warn 语域", () => {
     renderRunDetail(stateWithUsage(900), { activeTab: "loop", harness: H });
+    openDrawer();
     expect(document.querySelector(".ctx-gauge")!.classList.contains("ctx-gauge--warn")).toBe(true);
   });
 
@@ -1139,6 +976,7 @@ describe("常驻上下文水位", () => {
    */
   it("已发生压缩时走不可逆语域，并在名称里说明不可恢复", () => {
     renderRunDetail(stateWithUsage(300, 2), { activeTab: "loop", harness: H });
+    openDrawer();
     const g = document.querySelector(".ctx-gauge")!;
     expect(g.classList.contains("ctx-gauge--irreversible")).toBe(true);
     expect(g.textContent).toContain("⊟2");
@@ -1149,6 +987,7 @@ describe("常驻上下文水位", () => {
     const seen: string[] = [];
     document.addEventListener("tab-switch", (e) => seen.push((e as CustomEvent).detail.tab));
     renderRunDetail(stateWithUsage(480), { activeTab: "loop", harness: H });
+    openDrawer();
     (document.querySelector(".ctx-gauge") as HTMLElement).click();
     expect(seen).toEqual(["context"]);
   });
@@ -1161,6 +1000,7 @@ describe("常驻上下文水位", () => {
     renderRunDetail(stateWithUsage(480), {
       activeTab: "loop", harness: { ...FAKE_HARNESS, guardrails: {} },
     });
+    openDrawer();
     const g = document.querySelector(".ctx-gauge")!;
     expect(g.textContent).not.toContain("%");
     expect(g.textContent).not.toContain("▯");
@@ -1172,9 +1012,11 @@ describe("常驻上下文水位", () => {
   it("配了上限时才画刻度，格数随水位增长", () => {
     const H2 = { ...FAKE_HARNESS, guardrails: { ...FAKE_HARNESS.guardrails, contextTokenLimit: 1000 } };
     renderRunDetail(stateWithUsage(150), { activeTab: "loop", harness: H2 });
+    openDrawer();
     const low = document.querySelector(".ctx-gauge")!.textContent!;
     document.body.innerHTML = loadSkeleton();
     renderRunDetail(stateWithUsage(950), { activeTab: "loop", harness: H2 });
+    openDrawer();
     const high = document.querySelector(".ctx-gauge")!.textContent!;
     expect((low.match(/▮/g) ?? []).length).toBeLessThan((high.match(/▮/g) ?? []).length);
   });

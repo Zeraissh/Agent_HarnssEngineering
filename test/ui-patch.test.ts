@@ -26,6 +26,9 @@ import {
   keepScrollAnchored,
   createBatcher,
   shouldShowReconnecting,
+  deriveChatItems,
+  toolPeek,
+  foldChain,
   applyCollapseOverrides,
   nextCollapseOverride,
 } from "../ui/public/app.js";
@@ -805,22 +808,24 @@ describe("换标签重建时对话视图的签名要一起作废", () => {
   }
 
   /**
-   * 换标签时 `.tab-content` 整体重建，`.chat-view` 变成空 div；若只清
-   * `sig.tabBody` 而漏了 `sig.chat`，patchLoopView 看签名没变直接提前 return，
-   * 于是**整段对话白屏，且没有任何报错**。
+   * 旧形态下对话是 Loop 面里的子视图，换标签会把它连同下钻面一起重建——
+   * 曾因漏清一个签名导致整段对话白屏。**对话升为主干后它在下钻面之外**，
+   * 换标签结构上碰不到它。这条锁的就是这个结构事实。
    */
-  it("loop → tools → loop 之后对话内容还在", () => {
+  it("对话在下钻抽屉之外：换标签不影响它", () => {
     const s = doneState();
-    const opts = { harness: null, loopView: "chat", transcript } as any;
-    renderRunDetail(s, { ...opts, activeTab: "loop" });
-    expect(document.querySelector(".chat-view")!.textContent).toContain("记住了");
+    renderRunDetail(s, { activeTab: "loop", harness: null });
+    const chat = document.querySelector(".conversation")!;
+    expect(chat.textContent).toContain("记住暗号");
 
-    renderRunDetail(s, { ...opts, activeTab: "tools" });
-    renderRunDetail(s, { ...opts, activeTab: "loop" });
+    renderRunDetail(s, { activeTab: "tools", harness: null });
+    renderRunDetail(s, { activeTab: "loop", harness: null });
+    expect(document.querySelector(".conversation")).toBe(chat); // 同一个节点，没被重建
+    expect(chat.textContent).toContain("记住暗号");
     expect(
-      document.querySelector(".chat-view")!.textContent,
-      "换标签再切回，对话整段消失了",
-    ).toContain("记住了");
+      document.getElementById("tab-content")!.contains(chat),
+      "对话不该落在下钻面里",
+    ).toBe(false);
   });
 });
 
@@ -963,5 +968,132 @@ describe("R-01 运行结束后，页面上不该有任何可点的审批按钮",
       (document.getElementById("action-dock") as HTMLElement).hidden,
       "已结束的运行不该还占着待办坞",
     ).toBe(true);
+  });
+});
+
+// ================================================================
+// 对话主干（委托方："还是希望做成对话框的形式"）
+// ================================================================
+
+describe("deriveChatItems：对话从事件流派生，因此实时", () => {
+  const run = (...evts: any[]) => {
+    let s = createInitialState("run-chat2", "查一下今天的天气", false);
+    return reduceEvents(s, evts);
+  };
+
+  it("任务本身是第一条用户消息——打开运行第一眼要看到自己要求了什么", () => {
+    const items = deriveChatItems(run());
+    expect(items[0]).toMatchObject({ kind: "user", text: "查一下今天的天气" });
+  });
+
+  it("工具调用与它的返回合成一行，而不是两条各自漂着", () => {
+    const s = run(
+      sse(0, "main", "turn_start", { turn: 1 }),
+      sse(1, "main", "tool_call", { toolUseId: "t1", name: "bash", input: { command: "date" } }),
+      sse(2, "main", "tool_result", { toolUseId: "t1", result: { content: "2026-08-08", isError: false }, durationMs: 12 }),
+    );
+    const tools = deriveChatItems(s).filter((i) => i.kind === "tool");
+    expect(tools).toHaveLength(1);
+    expect(tools[0]).toMatchObject({ name: "bash", status: "ok", result: "2026-08-08", durationMs: 12 });
+  });
+
+  it("还没返回的工具是 running 态——运行中就该看得见它正在做什么", () => {
+    const s = run(sse(0, "main", "tool_call", { toolUseId: "t1", name: "bash", input: { command: "sleep 5" } }));
+    expect(deriveChatItems(s).filter((i) => i.kind === "tool")[0]!.status).toBe("running");
+  });
+
+  /**
+   * 事后回看时，"这一步被拦过"必须看得出来。只把审批卡放在坞里的话，
+   * 运行结束坞收起，对话里的那次调用就变成凭空执行了。
+   */
+  it("经过审批的工具带放行标记", () => {
+    const s = run(
+      sse(0, "main", "tool_call", { toolUseId: "t1", name: "write_file", input: { path: "a.txt" } }),
+      sse(1, "main", "approval_request", { toolUseId: "t1", name: "write_file", input: { path: "a.txt" } }),
+    );
+    expect(deriveChatItems(s).find((i) => i.kind === "tool")).toMatchObject({ gated: true });
+  });
+
+  it("换来源插一条分界（main → verifier），turn_start 这类噪声不插", () => {
+    const s = run(
+      sse(0, "main", "assistant_text", { text: "做完了" }),
+      sse(1, "verifier", "assistant_text", { text: "我来复核" }),
+    );
+    const kinds = deriveChatItems(s).map((i) => i.kind);
+    expect(kinds.filter((k) => k === "boundary")).toHaveLength(2); // main 段 + verifier 段
+  });
+
+  it("裁决作为收尾卡进对话，不再是另一个页面", () => {
+    let s = run(sse(0, "main", "assistant_text", { text: "做完了" }));
+    s = reduceEvents(s, [
+      sse(1, "verifier", "verification", {
+        round: 0,
+        verdict: { passed: false, issues: ["缺收尾"], unverified: [], advisory: [], summary: "未通过" },
+      }),
+    ]);
+    const v = deriveChatItems(s).find((i) => i.kind === "verdict");
+    expect(v).toBeTruthy();
+    expect(v!.verdict.issues).toEqual(["缺收尾"]);
+  });
+
+  it("空文本不产生空气泡", () => {
+    const s = run(sse(0, "main", "assistant_text", { text: "   " }));
+    expect(deriveChatItems(s).filter((i) => i.kind === "text")).toHaveLength(0);
+  });
+});
+
+describe("toolPeek：摘要要一眼认得出在干什么", () => {
+  /**
+   * 委托方截图里那行 `→ bash {` 就是反例：入参被美化过（缩进 JSON），
+   * 取首行自然只剩一个左花括号，等于什么都没说。
+   */
+  it("bash 取 command，不是那个左花括号", () => {
+    expect(toolPeek("bash", { command: "npx vitest run" })).toBe("npx vitest run");
+    expect(toolPeek("bash", { command: "a\nb" })).toBe("a");
+  });
+
+  it("读写类取路径、抓取类取 URL", () => {
+    expect(toolPeek("read_file", { path: "src/loop.ts" })).toBe("src/loop.ts");
+    expect(toolPeek("fetch_url", { url: "https://example.com" })).toBe("https://example.com");
+  });
+
+  it("没有已知主参数时给紧凑单行，绝不返回孤零零的括号", () => {
+    const peek = toolPeek("weird", { a: 1, b: [2, 3] });
+    expect(peek).toContain("a=1");
+    expect(peek.trim()).not.toBe("{");
+  });
+
+  it("空入参返回空串而不是崩", () => {
+    expect(toolPeek("x", null)).toBe("");
+    expect(toolPeek("x", undefined)).toBe("");
+  });
+});
+
+describe("foldChain：连续主轮折叠成计数", () => {
+  /**
+   * 多轮对话下会出现二十几个连着的 main 段，逐个画出来就是一排一模一样的
+   * 「■ 主轮」——委托方截图里那一行占满整屏却零信息量。
+   */
+  it("20 个连续主轮折成一个 ×20", () => {
+    const folded = foldChain(Array.from({ length: 20 }, () => ({ role: "main", round: 0, passed: null })));
+    expect(folded).toHaveLength(1);
+    expect(folded[0].count).toBe(20);
+  });
+
+  /** 只折 main：返工三次必须还看得出是三次，否则等于把失败史抹平 */
+  it("核查与返工不折叠", () => {
+    const folded = foldChain([
+      { role: "main" }, { role: "main" },
+      { role: "verifier", round: 0 }, { role: "rework", round: 1 },
+      { role: "verifier", round: 1 }, { role: "rework", round: 2 },
+    ]);
+    expect(folded.map((c) => `${c.role}${c.count > 1 ? "×" + c.count : ""}`)).toEqual([
+      "main×2", "verifier", "rework", "verifier", "rework",
+    ]);
+  });
+
+  it("空链不炸", () => {
+    expect(foldChain([])).toEqual([]);
+    expect(foldChain(undefined)).toEqual([]);
   });
 });

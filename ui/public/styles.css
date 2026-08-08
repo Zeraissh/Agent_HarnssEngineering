@@ -1877,3 +1877,88 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
 .submit-bar[data-mode="append"] {
   border-left: 3px solid var(--accent);
 }
+
+/* ===== 对话主干（委托方："还是希望做成对话框的形式"）===== */
+/* 单列、限宽、留白——按"读文章"排版，而不是按"看仪表盘"排版 */
+.conversation {
+  max-width: 78ch;
+  margin: 0 auto var(--space-lg);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+}
+
+/* 工具调用：一行摘要，展开才看细节。它是旁支，不该和正文抢视觉权重 */
+.chat-tool {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg2);
+  font-size: var(--font-md);
+}
+.chat-tool > summary {
+  cursor: pointer;
+  padding: var(--space-xs) var(--space-sm);
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-sm);
+  list-style: none;
+}
+.chat-tool > summary::-webkit-details-marker { display: none; }
+.chat-tool--err { border-color: var(--red); }
+.chat-tool--live { border-style: dashed; }
+.chat-tool .chat-body {
+  margin: 0;
+  padding: var(--space-sm);
+  border-top: 1px solid var(--border);
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--font-mono);
+  font-size: var(--font-sm);
+}
+/* 曾被人工放行过：事后回看必须看得出这一步被拦过，否则读起来像凭空执行 */
+.chat-tool-gate { color: var(--yellow); font-size: var(--font-sm); }
+
+.chat-gate {
+  color: var(--yellow);
+  font-size: var(--font-md);
+  border-left: 3px solid var(--yellow);
+  padding-left: var(--space-sm);
+}
+
+/* 裁决卡：一段的收尾，就地长在对话里 */
+.chat-verdict {
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  border-radius: var(--radius-sm);
+  padding: var(--space-sm) var(--space-md);
+  background: var(--bg2);
+}
+.chat-verdict--ok { border-left-color: var(--green); }
+.chat-verdict--warn { border-left-color: var(--yellow); }
+.chat-verdict--bad { border-left-color: var(--red); }
+.chat-verdict-head {
+  font-weight: 600;
+  display: flex;
+  gap: var(--space-sm);
+  align-items: baseline;
+}
+.chat-verdict-summary { margin: var(--space-xs) 0 0; }
+.chat-verdict-list { margin: var(--space-xs) 0 0; padding-left: var(--space-lg); }
+.chat-verdict-list--bad { color: var(--red); }
+.chat-verdict-list--warn { color: var(--yellow); }
+.chat-verdict-list--note { color: var(--magenta); }
+
+/* ===== 运行详情抽屉：仪表盘退居二线，默认收起 ===== */
+.detail-drawer {
+  margin-top: var(--space-lg);
+  border-top: 1px solid var(--border);
+  padding-top: var(--space-sm);
+}
+.drawer-summary {
+  cursor: pointer;
+  color: var(--text-2);
+  font-size: var(--font-md);
+  padding: var(--space-xs) 0;
+}
+.drawer-summary:hover { color: var(--text-1); }

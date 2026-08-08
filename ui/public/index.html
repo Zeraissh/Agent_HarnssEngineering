@@ -482,9 +482,6 @@ function renderDetailWithState(state) {
     liveText: liveTexts.get(runId) ?? "",
     liveThinking: liveThinking.get(runId) ?? "",
     onPlanDecision: (decision) => postPlanDecision(runId, decision),
-    loopView: loopViews.get(runId) ?? "events",
-    transcript: transcripts.get(runId) ?? null,
-    onSwitchView: (view) => switchLoopView(runId, view),
   });
   // 本地 SSE 把状态推到 done 时列表未必同步刷新过——底栏要立刻从「运行中」
   // 变回「继续对话」，否则用户盯着一个死按钮等
