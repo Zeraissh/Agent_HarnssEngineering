@@ -1840,7 +1840,7 @@ export function renderRunDetail(state, callbacks) {
   patchApprovalRail(parts, state, isRunning, callbacks);
   patchUnverifiedRail(parts, faces);
   patchLiveStrip(parts, state, isRunning, callbacks.liveText ?? "", callbacks.liveThinking ?? "");
-  patchConversation(parts, state);
+  patchConversation(parts, state, { text: callbacks.liveText, thinking: callbacks.liveThinking });
   patchDetailRail(parts, faces);
   patchOutcomeCard(parts, state, overview, faces);
   patchFactorGrid(parts, faces, activeTab, callbacks);
@@ -1961,6 +1961,7 @@ function ensureDetailSkeleton(mainEl, state, callbacks) {
   if (showBack) {
     mainEl.querySelector("#back-to-list-btn").addEventListener("click", callbacks.onBack);
   }
+  bindThinkingPref(mainEl.querySelector(".conversation"));
   const railToggle = mainEl.querySelector("#rail-toggle");
   if (railToggle) {
     railToggle.addEventListener("click", () => {
@@ -2178,15 +2179,21 @@ function patchLiveStrip(parts, state, isRunning, liveText = "", liveThinking = "
   const text = recent.find((e) => e.type === "assistant_text");
   // 优先级：正文 > 思考 > 工具 > 最后一句。思考排在工具之前是因为它是【此刻】
   // 在发生的——委托方反馈的那段"只有一行流动对话"的空窗正是它
-  const label = streaming
-    ? tailOf(streaming, 80)
-    : thinking
-    ? `✽ ${tailOf(thinking, 76)}`
-    : call
-      ? `${call.name}(${summarizeInput(call.input)})`
-      : text
-        ? String(text.text ?? "").slice(0, 80)
-        : "等待模型响应…";
+  /**
+   * **正文与思考已经在对话里逐字流了，这里不再重复**（V-16）。
+   * 直播条现在只说对话此刻说不出来的那几种：正在调哪个工具、以及还没开口的空窗。
+   * 两处同时滚同一段文字会让人不知道该看哪儿——那正是"过于难用"的一种。
+   */
+  if (streaming || thinking) {
+    setAttr(parts.liveStrip, "hidden", "");
+    parts.sig.live = null;
+    return;
+  }
+  const label = call
+    ? `${call.name}(${summarizeInput(call.input)})`
+    : text
+      ? String(text.text ?? "").slice(0, 80)
+      : "等待模型响应…";
 
   const sig = signature([label]);
   if (parts.sig.live === sig) return;
@@ -2378,13 +2385,129 @@ function updateApprovalCard(card, a, isRunning) {
  * 签名只看 `lastSeq` 与条目数：事件流单调追加，这两个数不变就没有新内容。
  * 与日志面同款——重画整段对话会打断正在展开的 details 与用户的滚动位置。
  */
-function patchConversation(parts, state) {
-  if (!parts.conversation) return;
-  const items = deriveChatItems(state);
-  const sig = signature([state.lastSeq, items.length, state.verifications.length, state.status]);
-  if (parts.sig.conversation === sig) return;
-  parts.sig.conversation = sig;
-  parts.conversation.innerHTML = renderChatStream(items, state);
+function patchConversation(parts, state, live) {
+  const host = parts.conversation;
+  if (!host) return;
+  const items = deriveChatItems(state, live);
+
+  if (items.length === 0) {
+    host.__patchNodes = undefined;
+    host.innerHTML =
+      state.status === "running"
+        ? '<p class="empty-note">刚开始，还没有内容。</p>'
+        : '<p class="empty-note">这次运行没有产生对话内容。</p>';
+    return;
+  }
+  const empty = host.querySelector(".empty-note");
+  if (empty) empty.remove();
+
+  /**
+   * **键控补丁，不是整段重画。**
+   *
+   * 初版这里是一句 `innerHTML = renderChatStream(...)`。流式一开，签名每来一个
+   * 字就变一次，于是整段对话每秒重建几十遍——后果是**用户点开的思考过程当场
+   * 被关上**（`<details open>` 随节点一起没了），滚动位置也一起归零。
+   * 委托方那句"点开思考过程就应该永远显示"，缺的正是这一层。
+   *
+   * 这也正是本仓 V-10 早就定下的纪律（已存在 key 的节点永不重建，只更新），
+   * 我在把对话搬成主干时把它漏掉了。
+   */
+  patchList(host, items, {
+    key: (it) => it.key,
+    create: (it) => {
+      const node = document.createElement("div");
+      node.className = "chat-item";
+      node.__sig = chatItemSig(it);
+      node.innerHTML = renderChatItem(it, thinkingPrefOpen());
+      return node;
+    },
+    update: (node, it) => {
+      const sig = chatItemSig(it);
+      if (node.__sig === sig) return;
+      node.__sig = sig;
+      // 流式那条**就地改文本**，绝不重建：它每来一个字就走一次这里，
+      // 重建等于把用户刚点开的 details 一秒关上几十遍
+      if (it.kind === "live" && updateLiveNode(node, it)) return;
+      node.innerHTML = renderChatItem(it, thinkingPrefOpen());
+    },
+  });
+}
+
+/**
+ * 就地更新流式条目。
+ *
+ * 只改文本节点与字数，不动 DOM 结构——于是 `<details open>` 天然保住，
+ * 滚动位置也不跳。结构还不存在时（第一次出现思考、或思考之后才开口）
+ * 返回 false，交给调用方整条渲染一次。
+ *
+ * @returns {boolean} 是否已就地更新完毕
+ */
+function updateLiveNode(node, it) {
+  const wantThinking = Boolean(it.thinking.trim());
+  const wantText = Boolean(it.text.trim());
+  const thinkEl = node.querySelector(".chat-thinking--live");
+  const textEl = node.querySelector(".chat-msg--live");
+  // 结构与需求不一致 = 有新块要出现，只能重建一次
+  if (wantThinking !== Boolean(thinkEl) || wantText !== Boolean(textEl)) return false;
+
+  if (thinkEl) {
+    setText(thinkEl.querySelector(".chat-live-text"), it.thinking);
+    setText(thinkEl.querySelector(".aside-peek"), `${it.thinking.length} 字`);
+  }
+  if (textEl) setText(textEl.querySelector(".chat-live-text"), it.text);
+  return true;
+}
+
+/** 一条对话条目的可变部分——只有它变了才重建那一条 */
+function chatItemSig(it) {
+  switch (it.kind) {
+    case "live":
+      return `live:${it.thinking.length}:${it.text.length}`;
+    case "tool":
+      return `tool:${it.status}:${it.gated ? 1 : 0}:${it.durationMs ?? ""}:${(it.result ?? "").length}`;
+    case "verdict":
+      return `verdict:${JSON.stringify(it.verdict)}`;
+    default:
+      return `${it.kind}:${(it.text ?? "").length}`;
+  }
+}
+
+/**
+ * "思考过程展开与否"是**用户的偏好**，不是每条消息各自的状态。
+ *
+ * 委托方的原话是"点开的时候就永远显示流式的思考过程，再点一次关闭就不看"——
+ * 也就是说这个开关一次设定、后续每一轮都照办。逐条记的话，每来一轮新思考
+ * 又是收起的，等于每轮都要再点一次。存进 localStorage，跨会话也保持。
+ */
+const THINKING_PREF_KEY = "agent-ui-thinking-open";
+
+function thinkingPrefOpen() {
+  try {
+    return localStorage.getItem(THINKING_PREF_KEY) === "1";
+  } catch {
+    return false; // 隐私模式下读不到就按收起处理，不影响主流程
+  }
+}
+
+/**
+ * 展开/收起思考块时记住偏好。
+ * 用**事件委托**绑在对话容器上（`toggle` 事件不冒泡，所以监听 summary 的 click），
+ * 这样键控补丁重建条目时不会漏绑、也不会重复绑。
+ */
+function bindThinkingPref(host) {
+  if (!host || host.__thinkingBound) return;
+  host.__thinkingBound = true;
+  host.addEventListener("click", (e) => {
+    const summary = e.target instanceof Element ? e.target.closest("summary") : null;
+    const details = summary && summary.parentElement;
+    if (!details || !details.classList.contains("chat-thinking")) return;
+    // click 先于浏览器切换 open，所以这里取反才是切换后的值
+    try {
+      localStorage.setItem(THINKING_PREF_KEY, details.open ? "0" : "1");
+    } catch {
+      // 写不进去也不影响本次展开，静默
+    }
+  });
 }
 
 /**
@@ -3078,7 +3201,7 @@ function patchLoopView(parts, container, state, logEntries, callbacks) {
  *
  * @returns {{kind:string,[k:string]:any}[]}
  */
-export function deriveChatItems(state) {
+export function deriveChatItems(state, live) {
   const items = [];
   /**
    * 开场白：**任务本身就是第一条用户消息**。
@@ -3157,6 +3280,34 @@ export function deriveChatItems(state) {
   for (const v of state.verifications ?? []) {
     items.push({ kind: "verdict", round: v.round, verdict: v.verdict, recovery: v.recovery ?? null });
   }
+
+  /**
+   * **正在流入的那一轮**（委托方："对话中的流式输出也没有做好，思考过程也没法
+   * 流式被用户看见"）。
+   *
+   * 此前逐字增量只喂给页面顶部那条一行的直播条，对话里要等整轮结束、
+   * `assistant_text` 落下来才突然出现一整段。于是"正在发生的事"和"发生过的事"
+   * 在两个地方，而人的注意力只能在一处。现在增量直接长在对话末尾，
+   * 那一轮结束时被真正的 `assistant_text` 条目自然接替。
+   *
+   * 思考与正文分成两块：思考仍是可折叠的（它是"为什么这么做"的证据，不是主线），
+   * 但**展开之后就一直流**——这正是委托方要的那个行为。
+   */
+  const liveText = String(live?.text ?? "");
+  const liveThinking = String(live?.thinking ?? "");
+  if (state.status === "running" && (liveText.trim() || liveThinking.trim())) {
+    items.push({ kind: "live", text: liveText, thinking: liveThinking });
+  }
+
+  // 稳定 key：节点靠它复用，不复用就保不住 details 的展开状态与滚动位置
+  let n = 0;
+  for (const it of items) {
+    it.key =
+      it.kind === "live" ? "live"
+      : it.kind === "verdict" ? `verdict:${it.round}`
+      : `${it.kind}:${it.seq ?? "x"}:${n}`;
+    n++;
+  }
   return items;
 }
 
@@ -3176,8 +3327,19 @@ export function renderChatStream(items, state) {
       ? '<p class="empty-note">刚开始，还没有内容。</p>'
       : '<p class="empty-note">这次运行没有产生对话内容。</p>';
   }
-  let html = "";
-  for (const it of items) {
+  return items.map((it) => renderChatItem(it)).join("");
+}
+
+/**
+ * 单条对话条目。
+ *
+ * @param {any} it
+ * @param {boolean} [thinkingOpen] 思考块是否默认展开——见 `THINKING_PREF_KEY`
+ * @returns {string}
+ */
+export function renderChatItem(it, thinkingOpen = false) {
+  {
+    let html = "";
     switch (it.kind) {
       case "boundary":
         html += renderSegmentBoundary({ role: it.role, round: it.round ?? 0, source: it.source });
@@ -3195,9 +3357,30 @@ export function renderChatStream(items, state) {
       case "thinking":
         html += it.redacted
           ? '<div class="chat-thinking chat-thinking--redacted">✽ 思考过程已被服务端加密（redacted），无法展示</div>'
-          : '<details class="chat-thinking">' +
+          : `<details class="chat-thinking"${thinkingOpen ? " open" : ""}>` +
             `<summary>✽ 思考过程 <span class="aside-peek">${it.text.length} 字</span></summary>` +
             `<div class="chat-body chat-body--text md">${renderMarkdown(it.text)}</div></details>`;
+        break;
+      /**
+       * 正在流入的这一轮。思考在上、正文在下，与已落定的形态一致，
+       * 所以它结束时被真正的条目接替不会有视觉跳变。
+       *
+       * 正文用**纯文本**而不是 Markdown：半截的 Markdown（没闭合的围栏、
+       * 写到一半的表格）每来一个字就重排一次，看着像抽搐。整轮结束后
+       * `assistant_text` 那条会用 Markdown 重新渲染同一段。
+       */
+      case "live":
+        if (it.thinking.trim()) {
+          html +=
+            `<details class="chat-thinking chat-thinking--live"${thinkingOpen ? " open" : ""}>` +
+            `<summary>✽ 正在思考 <span class="aside-peek">${it.thinking.length} 字</span></summary>` +
+            `<div class="chat-body chat-body--text chat-live-text">${esc(it.thinking)}</div></details>`;
+        }
+        if (it.text.trim()) {
+          html +=
+            '<div class="chat-msg chat-msg--assistant chat-msg--live"><div class="chat-role">¶ Agent</div>' +
+            `<div class="chat-body chat-body--text chat-live-text">${esc(it.text)}</div></div>`;
+        }
         break;
       case "tool":
         html += renderToolRow(it);
@@ -3211,8 +3394,8 @@ export function renderChatStream(items, state) {
       default:
         break;
     }
+    return html;
   }
-  return html;
 }
 
 /**

@@ -536,12 +536,15 @@ describe("重试退避等待在界面上可见", () => {
 // 文本流式（backlog §4）
 // ================================================================
 
-describe("直播条消费逐字增量", () => {
+describe("流式输出直接长在对话里", () => {
   /**
-   * 服务端 R2 起就在推 `event: delta`，前端一直丢弃——直播条显示的是上一条
-   * **完整** assistant_text。这里锁的是"流入的文本优先于已发生完的事"。
-   * liveText 不进 RunState（delta 不占 seq、重放时不存在），所以它是 render
-   * 的入参而不是 state 的字段——这一点本身也由下面"重放幂等"那条守住。
+   * 服务端 R2 起就在推 `event: delta`。此前它只喂给页面顶部那条**一行**的直播条，
+   * 对话里要等整轮结束、`assistant_text` 落下来才突然出现一整段——于是
+   * "正在发生的事"和"发生过的事"在两个地方，而人的注意力只能在一处。
+   * 委托方："对话中的流式输出也没有做好，思考过程也没法流式被用户看见。"
+   *
+   * liveText/liveThinking 不进 RunState（delta 不占 seq、重放时不存在），
+   * 所以它们是 render 的入参而不是 state 的字段。
    */
   function runningState() {
     let s = createInitialState("run-s", "流式任务", false);
@@ -549,58 +552,88 @@ describe("直播条消费逐字增量", () => {
     return s;
   }
 
-  const liveText = () =>
-    document.querySelector(".live-strip .live-text")?.textContent ?? "";
+  const conv = () => document.querySelector(".conversation")?.textContent ?? "";
+  const strip = () => document.querySelector(".live-strip .live-text")?.textContent ?? "";
 
-  it("有增量时显示增量的尾部，而不是「等待模型响应…」", () => {
+  it("正文增量逐字出现在对话末尾", () => {
     renderRunDetail(runningState(), { activeTab: "loop", liveText: "我先读一下 package.json" });
-    expect(liveText()).toContain("package.json");
-    expect(liveText()).not.toContain("等待模型响应");
+    expect(conv()).toContain("package.json");
+    expect(document.querySelector(".chat-msg--live")).toBeTruthy();
   });
 
-  it("超长增量取尾部——要看的是刚写出来的那截", () => {
-    const long = `${"甲".repeat(300)}结论在最后`;
-    renderRunDetail(runningState(), { activeTab: "loop", liveText: long });
-    expect(liveText()).toContain("结论在最后");
-    expect(liveText().length).toBeLessThan(100);
+  it("思考增量也在对话里，且是可折叠的一块", () => {
+    renderRunDetail(runningState(), { activeTab: "loop", liveThinking: "先确认路径在不在工作目录内" });
+    expect(conv()).toContain("先确认路径在不在工作目录内");
+    const d = document.querySelector("details.chat-thinking--live");
+    expect(d, "流式思考应当是一块可折叠的 details").toBeTruthy();
   });
 
-  it("增量里的换行折成单行——直播条是单行，原样塞进去会撑开布局", () => {
-    renderRunDetail(runningState(), { activeTab: "loop", liveText: "第一行\n\n第二行" });
-    expect(liveText()).not.toContain("\n");
-    expect(liveText()).toContain("第一行 第二行");
+  /** 半截 Markdown 每来一个字重排一次，看着像抽搐；整轮结束后再按 Markdown 渲染 */
+  it("流式正文按纯文本渲染，不做 Markdown", () => {
+    renderRunDetail(runningState(), { activeTab: "loop", liveText: "**还没写完的粗体" });
+    expect(document.querySelector(".chat-msg--live strong")).toBeNull();
+    expect(conv()).toContain("**还没写完的粗体");
   });
 
-  it("增量为空时退回原行为（最近一次工具调用）", () => {
+  /**
+   * **对话已经在逐字流了，直播条不该再滚同一段字**（V-16）。
+   * 两处同时滚同一段文字会让人不知道该看哪儿——那正是"过于难用"的一种。
+   */
+  it("有增量时直播条让位；只在对话说不出来的时候才出声", () => {
+    renderRunDetail(runningState(), { activeTab: "loop", liveText: "正在写" });
+    expect((document.querySelector(".live-strip") as HTMLElement).hasAttribute("hidden")).toBe(true);
+
     let s = runningState();
     s = reduceEvents(s, [
       sse(1, "main", "tool_call", { toolUseId: "t1", name: "read_file", input: { path: "a.ts" } }),
     ]);
     renderRunDetail(s, { activeTab: "loop", liveText: "" });
-    expect(liveText()).toContain("read_file");
+    expect(strip(), "没有增量时直播条要说清正在调什么工具").toContain("read_file");
   });
 
-  it("不传 liveText 时行为与接入前完全一致（老调用方不受影响）", () => {
+  it("没有任何增量与工具时仍报「等待模型响应…」", () => {
     renderRunDetail(runningState(), { activeTab: "loop" });
-    expect(liveText()).toContain("等待模型响应");
+    expect(strip()).toContain("等待模型响应");
   });
 
-  it("运行已结束时直播条隐藏，增量不能把它拉回来", () => {
+  it("运行已结束时不再有流式条目，残留增量也拉不回来", () => {
     let s = runningState();
     s = reduceEvents(s, [
       sse(1, "main", "done", { stopReason: "completed", messageCount: 2, usage: {} }),
       sse(2, "host", "run_end", { outcome: "completed" }),
     ]);
     renderRunDetail(s, { activeTab: "loop", liveText: "还在流的残留文本" });
-    const strip = document.querySelector(".live-strip") as HTMLElement;
-    expect(strip.hasAttribute("hidden")).toBe(true);
+    expect(document.querySelector(".chat-msg--live")).toBeNull();
+    expect((document.querySelector(".live-strip") as HTMLElement).hasAttribute("hidden")).toBe(true);
+  });
+
+  /**
+   * 这条是委托方那句话的核心：**点开思考过程就该一直看得见它在流**。
+   * 初版对话用 `innerHTML` 整段重画，流式一开每秒重建几十遍，
+   * 用户刚点开的 details 当场被关上——键控补丁就是为这个上的。
+   */
+  it("流式期间已展开的思考块不会被重画关上", () => {
+    const s = runningState();
+    renderRunDetail(s, { activeTab: "loop", liveThinking: "第一句" });
+    const d = document.querySelector("details.chat-thinking--live") as HTMLDetailsElement;
+    d.open = true;
+
+    renderRunDetail(s, { activeTab: "loop", liveThinking: "第一句，第二句" });
+    const after = document.querySelector("details.chat-thinking--live") as HTMLDetailsElement;
+    expect(after, "思考块被整段重建了").toBe(d);
+    expect(after.open, "用户点开的思考过程被重画关上了").toBe(true);
+    expect(after.textContent).toContain("第二句");
+  });
+
+  it("已落定的条目不因流式而重建（节点同一性）", () => {
+    let s = runningState();
+    s = reduceEvents(s, [sse(1, "main", "assistant_text", { text: "上一轮说完的话" })]);
+    renderRunDetail(s, { activeTab: "loop", liveText: "新" });
+    const first = document.querySelectorAll(".chat-item")[0];
+    renderRunDetail(s, { activeTab: "loop", liveText: "新的一句" });
+    expect(document.querySelectorAll(".chat-item")[0]).toBe(first);
   });
 });
-
-// ================================================================
-// 计划确认门（§5.1）
-// ================================================================
-
 describe("思考过程进事件流", () => {
   function withThinking(extra: Record<string, unknown>) {
     let s = createInitialState("run-t", "任务", false);
@@ -706,41 +739,6 @@ describe("计划确认门的签字位", () => {
     expect(head).not.toContain("异常终止");
   });
 });
-
-describe("思考流式：直播条在正文之前显示它在想什么", () => {
-  function running() {
-    let s = createInitialState("run-th", "任务", false);
-    return reduceEvents(s, [sse(0, "main", "turn_start", { turn: 1 })]);
-  }
-  const liveText = () => document.querySelector(".live-strip .live-text")?.textContent ?? "";
-
-  it("只有思考增量时显示思考（此前这段是「等待模型响应…」的空窗）", () => {
-    renderRunDetail(running(), { activeTab: "loop", liveThinking: "先看 package.json 再决定" });
-    expect(liveText()).toContain("✽");
-    expect(liveText()).toContain("package.json");
-    expect(liveText()).not.toContain("等待模型响应");
-  });
-
-  it("正文一来就压过思考——它已经想完了", () => {
-    renderRunDetail(running(), {
-      activeTab: "loop",
-      liveThinking: "还在想",
-      liveText: "我先读一下配置",
-    });
-    expect(liveText()).toContain("我先读一下配置");
-    expect(liveText()).not.toContain("还在想");
-  });
-
-  it("两者都空时退回原行为", () => {
-    renderRunDetail(running(), { activeTab: "loop" });
-    expect(liveText()).toContain("等待模型响应");
-  });
-});
-
-
-// ================================================================
-// 「需你决定」的固定坞（委托方建议的结构解法）
-// ================================================================
 
 describe("需你决定：钉在输入框上方的固定坞", () => {
   const dock = () => document.getElementById("action-dock") as HTMLElement;

@@ -2051,3 +2051,22 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
 }
 /* 整项轻微提亮，扫视时不必逐个找那颗星 */
 .run-item--unread .run-item-task { font-weight: 600; }
+
+/* 流式条目：正在长出来的那一段。虚线左边框表示"还没定稿" */
+.chat-msg--live .chat-body,
+.chat-thinking--live .chat-body {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.chat-msg--live { border-left: 2px dashed var(--accent); padding-left: var(--space-sm); }
+.chat-thinking--live > summary { color: var(--identity-verifier); }
+/* 光标：让"它还在写"这件事不必靠猜 */
+.chat-live-text::after {
+  content: "▌";
+  color: var(--accent);
+  animation: chat-caret 1s steps(2) infinite;
+}
+@keyframes chat-caret { 50% { opacity: 0; } }
+@media (prefers-reduced-motion: reduce) {
+  .chat-live-text::after { animation: none; }
+}
