@@ -278,6 +278,26 @@ function syncScrollNav() {
   nav.querySelector('[data-nav="bottom"]').hidden = !nvis.showBottom;
 }
 
+/**
+ * 空态的示例任务：点一下**填进输入框**，不直接开跑。
+ *
+ * 让人看清自己要提交什么再按，是这个 harness 一贯的做法——
+ * 同一条纪律在计划确认门、审批门上各出现过一次。
+ * 用事件委托绑在 #main-area 上：空态会被重渲染，逐次绑会漏也会重。
+ */
+(function bindExamples() {
+  const area = document.getElementById("main-area");
+  if (!area) return;
+  area.addEventListener("click", (e) => {
+    const btn = e.target.closest?.("[data-example]");
+    if (!btn) return;
+    taskInput.value = btn.getAttribute("data-example");
+    taskInput.focus();
+    // 光标放到末尾，人可以直接接着改
+    taskInput.setSelectionRange(taskInput.value.length, taskInput.value.length);
+  });
+})();
+
 (function bindScrollNav() {
   const scroller = document.getElementById("main-area");
   const nav = document.getElementById("scroll-nav");

@@ -1531,6 +1531,59 @@ export function nextCollapseOverride(entries, overrides, seq) {
  * @param {Map<string, RunState>} runStates
  * @returns {Map<string, RunListItemMeta>}
  */
+/**
+ * 会话标题：从任务文本里**算**一个短标题出来。
+ *
+ * 侧栏此前直接铺任务原文，一条几百字的任务描述会占掉三四行、还看不出是什么
+ * （委托方截图里第一条就是 `附件：uploads/65a53cbdab081af8413977836a52f10b.jpg…`）。
+ *
+ * **为什么不让模型生成标题**：那是每次运行多付一次调用，而任务的第一句
+ * 本来就是人自己写的概括。花钱买一个它已经知道的答案，不合算——
+ * 真需要更好的标题时，人可以自己改第一句。
+ *
+ * 只上传附件、没写文字时特殊处理：拿文件名当标题，
+ * 因为 `附件：uploads/<32 位哈希>.jpg` 里唯一有信息量的就是那个扩展名与前几位。
+ */
+export function deriveRunTitle(task, max = 24) {
+  const raw = String(task ?? "").trim();
+  if (!raw) return "未命名任务";
+
+  const lines = raw.split(NEWLINE_RE).map((l) => l.trim()).filter(Boolean);
+  // 优先取第一条**不是附件行**的内容——附件是补充材料，不是任务本身
+  const meaningful = lines.find((l) => !ATTACH_RE.test(l));
+  if (!meaningful) {
+    const m = ATTACH_CAPTURE_RE.exec(lines[0] ?? "");
+    const file = (m?.[1] ?? "").split(PATH_SEP_RE).pop() ?? "";
+    return file ? `附件 ${clip(file, max)}` : "附件";
+  }
+
+  // 去掉 Markdown 的行首记法：标题/列表/引用符号本身不是标题内容
+  const cleaned = meaningful
+    .replace(HEADING_RE, "")
+    .replace(BULLET_RE, "")
+    .replace(ORDERED_RE, "")
+    .replace(QUOTE_RE, "")
+    .replace(SPACES_RE, " ")
+    .trim();
+  return clip(cleaned, max) || "未命名任务";
+}
+
+const NEWLINE_RE = /\r?\n/;
+const ATTACH_RE = /^附件[：:]/;
+const ATTACH_CAPTURE_RE = /^附件[：:]\s*(.+)$/;
+const PATH_SEP_RE = /[\\/]/;
+const HEADING_RE = /^#{1,6}\s*/;
+const BULLET_RE = /^[-*+]\s+/;
+const ORDERED_RE = /^\d+[.)]\s+/;
+const QUOTE_RE = /^(?:&gt;|>)\s*/;
+const SPACES_RE = /\s+/g;
+
+/** 截断到 max 字并补省略号；刚好放得下就不补 */
+function clip(text, max) {
+  const t = String(text ?? "").trim();
+  return t.length <= max ? t : `${t.slice(0, max)}…`;
+}
+
 export function deriveRunListItems(runs, runStates, unread) {
   /** @type {Map<string, RunListItemMeta>} */
   const map = new Map();
@@ -1816,7 +1869,9 @@ function updateRunItem(el, r, metaMap, selectedRunId) {
   }
 
   setText(el.querySelector(".run-item-state-label"), r.status === "running" ? "运行中" : "已完成");
-  setText(el.querySelector(".run-item-task"), r.task);
+  // 标题是算出来的短句；完整任务原文挂 title，鼠标停一下就能看全
+  setText(el.querySelector(".run-item-task"), deriveRunTitle(r.task));
+  setAttr(el.querySelector(".run-item-task"), "title", r.task);
   setText(el.querySelector(".run-item-time"), meta ? formatTimeShort(meta.startTime) : "");
   setText(
     el.querySelector(".run-item-duration"),
@@ -4362,17 +4417,43 @@ function renderVerdictCard(v) {
  * 渲染空态提示。
  * @param {boolean} [hasRuns] - 列表是否已有运行记录
  */
+/**
+ * 空态给的是**能点的例子**，不是一句"尚无运行"。
+ *
+ * 第一次打开时最难的不是不会用，而是不知道**这个 agent 到底能干什么**——
+ * 一句"尚无运行"把这个问题原样退回给人。四个例子刻意各走一条不同的路：
+ * 纯问答（不碰工具）、读代码（只读工具）、写文件（会触发审批门）、
+ * 带核查的交付（三值裁决）。点一下填进输入框，**不直接开跑**——
+ * 让人看清自己要提交什么，是这个 harness 一贯的做法。
+ */
+export const EXAMPLE_TASKS = [
+  { label: "问一个问题", text: "用三句话解释什么是 PID 控制器。不要调用工具。" },
+  { label: "读一读这个项目", text: "看看当前工作目录里有哪些源文件，用一段话总结这个项目在做什么。" },
+  { label: "写个文件（会问你要不要放行）", text: "在工作目录下创建 hello.md，写一段这个项目的简介。" },
+  { label: "带独立核查的交付", text: "写一个 TypeScript 函数 clamp(n, min, max) 并配 vitest 测试，跑通后告诉我结果。" },
+];
+
 export function renderEmptyState(hasRuns) {
   const mainEl = document.getElementById("main-area");
-  if (mainEl) {
-    const msg = hasRuns
-      ? "选择左侧运行查看详情，或创建新任务。"
-      : "尚无运行。";
-    mainEl.innerHTML = `<div class="empty-state">
-      <div class="empty-icon">◌</div>
-      <p>${msg}</p>
-    </div>`;
+  if (!mainEl) return;
+  if (hasRuns) {
+    mainEl.innerHTML =
+      '<div class="empty-state"><div class="empty-icon">◌</div>' +
+      "<p>选择左侧运行查看详情，或在下面写一个新任务。</p></div>";
+    return;
   }
+  mainEl.innerHTML =
+    '<div class="empty-state">' +
+    '<div class="empty-icon">◌</div>' +
+    "<p>还没有运行。试试这些——点一下会填进下面的输入框，你确认后再提交。</p>" +
+    '<ul class="example-tasks">' +
+    EXAMPLE_TASKS.map(
+      (e) =>
+        `<li><button type="button" class="example-task" data-example="${esc(e.text)}">` +
+        `<span class="example-label">${esc(e.label)}</span>` +
+        `<span class="example-text">${esc(e.text)}</span></button></li>`,
+    ).join("") +
+    "</ul></div>";
 }
 
 // ---------------------------------------------------------------

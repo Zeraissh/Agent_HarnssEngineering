@@ -30,6 +30,8 @@ import {
   toolPeek,
   foldChain,
   deriveRunListItems,
+  deriveRunTitle,
+  renderEmptyState,
   deriveAssemblyBar,
   deriveComposerMode,
   composerSubmitPlan,
@@ -1526,5 +1528,76 @@ describe("装配条的识图那一格", () => {
       deriveAssemblyBar(bare(), { roleModels: { vision: { configured: true, model: "gpt-4o" } } })
         .find((i) => i.key === "vision")!.chip,
     ).toContain("gpt-4o");
+  });
+});
+
+describe("会话标题：算出来的短句，不是任务原文", () => {
+  /**
+   * 侧栏此前直接铺任务原文——一条几百字的描述占三四行还看不出是什么。
+   * 委托方截图里第一条就是 `附件：uploads/65a53cbdab081af8413977836a52f10b.jpg…`。
+   */
+  it("长任务截断到可扫视的长度", () => {
+    const t = deriveRunTitle("你好 今天广东省佛山市南海区的天气怎么样 适合去哪些地方玩啊?");
+    expect(t.length).toBeLessThanOrEqual(25);
+    expect(t.startsWith("你好")).toBe(true);
+  });
+
+  it("只有附件时拿文件名当标题，不铺整条路径", () => {
+    const t = deriveRunTitle("附件：uploads/65a53cbdab081af8413977836a52f10b.jpg");
+    expect(t.startsWith("附件 ")).toBe(true);
+    expect(t).not.toContain("uploads/");
+  });
+
+  /** 附件是补充材料不是任务本身——有正文就取正文 */
+  it("既有正文又有附件时取正文", () => {
+    expect(deriveRunTitle("写一个函数\n附件：uploads/a.png")).toBe("写一个函数");
+  });
+
+  it("剥掉 Markdown 行首记法（标题/列表/引用）", () => {
+    expect(deriveRunTitle("## 三、四线制 PT1000 测量原理")).toBe("三、四线制 PT1000 测量原理");
+    expect(deriveRunTitle("- 做一件事")).toBe("做一件事");
+    expect(deriveRunTitle("1. 做一件事")).toBe("做一件事");
+    expect(deriveRunTitle("> 引用的任务")).toBe("引用的任务");
+  });
+
+  it("空 / 全空白 → 有个确定的兜底，不是空字符串", () => {
+    expect(deriveRunTitle("")).toBe("未命名任务");
+    expect(deriveRunTitle("   \n  ")).toBe("未命名任务");
+    expect(deriveRunTitle(undefined)).toBe("未命名任务");
+  });
+
+  it("列表项渲染标题，同时把原文挂 title（鼠标停一下看全）", () => {
+    const runs = [{ runId: "a", task: "很长很长的任务描述".repeat(6), status: "done", verify: false, createdAt: 1, finishedAt: 2 }];
+    renderRunList(runs, null, () => {}, deriveRunListItems(runs, new Map()));
+    const el = document.querySelector(".run-item-task") as HTMLElement;
+    expect(el.textContent!.length).toBeLessThan(30);
+    expect(el.getAttribute("title")).toBe(runs[0].task);
+  });
+});
+
+describe("空态给的是能点的例子", () => {
+  /**
+   * 第一次打开时最难的不是不会用，而是**不知道这个 agent 能干什么**——
+   * 一句"尚无运行"把这个问题原样退回给人。
+   */
+  it("无运行时列出示例，且各走一条不同的路", () => {
+    renderEmptyState(false);
+    const items = [...document.querySelectorAll("[data-example]")];
+    expect(items.length).toBeGreaterThanOrEqual(3);
+    const all = items.map((e) => e.getAttribute("data-example")!).join(" ");
+    expect(all, "应当有一个不碰工具的纯问答").toContain("不要调用工具");
+    expect(all, "应当有一个会触发审批门的写入").toMatch(/创建|写/);
+  });
+
+  it("示例文本进 data-example，点击由宿主填进输入框（不直接开跑）", () => {
+    renderEmptyState(false);
+    const btn = document.querySelector("[data-example]") as HTMLElement;
+    expect(btn.tagName).toBe("BUTTON"); // 键盘可达
+    expect(btn.getAttribute("data-example")!.length).toBeGreaterThan(5);
+  });
+
+  it("已有运行时不列示例——那时人已经知道怎么用了", () => {
+    renderEmptyState(true);
+    expect(document.querySelector("[data-example]")).toBeNull();
   });
 });

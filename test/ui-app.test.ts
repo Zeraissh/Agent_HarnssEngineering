@@ -362,7 +362,9 @@ describe("reduceEvent", () => {
     const appSrc = readFileSync(appPath, "utf-8");
 
     expect(appSrc).toContain("尚无运行。");
-    expect(appSrc).toContain("选择左侧运行查看详情，或创建新任务。");
+    // 文案随控件位置更新：提交栏已移到底部，"创建新任务"那句指的按钮不在原处了。
+    // 闸门盯的是**空态必须说清下一步怎么做**，不是盯某个具体字符串。
+    expect(appSrc).toContain("选择左侧运行查看详情，或在下面写一个新任务。");
     expect(appSrc).not.toContain("尚无运行。提交一个任务开始。");
   });
 
@@ -785,7 +787,7 @@ describe("AC7 第 12 节文案", () => {
     expect(combined).toContain("核查 Agent");
     expect(combined).toContain("允许本次");
     expect(combined).toContain("拒绝并说明");
-    expect(combined).toContain("选择左侧运行查看详情，或创建新任务。");
+    expect(combined).toContain("选择左侧运行查看详情，或在下面写一个新任务。");
 
     const checkboxLabel = html.match(/<span>(核查|开启独立核查)<\/span>/);
     expect(checkboxLabel).not.toBeNull();
