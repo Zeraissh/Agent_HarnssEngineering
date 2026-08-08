@@ -184,7 +184,8 @@ export type TurnEvent =
    */
   | { type: "segment_resume"; attempt: number; reason: string; priorTurns: number }
   /**
-   * 模型的思考块（turn 级，不是流式——`thinking_delta` 尚未接）。
+   * 模型的思考块（turn 级整块）。与 `thinking_delta`（逐字）**互补，不是替代**：
+   * 这条是事后回看的完整记录并进日志，那条是运行中的直播、不占 seq。
    * 数据一直在 message.content 里，但此前只进会话正史，而正史每段结束才落盘，
    * 于是运行过程中完全看不见。redacted = 服务端加密的思考，内容取不到但事实要可见。
    */

@@ -1779,3 +1779,25 @@ describe("AC-05 焦点环不许被组件规则压掉", () => {
     expect(rule![1]).toMatch(/outline:\s*\d+px\s+solid/);
   });
 });
+
+/**
+ * AC2-11 的落点锁。
+ *
+ * 真机量化的结论是"帧的钱花在布局上，不在脚本上"——所以守护它的东西不是
+ * 一条 JS 断言，而是这条 CSS。删掉它，1400 条日志之后每帧就掉出 16ms 预算。
+ * jsdom 不做布局，这里只能守住"规则还在、且用的是 auto 不是 hidden"。
+ */
+describe("AC2-11 长日志的单帧预算靠 content-visibility 守住", () => {
+  const css = readFileSync(join(__dirname, "..", "ui", "public", "styles.css"), "utf-8");
+
+  it(".log-entry 上有 content-visibility:auto + contain-intrinsic-size", () => {
+    const rule = css.match(/(?:^|\})\s*\.log-entry\s*\{([\s\S]*?)\}/);
+    expect(rule, ".log-entry 规则不见了").not.toBeNull();
+    expect(rule![1]).toMatch(/content-visibility:\s*auto/);
+    expect(rule![1]).toMatch(/contain-intrinsic-size:\s*auto\s+\d+px/);
+  });
+
+  it("不许用 content-visibility:hidden——那会把内容从可访问性树里摘掉", () => {
+    expect(css).not.toMatch(/content-visibility:\s*hidden/);
+  });
+});
