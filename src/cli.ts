@@ -58,6 +58,7 @@ import { fetchUrlTool } from "./tools/fetch-url.js";
 import { readFileTool } from "./tools/read-file.js";
 import { writeFileTool } from "./tools/write-file.js";
 import { appendRunLedger, buildLedgerEntry, tallyToolCall, type ToolTally } from "./ledger.js";
+import { warnEnvConflicts } from "./env-check.js";
 import { EFFORT_LEVELS } from "./types.js";
 import type { AgentConfig, Effort, TurnEvent } from "./types.js";
 
@@ -78,6 +79,9 @@ Keep file outputs clean and well-structured. Respond in the language the user us
 You have a persistent memory that survives across sessions. The current memory index is provided in the <context> block of the first message. Consult relevant memories (memory_read) before starting work. When you learn a durable fact, user preference, or lesson worth reusing — a correction you received, a project constant, an approach that worked — save it with memory_write (one fact per file, first line = summary). Update or delete memories that turn out to be wrong. Do not store transient task state or things already recorded in the repository.` + RULE_PRECEDENCE_DISCIPLINE;
 
 async function main(): Promise<void> {
+  // .env 被残留环境变量压掉时大声说出来（可能意味着凭据发往另一家端点）
+  warnEnvConflicts();
+
   const args = process.argv.slice(2);
   const autoYes = args.includes("--yes");
   const withPlan = args.includes("--plan");

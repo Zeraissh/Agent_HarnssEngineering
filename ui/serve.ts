@@ -23,6 +23,10 @@
  */
 import { delimiter } from "node:path";
 import { createUiServer } from "./server.js";
+import { warnEnvConflicts } from "../src/env-check.js";
+
+// .env 被残留环境变量压掉时大声说出来——那可能意味着凭据被发往另一家端点
+warnEnvConflicts();
 
 const port = Number(process.env.AGENT_UI_PORT ?? process.env.PORT ?? 4173);
 const host = process.env.AGENT_UI_HOST ?? "127.0.0.1";
