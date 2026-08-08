@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vitest";
 import type Anthropic from "@anthropic-ai/sdk";
 import { runVerified } from "../src/orchestrate.js";
-import { DEFAULT_VERIFIER_MAX_TURNS, VERDICT_PARSE_FAIL, parseVerdict, runVerifier } from "../src/verifier.js";
+import {
+  DEFAULT_VERIFIER_MAX_TURNS,
+  VERIFIER_WRAPUP_MAX_TURNS,
+  VERDICT_PARSE_FAIL,
+  parseVerdict,
+  runVerifier,
+} from "../src/verifier.js";
 import { PACKS } from "../src/presets.js";
 import type { ModelClient, ModelRequest, ModelTurn } from "../src/types.js";
 import { FakeModelClient, fakeMessage, makeTool, textBlock, toolUseBlock } from "./helpers.js";
@@ -435,13 +441,14 @@ describe("核查轮次预算", () => {
     const model = new NeverConcludes();
     // 执行者被压到 2 轮也不该影响核查预算——REPS=5 复现批的教训
     await runVerifier({ ...probeCfg, maxTurns: 2 }, model, { task: "t", executorReport: "r" });
-    expect(model.calls).toBe(DEFAULT_VERIFIER_MAX_TURNS);
+    // 调查预算 + 收口续跑（9.7）：撞满预算后还会续跑一小段专门写裁决
+    expect(model.calls).toBe(DEFAULT_VERIFIER_MAX_TURNS + VERIFIER_WRAPUP_MAX_TURNS);
   });
 
   it("opts.maxTurns 覆盖缺省——真机域每条验收要多次探针往返，15 装不下（案例 #8）", async () => {
     const model = new NeverConcludes();
     await runVerifier(probeCfg, model, { task: "t", executorReport: "r", maxTurns: 30 });
-    expect(model.calls).toBe(30);
+    expect(model.calls).toBe(30 + VERIFIER_WRAPUP_MAX_TURNS);
   });
 
   it("stm32-debug 包声明了更大的核查预算，且不高于它自己的执行者护栏", () => {
@@ -502,5 +509,114 @@ describe("核查轮次预算", () => {
     });
     expect(roomy.finalPassed, "给到 30 轮就该拿到实质裁决").toBe(true);
     expect(roomy.verifications[0]!.verdict.summary).toBe("查完了");
+  });
+});
+
+// ================================================================
+// 9.7 预算用尽的收口续跑 + 9.2 fail-closed 裁决带过程摘要
+// ================================================================
+
+describe("预算用尽后的收口（案例 #8 的 9.7 / 9.2）", () => {
+  const probeCfg = {
+    ...baseConfig,
+    tools: [makeTool({ name: "probe" })],
+    maxTurns: 50,
+  };
+
+  /**
+   * 前 N 次只调工具（撞满预算），之后按脚本回答。
+   * 用它模拟"核查做了大量取证但没来得及写裁决"——案例 #8 的真实形态。
+   */
+  function busyThenScripted(toolTurns: number, then: Anthropic.Message[]): ModelClient {
+    let n = 0;
+    const rest = [...then];
+    return {
+      requests: [] as ModelRequest[],
+      send(req: ModelRequest): Promise<ModelTurn> {
+        (this as any).requests.push(structuredClone(req));
+        n += 1;
+        const m =
+          n <= toolTurns
+            ? fakeMessage([toolUseBlock(`tu_${n}`, "probe", {})], "tool_use")
+            : rest.shift() ?? fakeMessage([textBlock("（脚本耗尽）")], "end_turn");
+        return Promise.resolve({ message: m, stopReason: m.stop_reason, usage: m.usage });
+      },
+    } as unknown as ModelClient;
+  }
+
+  it("撞满预算 → 续跑同一会话收口，拿到实质裁决（此前整场核查作废）", async () => {
+    const model = busyThenScripted(5, [
+      fakeMessage(
+        [textBlock('{"passed": true, "issues": [], "unverified": ["AC3 预算用尽未及核查"], "summary": "已查项全过"}')],
+        "end_turn",
+      ),
+    ]);
+    const outcome = await runVerifier({ ...probeCfg }, model, {
+      task: "t",
+      executorReport: "r",
+      maxTurns: 5, // 5 轮全用在工具上 → 撞满
+    });
+
+    expect(outcome.verdict.passed, "收口续跑应当拿到实质裁决").toBe(true);
+    expect(outcome.verdict.summary).toBe("已查项全过");
+    // 没查完的进 unverified 而不是 failed——否则就是把"没查"当成"没做对"
+    expect(outcome.verdict.unverified).toEqual(["AC3 预算用尽未及核查"]);
+  });
+
+  it("收口续跑带着原会话正史——那些工具返回还在上下文里（不是另起炉灶）", async () => {
+    const model = busyThenScripted(3, [
+      fakeMessage([textBlock('{"passed": true, "issues": [], "summary": "ok"}')], "end_turn"),
+    ]);
+    await runVerifier({ ...probeCfg }, model, { task: "t", executorReport: "r", maxTurns: 3 });
+
+    const reqs = (model as unknown as { requests: ModelRequest[] }).requests;
+    const wrapUp = reqs.at(-1)!;
+    const flat = JSON.stringify(wrapUp.messages);
+    // 正史带上了：原提示与三次工具往返都在
+    expect(flat).toContain("独立验证员");
+    expect(flat).toContain("tu_1");
+    expect(flat).toContain("tu_3");
+    // 且收口提示明确禁止继续取证
+    expect(flat).toContain("不要再调用任何工具");
+    expect(flat).toContain("不得因为没查完就判 failed");
+  });
+
+  it("收口也失败时，fail-closed 裁决带过程摘要（返工者要知道上一轮走到哪）", async () => {
+    // 永不收口：连续调工具，续跑那两轮也一样
+    const model = busyThenScripted(999, []);
+    const outcome = await runVerifier({ ...probeCfg }, model, {
+      task: "t",
+      executorReport: "r",
+      maxTurns: 6,
+    });
+
+    expect(outcome.verdict.passed).toBe(false);
+    // 哨兵原文不动——isParseFailure 与界面的核查饥饿判定都靠它
+    expect(outcome.verdict.issues).toEqual([VERDICT_PARSE_FAIL]);
+    // 但 summary 不再是"(空输出)"这种零信息量的东西
+    const s = outcome.verdict.summary;
+    expect(s).toContain("跑满 6 轮预算仍未收口");
+    expect(s).toContain("次工具调用");
+    expect(s).toContain("probe×");
+    expect(s).toContain("这不等于产物有问题");
+    expect(s).not.toBe("(空输出)");
+  });
+
+  it("零工具调用的失败与「查了很多没收口」要能分辨——那是两种完全不同的故障", async () => {
+    const model = new FakeModelClient([fakeMessage([textBlock("")], "end_turn")]);
+    const outcome = await runVerifier({ ...baseConfig, tools: [] }, model, {
+      task: "t",
+      executorReport: "r",
+    });
+    expect(outcome.verdict.summary).toContain("全程零工具调用");
+    expect(outcome.verdict.summary).toContain("核查很可能根本没有开展");
+  });
+
+  it("正常收口的裁决不被过程摘要污染", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([textBlock('{"passed": true, "issues": [], "summary": "产出正确"}')], "end_turn"),
+    ]);
+    const outcome = await runVerifier({ ...baseConfig, tools: [] }, model, { task: "t", executorReport: "r" });
+    expect(outcome.verdict.summary).toBe("产出正确");
   });
 });

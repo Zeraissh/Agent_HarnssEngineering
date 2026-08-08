@@ -9,6 +9,7 @@
  * - 只读纪律由硬约束兜底（P6）：verifier 内部对一切 approval_request 自动 deny，
  *   permission="ask" 的写类工具在 verifier 里永远执行不了。
  */
+import type Anthropic from "@anthropic-ai/sdk";
 import { AgentLoop } from "./loop.js";
 import type { AgentConfig, AggregateUsage, ModelClient, TurnEvent } from "./types.js";
 
@@ -75,6 +76,12 @@ export interface VerifyOutcome {
  */
 export const DEFAULT_VERIFIER_MAX_TURNS = 15;
 
+/**
+ * 预算用尽后"收口续跑"的额外轮次上限（9.7）。
+ * 刻意很小：这一步只允许写裁决，不允许继续取证——大了就等于偷偷放宽调查预算。
+ */
+export const VERIFIER_WRAPUP_MAX_TURNS = 2;
+
 export async function runVerifier(
   cfg: AgentConfig,
   model: ModelClient,
@@ -89,9 +96,8 @@ export async function runVerifier(
   // 但解耦≠一个常数走天下（案例 #8）：15 是按软件域定的，真机域每条验收都要
   // 多次探针往返，装不下。领域包可用 verify.maxTurns 声明自己需要多少。
   const verifierMaxTurns = opts.maxTurns ?? DEFAULT_VERIFIER_MAX_TURNS;
-  const first = await drainVerifierLoop(
-    new AgentLoop({ ...cfg, maxTurns: verifierMaxTurns }, model),
-    buildVerifierPrompt(opts),
+  const first = await drainVerifierEvents(
+    new AgentLoop({ ...cfg, maxTurns: verifierMaxTurns }, model).run(buildVerifierPrompt(opts)),
     onEvent,
     opts.readOnlyCommands,
   );
@@ -100,13 +106,44 @@ export async function runVerifier(
   let raw = first.text;
   let usage = first.usage;
 
-  // 裁决重问（一次）：核查做了但最终消息不是纯 JSON 时，让模型把已有结论转写成 JSON。
-  // fail-closed 直接返工会对正确产物空转（A/B 实测烧 10 万级 token），一次重问便宜得多。
-  // 空输出没有可转写的结论，不重问（转写会变成无依据的编造），维持 fail-closed。
+  /**
+   * 兜底一：**预算用尽的收口续跑**（案例 #8 的 9.7）。
+   *
+   * 撞满轮次预算时，最终消息往往是半截工具调用、文本为空——没有可转写的东西，
+   * 于是下面那条重问路径直接跳过，整场核查连同它已经取到的全部证据一起作废。
+   * 案例 #8 三跑里这个形态出现了四次，其中一次 verifier 已经嗅到真缺陷并在追查。
+   *
+   * 正解是**续跑同一个会话**：`runContinuation` 把原会话正史带上，模型手里
+   * 那些工具返回都还在，只是被要求"别查了，现在就用已有证据下结论"。
+   * 这与下面的重问是两件事——重问另起新 loop、只喂原始文本，那条路对
+   * "文本为空"的情形无能为力。
+   *
+   * 收口提示里明写"没查完的进 unverified、不得因没查完判 failed"——否则
+   * 预算用尽会直接退化成 fail-closed 第三种误伤形态（把"没查"当成"没做对"）。
+   */
+  if (isParseFailure(verdict) && first.stopReason === "max_turns" && first.messages.length > 0) {
+    const wrapUp = await drainVerifierEvents(
+      new AgentLoop({ ...cfg, maxTurns: VERIFIER_WRAPUP_MAX_TURNS }, model).runContinuation(
+        first.messages as Anthropic.MessageParam[],
+        buildWrapUpPrompt(first.turns),
+      ),
+      onEvent,
+      opts.readOnlyCommands,
+    );
+    usage = sumUsage(usage, wrapUp.usage);
+    const concluded = parseVerdict(wrapUp.text);
+    if (!isParseFailure(concluded)) {
+      verdict = concluded;
+      raw = wrapUp.text;
+    }
+  }
+
+  // 兜底二：裁决重问（一次）。核查做了但最终消息不是纯 JSON 时，让模型把已有结论
+  // 转写成 JSON。fail-closed 直接返工会对正确产物空转（A/B 实测烧 10 万级 token），
+  // 一次重问便宜得多。空输出没有可转写的结论，不重问（转写会变成无依据的编造）。
   if (isParseFailure(verdict) && first.text.trim() !== "") {
-    const retry = await drainVerifierLoop(
-      new AgentLoop({ ...cfg, maxTurns: 3 }, model),
-      buildReformatPrompt(first.text),
+    const retry = await drainVerifierEvents(
+      new AgentLoop({ ...cfg, maxTurns: 3 }, model).run(buildReformatPrompt(first.text)),
       onEvent,
     );
     usage = sumUsage(usage, retry.usage);
@@ -117,23 +154,84 @@ export async function runVerifier(
     }
   }
 
+  /**
+   * 兜底三：**fail-closed 裁决要带过程摘要**（案例 #8 的 9.2）。
+   *
+   * `{passed:false, issues:["…无法解析…"]}` 对返工者是零信息量——它分不清
+   * "核查者胡言乱语"和"核查者做了大量取证但没来得及收口"。案例 #8 是后者，
+   * 而返工者拿到的信号与前者完全相同，只能从头再来，又烧光一整轮预算。
+   *
+   * 把过程事实写进 summary（返工提示是从裁决拼的，summary 会原样传过去），
+   * 让返工者知道上一轮走到哪了。issues[0] 保持哨兵原文不动——
+   * `isParseFailure` 与界面的核查饥饿判定都靠它。
+   */
+  if (isParseFailure(verdict)) {
+    verdict = { ...verdict, summary: describeAbortedVerification(first, raw) };
+  }
+
   return { verdict, usage, raw };
+}
+
+/** 把没收口的核查过程压成一句话，写进 fail-closed 裁决的 summary */
+function describeAbortedVerification(
+  run: { turns: number; stopReason: string | null; toolCalls: string[] },
+  raw: string,
+): string {
+  const why =
+    run.stopReason === "max_turns"
+      ? `跑满 ${run.turns} 轮预算仍未收口`
+      : `在第 ${run.turns} 轮以 ${run.stopReason ?? "未知原因"} 终止`;
+
+  if (run.toolCalls.length === 0) {
+    return `核查未产出可解析裁决：${why}，且全程零工具调用——核查很可能根本没有开展，不要据此认定产物有问题。`;
+  }
+  const tally = new Map<string, number>();
+  for (const n of run.toolCalls) tally.set(n, (tally.get(n) ?? 0) + 1);
+  const top = [...tally.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([n, c]) => `${n}×${c}`)
+    .join("、");
+  const tail = raw.trim() ? `最后一条消息片段：「${raw.trim().slice(0, 80)}」` : "最终消息为空（停在半截工具调用）";
+  return (
+    `核查未产出可解析裁决：${why}，期间发起 ${run.toolCalls.length} 次工具调用（${top}）。` +
+    `**这不等于产物有问题**——核查过程本身没走完，返工前请先看上面的核查日志判断它查到哪一步。${tail}`
+  );
 }
 
 function isParseFailure(v: Verdict): boolean {
   return !v.passed && v.issues[0] === VERDICT_PARSE_FAIL;
 }
 
-async function drainVerifierLoop(
-  loop: AgentLoop,
-  prompt: string,
+/**
+ * 消费一段 verifier 事件流。
+ *
+ * 收 `AsyncIterable<TurnEvent>` 而不是 (loop, prompt)，是为了让首轮 `run()` 与
+ * 预算用尽后的 `runContinuation()` 走同一条消费逻辑——只读审批门、事件透传、
+ * 过程统计三件事对两者都要一样。
+ *
+ * 返回值里的 messages/stopReason/toolCalls 是 9.7 与 9.2 的原料：
+ * 续跑要正史，过程摘要要终止原因与工具统计。
+ */
+async function drainVerifierEvents(
+  events: AsyncIterable<TurnEvent>,
   onEvent?: (event: TurnEvent) => void | Promise<void>,
   readOnlyCommands?: string[],
-): Promise<{ text: string; usage: AggregateUsage }> {
+): Promise<{
+  text: string;
+  usage: AggregateUsage;
+  messages: unknown[];
+  stopReason: string | null;
+  turns: number;
+  toolCalls: string[];
+}> {
   let finalText = "";
   let usage: AggregateUsage | undefined;
+  let messages: unknown[] = [];
+  let stopReason: string | null = null;
+  const toolCalls: string[] = [];
 
-  for await (const event of loop.run(prompt)) {
+  for await (const event of events) {
     await onEvent?.(event);
     switch (event.type) {
       case "assistant_text":
@@ -153,15 +251,45 @@ async function drainVerifierLoop(
         }
         break;
       }
+      case "tool_call":
+        toolCalls.push(event.name);
+        break;
       case "done":
         usage = event.result.usage;
+        messages = event.result.messages;
+        stopReason = event.result.stopReason;
         break;
       default:
         break;
     }
   }
 
-  return { text: finalText, usage: usage! };
+  return {
+    text: finalText,
+    usage: usage!,
+    messages,
+    stopReason,
+    turns: usage?.turns ?? 0,
+    toolCalls,
+  };
+}
+
+/**
+ * 预算用尽时的收口提示（续跑同一会话，正史与工具返回都还在上下文里）。
+ *
+ * 最后那条"不得因没查完判 failed"是关键：预算用尽若直接变成 failed，
+ * 就是把"没查"当成"没做对"——fail-closed 第三种误伤形态（案例 #4 烧过 22 轮空转）。
+ */
+function buildWrapUpPrompt(turns: number): string {
+  return `你的核查轮次预算已经用尽（已跑 ${turns} 轮）。**现在不要再调用任何工具**，就用你手里已经取到的证据把裁决写出来。
+
+- 已经查实的验收项照常判：全部符合 → passed=true；有明确不符 → 写进 issues；
+- 因为预算用尽而**没来得及查完**的项，写进 unverified 并注明"预算用尽未及核查"——
+  **不得因为没查完就判 failed**，那是把"没查"错当成"没做对"；
+- 主观质量类判断写进 advisory 并自陈判法。
+
+你的回复必须只包含一个 JSON 对象（不要代码围栏、不要多余文字）：
+{"passed": true/false, "issues": ["客观项不符之处；无则空数组"], "unverified": ["缺手段或没来得及核查的项；无则省略"], "advisory": ["主观意见；无则省略"], "summary": "一句话结论"}`;
 }
 
 /** 管道下游允许的通用只读过滤器 */
