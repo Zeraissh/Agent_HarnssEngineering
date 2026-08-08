@@ -94,3 +94,22 @@ SDK 升级窗口的验证纪律（已入交接记忆）：单测不碰真实 wir
 
 UI 可用 `createUiServer({ workdir, packName, modelClient })` 起在任意端口。
 225 单测 + tsc 全绿，`npm audit` **total 0**。整改报告全部关闭，等委托方最终验收。
+
+---
+
+## 后续（2026-08-06 ~ 08-08）
+
+本案文字停在 v1 整改收口（225 单测）。**故事没有到此为止**，但后续没有并进本文——
+它们各自有更合适的载体，重复叙述只会造成两份会漂移的记录：
+
+| 阶段 | 规模 | 载体 |
+|---|---|---|
+| **UI v2**（R0–R11，34 个问题项 V-01~V-34） | 225 → 485 单测 | [`ui/remediation-v2.md`](../../ui/remediation-v2.md)（任务书源）+ [`ui/remediation-v2-status.md`](../../ui/remediation-v2-status.md)（逐条关闭状态与第一手证据） |
+| **v2 之后的未做项与逐条理由** | — | [`docs/06-backlog.md`](../06-backlog.md)（交接文档，含"为什么不那么做"） |
+| **backlog 开工两批**（schema 校验 / 抖动 / 文本流式 / 计划确认门 / MCP 接入 / 核查预算 / 收口续跑 / 段级续跑 / 思考透出 / Markdown 渲染） | 485 → 592 单测 | `docs/06-backlog.md` 各节的"已实施"标注 |
+| **案例 #8**（STM32 真机跨域，计划确认门首次用于高风险交付） | — | [`case-08-crc-selfcheck-hil.md`](case-08-crc-selfcheck-hil.md) |
+
+**本案沉淀的方法论已升格进研究总结**：委托方正式报告当判据、静态断言只守护
+"写了什么"、引入检查工具的价值在"查你想不到要查的"——见
+[`docs/05-findings.md`](../05-findings.md)。v2 期间新增的宿主学（"harness 有、
+宿主没接"累计 8 例）在同文档第 7.5 节。
