@@ -12,3 +12,5 @@ scratch/
 uploads/
 # L6 运行台账：本地研究仪器，逐次追加。进仓的是 npm run ledger 的**汇总结论**，不是原始行
 .agent-runs.jsonl
+# vitest --coverage 的中间产物（子代理跑覆盖率时会留下）
+coverage/
