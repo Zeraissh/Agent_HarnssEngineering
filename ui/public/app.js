@@ -420,6 +420,8 @@ function applyVerification(state, event) {
       ...state.verifications,
       {
         round: Number(event.round ?? state.verifications.length),
+        // 裁决获得路径（第五次提醒：这是逐字段白名单投影，不列出就静默丢弃）
+        recovery: event.recovery ? String(event.recovery) : null,
         verdict: {
           passed: Boolean(raw.passed),
           summary: String(raw.summary ?? ""),
@@ -3245,6 +3247,22 @@ function renderVerifyTab(state, face) {
 
   // 核查者的能力边界——deny 消息即教学，白名单即边界说明书
   if (face) {
+    /**
+     * 裁决获得路径（§2.1 前置）：裁决是"首轮直接给的"还是"靠兜底救回来的"，
+     * 这件事本身就是信号——救回来的那些说明核查者收口不稳，而不是产物有问题。
+     * 也是 fail-closed 三种误伤形态第一次可计量。
+     * （措辞避开"核查"+"过程"连写：那是 v1 的旧标签名，AC7 文案门禁仍在禁它。）
+     */
+    const recoveries = face.rounds.map((r) => r.recovery).filter(Boolean);
+    if (recoveries.length > 0 && recoveries.some((r) => r !== "direct")) {
+      const label = { direct: "首轮直接给出", wrapup: "预算用尽后收口续跑救回", reformat: "重问转写救回", failed: "兜底未救回（fail-closed）" };
+      html += '<h3 class="overview-section-title">裁决获得路径</h3><ul class="unverified-list">';
+      html += face.rounds
+        .map((r, i) => `<li>第 ${r.round ?? i} 轮：${esc(label[r.recovery] ?? String(r.recovery ?? "—"))}</li>`)
+        .join("");
+      html += "</ul><p class=\"rail-note\">非「首轮直接给出」说明核查者收口不稳——问题出在核查这一环，不是产物本身。</p>";
+    }
+
     html += '<h3 class="overview-section-title">核查者的边界</h3><dl class="boundary-list">';
     html += `<dt>只读白名单</dt><dd>${face.whitelist.length ? esc(face.whitelist.join("、")) : "（空——只能读文件，无法重跑门禁）"}</dd>`;
     // 不再写"固定"：9.1 之后领域包可用 verify.maxTurns 覆盖，

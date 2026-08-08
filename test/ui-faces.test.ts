@@ -776,3 +776,33 @@ describe("计划确认门", () => {
     expect(afterMain.status).toBe("done"); // 单跑的快路径保持原样
   });
 });
+
+describe("裁决获得路径透出到宿主（§2.1 前置）", () => {
+  it("verification 事件的 recovery 进 state（白名单投影必须列它）", () => {
+    seq = 0;
+    const s = feed([
+      ev("verifier", {
+        type: "verification",
+        round: 0,
+        recovery: "wrapup",
+        verdict: { passed: true, issues: [], summary: "ok" },
+        usage: { turns: 31 },
+      }),
+    ]);
+    expect(s.verifications[0].recovery).toBe("wrapup");
+    expect(deriveVerificationFace(s, HARNESS).rounds[0].recovery).toBe("wrapup");
+  });
+
+  it("旧事件没有 recovery 时为 null，不显示 undefined", () => {
+    seq = 0;
+    const s = feed([
+      ev("verifier", {
+        type: "verification",
+        round: 0,
+        verdict: { passed: true, issues: [], summary: "ok" },
+        usage: {},
+      }),
+    ]);
+    expect(s.verifications[0].recovery).toBeNull();
+  });
+});

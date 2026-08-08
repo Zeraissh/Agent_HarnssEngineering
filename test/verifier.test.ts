@@ -717,3 +717,67 @@ describe("段级续跑（案例 #8 的 9.8）", () => {
     expect(calls).toBeLessThanOrEqual(2);
   });
 });
+
+// ================================================================
+// 裁决获得路径计数（§2.1 前置：先量再定）
+// ================================================================
+
+describe("裁决获得路径（recovery）", () => {
+  const probeCfg = { ...baseConfig, tools: [makeTool({ name: "probe" })], maxTurns: 50 };
+
+  it("direct：首轮就是可解析裁决", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([textBlock('{"passed": true, "issues": [], "summary": "ok"}')], "end_turn"),
+    ]);
+    const o = await runVerifier({ ...baseConfig, tools: [] }, model, { task: "t", executorReport: "r" });
+    expect(o.recovery).toBe("direct");
+  });
+
+  it("reformat：产出散文 → 重问转写救回", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([textBlock("核查完毕：数值正确，没问题。")], "end_turn"),
+      fakeMessage([textBlock('{"passed": true, "issues": [], "summary": "正确"}')], "end_turn"),
+    ]);
+    const o = await runVerifier({ ...baseConfig, tools: [] }, model, { task: "t", executorReport: "r" });
+    expect(o.recovery).toBe("reformat");
+    expect(o.verdict.passed).toBe(true);
+  });
+
+  it("wrapup：撞满预算 → 收口续跑救回", async () => {
+    let n = 0;
+    const model: ModelClient = {
+      send() {
+        n += 1;
+        const m =
+          n <= 4
+            ? fakeMessage([toolUseBlock(`tu_${n}`, "probe", {})], "tool_use")
+            : fakeMessage([textBlock('{"passed": true, "issues": [], "summary": "查完了"}')], "end_turn");
+        return Promise.resolve({ message: m, stopReason: m.stop_reason, usage: m.usage });
+      },
+    };
+    const o = await runVerifier(probeCfg, model, { task: "t", executorReport: "r", maxTurns: 4 });
+    expect(o.recovery).toBe("wrapup");
+    expect(o.verdict.summary).toBe("查完了");
+  });
+
+  it("failed：兜底都没救回", async () => {
+    const model: ModelClient = {
+      send() {
+        const m = fakeMessage([toolUseBlock("tu_x", "probe", {})], "tool_use");
+        return Promise.resolve({ message: m, stopReason: m.stop_reason, usage: m.usage });
+      },
+    };
+    const o = await runVerifier(probeCfg, model, { task: "t", executorReport: "r", maxTurns: 3 });
+    expect(o.recovery).toBe("failed");
+    expect(o.verdict.passed).toBe(false);
+  });
+
+  it("runVerified 把 recovery 带进每轮 VerifyOutcome（宿主要靠它统计）", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([textBlock("完成了")], "end_turn"),
+      fakeMessage([textBlock('{"passed": true, "issues": [], "summary": "ok"}')], "end_turn"),
+    ]);
+    const outcome = await runVerified({ ...baseConfig, tools: [] }, model, "任务");
+    expect(outcome.verifications[0]!.recovery).toBe("direct");
+  });
+});

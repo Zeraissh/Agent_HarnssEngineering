@@ -63,11 +63,30 @@ export interface VerifyOptions {
   maxTurns?: number;
 }
 
+/**
+ * 这次裁决是怎么拿到的——**让 fail-closed 的三种误伤形态第一次可计量**。
+ *
+ * 动机：项目对 fail-closed 有一整套设计（重问、收口续跑、过程摘要），但
+ * "它们各自多久救一次场、还有多少漏网"从来没有数据。而 backlog §2.1
+ * （结构化输出 `tool_choice`/`response_format`）的收益恰恰**完全取决于这个数**——
+ * 若首轮解析成功率已经很高，那一整套能力探测 + 降级路径就不值得建。
+ *
+ * 项目自己的纪律是「失败形态即证据」「REPS=2 一律视为待复现」，所以先量再定。
+ *
+ * - `direct`   首轮就是可解析裁决——理想路径
+ * - `wrapup`   撞满预算没收口，靠续跑同一会话救回（9.7）
+ * - `reformat` 产出了散文但不是 JSON，靠重问转写救回
+ * - `failed`   兜底都没救回，落 fail-closed（此时 summary 带过程摘要，见 9.2）
+ */
+export type VerdictRecovery = "direct" | "wrapup" | "reformat" | "failed";
+
 export interface VerifyOutcome {
   verdict: Verdict;
   usage: AggregateUsage;
   /** verifier 的原始最终输出（供审计） */
   raw: string;
+  /** 裁决的获得路径。见 VerdictRecovery——它是 §2.1 该不该做的唯一判据 */
+  recovery: VerdictRecovery;
 }
 
 /**
@@ -105,6 +124,8 @@ export async function runVerifier(
   let verdict = parseVerdict(first.text);
   let raw = first.text;
   let usage = first.usage;
+  // 裁决获得路径：首轮直接解析成功即 direct，被兜底救回则记录是哪一条救的
+  let recovery: VerdictRecovery = isParseFailure(verdict) ? "failed" : "direct";
 
   /**
    * 兜底一：**预算用尽的收口续跑**（案例 #8 的 9.7）。
@@ -135,6 +156,7 @@ export async function runVerifier(
     if (!isParseFailure(concluded)) {
       verdict = concluded;
       raw = wrapUp.text;
+      recovery = "wrapup";
     }
   }
 
@@ -151,6 +173,7 @@ export async function runVerifier(
     if (!isParseFailure(second)) {
       verdict = second;
       raw = retry.text;
+      recovery = "reformat";
     }
   }
 
@@ -169,7 +192,7 @@ export async function runVerifier(
     verdict = { ...verdict, summary: describeAbortedVerification(first, raw) };
   }
 
-  return { verdict, usage, raw };
+  return { verdict, usage, raw, recovery };
 }
 
 /** 把没收口的核查过程压成一句话，写进 fail-closed 裁决的 summary */

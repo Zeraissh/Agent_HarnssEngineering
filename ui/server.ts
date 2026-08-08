@@ -748,6 +748,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
               verdict: v.verdict,
               usage: v.usage,
               raw: v.raw,
+              recovery: v.recovery,
             })),
           }
         : {}),
@@ -1029,6 +1030,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             round,
             verdict: vo.verdict,
             usage: vo.usage,
+            // 裁决是怎么拿到的（direct/wrapup/reformat/failed）——让 fail-closed
+            // 的三种误伤形态可计量，也是 §2.1 该不该做的判据
+            recovery: vo.recovery,
           });
         },
       });
