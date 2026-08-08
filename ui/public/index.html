@@ -68,6 +68,13 @@
       <p>尚无运行。</p>
     </div>
   </div>
+  <!-- 跳转箭头：**在滚动容器之外**，所以它自己不会被滚走。
+       ↓ 回到底部（流式时往上翻过之后用），↑ 回到四决定因素（读进下钻面之后用）。 -->
+  <div id="scroll-nav" class="scroll-nav">
+    <button type="button" class="scroll-nav-btn" data-nav="top" hidden aria-label="回到四决定因素">↑</button>
+    <button type="button" class="scroll-nav-btn" data-nav="bottom" hidden aria-label="回到最新">↓</button>
+  </div>
+
   <!-- 需你决定：钉在输入框正上方，**在滚动容器之外**。
        它不随内容滚走——这正是委托方那条反馈的结构解法。 -->
   <div id="action-dock" class="action-dock" hidden></div>
@@ -203,6 +210,7 @@ import {
   composerSubmitPlan,
   patchComposer,
   shouldShowReconnecting,
+  deriveScrollNav,
 } from "/app.js";
 
 // ---- 状态 ----
@@ -241,6 +249,69 @@ const followUpErrors = new Map();
  * 而不是切进去之后被一行废话占掉版面。
  */
 const unreadRuns = new Set();
+
+/**
+ * 跳转箭头的接线。
+ *
+ * 判据在 app.js 的 `deriveScrollNav`（纯函数，可测）；这里只负责量几何、
+ * 按结果切显隐、以及点下去真的滚过去。
+ *
+ * 监听挂在滚动容器上而不是逐次渲染时算：人**只滚动不产生新事件**的那段时间
+ * 里箭头也得跟着变，靠渲染驱动就会迟一步或干脆不动。
+ */
+function syncScrollNav() {
+  const scroller = document.getElementById("main-area");
+  const nav = document.getElementById("scroll-nav");
+  if (!scroller || !nav) return;
+  const drawer = document.getElementById("detail-drawer");
+  const grid = document.querySelector(".factor-grid");
+  const nvis = deriveScrollNav({
+    scrollTop: scroller.scrollTop,
+    scrollHeight: scroller.scrollHeight,
+    clientHeight: scroller.clientHeight,
+    // 四张卡相对滚动容器的位置：<0 就是已经滚出上边界
+    anchorTop: grid ? grid.getBoundingClientRect().top - scroller.getBoundingClientRect().top : null,
+    drawerOpen: Boolean(drawer && drawer.open),
+  });
+  nav.querySelector('[data-nav="top"]').hidden = !nvis.showTop;
+  nav.querySelector('[data-nav="bottom"]').hidden = !nvis.showBottom;
+}
+
+(function bindScrollNav() {
+  const scroller = document.getElementById("main-area");
+  const nav = document.getElementById("scroll-nav");
+  if (!scroller || !nav) return;
+  scroller.addEventListener("scroll", syncScrollNav, { passive: true });
+  // 抽屉开合会改变可滚高度与四张卡的位置，也得重算
+  document.addEventListener("toggle", syncScrollNav, true);
+  nav.addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-nav]");
+    if (!btn) return;
+    /**
+     * **落点用直接赋值，平滑交给 CSS 的 `scroll-behavior`。**
+     *
+     * 不在 JS 里写 `behavior:"smooth"`：那样"要不要动画"这件事就散在两处
+     * （JS 一处、CSS 一处），而 `prefers-reduced-motion` 只管得住 CSS 那处。
+     * 现在 JS 只负责"滚到哪"，动不动画由样式表统一决定——
+     * **动效可以降级，落点不能。**
+     *
+     * 附一条自动化验证的边界（省得下一个人重复踩）：本项目的浏览器自动化面板
+     * 不合成画面，**任何带动画的滚动在那里都不会推进**（scrollTop 停在原地且
+     * 不报错），所以验证落点必须临时把 `scroll-behavior` 置成 auto 再量。
+     * 我第一次就是没意识到这点，差点把它当成产品缺陷记下来。
+     */
+    if (btn.getAttribute("data-nav") === "bottom") {
+      scroller.scrollTop = scroller.scrollHeight;
+    } else {
+      const grid = document.querySelector(".factor-grid");
+      if (grid) {
+        scroller.scrollTop +=
+          grid.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
+      }
+    }
+    syncScrollNav();
+  });
+})();
 
 // ---- 统一 composer 的三个事实（派生逻辑在 app.js，这里只存输入）----
 /** @type {ReturnType<typeof deriveComposerMode>|null} */
@@ -497,6 +568,7 @@ function renderDetailWithState(state) {
   // 本地 SSE 把状态推到 done 时列表未必同步刷新过——底栏要立刻从「运行中」
   // 变回「继续对话」，否则用户盯着一个死按钮等
   if (runId === selectedRunId) syncComposer();
+  syncScrollNav();
 }
 
 /**

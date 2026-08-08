@@ -2079,6 +2079,34 @@ function patchAssemblyBar(parts, state, harness) {
 }
 
 /**
+ * 两个跳转箭头该不该出现。
+ *
+ * 委托方要的是两件不同的事：
+ *   · **↓ 回到底部**——流式时人往上翻过之后，得有一步回到"正在写"的地方；
+ *   · **↑ 回到四决定因素**——点开下钻抽屉、往下读进去之后，
+ *     四张卡已经滚出视野，没有箭头就只能一路滚回去。
+ *
+ * 抽成纯函数是因为这两条判据都只是算术，而 jsdom 里量不到真实布局——
+ * 放在渲染函数里就等于没法测（本轮反复吃过这个亏）。
+ *
+ * @param {{scrollTop:number, scrollHeight:number, clientHeight:number,
+ *          anchorTop:number|null, drawerOpen:boolean}} m 已量好的几何量
+ */
+export function deriveScrollNav(m, threshold = 80) {
+  const distanceToBottom = m.scrollHeight - m.scrollTop - m.clientHeight;
+  // 内容还没长到需要滚动时，两个箭头都是噪声
+  const scrollable = m.scrollHeight - m.clientHeight > threshold;
+  return {
+    showBottom: scrollable && distanceToBottom > threshold,
+    /**
+     * ↑ 只在**抽屉开着且四张卡已经滚出视野**时出现。
+     * 抽屉没开时上面就是对话，往上翻是读历史，不该被一个"回到顶部"催着走。
+     */
+    showTop: Boolean(m.drawerOpen) && m.anchorTop !== null && m.anchorTop < 0,
+  };
+}
+
+/**
  * 装配状态条：**显示的是这次运行的真实装配，点开才是那句设计思想**。
  *
  * 委托方问的是"能不能在某处以状态栏的形式显示我们 harness 的哲学设计思想"。
@@ -2571,6 +2599,17 @@ function patchConversation(parts, state, live) {
    * 这也正是本仓 V-10 早就定下的纪律（已存在 key 的节点永不重建，只更新），
    * 我在把对话搬成主干时把它漏掉了。
    */
+  /**
+   * **贴底跟随**：人在底部就跟着新内容往下走，人往上翻了就别动他
+   * （委托方："在流式的情况下在最底部的时候应该一直往下移动，
+   *  然后不在最底部的时候就不往下移动"）。
+   *
+   * 这是 GitHub Actions / 各家日志面板的标准行为，本仓的 `keepScrollAnchored`
+   * 早就实现了它，只是**日志面在用、对话没接**——而流式恰恰全在对话里，
+   * 于是"正在写"的那一段每次都长在视野之外。
+   */
+  const scroller = host.closest(".content-area") || host;
+  keepScrollAnchored(scroller, () => {
   patchList(host, items, {
     key: (it) => it.key,
     create: (it) => {
@@ -2589,6 +2628,7 @@ function patchConversation(parts, state, live) {
       if (it.kind === "live" && updateLiveNode(node, it)) return;
       node.innerHTML = renderChatItem(it, thinkingPrefOpen());
     },
+  });
   });
 }
 

@@ -31,6 +31,8 @@ import {
   foldChain,
   deriveRunListItems,
   deriveAssemblyBar,
+  deriveScrollNav,
+  keepScrollAnchored,
   renderRunList,
   applyCollapseOverrides,
   nextCollapseOverride,
@@ -1322,5 +1324,79 @@ describe("装配条不许说谎（文案交叉核对抓到的三处）", () => {
   it("白名单有值时报真实条数", () => {
     const s = cfg({ pack: { name: "ts-coding", verify: { readOnlyCommands: ["a", "b", "c"] } } });
     expect(deriveAssemblyBar(s, null).find((i) => i.key === "verify")!.chip).toContain("白名单 3");
+  });
+});
+
+// ================================================================
+// 跳转箭头与贴底跟随
+// ================================================================
+
+describe("deriveScrollNav：两个箭头各管各的", () => {
+  const at = (over: any = {}) =>
+    deriveScrollNav({
+      scrollTop: 0, scrollHeight: 2000, clientHeight: 600, anchorTop: null, drawerOpen: false,
+      ...over,
+    });
+
+  it("离底还远 → 出现「回到最新」", () => {
+    expect(at({ scrollTop: 0 }).showBottom).toBe(true);
+  });
+
+  it("已经贴底 → 不出现（它此刻什么也做不了）", () => {
+    expect(at({ scrollTop: 1400 }).showBottom).toBe(false);
+  });
+
+  it("内容根本不够滚时两个都不出现——那是纯噪声", () => {
+    const n = at({ scrollHeight: 620, clientHeight: 600, scrollTop: 0 });
+    expect(n.showBottom).toBe(false);
+    expect(n.showTop).toBe(false);
+  });
+
+  /**
+   * ↑ 的判据不是"往上翻过"，而是**抽屉开着且四张卡已经滚出视野**。
+   * 抽屉没开时上面就是对话，往上翻是在读历史——那时候弹一个"回到顶部"
+   * 是在催人离开他正在读的地方。
+   */
+  it("抽屉没开时不出现「回到四决定因素」，哪怕已经滚很远", () => {
+    expect(at({ scrollTop: 1200, anchorTop: -800, drawerOpen: false }).showTop).toBe(false);
+  });
+
+  it("抽屉开着且四张卡滚出上边界 → 出现", () => {
+    expect(at({ scrollTop: 1200, anchorTop: -800, drawerOpen: true }).showTop).toBe(true);
+  });
+
+  it("抽屉开着但四张卡还在视野内 → 不出现", () => {
+    expect(at({ scrollTop: 100, anchorTop: 120, drawerOpen: true }).showTop).toBe(false);
+  });
+
+  it("量不到四张卡时不猜——宁可不显示也不乱跳", () => {
+    expect(at({ anchorTop: null, drawerOpen: true }).showTop).toBe(false);
+  });
+});
+
+describe("对话贴底跟随", () => {
+  /**
+   * 本仓早就有 `keepScrollAnchored`（贴底时跟随、否则不动用户的位置），
+   * 但**只有日志面在用、对话没接**——而流式全在对话里，
+   * 于是"正在写"的那一段每次都长在视野之外。这条锁住它确实接上了。
+   */
+  it("patchConversation 走 keepScrollAnchored", () => {
+    const src = readFileSync(join(__dirname, "..", "ui", "public", "app.js"), "utf-8");
+    const fn = src.slice(src.indexOf("function patchConversation"), src.indexOf("function chatItemSig"));
+    expect(fn, "对话没有接贴底跟随").toContain("keepScrollAnchored(");
+  });
+
+  it("贴底时跟随到新的底部；离底时一动不动", () => {
+    // 直接测那个 helper 的两种分支——jsdom 量不到真实布局，所以造一个假滚动容器
+    const make = (scrollTop: number) => ({
+      scrollTop, scrollHeight: 1000, clientHeight: 400,
+    });
+    const pinned = make(590); // 距底 10px，算贴底
+    expect(keepScrollAnchored(pinned as any, () => { pinned.scrollHeight = 1200; })).toBe(true);
+    expect(pinned.scrollTop, "贴底时应跟到新底部").toBe(1200);
+
+    const away = make(100); // 距底 500px，人在往上翻
+    expect(keepScrollAnchored(away as any, () => { away.scrollHeight = 1200; })).toBe(false);
+    expect(away.scrollTop, "人往上翻了就不该动他").toBe(100);
   });
 });

@@ -2139,3 +2139,42 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
   color: var(--text-2);
   max-width: 78ch;
 }
+
+/* ===== 跳转箭头：在滚动容器之外，所以自己不会被滚走 ===== */
+.scroll-nav {
+  position: absolute;
+  right: var(--space-lg);
+  /* 停在待办坞与提交栏之上，别压住正在等人点的审批卡 */
+  bottom: 180px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  z-index: 4;
+  pointer-events: none;
+}
+.scroll-nav-btn {
+  pointer-events: auto;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  border: 1px solid var(--border-2);
+  background: var(--bg2);
+  color: var(--text-1);
+  font-size: var(--font-lg);
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.18);
+}
+.scroll-nav-btn:hover { background: var(--bg3); }
+/* main 是定位上下文——箭头相对它定位，而不是相对整页 */
+.main { position: relative; }
+
+/**
+ * 平滑滚动**只在这里定义**，JS 那侧不写 `behavior:"smooth"`。
+ * 理由是让"要不要动画"只有一个开关——散在两处的话，
+ * `prefers-reduced-motion` 只管得住 CSS 那处，JS 那处会照样动。
+ */
+.content-area { scroll-behavior: smooth; }
+@media (prefers-reduced-motion: reduce) {
+  .content-area { scroll-behavior: auto; }
+}
