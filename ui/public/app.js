@@ -783,6 +783,9 @@ export const VERDICT_PARSE_FAIL = "verifier 输出无法解析为 JSON 裁决";
 /** 写类工具：会改变外部世界的那些，用于识别"零写入返工" */
 const WRITE_TOOLS = new Set(["write_file", "memory_write", "bash"]);
 
+/** 能从入参直接读出产物路径的写类工具。bash 不在其中——见 deriveArtifacts 的说明 */
+const ARTIFACT_TOOLS = new Set(["write_file", "memory_write"]);
+
 /** source → 角色。前缀式来源（"s1/main"）为并行编排预留 */
 function segmentRole(source) {
   if (source === "planner") return "planner";
@@ -1841,7 +1844,7 @@ export function renderRunDetail(state, callbacks) {
   patchUnverifiedRail(parts, faces);
   patchLiveStrip(parts, state, isRunning, callbacks.liveText ?? "", callbacks.liveThinking ?? "");
   patchConversation(parts, state, { text: callbacks.liveText, thinking: callbacks.liveThinking });
-  patchDetailRail(parts, faces);
+  patchDetailRail(parts, state, faces, callbacks);
   patchOutcomeCard(parts, state, overview, faces);
   patchFactorGrid(parts, faces, activeTab, callbacks);
   patchTabContent(parts, state, activeTab, overview, logEntries, callbacks, faces);
@@ -1945,7 +1948,10 @@ function ensureDetailSkeleton(mainEl, state, callbacks) {
     '<div class="conversation" id="conversation"></div>' +
     '<aside class="detail-rail" id="detail-rail" hidden aria-label="子任务">' +
     '<button type="button" class="rail-toggle" id="rail-toggle" aria-expanded="true" aria-controls="rail-body">子任务 ⟩</button>' +
-    '<div class="rail-body" id="rail-body"><div class="plan-board"></div></div>' +
+    '<div class="rail-body" id="rail-body">' +
+    '<div class="artifacts" hidden></div>' +
+    '<div class="plan-board"></div>' +
+    "</div>" +
     "</aside>" +
     "</div>" +
     // 结果卡排在对话之后：它是这次运行的收尾，不是开场白
@@ -1987,6 +1993,7 @@ function ensureDetailSkeleton(mainEl, state, callbacks) {
     conversation: mainEl.querySelector(".conversation"),
     rail: mainEl.querySelector(".detail-rail"),
     railBoard: mainEl.querySelector(".detail-rail .plan-board"),
+    artifacts: mainEl.querySelector(".detail-rail .artifacts"),
     drawer: mainEl.querySelector(".detail-drawer"),
     outcome: mainEl.querySelector(".outcome-card"),
     factorGrid: mainEl.querySelector(".factor-grid"),
@@ -2517,13 +2524,61 @@ function bindThinkingPref(host) {
  * 什么"。它此前埋在 Loop 面的下钻里，跟"当前这一步进行到哪"隔了两层。
  * 放到对话右侧之后，读对话与看进度是同一屏。
  */
-function patchDetailRail(parts, faces) {
+function patchDetailRail(parts, state, faces, callbacks) {
   if (!parts.rail) return;
   const plan = faces.plan;
+  const files = deriveArtifacts(state);
   // 判据是"这是不是一次编排运行"，**不是"有没有子任务"**：
   // planner fail-closed 时子任务为空，而那句"未能产出可解析计划"最该被看见
-  setAttr(parts.rail, "hidden", plan ? null : "");
+  setAttr(parts.rail, "hidden", plan || files.length > 0 ? null : "");
+  setAttr(parts.railBoard, "hidden", plan ? null : "");
   if (plan) patchPlanBoard(parts, parts.railBoard, plan);
+  patchArtifacts(parts, files, state.runId, callbacks);
+}
+
+/**
+ * 产物清单。
+ *
+ * 「预览」与「下载」都走宿主的 `/api/runs/:id/artifact`——浏览器一律拦截
+ * http 页面跳 `file://`，所以本地文件必须由宿主取给它。
+ * 「在文件夹中显示」是**从网页请求启动本机进程**，圈禁在服务端（同一套
+ * resolveInWorkdir），这里只负责把路径原样交上去。
+ */
+function patchArtifacts(parts, files, runId, callbacks) {
+  const host = parts.artifacts;
+  if (!host) return;
+  setAttr(host, "hidden", files.length > 0 ? null : "");
+  const sig = signature(files.map((f) => `${f.path}:${f.writes}`));
+  if (parts.sig.artifacts === sig) return;
+  parts.sig.artifacts = sig;
+
+  host.innerHTML =
+    `<h3 class="rail-title">产物 <span class="aside-peek">${files.length}</span></h3>` +
+    files
+      .map((f) => {
+        const href = `/api/runs/${encodeURIComponent(runId)}/artifact?path=${encodeURIComponent(f.path)}`;
+        // 写了不止一次时说出来：那通常意味着返工，看的人有权知道这不是一稿过
+        const times = f.writes > 1 ? `<span class="aside-peek">改 ${f.writes} 次</span>` : "";
+        return (
+          '<div class="artifact">' +
+          `<a class="artifact-name" href="${esc(href)}" target="_blank" rel="noopener noreferrer" title="${esc(f.path)}">${esc(f.path)}</a>` +
+          `${times}` +
+          '<div class="artifact-actions">' +
+          `<a class="artifact-btn" href="${esc(href)}&download=1">下载</a>` +
+          `<button type="button" class="artifact-btn" data-reveal="${esc(f.path)}">在文件夹中显示</button>` +
+          "</div></div>"
+        );
+      })
+      .join("");
+
+  // 事件委托：清单每次重画，逐个绑会漏也会重
+  if (!host.__revealBound) {
+    host.__revealBound = true;
+    host.addEventListener("click", (e) => {
+      const btn = e.target instanceof Element ? e.target.closest("[data-reveal]") : null;
+      if (btn) callbacks.onReveal?.(btn.getAttribute("data-reveal"));
+    });
+  }
 }
 
 function patchOutcomeCard(parts, state, overview, faces) {
@@ -3309,6 +3364,47 @@ export function deriveChatItems(state, live) {
     n++;
   }
   return items;
+}
+
+/**
+ * 这次运行**产出了哪些文件**（委托方："最终生成的文件有没有办法有超链接给用户
+ * 直接点击打开"）。
+ *
+ * 数据源仍是事件流：写类工具的 `tool_call` 带着路径，配对的 `tool_result`
+ * 说明它到底成没成。**只收成功的那些**——失败的写入不是产物，列出来只会
+ * 让人点开一个不存在的文件。
+ *
+ * 边界诚实声明：`bash` 里 `>` 重定向出来的文件**认不出来**。要认出它得去
+ * 解析 shell 命令，那是猜；宁可少列几个，也不要列一个其实没生成的。
+ * 同一路径被写多次只留最后一次（那才是当前内容），但保留首次出现的顺序，
+ * 因为人记的是"先做了什么再做了什么"。
+ */
+export function deriveArtifacts(state) {
+  // 注意**不能**复用 WRITE_TOOLS：那一组含 bash（它用来判"这轮返工有没有动过
+  // 东西"），而 bash 没有 path 入参，混进来只会产生一堆空路径
+
+  const results = new Map();
+  for (const e of state.timeline ?? []) {
+    if (e.type === "tool_result") results.set(e.toolUseId, e);
+  }
+  /** @type {Map<string, any>} */
+  const byPath = new Map();
+  for (const e of state.timeline ?? []) {
+    if (e.type !== "tool_call" || !ARTIFACT_TOOLS.has(e.name)) continue;
+    const input = e.input && typeof e.input === "object" ? e.input : {};
+    const path = String(input.path ?? input.file_path ?? "").trim();
+    if (!path) continue;
+    const res = results.get(e.toolUseId);
+    if (!res || res.resultIsError) continue; // 没成的不是产物
+    const prev = byPath.get(path);
+    byPath.set(path, {
+      path,
+      tool: e.name,
+      seq: prev ? prev.seq : e.seq, // 保留首次出现的次序
+      writes: (prev?.writes ?? 0) + 1,
+    });
+  }
+  return [...byPath.values()].sort((a, b) => a.seq - b.seq);
 }
 
 /** 会引起"换段"的事件类型：turn_start 这类噪声不该产生分界 */

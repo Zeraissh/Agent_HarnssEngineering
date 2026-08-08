@@ -15,11 +15,11 @@
  *   k. 执行失败: 模型抛错不崩 → done/stopReason=error + 列表 status=done/finishedAt 非 null
  *   l. 核查未通过: 末尾 verdict 合成事件 passed=false + issues 非空 + source="rework" 事件出现
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { join, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
-import { mkdtemp, rm, readFile, readdir } from "node:fs/promises";
-import { createUiServer, type UiServerHandle } from "../ui/server.js";
+import { mkdtemp, rm, readFile, readdir, writeFile, mkdir } from "node:fs/promises";
+import { createUiServer, contentTypeOf, revealCommand, type UiServerHandle } from "../ui/server.js";
 import {
   FakeModelClient,
   fakeMessage,
@@ -2318,5 +2318,183 @@ describe("ui-server", () => {
     expect(finished.run.finishedAt).not.toBeNull();
     expect(finished.run).toHaveProperty("stopReason");
     expect(finished.run).toHaveProperty("pendingApprovals");
+  });
+});
+
+// ================================================================
+// 产物取件（委托方："生成的文件有没有办法有超链接直接点击打开"）
+// ================================================================
+
+describe("产物取件：圈禁比功能更要紧", () => {
+  let handle: Awaited<ReturnType<typeof createUiServer>>;
+  let base: string;
+  let dir: string;
+  let runId: string;
+
+  beforeAll(async () => {
+    dir = await mkdtemp(join(tmpdir(), "artifact-"));
+    await writeFile(join(dir, "report.html"), "<h1>产物</h1>", "utf8");
+    await writeFile(join(dir, "notes.md"), "# 标题", "utf8");
+    await mkdir(join(dir, "sub"), { recursive: true });
+
+    handle = createUiServer({
+      modelClient: new FakeModelClient([fakeMessage([textBlock("done")], "end_turn")]),
+      workdir: dir,
+    });
+    const port = await startServer(handle);
+    base = baseUrl(port);
+    const res = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "生成报告" }),
+    });
+    runId = (await res.json()).runId;
+  });
+
+  afterAll(async () => {
+    await handle.close();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const get = (path: string, extra = "") =>
+    fetch(`${base}/api/runs/${runId}/artifact?path=${encodeURIComponent(path)}${extra}`);
+
+  it("取回文件内容，并按扩展名给出 content-type", async () => {
+    const res = await get("report.html");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/html");
+    expect(await res.text()).toContain("产物");
+  });
+
+  it("download=1 走 attachment，默认走 inline（预览与下载是两件事）", async () => {
+    expect((await get("notes.md")).headers.get("content-disposition")).toMatch(/^inline/);
+    expect((await get("notes.md", "&download=1")).headers.get("content-disposition")).toMatch(/^attachment/);
+  });
+
+  /**
+   * 预览的是**模型生成的 HTML**。不加 CSP 就等于让它在宿主同源下执行任意 JS，
+   * 而同源意味着它能读 `/api/*`——包括别的运行的会话正文。
+   */
+  it("预览响应带 CSP 且禁脚本，并带 nosniff", async () => {
+    const res = await get("report.html");
+    const csp = res.headers.get("content-security-policy") ?? "";
+    expect(csp).toContain("default-src 'none'");
+    expect(csp).not.toContain("script-src 'unsafe-inline'");
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+  });
+
+  it.each([
+    ["../outside.txt", "上跳一级"],
+    ["../../etc/passwd", "上跳多级"],
+    ["sub/../../outside.txt", "绕一圈再跳"],
+    ["C:\\\\Windows\\\\win.ini", "Windows 绝对路径"],
+    ["/etc/passwd", "POSIX 绝对路径"],
+  ])("拒绝逃出工作目录的路径：%s（%s）", async (p) => {
+    const res = await get(p);
+    expect([400, 404]).toContain(res.status);
+    const body = await res.text();
+    expect(body).not.toContain("root:");
+    expect(body).not.toContain("[fonts]");
+  });
+
+  it("目录一律 404——否则等于开了目录浏览", async () => {
+    expect((await get("sub")).status).toBe(404);
+    expect((await get(".")).status).toBe(404);
+  });
+
+  it("不存在的文件 404 而不是 500", async () => {
+    expect((await get("nope.txt")).status).toBe(404);
+  });
+
+  it("未知 runId 取不到任何东西（路径按该 run 自己的 workdir 解析）", async () => {
+    const res = await fetch(`${base}/api/runs/not-a-run/artifact?path=report.html`);
+    expect(res.status).toBe(404);
+  });
+
+  it("缺 path 参数不当成一次取件——落到未知路由（404），不会去读任何文件", async () => {
+    // 与静态资源的 `..` 一样归入 malformed：判据统一在一处，不为这一个参数另开分支
+    expect((await fetch(`${base}/api/runs/${runId}/artifact?`)).status).toBe(404);
+  });
+
+  it("认不出的扩展名按 octet-stream + nosniff，让浏览器下载而不是猜着执行", async () => {
+    await writeFile(join(dir, "blob.weird"), "x", "utf8");
+    const res = await get("blob.weird");
+    expect(res.headers.get("content-type")).toContain("application/octet-stream");
+  });
+});
+
+describe("在文件夹中显示：从网页请求启动本机进程，圈禁只能更严", () => {
+  let handle: Awaited<ReturnType<typeof createUiServer>>;
+  let base: string;
+  let dir: string;
+  let runId: string;
+
+  beforeAll(async () => {
+    dir = await mkdtemp(join(tmpdir(), "reveal-"));
+    await writeFile(join(dir, "ok.txt"), "x", "utf8");
+    handle = createUiServer({ modelClient: new FakeModelClient([fakeMessage([textBlock("done")], "end_turn")]), workdir: dir });
+    const port = await startServer(handle);
+    base = baseUrl(port);
+    const res = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "t" }),
+    });
+    runId = (await res.json()).runId;
+  });
+
+  afterAll(async () => {
+    await handle.close();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const reveal = (path: unknown) =>
+    fetch(`${base}/api/runs/${runId}/reveal`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+
+  it.each([
+    ["../../secret.txt", "上跳"],
+    ["/etc/passwd", "绝对路径"],
+  ])("拒绝逃出工作目录：%s（%s）", async (p) => {
+    expect((await reveal(p)).status).toBe(400);
+  });
+
+  it("文件不存在 → 404，不启动任何进程", async () => {
+    expect((await reveal("nope.txt")).status).toBe(404);
+  });
+
+  it("缺 path / 非 JSON 体 → 400", async () => {
+    expect((await reveal("")).status).toBe(400);
+    const res = await fetch(`${base}/api/runs/${runId}/reveal`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "not json",
+    });
+    expect(res.status).toBe(400);
+  });
+
+  /**
+   * 命令**必须以参数数组的形式**交给 spawn。拼成 shell 串就等于把文件名
+   * 交给命令行解析器——一个含 `&` 或反引号的文件名即可执行任意命令。
+   */
+  it("revealCommand 返回参数数组，且不含 shell 元字符拼接", () => {
+    const cmd = revealCommand("/tmp/a b & c.txt");
+    if (!cmd) return; // 不支持的平台返回 null，本身就是安全的
+    expect(Array.isArray(cmd.args)).toBe(true);
+    expect(cmd.file).not.toContain(" ");
+    // 文件名原样落在某个参数里，而不是被拼进一条串
+    expect(cmd.args.some((a) => a.includes("a b & c.txt"))).toBe(true);
+  });
+
+  it("contentTypeOf：源码按纯文本，未知按 octet-stream", () => {
+    expect(contentTypeOf("x.html")).toContain("text/html");
+    expect(contentTypeOf("x.ts")).toContain("text/plain");
+    expect(contentTypeOf("x.py")).toContain("text/plain");
+    expect(contentTypeOf("x.bin")).toContain("application/octet-stream");
+    // 大小写不敏感
+    expect(contentTypeOf("X.PNG")).toContain("image/png");
   });
 });

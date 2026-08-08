@@ -3,7 +3,8 @@
  * 并支持任务提交与审批应答。Node 内置模块，零第三方依赖。
  */
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
-import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { readFile, writeFile, mkdir, stat } from "node:fs/promises";
+import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join, extname, dirname, delimiter, resolve, basename, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -27,6 +28,7 @@ import { createDescribeImageTool } from "../src/tools/describe-image.js";
 import { fetchUrlTool } from "../src/tools/fetch-url.js";
 import { readFileTool } from "../src/tools/read-file.js";
 import { writeFileTool } from "../src/tools/write-file.js";
+import { resolveInWorkdir } from "../src/tools/fs-util.js";
 import { appendRunLedger, buildLedgerEntry, ledgerPath, tallyToolCall, type ToolTally } from "../src/ledger.js";
 import { EFFORT_LEVELS } from "../src/types.js";
 import type { ModelClient, TurnEvent, AgentConfig, Tool, Effort } from "../src/types.js";
@@ -290,6 +292,49 @@ function serializeEvent(
     default:
       return { ...event };
   }
+}
+
+/**
+ * 产物预览的 MIME。只列真的会被生成出来的那几类；认不出的一律
+ * `application/octet-stream` + nosniff —— 让浏览器下载而不是猜着执行。
+ */
+const CONTENT_TYPES: Record<string, string> = {
+  ".html": "text/html; charset=utf-8",
+  ".htm": "text/html; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".pdf": "application/pdf",
+  ".json": "application/json; charset=utf-8",
+  ".md": "text/plain; charset=utf-8",
+  ".txt": "text/plain; charset=utf-8",
+  ".csv": "text/plain; charset=utf-8",
+  ".log": "text/plain; charset=utf-8",
+};
+
+export function contentTypeOf(name: string): string {
+  const ext = extname(name).toLowerCase();
+  if (CONTENT_TYPES[ext]) return CONTENT_TYPES[ext]!;
+  // 源码一律按纯文本预览：按扩展名猜 MIME 容易把 .ts 之类当成别的东西
+  if (/\.(ts|tsx|js|jsx|py|c|h|cpp|rs|go|java|sh|yml|yaml|toml|ini|xml)$/i.test(name)) {
+    return "text/plain; charset=utf-8";
+  }
+  return "application/octet-stream";
+}
+
+/**
+ * "在文件管理器里选中它"的平台命令。**返回参数数组而不是命令串**——
+ * 拼串就等于把文件名交给命令行解析器去解释。
+ */
+export function revealCommand(abs: string): { file: string; args: string[] } | null {
+  if (process.platform === "win32") return { file: "explorer.exe", args: [`/select,${abs}`] };
+  if (process.platform === "darwin") return { file: "open", args: ["-R", abs] };
+  if (process.platform === "linux") return { file: "xdg-open", args: [dirname(abs)] };
+  return null;
 }
 
 const BUILTIN_POOL: Tool[] = [bashTool, fetchUrlTool, readFileTool, writeFileTool];
@@ -1350,6 +1395,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     | { type: "runsList" }
     | { type: "lifecycleStream" }
     | { type: "transcript"; runId: string }
+    | { type: "artifact"; runId: string; path: string; download: boolean }
+    | { type: "reveal"; runId: string }
     | { type: "followUp"; runId: string }
     | { type: "upload" }
     | { type: "createRun" }
@@ -1381,6 +1428,30 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     const transcriptMatch = method === "GET" && url.match(/^\/api\/runs\/([^/]+)\/transcript$/);
     if (transcriptMatch) {
       return { type: "transcript", runId: transcriptMatch[1]! };
+    }
+
+    /**
+     * 产物取件（委托方："最终生成的文件有没有办法有超链接给用户直接点击打开"）。
+     *
+     * 不能用 `file://`——浏览器一律拦截 http 页面跳本地文件协议。所以要经宿主：
+     * 它知道这次运行的 workdir，也只肯在那个圈里取文件。
+     */
+    const artifactMatch = method === "GET" && url.match(/^\/api\/runs\/([^/]+)\/artifact\?(.*)$/);
+    if (artifactMatch) {
+      const q = new URLSearchParams(artifactMatch[2]!);
+      const wanted = q.get("path");
+      if (!wanted) return { type: "malformed" };
+      return {
+        type: "artifact",
+        runId: artifactMatch[1]!,
+        path: wanted,
+        download: q.get("download") === "1",
+      };
+    }
+
+    const revealMatch = method === "POST" && url.match(/^\/api\/runs\/([^/]+)\/reveal$/);
+    if (revealMatch) {
+      return { type: "reveal", runId: revealMatch[1]! };
     }
 
     if (method === "POST" && url === "/api/upload") {
@@ -1574,6 +1645,93 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           task: run.task,
           segments: run.transcript,
         });
+      }
+
+      /**
+       * 取一件产物：预览或下载。
+       *
+       * 三道闸，缺一不可：
+       *   ① run 必须存在，且路径按**这次运行自己的 workdir** 解析——
+       *      不同运行可以在不同工作目录，拿 A 的 id 取不到 B 的文件；
+       *   ② `resolveInWorkdir` 拒绝 `..` 逃逸与工作区外的绝对路径
+       *      （与写类工具共用同一个圈禁函数，判据只有一处）；
+       *   ③ 只回文件，目录一律 404——否则等于开了目录浏览。
+       */
+      case "artifact": {
+        const run = runs.get(route.runId);
+        if (!run) return notFound(res, `Run not found: ${route.runId}`);
+        const root = run.workdir ?? workdir;
+        let abs: string;
+        try {
+          abs = resolveInWorkdir(root, route.path);
+        } catch (err) {
+          return json(res, 400, { error: (err as Error).message });
+        }
+        try {
+          const st = await stat(abs);
+          if (!st.isFile()) return notFound(res, "Not a file");
+          const body = await readFile(abs);
+          const name = basename(abs);
+          res.writeHead(200, {
+            "Content-Type": contentTypeOf(name),
+            "Content-Length": String(body.length),
+            // 预览走 inline，下载走 attachment；文件名按 RFC 5987 编码，
+            // 中文名不编码会在 header 里变成乱码或被截断
+            "Content-Disposition": `${route.download ? "attachment" : "inline"}; filename*=UTF-8''${encodeURIComponent(name)}`,
+            // 产物是本地文件，不该被任何中间层缓存住旧版本
+            "Cache-Control": "no-store",
+            // 预览的是模型生成的 HTML——**不可信内容**。禁掉脚本与外链，
+            // 否则等于让它在宿主同源下执行任意 JS（能读同源的 /api/*）
+            "Content-Security-Policy":
+              "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; font-src data:",
+            "X-Content-Type-Options": "nosniff",
+          });
+          res.end(body);
+          return;
+        } catch {
+          return notFound(res, `Artifact not found: ${route.path}`);
+        }
+      }
+
+      /**
+       * 在系统文件管理器里选中这个文件。
+       *
+       * 这条是**从网页请求启动本机进程**，所以圈禁必须比取件更严：同一套
+       * `resolveInWorkdir` + 必须真实存在 + **参数数组传给 spawn，绝不拼 shell 串**
+       * （拼串就等于把文件名交给命令行解析器）。服务只绑 127.0.0.1，
+       * 但这不构成放松的理由——绑定是部署事实，圈禁是代码事实。
+       */
+      case "reveal": {
+        const run = runs.get(route.runId);
+        if (!run) return notFound(res, `Run not found: ${route.runId}`);
+        const body = await readBody(req);
+        let wanted: string;
+        try {
+          wanted = String(JSON.parse(body).path ?? "");
+        } catch {
+          return json(res, 400, { error: "Body must be JSON with a path field" });
+        }
+        if (!wanted) return json(res, 400, { error: "path is required" });
+        const root = run.workdir ?? workdir;
+        let abs: string;
+        try {
+          abs = resolveInWorkdir(root, wanted);
+        } catch (err) {
+          return json(res, 400, { error: (err as Error).message });
+        }
+        try {
+          await stat(abs);
+        } catch {
+          return notFound(res, `Artifact not found: ${wanted}`);
+        }
+        const cmd = revealCommand(abs);
+        if (!cmd) return json(res, 501, { error: `Unsupported platform: ${process.platform}` });
+        try {
+          spawn(cmd.file, cmd.args, { detached: true, stdio: "ignore" }).unref();
+        } catch (err) {
+          return json(res, 500, { error: `Failed to reveal: ${(err as Error).message}` });
+        }
+        return json(res, 200, { revealed: abs });
       }
 
       case "lifecycleStream": {

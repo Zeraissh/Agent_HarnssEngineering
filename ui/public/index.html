@@ -492,6 +492,7 @@ function renderDetailWithState(state) {
     liveText: liveTexts.get(runId) ?? "",
     liveThinking: liveThinking.get(runId) ?? "",
     onPlanDecision: (decision) => postPlanDecision(runId, decision),
+    onReveal: (path) => revealArtifact(runId, path),
   });
   // 本地 SSE 把状态推到 done 时列表未必同步刷新过——底栏要立刻从「运行中」
   // 变回「继续对话」，否则用户盯着一个死按钮等
@@ -586,6 +587,30 @@ async function postFollowUp(runId, text) {
     followUpErrors.set(runId, `追加失败：${err.message ?? "网络错误"}`);
     const st = runStates.get(runId);
     if (st) renderDetailWithState(st);
+  }
+}
+
+/**
+ * 在系统文件管理器里选中一件产物。
+ *
+ * 路径原样交给宿主——圈禁在服务端做（同一套 resolveInWorkdir，与写类工具
+ * 共用判据）。前端不做校验不是偷懒：前端的校验对攻击者不存在，
+ * 判据放在唯一说了算的地方。
+ */
+async function revealArtifact(runId, path) {
+  if (!path) return;
+  try {
+    const res = await fetch(`/api/runs/${runId}/reveal`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+    if (!res.ok) {
+      const b = await res.json().catch(() => ({}));
+      showSubmitError(b.error ?? `打开失败（HTTP ${res.status}）`);
+    }
+  } catch (err) {
+    showSubmitError(`打开失败：${err.message ?? "网络错误"}`);
   }
 }
 

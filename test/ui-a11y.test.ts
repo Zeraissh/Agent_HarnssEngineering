@@ -641,13 +641,19 @@ describe("编排面板", () => {
    * 判据没变（非编排运行不该出现子任务盘），**承载物变了**：计划盘从 Loop 面的
    * 下钻搬到了对话右栏，于是"隐藏"由整条右栏承担。锁跟着迁移，不是放宽。
    */
-  it("非编排运行不出现子任务右栏", () => {
+  it("非编排运行不渲染子任务盘（右栏可能因产物而在，但盘要收起）", () => {
     renderRunDetail(buildRichState(), { activeTab: "loop", harness: FAKE_HARNESS });
-    const rail = document.getElementById("detail-rail") as HTMLElement;
-    expect(rail.hidden, "单任务运行不该挂一条空的子任务栏").toBe(true);
-    // 且整页只有一处计划盘——两处同名节点会让 querySelector 取到错的那个
+    const board = document.querySelector(".plan-board") as HTMLElement;
+    // 整页只有一处计划盘——两处同名节点会让 querySelector 取到错的那个
     expect(document.querySelectorAll(".plan-board")).toHaveLength(1);
-    expect(document.querySelector(".plan-board")!.closest("[hidden]")).toBe(rail);
+    expect(board.hidden || board.closest("[hidden]") !== null, "非编排运行不该显示子任务盘").toBe(true);
+  });
+
+  it("既无子任务也无产物时，右栏整条不占位", () => {
+    let s = createInitialState("r-bare", "什么都没产出的任务", false);
+    s = reduceEvent(s, { seq: 0, source: "main", event: { type: "assistant_text", text: "说完了" } });
+    renderRunDetail(s, { activeTab: "loop", harness: FAKE_HARNESS });
+    expect((document.getElementById("detail-rail") as HTMLElement).hidden).toBe(true);
   });
 
   it("编排面板零 violations（两套主题）", async () => {

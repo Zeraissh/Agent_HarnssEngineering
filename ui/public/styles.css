@@ -2070,3 +2070,37 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
 @media (prefers-reduced-motion: reduce) {
   .chat-live-text::after { animation: none; }
 }
+
+/* ===== 产物清单（委托方："生成的文件能不能点击直接打开"）===== */
+.artifacts { margin-bottom: var(--space-lg); }
+.artifact {
+  padding: var(--space-sm) 0;
+  border-bottom: 1px solid var(--border);
+}
+.artifact:last-child { border-bottom: none; }
+.artifact-name {
+  display: block;
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: var(--font-md);
+  /* 长路径截断而不是撑破右栏——完整值在 title 里 */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.artifact-actions {
+  display: flex;
+  gap: var(--space-md);
+  margin-top: var(--space-xs);
+}
+.artifact-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--text-2);
+  font: inherit;
+  font-size: var(--font-sm);
+  cursor: pointer;
+  text-decoration: underline;
+}
+.artifact-btn:hover { color: var(--text-1); }
