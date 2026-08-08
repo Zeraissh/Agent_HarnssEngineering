@@ -1832,6 +1832,7 @@ export function renderRunDetail(state, callbacks) {
   const parts = ensureDetailSkeleton(mainEl, state, callbacks);
 
   patchDetailHeader(parts, state, isRunning, faces);
+  patchAssemblyBar(parts, state, callbacks.harness);
   /**
    * 「需你决定」现在钉在滚动容器【之外】（#action-dock），它变高变矮只会改变
    * 滚动容器的高度，不会平移容器里的内容——所以**不再需要任何滚动补偿**。
@@ -1922,7 +1923,11 @@ function ensureDetailSkeleton(mainEl, state, callbacks) {
     // 永不可恢复），所以"快满了"必须在第一屏就看得见，而不是要下钻才发现
     '<button type="button" class="ctx-gauge" hidden aria-live="polite"></button>' +
     '<span class="detail-hint" hidden></span>' +
-    "</div></div>" +
+    "</div>" +
+    // 装配状态条：条上是这次运行的真实装配，点开才是那句设计思想
+    '<div class="assembly-bar" role="group" aria-label="本次运行的装配"></div>' +
+    '<div class="assembly-why" hidden role="note"></div>' +
+    "</div>" +
     '<div class="live-strip" hidden aria-live="polite"></div>' +
     /**
      * **对话是主干**（委托方："还是希望做成对话框的形式，对于用惯了其它 agent
@@ -1986,6 +1991,8 @@ function ensureDetailSkeleton(mainEl, state, callbacks) {
     verifyBadge: mainEl.querySelector(".verify-badge"),
     ctxGauge: mainEl.querySelector(".ctx-gauge"),
     hint: mainEl.querySelector(".detail-hint"),
+    assembly: mainEl.querySelector(".assembly-bar"),
+    assemblyWhy: mainEl.querySelector(".assembly-why"),
     // 「需你决定」在滚动容器之外（#action-dock，钉在输入框上方）——
     // 它不随内容滚走，新审批出现在哪都看得见（委托方建议的结构解法）
     ...ensureActionDock(),
@@ -2027,6 +2034,135 @@ function patchDetailHeader(parts, state, isRunning, faces) {
   // 用户必须在第一屏就知道"通过也不代表任务做完"
   setAttr(parts.hint, "hidden", !isRunning && cls.hint ? null : "");
   if (!isRunning && cls.hint) setText(parts.hint, cls.hint);
+}
+
+/**
+ * 渲染装配条。每一项是一个按钮，点开在下方展开那句"为什么这样设计"。
+ *
+ * 用按钮而不是 `title` 提示：`title` 触屏上根本出不来、键盘也够不着，
+ * 而这条恰恰是给"第一次用、想知道这跟别家有什么不同"的人看的。
+ */
+function patchAssemblyBar(parts, state, harness) {
+  const host = parts.assembly;
+  if (!host) return;
+  const items = deriveAssemblyBar(state, harness);
+  setAttr(host, "hidden", items.length > 0 ? null : "");
+  const sig = signature(items.map((i) => `${i.key}:${i.chip}`));
+  if (parts.sig.assembly !== sig) {
+    parts.sig.assembly = sig;
+    host.innerHTML = items
+      .map(
+        (i) =>
+          `<button type="button" class="assembly-chip" data-why="${esc(i.key)}" aria-expanded="false" title="${esc(i.chip)}">${esc(i.chip)}</button>`,
+      )
+      .join('<span class="assembly-sep">·</span>');
+  }
+
+  if (host.__whyBound) return;
+  host.__whyBound = true;
+  host.addEventListener("click", (e) => {
+    const btn = e.target instanceof Element ? e.target.closest("[data-why]") : null;
+    if (!btn) return;
+    const key = btn.getAttribute("data-why");
+    const cur = deriveAssemblyBar(state, harness).find((i) => i.key === key);
+    const box = parts.assemblyWhy;
+    const already = btn.getAttribute("aria-expanded") === "true";
+    for (const b of host.querySelectorAll("[data-why]")) b.setAttribute("aria-expanded", "false");
+    if (already || !cur) {
+      setAttr(box, "hidden", "");
+      return;
+    }
+    btn.setAttribute("aria-expanded", "true");
+    setAttr(box, "hidden", null);
+    box.innerHTML = `<strong>${esc(cur.chip)}</strong> ${renderMarkdownInline(cur.why)}`;
+  });
+}
+
+/**
+ * 装配状态条：**显示的是这次运行的真实装配，点开才是那句设计思想**。
+ *
+ * 委托方问的是"能不能在某处以状态栏的形式显示我们 harness 的哲学设计思想"。
+ * 直接滚动展示理念的状态栏，本质是标语——而本项目一贯反对标语（findings 全篇
+ * 的写法都是"判据 + 出处"，不是主张）。所以把它翻过来：
+ *
+ *   条上是 `opus-5 · ts-coding · 40轮/64k · 核查开 · 写入圈禁 D:\proj`，
+ *   点「核查开」才弹出那句"为什么这个 harness 要有独立核查者"。
+ *
+ * **哲学通过它管着的那个真实数字被看见**，而不是通过一句悬空的话。
+ * 一个副作用是它没法说谎：数字来自 run_config，装配变了条上就变，
+ * 说明文字不会和现实脱节——而一条写死的标语会。
+ *
+ * 每一项的 `why` 都必须落在**具体后果**上（不这样会发生什么），
+ * 且能追到 docs 里的出处。写不出后果的项，就不该占状态条的位置。
+ */
+export function deriveAssemblyBar(state, harness) {
+  const cfg = state.runConfig ?? {};
+  const g = cfg.guardrails ?? harness?.guardrails ?? null;
+  const pack = cfg.pack ?? harness?.pack ?? null;
+  const items = [];
+
+  const push = (key, chip, why) => {
+    if (chip) items.push({ key, chip, why });
+  };
+
+  // 执行模型：换模型是最容易被忘记的变量，而它解释掉大半的行为差异
+  push(
+    "model",
+    harness?.model ?? null,
+    "执行者用的模型。本项目的判断结构不绑定某一家：Anthropic 原生与 OpenAI wire 两条协议都走同一个手写循环，" +
+      "所以换模型是可比较的实验变量而不是一次重写——案例 #8 的四跑 A/B/C/D 正是靠这一点做出来的。",
+  );
+
+  // 领域包：本项目最独特的装配单位
+  push(
+    "pack",
+    pack?.name ?? "无领域包",
+    "领域包一次装配三样东西：系统提示、工具面、以及**核查者的只读白名单与预算**。" +
+      "分开配的后果案例 #4 实证过——核查者没有可用的只读命令，会在 22 轮里反复重新证明已经为真的事（核查饥饿），" +
+      "烧光预算却什么也没查出来。",
+  );
+
+  // 护栏：轮数与 token 是硬边界，撞上了核查救不了
+  push(
+    "guardrails",
+    g ? `${g.maxTurns} 轮 / ${Math.round((g.maxTokens ?? 0) / 1000)}k` : null,
+    "单次运行的硬边界。撞上它们与「做完了」是两回事：`max_turns` / `max_tokens` 结束的运行，" +
+      "即使核查通过也不代表任务做完——所以终止原因分六值而不是成败两值，撞边界时界面会直说「核查救不了这一类」。",
+  );
+
+  // 核查：三值裁决 + 独立上下文，这是与别家最明显的分野
+  push(
+    "verify",
+    state.verify ? `核查开${cfg.verifierBudgetTurns ? ` ${cfg.verifierBudgetTurns} 轮` : ""}` : "核查关",
+    "开启后由**另一个上下文**独立复核，不是让执行者自己说自己对（它看得见自己的推理，天然会为结论辩护）。" +
+      "裁决分三值：passed / unverified / advisory——「没验成」和「不合格」是两件事，压成一个布尔值会让前者被当成后者。",
+  );
+
+  // 工作目录：工具的写入圈禁根
+  push(
+    "workdir",
+    cfg.workdir ? shortPath(cfg.workdir) : null,
+    "工具的写入圈禁根。路径校验在**宿主**这一侧做，不靠提示词让模型自觉——" +
+      "模型给出的路径是不可信输入，`..` 逃逸与工作区外的绝对路径一律在执行前被拒。",
+  );
+
+  // 编排：计划确认门是"零副作用时刻"的唯一入口
+  if (state.plan) {
+    push(
+      "plan",
+      `编排 ${state.plan.subtasks?.length ?? 0} 步`,
+      "planner 先拆解成带依赖的子任务再调度，互不依赖的并发跑。" +
+        "配套的计划确认门挂在**第一个子任务发射之前**——那是整场运行里唯一一个否决它零副作用的时刻，过了就有东西被改了。",
+    );
+  }
+
+  return items;
+}
+
+/** 长路径只留尾部两级：状态条是一行，完整值挂 title */
+function shortPath(p) {
+  const parts = String(p).split(/[\\/]/).filter(Boolean);
+  return parts.length <= 2 ? String(p) : `…${parts.slice(-2).join("/")}`;
 }
 
 /**

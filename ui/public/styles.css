@@ -2104,3 +2104,38 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
   text-decoration: underline;
 }
 .artifact-btn:hover { color: var(--text-1); }
+
+/* ===== 装配状态条：条上是真实装配，点开才是设计思想 ===== */
+.assembly-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-xs);
+  margin-top: var(--space-xs);
+  font-size: var(--font-md);
+}
+.assembly-chip {
+  background: none;
+  border: none;
+  padding: 0 2px;
+  font: inherit;
+  color: var(--text-2);
+  cursor: pointer;
+  border-bottom: 1px dotted var(--border-2);
+}
+.assembly-chip:hover { color: var(--text-1); }
+.assembly-chip[aria-expanded="true"] {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+.assembly-sep { color: var(--text-3); }
+/* 说明块：只在点开时出现，占位不常驻 */
+.assembly-why {
+  margin-top: var(--space-sm);
+  padding: var(--space-sm) var(--space-md);
+  border-left: 2px solid var(--accent);
+  background: var(--bg2);
+  font-size: var(--font-md);
+  color: var(--text-2);
+  max-width: 78ch;
+}

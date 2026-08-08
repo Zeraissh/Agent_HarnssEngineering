@@ -30,6 +30,7 @@ import {
   toolPeek,
   foldChain,
   deriveRunListItems,
+  deriveAssemblyBar,
   renderRunList,
   applyCollapseOverrides,
   nextCollapseOverride,
@@ -1167,5 +1168,101 @@ describe("未读星取代那条「■ 已完成」", () => {
     renderRunList(runs, null, () => {}, deriveRunListItems(runs, new Map(), new Set(["a"])));
     const star = document.querySelector('[data-run-id="a"] .run-item-unread')!;
     expect(star.getAttribute("aria-label")).toContain("尚未查看");
+  });
+});
+
+// ================================================================
+// 装配状态条：条上是真实装配，点开才是设计思想
+// ================================================================
+
+describe("装配状态条", () => {
+  function configured() {
+    let s = createInitialState("run-asm", "任务", true);
+    return reduceEvents(s, [
+      sse(0, "host", "run_config", {
+        pack: { name: "ts-coding" },
+        workdir: "D:/Work/Github_pros/Agent_Design",
+        guardrails: { maxTurns: 40, maxTokens: 64000 },
+        verifierBudgetTurns: 15,
+      }),
+    ]);
+  }
+
+  /**
+   * 这条是整个设计的关键：**状态条上的每个数字都来自 run_config**，
+   * 不是写死的文案。装配变了条上就变，说明文字因此不会和现实脱节——
+   * 而一条写死的标语会。
+   */
+  it("chip 全部来自本次运行的真实装配", () => {
+    const items = deriveAssemblyBar(configured(), { model: "claude-opus-5" });
+    const by = Object.fromEntries(items.map((i) => [i.key, i.chip]));
+    expect(by.model).toBe("claude-opus-5");
+    expect(by.pack).toBe("ts-coding");
+    expect(by.guardrails).toBe("40 轮 / 64k");
+    expect(by.verify).toContain("15 轮");
+  });
+
+  it("装配变了条上就变——核查关掉时说的是「核查关」", () => {
+    let s = createInitialState("r2", "t", false);
+    const items = deriveAssemblyBar(s, null);
+    expect(items.find((i) => i.key === "verify")!.chip).toBe("核查关");
+  });
+
+  it("没有领域包时如实说「无领域包」，不留空", () => {
+    const items = deriveAssemblyBar(createInitialState("r3", "t", false), null);
+    expect(items.find((i) => i.key === "pack")!.chip).toBe("无领域包");
+  });
+
+  it("长工作目录只留尾部两级——状态条是一行", () => {
+    const items = deriveAssemblyBar(configured(), null);
+    const wd = items.find((i) => i.key === "workdir")!.chip;
+    expect(wd.length).toBeLessThan(40);
+    expect(wd).toContain("Agent_Design");
+  });
+
+  it("非编排运行没有编排项", () => {
+    expect(deriveAssemblyBar(configured(), null).some((i) => i.key === "plan")).toBe(false);
+  });
+
+  /**
+   * **每一句 why 都必须落在具体后果上**，不能是标语。
+   * 判据：说清"不这样会发生什么"。写不出后果的项就不该占状态条的位置——
+   * 本项目一贯反对标语（findings 全篇都是"判据 + 出处"的写法）。
+   */
+  it("每一项都有说明，且不是空泛口号", () => {
+    const items = deriveAssemblyBar(configured(), { model: "m" });
+    expect(items.length).toBeGreaterThanOrEqual(5);
+    for (const i of items) {
+      expect(i.why.length, `${i.key} 的说明太短`).toBeGreaterThan(40);
+      // 标语词一律不许出现
+      for (const banned of ["我们相信", "更可靠", "更智能", "赋能", "领先"]) {
+        expect(i.why, `${i.key} 的说明里出现了口号「${banned}」`).not.toContain(banned);
+      }
+    }
+  });
+
+  it("点一下展开说明，再点一下收起", () => {
+    renderRunDetail(configured(), { activeTab: "loop", harness: { model: "m" } });
+    const chips = [...document.querySelectorAll(".assembly-chip")] as HTMLElement[];
+    const why = document.querySelector(".assembly-why") as HTMLElement;
+    expect(why.hidden).toBe(true);
+
+    chips[0].click();
+    expect(why.hidden).toBe(false);
+    expect(chips[0].getAttribute("aria-expanded")).toBe("true");
+    expect(why.textContent!.length).toBeGreaterThan(20);
+
+    chips[0].click();
+    expect(why.hidden, "再点一次应当收起").toBe(true);
+  });
+
+  it("同时只展开一项——两句解释叠在一起没人读", () => {
+    renderRunDetail(configured(), { activeTab: "loop", harness: { model: "m" } });
+    const chips = [...document.querySelectorAll(".assembly-chip")] as HTMLElement[];
+    chips[0].click();
+    chips[1].click();
+    const open = chips.filter((c) => c.getAttribute("aria-expanded") === "true");
+    expect(open).toHaveLength(1);
+    expect(open[0]).toBe(chips[1]);
   });
 });
