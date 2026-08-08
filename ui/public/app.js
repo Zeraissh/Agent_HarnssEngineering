@@ -1163,7 +1163,7 @@ export function deriveVerificationFace(state, harness) {
  * 说明行、`data-mode` 四处同时变，绝不静默。
  *
  * @param {{
- *   info?: {status?: string, canContinue?: boolean, mode?: string, verify?: boolean, workdir?: string, runId?: string}|null,
+ *   info?: {status?: string, canContinue?: boolean, mode?: string, verify?: boolean, workdir?: string, runId?: string, archived?: boolean}|null,
  *   localStatus?: string|null,   // 本地 SSE 观测到的状态；见下方"默认值不是观测"
  *   submitting?: boolean,        // 提交在飞：服务端还没回、列表也还没更新
  *   error?: string|null,
@@ -1279,6 +1279,11 @@ export function deriveComposerMode({ info, localStatus, submitting, error } = {}
 
 /** 不能追加的原因（V-28：不能只是"没有输入框"，要说为什么） */
 function blockedReason(info) {
+  // B2 判据④：归档运行（宿主重启前的历史）排最前——它同样没有 loop，
+  // 落到最后那句"可能执行阶段就失败了"就是对着好端端的历史说谎
+  if (info.archived) {
+    return "这是宿主重启前的归档运行：事件与会话可回看，但执行上下文没有跨重启保存，无法续跑。";
+  }
   if (info.mode === "plan") {
     return "计划编排的运行不支持追加：runPlanned 每次都从拆解开始，没有续跑入口。";
   }

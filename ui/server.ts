@@ -32,6 +32,16 @@ import { readFileTool } from "../src/tools/read-file.js";
 import { writeFileTool } from "../src/tools/write-file.js";
 import { resolveInWorkdir } from "../src/tools/fs-util.js";
 import { appendRunLedger, buildLedgerEntry, ledgerPath, tallyToolCall, type ToolTally } from "../src/ledger.js";
+import {
+  RunHistoryWriter,
+  historyKeepCount,
+  historyRootPath,
+  loadArchivedMetas,
+  pruneHistory,
+  readArchivedEvents,
+  readArchivedTranscript,
+  type ArchivedMeta,
+} from "./history.js";
 import { EFFORT_LEVELS } from "../src/types.js";
 import type { ModelClient, TurnEvent, AgentConfig, Tool, Effort } from "../src/types.js";
 import type { Verdict } from "../src/verifier.js";
@@ -171,6 +181,17 @@ interface StoredRun {
   /** 计划门挂起态；同一 run 至多一次（计划只出一次，不像审批会跨返工轮复用） */
   pendingPlan?: PendingPlan;
   planDecision?: { decision: "approve" | "reject"; at: number };
+  // ---- B2 运行历史落盘 ----
+  /** 本次进程内的落盘写入器；无历史根或显式关闭时缺省（history 一名已被会话正史占用） */
+  archiveWriter?: RunHistoryWriter;
+  /** true = 从磁盘恢复的归档运行：只读回看，无 loop/abort，不能续跑（判据④） */
+  archived?: true;
+  /** 归档目录（events/transcript 按需读的来源） */
+  archiveDir?: string;
+  /** 归档的懒加载：首次访问 events/transcript 时才付读盘代价，且只付一次 */
+  hydration?: Promise<void>;
+  /** 归档的裁决摘要（列表列用）；活 run 走 outcome，两者在 runSummary 合流 */
+  archivedOutcome?: { finalPassed: boolean | null; reworks: number | null; verdict: Verdict | null };
 }
 
 interface PendingPlan {
@@ -244,6 +265,14 @@ export interface UiServerOptions {
    * `false` = 显式关闭；字符串 = 指定文件。
    */
   ledger?: false | string;
+  /**
+   * B2 运行历史落点（每 run 一个目录）。缺省逻辑同 `ledger`：注入了
+   * modelClient 就默认不存（测试与脚本驱动的运行不该污染真档案）。
+   * `false` = 显式关闭；字符串 = 指定根目录。
+   */
+  history?: false | string;
+  /** 历史保留数（判据③），缺省 env AGENT_RUN_HISTORY_KEEP > DEFAULT_HISTORY_KEEP */
+  historyKeep?: number;
 }
 
 export interface UiServerHandle {
@@ -402,6 +431,17 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         : options.modelClient
           ? null
           : ledgerPath();
+  // B2 运行历史根。缺省逻辑与台账同一条仪器纪律：注入 modelClient 的运行
+  // （测试/脚本）默认不落档案——假模型的"历史"混进真档案同样是假证据
+  const historyRoot: string | null =
+    options.history === false
+      ? null
+      : typeof options.history === "string"
+        ? resolve(options.history)
+        : options.modelClient
+          ? null
+          : historyRootPath();
+  const historyKeep = options.historyKeep ?? historyKeepCount();
   const envCompat = resolved.compat;
   // 在源头就归一：workdir 参与白名单比对、侧栏分组键、工具圈禁根三处，
   // 三处必须是同一个字符串形态。`D:/a/b` 与 `D:` 指同一个目录，
@@ -451,6 +491,135 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
   const runs = new Map<string, StoredRun>();
 
+  // ---- B2 运行历史落盘 ----
+
+  /** run → meta.json 的形状。创建 / 追加轮开始 / 收尾各整写一次 */
+  function persistMeta(run: StoredRun): void {
+    if (!run.archiveWriter) return;
+    const meta: ArchivedMeta = {
+      version: 1,
+      runId: run.id,
+      task: run.task,
+      status: run.status,
+      verify: run.verify,
+      createdAt: run.createdAt,
+      finishedAt: run.finishedAt ?? null,
+      packName: run.packName ?? pack?.name ?? null,
+      mode: run.mode ?? "single",
+      effort: run.effort ?? null,
+      rubric: run.rubric ?? null,
+      workdir: run.workdir ?? workdir,
+      conversationTurn: run.conversationTurn,
+      planGate: Boolean(run.planGate),
+      planDecision: run.planDecision ?? null,
+      mainStopReason: run.mainStopReason ?? null,
+      outcome: run.outcome
+        ? {
+            finalPassed: run.outcome.finalPassed,
+            reworks: run.outcome.reworks,
+            verdict: run.outcome.verifications.at(-1)?.verdict ?? null,
+          }
+        : null,
+    };
+    run.archiveWriter.writeMeta(meta);
+  }
+
+  /**
+   * 启动时恢复档案（判据①②）。先修剪再恢复；坏档案已在 loadArchivedMetas
+   * 里被跳过。恢复出来的 run 一律 status=done + archived——**没有任何一个
+   * 归档 run 是"在跑的"**：跑到一半宿主没了的，按异常终止归档（见 hydrate
+   * 的 run_end 合成），绝不显示成还在跑。
+   */
+  async function restoreArchivedRuns(): Promise<void> {
+    if (!historyRoot) return;
+    try {
+      await pruneHistory(historyRoot, historyKeep);
+      for (const a of await loadArchivedMetas(historyRoot)) {
+        if (runs.has(a.meta.runId)) continue;
+        const crashed = a.meta.status === "running";
+        runs.set(a.meta.runId, {
+          id: a.meta.runId,
+          task: a.meta.task,
+          status: "done",
+          verify: a.meta.verify,
+          createdAt: a.meta.createdAt,
+          ...(a.meta.finishedAt !== null ? { finishedAt: a.meta.finishedAt } : {}),
+          events: [],
+          pendingApprovals: new Map(),
+          respondedApprovals: new Map(),
+          respondedToolUseIds: new Set(),
+          sseClients: new Set(),
+          segmentIndex: 0,
+          transcript: [],
+          conversationTurn: a.meta.conversationTurn,
+          toolTally: {},
+          archived: true,
+          archiveDir: a.dir,
+          ...(a.meta.packName ? { packName: a.meta.packName } : {}),
+          ...(a.meta.mode === "plan" ? { mode: "plan" as const } : {}),
+          ...(a.meta.effort ? { effort: a.meta.effort as Effort } : {}),
+          ...(a.meta.rubric ? { rubric: a.meta.rubric } : {}),
+          ...(a.meta.workdir ? { workdir: a.meta.workdir } : {}),
+          ...(a.meta.planGate ? { planGate: true } : {}),
+          ...(a.meta.planDecision ? { planDecision: a.meta.planDecision } : {}),
+          // 崩溃档案（meta 还停在 running）：没人正常收过尾，按宿主级异常归档
+          ...(crashed
+            ? { mainStopReason: "error" }
+            : a.meta.mainStopReason
+              ? { mainStopReason: a.meta.mainStopReason }
+              : {}),
+          ...(a.meta.outcome
+            ? {
+                archivedOutcome: {
+                  finalPassed: a.meta.outcome.finalPassed,
+                  reworks: a.meta.outcome.reworks,
+                  verdict: (a.meta.outcome.verdict as Verdict | null) ?? null,
+                },
+              }
+            : {}),
+        });
+      }
+    } catch {
+      // 档案层任何失败都不影响宿主启动（仪器纪律）
+    }
+  }
+  /** 所有 API 路由在此就绪后才应答——启动后的第一个 GET /api/runs 就要看得到档案 */
+  const historyReady: Promise<void> = restoreArchivedRuns();
+
+  /**
+   * 归档懒加载：events/transcript 首次被要时才读盘，且只读一次。
+   * 崩溃档案的事件流没有 run_end——合成一条（outcome=error），否则重放出来
+   * 的界面会永远"运行中"，那是档案在对人说谎。
+   */
+  function hydrateArchive(run: StoredRun): Promise<void> {
+    if (!run.archived || !run.archiveDir) return Promise.resolve();
+    run.hydration ??= (async () => {
+      const dir = run.archiveDir!;
+      run.events = (await readArchivedEvents(dir)) as SSEEvent[];
+      run.transcript = (await readArchivedTranscript(dir)) as StoredRun["transcript"];
+      const hasRunEnd = run.events.some((e) => (e.event as { type?: string } | undefined)?.type === "run_end");
+      if (!hasRunEnd) {
+        const lastTs = run.events.at(-1)?.ts ?? run.createdAt;
+        run.events.push({
+          seq: run.events.length,
+          source: "host",
+          ts: lastTs,
+          event: {
+            type: "run_end",
+            outcome: "error",
+            mainStopReason: "error",
+            finishedAt: lastTs,
+            // 观测者要分得清"它当时崩了"与"宿主没能归档收尾"——后者才是事实
+            synthesized: "host_not_finalized",
+          },
+        });
+      }
+    })().catch(() => {
+      // 读盘失败：events/transcript 留空，列表元数据仍可用
+    });
+    return run.hydration;
+  }
+
   /**
    * 全局生命周期流的订阅者（V-10）。
    *
@@ -475,16 +644,20 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       finishedAt: r.finishedAt ?? null,
       packName: r.packName ?? pack?.name ?? null,
       stopReason: r.mainStopReason ?? null,
-      finalPassed: r.outcome?.finalPassed ?? null,
-      reworks: r.outcome?.reworks ?? null,
+      // 活 run 走 outcome，归档 run 走 meta 里的摘要——列表列不因重启而变
+      finalPassed: r.outcome?.finalPassed ?? r.archivedOutcome?.finalPassed ?? null,
+      reworks: r.outcome?.reworks ?? r.archivedOutcome?.reworks ?? null,
       pendingApprovals: r.pendingApprovals.size,
       // V-14 口径：需要人介入的事项由服务端持有，不取决于该 run 有没有被订阅过。
       // 计划门挂起时侧栏就该显示"需你决定"，而不是点进去才发现
       planGate: Boolean(r.planGate),
       awaitingPlanApproval: Boolean(r.pendingPlan),
       planDecision: r.planDecision?.decision ?? null,
-      verdict: r.outcome?.verifications.at(-1)?.verdict ?? null,
+      verdict: r.outcome?.verifications.at(-1)?.verdict ?? r.archivedOutcome?.verdict ?? null,
       mode: r.mode ?? "single",
+      // B2 判据④：归档运行只能回看。界面据此把"不能续跑"说成真话
+      // （"执行上下文没跨重启保存"），而不是"执行阶段就失败了"
+      ...(r.archived ? { archived: true } : {}),
       conversationTurn: r.conversationTurn,
       // V-32：侧栏按工作目录分组。workdir 是工具的写入圈禁边界，
       // 也就是"这段工作触碰的范围"——它是这个 harness 自己长出来的分组键，
@@ -814,11 +987,14 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
     // 段计数在 done 之后递增：done 自身属于刚结束的那一段
     if (event.type === "done") {
-      run.transcript.push({
+      const segment = {
         index: run.segmentIndex,
         source,
         messages: event.result.messages ?? [],
-      });
+      };
+      run.transcript.push(segment);
+      // B2 判据①：正文与事件流分开落盘（可达数 MB/段，不能混进重放流）
+      run.archiveWriter?.appendTranscriptSegment(segment);
       run.segmentIndex += 1;
       // V-28：留下会话正史，下一轮 runContinuation 要接在它后面。
       // 只认主线（main）——verifier 是全新上下文的独立复核，它的正史不属于对话
@@ -827,6 +1003,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       }
     }
 
+    // B2：durable 事件逐条落盘（delta 在上面早已 return——本来就不进缓冲）
+    run.archiveWriter?.appendEvent(sseEvent);
     // 推送给在线 SSE 客户端
     broadcastSSE(run, frameFor(sseEvent));
     return seq;
@@ -837,6 +1015,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     const seq = run.events.length;
     const sseEvent: SSEEvent = { seq, source, ts: Date.now(), event };
     run.events.push(sseEvent);
+    run.archiveWriter?.appendEvent(sseEvent);
     broadcastSSE(run, frameFor(sseEvent));
     return seq;
   }
@@ -957,6 +1136,17 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         ledgerFile,
       );
     }
+
+    // B2：收尾状态整写进档案，然后修剪（判据③）。在跑的 run 受保护不删。
+    // 修剪排在本 run 的写入链上：直接 fire-and-forget 会与自己的 meta 写赛跑，
+    // 读盘时档案未成形、计数不足就漏剪
+    persistMeta(run);
+    if (historyRoot && run.archiveWriter) {
+      const running = new Set(
+        [...runs.values()].filter((r) => r.status === "running").map((r) => r.id),
+      );
+      run.archiveWriter.schedule(() => pruneHistory(historyRoot, historyKeep, running));
+    }
   }
 
   /** 启动一次不带核查的运行 */
@@ -1013,6 +1203,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     run.status = "running";
     delete run.finishedAt;
     run.conversationTurn += 1;
+    persistMeta(run); // 追加轮开始也要进档案：轮数与"回到运行中"都是状态
 
     // 追加的这句话本身要进事件流：它是会话的一部分，也是"这一段为什么开始"的解释
     pushSyntheticEvent(run, "host", {
@@ -1596,6 +1787,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     const method = req.method ?? "GET";
     const route = matchRoute(method, url);
 
+    // B2：档案恢复完成前不应答 API——启动后的第一个 GET /api/runs 就要看得到
+    // 历史，否则界面会先画一份空列表再闪一次（静态资源不用等）
+    if (route.type !== "static") await historyReady;
+
     switch (route.type) {
       case "malformed":
         return notFound(res, `Unknown route: ${method} ${url}`);
@@ -1689,6 +1884,14 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         const run = runs.get(route.runId);
         if (!run) return notFound(res, `Run not found: ${route.runId}`);
 
+        // B2 判据④：归档运行只能回看。这个原因必须排在最前——归档 run 也没有
+        // loop，落到下面那句"可能执行阶段就失败了"就是对着好端端的历史说谎
+        if (run.archived) {
+          return json(res, 409, {
+            error: "归档运行（宿主重启前的历史）只能回看：执行上下文没有跨重启保存，无法续跑",
+          });
+        }
+
         // 边界要说清，不能含糊地失败：
         //  · 运行中不接受追加——两条指令并发进同一个会话会互相踩
         //  · 核查/编排模式没有续跑入口（runVerified / runPlanned 都从头开始），
@@ -1734,6 +1937,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       case "transcript": {
         const run = runs.get(route.runId);
         if (!run) return notFound(res, `Run not found: ${route.runId}`);
+        await hydrateArchive(run); // 归档 run 的正文在磁盘上，首次访问才读
         // 按需拉：会话正文可达数 MB，不能进 SSE 缓冲（那会让每个晚订阅的
         // 客户端都重放一遍）。这里只在用户真的切到对话视图时才付这笔代价。
         return json(res, 200, {
@@ -1975,6 +2179,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           ...(parsed.usePlannerModel === false ? { usePlannerModel: false } : {}),
           ...(parsed.planGate === true ? { planGate: true } : {}),
         };
+        // B2：建档要在第一条事件之前——writer 的写入链从 mkdir 开始保序
+        if (historyRoot) {
+          run.archiveWriter = new RunHistoryWriter(join(historyRoot, id));
+          persistMeta(run);
+        }
         runs.set(id, run);
         broadcastLifecycle("run_created", run);
 
@@ -1992,6 +2201,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       case "events": {
         const run = runs.get(route.runId);
         if (!run) return notFound(res, `Run not found: ${route.runId}`);
+        await hydrateArchive(run); // 归档 run 的事件流在磁盘上，重放前先装回缓冲
         return serveSSE(req, res, run);
       }
 
@@ -2151,12 +2361,19 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         for (const run of runs.values()) {
           finalizeRun(run, { outcome: "closed" });
         }
+        // B2：等档案写入链走完再关——收尾刚排进队列的 approval_expired /
+        // run_end / meta 不能丢在半路，否则重启后的档案缺最关键的那几行
+        const flushes = [...runs.values()]
+          .map((r) => r.archiveWriter?.flush())
+          .filter((p): p is Promise<unknown> => Boolean(p));
         runs.clear();
         // MCP 子进程必须显式断开：留着就是常驻的僵尸 server，stm32 那种还攥着
         // 探针（案例 #3 的事故原型）。close() 不等它完成——服务器该关就关，
         // 但断开动作要发出去
         void mcpRuntime?.close().catch(() => {});
-        server.close((err) => (err ? reject(err) : resolve()));
+        void Promise.allSettled(flushes).then(() => {
+          server.close((err) => (err ? reject(err) : resolve()));
+        });
       });
     },
   };

@@ -1521,6 +1521,21 @@ describe("停止按钮：运行中那个位置变成「停止」", () => {
   });
 });
 
+describe("B2 · 归档运行在底栏的说法", () => {
+  /**
+   * 归档 run（宿主重启前的历史）同样 canContinue=false，但原因完全不同：
+   * 落到兜底那句"可能执行阶段就失败了"是对着一次好端端的运行说谎（判据④）。
+   */
+  it("归档的'不能续跑'要说真话，而不是'执行阶段就失败了'", () => {
+    const m = deriveComposerMode({
+      info: { runId: "r1", status: "done", canContinue: false, archived: true },
+    });
+    expect(m.mode).toBe("new-blocked");
+    expect(m.note).toContain("归档");
+    expect(m.note).not.toContain("失败");
+  });
+});
+
 describe("装配条的识图那一格", () => {
   const bare = () => createInitialState("rv", "t", false);
 

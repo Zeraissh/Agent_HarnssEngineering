@@ -23,6 +23,7 @@ import { readFileSync, existsSync } from "node:fs";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createUiServer, contentTypeOf, planGateStopReason, revealCommand, type UiServerHandle } from "../ui/server.js";
+import { DEFAULT_HISTORY_KEEP, historyKeepCount, historyRootPath } from "../ui/history.js";
 import {
   FakeModelClient,
   fakeMessage,
@@ -2689,5 +2690,210 @@ describe("本次对话常驻放行：省的是点击，不是记录", () => {
     expect((await res.json()).autoAllow).toBeUndefined();
     // 下一次调用仍要人点
     await firstPending(runId);
+  });
+});
+
+// ================================================================
+// B2：运行历史落盘——重启不再清零
+// ================================================================
+
+describe("B2 · 运行历史落盘", () => {
+  let handle: UiServerHandle | undefined;
+  let port = 0;
+  let base = "";
+  let dir = "";
+
+  afterEach(async () => {
+    if (handle) {
+      await handle.close();
+      handle = undefined;
+    }
+    if (dir) {
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+      dir = "";
+    }
+  });
+
+  async function boot(opts: Parameters<typeof createUiServer>[0]): Promise<void> {
+    handle = createUiServer(opts);
+    port = await startServer(handle);
+    base = baseUrl(port);
+  }
+
+  const post = (path: string, body: unknown) =>
+    fetch(`${base}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+  it("重启后运行仍在：列表、事件重放、正文都来自档案，且照实说不能续跑", async () => {
+    dir = await mkdtemp(join(tmpdir(), "history-"));
+    await boot({
+      modelClient: new FakeModelClient([fakeMessage([textBlock("完事了")], "end_turn")]),
+      tools: [autoTool("noop")],
+      workdir: process.cwd(),
+      history: dir,
+    });
+    const { runId } = (await (await post("/api/runs", { task: "归档我", verify: false })).json()) as { runId: string };
+    await waitForDone(base, runId);
+    const before = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+    await handle!.close();
+    handle = undefined;
+
+    await boot({ modelClient: new FakeModelClient([]), tools: [], workdir: process.cwd(), history: dir });
+    const list = (await (await fetch(`${base}/api/runs`)).json()) as any[];
+    const restored = list.find((r) => r.runId === runId);
+    expect(restored, "重启后列表里没有这个 run").toBeDefined();
+    expect(restored.archived).toBe(true);
+    expect(restored.status).toBe("done");
+    expect(restored.stopReason).toBe("completed");
+    expect(restored.task).toBe("归档我");
+    // 判据④：归档只能回看，服务端与界面都不许骗人
+    expect(restored.canContinue).toBe(false);
+
+    // 事件重放逐条等价——界面的一切都从重放长出来，这是档案的硬契约（V-05 的延伸）
+    const after = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+    expect(after).toEqual(before);
+
+    const transcript = (await (await fetch(`${base}/api/runs/${runId}/transcript`)).json()) as any;
+    expect(transcript.segments.length).toBeGreaterThan(0);
+
+    const follow = await post(`/api/runs/${runId}/messages`, { text: "再来一轮" });
+    expect(follow.status).toBe(409);
+    expect(((await follow.json()) as any).error).toContain("归档");
+  });
+
+  it("宿主收尾时在飞的 run 也归档：审批过期宣告与 run_end(closed) 都在档案里", async () => {
+    dir = await mkdtemp(join(tmpdir(), "history-"));
+    await boot({
+      modelClient: new FakeModelClient([fakeMessage([toolUseBlock("tu_hang", "sensitive", {})], "tool_use")]),
+      tools: [askTool("sensitive")],
+      workdir: process.cwd(),
+      history: dir,
+    });
+    const { runId } = (await (await post("/api/runs", { task: "开着就关", verify: false })).json()) as { runId: string };
+    await waitForEvent(base, runId, (e: any) => e.event.type === "approval_request");
+    await handle!.close();
+    handle = undefined;
+
+    await boot({ modelClient: new FakeModelClient([]), tools: [], workdir: process.cwd(), history: dir });
+    const restored = ((await (await fetch(`${base}/api/runs`)).json()) as any[]).find((r) => r.runId === runId);
+    expect(restored.status).toBe("done");
+    const events = (await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`))) as any[];
+    expect(events.map((e) => e.event.type)).toContain("approval_expired");
+    expect(events.at(-1)!.event.type).toBe("run_end");
+    expect(events.at(-1)!.event.outcome).toBe("closed");
+  });
+
+  it("崩溃档案（meta 停在 running）按异常终止恢复，绝不显示成还在跑", async () => {
+    dir = await mkdtemp(join(tmpdir(), "history-"));
+    const runDir = join(dir, "crash-run");
+    await mkdir(runDir, { recursive: true });
+    await writeFile(
+      join(runDir, "meta.json"),
+      JSON.stringify({
+        version: 1, runId: "crash-run", task: "崩溃现场", status: "running", verify: false,
+        createdAt: 1000, finishedAt: null, packName: null, mode: "single", effort: null,
+        rubric: null, workdir: null, conversationTurn: 1, planGate: false, planDecision: null,
+        mainStopReason: null, outcome: null,
+      }),
+      "utf8",
+    );
+    await writeFile(
+      join(runDir, "events.jsonl"),
+      `${JSON.stringify({ seq: 0, source: "main", ts: 1001, event: { type: "turn_start", turn: 1 } })}\n`,
+      "utf8",
+    );
+
+    await boot({ modelClient: new FakeModelClient([]), tools: [], workdir: process.cwd(), history: dir });
+    const r = ((await (await fetch(`${base}/api/runs`)).json()) as any[]).find((x) => x.runId === "crash-run");
+    expect(r.status).toBe("done");
+    expect(r.stopReason).toBe("error");
+    // 事件流缺 run_end 时合成一条，否则重放出来的界面会永远"运行中"
+    const events = (await readSSEAll(await fetch(`${base}/api/runs/crash-run/events`))) as any[];
+    expect(events.at(-1)!.event.type).toBe("run_end");
+    expect(events.at(-1)!.event.mainStopReason).toBe("error");
+    expect(events.at(-1)!.event.synthesized).toBe("host_not_finalized");
+  });
+
+  it("保留策略（判据③）：超出 keep 的最老档案被修剪，重启后列表同口径", async () => {
+    dir = await mkdtemp(join(tmpdir(), "history-"));
+    await boot({
+      modelClient: new FakeModelClient([
+        fakeMessage([textBlock("一")], "end_turn"),
+        fakeMessage([textBlock("二")], "end_turn"),
+        fakeMessage([textBlock("三")], "end_turn"),
+      ]),
+      tools: [],
+      workdir: process.cwd(),
+      history: dir,
+      historyKeep: 2,
+    });
+    const ids: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      const { runId } = (await (await post("/api/runs", { task: `任务${i}`, verify: false })).json()) as { runId: string };
+      ids.push(runId);
+      await waitForDone(base, runId);
+      await new Promise((r) => setTimeout(r, 10)); // createdAt 是排序键，别让两条同毫秒
+    }
+    await handle!.close();
+    handle = undefined;
+
+    expect((await readdir(dir)).sort()).toEqual([ids[1]!, ids[2]!].sort());
+
+    await boot({ modelClient: new FakeModelClient([]), tools: [], workdir: process.cwd(), history: dir, historyKeep: 2 });
+    const list = (await (await fetch(`${base}/api/runs`)).json()) as any[];
+    expect(list.map((r) => r.runId).sort()).toEqual([ids[1]!, ids[2]!].sort());
+  });
+
+  it("坏档案逐条跳过，好档案照常恢复——档案坏了不影响宿主启动", async () => {
+    dir = await mkdtemp(join(tmpdir(), "history-"));
+    await mkdir(join(dir, "bogus"));
+    await writeFile(join(dir, "bogus", "meta.json"), "{ 这不是 JSON", "utf8");
+    await mkdir(join(dir, "no-meta"));
+    const good = join(dir, "good-run");
+    await mkdir(good);
+    await writeFile(
+      join(good, "meta.json"),
+      JSON.stringify({
+        version: 1, runId: "good-run", task: "好档案", status: "done", verify: false,
+        createdAt: 2000, finishedAt: 2100, packName: null, mode: "single", effort: null,
+        rubric: null, workdir: null, conversationTurn: 1, planGate: false, planDecision: null,
+        mainStopReason: "completed", outcome: null,
+      }),
+      "utf8",
+    );
+
+    await boot({ modelClient: new FakeModelClient([]), tools: [], workdir: process.cwd(), history: dir });
+    const list = (await (await fetch(`${base}/api/runs`)).json()) as any[];
+    expect(list.map((r) => r.runId)).toEqual(["good-run"]);
+  });
+
+  it("档案根不可写时运行照常完成——仪器坏了不能影响被测对象（与台账同纪律）", async () => {
+    dir = await mkdtemp(join(tmpdir(), "history-"));
+    const file = join(dir, "plain.txt");
+    await writeFile(file, "x", "utf8");
+    // 根的父路径是普通文件：mkdir 必败，写入链熄火，但 run 必须照常跑完
+    await boot({
+      modelClient: new FakeModelClient([fakeMessage([textBlock("ok")], "end_turn")]),
+      tools: [],
+      workdir: process.cwd(),
+      history: join(file, "sub"),
+    });
+    const { runId } = (await (await post("/api/runs", { task: "x", verify: false })).json()) as { runId: string };
+    await waitForDone(base, runId);
+    const r = ((await (await fetch(`${base}/api/runs`)).json()) as any[]).find((x) => x.runId === runId);
+    expect(r.status).toBe("done");
+    expect(r.stopReason).toBe("completed");
+  });
+
+  it("historyRootPath / historyKeepCount：env 覆盖与非法值回退", () => {
+    expect(historyRootPath({}, "/proj")).toMatch(/[\\/]proj[\\/]\.agent-run-history$/);
+    expect(historyRootPath({ AGENT_RUN_HISTORY_DIR: "out/h" }, "/proj")).toMatch(/out[\\/]h$/);
+    expect(historyKeepCount({})).toBe(DEFAULT_HISTORY_KEEP);
+    expect(historyKeepCount({ AGENT_RUN_HISTORY_KEEP: "7" })).toBe(7);
+    expect(historyKeepCount({ AGENT_RUN_HISTORY_KEEP: "abc" })).toBe(DEFAULT_HISTORY_KEEP);
+    expect(historyKeepCount({ AGENT_RUN_HISTORY_KEEP: "0" })).toBe(DEFAULT_HISTORY_KEEP);
   });
 });
