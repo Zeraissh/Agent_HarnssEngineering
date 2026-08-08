@@ -19,6 +19,9 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { join, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { mkdtemp, rm, readFile, readdir, writeFile, mkdir } from "node:fs/promises";
+import { readFileSync, existsSync } from "node:fs";
+import { dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createUiServer, contentTypeOf, revealCommand, type UiServerHandle } from "../ui/server.js";
 import {
   FakeModelClient,
@@ -2496,5 +2499,45 @@ describe("在文件夹中显示：从网页请求启动本机进程，圈禁只�
     expect(contentTypeOf("x.bin")).toContain("application/octet-stream");
     // 大小写不敏感
     expect(contentTypeOf("X.PNG")).toContain("image/png");
+  });
+});
+
+describe("凭据装载：npm 脚本必须自己读 .env", () => {
+  /**
+   * 实测事故：key 只活在"启动那个服务的那个终端"里。终端找不回来之后，
+   * 运行中的服务还在用它，而任何人（包括我）都无法再起一个等价的实例——
+   * 于是"更新到新版"变成了"先丢掉凭据再丢掉历史"。
+   * **凭据的存放位置本身就该是可复现的。**
+   *
+   * 用 Node 自带的 `--env-file-if-exists`：零依赖，且文件不存在时照旧走进程
+   * 环境变量（不能因为没有 .env 就把已经配好环境的用户挡在外面）。
+   */
+  it("所有会调模型的入口都带 --env-file-if-exists", () => {
+    const pkg = JSON.parse(
+      readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "package.json"), "utf-8"),
+    );
+    for (const name of ["cli", "ui", "eval", "ab", "lab", "smoke:local"]) {
+      expect(pkg.scripts[name], `${name} 不会读 .env`).toContain("--env-file-if-exists=.env");
+    }
+  });
+
+  it(".env 必须被 gitignore——凭据绝不进仓库", () => {
+    const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+    const ignored = readFileSync(join(root, ".gitignore"), "utf-8").split(/\r?\n/);
+    expect(ignored).toContain(".env");
+    // 而模板要进仓库：新机器上得知道该填哪些字段
+    expect(existsSync(join(root, ".env.example"))).toBe(true);
+  });
+
+  it("模板里所有敏感字段都是空值——不能提交一个填着真 key 的样例", () => {
+    const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+    const text = readFileSync(join(root, ".env.example"), "utf-8");
+    for (const line of text.split(/\r?\n/)) {
+      if (line.startsWith("#") || !line.includes("=")) continue;
+      const [k, v] = line.split("=", 2);
+      if (/KEY|TOKEN|SECRET/i.test(k!)) {
+        expect(v!.trim(), `${k} 在模板里有值`).toBe("");
+      }
+    }
   });
 });

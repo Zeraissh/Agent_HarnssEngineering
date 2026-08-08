@@ -5,15 +5,15 @@
   "type": "module",
   "description": "Harness engineering agent framework — hand-written agent loop on the Anthropic Messages API",
   "scripts": {
-    "cli": "tsx src/cli.ts",
-    "ui": "tsx ui/serve.ts",
-    "eval": "tsx eval/run.ts",
-    "ab": "tsx eval/ab.ts",
-    "lab": "tsx eval/lab.ts",
-    "smoke:local": "tsx eval/smoke-local.ts",
+    "cli": "tsx --env-file-if-exists=.env src/cli.ts",
+    "ui": "tsx --env-file-if-exists=.env ui/serve.ts",
+    "eval": "tsx --env-file-if-exists=.env eval/run.ts",
+    "ab": "tsx --env-file-if-exists=.env eval/ab.ts",
+    "lab": "tsx --env-file-if-exists=.env eval/lab.ts",
+    "smoke:local": "tsx --env-file-if-exists=.env eval/smoke-local.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "ledger": "tsx eval/ledger-report.ts"
+    "ledger": "tsx --env-file-if-exists=.env eval/ledger-report.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.115.0",
