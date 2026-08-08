@@ -142,6 +142,54 @@ describe("verifyInstructions 注入 verifier 提示", () => {
       fakeMessage([textBlock('{"passed": true, "issues": [], "summary": "ok"}')], "end_turn"),
     ]);
     await runVerified({ systemPrompt: "sys", tools: [], workdir: process.cwd() }, model, "任务", {});
-    expect(model.prompts[1]!).not.toContain("领域核查方法");
+    const p = model.prompts[1]!;
+    expect(p).not.toContain("领域核查方法");
+    // 没有领域说明时，不能让 verifier 去看一个不存在的章节——只读那条要给出
+    // 自足的兜底（写这条时就是它抓到我引用了不存在的段落）
+    expect(p).toContain("不要自作主张去改变被测系统的状态");
+  });
+
+  /**
+   * 9.6：真机域的"只读核查"必须含"把系统带到可观测状态"。
+   *
+   * 案例 #8 实测：stm32-debug 的核查指令原文写着「不要 flash、不要 reset、
+   * 不要写内存」一刀切，于是 verifier 68 次工具调用里一次都没复位，读到上一段
+   * 会话遗留的未初始化 SRAM（magic=0x4E0A43C0、PC 在 SRAM 内），据此判执行者
+   * 失败——而板子上的固件一直是好的。
+   *
+   * 但那条禁令对【故障现场核查】完全正确（复位会毁掉 .noinit 闩锁/CFSR/栈帧）。
+   * 所以正解不是放宽，是把两种核查形态分开写清楚。下面两条锁的就是"分开了"。
+   */
+  it("硬件核查指令区分两种形态：故障现场绝不复位，运行行为必须先复位跑起来", () => {
+    const instr = PACKS["stm32-debug"]!.verify.instructions!;
+    // 故障现场那一支：禁令必须还在——这是案例 #1/#3 换来的
+    expect(instr).toContain("故障现场核查");
+    expect(instr).toMatch(/绝对不要\s*reset|不要\s*reset/);
+    expect(instr).toContain("复位会把故障现场毁掉");
+    // 运行行为那一支：必须明确要求先带到可观测状态
+    expect(instr).toContain("运行行为核查");
+    expect(instr).toContain("reset_target");
+    expect(instr).toContain("run_for_duration");
+    expect(instr).toContain("未初始化 SRAM");
+    // 还要给出"怎么认出板子没在跑"的判据，否则模型只能猜
+    expect(instr).toMatch(/PC 不在 main|看着像随机数/);
+  });
+
+  it("通用只读纪律澄清：只读针对产物，不等于不许让被测系统运行", async () => {
+    const model = new CapturingClient([
+      fakeMessage([textBlock("完成")], "end_turn"),
+      fakeMessage([textBlock('{"passed": true, "issues": [], "summary": "ok"}')], "end_turn"),
+    ]);
+    await runVerified(
+      { systemPrompt: "sys", tools: [], workdir: process.cwd() },
+      model,
+      "核查运行行为",
+      { verifyInstructions: "先 reset_target 再 run_for_duration" },
+    );
+    const p = model.prompts[1]!;
+    expect(p).toContain("不得改动【被核查的产物】");
+    expect(p).toContain('不等于"不许让被测系统运行"');
+    // 有领域说明时，以领域说明为准（含"反而绝对不能"那一侧）
+    expect(p).toContain("以下面的【领域核查方法】为准");
   });
 });
