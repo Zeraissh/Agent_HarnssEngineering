@@ -167,7 +167,14 @@ interface AggregateUsage {
 }
 
 interface AgentRunResult {
-  stopReason: "completed" | "max_turns" | "budget_exhausted" | "refusal" | "error";
+  /**
+   * 具名值全集与分层以 src/types.ts 的 STOP_REASONS 为准（三处口径一致锁的
+   * 事实源，test/ui-app.test.ts 有逐值锁）。loop 只发射下面七值；
+   * `"plan_rejected"` 与 `"plan_gate_expired"` 是 run 级值，由 Web 宿主在
+   * 计划确认门路径写入，不会出现在这里。
+   */
+  stopReason: "completed" | "max_tokens" | "max_turns" | "budget_exhausted"
+    | "refusal" | "aborted" | "error";
   /** 完整会话历史（SDK 类型），可用于持久化或子代理接力 */
   messages: Anthropic.MessageParam[];
   usage: AggregateUsage;
@@ -179,7 +186,8 @@ interface AgentLoop {
   /**
    * 事件驱动契约：宿主 for-await 消费事件即驱动循环前进。
    * - approval_request 事件挂起循环直到 respond 被调用；
-   * - abort signal 触发时，当前工具收到取消信号，循环以 stopReason="error" 尽快结束；
+   * - abort signal 触发时，当前工具收到取消信号，循环以 stopReason="aborted" 尽快结束
+   *   （人叫停是决定不是故障，与 "error" 分开——混在一起界面会把"我停的"画成"它崩了"）；
    * - 事件流最后一个事件恒为 done。
    */
   run(userInput: string, signal?: AbortSignal): AsyncIterable<TurnEvent>;

@@ -37,6 +37,7 @@ import {
   filterRunsByStatus,
 } from "../ui/public/app.js";
 import { plannedStopReason } from "../src/orchestrate.js";
+import { STOP_REASONS } from "../src/types.js";
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -608,6 +609,34 @@ describe("v2 R1 · stopReason 六值分档 (V-04)", () => {
       }),
     ]);
     expect(s.error).toBe("上游端点 502");
+  });
+});
+
+/**
+ * B1 · 终止原因三处口径一致锁。
+ *
+ * 曾经 docs 列 5 值、types 列 7 值、classifyStopReason 判 9 个具名值，三处都在
+ * 被引用——谁引到哪一处就得到哪个答案。事实源收敛为 src/types.ts 的
+ * STOP_REASONS：加新值先加那里，下面三条测试逼着另外两处逐值跟上。
+ */
+describe("B1 · 终止原因三处口径一致锁", () => {
+  it("classifyStopReason 的具名 case 与 STOP_REASONS 逐值一致（不多不少）", () => {
+    const src = readFileSync(join(__dirname, "../ui/public/app.js"), "utf8");
+    const start = src.indexOf("function classifyStopReason");
+    const body = src.slice(start, src.indexOf("export function", start + 1));
+    const cases = [...body.matchAll(/case "([^"]+)":/g)].map((m) => m[1]).sort();
+    expect(cases).toEqual([...STOP_REASONS].sort());
+  });
+
+  it("每个具名值都有非默认分档——default 的 label 是原样回显，具名值的是人话", () => {
+    for (const v of STOP_REASONS) expect(classifyStopReason(v).label).not.toBe(v);
+  });
+
+  it("docs/03-interfaces.md 提到每一个具名值（要求带引号或反引号，防裸词误中）", () => {
+    const doc = readFileSync(join(__dirname, "../docs/03-interfaces.md"), "utf8");
+    for (const v of STOP_REASONS) {
+      expect(doc, `docs/03-interfaces.md 缺 ${v}`).toMatch(new RegExp(`["\`]${v}["\`]`));
+    }
   });
 });
 

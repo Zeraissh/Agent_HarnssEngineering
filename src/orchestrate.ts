@@ -125,8 +125,9 @@ export async function runVerified(
      * 段级续跑（9.8）：整段因**瞬时**宿主级错误终止时，带着已有正史再续一次，
      * 而不是把整段工作作废。
      *
-     * **但人主动按了停止就不续**——中止在 loop 里也表现为 `stopReason=error`，
-     * 不排除的话"停止"会变成"停一下又自己接着跑"，那是最糟的一种界面谎话。
+     * **但人主动按了停止就不续**——loop 对中止发射独立的 `aborted`（进不了
+     * 这个 error 分支），下面再查一次 `signal.aborted` 是第二道保险：
+     * "停止"变成"停一下又自己接着跑"是最糟的一种界面谎话，值得双保险。
      *
      * 案例 #8 实录：执行者跑到第 29 轮 API 超时，`stopReason=error` 直接短路，
      * 而它当时已经做了 28 次工具调用、最后一句是「让我验证 RCC 寄存器布局是否
@@ -143,8 +144,7 @@ export async function runVerified(
       main.stopReason === "error" &&
       resumesLeft > 0 &&
       main.messages.length > 0 &&
-      // 人按了停止就不续——中止在 loop 里也是 stopReason=error，
-      // 不排除的话"停止"会变成"停一下又自己接着跑"
+      // 中止已是独立的 aborted 值，进不了这个 error 分支；这里是第二道保险
       !opts.signal?.aborted &&
       isTransientApiError(main.error?.cause)
     ) {

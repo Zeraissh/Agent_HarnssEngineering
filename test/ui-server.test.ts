@@ -22,7 +22,7 @@ import { mkdtemp, rm, readFile, readdir, writeFile, mkdir } from "node:fs/promis
 import { readFileSync, existsSync } from "node:fs";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createUiServer, contentTypeOf, revealCommand, type UiServerHandle } from "../ui/server.js";
+import { createUiServer, contentTypeOf, planGateStopReason, revealCommand, type UiServerHandle } from "../ui/server.js";
 import {
   FakeModelClient,
   fakeMessage,
@@ -1760,6 +1760,17 @@ describe("ui-server", () => {
     expect(summary.stopReason).toBe("plan_rejected");
     expect(summary.planDecision).toBe("reject");
     expect(summary.awaitingPlanApproval).toBe(false);
+  });
+
+  /**
+   * B1 顺带修出的缺陷：此前 PlanRejectedError 的两种 cause 都被写成
+   * plan_rejected，前端 plan_gate_expired 分档从未触发。expired 的唯一触发
+   * 路径是宿主关停——关停后 SSE 已断、HTTP 已关，集成层观测不到那条缓冲
+   * 事件（B2 运行历史落盘后才会浮出水面），所以映射在纯函数层钉住。
+   */
+  it("计划门两种收场必须分开：否决 → plan_rejected，未应答 → plan_gate_expired", () => {
+    expect(planGateStopReason("rejected")).toBe("plan_rejected");
+    expect(planGateStopReason("expired")).toBe("plan_gate_expired");
   });
 
   it("v2-33. 计划门幂等：二次应答 409，且不改已记录的决策", async () => {

@@ -93,7 +93,7 @@ verifier 修前（15）还紧，撞上的概率更高；案例 #8 正是由 plan
 常量并接 `DomainPack`，与 9.1 的 env > 包 > 默认 三级同构。
 改完记得改那条钉死旧语义的测试。
 
-**B1. 终止原因的口径三处不一致：5 / 7 / 9。**
+~~**B1. 终止原因的口径三处不一致：5 / 7 / 9。**~~ ✅ 已收口（2026-08-09，见条末）
 `docs/03-interfaces.md:170` 列 **5** 值、`src/types.ts` 列 **7** 值、
 而 `ui/public/app.js` 的 `classifyStopReason` 实判 **9** 个具名值
 （多 `max_tokens` / `plan_rejected` / `plan_gate_expired`）。三处都在被引用。
@@ -104,6 +104,20 @@ verifier 修前（15）还紧，撞上的概率更高；案例 #8 正是由 plan
 → **第一步**：以 `ui/public/app.js` 的 `classifyStopReason` 为准回填 types 与 docs，
 并加一条"三处枚举必须逐值一致"的锁——否则下次加一个值又会漂开。
 界面文案已先行避险（不写具体数目，有回归锁挡着）。
+
+✅ **已收口（2026-08-09）**：事实源收敛为 `src/types.ts` 的 `STOP_REASONS`
+（含类型层"loop 值 ⊆ 全集"锁），docs/03-interfaces.md 回填 loop 七值联合、
+标注计划门两值属 run 级，并修掉 `:182` 的 abort=error 旧说法；
+`test/ui-app.test.ts`「B1 · 终止原因三处口径一致锁」三条测试逐值钉死
+（抠 app.js 源码的 case 比对全集、每值必须非默认分档、docs 逐值提及）。
+**顺带修出一个潜伏缺陷**：计划门未应答（expired）此前也被写成
+`plan_rejected`——前端 `plan_gate_expired` 分档从未触发过。说"潜伏"是
+因为 expired 的唯一触发路径是宿主关停，关停后 SSE 已断、HTTP 已关，
+缓冲里那条错值今天没人读得到；**B2 运行历史落盘后它就会浮出水面**，
+届时门未应答会被画成"计划未获批准"（把宿主收尾说成委托方的决定，
+V-04 同族）。`ui/server.ts` 已提成 `planGateStopReason` 纯函数按 cause
+分流（expired 的 outcome 归 closed）并加单测钉住；orchestrate 里两处
+"中止=stopReason error"的过期注释一并更正（loop 实际发射独立的 `aborted`）。
 
 **B2. 运行历史不落盘：宿主一重启，全部运行连同会话正文一起没。**
 `ui/server.ts` 的 `runs` 是内存 `Map`。上一轮真机撞到后果：想升级到新版界面
@@ -797,6 +811,8 @@ fail-closed。round 0 这次 19 轮就自行收口、未触发续跑，**因此�
   （`ui-patch.test.ts`「护栏说明不写死终止值的个数」）。
   收口这件事本身要一次做全：以 `classifyStopReason` 为准回填 types 与 docs，
   并加一条"三处枚举必须逐值一致"的锁——否则下次加一个值又会漂开。
+  → ✅ **已收口（2026-08-09）**：做法与顺带修出的 expired→plan_rejected
+  真缺陷见交接页 B1 条目。
 
 - **9.9** `write_memory` 观察项 —— **改为自动检出（2026-08-08）**。
   此前那次是读 verifier 日志时**碰巧看见的**，仓库里没有任何"哪个角色调了哪个

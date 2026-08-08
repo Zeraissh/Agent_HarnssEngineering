@@ -188,6 +188,18 @@ class PlanRejectedError extends Error {
   }
 }
 
+/**
+ * 计划门两种收场的 stopReason：否决与未应答必须分开——没人拒绝过的计划
+ * 不能写成"未获批准"（把宿主收尾说成委托方的决定，V-04 同族）。
+ * 提成纯函数是因为 expired 的唯一触发路径是宿主关停：SSE 已断、HTTP 已关，
+ * 集成测试观测不到那条缓冲事件，只能在这一层钉住映射（B2 落盘后它会浮出水面）。
+ */
+export function planGateStopReason(
+  cause: "rejected" | "expired",
+): "plan_rejected" | "plan_gate_expired" {
+  return cause === "expired" ? "plan_gate_expired" : "plan_rejected";
+}
+
 /** 审批唯一键：同一 toolUseId 在返工轮再次出现时，靠 requestSeq 区分 */
 function approvalId(toolUseId: string, requestSeq: number): string {
   return `${toolUseId}#${requestSeq}`;
@@ -1175,7 +1187,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       const errorMsg = err instanceof Error ? err.message : String(err);
       // 计划被否决不是失败，是决定——单独一个终止原因，不混进 error。
       // 混进去界面会显示"异常终止"，那是在对委托方自己的决定说谎（V-04）。
-      mainStopReason = err instanceof PlanRejectedError ? "plan_rejected" : "error";
+      // B1 收口时发现此前两种 cause 都写成 plan_rejected，前端的
+      // plan_gate_expired 分档从未触发过；分流的理由见 planGateStopReason。
+      mainStopReason =
+        err instanceof PlanRejectedError ? planGateStopReason(err.cause_) : "error";
       pushSyntheticEvent(run, "main", {
         type: "done",
         stopReason: mainStopReason,
@@ -1191,9 +1206,13 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         outcome:
           mainStopReason === "error"
             ? "error"
-            : mainStopReason === "plan_rejected"
-              ? "rejected"
-              : "completed",
+            // 门未应答唯一的触发路径是宿主收尾时 settle("expired")，归 closed
+            // （run 本身没跑完）；finalizeRun 幂等，这条实际只在首次收尾生效
+            : mainStopReason === "plan_gate_expired"
+              ? "closed"
+              : mainStopReason === "plan_rejected"
+                ? "rejected"
+                : "completed",
         ...(mainStopReason ? { mainStopReason } : {}),
       });
     }

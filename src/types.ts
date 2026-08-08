@@ -173,6 +173,34 @@ export interface AgentRunResult {
   error?: Error;
 }
 
+/**
+ * run 级终止原因**全集**——三处口径一致锁的唯一事实源（backlog B1）。
+ * = loop 的七值（AgentRunResult.stopReason）+ 宿主计划门两值：
+ * plan_rejected / plan_gate_expired 由 Web 宿主在计划确认门路径写入
+ * run 级 stopReason，AgentLoop 永远不会发射它们。
+ * 加新值**先加这里**——ui/public/app.js 的 classifyStopReason 与
+ * docs/03-interfaces.md 由回归锁（test/ui-app.test.ts「B1 · 终止原因
+ * 三处口径一致锁」）逼着逐值跟上，写死的计数会过期，枚举不会。
+ */
+export const STOP_REASONS = [
+  "completed",
+  "max_tokens",
+  "max_turns",
+  "budget_exhausted",
+  "refusal",
+  "aborted",
+  "error",
+  "plan_rejected",
+  "plan_gate_expired",
+] as const;
+export type StopReason = (typeof STOP_REASONS)[number];
+
+type MustBeTrue<T extends true> = T;
+/** 类型层锁：loop 的值必须落在全集内——往 AgentRunResult 加值而漏进 STOP_REASONS 时这行编译不过 */
+export type LoopStopReasonsAreCanonical = MustBeTrue<
+  AgentRunResult["stopReason"] extends StopReason ? true : false
+>;
+
 /** loop 对外发射的结构化事件——日志、UI、审批门都是它的消费者 */
 export type TurnEvent =
   | { type: "turn_start"; turn: number }

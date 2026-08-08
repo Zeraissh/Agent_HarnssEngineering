@@ -1325,9 +1325,10 @@ describe("装配条不许说谎（文案交叉核对抓到的三处）", () => {
   });
 
   /**
-   * `classifyStopReason` 实判**八个**具名值（含 plan_rejected / plan_gate_expired /
-   * budget_exhausted / refusal）。文案里写死"六值"是过期口径——
-   * 而它恰好把计划门那两个新值排除在外。所以文案不写具体数目。
+   * `classifyStopReason` 的具名值全集以 src/types.ts 的 STOP_REASONS 为准
+   * （B1 一致锁钉着，数目还会长——这条注释因此也不写数字；初稿写"八个"，
+   * aborted 一上线就过期了，正是"写死的计数会过期"的活标本）。
+   * 文案里写死"六值"同理是过期口径，所以文案不写具体数目。
    */
   it("护栏说明不写死终止值的个数（口径会漂）", () => {
     const why = deriveAssemblyBar(cfg({ guardrails: { maxTurns: 40 } }), null)
