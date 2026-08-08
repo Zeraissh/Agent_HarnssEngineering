@@ -26,6 +26,8 @@ import {
   keepScrollAnchored,
   createBatcher,
   shouldShowReconnecting,
+  applyCollapseOverrides,
+  nextCollapseOverride,
 } from "../ui/public/app.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -842,5 +844,124 @@ describe("shouldShowReconnecting：分辨正常收流与真断线", () => {
 
   it("什么都不知道时按断线处理——宁可多提示一次，也不要静默失联", () => {
     expect(shouldShowReconnecting({})).toBe(true);
+  });
+});
+
+// ================================================================
+// AC2-18 复验补的锁：这几条此前都是"变异了也不红"
+// ================================================================
+
+describe("AC-04 展开一条默认折叠的日志：点一下就该展开", () => {
+  const entries = [
+    { seq: 0, type: "tool_call", collapsed: true },
+    { seq: 1, type: "tool_result", collapsed: true },
+    { seq: 2, type: "approval_request", collapsed: false },
+  ];
+
+  /**
+   * 实测缺陷：宿主写的是 `overrides.set(seq, !overrides.get(seq))`，
+   * 覆盖表里没有这一条时 `!undefined === true`，而多数条目默认就是 true——
+   * 第一次点击把 true 写成 true，DOM 早退，屏幕上一点反应都没有。
+   * AC-04 说"两次操作可达原始详情"，实际是三次，且第一次零反馈。
+   */
+  it("默认折叠的条目：第一次点击就翻成展开（不是第二次）", () => {
+    const overrides = new Map<number, boolean>();
+    expect(nextCollapseOverride(entries, overrides, 0), "第一次点击必须真的改变状态").toBe(false);
+  });
+
+  it("默认展开的条目（审批）：第一次点击折叠", () => {
+    expect(nextCollapseOverride(entries, new Map(), 2)).toBe(true);
+  });
+
+  it("点两次回到原状", () => {
+    const ov = new Map<number, boolean>();
+    ov.set(0, nextCollapseOverride(entries, ov, 0)!);
+    ov.set(0, nextCollapseOverride(entries, ov, 0)!);
+    expect(ov.get(0)).toBe(true);
+  });
+
+  it("不存在的 seq 返回 null，宿主据此不写覆盖表", () => {
+    expect(nextCollapseOverride(entries, new Map(), 999)).toBeNull();
+  });
+
+  it("覆盖表只影响被点过的那条", () => {
+    const ov = new Map([[0, false]]);
+    const applied = applyCollapseOverrides(entries, ov);
+    expect(applied.map((e) => e.collapsed)).toEqual([false, true, false]);
+  });
+
+  /**
+   * 这个 bug 能活下来的根因：宿主自己另写了一套 toggle，被测的纯函数
+   * 全仓零调用——**测试测的是产品不用的那份实现**。所以顺手锁住调用关系。
+   */
+  it("宿主必须调纯函数，不许自己再写一套 toggle", () => {
+    const html = readFileSync(join(__dirname, "..", "ui", "public", "index.html"), "utf-8");
+    expect(html).toContain("nextCollapseOverride(");
+    expect(html).toContain("applyCollapseOverrides(");
+    expect(html, "宿主又在自己翻转覆盖表了").not.toMatch(/overrides\.set\(\s*seq\s*,\s*!/);
+  });
+});
+
+describe("R-03 结果卡必须排在下钻面之前（无需展开日志即可判断结果）", () => {
+  /**
+   * 此前这条只有 app.js 骨架里的字面顺序在守：把 outcome-card 挪到
+   * tab-content 之后（正是 R-03 存在的理由），326 条测试无一变红。
+   */
+  it("outcome-card 在 tab-content 之前，且裁决在执行者报告之前", () => {
+    let s = createInitialState("run-r3", "任务", true);
+    s = reduceEvents(s, [
+      sse(0, "main", "turn_start", { turn: 1 }),
+      sse(1, "main", "done", { stopReason: "completed", usage: { turns: 1 } }),
+      sse(2, "verifier", "verification", {
+        round: 0,
+        verdict: { passed: false, issues: ["缺收尾"], unverified: [], advisory: [], summary: "未通过" },
+      }),
+      // verdict 事件才是最终裁决（verification 是逐轮记录），outcome-card 读的是它
+      sse(3, "host", "verdict", {
+        verdict: { passed: false, issues: ["缺收尾"], unverified: [], advisory: [], summary: "未通过" },
+      }),
+      sse(4, "host", "run_end", { stopReason: "completed" }),
+    ]);
+    renderRunDetail(s, { activeTab: "loop", harness: null });
+
+    const outcome = document.querySelector(".outcome-card")!;
+    const tabs = document.getElementById("tab-content")!;
+    expect(outcome, "结果卡不见了").toBeTruthy();
+    expect(
+      outcome.compareDocumentPosition(tabs) & Node.DOCUMENT_POSITION_FOLLOWING,
+      "结果卡被排到下钻面之后了——那正是 R-03 要修的毛病",
+    ).toBeTruthy();
+    expect(outcome.textContent).toContain("缺收尾");
+  });
+});
+
+describe("R-01 运行结束后，页面上不该有任何可点的审批按钮", () => {
+  /**
+   * 此前只有 reducer 与服务端 409 在守；渲染层那道 `operable = isPending && isRunning`
+   * 里 isPending 在唯一调用路径上恒为 true，把它改成 `true` 也没有一条测试变红。
+   * 这条补的是 DOM 级的终态判据。
+   */
+  it("done 之后审批转 expired，坞收起，allow/deny 按钮数 = 0", () => {
+    let s = createInitialState("run-r1", "写文件", true);
+    s = reduceEvents(s, [
+      sse(0, "main", "turn_start", { turn: 1 }),
+      sse(1, "main", "approval_request", { toolUseId: "tu_1", name: "write_file", input: { path: "a" } }),
+    ]);
+    renderRunDetail(s, { activeTab: "loop", harness: null });
+    expect(document.querySelectorAll("[data-action='allow']").length, "运行中该有可点的按钮").toBe(1);
+
+    s = reduceEvents(s, [
+      sse(2, "main", "done", { stopReason: "completed", usage: { turns: 1 } }),
+      sse(3, "host", "run_end", { stopReason: "completed" }),
+    ]);
+    renderRunDetail(s, { activeTab: "loop", harness: null });
+
+    expect(s.pendingApprovals[0].status).toBe("expired");
+    expect(document.querySelectorAll("[data-action='allow']").length).toBe(0);
+    expect(document.querySelectorAll("[data-action='deny']").length).toBe(0);
+    expect(
+      (document.getElementById("action-dock") as HTMLElement).hidden,
+      "已结束的运行不该还占着待办坞",
+    ).toBe(true);
   });
 });

@@ -89,8 +89,12 @@
       <span>开启独立核查</span>
     </label>
     <button type="submit" class="btn btn--primary" id="submit-btn">运行任务</button>
-    <label class="btn btn--ghost upload-label" for="file-upload">＋ 附件</label>
+    <!-- input **排在 label 之前**：它是 sr-only（宽高 1px + clip），焦点环会被
+         整个裁掉，键盘用户 Tab 到附件时屏幕上没有任何反应。把它放前面，
+         就能用最朴素的相邻兄弟选择器把环画到那个可见的 label 上
+         （#file-upload:focus-visible + .upload-label）。 -->
     <input type="file" id="file-upload" class="sr-only" multiple />
+    <label class="btn btn--ghost upload-label" for="file-upload">＋ 附件</label>
     <button type="button" class="btn btn--ghost" id="knobs-toggle" aria-expanded="false" aria-controls="run-knobs">装配 ▾</button>
     <!-- 模式说明。独立于 #submit-error：后者是 role="alert"，
          "这次提交会去哪儿"不是错误，不该被当成警报播报 -->
@@ -187,7 +191,8 @@ import {
   markApprovalResolved,
   expirePendingApprovals,
   deriveLogEntries,
-  toggleEntryCollapsed,
+  applyCollapseOverrides,
+  nextCollapseOverride,
   deriveRunListItems,
   filterRunsByStatus,
   filterRunsByQuery,
@@ -435,17 +440,21 @@ window.addEventListener("hashchange", () => {
 // ---- 日志折叠切换 (R-04) ----
 function handleToggleEntry(seq) {
   if (!selectedRunId) return;
+  const state = runStates.get(selectedRunId);
+  if (!state) return;
   let overrides = logCollapseOverrides.get(selectedRunId);
   if (!overrides) {
     overrides = new Map();
     logCollapseOverrides.set(selectedRunId, overrides);
   }
-  const current = overrides.get(seq);
-  overrides.set(seq, !current); // toggle
-  const state = runStates.get(selectedRunId);
-  if (state) {
-    renderDetailWithState(state);
-  }
+  // 翻转交给纯函数：它会**先把默认折叠态算进来**。此前这里是直接对覆盖表
+  // 取反，而表里没有这一条时取反得到 true，多数条目默认本来就是 true——
+  // 于是第一次点一条默认折叠的条目等于把 true 写成 true，
+  // 一次完全没有反馈的死点击（AC2-18 复验抓到）
+  const next = nextCollapseOverride(deriveLogEntries(state), overrides, seq);
+  if (next === null) return;
+  overrides.set(seq, next);
+  renderDetailWithState(state);
 }
 
 // ---- 渲染详情（统一入口） ----
@@ -454,15 +463,11 @@ function renderDetailWithState(state) {
   const activeTab = normalizeTab(activeTabs.get(runId));
 
   // 构建日志条目（应用折叠覆盖）
-  const baseEntries = deriveLogEntries(state);
-  const overrides = logCollapseOverrides.get(runId);
-  let logEntries = baseEntries;
-  if (overrides) {
-    logEntries = baseEntries.map((e) => {
-      const ov = overrides.get(e.seq);
-      return ov !== undefined ? { ...e, collapsed: ov } : e;
-    });
-  }
+  // 与 handleToggleEntry 共用同一个应用函数——两处各写一份就会漂
+  const logEntries = applyCollapseOverrides(
+    deriveLogEntries(state),
+    logCollapseOverrides.get(runId),
+  );
 
   renderRunDetail(state, {
     showBack: isNarrow(),

@@ -1456,6 +1456,37 @@ export function toggleEntryCollapsed(entries, seq) {
   );
 }
 
+/**
+ * 把"用户手动展开/折叠过哪些条"的覆盖表贴到派生条目上。
+ * 覆盖表里没有的条，走 deriveLogEntries 给的默认（成功折叠、异常展开）。
+ */
+export function applyCollapseOverrides(entries, overrides) {
+  if (!overrides || overrides.size === 0) return entries;
+  return entries.map((e) => (overrides.has(e.seq) ? { ...e, collapsed: overrides.get(e.seq) } : e));
+}
+
+/**
+ * 点一下之后，这一条的覆盖值该写成什么。
+ *
+ * **必须先把默认值算进来再翻**。宿主此前直接对覆盖表取反，而表里没有这一条时
+ * 取反得到 true——可多数条目（tool_call、成功的 tool_result、assistant_text、
+ * turn_start）默认就是 `collapsed: true`。于是**第一次点击把 true 写成 true**：
+ * 状态没变、DOM 早退、屏幕上一点反应都没有，要点第二下才展开。
+ * AC-04 说的"两次操作可达原始详情"实际是三次，且第一次零反馈。
+ *
+ * 这个 bug 能活下来，是因为宿主自己另写了一套 toggle，而被测的
+ * `toggleEntryCollapsed` **全仓零调用**——测试测的是产品不用的那份实现。
+ * 所以这里把"算默认 → 翻转"整条做成纯函数，宿主只许调它。
+ *
+ * @returns {boolean|null} 该写进覆盖表的值；seq 不存在时返回 null
+ */
+export function nextCollapseOverride(entries, overrides, seq) {
+  const hit = toggleEntryCollapsed(applyCollapseOverrides(entries, overrides), seq).find(
+    (e) => e.seq === seq,
+  );
+  return hit ? hit.collapsed : null;
+}
+
 // ---------------------------------------------------------------
 // 阶段二 新增：运行列表元数据与筛选 (R-08)
 // ---------------------------------------------------------------
@@ -2231,6 +2262,15 @@ function patchResolvedSummary(parts, resolved) {
 
 function updateApprovalCard(card, a, isRunning) {
   const isPending = a.status === "pending";
+  /**
+   * 这是**兜底**，不是主闸——说清楚免得高估它。
+   *
+   * 唯一的调用路径 `patchApprovalRail` 已经把列表过滤成 pending-only，
+   * 所以这里 `isPending` 恒真；变异测试（改成 `operable = true`）不会让任何
+   * 一条测试变红。真正在守 R-01 的是三处：reducer 在 run_end/error 上把
+   * pending 收敛成 expired、rail 的 pending-only 过滤、服务端两路 409。
+   * 留着它是防"reducer 漏掉某条终止路径"，不是防用户。
+   */
   const operable = isPending && isRunning;
   const resolved = !isPending;
 

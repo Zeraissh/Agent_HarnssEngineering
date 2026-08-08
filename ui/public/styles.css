@@ -26,7 +26,12 @@
   --p-line-strong: #C9C4B4;
   --p-text-1: #14130F;
   --p-text-2: #4A463D;
-  --p-text-3: #6E6959;
+  /* AC2-18 复验实算：旧值 #6E6959 压在 --surface-2 上只有 4.23:1（低于 4.5），
+     而 .approvals-done 的摘要行与列表项正落在那层底上，还叠了 opacity:0.6。
+     压深到 #665F4F 后三层底分别是 6.01 / 5.45 / 4.89:1。
+     这个 4.23 恰好就是 :31 注释里拿来否决 #C15F3C 的同一个数字——
+     当时否掉了一个，另一个从 v1 起就在表里没人查。 */
+  --p-text-3: #665F4F;
   /* 陶土。注意不是 #C15F3C——那个白字上去只有 4.23:1、纸面上 4.01:1，两头都不达标 */
   --p-accent: #B0522F;
   --p-accent-hover: #8F4126;
@@ -487,6 +492,16 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
 
 /* --- 附件 --- */
 .upload-label { cursor: pointer; }
+/**
+ * 视觉隐藏的原生 file input 仍然可聚焦，但 .sr-only 的 clip 会把焦点环裁没。
+ * 把环转画到它后面那个可见的 label 上——这是 sr-only + 可聚焦控件的标准配对。
+ * （AC2-18 复验发现：全表零 :focus-within、零焦点补偿，键盘走到附件这一步
+ *   屏幕上完全没有反馈。）
+ */
+#file-upload:focus-visible + .upload-label {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
 
 .upload-list {
   flex-basis: 100%;

@@ -1155,6 +1155,12 @@ describe("AC5 WCAG 对比度 (R-06)", () => {
     ["次要文字 / 页面底", "text-2", "surface-0", 4.5],
     ["次要文字 / 抬升面", "text-2", "surface-1", 4.5],
     ["三级文字 / 页面底", "text-3", "surface-0", 4.5],
+    // 下面两行是 AC2-18 复验补的。缺了它们时表面 46 条全绿，而页面上
+    // .approvals-done（折叠摘要行 + 列表项）实际只有 4.23:1——
+    // 覆盖表漏一行，门禁就只是看起来严
+    ["三级文字 / 抬升面", "text-3", "surface-1", 4.5],
+    ["三级文字 / 下沉面", "text-3", "surface-2", 4.5],
+    ["次要文字 / 下沉面", "text-2", "surface-2", 4.5],
     ["主按钮文字 / 强调底", "on-accent", "accent", 4.5],
     ["强调色 / 页面底", "accent", "surface-0", 4.5],
     ["通过色 / 页面底", "status-ok", "surface-0", 4.5],
@@ -1408,19 +1414,30 @@ describe("AC8 CSS 令牌统一 (P2)", () => {
       stripped = stripped.slice(0, a) + stripped.slice(b);
     }
 
-    // 匹配属性值中的裸六位色值
-    const propHexRe = /:\s*(?:[^;{]*?\s)?(#[0-9a-fA-F]{6})\b/g;
-    const violations = [];
-    let match;
-    while ((match = propHexRe.exec(stripped)) !== null) {
-      const ctx = stripped.substring(Math.max(0, match.index - 20), match.index + match[0].length + 10);
-      // 确认不是 var() 的参数
-      if (!ctx.includes("var(")) {
-        violations.push(match[0].trim());
+    /**
+     * 逐**声明**扫，而不是拿一条正则在整段文本上滑窗。
+     *
+     * AC2-18 复验用四组探针实测，旧写法有三个洞（注入后门禁仍返回空）：
+     *   ① 三位简写 `#fff` —— 只匹配 {6} 位，整类漏过；
+     *   ② 八位带 alpha `#ff0000cc` —— 同上；
+     *   ③ 同一条声明里出现过 `var()` 就整条跳过（那个 20 字符上下文窗口），
+     *      而 box-shadow / linear-gradient 恰恰是硬编码色值最常见的落点，
+     *      本表里就有两条 box-shadow。
+     * 也就是说，旧的绿只说明"没人用最朴素的写法写死颜色"。
+     */
+    const violations: string[] = [];
+    for (const decl of stripped.split(/[;{}]/)) {
+      const colonAt = decl.indexOf(":");
+      if (colonAt < 0) continue;
+      const prop = decl.slice(0, colonAt).trim();
+      if (prop.startsWith("--")) continue; // 令牌定义（:root 已剥离，这里是防媒体块里的覆盖）
+      for (const m of decl.slice(colonAt + 1).matchAll(/#[0-9a-fA-F]{3,8}\b/g)) {
+        // # 后只有 3/4/6/8 位才是合法色值，其余是别的东西（如 url 片段）
+        if ([4, 5, 7, 9].includes(m[0].length)) violations.push(`${prop}: …${m[0]}`);
       }
     }
 
-    expect(violations).toEqual([]);
+    expect(violations, `组件层出现裸色值：${violations.join(" | ")}`).toEqual([]);
   });
 });
 
@@ -1657,13 +1674,18 @@ describe("AC-10 核查未通过 · 渲染语义", () => {
     expect(failBlock).toContain("--red");
 
     // 两套颜色不同
-    const green = resolveColor(vars["green"] || "#3fb950", vars);
-    const red = resolveColor(vars["red"] || "#f85149", vars);
+    // 不给兜底默认值：令牌被整条删掉时必须红，而不是拿一个写死的颜色顶上
+    // （旧版 `vars["green"] || "#3fb950"` 让"令牌不存在"这一态也能通过）
+    const green = resolveColor(vars["green"], vars);
+    const red = resolveColor(vars["red"], vars);
+    expect(green, "--green 未定义").toMatch(/^#[0-9a-fA-F]{3,8}$/);
+    expect(red, "--red 未定义").toMatch(/^#[0-9a-fA-F]{3,8}$/);
     expect(green).not.toBe(red);
 
-    // 语义区分：红≠绿
-    const greenBg = resolveColor(vars["green-bg"] || "#12261e", vars);
-    const redBg = resolveColor(vars["red-bg"] || "#261212", vars);
+    // 语义区分：红≠绿（比的必须是解析到底的**字面色值**，不是令牌名）
+    const greenBg = resolveColor(vars["green-bg"], vars);
+    const redBg = resolveColor(vars["red-bg"], vars);
+    expect(greenBg).toMatch(/^#[0-9a-fA-F]{3,8}$/);
     expect(greenBg).not.toBe(redBg);
   });
 
@@ -1703,16 +1725,20 @@ function parseRootVars(css) {
   return vars;
 }
 
-function resolveColor(value, vars) {
-  let v = value.trim();
-  const varRef = v.match(/^var\((--[\w-]+)\)$/);
-  if (varRef) {
-    const refName = varRef[1].replace(/^--/, "");
-    if (vars[refName]) {
-      v = vars[refName];
-    }
+/**
+ * 顺 var() 链**一路**解析到字面色值。
+ *
+ * 旧版只跳一层，而令牌是三层（--green → --status-ok → --p-ok → #2F6F43）。
+ * 于是「绿≠红」这类断言比的是**令牌名字符串**（"var(--p-ok)" vs "var(--p-bad)"），
+ * 把 --p-ok 改成红色照样绿——AC2-18 复验实测确认这四条断言不可证伪。
+ */
+function resolveColor(value, vars, depth = 0) {
+  const v = String(value).replace(/\/\*[\s\S]*?\*\//g, "").trim();
+  const ref = v.match(/^var\(\s*(--[\w-]+)\s*\)$/);
+  if (ref && depth < 8) {
+    const name = ref[1].replace(/^--/, "");
+    if (vars[name] !== undefined) return resolveColor(vars[name], vars, depth + 1);
   }
-  v = v.replace(/\/\*.*?\*\//g, "").trim();
   return v;
 }
 
@@ -1729,8 +1755,11 @@ describe("AC-05 焦点环不许被组件规则压掉", () => {
   it("任何在 :focus 上写 outline:none 的规则，都必须限定 :not(:focus-visible)", () => {
     const css = readFileSync(join(__dirname, "..", "ui", "public", "styles.css"), "utf-8");
     const offenders: string[] = [];
+    // 先把 @media 之类的开括号去掉，否则 `[^}]*` 会吞掉嵌套内容导致规则错位——
+    // 把 outline:none 写进任何媒体块即可绕过这道门（复验实测的次生洞）
+    const flat = css.replace(/@[a-z-]+[^{]*\{/gi, "");
     // 逐条规则扫：选择器带 :focus 且声明里关了 outline
-    for (const m of css.matchAll(/([^{}]+)\{([^}]*)\}/g)) {
+    for (const m of flat.matchAll(/([^{}]+)\{([^}]*)\}/g)) {
       const sel = m[1].trim();
       const body = m[2];
       if (!/:focus\b/.test(sel)) continue;
