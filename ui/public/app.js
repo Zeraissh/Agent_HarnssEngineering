@@ -1562,6 +1562,8 @@ export function renderRunDetail(state, callbacks) {
    * 内容就整体平移——委托方反馈"点一下允许就被弹到最上方"。锚点取结果卡
    * （紧邻 rail 下方、始终存在），补丁后按位移反向补偿滚动位置。
    */
+  // mode 默认 "shrink"：长高让它长（新审批卡就是人要看的东西，不能藏），
+  // 变矮才补偿（否则下面正在读的内容会整块往上跳）
   keepViewportAnchored(mainEl, parts.outcome, () => {
     patchPlanGate(parts, state, faces, callbacks);
     patchApprovalRail(parts, state, isRunning, callbacks);

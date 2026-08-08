@@ -157,7 +157,7 @@ export function keepScrollAnchored(scroller, mutate, threshold = 40) {
  * @param {HTMLElement} anchor   锚点元素（取其 getBoundingClientRect().top）
  * @param {() => void} mutate
  */
-export function keepViewportAnchored(scroller, anchor, mutate) {
+export function keepViewportAnchored(scroller, anchor, mutate, mode = "shrink") {
   if (!scroller || !anchor || typeof anchor.getBoundingClientRect !== "function") {
     mutate();
     return 0;
@@ -165,9 +165,23 @@ export function keepViewportAnchored(scroller, anchor, mutate) {
   const before = anchor.getBoundingClientRect().top;
   mutate();
   const delta = anchor.getBoundingClientRect().top - before;
-  // jsdom 里 rect 恒为 0，delta 恒为 0——这条在单测里是空操作，真机才有效
-  if (delta) scroller.scrollTop += delta;
-  return delta;
+
+  /**
+   * **只在内容变矮时补偿**（`mode="shrink"`，默认）。这条不对称是委托方实测
+   * 反馈出来的，初版对称补偿反而更糟：
+   *
+   * - 上方区域**变高**（新审批卡冒出来）→ 锚点下移 → 对称补偿会把视口一起往下
+   *   拉，于是顶部那张刚出现的、正等着人点的卡被推出视野。这恰好和人的意图相反：
+   *   新出现的待办就是他要看的东西，**不该被藏起来**。
+   * - 上方区域**变矮**（审批被应答、卡片离开待办区）→ 锚点上移 → 不补偿的话
+   *   下面正在读的内容会整块往上跳一截。这才是需要压住的抖动。
+   *
+   * 一句话：**长高让它长，变矮才补偿。**
+   */
+  const shouldApply = mode === "both" ? delta !== 0 : delta < 0;
+  // jsdom 里 rect 恒为 0，delta 恒为 0——真机才有效；helper 本身可注入锚点直测
+  if (shouldApply) scroller.scrollTop = Math.max(0, scroller.scrollTop + delta);
+  return shouldApply ? delta : 0;
 }
 
 /** CSS.escape 的最小替身（jsdom 里不一定有） */

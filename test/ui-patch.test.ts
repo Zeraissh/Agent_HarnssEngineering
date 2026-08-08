@@ -24,6 +24,7 @@ import {
   patchList,
   appendOnly,
   keepScrollAnchored,
+  keepViewportAnchored,
   createBatcher,
 } from "../ui/public/app.js";
 
@@ -726,5 +727,54 @@ describe("思考流式：直播条在正文之前显示它在想什么", () => {
   it("两者都空时退回原行为", () => {
     renderRunDetail(running(), { activeTab: "loop" });
     expect(liveText()).toContain("等待模型响应");
+  });
+});
+
+describe("keepViewportAnchored：长高让它长，变矮才补偿", () => {
+  /**
+   * 委托方实测反馈：初版对称补偿反而更糟——新审批卡冒出来时视口被一起往下拉，
+   * 顶部那张正等着人点的卡被推出视野。这一组用可注入的假锚点直测，
+   * 绕开 jsdom 里 getBoundingClientRect 恒为 0 的限制（那正是上一版没测出来的原因）。
+   */
+  function fakeAnchor(tops: number[]) {
+    let i = 0;
+    return { getBoundingClientRect: () => ({ top: tops[Math.min(i++, tops.length - 1)] }) };
+  }
+  const scroller = (top = 500) => ({ scrollTop: top });
+
+  it("上方变高（新审批卡出现）→ 不补偿，让新卡看得见", () => {
+    const sc = scroller(500);
+    // 锚点从 300 被推到 460：上方长高了 160
+    const d = keepViewportAnchored(sc, fakeAnchor([300, 460]), () => {});
+    expect(d).toBe(0);
+    expect(sc.scrollTop, "长高时不该动视口——那会把新出现的待办藏起来").toBe(500);
+  });
+
+  it("上方变矮（审批被应答、卡片离开）→ 补偿，压住下方内容的跳动", () => {
+    const sc = scroller(500);
+    const d = keepViewportAnchored(sc, fakeAnchor([460, 300]), () => {});
+    expect(d).toBe(-160);
+    expect(sc.scrollTop).toBe(340);
+  });
+
+  it("补偿不会把 scrollTop 压成负数", () => {
+    const sc = scroller(20);
+    keepViewportAnchored(sc, fakeAnchor([200, 0]), () => {});
+    expect(sc.scrollTop).toBe(0);
+  });
+
+  it('mode="both" 仍可对称补偿（保留给确实需要的场景）', () => {
+    const sc = scroller(500);
+    const d = keepViewportAnchored(sc, fakeAnchor([300, 460]), () => {}, "both");
+    expect(d).toBe(160);
+    expect(sc.scrollTop).toBe(660);
+  });
+
+  it("锚点缺失时只执行 mutate，不碰滚动", () => {
+    const sc = scroller(500);
+    let ran = false;
+    keepViewportAnchored(sc, null, () => { ran = true; });
+    expect(ran).toBe(true);
+    expect(sc.scrollTop).toBe(500);
   });
 });
