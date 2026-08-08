@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { ToolExecutor, ToolRegistry } from "../src/tools/registry.js";
+import { ToolExecutor, ToolRegistry, nearestToolNames } from "../src/tools/registry.js";
 import { validateToolInput } from "../src/tools/validate-input.js";
 import { bashTool } from "../src/tools/bash.js";
 import { readFileTool } from "../src/tools/read-file.js";
@@ -241,5 +241,44 @@ describe("ToolExecutor 集成 —— 拦截点与顺序", () => {
     );
     expect(good!.is_error).toBeUndefined();
     expect(call).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("未知工具名的最近候选（案例 #8 的 9.4）", () => {
+  const FACE = [
+    "read_file",
+    "write_file",
+    "stm32__read_variable",
+    "stm32__read_memory",
+    "stm32__reset_target",
+  ];
+
+  it("漏掉 MCP 前缀 → 后缀命中（实测最常见的形态）", () => {
+    expect(nearestToolNames("read_variable", FACE)).toEqual(["stm32__read_variable"]);
+    expect(nearestToolNames("reset_target", FACE)).toEqual(["stm32__reset_target"]);
+  });
+
+  it("拼写手滑 → 编辑距离命中", () => {
+    expect(nearestToolNames("read_fil", FACE)).toContain("read_file");
+    expect(nearestToolNames("wirte_file", FACE)).toContain("write_file");
+  });
+
+  it("八竿子打不着就不提示——猜错方向比不猜更糟", () => {
+    expect(nearestToolNames("launch_missiles", FACE)).toEqual([]);
+  });
+
+  it("executor 的未知工具报错里带上候选，且仍附全量清单", async () => {
+    const reg = new ToolRegistry();
+    for (const n of FACE) reg.register(makeTool({ name: n }));
+    const exec = new ToolExecutor(reg, "/tmp/x");
+    const [r] = await exec.executeAll(
+      [toolUseBlock("tu_1", "read_variable", { name: "g_telemetry" })],
+      new AbortController().signal,
+      async () => ({ decision: "allow" as const }),
+    );
+    const msg = String(r!.content);
+    expect(r!.is_error).toBe(true);
+    expect(msg).toContain('Did you mean: stm32__read_variable?');
+    expect(msg).toContain("Available tools:"); // 候选只是提示，清单照给
   });
 });
