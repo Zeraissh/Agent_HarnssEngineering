@@ -43,7 +43,11 @@ export class OpenAIModelClient implements ModelClient {
       });
   }
 
-  async send(req: ModelRequest, onDelta?: (delta: StreamDelta) => void): Promise<ModelTurn> {
+  async send(
+    req: ModelRequest,
+    onDelta?: (delta: StreamDelta) => void,
+    signal?: AbortSignal,
+  ): Promise<ModelTurn> {
     const stream = await this.client.chat.completions.create({
       model: this.model,
       max_tokens: req.maxTokens,
@@ -51,7 +55,9 @@ export class OpenAIModelClient implements ModelClient {
       ...(req.tools.length > 0 ? { tools: toOpenAITools(req.tools) } : {}),
       stream: true,
       stream_options: { include_usage: true },
-    });
+    },
+    // 同 Anthropic 侧：signal 必须落到请求选项里，否则"停止"掐不掉在飞的请求
+    signal ? { signal } : undefined);
 
     let text = "";
     const calls: { id: string; name: string; args: string }[] = [];

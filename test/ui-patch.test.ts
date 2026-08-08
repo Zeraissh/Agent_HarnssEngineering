@@ -31,6 +31,8 @@ import {
   foldChain,
   deriveRunListItems,
   deriveAssemblyBar,
+  deriveComposerMode,
+  composerSubmitPlan,
   deriveScrollNav,
   paceReveal,
   keepScrollAnchored,
@@ -1455,5 +1457,74 @@ describe("paceReveal：把上游的一阵一阵摊成匀速", () => {
 
   it("dt 为 0 也至少推进一个字——绝不卡死", () => {
     expect(paceReveal({ arrived: 100, revealed: 0, dtMs: 0 })).toBeGreaterThan(0);
+  });
+});
+
+describe("停止按钮：运行中那个位置变成「停止」", () => {
+  const running = () =>
+    deriveComposerMode({
+      info: { runId: "r1", status: "running", canContinue: false },
+      localStatus: "running",
+    });
+
+  it("运行中按钮是「停止」且可点——不是一个灰着的「运行任务」", () => {
+    const m = running();
+    expect(m.buttonLabel).toBe("停止");
+    expect(m.canSubmit).toBe(true);
+    expect(m.kind).toBe("stop");
+  });
+
+  /** 框里那半截草稿是给下一轮准备的，不该拦着人叫停 */
+  it("停止不需要文本", () => {
+    expect(composerSubmitPlan(running(), "")).toEqual({ kind: "stop", runId: "r1", text: "" });
+    expect(composerSubmitPlan(running(), "   ")).toEqual({ kind: "stop", runId: "r1", text: "" });
+  });
+
+  it("说明里讲清楚它只保证「下一次模型调用之前收手」", () => {
+    expect(running().note).toContain("下一次模型调用之前");
+  });
+
+  it("非运行态不会误发停止", () => {
+    const done = deriveComposerMode({ info: { runId: "r1", status: "done", canContinue: true } });
+    expect(done.kind).toBe("append");
+    expect(composerSubmitPlan(done, "继续")!.kind).toBe("append");
+  });
+});
+
+describe("装配条的识图那一格", () => {
+  const bare = () => createInitialState("rv", "t", false);
+
+  /**
+   * 委托方遇到的正是这条：传图进去，模型诚实地说"我看不到"，
+   * 但界面上完全看不出**是这套装配里没有这个工具**，只能从模型的道歉里推。
+   */
+  it("未配时明说「未配」，并解释为什么工具面上干脆没有它", () => {
+    const item = deriveAssemblyBar(bare(), { roleModels: { vision: { configured: false } } })
+      .find((i) => i.key === "vision")!;
+    expect(item.chip).toBe("识图 未配");
+    expect(item.why).toContain("根本不进工具面");
+  });
+
+  /**
+   * `/api/harness` 未配时给的是 `{configured:false}`——**一个真值对象**。
+   * 直接 `vision ? …` 会让这一格恰好在它唯一有用的场景下说反话。
+   */
+  it("未配的那个对象是真值——判据必须认 configured 而不是对象本身", () => {
+    const snapshot = { roleModels: { vision: { configured: false } } };
+    expect(Boolean(snapshot.roleModels.vision), "前提：它确实是真值").toBe(true);
+    expect(
+      deriveAssemblyBar(bare(), snapshot).find((i) => i.key === "vision")!.chip,
+    ).toBe("识图 未配");
+  });
+
+  it("两种数据源形状都认：逐 run 是字符串，进程级是对象", () => {
+    const perRun = reduceEvents(bare(), [
+      sse(0, "host", "run_config", { roleModels: { vision: "qwen-vl" } }),
+    ]);
+    expect(deriveAssemblyBar(perRun, null).find((i) => i.key === "vision")!.chip).toContain("qwen-vl");
+    expect(
+      deriveAssemblyBar(bare(), { roleModels: { vision: { configured: true, model: "gpt-4o" } } })
+        .find((i) => i.key === "vision")!.chip,
+    ).toContain("gpt-4o");
   });
 });

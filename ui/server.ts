@@ -114,6 +114,23 @@ interface StoredRun {
   toolTally: ToolTally;
   /** 核查是否撞过轮次上限（"预算不够"这个嫌疑要有据可查，见案例 #8 的三层归因） */
   verifierHitBudget?: boolean;
+  /**
+   * 中止闸。**逐 run 一个**——停止的是这一次运行，不是整个宿主。
+   * 人按下停止即 abort()，编排层把它传给 AgentLoop，循环在下一次模型调用
+   * 之前收手。已经在飞的那个请求不撤（HTTP 已经发出去了，钱已经花了），
+   * 所以"停止"的准确语义是**不再往下走**，不是"当场消失"。
+   */
+  abort?: AbortController;
+  /**
+   * 本次对话内**常驻放行**的工具名（委托方："每次都要人手点击很麻烦"）。
+   *
+   * 三条边界，缺一条这个功能就从"省事"变成"把审批门拆了"：
+   *   ① **逐 run**，不跨 run、不落盘——下一次对话从零开始问；
+   *   ② **逐工具名**，不是"全部放行"——你放行的是 read_file，不等于放行 bash；
+   *   ③ 自动放行**照样进事件流**（actor: "auto-rule"），审计记录里看得出
+   *      这一次没有人真的点过。第 ③ 条最重要：省掉的是点击，不是记录。
+   */
+  autoAllow?: Set<string>;
   /** 本次运行的装配（V-24：可逐 run 覆盖，不再是进程级常量） */
   packName?: string;
   effort?: Effort;
@@ -730,6 +747,26 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
     // F2: verifier 的 approval_request 不进 pendingApprovals（verifier 内部已自答）
     if (event.type === "approval_request" && !isVerifierSource(source)) {
+      /**
+       * 常驻放行：本次对话里已经对这个工具说过"以后都行"，就直接放。
+       *
+       * **仍然写一条 approval_resolved 进事件流**（actor: "auto-rule"）——
+       * 省掉的是点击，不是记录。事后回看必须看得出"这一步没有人真的点过"，
+       * 否则审计里的"已允许"就分不清是人还是规则，那比多点几下危险得多。
+       */
+      if (run.autoAllow?.has(event.name)) {
+        event.respond("allow");
+        pushSyntheticEvent(run, "host", {
+          type: "approval_resolved",
+          requestSeq: seq,
+          toolUseId: event.toolUseId,
+          name: event.name,
+          decision: "allow",
+          actor: "auto-rule",
+          at: Date.now(),
+        });
+        return seq;
+      }
       run.pendingApprovals.set(approvalId(event.toolUseId, seq), {
         toolUseId: event.toolUseId,
         name: event.name,
@@ -900,7 +937,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     run.loop = loop;
     let mainStopReason: string | undefined;
     try {
-      for await (const event of loop.run(run.task)) {
+      for await (const event of loop.run(run.task, run.abort?.signal)) {
         if (event.type === "done") mainStopReason = event.result.stopReason;
         pushEvent(run, "main", event);
       }
@@ -955,7 +992,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
     let mainStopReason: string | undefined;
     try {
-      for await (const event of loop.runContinuation(history, feedback)) {
+      for await (const event of loop.runContinuation(history, feedback, run.abort?.signal)) {
         if (event.type === "done") mainStopReason = event.result.stopReason;
         pushEvent(run, "main", event);
       }
@@ -1143,6 +1180,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     try {
       const outcome = await runVerified(cfg, modelClient, run.task, {
         ...buildVerifyOptions(run),
+        ...(run.abort ? { signal: run.abort.signal } : {}),
         onEvent: (source, event) => {
           // 只记主/返工段的终止原因：verifier 的 done 已被 orchestrate 压掉，
           // 这里取到的最后一个就是最终交付那一段的
@@ -1397,6 +1435,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     | { type: "transcript"; runId: string }
     | { type: "artifact"; runId: string; path: string; download: boolean }
     | { type: "reveal"; runId: string }
+    | { type: "stop"; runId: string }
     | { type: "followUp"; runId: string }
     | { type: "upload" }
     | { type: "createRun" }
@@ -1452,6 +1491,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     const revealMatch = method === "POST" && url.match(/^\/api\/runs\/([^/]+)\/reveal$/);
     if (revealMatch) {
       return { type: "reveal", runId: revealMatch[1]! };
+    }
+
+    const stopMatch = method === "POST" && url.match(/^\/api\/runs\/([^/]+)\/stop$/);
+    if (stopMatch) {
+      return { type: "stop", runId: stopMatch[1]! };
     }
 
     if (method === "POST" && url === "/api/upload") {
@@ -1734,6 +1778,35 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         return json(res, 200, { revealed: abs });
       }
 
+      /**
+       * 停止这次运行。
+       *
+       * **幂等**：已经结束的 run 返回 409 而不是假装停了——"我按了但它还在跑"
+       * 与"我按了它早就停了"是两件事，混成一个 200 会让人不知道自己那一下有没有用。
+       * 已挂起的审批与计划门由 finalizeRun 统一宣告过期，不在这里重复处理。
+       */
+      case "stop": {
+        const run = runs.get(route.runId);
+        if (!run) return notFound(res, `Run not found: ${route.runId}`);
+        if (run.status === "done") {
+          return json(res, 409, { error: "Run already finished" });
+        }
+        if (!run.abort) {
+          return json(res, 409, { error: "This run does not support stopping" });
+        }
+        run.abort.abort();
+        // 挂起的审批/计划门要立刻解除，否则协程仍吊在 await 上，abort 传不进去
+        for (const pending of run.pendingApprovals.values()) {
+          try { pending.respond("deny", "委托方已停止这次运行"); } catch { /* 已应答过 */ }
+        }
+        run.pendingApprovals.clear();
+        if (run.pendingPlan) {
+          try { run.pendingPlan.settle("reject"); } catch { /* 已决 */ }
+        }
+        broadcastLifecycle("run_updated", run);
+        return json(res, 200, { stopping: true });
+      }
+
       case "lifecycleStream": {
         res.writeHead(200, {
           "Content-Type": "text/event-stream",
@@ -1839,6 +1912,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           transcript: [],
           conversationTurn: 1,
           toolTally: {},
+          abort: new AbortController(),
           ...(parsed.pack ? { packName: parsed.pack } : {}),
           ...(parsed.effort ? { effort: parsed.effort as Effort } : {}),
           ...(parsed.rubric ? { rubric: parsed.rubric } : {}),
@@ -1945,7 +2019,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         } catch {
           return badRequest(res, "Failed to read request body");
         }
-        let parsed: { decision?: string; reason?: string };
+        let parsed: { decision?: string; reason?: string; scope?: string };
         try {
           parsed = JSON.parse(body);
         } catch {
@@ -1955,6 +2029,14 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           return badRequest(res, 'decision must be "allow" or "deny"');
         }
 
+        /**
+         * `scope: "conversation"` = 本次对话内此后同名工具自动放行。
+         * 只对 allow 有意义——"以后都拒绝"没有用例：模型拿到 deny 会换做法，
+         * 常驻拒绝等于让它反复撞同一堵墙。
+         */
+        if (parsed.decision === "allow" && parsed.scope === "conversation") {
+          (run.autoAllow ??= new Set()).add(pending.name);
+        }
         pending.respond(parsed.decision, parsed.reason);
         const at = Date.now();
         run.respondedApprovals.set(key!, {
@@ -1976,10 +2058,14 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           decision: parsed.decision,
           ...(parsed.reason ? { reason: parsed.reason } : {}),
           actor: "user",
+          ...(parsed.scope === "conversation" ? { scope: "conversation" } : {}),
           at,
         });
 
-        return json(res, 200, { acknowledged: true });
+        return json(res, 200, {
+          acknowledged: true,
+          ...(run.autoAllow?.size ? { autoAllow: [...run.autoAllow] } : {}),
+        });
       }
 
       case "static": {

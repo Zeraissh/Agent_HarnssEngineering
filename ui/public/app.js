@@ -124,6 +124,8 @@ export function createInitialState(runId, task, verify) {
     verify,
     timeline: [],
     verifierTimeline: [],
+    /** 本次对话内常驻放行的工具名（见 deriveAssemblyBar 的 autoAllow 那一格） */
+    autoAllow: [],
     pendingApprovals: [],
     verdict: null,
     usage: null,
@@ -186,6 +188,16 @@ export function classifyStopReason(stopReason) {
         tone: "bad",
         label: "撞轮次护栏",
         hint: "执行未自然结束，核查救不了这一类——即使核查通过也不代表任务做完",
+      };
+    /**
+     * 人主动叫停：判 warn 不判 bad。把委托方自己的决定画成"异常终止"
+     * 是对他说谎（与 plan_rejected 同一条纪律）。
+     */
+    case "aborted":
+      return {
+        tone: "warn",
+        label: "已停止",
+        hint: "这次运行由你主动停止；已完成的工具调用与写入不会回滚。",
       };
     case "budget_exhausted":
       return {
@@ -253,7 +265,17 @@ export function reduceEvent(state, sseEvent) {
     return applyApproval(state, seq, source, event);
   }
   if (type === "approval_resolved") {
-    return applyApprovalResolved(state, event);
+    const next = applyApprovalResolved(state, event);
+    /**
+     * 常驻放行规则也从这条事件里长出来（服务端在建规则那次带上 `scope`）。
+     * **不能另开一个 `if (type === "approval_resolved" && …)`**——
+     * 上面那个分支会先命中，后写的那条永远到不了。
+     * （我第一版就是这么写的，加完发现规则永远是空的。）
+     */
+    if (event.scope !== "conversation") return next;
+    const name = String(event.name ?? "");
+    if (!name || next.autoAllow.includes(name)) return next;
+    return { ...next, autoAllow: [...next.autoAllow, name] };
   }
   if (type === "approval_expired") {
     return applyApprovalExpired(state, event);
@@ -1196,13 +1218,20 @@ export function deriveComposerMode({ info, localStatus, submitting, error } = {}
     return {
       ...base,
       mode: "running",
-      kind: null,
-      buttonLabel: "运行任务",
+      kind: "stop",
+      /**
+       * 运行中这个位置变成「停止」，而不是再加一个按钮。
+       *
+       * 理由是此刻它本来就没别的事可做（既不能新建也不能追加），
+       * 空着一个灰按钮 + 旁边再摆一个停止键，是把一个位置的两种状态
+       * 画成了两个控件。
+       */
+      buttonLabel: "停止",
       labelText: "任务描述",
       // 不禁用输入框：把"先把下一条想好"的能力也没收掉是过度反应
       placeholder: "运行进行中，可以先把下一条指令打好…",
-      note: "运行进行中，等这一轮结束后可以追加指令；要现在开新任务请点左侧「+ 新建对话」。",
-      canSubmit: false,
+      note: "运行进行中，等这一轮结束后可以追加指令；要现在开新任务请点左侧「+ 新建对话」。按「停止」会让它在下一次模型调用之前收手。",
+      canSubmit: true,
       optionsEnabled: false,
     };
   }
@@ -1260,6 +1289,8 @@ function blockedReason(info) {
  */
 export function composerSubmitPlan(mode, rawText) {
   if (!mode || !mode.canSubmit || !mode.kind) return null;
+  // 停止不需要文本——框里那半截草稿是给下一轮准备的，不该拦着人叫停
+  if (mode.kind === "stop") return { kind: "stop", runId: mode.runId, text: "" };
   const text = String(rawText ?? "").trim();
   if (!text) return null;
   return { kind: mode.kind, runId: mode.runId, text };
@@ -2239,6 +2270,54 @@ export function deriveAssemblyBar(state, harness) {
       "模型给出的路径是不可信输入，`..` 逃逸与工作区外的绝对路径一律在执行前被拒。",
   );
 
+  /**
+   * 识图能力。**没配就明说没配**——委托方遇到的正是这一条：
+   * 传了图进去，模型很诚实地回"我看不到图片"，但界面上完全看不出
+   * "是这套装配里没有这个工具"，只能从模型的道歉里推。
+   *
+   * 顺带说明 harness 在这件事上的判断：视觉模型没配时，`describe_image`
+   * **根本不进工具面**，而不是摆一个一调用就报错的工具——
+   * 给模型一个用不了的工具，它会反复尝试并把失败归咎于自己。
+   */
+  /**
+   * 两处数据源形状**不一样**，都得认：
+   *   · `run_config.roleModels.vision` 是 `string|null`（本 run 实际用的）；
+   *   · `/api/harness` 的是 `{configured:boolean, model?}`（进程级配置）。
+   * 直接 `harness.roleModels.vision ? …` 会永远为真——未配时它是
+   * `{configured:false}`，一个真值对象。**那会让这一格恰好在它唯一有用的
+   * 场景下说反话**，所以判据只认名字与 configured。
+   */
+  const visionRun = cfg.roleModels?.vision ?? null;
+  const visionCfg = harness?.roleModels?.vision ?? null;
+  const visionName =
+    (typeof visionRun === "string" && visionRun) ||
+    (visionCfg && visionCfg.configured ? visionCfg.model ?? "已配" : null);
+  push(
+    "vision",
+    visionName ? `识图 ${visionName}` : "识图 未配",
+    visionName
+      ? "配了视觉模型，`describe_image` 才在工具面上。图片走独立角色模型，与执行者解耦——" +
+        "执行模型不必自己支持视觉。"
+      : "没配视觉模型（`AGENT_VISION_MODEL`），所以 `describe_image` **根本不进工具面**——" +
+        "而不是摆一个一调用就报错的工具。给模型一个用不了的工具，它会反复尝试并把失败归咎于自己；" +
+        "工具面必须与真实能力一致，这是工具运行时地板那条纪律。",
+  );
+
+  /**
+   * 本次对话内的常驻放行规则。**有规则就必须显示**——
+   * 一个悄悄不再问你的审批门，和没有审批门是一回事。
+   */
+  const rules = state.autoAllow ?? [];
+  if (rules.length > 0) {
+    push(
+      "autoAllow",
+      `常驻放行 ${rules.join("·")}`,
+      "你在这次对话里对这些工具说过「以后都允许」。规则**只在本次对话内、只对这几个工具名**生效，" +
+        "不跨对话也不落盘。自动放行照样进事件流（标记为 auto-rule），" +
+        "所以事后回看分得清哪一步是人点的、哪一步是规则放的——省掉的是点击，不是记录。",
+    );
+  }
+
   // 编排：计划确认门是"零副作用时刻"的唯一入口
   if (state.plan) {
     push(
@@ -2499,6 +2578,8 @@ function patchApprovalRail(parts, state, isRunning, callbacks) {
         '<pre class="approval-input"></pre>' +
         '<div class="approval-actions" hidden>' +
         '<button class="btn btn--allow" data-action="allow">允许本次</button>' +
+        // 常驻放行只对**这个工具**、**这次对话**生效——不是"全部放行"开关
+        '<button class="btn btn--allow-always" data-action="allow-always">本次对话都允许</button>' +
         '<button class="btn btn--deny" data-action="deny">拒绝并说明</button>' +
         '<input class="deny-reason" placeholder="拒绝理由（可选）" />' +
         "</div>" +
@@ -2510,6 +2591,9 @@ function patchApprovalRail(parts, state, isRunning, callbacks) {
       input.setAttribute("data-fk", `approval:${cardId}:reason`);
       card.querySelector("[data-action='allow']").addEventListener("click", () => {
         callbacks.onAllow?.(cardId);
+      });
+      card.querySelector("[data-action='allow-always']").addEventListener("click", () => {
+        callbacks.onAllowAlways?.(cardId, a.name);
       });
       card.querySelector("[data-action='deny']").addEventListener("click", () => {
         callbacks.onDenyReason?.(cardId, input.value.trim());

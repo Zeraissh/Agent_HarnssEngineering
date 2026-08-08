@@ -555,6 +555,7 @@ function renderDetailWithState(state) {
     showBack: isNarrow(),
     onBack: backToList,
     onAllow: (approvalId) => postApproval(runId, approvalId, "allow"),
+    onAllowAlways: (approvalId) => postApproval(runId, approvalId, "allow", undefined, "conversation"),
     onDenyReason: (approvalId, reason) =>
       postApproval(runId, approvalId, "deny", reason || ""),
     activeTab,
@@ -959,14 +960,15 @@ async function postPlanDecision(runId, decision) {
   }
 }
 
-async function postApproval(runId, approvalId, decision, reason) {
+async function postApproval(runId, approvalId, decision, reason, scope) {
   try {
     const res = await fetch(
       `/api/runs/${runId}/approvals/${encodeURIComponent(approvalId)}`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ decision, reason }),
+        // scope="conversation" 建一条本次对话内的常驻放行规则（只对这个工具名）
+        body: JSON.stringify({ decision, reason, ...(scope ? { scope } : {}) }),
       },
     );
     if (res.status === 409) return;
@@ -1007,7 +1009,8 @@ submitForm.addEventListener("submit", (e) => {
     }
     return;
   }
-  if (plan.kind === "append") void submitAppend(plan);
+  if (plan.kind === "stop") void stopRun(plan.runId);
+  else if (plan.kind === "append") void submitAppend(plan);
   else void submitNewRun(plan);
 });
 
@@ -1085,6 +1088,26 @@ async function submitNewRun({ text: task }) {
     // 否则当场掉回 body
     if (document.activeElement === submitBtn) taskInput.focus();
     refreshRunListView();
+  }
+}
+
+/**
+ * 停止这次运行。
+ *
+ * 语义要说准：中止只保证**不再往下走**（循环在下一次模型调用之前收手），
+ * 已经在飞的那个请求不撤——HTTP 已经发出去、钱已经花了。
+ * 把它说成"立刻停"是骗人。
+ */
+async function stopRun(runId) {
+  if (!runId) return;
+  try {
+    const res = await fetch(`/api/runs/${runId}/stop`, { method: "POST" });
+    if (!res.ok) {
+      const b = await res.json().catch(() => ({}));
+      showSubmitError(b.error ?? `停止失败（HTTP ${res.status}）`);
+    }
+  } catch (err) {
+    showSubmitError(`停止失败：${err.message ?? "网络错误"}`);
   }
 }
 

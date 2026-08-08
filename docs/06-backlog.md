@@ -605,6 +605,9 @@ fail-closed。round 0 这次 19 轮就自行收口、未触发续跑，**因此�
   > 台账那一轮的教训在这里同样适用：**先定判据再动手**。
   > 不然很容易做成"什么都存"，然后发现最想要的那件事（续跑）恰恰没解决。
 
+- **`aborted` 是本轮新增的第七个终止值**（停止按钮催生）。它加剧了下面那条口径不一致——
+  收口时按 `classifyStopReason` 为准回填，别再各写各的。
+
 - **终止原因的口径三处不一致**（2026-08-08，装配条文案交叉核对时发现）。
   `docs/03-interfaces.md` 列五值、`src/types.ts` 列六值、而 `classifyStopReason`
   实判**八个**具名值（多了 `budget_exhausted` / `refusal` / `plan_rejected` /

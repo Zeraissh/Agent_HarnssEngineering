@@ -27,7 +27,11 @@ export class AnthropicModelClient implements ModelClient {
     this.compat = opts?.compat ?? !model.startsWith("claude");
   }
 
-  async send(req: ModelRequest, onDelta?: (delta: StreamDelta) => void): Promise<ModelTurn> {
+  async send(
+    req: ModelRequest,
+    onDelta?: (delta: StreamDelta) => void,
+    signal?: AbortSignal,
+  ): Promise<ModelTurn> {
     const stream = this.client.messages.stream({
       model: this.model,
       max_tokens: req.maxTokens,
@@ -39,7 +43,9 @@ export class AnthropicModelClient implements ModelClient {
       ...(this.compat
         ? {}
         : { thinking: { type: "adaptive" as const }, output_config: { effort: req.effort } }),
-    });
+    },
+    // 第二参是请求选项：signal 进到这里，abort 才能掐掉在飞的 HTTP 请求
+    signal ? { signal } : undefined);
 
     if (onDelta) {
       stream.on("text", (delta) => onDelta({ kind: "text", text: delta }));

@@ -180,7 +180,8 @@ export class AgentLoop {
     for (let turn = 1; turn <= this.maxTurns; turn++) {
       // 护栏检查发生在每次模型调用之前（契约 4）
       if (signal.aborted) {
-        return finish("error", new Error("Aborted by host"));
+        // 不是 error：人叫停是决定不是故障（见 AgentRunResult.stopReason 注释）
+        return finish("aborted");
       }
       if (this.maxTokensBudget !== undefined) {
         const spent =
@@ -206,16 +207,27 @@ export class AgentLoop {
       let modelTurn;
       for (let attempt = 0; ; attempt++) {
         try {
-          modelTurn = await this.model.send(request, (delta) =>
-            q.push(
-              delta.kind === "thinking"
-                ? { type: "thinking_delta", text: delta.text }
-                : { type: "text_delta", text: delta.text },
-            ),
+          modelTurn = await this.model.send(
+            request,
+            (delta) =>
+              q.push(
+                delta.kind === "thinking"
+                  ? { type: "thinking_delta", text: delta.text }
+                  : { type: "text_delta", text: delta.text },
+              ),
+            // 中止位不能只在轮与轮之间查：一次长生成就是一次调用，
+            // 不把 signal 交给 SDK，"停止"就要等这一整轮吐完才生效
+            signal,
           );
           break;
         } catch (err) {
-          if (signal.aborted || !isTransientApiError(err) || attempt >= this.errorRetries) {
+          /**
+           * 中止把在飞的请求掐断，SDK 会抛 AbortError——那不是故障。
+           * 不在这里分出去的话，"我按了停止"会被画成"它崩了"，
+           * 而且 error 路径还会触发段级续跑（9.8），变成"停一下又自己接着跑"。
+           */
+          if (signal.aborted) return finish("aborted");
+          if (!isTransientApiError(err) || attempt >= this.errorRetries) {
             // 原始错误挂在 cause 上：分类过的消息是给人看的，但编排层要靠
             // isTransientApiError(原始错误) 决定"这段能不能带着正史续跑"（9.8）。
             // 此前这里只留下一句字符串，上游再想分类只能字符串匹配——那正是

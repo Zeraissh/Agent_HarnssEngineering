@@ -18,6 +18,18 @@ import type { DomainPack } from "./presets.js";
 import type { AgentConfig, AgentRunResult, AggregateUsage, ModelClient, TurnEvent } from "./types.js";
 
 export interface VerifiedRunOptions {
+  /**
+   * 中止信号。
+   *
+   * `AgentLoop.run` 从一开始就收 `AbortSignal`（loop.ts 每轮模型调用之前查它），
+   * 但编排层与 Web 宿主**一直没往下传**——于是"停止"这个能力在 harness 里
+   * 是有的、在宿主上是没有的。这正是宿主学那条规律的第九例
+   * （findings 34：harness 有、宿主没接）。
+   *
+   * 语义：中止的是**执行者**。核查者不受它影响——一次已经开始的核查该跑完，
+   * 半截的裁决比没有裁决更误导。
+   */
+  signal?: AbortSignal;
   /** 核查未通过时的最大返工轮数。默认 1 */
   maxReworks?: number;
   /**
@@ -104,14 +116,17 @@ export async function runVerified(
     // inherit 模式的返工在上一轮正史上续跑；fresh（与首轮）全新开局
     const events =
       round > 0 && reworkMode === "inherit"
-        ? new AgentLoop(cfg, model).runContinuation(main!.messages, feedback)
-        : new AgentLoop(cfg, model).run(feedback);
+        ? new AgentLoop(cfg, model).runContinuation(main!.messages, feedback, opts.signal)
+        : new AgentLoop(cfg, model).run(feedback, opts.signal);
     main = await drain(events, (e) => opts.onEvent?.(source, e));
     executionUsage = executionUsage ? sumUsage(executionUsage, main.usage) : main.usage;
 
     /**
      * 段级续跑（9.8）：整段因**瞬时**宿主级错误终止时，带着已有正史再续一次，
      * 而不是把整段工作作废。
+     *
+     * **但人主动按了停止就不续**——中止在 loop 里也表现为 `stopReason=error`，
+     * 不排除的话"停止"会变成"停一下又自己接着跑"，那是最糟的一种界面谎话。
      *
      * 案例 #8 实录：执行者跑到第 29 轮 API 超时，`stopReason=error` 直接短路，
      * 而它当时已经做了 28 次工具调用、最后一句是「让我验证 RCC 寄存器布局是否
@@ -128,6 +143,9 @@ export async function runVerified(
       main.stopReason === "error" &&
       resumesLeft > 0 &&
       main.messages.length > 0 &&
+      // 人按了停止就不续——中止在 loop 里也是 stopReason=error，
+      // 不排除的话"停止"会变成"停一下又自己接着跑"
+      !opts.signal?.aborted &&
       isTransientApiError(main.error?.cause)
     ) {
       resumesLeft -= 1;
@@ -139,7 +157,7 @@ export async function runVerified(
         priorTurns,
       });
       const resumed = await drain(
-        new AgentLoop(cfg, model).runContinuation(main.messages, SEGMENT_RESUME_NUDGE),
+        new AgentLoop(cfg, model).runContinuation(main.messages, SEGMENT_RESUME_NUDGE, opts.signal),
         (e) => opts.onEvent?.(source, e),
       );
       executionUsage = sumUsage(executionUsage!, resumed.usage);

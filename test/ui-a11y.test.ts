@@ -760,10 +760,17 @@ describe("统一 composer：一个框，两种去向", () => {
     });
     expect(composerSubmitPlan(append, "   ")).toBeNull();
 
+    /**
+     * 运行中这个位置**改成了「停止」**（此前是一个灰着的「运行任务」）。
+     * 所以判据从"一律不发"变成"发的是停止、且不吃那半截草稿"——
+     * 那段文字是给下一轮准备的，不该拦着人叫停。
+     */
     const running = deriveComposerMode({
       info: { ...CONTINUABLE, status: "running", canContinue: false }, localStatus: "running",
     });
-    expect(composerSubmitPlan(running, "已经写好了")).toBeNull();
+    expect(composerSubmitPlan(running, "已经写好了")).toEqual({
+      kind: "stop", runId: "run-mt", text: "",
+    });
 
     expect(composerSubmitPlan(deriveComposerMode({ info: null }), "新任务")).toEqual({
       kind: "new", runId: null, text: "新任务",
@@ -790,11 +797,13 @@ describe("统一 composer：一个框，两种去向", () => {
     expect((q("#file-upload") as HTMLInputElement).disabled).toBe(false);
   });
 
-  it("运行中：只禁按钮，输入框仍可打草稿，原因写在 note 里", () => {
+  it("运行中：按钮变「停止」，输入框仍可打草稿，原因写在 note 里", () => {
     patchComposer(deriveComposerMode({
       info: { ...CONTINUABLE, status: "running", canContinue: false }, localStatus: "running",
     }));
-    expect((q("#submit-btn") as HTMLButtonElement).disabled).toBe(true);
+    // 从"灰着的运行任务"改成"可点的停止"：同一个位置，两种状态，不加第二个控件
+    expect(q("#submit-btn").textContent).toBe("停止");
+    expect((q("#submit-btn") as HTMLButtonElement).disabled).toBe(false);
     expect((q("#task-input") as HTMLTextAreaElement).disabled).toBe(false);
     expect(q("#composer-note").textContent).toContain("等这一轮结束");
     // disabled 的按钮不可聚焦、不会被读到，原因只能挂在输入框上

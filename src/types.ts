@@ -82,8 +82,19 @@ export interface StreamDelta {
 }
 
 export interface ModelClient {
-  /** 一律流式发送；增量通过 onDelta 旁路（仅供渲染），控制流只依赖最终 ModelTurn */
-  send(req: ModelRequest, onDelta?: (delta: StreamDelta) => void): Promise<ModelTurn>;
+  /**
+   * 一律流式发送；增量通过 onDelta 旁路（仅供渲染），控制流只依赖最终 ModelTurn。
+   *
+   * `signal` 透传给底层 SDK 的请求选项。**没有它，"停止"就只是句空话**：
+   * 循环只在每轮模型调用之前查中止位，而一次长生成就是一次调用——
+   * 人按下停止之后仍要等这一整轮吐完（实测按下 8 秒后 run 仍在 running）。
+   * 传下去才能真的把在飞的那个 HTTP 请求掐掉。
+   */
+  send(
+    req: ModelRequest,
+    onDelta?: (delta: StreamDelta) => void,
+    signal?: AbortSignal,
+  ): Promise<ModelTurn>;
 }
 
 // ---------------------------------------------------------------- L1: 循环与事件
@@ -142,7 +153,19 @@ export interface AgentRunResult {
    * （非错误：已生成内容保留在 messages 中，提高 maxTokens 可让其写完）；
    * 其余为护栏/拒绝/宿主错误。
    */
-  stopReason: "completed" | "max_tokens" | "max_turns" | "budget_exhausted" | "refusal" | "error";
+  stopReason:
+    | "completed"
+    | "max_tokens"
+    | "max_turns"
+    | "budget_exhausted"
+    | "refusal"
+    /**
+     * 宿主主动中止（人按了停止）。**与 error 分开**：那是委托方的决定，不是失败。
+     * 混进 error 会让界面把"我叫停的"画成"它崩了"——V-04 那条教训的同族
+     * （计划门否决当初也是这么分出去的）。
+     */
+    | "aborted"
+    | "error";
   /** 完整会话历史（SDK 类型），可用于持久化或子代理接力 */
   messages: Anthropic.MessageParam[];
   usage: AggregateUsage;

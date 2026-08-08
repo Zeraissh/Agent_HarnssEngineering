@@ -2541,3 +2541,134 @@ describe("凭据装载：npm 脚本必须自己读 .env", () => {
     }
   });
 });
+
+describe("本次对话常驻放行：省的是点击，不是记录", () => {
+  let handle: Awaited<ReturnType<typeof createUiServer>>;
+  let base: string;
+
+  afterEach(async () => {
+    await handle?.close();
+  });
+
+  /** 每次调用都要审批的工具；模型连着调它三次 */
+  const askEvery = (name: string) => makeTool({ name, permission: "ask", parallelSafe: false });
+
+  async function startRunCallingThrice(): Promise<{ runId: string }> {
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("t1", "danger", {})], "tool_use"),
+      fakeMessage([toolUseBlock("t2", "danger", {})], "tool_use"),
+      fakeMessage([toolUseBlock("t3", "danger", {})], "tool_use"),
+      fakeMessage([textBlock("done")], "end_turn"),
+    ]);
+    handle = createUiServer({ modelClient: model, tools: [askEvery("danger")], workdir: process.cwd() });
+    base = baseUrl(await startServer(handle));
+    const res = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "连着调三次" }),
+    });
+    return { runId: (await res.json()).runId };
+  }
+
+  const firstPending = async (runId: string) => {
+    for (let i = 0; i < 60; i++) {
+      const list = await (await fetch(`${base}/api/runs`)).json();
+      const r = list.find((x: any) => x.runId === runId);
+      if (r?.pendingApprovals > 0) {
+        const evs = await readSSESnapshot(base, runId);
+        const req = evs.filter((e: any) => (e.event as any)?.type === "approval_request").at(-1) as any;
+        return `${req.event.toolUseId}#${req.seq}`;
+      }
+      await new Promise((r2) => setTimeout(r2, 50));
+    }
+    throw new Error("没等到审批请求");
+  };
+
+  it("建规则之后同名工具不再挂起，run 自己跑完", async () => {
+    const { runId } = await startRunCallingThrice();
+    const ref = await firstPending(runId);
+    const res = await fetch(`${base}/api/runs/${runId}/approvals/${encodeURIComponent(ref)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: "allow", scope: "conversation" }),
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json()).autoAllow).toContain("danger");
+
+    await waitForDone(base, runId);
+    const list = await (await fetch(`${base}/api/runs`)).json();
+    expect(list.find((x: any) => x.runId === runId).pendingApprovals).toBe(0);
+  });
+
+  /**
+   * **这条是这个功能能不能上的分界线。**
+   * 自动放行必须照样进事件流并标 `actor: "auto-rule"`——
+   * 事后回看要分得清哪一步是人点的、哪一步是规则放的。
+   * 分不清的审计记录比多点几下危险得多。
+   */
+  it("自动放行照样进事件流，且标明不是人点的", async () => {
+    const { runId } = await startRunCallingThrice();
+    const ref = await firstPending(runId);
+    await fetch(`${base}/api/runs/${runId}/approvals/${encodeURIComponent(ref)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: "allow", scope: "conversation" }),
+    });
+    await waitForDone(base, runId);
+
+    const evs = await readSSESnapshot(base, runId);
+    const resolved = evs.filter((e: any) => (e.event as any)?.type === "approval_resolved") as any[];
+    expect(resolved.length, "三次调用应当有三条决策记录").toBe(3);
+    expect(resolved[0].event.actor, "第一次是人点的").toBe("user");
+    expect(resolved[0].event.scope, "建规则那次要标出来").toBe("conversation");
+    for (const r of resolved.slice(1)) {
+      expect(r.event.actor, "自动放行必须标 auto-rule，不能冒充人点的").toBe("auto-rule");
+      expect(r.event.decision).toBe("allow");
+    }
+  });
+
+  /** 规则**逐工具名**——放行 read_file 不等于放行 bash */
+  it("规则只覆盖同名工具，别的照样问", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("t1", "alpha", {})], "tool_use"),
+      fakeMessage([toolUseBlock("t2", "beta", {})], "tool_use"),
+      fakeMessage([textBlock("done")], "end_turn"),
+    ]);
+    handle = createUiServer({
+      modelClient: model,
+      tools: [askEvery("alpha"), askEvery("beta")],
+      workdir: process.cwd(),
+    });
+    base = baseUrl(await startServer(handle));
+    const runId = (await (await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "两个不同工具" }),
+    })).json()).runId;
+
+    const ref = await firstPending(runId);
+    await fetch(`${base}/api/runs/${runId}/approvals/${encodeURIComponent(ref)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: "allow", scope: "conversation" }),
+    });
+    // beta 不在规则里，必须仍然挂起等人
+    const ref2 = await firstPending(runId);
+    expect(ref2.startsWith("t2"), "beta 应当照样问").toBe(true);
+  });
+
+  /** "以后都拒绝"没有用例：模型拿到 deny 会换做法，常驻拒绝等于让它反复撞墙 */
+  it("scope 只对 allow 生效，deny 不建规则", async () => {
+    const { runId } = await startRunCallingThrice();
+    const ref = await firstPending(runId);
+    const res = await fetch(`${base}/api/runs/${runId}/approvals/${encodeURIComponent(ref)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: "deny", reason: "不行", scope: "conversation" }),
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json()).autoAllow).toBeUndefined();
+    // 下一次调用仍要人点
+    await firstPending(runId);
+  });
+});

@@ -2235,3 +2235,12 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
 .hl-str { color: var(--hl-str); }
 .hl-kw { color: var(--hl-kw); }
 .hl-num { color: var(--hl-num); }
+
+/* 「本次对话都允许」：比「允许本次」低一档视觉权重——
+   它是省事的那条路，不该看起来比逐次确认更像主操作 */
+.btn--allow-always {
+  color: var(--text-2);
+  border-color: var(--border-2);
+  font-size: var(--font-md);
+}
+.btn--allow-always:hover { color: var(--status-ok); border-color: var(--status-ok); }
