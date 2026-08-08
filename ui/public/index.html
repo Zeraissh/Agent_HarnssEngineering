@@ -72,12 +72,18 @@
        它不随内容滚走——这正是委托方那条反馈的结构解法。 -->
   <div id="action-dock" class="action-dock" hidden></div>
 
-  <!-- 提交栏：**在底部**（委托方建议）。
-       理由不只是习惯：待办钉在输入框上方 = 固定可见位置，新审批出现在哪都看得见，
-       从结构上消掉了"内容变高把待办推出视野"那个问题，不必再靠滚动补偿。 -->
+  <!-- 提交栏：**在底部**，且**一个框两种去向**（都来自委托方反馈）。
+       在底部的理由不只是习惯：待办钉在输入框上方 = 固定可见位置，新审批出现在
+       哪都看得见，从结构上消掉了"内容变高把待办推出视野"那个问题。
+       共用一个框的理由：分开纯粹是实现遗留（一个打 /api/runs、一个打 /messages），
+       对用户来说它们长得一样、位置也挨着。选中一个可续跑的运行 → 「继续对话」，
+       没选中 → 「运行任务」；文案、placeholder、说明行、data-mode 四处一起变。
+       派生逻辑在 app.js 的 deriveComposerMode / patchComposer 里（因此可测）。 -->
   <form id="submit-form" class="submit-bar" autocomplete="off">
+    <!-- 文案由 patchComposer 按模式改写（「任务描述」↔「追加指令」）。
+         for/id 不许动：整页 axe 与文案闸门都钉着这一对。 -->
     <label for="task-input" class="task-label">任务描述</label>
-    <textarea id="task-input" placeholder="输入新任务描述…（提交会新建一次运行；要追加指令请用运行详情里的追加框）" rows="1"></textarea>
+    <textarea id="task-input" placeholder="输入新任务描述…（Ctrl+Enter 发送）" rows="1"></textarea>
     <label class="checkbox-label">
       <input type="checkbox" id="verify-toggle" />
       <span>开启独立核查</span>
@@ -86,6 +92,9 @@
     <label class="btn btn--ghost upload-label" for="file-upload">＋ 附件</label>
     <input type="file" id="file-upload" class="sr-only" multiple />
     <button type="button" class="btn btn--ghost" id="knobs-toggle" aria-expanded="false" aria-controls="run-knobs">装配 ▾</button>
+    <!-- 模式说明。独立于 #submit-error：后者是 role="alert"，
+         "这次提交会去哪儿"不是错误，不该被当成警报播报 -->
+    <p id="composer-note" class="composer-note knob-hint" hidden></p>
     <p id="submit-error" class="inline-error" role="alert" hidden></p>
     <ul id="upload-list" class="upload-list" hidden></ul>
 
@@ -185,6 +194,10 @@ import {
   renderRunList,
   renderRunDetail,
   renderEmptyState,
+  deriveComposerMode,
+  composerSubmitPlan,
+  patchComposer,
+  shouldShowReconnecting,
 } from "/app.js";
 
 // ---- 状态 ----
@@ -214,6 +227,15 @@ const transcripts = new Map();
 /** V-28：追加指令的报错，逐 run 独立 */
 /** @type {Map<string, string>} */
 const followUpErrors = new Map();
+
+// ---- 统一 composer 的三个事实（派生逻辑在 app.js，这里只存输入）----
+/** @type {ReturnType<typeof deriveComposerMode>|null} */
+let composerMode = null;
+/** 提交在飞。**必须进模式**，不能命令式改 btn.disabled——服务端在返回响应
+    之前就广播了 run_created，列表刷新会立刻把按钮重算成"可点" */
+let submitting = false;
+/** 与具体 run 无关的提交错误（新建路径） */
+let newRunError = null;
 
 // ---- DOM 引用 ----
 const submitForm = /** @type {HTMLFormElement} */ (document.getElementById("submit-form"));
@@ -259,10 +281,18 @@ function exitDetailMode() {
   if (isNarrow()) {
     sidebar.classList.remove("narrow-hidden");
     mainPanel.classList.remove("narrow-full");
-    selectedRunId = null;
-    refreshRunListView();
-    renderEmptyState(runs.length > 0);
   }
+  /**
+   * 清选中这件事**两种屏宽都要做**。
+   *
+   * 此前整个函数体包在 `isNarrow()` 里，于是宽屏下按浏览器后退（hash 回到
+   * `#/`）什么都没发生，`selectedRunId` 仍指着那个 run。合并之后这个不一致
+   * 会直接变成骗人：地址栏说"没选中任何运行"，底栏却停在「继续对话」——
+   * 而按 F5 之后同一个 URL 又会变成「运行任务」。同一条链接、两种去向。
+   */
+  selectedRunId = null;
+  refreshRunListView();
+  renderEmptyState(runs.length > 0);
 }
 
 function backToList() {
@@ -289,6 +319,8 @@ function refreshRunListView() {
   if (!selectedRunId) {
     renderEmptyState(runs.length > 0);
   }
+  // 选中态、列表内容、run 状态三者任一变了底栏就可能换模式——这里是它们的汇合点
+  syncComposer();
 }
 
 async function loadRuns() {
@@ -326,6 +358,7 @@ function selectRun(runId) {
   // 于是一个断过线的 run 被重新打开时永远不会重新订阅，界面就此定格。
   const state = ensureState(runId);
   if (!state) return;
+  syncConnectionBanner();
   renderDetailWithState(state);
   enterDetailMode();
   writeHash(runId, activeTabs.get(runId));
@@ -447,9 +480,10 @@ function renderDetailWithState(state) {
     loopView: loopViews.get(runId) ?? "events",
     transcript: transcripts.get(runId) ?? null,
     onSwitchView: (view) => switchLoopView(runId, view),
-    ...followUpAffordance(runId),
-    onFollowUp: (text) => postFollowUp(runId, text),
   });
+  // 本地 SSE 把状态推到 done 时列表未必同步刷新过——底栏要立刻从「运行中」
+  // 变回「继续对话」，否则用户盯着一个死按钮等
+  if (runId === selectedRunId) syncComposer();
 }
 
 /**
@@ -483,23 +517,27 @@ function refreshTranscriptIfWatching(runId) {
 }
 
 /**
- * 能否追加指令，以及不能的话为什么（V-28）。
+ * 底栏 composer 与当前选中态对齐。
  *
- * 服务端在列表里算好了 canContinue——界面据此决定要不要显示输入框，
- * 而不是让用户点了才吃一个 409。不能追加时把原因写出来，别只是没有输入框。
+ * 这是**唯一**改写底栏 DOM 的入口——模式派生（deriveComposerMode）和 DOM
+ * 应用（patchComposer）都在 app.js 里，所以"按钮该写什么、能不能点"这件事
+ * 第一次变成可测的；这里只负责喂它当前的四个事实。
+ *
+ * 服务端算好的 canContinue 仍是权威（V-28：不能让用户点了才吃 409），
+ * 只是现在"不能追加"不再表现为"没有输入框"，而是同一个框换个去向 + 说明原因。
  */
-function followUpAffordance(runId) {
-  const info = runs.find((r) => r.runId === runId);
-  const state = runStates.get(runId);
-  if (!info) return { canContinue: false };
-  if (info.canContinue) return { canContinue: true, followUpError: followUpErrors.get(runId) ?? null };
-
-  let reason = null;
-  if (state?.status === "running") reason = "运行进行中，等这一轮结束后可以追加指令。";
-  else if (info.mode === "plan") reason = "计划编排的运行不支持追加指令：runPlanned 每次都从拆解开始，没有续跑入口。";
-  else if (info.verify) reason = "开启独立核查的运行不支持追加指令：追加会绕过已出具的裁决。";
-  else reason = "该运行没有可续跑的会话正史（可能是执行阶段就失败了）。";
-  return { canContinue: false, followUpBlockedReason: reason };
+function syncComposer() {
+  const info = selectedRunId ? runs.find((r) => r.runId === selectedRunId) ?? null : null;
+  composerMode = deriveComposerMode({
+    info: info ? { ...info, runId: selectedRunId } : null,
+    localStatus: selectedRunId ? runStates.get(selectedRunId)?.status ?? null : null,
+    submitting,
+    // 错误按 run 隔离：否则 run A 的 409 会原样挂在切过去的 run B 头上
+    // 刚发生的错误压过 run 上挂着的旧错；两者都按各自的时机清，
+    // 所以切到另一个 run 时不会看见上一个 run 的 409
+    error: newRunError ?? (selectedRunId ? followUpErrors.get(selectedRunId) ?? null : null),
+  });
+  patchComposer(composerMode);
 }
 
 async function postFollowUp(runId, text) {
@@ -636,6 +674,9 @@ const batcher = createBatcher((batches) => {
       if (es) {
         es.close();
         eventSources.delete(runId);
+        // 收尾前多半已经吃过一次 error（服务端 res.end 先到、run_end 后 flush），
+        // 横幅正挂着。close 不触发任何事件，不在这儿落它就会一直挂到下次切换。
+        setConnectionState(runId, "live");
         announceStatus(`运行已完成：${next.task}`);
         refreshTranscriptIfWatching(runId);
         // canContinue 由服务端算，run 收尾后要拉一次列表才知道能不能追加
@@ -690,6 +731,17 @@ function ensureSubscription(runId) {
     //   · 把 pending 标 expired 更糟——一次网络抖动就让活着的审批卡消失，
     //     运行随即无人可应答而永久挂起。审批过期只由服务端 approval_expired 宣告。
     // 这里只反映"传输层断了"，不改 harness 事实。
+    //
+    // 但"断了"和"服务端正常收流了"在这一层长得一模一样（见 shouldShowReconnecting）——
+    // 委托方截图里一个**已完成**的运行顶上就挂着这条横幅。所以先用 harness
+    // 事实分辨一次，别把正常收尾报成故障。
+    if (!shouldShowReconnecting({
+      info: runs.find((r) => r.runId === runId) ?? null,
+      localStatus: runStates.get(runId)?.status ?? null,
+    })) {
+      setConnectionState(runId, "live");
+      return;
+    }
     setConnectionState(runId, "reconnecting");
     loadRuns();
   });
@@ -708,9 +760,20 @@ function setConnectionState(runId, next) {
   if (prev === next) return;
   connectionStates.set(runId, next);
   if (selectedRunId !== runId) return;
-  const banner = document.getElementById("reconnect-banner");
-  if (banner) banner.hidden = next !== "reconnecting";
+  syncConnectionBanner();
   if (next === "reconnecting") announceStatus("连接中断，正在重连…");
+}
+
+/**
+ * 横幅只反映**当前选中**那个运行的连接态。
+ *
+ * 必须能单独调：setConnectionState 在 `selectedRunId !== runId` 时只写 Map
+ * 不动 DOM，所以切换运行时，上一个运行的横幅会原样挂在新运行头上。
+ */
+function syncConnectionBanner() {
+  const banner = document.getElementById("reconnect-banner");
+  if (!banner) return;
+  banner.hidden = !(selectedRunId && connectionStates.get(selectedRunId) === "reconnecting");
 }
 
 // ---- 审批回调 ----
@@ -771,16 +834,42 @@ async function postApproval(runId, approvalId, decision, reason) {
   }
 }
 
-// ---- 提交任务 ----
-submitForm.addEventListener("submit", async (e) => {
+// ---- 提交：一个框，两种去向 ----
+/**
+ * 提交入口。去哪儿由 `composerSubmitPlan` 说了算——它是纯函数，
+ * 所以"这一下会新建还是会追加"这件事可以在测试里锁死，而不是靠人点。
+ */
+submitForm.addEventListener("submit", (e) => {
   e.preventDefault();
-  const task = taskInput.value.trim();
-  if (!task) return;
+  const plan = composerSubmitPlan(composerMode, taskInput.value);
+  if (!plan) {
+    // 不能提交时**不能静默**：运行中那个模式恰恰是主动邀请用户打字的
+    // （placeholder 写着"可以先把下一条指令打好"），按了却零反馈最伤人
+    if (composerMode && !composerMode.canSubmit && taskInput.value.trim()) {
+      announceStatus(composerMode.note || "现在不能提交");
+    }
+    return;
+  }
+  if (plan.kind === "append") void submitAppend(plan);
+  else void submitNewRun(plan);
+});
 
-  submitBtn.disabled = true;
-  submitBtn.textContent = "提交中…";
-  showSubmitError(null);
+/**
+ * Ctrl/Cmd+Enter 发送。**只绑在 textarea 上，不绑在 form 上**——
+ * `#rubric-input` 也在这个 form 里，绑 form 的话在评分表里按 Ctrl+Enter
+ * 会带着半截 rubric 直接发车。单独 Enter 留给换行，多行指令是常态。
+ */
+taskInput.addEventListener("keydown", (e) => {
+  if (e.key !== "Enter" || !(e.ctrlKey || e.metaKey)) return;
+  e.preventDefault();
+  if (typeof submitForm.requestSubmit === "function") submitForm.requestSubmit();
+  else submitForm.dispatchEvent(new Event("submit", { cancelable: true, bubbles: true }));
+});
 
+async function submitNewRun({ text: task }) {
+  submitting = true;
+  newRunError = null;
+  syncComposer();
   try {
     const verify = verifyToggle.checked;
     const res = await fetch("/api/runs", {
@@ -812,7 +901,7 @@ submitForm.addEventListener("submit", async (e) => {
         const body = await res.json();
         detail = body?.error ? `：${body.error}` : "";
       } catch { /* 响应体不是 JSON，只报状态码 */ }
-      showSubmitError(`提交失败（HTTP ${res.status}）${detail}`);
+      newRunError = `提交失败（HTTP ${res.status}）${detail}`;
       return;
     }
     const { runId } = await res.json();
@@ -823,7 +912,6 @@ submitForm.addEventListener("submit", async (e) => {
     runs.unshift({ runId, task, status: "running", verify, createdAt: Date.now(), finishedAt: null });
     selectedRunId = runId;
     activeTabs.set(runId, "loop");
-    refreshRunListView();
     renderDetailWithState(state);
     enterDetailMode();
     writeHash(runId, "loop");
@@ -831,13 +919,33 @@ submitForm.addEventListener("submit", async (e) => {
 
     ensureSubscription(runId);
     taskInput.value = "";
+    clearUploads();
   } catch (err) {
-    showSubmitError(`提交失败：${err.message ?? "网络错误"}`);
+    newRunError = `提交失败：${err.message ?? "网络错误"}`;
   } finally {
-    submitBtn.disabled = false;
-    submitBtn.textContent = "运行任务";
+    submitting = false;
+    // 焦点交还输入框：按钮这一刻会变成 disabled（运行中），鼠标用户的焦点
+    // 否则当场掉回 body
+    if (document.activeElement === submitBtn) taskInput.focus();
+    refreshRunListView();
   }
-});
+}
+
+async function submitAppend({ runId, text }) {
+  submitting = true;
+  syncComposer();
+  try {
+    await postFollowUp(runId, text);
+    if (!followUpErrors.has(runId)) {
+      taskInput.value = "";
+      clearUploads();
+    }
+  } finally {
+    submitting = false;
+    if (document.activeElement === submitBtn) taskInput.focus();
+    syncComposer();
+  }
+}
 
 /**
  * 提交错误就地显示（V-16）。
@@ -847,9 +955,10 @@ submitForm.addEventListener("submit", async (e) => {
  * 键盘焦点不动，错误内容还能带上 HTTP 状态码与服务端文案。
  */
 function showSubmitError(message) {
-  if (!submitError) return;
-  submitError.textContent = message ?? "";
-  submitError.hidden = !message;
+  // 合并之后 #submit-error 由 patchComposer 统一写。这里改成设状态再同步，
+  // 否则两个写入方会互相覆盖：一次列表刷新就能把刚报出来的错抹掉。
+  newRunError = message || null;
+  syncComposer();
 }
 
 // ---- 全局生命周期流（V-10：取代 3 秒轮询）----
@@ -1015,6 +1124,9 @@ if (newChatBtn) {
     sidebar.classList.remove("narrow-hidden");
     mainPanel.classList.remove("narrow-full");
     taskInput.value = "";
+    clearUploads();
+    newRunError = null;
+    syncComposer();
     taskInput.focus();
     announceStatus("已开始新对话，请输入任务描述");
   });
@@ -1040,6 +1152,17 @@ function renderUploads() {
     .join("");
 }
 
+/**
+ * 清单清空。合并之前这个数组**从来没被清过**——因为提交完页面重心就转走了，
+ * 看不见。现在 composer 常驻底栏，不清的话上一次的附件清单会挂到下一次提交
+ * 头上，一眼就能看出错。
+ */
+function clearUploads() {
+  if (uploaded.length === 0) return;
+  uploaded.length = 0;
+  renderUploads();
+}
+
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
@@ -1047,6 +1170,16 @@ function escapeHtml(s) {
 
 async function uploadFiles(files) {
   showSubmitError(null);
+  /**
+   * 附件落在**哪个工作目录**取决于这次提交去哪儿。
+   *
+   * 续跑复用原运行的 loop，工具的写入圈禁根是那个运行的 workdir；而
+   * `#workdir-select` 反映的是"下一次新建"的选择（追加模式下它还被禁用了）。
+   * 照旧取 select 的值，文件会落进另一个目录，agent 按路径读不到——
+   * 而且不报错，只表现为"它说找不到文件"。
+   */
+  const at = { mode: composerMode?.mode ?? "new", runId: composerMode?.runId ?? null };
+  const targetWorkdir = at.mode === "append" ? composerMode?.workdir : workdirSelect?.value;
   for (const file of files) {
     try {
       const buf = await file.arrayBuffer();
@@ -1062,7 +1195,7 @@ async function uploadFiles(files) {
         body: JSON.stringify({
           name: file.name,
           data: btoa(binary),
-          ...(workdirSelect?.value ? { workdir: workdirSelect.value } : {}),
+          ...(targetWorkdir ? { workdir: targetWorkdir } : {}),
         }),
       });
       if (!res.ok) {
@@ -1071,6 +1204,12 @@ async function uploadFiles(files) {
         continue;
       }
       const info = await res.json();
+      // 上传是 fire-and-forget（change 处理器不 await）。等它回来时用户可能
+      // 已经切走了——那条路径属于另一个工作目录，写进现在的框里就是错配。
+      if ((composerMode?.mode ?? "new") !== at.mode || (composerMode?.runId ?? null) !== at.runId) {
+        showSubmitError(`附件已上传到原来的工作目录（${info.path}），但你已经切换了对话——没有写进输入框。`);
+        continue;
+      }
       uploaded.push(info);
       // 把路径写进任务描述——模型只有看到路径才知道文件存在
       const line = `附件：${info.path}`;
@@ -1124,6 +1263,9 @@ if (themeToggle) {
   });
 }
 
+// 底栏先派生一次：loadRuns 失败时是静默的（见其 catch），
+// 不显式同步的话 composer 会停在 HTML 里那份未经派生的静态文案上
+syncComposer();
 loadHarness();
 loadRuns().then(applyHash);
 subscribeLifecycle();

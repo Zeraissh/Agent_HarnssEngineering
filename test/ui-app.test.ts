@@ -1571,6 +1571,37 @@ describe("V-20 hidden 必须真的隐藏", () => {
  * 作废，颜色回退成继承值，看起来"就是没生效"，改半天找不到原因。
  * 变量名是手写字符串，拼错/改名漏改是必然会再发生的，所以用一条全量扫描锁住。
  */
+/**
+ * 合并之后旧的追加框骨架必须**彻底消失**。
+ *
+ * 留一份在页面上就意味着两个输入框、两个 role="alert"、两处 duplicate id——
+ * 而且这类残迹不会报错，只会让人在错误的框里打字。
+ */
+describe("统一 composer：旧追加框不许回潮", () => {
+  it("index.html / app.js / styles.css 里都不再出现 followup", () => {
+    const dir = join(__dirname, "..", "ui", "public");
+    for (const f of ["index.html", "app.js", "styles.css"]) {
+      expect(readFileSync(join(dir, f), "utf-8"), `${f} 残留旧追加框`).not.toContain("followup");
+    }
+  });
+
+  it("底栏说明行独占一行——底栏是 flex-wrap，不给 100% 它会挤进控件行", () => {
+    const css = readFileSync(join(__dirname, "..", "ui", "public", "styles.css"), "utf-8");
+    expect(css).toMatch(/\.composer-note\s*\{[^}]*flex-basis:\s*100%/);
+  });
+
+  /**
+   * 本次把「禁用而不是隐藏」当成两个模式的主要可见承载。而此前整份样式表里
+   * 一条 :disabled 都没有，.btn 还无条件写了 cursor:pointer——禁用的按钮
+   * 长得、摸上去都和能点的一模一样。那样的"可见"是在骗人。
+   */
+  it("禁用态有可见样式（否则「禁用而不是隐藏」这条纪律是空的）", () => {
+    const css = readFileSync(join(__dirname, "..", "ui", "public", "styles.css"), "utf-8");
+    expect(css).toMatch(/\.btn:disabled/);
+    expect(css).toMatch(/:disabled[^{]*\{[^}]*cursor:\s*not-allowed/);
+  });
+});
+
 describe("CSS 变量：引用的必须定义过", () => {
   it("styles.css 里每个 var(--x) 都能在同文件找到定义", () => {
     const css = readFileSync(join(__dirname, "..", "ui", "public", "styles.css"), "utf-8");

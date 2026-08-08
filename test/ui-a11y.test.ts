@@ -27,6 +27,9 @@ import {
   renderRunDetail,
   renderEmptyState,
   renderConversation,
+  deriveComposerMode,
+  composerSubmitPlan,
+  patchComposer,
 } from "../ui/public/app.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -777,7 +780,7 @@ describe("编排面板", () => {
 // v2 R8：多轮对话 (V-28)
 // ================================================================
 
-describe("追加指令", () => {
+describe("统一 composer：一个框，两种去向", () => {
   function doneState() {
     let s = createInitialState("run-mt", "记住暗号", false);
     s = reduceEvent(s, { seq: 0, source: "main", event: { type: "turn_start", turn: 1 } });
@@ -798,48 +801,163 @@ describe("追加指令", () => {
     }],
   };
 
-  it("可续跑时给出输入框；不可续跑时说清为什么，而不是只是没有输入框", () => {
-    renderRunDetail(doneState(), {
-      activeTab: "loop", harness: FAKE_HARNESS, loopView: "chat", transcript, canContinue: true,
-    });
-    expect(document.querySelector(".followup-input")).toBeTruthy();
-    expect(document.querySelector(".followup-send")).toBeTruthy();
+  const CONTINUABLE = { runId: "run-mt", status: "done", canContinue: true, workdir: "D:\\repo" };
+  const q = (sel: string) => document.querySelector(sel) as HTMLElement;
+
+  // ---- 模式派生（纯函数）----
+
+  it("没选中运行 → 新建；选中可续跑的 → 追加，且带上 runId", () => {
+    const m0 = deriveComposerMode({ info: null });
+    expect(m0.mode).toBe("new");
+    expect(m0.buttonLabel).toBe("运行任务");
+
+    const m1 = deriveComposerMode({ info: CONTINUABLE, localStatus: "done" });
+    expect(m1.mode).toBe("append");
+    expect(m1.buttonLabel).toBe("继续对话");
+    expect(m1.runId).toBe("run-mt");
     // 轮次预算每轮重新起算，不说清用户会以为 maxTurns 是整场对话的总额
-    expect(document.querySelector(".followup")!.textContent).toContain("每轮重新起算");
-
-    document.body.innerHTML = loadSkeleton();
-    renderRunDetail(doneState(), {
-      activeTab: "loop", harness: FAKE_HARNESS, loopView: "chat", transcript,
-      canContinue: false, followUpBlockedReason: "开启独立核查的运行不支持追加指令：追加会绕过已出具的裁决。",
-    });
-    expect(document.querySelector(".followup-input")).toBeNull();
-    expect(document.querySelector(".followup-blocked")!.textContent).toContain("绕过已出具的裁决");
+    expect(m1.note).toContain("每轮重新起算");
   });
 
-  it("点击发送把文本交给回调", () => {
-    const seen: string[] = [];
-    renderRunDetail(doneState(), {
-      activeTab: "loop", harness: FAKE_HARNESS, loopView: "chat", transcript,
-      canContinue: true, onFollowUp: (t: string) => seen.push(t),
-    });
-    const input = document.querySelector(".followup-input") as HTMLTextAreaElement;
-    input.value = "  暗号是什么？  ";
-    (document.querySelector(".followup-send") as HTMLElement).click();
-    expect(seen).toEqual(["暗号是什么？"]);
+  /**
+   * `createInitialState` 把 status 初始化成 "running"——那是**默认值不是观测**。
+   * 拿它当"在跑"的证据，会让点开一条早已结束的运行走出 append→running→append
+   * 的抖动，中间还挂一句"运行进行中"的假话。所以本地状态只能单向生效。
+   */
+  it("本地状态只能把模式往「已结束」推，不能往「在跑」推", () => {
+    // 服务端说结束、本地还是初始化默认的 running → 仍然是追加，不抖
+    expect(deriveComposerMode({ info: CONTINUABLE, localStatus: "running" }).mode).toBe("append");
+    // 服务端说在跑、本地也在跑 → 运行中
+    expect(deriveComposerMode({
+      info: { ...CONTINUABLE, status: "running", canContinue: false }, localStatus: "running",
+    }).mode).toBe("running");
+    // 服务端还没刷新、本地已经收到 run_end → 立刻放行（这一侧是真观测）
+    expect(deriveComposerMode({
+      info: { ...CONTINUABLE, status: "running" }, localStatus: "done",
+    }).mode).toBe("append");
   });
 
-  it("Ctrl+Enter 发送，单独 Enter 不发（多行指令是常态）", () => {
-    const seen: string[] = [];
+  /**
+   * V-28 的原意保留：不能追加时要说清为什么。合并之后它不再表现为
+   * "没有输入框"，而是同一个框换个去向——**但绝不静默**，必须明说会新建。
+   */
+  it("不能追加时说清原因，并明说这一提交会新建一次运行", () => {
+    const verify = deriveComposerMode({ info: { ...CONTINUABLE, canContinue: false, verify: true } });
+    expect(verify.mode).toBe("new-blocked");
+    expect(verify.note).toContain("绕过已出具的裁决");
+    expect(verify.note).toContain("将新建一次运行");
+    expect(verify.canSubmit).toBe(true);
+
+    const plan = deriveComposerMode({ info: { ...CONTINUABLE, canContinue: false, mode: "plan" } });
+    expect(plan.note).toContain("没有续跑入口");
+    expect(plan.note).toContain("将新建一次运行");
+  });
+
+  it("提交在飞时按钮不可点——服务端在返回响应之前就广播了 run_created", () => {
+    const m = deriveComposerMode({ info: null, submitting: true });
+    expect(m.canSubmit).toBe(false);
+    expect(m.buttonLabel).toBe("提交中…");
+  });
+
+  // ---- 提交去向（纯函数）----
+
+  it("提交计划：追加带 runId，去空白，运行中一律不发", () => {
+    const append = deriveComposerMode({ info: CONTINUABLE, localStatus: "done" });
+    expect(composerSubmitPlan(append, "  暗号是什么？  ")).toEqual({
+      kind: "append", runId: "run-mt", text: "暗号是什么？",
+    });
+    expect(composerSubmitPlan(append, "   ")).toBeNull();
+
+    const running = deriveComposerMode({
+      info: { ...CONTINUABLE, status: "running", canContinue: false }, localStatus: "running",
+    });
+    expect(composerSubmitPlan(running, "已经写好了")).toBeNull();
+
+    expect(composerSubmitPlan(deriveComposerMode({ info: null }), "新任务")).toEqual({
+      kind: "new", runId: null, text: "新任务",
+    });
+  });
+
+  // ---- DOM 应用 ----
+
+  it("追加模式：按钮/标签/说明一起变，装配项禁用但附件仍可用", () => {
+    patchComposer(deriveComposerMode({ info: CONTINUABLE, localStatus: "done" }));
+    expect(q("#submit-btn").textContent).toBe("继续对话");
+    expect((q("#submit-btn") as HTMLButtonElement).disabled).toBe(false);
+    // 可及名称不能说谎：这一刻它不是「任务描述」
+    expect(q('label[for="task-input"]').textContent).toBe("追加指令");
+    expect(q("#composer-note").hidden).toBe(false);
+    expect(q("#task-input").getAttribute("aria-describedby")).toBe("composer-note");
+
+    // 续跑复用原运行的装配，这一组构造上无效——禁用而不是藏起来
+    expect((q("#verify-toggle") as HTMLInputElement).disabled).toBe(true);
+    expect((q("#rubric-input") as HTMLTextAreaElement).disabled).toBe(true);
+    // 但**不动面板的开合**：那是用户状态，后台事件去改它会把焦点踢回 body
+    expect(q("#run-knobs").hidden).toBe(true); // 骨架初始就是折叠的，没被动过
+    // 附件走独立端点、不进请求体，续跑照常能用
+    expect((q("#file-upload") as HTMLInputElement).disabled).toBe(false);
+  });
+
+  it("运行中：只禁按钮，输入框仍可打草稿，原因写在 note 里", () => {
+    patchComposer(deriveComposerMode({
+      info: { ...CONTINUABLE, status: "running", canContinue: false }, localStatus: "running",
+    }));
+    expect((q("#submit-btn") as HTMLButtonElement).disabled).toBe(true);
+    expect((q("#task-input") as HTMLTextAreaElement).disabled).toBe(false);
+    expect(q("#composer-note").textContent).toContain("等这一轮结束");
+    // disabled 的按钮不可聚焦、不会被读到，原因只能挂在输入框上
+    expect(document.getElementById(q("#task-input").getAttribute("aria-describedby")!)).toBeTruthy();
+  });
+
+  it("切回新建模式时装配项解禁、说明行收起", () => {
+    patchComposer(deriveComposerMode({ info: CONTINUABLE, localStatus: "done" }));
+    patchComposer(deriveComposerMode({ info: null }));
+    expect(q("#submit-btn").textContent).toBe("运行任务");
+    expect(q('label[for="task-input"]').textContent).toBe("任务描述");
+    expect((q("#verify-toggle") as HTMLInputElement).disabled).toBe(false);
+    expect((q("#rubric-input") as HTMLTextAreaElement).disabled).toBe(false);
+    expect(q("#composer-note").hidden).toBe(true);
+    expect(q("#task-input").getAttribute("aria-describedby")).toBeNull();
+  });
+
+  /**
+   * 合并把输入框从"每次重建"变成"永久存在"，重复绑定从不可能变成一步之遥。
+   * 用职责切分堵死：patchComposer 只写属性，一行 addEventListener 都没有。
+   */
+  it("patchComposer 反复调用不会累积事件监听", () => {
+    let clicks = 0;
+    q("#submit-btn").addEventListener("click", () => clicks++);
+    for (let i = 0; i < 5; i++) patchComposer(deriveComposerMode({ info: CONTINUABLE, localStatus: "done" }));
+    (q("#submit-btn") as HTMLElement).click();
+    expect(clicks).toBe(1);
+  });
+
+  it("禁用一个正被聚焦的装配项时，焦点交还输入框而不是掉回 body", () => {
+    const rubric = q("#rubric-input") as HTMLTextAreaElement;
+    rubric.focus();
+    expect(document.activeElement).toBe(rubric);
+    patchComposer(deriveComposerMode({ info: CONTINUABLE, localStatus: "done" }));
+    expect(document.activeElement).toBe(q("#task-input"));
+  });
+
+  it("提交错误显示在 #submit-error，且随模式清掉——不会挂到另一次运行头上", () => {
+    patchComposer(deriveComposerMode({ info: CONTINUABLE, localStatus: "done", error: "HTTP 409" }));
+    expect(q("#submit-error").hidden).toBe(false);
+    expect(q("#submit-error").textContent).toContain("409");
+    patchComposer(deriveComposerMode({ info: null }));
+    expect(q("#submit-error").hidden).toBe(true);
+  });
+
+  it("整页只有一个输入框、一个 role=alert，且不留任何旧的追加框残迹", () => {
+    patchComposer(deriveComposerMode({ info: CONTINUABLE, localStatus: "done" }));
     renderRunDetail(doneState(), {
       activeTab: "loop", harness: FAKE_HARNESS, loopView: "chat", transcript,
-      canContinue: true, onFollowUp: (t: string) => seen.push(t),
     });
-    const input = document.querySelector(".followup-input") as HTMLTextAreaElement;
-    input.value = "继续";
-    input.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
-    expect(seen).toHaveLength(0);
-    input.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Enter", ctrlKey: true, bubbles: true }));
-    expect(seen).toEqual(["继续"]);
+    expect(document.querySelectorAll("#task-input")).toHaveLength(1);
+    expect(document.querySelectorAll("form")).toHaveLength(1);
+    expect(document.querySelectorAll('[role="alert"]')).toHaveLength(1);
+    expect(document.querySelector("[class*='followup']")).toBeNull();
+    expect(document.getElementById("main-area")!.querySelector("form")).toBeNull();
   });
 
   /**
@@ -858,27 +976,27 @@ describe("追加指令", () => {
     const chat = document.querySelector(".chat-view")!;
     expect(chat.textContent).toContain("暗号是什么？");
     expect(chat.textContent).toContain("本轮结束后落盘");
-    // 运行中不给输入框——两条指令并发进同一个会话会互相踩
-    expect(document.querySelector(".followup-input")).toBeNull();
   });
 
-  it("追加失败的报错就地显示，不吞掉", () => {
-    renderRunDetail(doneState(), {
-      activeTab: "loop", harness: FAKE_HARNESS, loopView: "chat", transcript,
-      canContinue: true, followUpError: "运行进行中，请等它这一轮结束再追加指令",
-    });
-    expect(document.querySelector(".followup .inline-error")!.textContent).toContain("请等它这一轮结束");
-  });
-
-  it("追加输入框零 violations（两套主题）", async () => {
+  it("composer 的两种模式各自零 violations（两套主题）", async () => {
+    const modes = [
+      deriveComposerMode({ info: CONTINUABLE, localStatus: "done" }),
+      deriveComposerMode({ info: { ...CONTINUABLE, status: "running", canContinue: false }, localStatus: "running" }),
+    ];
     for (const theme of ["light", "dark"]) {
-      document.body.innerHTML = loadSkeleton();
-      document.documentElement.setAttribute("data-theme", theme);
-      renderRunDetail(doneState(), {
-        activeTab: "loop", harness: FAKE_HARNESS, loopView: "chat", transcript, canContinue: true,
-      });
-      const violations = await runAxe();
-      expect(violations, `${theme}: ${JSON.stringify(violations, null, 2)}`).toEqual([]);
+      for (const mode of modes) {
+        document.body.innerHTML = loadSkeleton();
+        document.documentElement.setAttribute("data-theme", theme);
+        renderRunDetail(doneState(), {
+          activeTab: "loop", harness: FAKE_HARNESS, loopView: "chat", transcript,
+        });
+        // 必须先打补丁再扫：不打的话 axe 看到的永远是那份静态骨架，
+        // 「禁用 + aria-describedby + note 可见」这个组合形态一眼都扫不到
+        patchComposer(mode);
+        expect(q("#composer-note").hidden, "前置：note 应当可见，否则这条扫描等于没扫").toBe(false);
+        const violations = await runAxe();
+        expect(violations, `${theme}/${mode.mode}: ${JSON.stringify(violations, null, 2)}`).toEqual([]);
+      }
     }
   });
 });

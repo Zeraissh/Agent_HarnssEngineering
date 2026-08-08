@@ -1112,6 +1112,233 @@ export function deriveVerificationFace(state, harness) {
   };
 }
 
+// ================================================================
+// 统一输入框（composer）：新建任务与追加指令共用同一个框
+// ================================================================
+
+/**
+ * 一个框、四个模式。模式**只由"当前选中哪个运行"派生**。
+ *
+ * 为什么合并（委托方原话："追加指令和下方的输入框不能公用吗 为啥要分开"）：
+ * 分开纯粹是实现遗留——底栏打 `POST /api/runs`（新建），详情里那个打
+ * `POST /api/runs/:id/messages`（续跑）。对用户来说它们长得一样、位置也挨着，
+ * 没有理由是两个框。
+ *
+ * 为什么模式由选中态派生、而不是加一个"新建/追加"切换器：切换器是第四个概念，
+ * 要持久化、要和选中态同步，还会造出"切换器说新建、详情页却显示着某个运行"
+ * 这种自相矛盾态。侧栏本来就有「+ 新建对话」，它天然就是"切回新建"的开关。
+ *
+ * **这笔交易的代价要认下来**：点开一个运行只是想读它，底栏却已经变成
+ * "追加到这个运行"。所以模式必须**处处可见**——按钮文案、placeholder、
+ * 说明行、`data-mode` 四处同时变，绝不静默。
+ *
+ * @param {{
+ *   info?: {status?: string, canContinue?: boolean, mode?: string, verify?: boolean, workdir?: string, runId?: string}|null,
+ *   localStatus?: string|null,   // 本地 SSE 观测到的状态；见下方"默认值不是观测"
+ *   submitting?: boolean,        // 提交在飞：服务端还没回、列表也还没更新
+ *   error?: string|null,
+ * }} input
+ */
+export function deriveComposerMode({ info, localStatus, submitting, error } = {}) {
+  const base = {
+    runId: info?.runId ?? null,
+    workdir: info?.workdir ?? null,
+    error: error ?? null,
+    optionsEnabled: true,
+  };
+
+  // 提交在飞：服务端在 json(res) **之前**就广播了 run_created，于是列表先一步
+  // 刷新、syncComposer 跟着跑一遍，按钮会被重新算成"可点"——用户第二下就建了
+  // 第二个 run（新建路径没有 409 兜着）。所以 in-flight 必须是模式的一部分，
+  // 不能用命令式的 btn.disabled=true 去和 patchComposer 抢同一个属性。
+  if (submitting) {
+    return {
+      ...base,
+      mode: "submitting",
+      kind: null,
+      buttonLabel: "提交中…",
+      labelText: "任务描述",
+      placeholder: "",
+      note: "",
+      canSubmit: false,
+      optionsEnabled: false,
+    };
+  }
+
+  if (!info) {
+    return {
+      ...base,
+      mode: "new",
+      kind: "new",
+      buttonLabel: "运行任务",
+      labelText: "任务描述",
+      placeholder: "输入新任务描述…（Ctrl+Enter 发送）",
+      note: "",
+      canSubmit: true,
+    };
+  }
+
+  /**
+   * "在跑"以**服务端列表**为准，本地状态只能把它往"结束"方向推，不能往
+   * "在跑"方向推。
+   *
+   * 原因：`createInitialState` 把 status 初始化成 `"running"`——那是默认值，
+   * **不是一次观测**。若拿它当"在跑"的证据，从侧栏点开一个早已结束的运行会
+   * 走出 append → running → append 的抖动，中间还挂一句"运行进行中"的假话。
+   * 反过来，本地已经收到 run_end 而列表还没刷新时，本地那一侧是真观测，
+   * 应当立刻生效——所以是单向的。
+   */
+  const running = info.status === "running" && localStatus !== "done";
+  if (running) {
+    return {
+      ...base,
+      mode: "running",
+      kind: null,
+      buttonLabel: "运行任务",
+      labelText: "任务描述",
+      // 不禁用输入框：把"先把下一条想好"的能力也没收掉是过度反应
+      placeholder: "运行进行中，可以先把下一条指令打好…",
+      note: "运行进行中，等这一轮结束后可以追加指令；要现在开新任务请点左侧「+ 新建对话」。",
+      canSubmit: false,
+      optionsEnabled: false,
+    };
+  }
+
+  if (info.canContinue) {
+    return {
+      ...base,
+      mode: "append",
+      kind: "append",
+      buttonLabel: "继续对话",
+      labelText: "追加指令",
+      placeholder: "追加一条指令，接着这次会话继续…（Ctrl+Enter 发送）",
+      // 轮次预算每轮重新起算，不说清楚用户会以为 maxTurns 是整场对话的总额
+      note: "续跑复用这次运行的装配（包 / 思考预算 / 工作目录 / 核查）；轮次预算每轮重新起算。",
+      canSubmit: true,
+      // 装配项在续跑里**构造上无效**：startContinuation 只取 run.loop 与
+      // run.history，pack/effort/workdir/mode/rubric 一个都不读
+      optionsEnabled: false,
+    };
+  }
+
+  /**
+   * 选中了运行、却不能追加。**绝不静默回落成新建**——那才是这次合并最容易
+   * 埋的雷：用户以为在续跑，实际另起了一次运行。原因照实写出来，
+   * 并且明说"提交将新建一次运行"。
+   */
+  return {
+    ...base,
+    mode: "new-blocked",
+    kind: "new",
+    buttonLabel: "运行任务",
+    labelText: "任务描述",
+    placeholder: "输入新任务描述…（Ctrl+Enter 发送）",
+    note: `${blockedReason(info)}提交将新建一次运行。`,
+    canSubmit: true,
+    // 不能追加 = 这一提交是新建，装配当然有效
+    optionsEnabled: true,
+  };
+}
+
+/** 不能追加的原因（V-28：不能只是"没有输入框"，要说为什么） */
+function blockedReason(info) {
+  if (info.mode === "plan") {
+    return "计划编排的运行不支持追加：runPlanned 每次都从拆解开始，没有续跑入口。";
+  }
+  if (info.verify) {
+    return "开启独立核查的运行不支持追加：追加会绕过已出具的裁决。";
+  }
+  return "这次运行没有可续跑的会话正史（可能执行阶段就失败了）。";
+}
+
+/**
+ * 提交意图。纯函数——路由决策与 DOM、网络无关，所以它可测。
+ * @returns {{kind:"new"|"append", runId:string|null, text:string}|null} null = 不该提交
+ */
+export function composerSubmitPlan(mode, rawText) {
+  if (!mode || !mode.canSubmit || !mode.kind) return null;
+  const text = String(rawText ?? "").trim();
+  if (!text) return null;
+  return { kind: mode.kind, runId: mode.runId, text };
+}
+
+/**
+ * 把模式应用到底栏 DOM。**这里一行 addEventListener 都没有**——
+ * 监听只在启动时由 `bindComposer` 绑一次。合并把输入框从"每次重建"变成
+ * "永久存在"，重复绑定从不可能变成一步之遥，所以用职责切分把它堵死。
+ */
+export function patchComposer(mode, root = document) {
+  const q = (sel) => root.querySelector(sel);
+  const form = q("#submit-form");
+  const btn = q("#submit-btn");
+  const input = q("#task-input");
+  const label = q('label[for="task-input"]');
+  const note = q("#composer-note");
+  const err = q("#submit-error");
+
+  if (form) setAttr(form, "data-mode", mode.mode);
+  if (btn) {
+    setText(btn, mode.buttonLabel);
+    setAttr(btn, "disabled", mode.canSubmit ? null : "");
+  }
+  if (label) setText(label, mode.labelText);
+  if (input) {
+    setAttr(input, "placeholder", mode.placeholder);
+    // 说明行不是 live region，靠 aria-describedby 在聚焦输入框时被读到——
+    // disabled 的按钮不可聚焦，读屏用户否则无从得知它为什么是死的
+    setAttr(input, "aria-describedby", mode.note ? "composer-note" : null);
+  }
+  if (note) {
+    setText(note, mode.note);
+    setAttr(note, "hidden", mode.note ? null : "");
+  }
+  if (err) {
+    setText(err, mode.error ?? "");
+    setAttr(err, "hidden", mode.error ? null : "");
+  }
+
+  /**
+   * 装配项（独立核查 / 装配面板里的每一项）跟着模式禁用，**但不隐藏**——
+   * 沿用本仓已有的纪律（见 index.html 并行度那处注释）：让"这个旋钮属于哪个
+   * 模式"这件事本身可见。
+   *
+   * 两条刻意的例外：
+   * ① 不动 `#run-knobs.hidden`：面板开合是用户状态、只有点击处理器一个写入方。
+   *    让后台事件（run 收尾 → loadRuns → syncComposer）去强行折叠它，会把焦点
+   *    正在 `#rubric-input` 里的用户直接踢回 body。
+   * ② 不改 checkbox 的 checked：这一组在续跑里根本不进请求体，清掉反而毁了
+   *    用户为下一次新建准备好的设置。禁用 + 一句说明比篡改用户的值诚实。
+   */
+  const knobs = [
+    q("#verify-toggle"),
+    ...(q("#run-knobs") ? q("#run-knobs").querySelectorAll("input, select, textarea, button") : []),
+  ].filter(Boolean);
+  const active = root.activeElement ?? document.activeElement;
+  for (const el of knobs) setAttr(el, "disabled", mode.optionsEnabled ? null : "");
+  // 禁用一个正被聚焦的控件会让焦点掉回 body（后续按键全丢）。把它交还给输入框。
+  if (!mode.optionsEnabled && active && knobs.includes(active) && input?.focus) input.focus();
+}
+
+/**
+ * 传输层断了，还是服务端正常收流了？
+ *
+ * 委托方截图里，一个状态是**已完成**的运行顶上挂着「连接中断，正在重连…」。
+ * 根因是 EventSource 这一层**分辨不了**这两件事：服务端推完 run_end 就
+ * `res.end()`，浏览器收到 FIN 派发的同样是 `error`、readyState 同样是
+ * CONNECTING。而 run_end 那条 message 还在 batcher 队列里（一帧之后才 flush），
+ * 所以顺序被结构性地固定成"先 error 挂横幅、后 flush 才 close"——前端永远
+ * 抢不到前面。**必现，不是竞态。**
+ *
+ * 既然传输层分不了，就用 harness 事实去分：两边任一说这个 run 已经结束，
+ * 就不是断线。（从侧栏点开一条历史运行同样走这条路——那时本地状态还是
+ * `createInitialState` 的默认 "running"，只有服务端列表说得出真话。）
+ */
+export function shouldShowReconnecting({ info, localStatus } = {}) {
+  if (localStatus === "done") return false;
+  if (info && info.status === "done") return false;
+  return true;
+}
+
 /**
  * 需要人介入的事项——ActionRail 的唯一数据源。
  *
@@ -2261,6 +2488,10 @@ function patchTabContent(parts, state, activeTab, overview, logEntries, callback
     container.__patchNodes = undefined;
     container.__tab = activeTab;
     parts.sig.tabBody = null;
+    // 对话视图的签名也要一起作废。漏掉它的后果是：切走再切回 Loop 面时
+    // `.chat-view` 已被上面这行重建成空 div，而 patchLoopView 看签名没变
+    // 直接提前 return——整段对话白屏，且没有任何报错。
+    parts.sig.chat = null;
     if (activeTab === "loop") {
       // V-23：同一段执行的两种读法。事件流是"它做了什么"（逐工具、逐结果），
       // 对话是"它当时在想什么"（user/assistant/tool 往返）。两者信息量不同，
@@ -2693,55 +2924,17 @@ function patchLoopView(parts, container, state, logEntries, callbacks) {
     return;
   }
 
-  const canContinue = Boolean(callbacks.canContinue) && state.status !== "running";
+  // 对话视图现在只剩正史——追加框已经并进底栏那个共用的 composer。
+  // 签名里也随之去掉 canContinue/followUpError，顺手消掉"一条错误就把整段
+  // 对话重画一遍"这个噪音源。
   const sig = signature([
     callbacks.transcript ? callbacks.transcript.segments.length : -1,
-    state.lastSeq, canContinue, callbacks.followUpError ?? "",
+    state.lastSeq,
   ]);
   if (parts.sig.chat === sig) return;
   parts.sig.chat = sig;
 
-  chatHost.innerHTML =
-    renderConversation(callbacks.transcript, state) +
-    renderFollowUpComposer(canContinue, callbacks);
-
-  const input = chatHost.querySelector(".followup-input");
-  const send = chatHost.querySelector(".followup-send");
-  if (input && send) {
-    const submit = () => {
-      const text = input.value.trim();
-      if (text) callbacks.onFollowUp?.(text);
-    };
-    send.addEventListener("click", submit);
-    // Ctrl/Cmd+Enter 发送——单独 Enter 留给换行，多行指令是常态
-    input.addEventListener("keydown", (e) => {
-      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
-        e.preventDefault();
-        submit();
-      }
-    });
-  }
-}
-
-/** @returns {string} */
-function renderFollowUpComposer(canContinue, callbacks) {
-  if (!canContinue) {
-    const why = callbacks.followUpBlockedReason;
-    return why ? `<p class="empty-note followup-blocked">${esc(why)}</p>` : "";
-  }
-  const err = callbacks.followUpError
-    ? `<p class="inline-error" role="alert">${esc(callbacks.followUpError)}</p>`
-    : "";
-  return (
-    '<div class="followup">' +
-    '<label class="sr-only" for="followup-input">追加指令</label>' +
-    '<textarea id="followup-input" class="followup-input" rows="2" placeholder="追加一条指令，接着这次会话继续…"></textarea>' +
-    '<div class="followup-actions">' +
-    '<button type="button" class="btn btn--primary followup-send">继续对话</button>' +
-    // 轮次预算每轮重新起算，不说清楚用户会以为 maxTurns 是整场对话的总额
-    '<span class="knob-hint">Ctrl+Enter 发送 · 轮次预算每轮重新起算</span>' +
-    "</div>" + err + "</div>"
-  );
+  chatHost.innerHTML = renderConversation(callbacks.transcript, state);
 }
 
 /**

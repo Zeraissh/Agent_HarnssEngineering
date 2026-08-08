@@ -500,38 +500,6 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
 .role-toggles { display: flex; flex-direction: column; gap: var(--space-xs); }
 .role-toggles .checkbox-label { font-size: var(--font-md); }
 
-/* --- 追加指令（V-28）--- */
-.followup {
-  margin-top: var(--space-lg);
-  padding-top: var(--space-md);
-  border-top: 1px dashed var(--border-2);
-}
-
-.followup-input {
-  width: 100%;
-  border: 1px solid var(--border-1);
-  border-radius: var(--radius-sm);
-  background: var(--surface-0);
-  color: var(--text-1);
-  font: inherit;
-  font-size: var(--font-lg);
-  padding: var(--space-sm);
-  resize: vertical;
-}
-
-.followup-actions {
-  display: flex;
-  align-items: center;
-  gap: var(--space-md);
-  margin-top: var(--space-sm);
-}
-
-.followup-blocked {
-  margin-top: var(--space-lg);
-  padding-top: var(--space-md);
-  border-top: 1px dashed var(--border-2);
-}
-
 /* --- 提交栏旋钮 --- */
 .btn--ghost {
   background: transparent;
@@ -1825,3 +1793,38 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
 /* 宽表自己横滚，不撑破布局（与 .md-code 同款纪律） */
 .md .md-table-wrap { overflow-x: auto; margin: 0 0 8px; }
 .md .md-table-wrap .md-table { margin: 0; }
+
+/* ===== 统一 composer：模式说明行 + 禁用态 ===== */
+/* 说明行独占一行——底栏是 flex-wrap，不给 100% 它会挤进控件行 */
+.composer-note {
+  flex-basis: 100%;
+  margin: 0;
+}
+
+/**
+ * 禁用态必须**看得出来**。
+ *
+ * 此前整份样式表里一条 `:disabled` 都没有，而 `.btn` 无条件写了
+ * `cursor:pointer`、`:hover` 也照常命中——于是一个 disabled 的按钮长得、
+ * 摸上去都和能点的一模一样。本次把「禁用而不是隐藏」当成两个模式的主要
+ * 可见承载，这条就从"缺个样式"升级成"在骗人"。
+ */
+.btn:disabled,
+.submit-bar input:disabled,
+.submit-bar select:disabled,
+.submit-bar textarea:disabled,
+.run-knobs input:disabled,
+.run-knobs select:disabled,
+.run-knobs textarea:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.btn:disabled:hover { background: inherit; }
+/* 被禁用的旋钮连同它的标签一起变淡，否则只有控件灰、说明文字照常鲜明 */
+.run-knobs:has(select:disabled) .knob > label,
+.run-knobs:has(input:disabled) .knob > label { opacity: 0.7; }
+
+/* 追加模式：底栏左侧一道标识色，提醒"这一下是发给当前这次运行的" */
+.submit-bar[data-mode="append"] {
+  border-left: 3px solid var(--accent);
+}

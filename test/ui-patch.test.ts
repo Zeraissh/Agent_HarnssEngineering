@@ -25,6 +25,7 @@ import {
   appendOnly,
   keepScrollAnchored,
   createBatcher,
+  shouldShowReconnecting,
 } from "../ui/public/app.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -774,5 +775,72 @@ describe("需你决定：钉在输入框上方的固定坞", () => {
     const card = document.querySelector(".approval-card")!;
     expect(dock().contains(card)).toBe(true);
     expect(document.getElementById("main-area")!.contains(card)).toBe(false);
+  });
+});
+
+// ================================================================
+// 换标签再切回：对话视图不许白屏
+// ================================================================
+
+describe("换标签重建时对话视图的签名要一起作废", () => {
+  const transcript = {
+    segments: [{
+      index: 0, source: "main",
+      messages: [
+        { role: "user", content: "记住暗号 alpha-7" },
+        { role: "assistant", content: [{ type: "text", text: "记住了。" }] },
+      ],
+    }],
+  };
+
+  function doneState() {
+    let s = createInitialState("run-chat", "记住暗号", false);
+    s = reduceEvents(s, [
+      sse(0, "main", "turn_start", { turn: 1 }),
+      sse(1, "main", "done", { stopReason: "completed", usage: { turns: 1 } }),
+    ]);
+    return s;
+  }
+
+  /**
+   * 换标签时 `.tab-content` 整体重建，`.chat-view` 变成空 div；若只清
+   * `sig.tabBody` 而漏了 `sig.chat`，patchLoopView 看签名没变直接提前 return，
+   * 于是**整段对话白屏，且没有任何报错**。
+   */
+  it("loop → tools → loop 之后对话内容还在", () => {
+    const s = doneState();
+    const opts = { harness: null, loopView: "chat", transcript } as any;
+    renderRunDetail(s, { ...opts, activeTab: "loop" });
+    expect(document.querySelector(".chat-view")!.textContent).toContain("记住了");
+
+    renderRunDetail(s, { ...opts, activeTab: "tools" });
+    renderRunDetail(s, { ...opts, activeTab: "loop" });
+    expect(
+      document.querySelector(".chat-view")!.textContent,
+      "换标签再切回，对话整段消失了",
+    ).toContain("记住了");
+  });
+});
+
+// ================================================================
+// 重连横幅：正常收尾不是断线
+// ================================================================
+
+describe("shouldShowReconnecting：分辨正常收流与真断线", () => {
+  it("服务端列表说已完成 → 不报断线（点开历史运行走的就是这条）", () => {
+    // 本地 status 此刻还是 createInitialState 的默认 "running"——那不是观测
+    expect(shouldShowReconnecting({ info: { status: "done" }, localStatus: "running" })).toBe(false);
+  });
+
+  it("本地已收到 run_end → 不报断线（列表还没刷新时走这条）", () => {
+    expect(shouldShowReconnecting({ info: { status: "running" }, localStatus: "done" })).toBe(false);
+  });
+
+  it("两边都说在跑 → 这才是真断线", () => {
+    expect(shouldShowReconnecting({ info: { status: "running" }, localStatus: "running" })).toBe(true);
+  });
+
+  it("什么都不知道时按断线处理——宁可多提示一次，也不要静默失联", () => {
+    expect(shouldShowReconnecting({})).toBe(true);
   });
 });
