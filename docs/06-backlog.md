@@ -48,9 +48,35 @@
 
 ### B. 已确诊、可直接动手
 
-**B1. 终止原因的口径三处不一致。**
-`docs/03-interfaces.md` 列五值、`src/types.ts` 列七值（上一轮加了 `aborted`）、
-而 `classifyStopReason` 实判**八个**具名值。三处都在被引用。
+**B0.（新，独立核对发现）planner 从来没拿到 verifier 拿到的那三项修复。**
+9.1（预算按域可覆盖）、9.7（撞预算后收口续跑）、9.2（兜底裁决带过程摘要）
+三件事都只做在 **verifier** 上。三角编排的第三个角色 **planner 一件都没有**：
+- `src/planner.ts:140` 与 `:291` 两处**各写死** `Math.min(cfg.maxTurns ?? 50, 12)`
+  ——包与 env 都覆盖不了，还会把 `presets.ts` 里声明的 25~40 轮护栏一律夹到 12；
+- 全文件 `runContinuation` **零命中**：撞满预算就是半截工具调用 + 空文本
+  → `runPlanner` 直接 fail-closed，整场拆解连同已取到的探索证据一起作废；
+- `src/planner.ts:289` 的 `drain` 只返回 `{ text, usage }`，
+  `stopReason` 与 `messages` **在这一层就被丢掉了**——不扩它，后面哪一项都做不了。
+
+失效形态与 9.7 修前的 verifier **逐字相同**，而 planner 的预算（12）比
+verifier 修前（15）还紧，撞上的概率更高；案例 #8 正是由 planner 拆的跨域任务。
+更麻烦的是 `test/planner.test.ts` 里有一条测试把**修前语义钉死了**
+（"空输出 → 不重问，无计划（fail-closed）"）——等于给这个缺口上了一道绿锁。
+
+→ **第一步**：先把 `drain` 的返回值扩成 `{ text, usage, stopReason, messages }`
+（这是前置，不扩后面都做不了）；再照 `src/verifier.ts:145` 那个分支的形状加
+`stopReason === "max_turns"` 的收口续跑；预算那条单独走——把两处 `12` 提成
+常量并接 `DomainPack`，与 9.1 的 env > 包 > 默认 三级同构。
+改完记得改那条钉死旧语义的测试。
+
+**B1. 终止原因的口径三处不一致：5 / 7 / 9。**
+`docs/03-interfaces.md:170` 列 **5** 值、`src/types.ts` 列 **7** 值、
+而 `ui/public/app.js` 的 `classifyStopReason` 实判 **9** 个具名值
+（多 `max_tokens` / `plan_rejected` / `plan_gate_expired`）。三处都在被引用。
+**另有一处直接矛盾**：`docs/03-interfaces.md:182` 仍写"abort 触发时循环以
+`stopReason="error"` 结束"，而 `aborted` 已经分出去了。
+（顺带：交接页初稿把它写成"八值"——那是 `aborted` 上线**之前**的数。
+每加一个值就再漂一次，这条本身就是"写死的计数会过期"的活标本。）
 → **第一步**：以 `ui/public/app.js` 的 `classifyStopReason` 为准回填 types 与 docs，
 并加一条"三处枚举必须逐值一致"的锁——否则下次加一个值又会漂开。
 界面文案已先行避险（不写具体数目，有回归锁挡着）。
@@ -66,12 +92,33 @@
 ContextManager 的水位记忆。**不能恢复也要说清楚**，否则重启后界面上那个
 「继续对话」按钮就是骗人的。
 
+**B2b. 本文件自己有三处在说谎（读的时候当心）。**
+§9.2 / §9.7 / §9.8 的**原始条目仍写成未做**，而代码里三件都已落地
+（`describeAbortedVerification`、`VERIFIER_WRAPUP_MAX_TURNS` + 收口续跑、
+`SEGMENT_RESUME_NUDGE` 段级续跑）；实施记录写在后面的 §10/§11，
+前面的条目没回头标注。**从上往下读会把三件已完成的事当成待办重做一遍。**
+同类还有：`ui/server.ts:344` 这个行号已漂到 `:438`。
+→ **第一步**（顺手做，五分钟）：给 §9.2/§9.7/§9.8 补"✅ 已实施，见第十一节"，
+更正那个行号。这正是 case-07 §六 那条教训的同族——**承载物变了，旧记录还在原地绿着**。
+
 **B3. AC2-11 的量化只覆盖了日志面。**
 上一轮量了长日志的单帧成本并用 `content-visibility` 把预算线从 ~1400 条推到
 ~4200 条。**其余几个面没量过**（Context 的逐轮表、Tools 的工具芯片、
 编排的甘特）。
 → **第一步**：照 `ui-patch.test.ts` 里那套办法（真机 `performance.now()` 逐面对照，
 先关掉动画再量），找有没有第二处悬崖。
+
+### B-其它（早就在本文件后面的章节里，交接页初稿漏了）
+
+- **§2.2 的第二现场**：`parseVerdict`（`src/verifier.ts:481`）与 `parsePlan`
+  （`src/planner.ts:379`）仍是手写字段校验。工具入参那一侧已建成校验器可复用，
+  但**方向相反**：工具入参是"违反就拒绝"，裁决是"缺字段时如何降级"。
+  → 先定降级语义（大概率都该降成 `unverified` 而不是 `failed`）再谈复用。
+- **§3.2 无模型降级**：零实现。钩子位置现成——`src/orchestrate.ts:141` 那个
+  续跑 while 循环，`resumesLeft` 用完后换备用模型再续一次。
+  → 先看 `npm run ledger` 里 error 类 stopReason 的频率，**有需求再做**（P2 按需晋升）。
+- **§5.2 需求澄清（ask_user）**：零实现。卡在判据不是实现——"什么时候该问、
+  问几个"，做过头比不问更糟。→ 照 §5.1 计划确认门的四个设计决定各写一条再动手。
 
 ### C. 研究线
 
