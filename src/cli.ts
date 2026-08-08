@@ -48,6 +48,7 @@ import { AgentLoop } from "./loop.js";
 import { connectMcpServers, loadMcpConfig } from "./mcp.js";
 import { createMemoryTools, MemoryStore } from "./memory.js";
 import { AUTO_CONCURRENCY_CAP, planParallelWidth, runPlanned, runVerified } from "./orchestrate.js";
+import type { VerifyOutcome } from "./verifier.js";
 import { getPack, PACKS, RULE_PRECEDENCE_DISCIPLINE, selectPackTools } from "./presets.js";
 import { routeToPack } from "./router.js";
 import { createModelClientFromEnv } from "./provider.js";
@@ -56,6 +57,7 @@ import { createDescribeImageTool } from "./tools/describe-image.js";
 import { fetchUrlTool } from "./tools/fetch-url.js";
 import { readFileTool } from "./tools/read-file.js";
 import { writeFileTool } from "./tools/write-file.js";
+import { appendRunLedger, buildLedgerEntry, tallyToolCall, type ToolTally } from "./ledger.js";
 import { EFFORT_LEVELS } from "./types.js";
 import type { AgentConfig, Effort, TurnEvent } from "./types.js";
 
@@ -370,6 +372,36 @@ async function main(): Promise<void> {
     }
   };
 
+  /**
+   * L6 运行台账：三条执行路径（编排 / 带核查 / 裸跑）共用同一份计数器。
+   *
+   * 为什么 CLI 也要记：§2.1 要量的是**模型吐不吐得出可解析的裁决**，那是模型
+   * 行为，两个宿主上是同一件事；而 9.9 那个 verifier 调 write_memory 的现象
+   * **只有 CLI + 领域包这条路能产生**（Web 宿主根本没接 MemoryStore）。
+   * 只记 Web 侧，等于把唯一能出证据的那条路排除在外。
+   */
+  const ledgerTally: ToolTally = {};
+  let ledgerHitBudget = false;
+  /** 三条路径各自把收尾事实归一到这里，最后统一写一行 */
+  let ledgerFacts: {
+    stopReason: string | null;
+    turns: number | null;
+    reworks: number | null;
+    finalPassed: boolean | null;
+    verifications: VerifyOutcome[];
+  } | null = null;
+  const ledgerStartedAt = Date.now();
+  const noteForLedger = (source: string, event: TurnEvent): void => {
+    if (event.type === "tool_call") tallyToolCall(ledgerTally, source, event.name);
+    if (
+      event.type === "done" &&
+      source.includes("verifier") &&
+      event.result.stopReason === "max_turns"
+    ) {
+      ledgerHitBudget = true;
+    }
+  };
+
   if (withPlan) {
     // 三角编排：planner 拆解 → 逐子任务(执行→核查→返工) → 交接下游
     const builtinPool = [bashTool, fetchUrlTool, readFileTool, writeFileTool, ...(visionTool ? [visionTool] : [])];
@@ -495,6 +527,7 @@ async function main(): Promise<void> {
         };
       },
       onEvent: async (source, event) => {
+        noteForLedger(source, event);
         if (effectiveConcurrency > 1 && source !== "planner") {
           await renderParallelEvent(source, event);
           return;
@@ -542,6 +575,15 @@ async function main(): Promise<void> {
         }
       }
       const serialMs = outcome.steps.reduce((acc, s) => acc + s.durationMs, 0);
+      ledgerFacts = {
+        stopReason: outcome.completed ? "completed" : String(outcome.planOutcome),
+        // 编排下 turns 取各子任务执行轮次之和：单看某一步没有意义
+        turns: outcome.steps.reduce((n, st) => n + st.result.executionUsage.turns, 0),
+        reworks: outcome.steps.reduce((n, st) => n + st.result.reworks, 0),
+        finalPassed: outcome.completed,
+        // 一次编排产生多次裁决——§2.1 的样本量正是这么攒起来的
+        verifications: outcome.steps.flatMap((st) => st.result.verifications),
+      };
       const wallNote = `全程 ${(totalWallMs / 1000).toFixed(1)}s，子任务阶段墙钟 ${(wallMs / 1000).toFixed(1)}s，子任务合计 ${(serialMs / 1000).toFixed(1)}s${effectiveConcurrency > 1 ? `，并行节省 ${Math.max(0, (serialMs - wallMs) / 1000).toFixed(1)}s` : ""}`;
       console.log(
         outcome.completed
@@ -559,6 +601,7 @@ async function main(): Promise<void> {
         ? { verifierModel: { client: verifierProvider.client, compat: verifierProvider.compat } }
         : {}),
       onEvent: async (source, event) => {
+        noteForLedger(source, event);
         if (source === "verifier") {
           renderVerifierEvent(event);
           return;
@@ -569,15 +612,60 @@ async function main(): Promise<void> {
         await renderEvent(event);
       },
     });
+    ledgerFacts = {
+      stopReason: outcome.main.stopReason,
+      turns: outcome.executionUsage.turns,
+      reworks: outcome.reworks,
+      finalPassed: outcome.finalPassed,
+      verifications: outcome.verifications,
+    };
     const tag = outcome.finalPassed ? c.green("✔ 核查通过") : c.red("✘ 核查未通过");
     console.log(`\n${tag}${outcome.reworks ? c.dim(`（返工 ${outcome.reworks} 轮）`) : ""}`);
     printVerdictSignal("  ", outcome.finalPassed, outcome.verifications.at(-1)?.verdict);
   } else {
     const loop = new AgentLoop(config, modelClient);
     for await (const event of loop.run(task)) {
+      noteForLedger("main", event);
+      if (event.type === "done") {
+        ledgerFacts = {
+          stopReason: event.result.stopReason,
+          turns: event.result.usage.turns,
+          reworks: null,
+          finalPassed: null,
+          verifications: [],
+        };
+      }
       await renderEvent(event);
     }
   }
+  /**
+   * L6 运行台账（fire-and-forget，永不影响本次运行）。
+   * 见 `src/ledger.ts` 顶部：这一行就是"等证据"能不能等到的全部区别。
+   */
+  void appendRunLedger(
+    buildLedgerEntry({
+      at: Date.now(),
+      runId: `cli-${ledgerStartedAt}`,
+      host: "cli",
+      task,
+      pack: pack?.name ?? null,
+      model: process.env.AGENT_MODEL ?? null,
+      effort: process.env.AGENT_EFFORT ?? null,
+      mode: withPlan ? "plan" : "single",
+      verify: withVerify || withPlan,
+      rubric: envRubric ?? pack?.verify.rubric ?? null,
+      stopReason: ledgerFacts?.stopReason ?? null,
+      turns: ledgerFacts?.turns ?? null,
+      reworks: ledgerFacts?.reworks ?? null,
+      finalPassed: ledgerFacts?.finalPassed ?? null,
+      verifications: ledgerFacts?.verifications ?? [],
+      verifierBudgetTurns: verifyMaxTurnsOf(pack) ?? null,
+      verifierHitBudget: ledgerHitBudget,
+      tools: ledgerTally,
+      durationMs: Date.now() - ledgerStartedAt,
+    }),
+  );
+
   rl?.close();
   await mcp?.close();
 

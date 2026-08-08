@@ -12,7 +12,8 @@
     "lab": "tsx eval/lab.ts",
     "smoke:local": "tsx eval/smoke-local.ts",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "ledger": "tsx eval/ledger-report.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.115.0",

@@ -27,6 +27,7 @@ import { createDescribeImageTool } from "../src/tools/describe-image.js";
 import { fetchUrlTool } from "../src/tools/fetch-url.js";
 import { readFileTool } from "../src/tools/read-file.js";
 import { writeFileTool } from "../src/tools/write-file.js";
+import { appendRunLedger, buildLedgerEntry, ledgerPath, tallyToolCall, type ToolTally } from "../src/ledger.js";
 import { EFFORT_LEVELS } from "../src/types.js";
 import type { ModelClient, TurnEvent, AgentConfig, Tool, Effort } from "../src/types.js";
 import type { Verdict } from "../src/verifier.js";
@@ -103,6 +104,14 @@ interface StoredRun {
    * 存在这里供 GET /api/runs/:id/transcript 按需拉。
    */
   transcript: { index: number; source: string; messages: unknown[] }[];
+  /**
+   * 按角色分的工具调用直方图（L6 运行台账）。
+   * 在事件旁路里逐条累加，而不是收尾时回扫 `run.events`——续跑会让
+   * 事件缓冲跨越多段，回扫容易把上一段的数重复计进来。
+   */
+  toolTally: ToolTally;
+  /** 核查是否撞过轮次上限（"预算不够"这个嫌疑要有据可查，见案例 #8 的三层归因） */
+  verifierHitBudget?: boolean;
   /** 本次运行的装配（V-24：可逐 run 覆盖，不再是进程级常量） */
   packName?: string;
   effort?: Effort;
@@ -196,6 +205,12 @@ export interface UiServerOptions {
   packName?: string;
   /** 测试注入：覆盖默认工具池 */
   tools?: Tool[];
+  /**
+   * L6 运行台账落点。缺省行为见 `ledgerFile` 的注释：
+   * **注入了 modelClient 就默认不记**（那是假模型的路径，记了就是假证据）。
+   * `false` = 显式关闭；字符串 = 指定文件。
+   */
+  ledger?: false | string;
 }
 
 export interface UiServerHandle {
@@ -294,6 +309,23 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   // F1: 缺省模型从环境变量读取，compat 取自 createModelClientFromEnv 返回值
   const resolved = createModelClientFromEnv(process.env.AGENT_MODEL ?? "claude-opus-4-8");
   const modelClient = options.modelClient ?? resolved.client;
+  /**
+   * L6 运行台账开关。**注入了 modelClient 就默认不记。**
+   *
+   * 这条不是洁癖，是仪器纪律：`options.modelClient` 是测试与脚本驱动的注入口，
+   * 那些运行用的是 FakeModelClient——它的裁决**永远可解析**。首次上线时忘了这条，
+   * 一跑测试套就往台账里灌了 86 条假运行、22 次裁决全是 `direct`，
+   * 正好会把 §2.1 的判据推向"关掉"。**用假模型的数去判模型行为，是最坏的一种假证据。**
+   * 显式传 `ledger` 可以覆盖（真机驱动脚本若注入 client 又想记账时用）。
+   */
+  const ledgerFile: string | null =
+    options.ledger === false
+      ? null
+      : typeof options.ledger === "string"
+        ? options.ledger
+        : options.modelClient
+          ? null
+          : ledgerPath();
   const envCompat = resolved.compat;
   // 在源头就归一：workdir 参与白名单比对、侧栏分组键、工具圈禁根三处，
   // 三处必须是同一个字符串形态。`D:/a/b` 与 `D:` 指同一个目录，
@@ -642,6 +674,15 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     };
     run.events.push(sseEvent);
 
+    // L6 运行台账：按角色累加工具调用。放在这里而不是收尾时回扫 run.events，
+    // 是因为续跑会让事件缓冲跨越多段，回扫容易把上一段的数重复计进来。
+    if (event.type === "tool_call") tallyToolCall(run.toolTally, source, event.name);
+    // 核查撞轮次上限要留痕：案例 #8 的三层归因里，"预算不够"是第二嫌疑，
+    // 而此前它只在日志里一闪而过，事后无从统计
+    if (event.type === "done" && isVerifierSource(source) && event.result.stopReason === "max_turns") {
+      run.verifierHitBudget = true;
+    }
+
     // F2: verifier 的 approval_request 不进 pendingApprovals（verifier 内部已自答）
     if (event.type === "approval_request" && !isVerifierSource(source)) {
       run.pendingApprovals.set(approvalId(event.toolUseId, seq), {
@@ -767,6 +808,40 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     run.sseClients.clear();
 
     broadcastLifecycle("run_finished", run);
+
+    /**
+     * L6 运行台账（fire-and-forget，永不影响本次运行）。
+     *
+     * 这一行就是 §2.1 与 9.9 "等证据"能不能等到的全部区别：在此之前
+     * `recovery` 只活在内存 Map 里，进程一重启样本归零。
+     */
+    if (ledgerFile) {
+      void appendRunLedger(
+        buildLedgerEntry({
+        at: run.finishedAt ?? Date.now(),
+        runId: run.id,
+        host: "web",
+        task: run.task,
+        pack: run.packName ?? pack?.name ?? null,
+        model: process.env.AGENT_MODEL ?? null,
+        effort: run.effort ?? null,
+        mode: run.mode ?? "single",
+        verify: run.verify,
+        rubric: run.rubric ?? null,
+        stopReason: endInfo.mainStopReason ?? null,
+        error: null,
+        turns: o?.executionUsage?.turns ?? null,
+        reworks: o?.reworks ?? null,
+        finalPassed: o?.finalPassed ?? null,
+        verifications: o?.verifications ?? [],
+        verifierBudgetTurns: verifyMaxTurnsOf(run.packName ? getPack(run.packName) : pack) ?? null,
+        verifierHitBudget: run.verifierHitBudget ?? false,
+          tools: run.toolTally,
+          durationMs: (run.finishedAt ?? Date.now()) - run.createdAt,
+        }),
+        ledgerFile,
+      );
+    }
   }
 
   /** 启动一次不带核查的运行 */
@@ -1605,6 +1680,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           segmentIndex: 0,
           transcript: [],
           conversationTurn: 1,
+          toolTally: {},
           ...(parsed.pack ? { packName: parsed.pack } : {}),
           ...(parsed.effort ? { effort: parsed.effort as Effort } : {}),
           ...(parsed.rubric ? { rubric: parsed.rubric } : {}),
