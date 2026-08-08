@@ -711,7 +711,19 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
   height: 36px;
   line-height: 1.4;
 }
-.submit-bar textarea:focus { outline: none; border-color: var(--accent); }
+/**
+ * 聚焦时换边框色是好的，但**不能顺手把焦点环也关掉**。
+ *
+ * AC2-18 真机复验抓到的：Tab 到任务输入框，`:focus-visible` 确实命中，
+ * 计算出来的 outline 却是 `none`——因为下面这条 `:focus` 比全局
+ * `:focus-visible` 更具体，把环压掉了。剩下的唯一信号是 1px 边框换个色，
+ * 对键盘用户来说这是焦点看不见。
+ *
+ * 正确写法是只对**鼠标聚焦**去环（`:focus:not(:focus-visible)`），
+ * 键盘聚焦照常有环。
+ */
+.submit-bar textarea:focus { border-color: var(--accent); }
+.submit-bar textarea:focus:not(:focus-visible) { outline: none; }
 
 .submit-bar label.checkbox-label {
   font-size: var(--font-sm);
@@ -923,7 +935,8 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
   padding: var(--space-xs) var(--space-sm);
   font-size: var(--font-sm);
 }
-.deny-reason:focus { outline: none; border-color: var(--red); }
+.deny-reason:focus { border-color: var(--red); }
+.deny-reason:focus:not(:focus-visible) { outline: none; }
 
 .approval-reason { font-size: var(--font-xs); color: var(--fg2); margin-top: var(--space-xs); }
 

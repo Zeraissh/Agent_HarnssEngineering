@@ -1715,3 +1715,38 @@ function resolveColor(value, vars) {
   v = v.replace(/\/\*.*?\*\//g, "").trim();
   return v;
 }
+
+/**
+ * AC2-18 真机复验抓到的：Tab 到任务输入框，`:focus-visible` 命中，
+ * 计算出来的 outline 却是 `none`——`.submit-bar textarea:focus` 比全局
+ * `:focus-visible` 更具体，把焦点环压掉了，只剩 1px 边框换个色。
+ * 对键盘用户来说这就是"焦点看不见"，AC-05 不通过。
+ *
+ * 换边框色本身没错，错的是**顺手把环也关了**。要去环只能对鼠标聚焦去
+ * （`:focus:not(:focus-visible)`）。
+ */
+describe("AC-05 焦点环不许被组件规则压掉", () => {
+  it("任何在 :focus 上写 outline:none 的规则，都必须限定 :not(:focus-visible)", () => {
+    const css = readFileSync(join(__dirname, "..", "ui", "public", "styles.css"), "utf-8");
+    const offenders: string[] = [];
+    // 逐条规则扫：选择器带 :focus 且声明里关了 outline
+    for (const m of css.matchAll(/([^{}]+)\{([^}]*)\}/g)) {
+      const sel = m[1].trim();
+      const body = m[2];
+      if (!/:focus\b/.test(sel)) continue;
+      if (!/outline\s*:\s*(none|0)\b/.test(body)) continue;
+      if (/:not\(\s*:focus-visible\s*\)/.test(sel)) continue; // 只对鼠标聚焦去环，合法
+      offenders.push(sel);
+    }
+    expect(offenders, `这些规则会让键盘焦点看不见：${offenders.join(" | ")}`).toEqual([]);
+  });
+
+  it("全局 :focus-visible 规则仍在，且真的画了一个环", () => {
+    const css = readFileSync(join(__dirname, "..", "ui", "public", "styles.css"), "utf-8");
+    // 选择器必须整行独占（前面只能是行首/注释结尾/上一条规则的 }），
+    // 否则会匹配到 `.foo :focus-visible` 这类后代选择器，测的就不是全局那条了
+    const rule = css.match(/(?:^|\}|\*\/)\s*:focus-visible\s*\{([^}]*)\}/);
+    expect(rule, "全局 :focus-visible 规则不见了").not.toBeNull();
+    expect(rule![1]).toMatch(/outline:\s*\d+px\s+solid/);
+  });
+});
