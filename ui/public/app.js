@@ -374,6 +374,8 @@ export function reduceEvent(state, sseEvent) {
         // reduceEvent 的投影分支、派生函数、渲染分支。
         verifierBudgetTurns: event.verifierBudgetTurns ?? null,
         verifierBudgetSource: event.verifierBudgetSource ?? null,
+        plannerBudgetTurns: event.plannerBudgetTurns ?? null,
+        plannerBudgetSource: event.plannerBudgetSource ?? null,
         guardrails: event.guardrails ?? null,
         tools: Array.isArray(event.tools) ? event.tools : [],
       },
@@ -934,6 +936,9 @@ export function derivePlanFace(state) {
     completed: result?.completed ?? null,
     planned: result ? result.planned !== false : null,
     plannerRaw: result?.plannerRaw ?? null,
+    // B0：区分"胡言乱语"与"探索没来得及收口"——两者的返工策略完全不同
+    plannerRecovery: result?.plannerRecovery ?? null,
+    plannerFailure: result?.plannerFailure ?? null,
     warnings: state.planWarnings,
     skipped: result?.skipped ?? [],
     // 计划确认门的审计记录（§5.1）。挂起态归 ActionRail（那是"需你现在决定"
@@ -2375,11 +2380,17 @@ export function deriveAssemblyBar(state, harness) {
 
   // 编排：计划确认门是"零副作用时刻"的唯一入口
   if (state.plan) {
+    // planner 预算不再是写死的 12（B0）：报数字必须带来源，口径同核查预算
+    const pb = cfg.plannerBudgetTurns ?? harness?.plannerBudgetTurns ?? null;
+    const pbSrc = cfg.plannerBudgetSource ?? harness?.plannerBudgetSource ?? null;
     push(
       "plan",
-      `编排 ${state.plan.subtasks?.length ?? 0} 步`,
+      `编排 ${state.plan.subtasks?.length ?? 0} 步${pb ? `·planner ${pb} 轮` : ""}`,
       "planner 先拆解成带依赖的子任务再调度，互不依赖的并发跑。" +
-        "配套的计划确认门挂在**第一个子任务发射之前**——那是整场运行里唯一一个否决它零副作用的时刻，过了就有东西被改了。",
+        "配套的计划确认门挂在**第一个子任务发射之前**——那是整场运行里唯一一个否决它零副作用的时刻，过了就有东西被改了。" +
+        (pb
+          ? `探索预算 ${pb} 轮（来源：${pbSrc === "env" ? "env 显式覆盖" : pbSrc === "pack" ? "领域包声明" : "默认值"}），与执行者护栏解耦；撞满会续跑一小段只许写计划的收口，仍无计划才 fail-closed。`
+          : ""),
     );
   }
 
@@ -3535,8 +3546,11 @@ function patchPlanBoard(parts, host, plan) {
   if (plan.planned === false) {
     // fail-closed：planner 产不出可解析计划时一个子任务都不执行。
     // 这不是"没结果"，是一个明确的结论，必须说清。
+    // B0 的过程摘要必须一并给出：「胡言乱语」与「探索没来得及收口」
+    // 在原始输出片段上长得一模一样，返工策略却完全不同。
     html += '<div class="callout callout--bad"><strong>planner 未能产出可解析计划</strong>' +
       "<p>整份计划作废，没有执行任何子任务（fail-closed）。下面是 planner 的原始输出片段。</p>" +
+      (plan.plannerFailure ? `<p>${esc(plan.plannerFailure)}</p>` : "") +
       (plan.plannerRaw ? `<pre class="chat-body">${esc(plan.plannerRaw)}</pre>` : "") +
       "</div>";
     host.innerHTML = html;

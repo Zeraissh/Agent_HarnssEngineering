@@ -1232,6 +1232,33 @@ describe("装配状态条", () => {
   });
 
   /**
+   * B0：planner 预算不再是写死的 12，plan 芯片必须报数字与来源。
+   * 这条同时锁 run_config 的白名单投影——plannerBudget* 两个字段若在
+   * reduceEvent 里被丢（新字段默认被丢，本轮已是第四次踩到这类坑），
+   * 芯片上就不会出现预算，本测试变红。
+   */
+  it("plan 芯片带 planner 预算，数字与来源都来自 run_config（B0）", () => {
+    let s = createInitialState("run-asm-plan", "任务", true);
+    s = reduceEvents(s, [
+      sse(0, "host", "run_config", {
+        pack: { name: "ts-coding" },
+        workdir: "D:/w",
+        guardrails: { maxTurns: 40 },
+        verifierBudgetTurns: 15,
+        plannerBudgetTurns: 30,
+        plannerBudgetSource: "pack",
+      }),
+      sse(1, "host", "plan", {
+        concurrency: 1,
+        subtasks: [{ id: "s1", title: "t", dependsOn: [], acceptance: [], description: "", pack: null }],
+      }),
+    ]);
+    const chip = deriveAssemblyBar(s, null).find((i) => i.key === "plan")!;
+    expect(chip.chip).toContain("planner 30 轮");
+    expect(chip.why).toContain("领域包声明");
+  });
+
+  /**
    * **每一句 why 都必须落在具体后果上**，不能是标语。
    * 判据：说清"不这样会发生什么"。写不出后果的项就不该占状态条的位置——
    * 本项目一贯反对标语（findings 全篇都是"判据 + 出处"的写法）。

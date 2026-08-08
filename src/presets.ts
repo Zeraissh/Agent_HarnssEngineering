@@ -73,6 +73,22 @@ export interface DomainPack {
     maxTurns?: number;
   };
   /**
+   * 计划配置（可选，backlog B0——9.1 的 planner 版）。
+   *
+   * planner 的探索预算此前是写死的 `Math.min(cfg.maxTurns ?? 50, 12)`，包与 env
+   * 都覆盖不了。现三级解析：`AGENT_PLAN_MAX_TURNS` > 包 > 默认 12（见
+   * `src/planner.ts` 的 resolvePlannerMaxTurns）。planner 面对整个包菜单，
+   * 取各包声明值的最大值。
+   *
+   * 刻意先不给任何包填数：verifier 的 30 是案例 #8 实测出来的（15 轮时已完成
+   * 5/6 条验收），planner 侧还没有等价证据——判据先写、数据后收，
+   * 需要时由实测驱动（不等式锁已就位：plan.maxTurns ≤ guardrails.maxTurns）。
+   */
+  plan?: {
+    /** planner 探索轮次预算（缺省 12，见 `src/planner.ts`） */
+    maxTurns?: number;
+  };
+  /**
    * 独占资源标签（调度器互斥用）：声明本包子任务在飞期间独占的全局单件
    * （探针/串口/某台设备）。并行编排里同标签子任务强制串行——真机域的
    * 无锁并发 = 抢探针事故（case-01 实录）。

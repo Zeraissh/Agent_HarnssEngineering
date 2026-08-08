@@ -10,6 +10,7 @@
  * 单元边界 = 上下文边界，每道交接都有信息损耗——能一次完成的不拆，
  * 只在【领域切换】或【产物交接】处切，且每个子任务必须带可程序化验收清单。
  */
+import type Anthropic from "@anthropic-ai/sdk";
 import { AgentLoop } from "./loop.js";
 import { sumUsage } from "./verifier.js";
 import type { DomainPack } from "./presets.js";
@@ -44,6 +45,18 @@ export interface Plan {
   subtasks: SubTask[];
 }
 
+/**
+ * 这次计划是怎么拿到的——镜像 verifier 的 `VerdictRecovery`（9.1/9.7/9.2 的
+ * planner 版，backlog B0）。独立声明而不复用那个类型：两者字面相同是巧合，
+ * 语义各自演化（如 planner 将来可能加 "host" 值），共享类型会把它们锁死在一起。
+ *
+ * - `direct`   首轮就是可解析计划——理想路径
+ * - `wrapup`   撞满预算没收口，靠续跑同一会话救回
+ * - `reformat` 产出了散文但不是 JSON，靠重问转写救回
+ * - `failed`   兜底都没救回，落 fail-closed（此时 failureSummary 带过程摘要）
+ */
+export type PlanRecovery = "direct" | "wrapup" | "reformat" | "failed";
+
 export interface PlanOutcome {
   /** undefined = 计划不可解析（fail-closed） */
   plan?: Plan;
@@ -52,6 +65,15 @@ export interface PlanOutcome {
   raw: string;
   /** 结构化协议下的分片清单（观测枚举稳定性用；freeform 协议无此项） */
   inventory?: ShardInventory;
+  /** 计划的获得路径。宿主注入计划（跳过 planner）时无此字段 */
+  recovery?: PlanRecovery;
+  /**
+   * 仅 fail-closed（plan=undefined 且 planner 真的跑过）时存在：拆解过程摘要——
+   * 跑了几轮、以什么原因终止、调了哪些工具、最后停在哪。没有它，宿主与委托方
+   * 只能看到"未能产出可解析计划"，无从区分"planner 胡言乱语"与"做了大量探索
+   * 没来得及收口"（案例 #8 里 verifier 的同款教训，9.2）。
+   */
+  failureSummary?: string;
 }
 
 // ————————— 结构化拆分协议（v1.1 拆分摇摆稳定化,强 planner 证伪后的规则杆） —————————
@@ -128,6 +150,153 @@ export function buildPlanFromInventory(task: string, inv: ShardInventory, rule: 
   return { subtasks };
 }
 
+/**
+ * planner 探索预算的缺省值。
+ *
+ * 此前是内联的 `Math.min(cfg.maxTurns ?? 50, 12)`——verifier 9.1 修前的同款失效：
+ * 包与 env 都覆盖不了，还把 presets 里 25~40 的执行者护栏一并夹到 12。
+ * 现与执行者的 maxTurns **解耦**（解耦的理由同 verifier：执行者被压到几轮时
+ * planner 不该跟着缩水到连一次探索都做不完），领域包用 `plan.maxTurns` 声明
+ * 自己需要多少，宿主用 `AGENT_PLAN_MAX_TURNS` 显式覆盖。
+ * "计划不该比执行贵"仍然成立——由 presets 测试锁不等式，不在运行时夹断。
+ */
+export const DEFAULT_PLANNER_MAX_TURNS = 12;
+
+/**
+ * 预算用尽后"收口续跑"的额外轮次上限（9.7 的 planner 版）。
+ * 刻意很小：这一步只允许写计划，不允许继续探索——大了就等于偷偷放宽调查预算。
+ */
+export const PLANNER_WRAPUP_MAX_TURNS = 2;
+
+/**
+ * 预算三级解析：显式（宿主从 env 传入）> 包 > 默认，同构 verifier 的 9.1。
+ *
+ * 与 verifier 的一处结构差异：核查预算逐子任务按【那个子任务的包】取，而 planner
+ * 面对的是整个菜单（packs 复数）——它还没拆，不知道任务落在哪个域。取声明值的
+ * **最大值**：菜单里有哪个域，就得装得下哪个域的拆解探索；预算是护栏不是配额，
+ * 取大只是允许、不强制烧掉。
+ */
+export function resolvePlannerMaxTurns(packs: DomainPack[], explicit?: number): number {
+  if (explicit !== undefined) return explicit;
+  const declared = packs
+    .map((p) => p.plan?.maxTurns)
+    .filter((n): n is number => n !== undefined);
+  if (declared.length > 0) return Math.max(...declared);
+  return DEFAULT_PLANNER_MAX_TURNS;
+}
+
+const PLANNER_READONLY_DENY =
+  "Planner is read-only. Explore with read-only means; do not modify anything.";
+
+/**
+ * 消费一段 planner 事件流。
+ *
+ * 收 `AsyncIterable<TurnEvent>` 而不是 (loop, prompt)，是为了让首轮 `run()` 与
+ * 预算用尽后的 `runContinuation()` 走同一条消费逻辑——只读审批拒答、事件透传、
+ * 过程统计三件事对两者都要一样（形状同 verifier 的 drainVerifierEvents）。
+ *
+ * 返回值里的 messages/stopReason/toolCalls 是收口续跑与失败摘要的原料：
+ * 续跑要正史，摘要要终止原因与工具统计。只返回 { text, usage } 的旧形状
+ * 正是 B0 三项缺口的共同前置。
+ */
+async function drainPlannerEvents(
+  events: AsyncIterable<TurnEvent>,
+  onEvent?: (event: TurnEvent) => void | Promise<void>,
+): Promise<{
+  text: string;
+  usage: AggregateUsage;
+  messages: unknown[];
+  stopReason: string | null;
+  turns: number;
+  toolCalls: string[];
+}> {
+  let text = "";
+  let usage: AggregateUsage | undefined;
+  let messages: unknown[] = [];
+  let stopReason: string | null = null;
+  const toolCalls: string[] = [];
+
+  for await (const event of events) {
+    await onEvent?.(event);
+    switch (event.type) {
+      case "assistant_text":
+        text = event.text; // 只留最后一条：契约要求最终消息为纯 JSON
+        break;
+      case "approval_request":
+        event.respond("deny", PLANNER_READONLY_DENY);
+        break;
+      case "tool_call":
+        toolCalls.push(event.name);
+        break;
+      case "done":
+        usage = event.result.usage;
+        messages = event.result.messages;
+        stopReason = event.result.stopReason;
+        break;
+      default:
+        break;
+    }
+  }
+
+  return { text, usage: usage!, messages, stopReason, turns: usage?.turns ?? 0, toolCalls };
+}
+
+/** 把没收口的拆解过程压成一句话，写进 fail-closed 结果的 failureSummary（9.2 同款） */
+function describeAbortedPlanning(
+  run: { turns: number; stopReason: string | null; toolCalls: string[] },
+  raw: string,
+): string {
+  const why =
+    run.stopReason === "max_turns"
+      ? `跑满 ${run.turns} 轮预算仍未收口`
+      : `在第 ${run.turns} 轮以 ${run.stopReason ?? "未知原因"} 终止`;
+
+  if (run.toolCalls.length === 0) {
+    return `拆解未产出可解析计划：${why}，且全程零工具调用——planner 很可能根本没有开展探索，不要据此认定任务不可拆解。`;
+  }
+  const tally = new Map<string, number>();
+  for (const n of run.toolCalls) tally.set(n, (tally.get(n) ?? 0) + 1);
+  const top = [...tally.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([n, c]) => `${n}×${c}`)
+    .join("、");
+  const tail = raw.trim() ? `最后一条消息片段：「${raw.trim().slice(0, 80)}」` : "最终消息为空（停在半截工具调用）";
+  return (
+    `拆解未产出可解析计划：${why}，期间发起 ${run.toolCalls.length} 次工具调用（${top}）。` +
+    `**这不等于任务不可拆解**——拆解过程本身没走完，可降级为单体执行或直接重试。${tail}`
+  );
+}
+
+/**
+ * 预算用尽时的收口提示（续跑同一会话，探索正史与工具返回都还在上下文里）。
+ *
+ * "拆分从保守"是关键：探索没做完时凭空猜拆分点，比不拆更糟——下游每个子任务
+ * 都会拿着一份编造的任务书开跑。单子任务计划是完全合法的兜底（编排层会把它
+ * 当单体执行调度），这与 fail-closed 相比保住了"计划可用"这个结果。
+ */
+function buildPlanWrapUpPrompt(turns: number): string {
+  return `你的拆解轮次预算已经用尽（已跑 ${turns} 轮）。**现在不要再调用任何工具**，就用你手里已有的信息把计划写出来。
+
+- 拆分从保守：探索没做完就少拆——把握不足时，输出【单个子任务、description 为完整任务原文】也是合法计划，宁可不拆也不要凭空猜测拆分点；
+- description 必须自包含（绝对路径、命令、约束写全）；acceptance 必须可被独立核查者逐条程序化验证；
+- 不得编造探索中未确认的细节（不存在的文件路径、未验证的命令）。
+
+你的回复必须只包含一个 JSON 对象（不要代码围栏、不要多余文字）：
+{"subtasks": [{"id": "s1", "title": "短标题", "pack": "包名或 null", "description": "自包含的任务书", "acceptance": ["验收点，每条一个字符串"], "dependsOn": ["依赖的子任务 id，无依赖填 []"]}]}`;
+}
+
+/** 结构化协议的收口提示：契约换成分片清单，其余纪律同上 */
+function buildInventoryWrapUpPrompt(turns: number): string {
+  return `你的枚举轮次预算已经用尽（已跑 ${turns} 轮）。**现在不要再调用任何工具**，就用你手里已有的信息把分片清单写出来。
+
+- 枚举从保守：探索没做完就少列——把握不足时，输出【单个分片、description 为完整任务原文】也是合法清单（拆不拆本来就不由你决定，由宿主规则判定）；
+- description 必须自包含；acceptance 必须可程序化核查；不得编造探索中未确认的细节。
+
+你的回复必须只包含一个 JSON 对象（不要代码围栏、不要多余文字）：
+{"shards": [{"id": "s1", "title": "短标题", "pack": "包名或 null", "description": "自包含任务书", "acceptance": ["验收点"], "estTurns": 2}]}`;
+}
+
 export async function runStructuredPlanner(
   cfg: AgentConfig,
   model: ModelClient,
@@ -135,47 +304,54 @@ export async function runStructuredPlanner(
   packs: DomainPack[],
   rule: SplitRule = DEFAULT_SPLIT_RULE,
   onEvent?: (event: TurnEvent) => void | Promise<void>,
+  opts?: { maxTurns?: number },
 ): Promise<PlanOutcome> {
-  const drain = async (prompt: string): Promise<{ text: string; usage: AggregateUsage }> => {
-    const loop = new AgentLoop({ ...cfg, maxTurns: Math.min(cfg.maxTurns ?? 50, 12) }, model);
-    let text = "";
-    let usage: AggregateUsage | undefined;
-    for await (const event of loop.run(prompt)) {
-      await onEvent?.(event);
-      switch (event.type) {
-        case "assistant_text":
-          text = event.text;
-          break;
-        case "approval_request":
-          event.respond("deny", "Planner is read-only. Explore with read-only means; do not modify anything.");
-          break;
-        case "done":
-          usage = event.result.usage;
-          break;
-        default:
-          break;
-      }
-    }
-    return { text, usage: usage! };
-  };
+  const plannerMaxTurns = resolvePlannerMaxTurns(packs, opts?.maxTurns);
+  const investigate = (prompt: string) =>
+    drainPlannerEvents(new AgentLoop({ ...cfg, maxTurns: plannerMaxTurns }, model).run(prompt), onEvent);
 
-  const first = await drain(buildInventoryPrompt(task, packs));
+  const first = await investigate(buildInventoryPrompt(task, packs));
   let inventory = parseShardInventory(first.text);
   let raw = first.text;
   let usage = first.usage;
+  let recovery: PlanRecovery = inventory ? "direct" : "failed";
 
+  // 兜底一（9.7 的 planner 版）：撞满预算时最终消息往往是半截工具调用、文本为空
+  // ——重问路径对它无能为力（无可转写内容），整场枚举连同探索证据一起作废。
+  // 正解是续跑同一会话：正史与工具返回都还在，只要求"别查了，现在写清单"。
+  if (!inventory && first.stopReason === "max_turns" && first.messages.length > 0) {
+    const wrapUp = await drainPlannerEvents(
+      new AgentLoop({ ...cfg, maxTurns: PLANNER_WRAPUP_MAX_TURNS }, model).runContinuation(
+        first.messages as Anthropic.MessageParam[],
+        buildInventoryWrapUpPrompt(first.turns),
+      ),
+      onEvent,
+    );
+    usage = sumUsage(usage, wrapUp.usage);
+    const concluded = parseShardInventory(wrapUp.text);
+    if (concluded) {
+      inventory = concluded;
+      raw = wrapUp.text;
+      recovery = "wrapup";
+    }
+  }
+
+  // 兜底二：重问一次（转写，不重新枚举）；空输出无可转写，直接 fail-closed
   if (!inventory && first.text.trim() !== "") {
-    const retry = await drain(buildInventoryReformatPrompt(first.text));
+    const retry = await investigate(buildInventoryReformatPrompt(first.text));
     usage = sumUsage(usage, retry.usage);
     const second = parseShardInventory(retry.text);
     if (second) {
       inventory = second;
       raw = retry.text;
+      recovery = "reformat";
     }
   }
 
-  if (!inventory) return { usage, raw };
-  return { plan: buildPlanFromInventory(task, inventory, rule), usage, raw, inventory };
+  if (!inventory) {
+    return { usage, raw, recovery: "failed", failureSummary: describeAbortedPlanning(first, raw) };
+  }
+  return { plan: buildPlanFromInventory(task, inventory, rule), usage, raw, inventory, recovery };
 }
 
 function buildInventoryPrompt(task: string, packs: DomainPack[]): string {
@@ -285,48 +461,54 @@ export async function runPlanner(
   task: string,
   packs: DomainPack[],
   onEvent?: (event: TurnEvent) => void | Promise<void>,
+  opts?: { maxTurns?: number },
 ): Promise<PlanOutcome> {
-  const drain = async (prompt: string): Promise<{ text: string; usage: AggregateUsage }> => {
-    // 计划不该比执行贵：探索预算收紧
-    const loop = new AgentLoop({ ...cfg, maxTurns: Math.min(cfg.maxTurns ?? 50, 12) }, model);
-    let text = "";
-    let usage: AggregateUsage | undefined;
-    for await (const event of loop.run(prompt)) {
-      await onEvent?.(event);
-      switch (event.type) {
-        case "assistant_text":
-          text = event.text;
-          break;
-        case "approval_request":
-          event.respond("deny", "Planner is read-only. Explore with read-only means; do not modify anything.");
-          break;
-        case "done":
-          usage = event.result.usage;
-          break;
-        default:
-          break;
-      }
-    }
-    return { text, usage: usage! };
-  };
+  const plannerMaxTurns = resolvePlannerMaxTurns(packs, opts?.maxTurns);
+  const investigate = (prompt: string) =>
+    drainPlannerEvents(new AgentLoop({ ...cfg, maxTurns: plannerMaxTurns }, model).run(prompt), onEvent);
 
-  const first = await drain(buildPlannerPrompt(task, packs));
+  const first = await investigate(buildPlannerPrompt(task, packs));
   let plan = parsePlan(first.text);
   let raw = first.text;
   let usage = first.usage;
+  let recovery: PlanRecovery = plan ? "direct" : "failed";
 
-  // 重问一次（转写，不重新规划）；空输出无可转写，直接 fail-closed
+  // 兜底一（9.7 的 planner 版）：撞满预算时最终消息往往是半截工具调用、文本为空
+  // ——重问路径对它无能为力（无可转写内容），整场拆解连同探索证据一起作废。
+  // 正解是续跑同一会话：正史与工具返回都还在，只要求"别查了，现在写计划"。
+  if (!plan && first.stopReason === "max_turns" && first.messages.length > 0) {
+    const wrapUp = await drainPlannerEvents(
+      new AgentLoop({ ...cfg, maxTurns: PLANNER_WRAPUP_MAX_TURNS }, model).runContinuation(
+        first.messages as Anthropic.MessageParam[],
+        buildPlanWrapUpPrompt(first.turns),
+      ),
+      onEvent,
+    );
+    usage = sumUsage(usage, wrapUp.usage);
+    const concluded = parsePlan(wrapUp.text);
+    if (concluded) {
+      plan = concluded;
+      raw = wrapUp.text;
+      recovery = "wrapup";
+    }
+  }
+
+  // 兜底二：重问一次（转写，不重新规划）；空输出无可转写，直接 fail-closed
   if (!plan && first.text.trim() !== "") {
-    const retry = await drain(buildReformatPrompt(first.text));
+    const retry = await investigate(buildReformatPrompt(first.text));
     usage = sumUsage(usage, retry.usage);
     const second = parsePlan(retry.text);
     if (second) {
       plan = second;
       raw = retry.text;
+      recovery = "reformat";
     }
   }
 
-  return { ...(plan ? { plan } : {}), usage, raw };
+  if (!plan) {
+    return { usage, raw, recovery: "failed", failureSummary: describeAbortedPlanning(first, raw) };
+  }
+  return { plan, usage, raw, recovery };
 }
 
 function buildPlannerPrompt(task: string, packs: DomainPack[]): string {

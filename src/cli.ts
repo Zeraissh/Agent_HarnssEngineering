@@ -33,6 +33,9 @@
  *   AGENT_VERIFY_MAX_TURNS 可选，核查者轮次预算（env > 包 verify.maxTurns > 默认 15）。
  *                       真机域每条验收要多次探针往返,15 装不下（案例 #8）;
  *                       非法值退出码 1,不静默降级
+ *   AGENT_PLAN_MAX_TURNS 可选，planner 探索轮次预算（env > 包 plan.maxTurns 取最大
+ *                       > 默认 12,见 B0——planner 面对整个包菜单,故取声明值最大）。
+ *                       非法值退出码 1,口径同 AGENT_VERIFY_MAX_TURNS
  *   AGENT_READ_ROOTS    可选，额外只读根（分号/路径分隔符分隔的绝对路径）：
  *                       read_file 可读取这些目录（写类工具不受益）。用于工作区外的
  *                       领域素材库（如 KiCad 官方符号/封装库）
@@ -291,6 +294,18 @@ async function main(): Promise<void> {
   const verifyMaxTurnsOf = (p?: { verify: { maxTurns?: number } }): number | undefined =>
     envVerifyMaxTurns ?? p?.verify.maxTurns;
 
+  /** planner 探索预算的显式覆盖（口径同 AGENT_VERIFY_MAX_TURNS：非法值当场退出） */
+  const envPlanMaxTurns = (() => {
+    const raw = process.env.AGENT_PLAN_MAX_TURNS;
+    if (raw === undefined || raw === "") return undefined;
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n < 1) {
+      console.error(c.red(`AGENT_PLAN_MAX_TURNS "${raw}" 无效：需为 ≥1 的整数`));
+      process.exit(1);
+    }
+    return n;
+  })();
+
   // 额外只读根：AGENT_READ_ROOTS（path.delimiter 分隔），read_file 专享
   const readRoots = (process.env.AGENT_READ_ROOTS ?? "")
     .split(path.delimiter)
@@ -483,6 +498,7 @@ async function main(): Promise<void> {
       packs: Object.values(PACKS),
       concurrency,
       plannerProtocol: planProtocol,
+      ...(envPlanMaxTurns !== undefined ? { planMaxTurns: envPlanMaxTurns } : {}),
       ...(plannerProvider
         ? { plannerModel: { client: plannerProvider.client, compat: plannerProvider.compat } }
         : {}),
@@ -564,6 +580,10 @@ async function main(): Promise<void> {
     console.log(c.cyan("\n═══ 三角编排结果 ═══"));
     if (!outcome.plan) {
       console.log(c.red(`✘ planner 未能产出可解析计划：${outcome.planOutcome.raw.slice(0, 200)}`));
+      // 9.2 的 planner 版：区分"胡言乱语"与"探索没来得及收口"，返工策略完全不同
+      if (outcome.planOutcome.failureSummary) {
+        console.log(c.yellow(`  ${outcome.planOutcome.failureSummary}`));
+      }
     } else {
       for (const sub of outcome.plan.subtasks) {
         const step = outcome.steps.find((s) => s.sub.id === sub.id);

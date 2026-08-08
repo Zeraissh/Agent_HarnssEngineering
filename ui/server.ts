@@ -21,6 +21,7 @@ import { createModelClientFromEnv, type ResolvedProvider } from "../src/provider
 import { getPack, selectPackTools, PACKS, type DomainPack } from "../src/presets.js";
 import { connectMcpServers, loadMcpConfig, type McpRuntime } from "../src/mcp.js";
 import { DEFAULT_VERIFIER_MAX_TURNS } from "../src/verifier.js";
+import { resolvePlannerMaxTurns } from "../src/planner.js";
 import type { Plan, SubTask } from "../src/planner.js";
 import type Anthropic from "@anthropic-ai/sdk";
 import { bashTool, SHELL_DESC } from "../src/tools/bash.js";
@@ -641,6 +642,25 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     return p?.verify.maxTurns;
   };
 
+  /**
+   * planner 探索预算：env > 包菜单声明取最大 > 默认 12（B0，口径同 src/cli.ts）。
+   * 与核查预算的一处结构差异：planner 的菜单是**全部包**（runPlanned 收
+   * Object.values(PACKS)），预算跟菜单走，与逐 run 选中的默认包无关。
+   */
+  const envPlanMaxTurns = (() => {
+    const raw = process.env.AGENT_PLAN_MAX_TURNS;
+    if (!raw) return undefined;
+    const n = Number(raw);
+    return Number.isInteger(n) && n >= 1 ? n : undefined;
+  })();
+  const plannerBudgetTurns = (): number => resolvePlannerMaxTurns(Object.values(PACKS), envPlanMaxTurns);
+  const plannerBudgetSource = (): "env" | "pack" | "default" =>
+    envPlanMaxTurns !== undefined
+      ? "env"
+      : Object.values(PACKS).some((p) => p.plan?.maxTurns !== undefined)
+        ? "pack"
+        : "default";
+
   function buildVerifyOptions(run?: StoredRun) {
     const runPack = run?.packName ? getPack(run.packName) : pack;
     // rubric 是任务属性，包只提供缺省：逐 run > env > 包（口径同 src/cli.ts）
@@ -1042,6 +1062,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       const outcome = await runPlanned(baseCfg, modelClient, run.task, {
         packs: Object.values(PACKS),
         concurrency,
+        ...(envPlanMaxTurns !== undefined ? { planMaxTurns: envPlanMaxTurns } : {}),
         ...(plannerRole && usePlanner
           ? { plannerModel: { client: plannerRole.provider.client, compat: plannerRole.provider.compat } }
           : {}),
@@ -1122,6 +1143,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         completed: outcome.completed,
         planned: Boolean(outcome.plan),
         plannerRaw: outcome.plan ? undefined : outcome.planOutcome.raw.slice(0, 400),
+        // B0：计划的获得路径与 fail-closed 过程摘要。没有摘要时，"planner 胡言
+        // 乱语"与"探索没来得及收口"在界面上长得一模一样，返工策略却完全不同
+        plannerRecovery: outcome.planOutcome.recovery ?? null,
+        ...(outcome.planOutcome.failureSummary
+          ? { plannerFailure: outcome.planOutcome.failureSummary }
+          : {}),
         plannerUsage: outcome.planOutcome.usage,
         ...(outcome.planOutcome.inventory ? { inventory: outcome.planOutcome.inventory } : {}),
         steps: outcome.steps.map((st) => ({
@@ -1311,6 +1338,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         : runPack?.verify.maxTurns !== undefined
           ? "pack"
           : "default",
+      // planner 预算同款（B0）：报数字必须带来源，否则无从判断"这是不是我要的值"
+      plannerBudgetTurns: plannerBudgetTurns(),
+      plannerBudgetSource: plannerBudgetSource(),
       workdir: cfg.workdir,
       roleModels: {
         executor: process.env.AGENT_MODEL ?? "claude-opus-4-8",
@@ -1388,6 +1418,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         : pack?.verify.maxTurns !== undefined
           ? "pack"
           : "default",
+      plannerBudgetTurns: plannerBudgetTurns(),
+      plannerBudgetSource: plannerBudgetSource(),
       pack: packView(pack),
       tools: tools.map((t) => ({
         name: t.name,

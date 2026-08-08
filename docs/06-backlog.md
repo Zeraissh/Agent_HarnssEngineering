@@ -3,6 +3,8 @@
 # 交接：从这里接着做（2026-08-08 收工）
 
 **HEAD** `8caed16`｜**758 单测 / 22 文件 + `tsc` 全绿**｜工作树干净。
+**本轮增量（2026-08-08 晚）**：B0 已实施——planner 补齐 9.1/9.7/9.2（详见 B 节 ✅ 条目），
+758 → 769 单测，七个变异全部被对应测试抓红。
 上一轮 24 个提交，主题是**委托方界面反馈四步**（对话主干化 → 产物清单 →
 装配状态条 → 低切换成本三件套），外加流式匀速放行、代码高亮、贴底跟随、
 `.env` 装载、L6 运行台账。
@@ -49,6 +51,28 @@
 ### B. 已确诊、可直接动手
 
 **B0.（新，独立核对发现）planner 从来没拿到 verifier 拿到的那三项修复。**
+**✅ 已实施（2026-08-08，769 单测全绿 + 七个变异全部被抓红）。** 落地与两条实施时才看清的事：
+
+- `drain` → `drainPlannerEvents`（镜像 `drainVerifierEvents`，run 与 runContinuation 共用）；
+  9.7 收口续跑（`PLANNER_WRAPUP_MAX_TURNS = 2`）+ 9.2 `failureSummary` 过程摘要，
+  freeform 与结构化协议两条路都接了；预算三级化 `AGENT_PLAN_MAX_TURNS` > 包
+  `plan.maxTurns` > 默认 12（`resolvePlannerMaxTurns`），与执行者 maxTurns 解耦。
+  宿主同提交接上：CLI 失败输出带摘要；Web 的 run_config/`/api/harness` 报
+  `plannerBudgetTurns`+来源、`plan_result` 带 `plannerRecovery`/`plannerFailure`、
+  plan 芯片与 Plan 面失败 callout 各有渲染锁。
+- **多包预算的设计点**（B0 原文没写，动手时定的）：verifier 逐子任务按那个子任务
+  的包取预算，planner 面对整个菜单（还没拆，不知道任务落在哪个域）——取声明值
+  **最大**。预算是护栏不是配额，取大只允许不强制。"计划不该比执行贵"改由不等式
+  测试锁（`plan.maxTurns ≤ guardrails.maxTurns`，且缺省 12 ≤ 全部包护栏），
+  不再运行时夹断。**没给任何包填数**：verifier 的 30 是案例 #8 实测出来的，
+  planner 侧还没有等价证据——机制先行，数字等实测。
+- **那条"钉死修前语义"的测试，实际比交接页写的细**：它的脚本是 `end_turn` 空输出
+  而非 `max_turns`，修后行为对该场景本来就该不变（模型自己收笔却没写东西，续跑
+  与重问都救不了）。所以不是改判据，是把标题收窄成"end_turn 空输出"并**新增**
+  `max_turns` 空输出 → 收口续跑的行为锁。核对交接页时值得记住：条目说"改那条
+  测试"，到了现场先看它到底钉的是哪半边。
+
+原始诊断（保留，作案发现场记录）：
 9.1（预算按域可覆盖）、9.7（撞预算后收口续跑）、9.2（兜底裁决带过程摘要）
 三件事都只做在 **verifier** 上。三角编排的第三个角色 **planner 一件都没有**：
 - `src/planner.ts:140` 与 `:291` 两处**各写死** `Math.min(cfg.maxTurns ?? 50, 12)`

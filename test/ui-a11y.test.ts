@@ -638,6 +638,27 @@ describe("编排面板", () => {
   });
 
   /**
+   * B0：fail-closed 的过程摘要必须渲染出来。「胡言乱语」与「探索没来得及收口」
+   * 在原始输出片段上长得一模一样，返工策略却完全不同——只给片段等于让人瞎猜。
+   */
+  it("planner 失败时给出过程摘要，不只是原始输出片段（B0）", () => {
+    let s = createInitialState("r", "t", true);
+    s = reduceEvent(s, { seq: 0, source: "host", event: { type: "plan", concurrency: 1, subtasks: [] } });
+    s = reduceEvent(s, {
+      seq: 1, source: "host",
+      event: {
+        type: "plan_result", planned: false, completed: false, plannerRaw: "……",
+        plannerRecovery: "failed",
+        plannerFailure: "拆解未产出可解析计划：跑满 12 轮预算仍未收口，期间发起 9 次工具调用（read_file×6、bash×3）。",
+        steps: [], skipped: [],
+      },
+    });
+    renderRunDetail(s, { activeTab: "loop", harness: FAKE_HARNESS });
+    openDrawer();
+    expect(document.querySelector(".plan-board")!.textContent).toContain("跑满 12 轮预算仍未收口");
+  });
+
+  /**
    * 判据没变（非编排运行不该出现子任务盘），**承载物变了**：计划盘从 Loop 面的
    * 下钻搬到了对话右栏，于是"隐藏"由整条右栏承担。锁跟着迁移，不是放宽。
    */

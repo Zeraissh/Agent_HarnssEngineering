@@ -1,9 +1,17 @@
 import { describe, expect, it } from "vitest";
 import type Anthropic from "@anthropic-ai/sdk";
-import { parsePlan, runPlanner } from "../src/planner.js";
+import {
+  DEFAULT_PLANNER_MAX_TURNS,
+  PLANNER_WRAPUP_MAX_TURNS,
+  parsePlan,
+  runPlanner,
+  runStructuredPlanner,
+} from "../src/planner.js";
 import { runPlanned } from "../src/orchestrate.js";
+import { PACKS } from "../src/presets.js";
+import type { DomainPack } from "../src/presets.js";
 import type { ModelClient, ModelRequest, ModelTurn } from "../src/types.js";
-import { fakeMessage, textBlock } from "./helpers.js";
+import { fakeMessage, makeTool, textBlock, toolUseBlock } from "./helpers.js";
 
 const baseConfig = {
   systemPrompt: "shared frozen system",
@@ -75,11 +83,166 @@ describe("runPlanner", () => {
     expect(outcome.usage.turns).toBe(2);
   });
 
-  it("空输出 → 不重问，无计划（fail-closed）", async () => {
+  /**
+   * 这条原来叫「空输出 → 不重问」，B0 之后判据收窄到 end_turn：模型自己
+   * 决定收笔却什么都没写，续跑与重问都救不了（无正史价值、无可转写内容）。
+   * max_turns 的空输出走的是另一条路——收口续跑（见下面的 B0 组测试）。
+   */
+  it("end_turn 空输出 → 不重问也不续跑，无计划（fail-closed）", async () => {
     const model = new ScriptedClient([fakeMessage([textBlock("")], "end_turn")]);
     const outcome = await runPlanner(baseConfig, model, "任务", []);
     expect(outcome.plan).toBeUndefined();
     expect(model.requests).toHaveLength(1);
+    expect(outcome.recovery).toBe("failed");
+    // 9.2 同款：零工具调用的失败要单独措辞——"根本没探索"与"探索没收口"是两种故障
+    expect(outcome.failureSummary).toContain("零工具调用");
+  });
+
+  it("recovery 标注获得路径：direct / reformat", async () => {
+    const direct = new ScriptedClient([fakeMessage([textBlock(PLAN_JSON)], "end_turn")]);
+    expect((await runPlanner(baseConfig, direct, "任务", [])).recovery).toBe("direct");
+
+    const prose = new ScriptedClient([
+      fakeMessage([textBlock("我把任务拆成两步")], "end_turn"),
+      fakeMessage([textBlock(PLAN_JSON)], "end_turn"),
+    ]);
+    expect((await runPlanner(baseConfig, prose, "任务", [])).recovery).toBe("reformat");
+  });
+});
+
+// ================================================================
+// B0：planner 探索预算三级化（9.1 的 planner 版）
+// ================================================================
+
+/** 永远只调工具、从不收口的模型——用来数 planner 到底被允许跑几轮 */
+class NeverConcludes implements ModelClient {
+  calls = 0;
+  send(_req: ModelRequest): Promise<ModelTurn> {
+    this.calls += 1;
+    const m = fakeMessage([toolUseBlock(`tu_${this.calls}`, "probe", {})], "tool_use");
+    return Promise.resolve({ message: m, stopReason: m.stop_reason, usage: m.usage });
+  }
+}
+
+const probeCfg = { ...baseConfig, tools: [makeTool({ name: "probe" })] };
+
+/** 最小领域包：只为声明 plan.maxTurns */
+function makePack(name: string, planMaxTurns?: number): DomainPack {
+  return {
+    name,
+    description: `pack ${name}`,
+    systemPrompt: "sp",
+    verify: { enabled: true, mode: "programmatic" },
+    ...(planMaxTurns !== undefined ? { plan: { maxTurns: planMaxTurns } } : {}),
+  };
+}
+
+describe("planner 探索预算（B0——9.1 的 planner 版）", () => {
+  it("缺省 12 轮，与执行者 maxTurns 解耦（修前是 Math.min(cfg.maxTurns ?? 50, 12) 夹断）", async () => {
+    const model = new NeverConcludes();
+    // 执行者被压到 2 轮也不该影响拆解预算——修前这里会被夹到 2
+    await runPlanner({ ...probeCfg, maxTurns: 2 }, model, "任务", []);
+    // 调查预算 + 收口续跑：撞满预算后还会续跑一小段专门写计划
+    expect(model.calls).toBe(DEFAULT_PLANNER_MAX_TURNS + PLANNER_WRAPUP_MAX_TURNS);
+  });
+
+  it("包声明 plan.maxTurns：菜单取最大——planner 还没拆，不知道任务落在哪个域", async () => {
+    const model = new NeverConcludes();
+    await runPlanner(probeCfg, model, "任务", [makePack("a", 4), makePack("b", 7), makePack("c")]);
+    expect(model.calls).toBe(7 + PLANNER_WRAPUP_MAX_TURNS);
+  });
+
+  it("显式覆盖压过包声明（env > 包 > 默认，宿主从 AGENT_PLAN_MAX_TURNS 传入）", async () => {
+    const model = new NeverConcludes();
+    await runPlanner(probeCfg, model, "任务", [makePack("a", 9)], undefined, { maxTurns: 3 });
+    expect(model.calls).toBe(3 + PLANNER_WRAPUP_MAX_TURNS);
+  });
+
+  it("包声明的 plan.maxTurns 不得高于该包自己的执行者护栏（计划不该比执行贵）", () => {
+    for (const p of Object.values(PACKS)) {
+      const executorCap = p.guardrails?.maxTurns;
+      if (p.plan?.maxTurns !== undefined && executorCap !== undefined) {
+        expect(p.plan.maxTurns, `${p.name} 的 plan.maxTurns 高于其执行者护栏`).toBeLessThanOrEqual(executorCap);
+      }
+      // 缺省值也受同一不等式约束：12 必须低于每个包的执行者护栏（25~40）
+      if (executorCap !== undefined) {
+        expect(DEFAULT_PLANNER_MAX_TURNS, `缺省拆解预算高于 ${p.name} 的执行者护栏`).toBeLessThanOrEqual(executorCap);
+      }
+    }
+  });
+});
+
+// ================================================================
+// B0：预算用尽的收口续跑 + fail-closed 带过程摘要（9.7/9.2 的 planner 版）
+// ================================================================
+
+describe("预算用尽后的收口（B0——9.7/9.2 的 planner 版）", () => {
+  /** 前 busy 次只调工具，之后按脚本走——同 verifier 测试的 busyThenScripted */
+  function busyThenScripted(busy: number, script: Anthropic.Message[]) {
+    let n = 0;
+    const requests: ModelRequest[] = [];
+    return {
+      requests,
+      send(req: ModelRequest): Promise<ModelTurn> {
+        requests.push(structuredClone(req));
+        n += 1;
+        const m =
+          n <= busy
+            ? fakeMessage([toolUseBlock(`tu_${n}`, "probe", {})], "tool_use")
+            : (script.shift() ?? fakeMessage([textBlock("")], "end_turn"));
+        return Promise.resolve({ message: m, stopReason: m.stop_reason, usage: m.usage });
+      },
+    } satisfies ModelClient & { requests: ModelRequest[] };
+  }
+
+  it("撞满预算 → 续跑同一会话收口，拿到计划（修前：整场拆解连同探索证据一起作废）", async () => {
+    const model = busyThenScripted(3, [fakeMessage([textBlock(PLAN_JSON)], "end_turn")]);
+    const outcome = await runPlanner(probeCfg, model, "任务", [], undefined, { maxTurns: 3 });
+    expect(outcome.plan, "收口续跑应当拿到计划").toBeDefined();
+    expect(outcome.recovery).toBe("wrapup");
+    // 续跑带上探索正史（不是从零重来），收口提示明说预算用尽
+    const wrapReq = model.requests[3]!;
+    expect(wrapReq.messages.length).toBeGreaterThan(1);
+    expect(JSON.stringify(wrapReq.messages.at(-1)!.content)).toContain("预算已经用尽");
+  });
+
+  it("结构化协议同款收口（契约换成分片清单）", async () => {
+    const model = busyThenScripted(2, [
+      fakeMessage(
+        [textBlock('{"shards": [{"id": "s1", "title": "整体", "pack": null, "description": "整体做完", "acceptance": ["ok"], "estTurns": 3}]}')],
+        "end_turn",
+      ),
+    ]);
+    const outcome = await runStructuredPlanner(probeCfg, model, "任务", [], undefined, undefined, { maxTurns: 2 });
+    expect(outcome.plan).toBeDefined();
+    expect(outcome.recovery).toBe("wrapup");
+    expect(JSON.stringify(model.requests[2]!.messages.at(-1)!.content)).toContain("分片清单");
+  });
+
+  it("兜底都没救回 → failureSummary 带轮数与工具分布（区分「胡言乱语」与「没来得及收口」）", async () => {
+    const model = new NeverConcludes(); // 收口续跑里也只调工具，救不回
+    const outcome = await runPlanner(probeCfg, model, "任务", [], undefined, { maxTurns: 3 });
+    expect(outcome.plan).toBeUndefined();
+    expect(outcome.recovery).toBe("failed");
+    expect(outcome.failureSummary).toContain("跑满 3 轮预算");
+    expect(outcome.failureSummary).toContain("probe");
+    expect(outcome.failureSummary).toContain("不等于任务不可拆解");
+  });
+
+  it("runPlanned 把 planMaxTurns 穿到 planner（行为断言：真的在那一轮收口）", async () => {
+    const passVerdict = () =>
+      fakeMessage([textBlock('{"passed": true, "issues": [], "summary": "ok"}')], "end_turn");
+    const model = busyThenScripted(2, [
+      fakeMessage([textBlock(PLAN_JSON)], "end_turn"), // 收口：两步计划
+      fakeMessage([textBlock("ELF 已构建")], "end_turn"), // s1 main
+      passVerdict(),
+      fakeMessage([textBlock("烧录完成")], "end_turn"), // s2 main
+      passVerdict(),
+    ]);
+    const outcome = await runPlanned(probeCfg, model, "整体任务", { planMaxTurns: 2 });
+    expect(outcome.plan).toBeDefined();
+    expect(JSON.stringify(model.requests[2]!.messages.at(-1)!.content)).toContain("预算已经用尽");
+    expect(outcome.completed).toBe(true);
   });
 });
 

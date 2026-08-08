@@ -189,11 +189,14 @@ export async function runPlanner(
   task: string,
   packs: DomainPack[],
   onEvent?: (event: TurnEvent) => void | Promise<void>,
+  opts?: { maxTurns?: number },   // 显式预算覆盖（宿主从 AGENT_PLAN_MAX_TURNS 传入）
 ): Promise<PlanOutcome>
 
 export function parsePlan(text: string): Plan | undefined
 
 export function validatePlanGraph(subtasks: SubTask[]): boolean
+
+export function resolvePlannerMaxTurns(packs: DomainPack[], explicit?: number): number
 
 export async function runStructuredPlanner(
   cfg: AgentConfig,
@@ -202,6 +205,7 @@ export async function runStructuredPlanner(
   packs: DomainPack[],
   rule: SplitRule = DEFAULT_SPLIT_RULE,
   onEvent?: (event: TurnEvent) => void | Promise<void>,
+  opts?: { maxTurns?: number },
 ): Promise<PlanOutcome>
 
 export function parseShardInventory(text: string): ShardInventory | undefined
@@ -215,7 +219,14 @@ export function buildPlanFromInventory(task: string, inv: ShardInventory, rule: 
 export const DEFAULT_SPLIT_RULE: SplitRule = { minShards: 2, minEstTurns: 1 };
 
 export const PLAN_PARSE_FAIL = "planner 输出无法解析为 JSON 计划";
+
+export const DEFAULT_PLANNER_MAX_TURNS = 12;   // 探索预算缺省（env > 包 plan.maxTurns 取最大 > 默认）
+export const PLANNER_WRAPUP_MAX_TURNS = 2;     // 收口续跑上限：只许写计划，不许继续探索
 ```
+
+`PlanOutcome` 另带 `recovery`（`direct | wrapup | reformat | failed`，计划的获得路径）与
+`failureSummary`（仅 fail-closed 时：轮数、终止原因、工具分布、最后停在哪——
+区分"胡言乱语"与"探索没来得及收口"）。
 
 ### 设计决策
 
@@ -223,7 +234,7 @@ export const PLAN_PARSE_FAIL = "planner 输出无法解析为 JSON 计划";
    单元边界 = 上下文边界，每道交接都有信息损耗。能一次完成的不拆，只在【领域切换】或【产物交接】处切。每个子任务必须带可程序化验收清单（具体的文件、数值、命令可获得的事实；不写"质量好/合理"这类不可验证的话）。
 
 2. **与 verifier 同款纪律**  
-   只读探索（approval 一律 deny），全新上下文；最终消息 = 纯 JSON 计划契约；宽容解析 + 解析失败重问一次转写；fail-closed——重问后仍不可解析 → 无计划（宿主决定放弃或降级为单体执行）。计划不该比执行贵：探索预算收紧至 `maxTurns = min(cfg.maxTurns, 12)`。
+   只读探索（approval 一律 deny），全新上下文；最终消息 = 纯 JSON 计划契约；宽容解析 + 兜底两级（B0，镜像 verifier 的 9.7/9.2）：撞满预算先**续跑同一会话收口**（正史与工具返回都在，只要求"别查了，现在写计划"，收口上限 2 轮），散文输出走重问转写；仍不可解析 → 无计划（fail-closed，`failureSummary` 带过程摘要，宿主决定放弃或降级为单体执行）。探索预算与执行者 `maxTurns` **解耦**，三级解析 env > 包 `plan.maxTurns`（菜单取最大——planner 还没拆，不知道任务落在哪个域）> 默认 12；"计划不该比执行贵"由 presets 不等式测试锁住（`plan.maxTurns ≤ guardrails.maxTurns`），不在运行时夹断。
 
 3. **v1.1 结构化拆分协议（强 planner 证伪后的规则杆）**  
    实测强 planner 无效——拆分摇摆是纪律歧义区的裁量问题而非能力问题。因此引入 `runStructuredPlanner`：planner 只枚举互不依赖的分片（事实清单），拆不拆由宿主 `SplitRule` 确定性判定，模型在决策点零裁量。

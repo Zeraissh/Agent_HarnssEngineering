@@ -333,6 +333,12 @@ export interface PlannedRunOptions {
   plannerProtocol?: "freeform" | "structured";
   /** structured 协议的拆分规则（默认 DEFAULT_SPLIT_RULE：分片≥2 即拆） */
   splitRule?: SplitRule;
+  /**
+   * planner 探索预算的显式覆盖（宿主从 AGENT_PLAN_MAX_TURNS 传入）。
+   * 缺省时 planner 按包菜单三级解析（包声明取最大 > 默认 12）——见
+   * `resolvePlannerMaxTurns`。opts.plan 存在时此项无效（planner 不运行）。
+   */
+  planMaxTurns?: number;
 }
 
 export interface PlannedStepResult {
@@ -383,10 +389,11 @@ export async function runPlanned(
         ? { ...baseCfg, compat: opts.plannerModel.compat }
         : baseCfg;
     const onPlannerEvent = (e: TurnEvent) => opts.onEvent?.("planner", e);
+    const plannerOpts = opts.planMaxTurns !== undefined ? { maxTurns: opts.planMaxTurns } : undefined;
     planOutcome =
       opts.plannerProtocol === "structured"
-        ? await runStructuredPlanner(plannerCfg, plannerClient, task, packs, opts.splitRule, onPlannerEvent)
-        : await runPlanner(plannerCfg, plannerClient, task, packs, onPlannerEvent);
+        ? await runStructuredPlanner(plannerCfg, plannerClient, task, packs, opts.splitRule, onPlannerEvent, plannerOpts)
+        : await runPlanner(plannerCfg, plannerClient, task, packs, onPlannerEvent, plannerOpts);
   }
   if (!planOutcome.plan) {
     return { planOutcome, steps: [], skipped: [], completed: false };

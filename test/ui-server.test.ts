@@ -1314,6 +1314,9 @@ describe("ui-server", () => {
     expect(snap.pack.verify.readOnlyCommands.length).toBeGreaterThan(0);
     expect(snap.pack.verify.mode).toBeTruthy();
     expect(snap.verifierBudgetTurns).toBe(15);
+    // planner 预算同款（B0）：数字 + 来源，缺一不可
+    expect(snap.plannerBudgetTurns).toBe(12);
+    expect(snap.plannerBudgetSource).toBe("default");
     expect(snap.compactWatermark).toBe(0.8);
     expect(Array.isArray(snap.tools)).toBe(true);
     expect(snap.tools.every((t: any) => t.name && t.permission)).toBe(true);
@@ -1579,6 +1582,7 @@ describe("ui-server", () => {
 
     const result = events.find((e: any) => e.event.type === "plan_result") as any;
     expect(result, "未发出 plan_result 事件").toBeDefined();
+    expect(result.event.plannerRecovery).toBe("direct"); // B0：计划获得路径随事件透出
     expect(result.event.steps.map((st: any) => st.id)).toEqual(["s1", "s2"]);
     // 每个数字都要有口径：子任务阶段墙钟排除 planner，节省是相对串行全序和
     for (const k of ["totalMs", "plannerMs", "subtaskWallMs", "stepSumMs", "savedMs"]) {
@@ -1612,6 +1616,10 @@ describe("ui-server", () => {
     expect(result.event.steps).toEqual([]);
     // 原始输出要留给人看——"为什么没拆"是可诊断的，不该只剩一个空结果
     expect(typeof result.event.plannerRaw).toBe("string");
+    // B0：fail-closed 必须带过程摘要，且零探索的失败要单独措辞——
+    // "根本没探索"与"探索没来得及收口"的返工策略完全不同
+    expect(result.event.plannerRecovery).toBe("failed");
+    expect(String(result.event.plannerFailure)).toContain("零工具调用");
     // 计划作废即一个子任务都不执行
     expect(events.some((e: any) => String(e.source).includes("/"))).toBe(false);
   });
