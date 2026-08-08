@@ -208,3 +208,68 @@ describe("Markdown 表格（模型极爱用，原样铺出来最难读）", () =
     expect([...host.querySelectorAll("p")].some((p) => p.textContent!.includes("结论"))).toBe(true);
   });
 });
+
+describe("代码高亮（委托方：用 VS 那种代码主题）", () => {
+  const code = (lang: string, body: string) =>
+    mount(renderMarkdown(["```" + lang, body, "```"].join("\n")));
+
+  it("关键字 / 字符串 / 数字 / 注释各自着色", () => {
+    const host = code("c", 'int n = 0x1F; // 采样\nconst char *s = "hi";');
+    expect(host.querySelector(".hl-kw")!.textContent).toBe("int");
+    expect(host.querySelector(".hl-num")!.textContent).toBe("0x1F");
+    expect(host.querySelector(".hl-comment")!.textContent).toContain("采样");
+    expect(host.querySelector(".hl-str")!.textContent).toContain("hi");
+  });
+
+  /**
+   * 优先级必须是 注释 > 字符串 > 数字 > 关键字。
+   * 反过来写就会在 `const url = "https://x"` 上把半行吃掉当注释——
+   * 这是这类实现最常见的 bug。
+   */
+  it("字符串里的 // 不算注释", () => {
+    const host = code("ts", 'const url = "https://example.com/a";');
+    expect(host.querySelector(".hl-comment"), "把 URL 里的 // 当成注释了").toBeNull();
+    expect(host.querySelector(".hl-str")!.textContent).toContain("https://example.com/a");
+  });
+
+  it("注释里的引号不开字符串", () => {
+    const host = code("py", '# 他说 "你好\nx = 1');
+    expect(host.querySelector(".hl-comment")!.textContent).toContain("你好");
+    expect(host.querySelector(".hl-str")).toBeNull();
+  });
+
+  it("认不出的语言原样输出——猜着高亮比不高亮更糟", () => {
+    const host = code("brainfuck", "+++[->+++<]");
+    expect(host.querySelector("[class^='hl-']")).toBeNull();
+    expect(host.textContent).toContain("+++[->+++<]");
+  });
+
+  it("语言角标进 data-lang，别名归一进 class", () => {
+    const host = code("TypeScript", "const a = 1;");
+    const pre = host.querySelector("pre")!;
+    expect(pre.getAttribute("data-lang")).toBe("TypeScript");
+    expect(pre.className).toContain("md-code--ts");
+  });
+
+  /**
+   * 高亮**在已转义文本上做**。它绝不能反转义——反转义等于把死文本变回活标签，
+   * 那是 markdown.js 整篇在防的事。这条同时覆盖"高亮不得引入 XSS"。
+   */
+  it("代码块里的 HTML 仍然不执行，且不被双重转义", () => {
+    const host = code("ts", 'const s = "<script>alert(1)</script>";');
+    expect(hasExecutableInjection(host)).toBe(false);
+    expect(host.querySelector("code")!.textContent).toContain("<script>alert(1)</script>");
+    expect(host.innerHTML, "出现了双重转义").not.toContain("&amp;lt;");
+  });
+
+  it("未闭合的字符串不吞掉后面整段（流式时半截代码很常见）", () => {
+    const host = code("ts", 'const a = "没闭合\nconst b = 2;');
+    expect(host.querySelectorAll(".hl-kw").length, "第二行的 const 被吞了").toBeGreaterThanOrEqual(2);
+  });
+
+  it("行内代码不受影响（只有围栏块高亮）", () => {
+    const host = mount(renderMarkdown("用 `const x = 1` 表示"));
+    expect(host.querySelector("code")!.textContent).toBe("const x = 1");
+    expect(host.querySelector(".hl-kw")).toBeNull();
+  });
+});

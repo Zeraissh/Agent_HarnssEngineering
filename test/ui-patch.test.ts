@@ -32,6 +32,7 @@ import {
   deriveRunListItems,
   deriveAssemblyBar,
   deriveScrollNav,
+  paceReveal,
   keepScrollAnchored,
   renderRunList,
   applyCollapseOverrides,
@@ -1398,5 +1399,61 @@ describe("对话贴底跟随", () => {
     const away = make(100); // 距底 500px，人在往上翻
     expect(keepScrollAnchored(away as any, () => { away.scrollHeight = 1200; })).toBe(false);
     expect(away.scrollTop, "人往上翻了就不该动他").toBe(100);
+  });
+});
+
+describe("paceReveal：把上游的一阵一阵摊成匀速", () => {
+  /**
+   * 委托方："有时候会卡住然后突然冒一长串。"
+   * 量下来**不是渲染慢**（长任务观测器录到 0 条），是上游本来就一阵一阵来：
+   * 一次 230 条增量里多数在同一毫秒到达，相邻两批最长静默 943ms。
+   * 所以修在"别把到达节奏当成显示节奏"。
+   */
+  it("一次突进不会一帧全糊上去", () => {
+    const next = paceReveal({ arrived: 300, revealed: 0, dtMs: 16 });
+    expect(next).toBeGreaterThan(0);
+    expect(next, "300 字一帧全放了，等于没做节流").toBeLessThan(300);
+  });
+
+  it("积压越多放得越快——否则长文会越拖越远", () => {
+    const small = paceReveal({ arrived: 50, revealed: 0, dtMs: 16 });
+    const big = paceReveal({ arrived: 5000, revealed: 0, dtMs: 16 });
+    expect(big).toBeGreaterThan(small);
+  });
+
+  /**
+   * 速度取自积压量 = 指数衰减，尾巴会拖。初版没有收尾闸，300 字突进 350ms
+   * 只走到 200 字，剩下那截慢慢爬——**正是这条测试把它抓出来的**。
+   * 现在加了剩不多了一次放完，实测：60 字 176ms / 300 字 352ms /
+   * 1200 字 512ms / 5000 字 672ms —— 越长的突进追得越快，但都在人可接受的范围内。
+   */
+  it("典型突进在 400ms 内追平，超长突进也不超过 1 秒", () => {
+    const catchUp = (burst: number) => {
+      let revealed = 0;
+      let t = 0;
+      while (revealed < burst && t < 5000) {
+        revealed = paceReveal({ arrived: burst, revealed, dtMs: 16 });
+        t += 16;
+      }
+      return t;
+    };
+    expect(catchUp(300)).toBeLessThanOrEqual(400);
+    expect(catchUp(5000)).toBeLessThanOrEqual(1000);
+  });
+
+  it("一轮结束时立刻全放——收尾必须是准的", () => {
+    expect(paceReveal({ arrived: 5000, revealed: 3, dtMs: 16, done: true })).toBe(5000);
+  });
+
+  it("没有积压就不动", () => {
+    expect(paceReveal({ arrived: 120, revealed: 120, dtMs: 16 })).toBe(120);
+  });
+
+  it("上游文本变短（换了一轮）时显示位置跟着回落，不会停在越界处", () => {
+    expect(paceReveal({ arrived: 10, revealed: 999, dtMs: 16 })).toBeLessThanOrEqual(10);
+  });
+
+  it("dt 为 0 也至少推进一个字——绝不卡死", () => {
+    expect(paceReveal({ arrived: 100, revealed: 0, dtMs: 0 })).toBeGreaterThan(0);
   });
 });

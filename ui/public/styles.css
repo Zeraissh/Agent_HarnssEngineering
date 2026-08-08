@@ -52,6 +52,12 @@
   --p-irreversible: #8A3D1F;
   --p-irreversible-surface: #F4E6DC;
   --p-focus: #8F4126;
+  /* 代码高亮（浅色）。取自 VS Code Light+ 的同族色，压深到本表的对比度要求 */
+  --p-code-bg: #F3F1EA;
+  --p-hl-comment: #4A7B4A;
+  --p-hl-str: #9B3F26;
+  --p-hl-kw: #7A2FA0;
+  --p-hl-num: #1E6B7B;
 
   /* ---------- Layer 2：语义层 ---------- */
   --surface-0: var(--p-surface-0);
@@ -78,6 +84,11 @@
   --irreversible: var(--p-irreversible);
   --irreversible-surface: var(--p-irreversible-surface);
   --focus: var(--p-focus);
+  --code-bg: var(--p-code-bg);
+  --hl-comment: var(--p-hl-comment);
+  --hl-str: var(--p-hl-str);
+  --hl-kw: var(--p-hl-kw);
+  --hl-num: var(--p-hl-num);
   --token-uncached: var(--p-info);
   --token-cache-write: var(--p-verifier);
   --token-cache-read: var(--p-ok);
@@ -176,6 +187,12 @@
     --p-irreversible: #E08A5F;
     --p-irreversible-surface: #31221A;
     --p-focus: #E08A5F;
+    /* 代码高亮（暗色）。取自 VS Code Dark+ 的同族色 */
+    --p-code-bg: #161513;
+    --p-hl-comment: #7FA87F;
+    --p-hl-str: #D99A6C;
+    --p-hl-kw: #C495E8;
+    --p-hl-num: #8FD3C8;
   }
 }
 
@@ -206,6 +223,12 @@
   --p-irreversible: #E08A5F;
   --p-irreversible-surface: #31221A;
   --p-focus: #E08A5F;
+  /* 代码高亮（暗色）。取自 VS Code Dark+ 的同族色 */
+  --p-code-bg: #161513;
+  --p-hl-comment: #7FA87F;
+  --p-hl-str: #D99A6C;
+  --p-hl-kw: #C495E8;
+  --p-hl-num: #8FD3C8;
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -2178,3 +2201,37 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
 @media (prefers-reduced-motion: reduce) {
   .content-area { scroll-behavior: auto; }
 }
+
+/* ===== 代码块：像代码，而不是像段落（委托方："用 VS 那种代码主题"）===== */
+.md .md-code {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: var(--space-md);
+  margin: 0 0 var(--space-md);
+  overflow-x: auto;               /* 长行自己横滚，不撑破对话宽度 */
+  font-family: var(--font-mono);
+  font-size: var(--font-md);
+  line-height: 1.55;              /* 比正文紧一点：代码靠行对齐读 */
+  position: relative;
+  tab-size: 2;
+}
+.md .md-code code {
+  font-family: inherit;
+  white-space: pre;               /* 代码不折行——折行会改变缩进的含义 */
+}
+/* 语言角标：右上角一枚小字，说清这是什么语言 */
+.md .md-code[data-lang]::before {
+  content: attr(data-lang);
+  position: absolute;
+  top: 2px;
+  right: var(--space-sm);
+  font-size: var(--font-xs);
+  color: var(--text-3);
+  text-transform: lowercase;
+  pointer-events: none;
+}
+.hl-comment { color: var(--hl-comment); font-style: italic; }
+.hl-str { color: var(--hl-str); }
+.hl-kw { color: var(--hl-kw); }
+.hl-num { color: var(--hl-num); }

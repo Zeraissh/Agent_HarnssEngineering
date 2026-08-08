@@ -18,6 +18,8 @@
  * 【不支持原始 HTML】是有意的，不是偷懒——支持它就等于把上面那条纪律作废。
  */
 
+import { highlight, normalizeLang } from "./highlight.js";
+
 const ESC = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
 const escapeHtml = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ESC[c]);
 
@@ -107,8 +109,20 @@ export function renderMarkdown(src) {
       const body = [];
       while (i < lines.length && !/^\s*```\s*$/.test(lines[i])) body.push(lines[i++]);
       i++; // 吃掉收尾围栏（缺失也不报错——模型经常写漏）
-      const lang = fence[1] ? ` data-lang="${escapeHtml(fence[1])}"` : "";
-      out.push(`<pre class="md-code"${lang}><code>${body.join("\n")}</code></pre>`);
+      /**
+       * 代码块的外观（委托方："代码应该用代码的样式来显示，比如 VS 的那种代码主题"）。
+       *
+       * 高亮**在已转义的文本上做**——`highlight()` 只插入自己的 span，不碰实体，
+       * 也不反转义（反转义就等于把死文本变回活标签，那是本文件整篇在防的事）。
+       * 认不出语言就原样返回：**猜着高亮比不高亮更糟**。
+       */
+      const raw = fence[1] ?? "";
+      const key = normalizeLang(raw);
+      const langAttr = raw ? ` data-lang="${escapeHtml(raw)}"` : "";
+      out.push(
+        `<pre class="md-code${key ? ` md-code--${key}` : ""}"${langAttr}>` +
+          `<code>${highlight(body.join("\n"), raw)}</code></pre>`,
+      );
       continue;
     }
 

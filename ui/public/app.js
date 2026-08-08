@@ -2079,6 +2079,55 @@ function patchAssemblyBar(parts, state, harness) {
 }
 
 /**
+ * 流式显示的**匀速放行**。
+ *
+ * 委托方："有时候会卡住然后突然冒一长串，就是有点像卡顿的样子。"
+ * 量了一轮，**不是我们渲染慢**（长任务观测器录到 0 条长任务），
+ * 是**上游本来就是一阵一阵来的**：一次 230 条增量里，多数在同一毫秒内到达，
+ * 而相邻两批之间最长静默 943ms。兼容端点按块推流，不是逐字推。
+ *
+ * 所以修不在"更快地画"，而在**别把到达节奏当成显示节奏**：
+ * 把已到达但还没显示的部分当成一个缓冲，按帧匀速放出去。
+ * 一次 300 字的突进因此摊成约 350ms 的平滑推进，而不是一帧糊上去。
+ *
+ * 三条边界：
+ *   ① **积压越多放得越快**——否则长文会越拖越远，最后停笔了字还在慢慢爬；
+ *   ② 有个下限速度，免得零星几个字挤牙膏；
+ *   ③ 一轮结束（`done`）时**立刻全放**——收尾必须是准的，
+ *      不能让人对着一段还没吐完的文字以为模型还在写。
+ *
+ * @param {{arrived:number, revealed:number, dtMs:number, done?:boolean}} m
+ * @returns {number} 这一帧该显示到第几个字
+ */
+export function paceReveal(m) {
+  const arrived = Math.max(0, m.arrived | 0);
+  // 上游文本变短 = 换了一轮（liveText 被清过），显示位置跟着回落
+  let revealed = Math.min(Math.max(0, m.revealed | 0), arrived);
+  if (m.done) return arrived;
+  const backlog = arrived - revealed;
+  if (backlog <= 0) return revealed;
+  /**
+   * **剩不多了就一次放完。**
+   *
+   * 速度取自积压量，所以这是指数衰减——越接近追平走得越慢，尾巴能拖很久。
+   * 初版没有这个收尾闸，一次 300 字的突进 350ms 只走到 200 字，
+   * 剩下那截慢慢爬，正是我要修的"字还在爬"本身。**是被自己写的那条测试
+   * 当场抓出来的**（断言 350ms 追平，实测 200/300）。
+   */
+  if (backlog <= REVEAL_SNAP) return arrived;
+  const cps = Math.max(REVEAL_MIN_CPS, backlog / REVEAL_DRAIN_SEC);
+  const step = Math.ceil((cps * Math.max(0, m.dtMs)) / 1000);
+  return Math.min(arrived, revealed + Math.max(1, step));
+}
+
+/** 积压排空的时间常数。指数衰减，配合下面的收尾闸才能真的追平 */
+const REVEAL_DRAIN_SEC = 0.12;
+/** 速度下限：零星几个字别挤牙膏 */
+const REVEAL_MIN_CPS = 40;
+/** 收尾闸：剩这么多字就一次放完，不留一条慢慢爬的尾巴 */
+const REVEAL_SNAP = 12;
+
+/**
  * 两个跳转箭头该不该出现。
  *
  * 委托方要的是两件不同的事：

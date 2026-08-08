@@ -211,6 +211,7 @@ import {
   patchComposer,
   shouldShowReconnecting,
   deriveScrollNav,
+  paceReveal,
 } from "/app.js";
 
 // ---- 状态 ----
@@ -560,8 +561,8 @@ function renderDetailWithState(state) {
     logEntries,
     onToggleEntry: handleToggleEntry,
     harness: harnessSnapshot,
-    liveText: liveTexts.get(runId) ?? "",
-    liveThinking: liveThinking.get(runId) ?? "",
+    liveText: revealedSlice(runId, liveTexts.get(runId) ?? "", false),
+    liveThinking: revealedSlice(runId, liveThinking.get(runId) ?? "", true),
     onPlanDecision: (decision) => postPlanDecision(runId, decision),
     onReveal: (path) => revealArtifact(runId, path),
   });
@@ -747,10 +748,54 @@ const deltaBatcher = createBatcher((batches) => {
       liveThinking.delete(runId);
     }
     if (selectedRunId !== runId) continue;
-    const state = runStates.get(runId);
-    if (state) renderDetailWithState(state);
+    startRevealTicker(runId);
   }
 });
+
+/**
+ * 匀速放行的节拍器。
+ *
+ * 上游是一阵一阵来的（实测相邻两批最长静默 943ms），直接照搬到屏幕上就是
+ * "卡一下、蹦一长串"。这里按帧把已到达的文本匀速放出去，判据在 app.js 的
+ * `paceReveal`（纯函数，可测）。
+ *
+ * 追平之后**自动停表**——没有内容要放时还空转 rAF 是白烧电。
+ */
+const revealed = new Map();
+let revealTicker = null;
+
+function startRevealTicker(runId) {
+  if (revealTicker !== null) return;
+  let last = performance.now();
+  const tick = (now) => {
+    const dtMs = now - last;
+    last = now;
+    const arrived = (liveTexts.get(runId) ?? "").length + (liveThinking.get(runId) ?? "").length;
+    const state = runStates.get(runId);
+    const done = !state || state.status !== "running";
+    const next = paceReveal({ arrived, revealed: revealed.get(runId) ?? 0, dtMs, done });
+    const changed = next !== (revealed.get(runId) ?? 0);
+    revealed.set(runId, next);
+    if (changed && state && selectedRunId === runId) renderDetailWithState(state);
+    // 追平且没在跑了就停表
+    if (next >= arrived && done) {
+      revealTicker = null;
+      return;
+    }
+    revealTicker = requestAnimationFrame(tick);
+  };
+  revealTicker = requestAnimationFrame(tick);
+}
+
+/** 取"该显示到第几个字"的那一截。思考与正文各自截，互不影响 */
+function revealedSlice(runId, full, isThinking) {
+  const n = revealed.get(runId);
+  if (n === undefined) return full;
+  // 思考在前、正文在后：正文的可见额度要扣掉思考已经占掉的
+  const thinkLen = (liveThinking.get(runId) ?? "").length;
+  const budget = isThinking ? n : Math.max(0, n - thinkLen);
+  return full.slice(0, budget);
+}
 
 const batcher = createBatcher((batches) => {
   for (const [runId, queue] of batches) {
@@ -766,6 +811,7 @@ const batcher = createBatcher((batches) => {
       if (t === "turn_start" || t === "tool_call" || t === "done") {
         liveTexts.delete(runId);
         liveThinking.delete(runId);
+        revealed.delete(runId); // 换轮了，放行位置跟着归零
         break;
       }
     }
