@@ -1266,3 +1266,61 @@ describe("装配状态条", () => {
     expect(open[0]).toBe(chips[1]);
   });
 });
+
+describe("装配条不许说谎（文案交叉核对抓到的三处）", () => {
+  const cfg = (over: any = {}) => {
+    let s = createInitialState("r", "t", true);
+    return reduceEvents(s, [sse(0, "host", "run_config", over)]);
+  };
+
+  /**
+   * `?? 0` 会把**没设过**的 maxTokens 渲成「0k」——一个没设过的护栏被画成
+   * 最严格的护栏。这条状态条的全部价值就在于它不说谎，所以这是必须锁的。
+   */
+  it("maxTokens 未设时不渲染，不许出现「0k」", () => {
+    const chip = deriveAssemblyBar(cfg({ guardrails: { maxTurns: 40 } }), null)
+      .find((i) => i.key === "guardrails")!.chip;
+    expect(chip).toBe("40 轮");
+    expect(chip).not.toContain("0k");
+  });
+
+  it("maxTokens 设了才带上", () => {
+    const chip = deriveAssemblyBar(cfg({ guardrails: { maxTurns: 40, maxTokens: 64000 } }), null)
+      .find((i) => i.key === "guardrails")!.chip;
+    expect(chip).toBe("40 轮 / 64k");
+  });
+
+  /**
+   * `classifyStopReason` 实判**八个**具名值（含 plan_rejected / plan_gate_expired /
+   * budget_exhausted / refusal）。文案里写死"六值"是过期口径——
+   * 而它恰好把计划门那两个新值排除在外。所以文案不写具体数目。
+   */
+  it("护栏说明不写死终止值的个数（口径会漂）", () => {
+    const why = deriveAssemblyBar(cfg({ guardrails: { maxTurns: 40 } }), null)
+      .find((i) => i.key === "guardrails")!.why;
+    expect(why).not.toMatch(/[六五四三七八九]值/);
+  });
+
+  /**
+   * 案例 #8 全程单模型（deepseek-v4-pro，执行/核查/planner 同款），
+   * 四跑 A/B/C/D 的变量是预算 / 只读纪律 / 收口续跑——**模型是控制量**。
+   * 拿它当"换模型可对照"的证据是把出处引反了。
+   */
+  it("模型说明不得拿案例 #8 当「换模型可对照」的证据", () => {
+    const why = deriveAssemblyBar(cfg({}), { model: "m" }).find((i) => i.key === "model")!.why;
+    expect(why).not.toContain("案例 #8");
+    expect(why).not.toContain("A/B/C/D");
+  });
+
+  /** 空白名单是案例 #4 的事故形态，必须显式显示 0 而不是省略 */
+  it("核查白名单为空时显示「白名单 0」，不适用「空就不显示」", () => {
+    const chip = deriveAssemblyBar(cfg({ guardrails: { maxTurns: 40 } }), null)
+      .find((i) => i.key === "verify")!.chip;
+    expect(chip).toContain("白名单 0");
+  });
+
+  it("白名单有值时报真实条数", () => {
+    const s = cfg({ pack: { name: "ts-coding", verify: { readOnlyCommands: ["a", "b", "c"] } } });
+    expect(deriveAssemblyBar(s, null).find((i) => i.key === "verify")!.chip).toContain("白名单 3");
+  });
+});

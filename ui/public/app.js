@@ -2109,8 +2109,9 @@ export function deriveAssemblyBar(state, harness) {
   push(
     "model",
     harness?.model ?? null,
-    "执行者用的模型。本项目的判断结构不绑定某一家：Anthropic 原生与 OpenAI wire 两条协议都走同一个手写循环，" +
-      "所以换模型是可比较的实验变量而不是一次重写——案例 #8 的四跑 A/B/C/D 正是靠这一点做出来的。",
+    "执行者用的模型。手写循环不绑定某一家：Anthropic 原生与 OpenAI wire 两条协议走同一个循环，" +
+      "所以模型是**可对照的实验变量**而不是一次重写——发现 15~17 的拆分方差对照（换更强的 planner 纹丝不动，" +
+      "改成结构化拆分协议才做到 5/5 零方差）就是靠这一点做出来的。这一格是记录，不是旋钮。",
   );
 
   // 领域包：本项目最独特的装配单位
@@ -2123,19 +2124,34 @@ export function deriveAssemblyBar(state, harness) {
   );
 
   // 护栏：轮数与 token 是硬边界，撞上了核查救不了
+  // maxTokens 未设时**不写它**：`?? 0` 会渲成「0k」，那是在说"上限为零"——
+  // 一个没设过的护栏被画成最严格的护栏，正是这条状态条最该避免的那种谎话
+  const tokenPart = g && g.maxTokens ? ` / ${Math.round(g.maxTokens / 1000)}k` : "";
   push(
     "guardrails",
-    g ? `${g.maxTurns} 轮 / ${Math.round((g.maxTokens ?? 0) / 1000)}k` : null,
-    "单次运行的硬边界。撞上它们与「做完了」是两回事：`max_turns` / `max_tokens` 结束的运行，" +
-      "即使核查通过也不代表任务做完——所以终止原因分六值而不是成败两值，撞边界时界面会直说「核查救不了这一类」。",
+    g && g.maxTurns ? `${g.maxTurns} 轮${tokenPart}` : null,
+    "单次运行的硬边界，由**宿主**执行：轮数/预算检查发生在每次模型调用之前，触发时不再发请求、" +
+      "直接以对应的 stopReason 收尾。撞上它与「做完了」是两回事——即使裁决 passed 也不代表任务做完，" +
+      "所以终止原因是**一组具名值**而不是成败两值，撞边界时界面会直说「核查救不了这一类」。",
   );
 
   // 核查：三值裁决 + 独立上下文，这是与别家最明显的分野
+  /**
+   * 白名单条数上条，**且 0 要显眼**。
+   *
+   * 这几条决定核查者是"能亲手重跑 vitest/tsc 的验证者"还是"只能读文件猜的观察者"。
+   * 案例 #4 就是空白名单：verifier 的 bash 全被拒，22 轮返工、零写入，
+   * 而四道门禁的地面真值早已全绿——把"查不了"错判成"没做对"，
+   * 那是 fail-closed 三种误伤里代价最高的一种。所以它不适用"空就不显示"。
+   */
+  const wl = (cfg.pack ?? harness?.pack)?.verify?.readOnlyCommands ?? [];
+  const wlPart = state.verify ? `·白名单 ${wl.length}` : "";
   push(
     "verify",
-    state.verify ? `核查开${cfg.verifierBudgetTurns ? ` ${cfg.verifierBudgetTurns} 轮` : ""}` : "核查关",
+    state.verify ? `核查开${cfg.verifierBudgetTurns ? ` ${cfg.verifierBudgetTurns} 轮` : ""}${wlPart}` : "核查关",
     "开启后由**另一个上下文**独立复核，不是让执行者自己说自己对（它看得见自己的推理，天然会为结论辩护）。" +
-      "裁决分三值：passed / unverified / advisory——「没验成」和「不合格」是两件事，压成一个布尔值会让前者被当成后者。",
+      "裁决分三值：passed / unverified / advisory——「没验成」和「不合格」是两件事，压成一个布尔值会让前者被当成后者。" +
+      "白名单是核查者的取证手段：案例 #4 里它为空，verifier 的 bash 全被拒，22 轮返工零写入，而地面真值早已全绿。",
   );
 
   // 工作目录：工具的写入圈禁根
