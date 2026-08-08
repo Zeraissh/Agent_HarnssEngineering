@@ -13,12 +13,18 @@ import {
   type SubTask,
 } from "./planner.js";
 import { runVerifier, sumUsage, type VerifyOutcome } from "./verifier.js";
+import { isTransientApiError } from "./model-client.js";
 import type { DomainPack } from "./presets.js";
 import type { AgentConfig, AgentRunResult, AggregateUsage, ModelClient, TurnEvent } from "./types.js";
 
 export interface VerifiedRunOptions {
   /** 核查未通过时的最大返工轮数。默认 1 */
   maxReworks?: number;
+  /**
+   * 段级瞬时失败的续跑次数（9.8，缺省 1）。整段因瞬时宿主级错误终止时，
+   * 带着已有正史续跑而不是作废。设 0 关闭（eval 做失败率统计时可能需要）。
+   */
+  transientResumes?: number;
   /**
    * 返工模式（A/B 变量）：
    * - "fresh"（默认）：全新上下文重跑——独立重试，不被上一轮的错误推理污染；
@@ -72,6 +78,12 @@ export interface VerifiedRunResult {
   executionUsage: AggregateUsage;
 }
 
+/**
+ * 段级续跑的提示语。刻意短：模型手里的正史已经说明了一切，这里只需要告诉它
+ * "刚才是基础设施抖了一下，不是你做错了"，以及别从头再来。
+ */
+const SEGMENT_RESUME_NUDGE = `【接续】刚才那次模型调用因为瞬时的基础设施故障（超时/限流/网络）中断了，不是你的工作有问题。你上面已经完成的步骤与工具返回都还在，请**从中断的地方接着做**，不要从头重来、也不要重复已经做过的工具调用。若你判断工作其实已经完成，直接给出最终总结即可。`;
+
 export async function runVerified(
   cfg: AgentConfig,
   model: ModelClient,
@@ -96,6 +108,43 @@ export async function runVerified(
         : new AgentLoop(cfg, model).run(feedback);
     main = await drain(events, (e) => opts.onEvent?.(source, e));
     executionUsage = executionUsage ? sumUsage(executionUsage, main.usage) : main.usage;
+
+    /**
+     * 段级续跑（9.8）：整段因**瞬时**宿主级错误终止时，带着已有正史再续一次，
+     * 而不是把整段工作作废。
+     *
+     * 案例 #8 实录：执行者跑到第 29 轮 API 超时，`stopReason=error` 直接短路，
+     * 而它当时已经做了 28 次工具调用、最后一句是「让我验证 RCC 寄存器布局是否
+     * 正确」——正朝着真缺陷去。一次端点抖动把整段工作连同进展全部作废。
+     *
+     * 这与 9.7 的收口续跑同构：那个救"核查没来得及收口"，这个救"执行没来得及
+     * 交付"，都靠 runContinuation 把正史接上。
+     *
+     * **只对瞬时错误续跑**（认证/4xx/abort 属于永久性，续跑只是重复失败）——
+     * 判据用 isTransientApiError 作用在原始错误上，不是字符串匹配分类后的消息。
+     */
+    let resumesLeft = opts.transientResumes ?? 1;
+    while (
+      main.stopReason === "error" &&
+      resumesLeft > 0 &&
+      main.messages.length > 0 &&
+      isTransientApiError(main.error?.cause)
+    ) {
+      resumesLeft -= 1;
+      const priorTurns = main.usage.turns;
+      await opts.onEvent?.(source, {
+        type: "segment_resume",
+        attempt: (opts.transientResumes ?? 1) - resumesLeft,
+        reason: main.error?.message ?? "瞬时失败",
+        priorTurns,
+      });
+      const resumed = await drain(
+        new AgentLoop(cfg, model).runContinuation(main.messages, SEGMENT_RESUME_NUDGE),
+        (e) => opts.onEvent?.(source, e),
+      );
+      executionUsage = sumUsage(executionUsage!, resumed.usage);
+      main = resumed;
+    }
 
     // 纯产物哲学：max_turns 时产物可能已就绪，照常核查；error 等宿主级失败才短路
     if (main.stopReason !== "completed" && main.stopReason !== "max_turns") {

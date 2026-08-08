@@ -157,4 +157,12 @@ export type TurnEvent =
   | { type: "compaction"; droppedBlocks: number }
   /** backoffMs = 本次实际等待毫秒（含抖动）——不带它宿主就看不出重试到底等了多久 */
   | { type: "api_retry"; turn: number; attempt: number; reason: string; backoffMs: number }
+  /**
+   * 段级续跑（9.8）：整段因**瞬时**宿主级错误终止后，带着已有正史再续一次，
+   * 而不是把整段工作作废。与 api_retry 是两回事——那个是同一轮内重发同一个请求，
+   * 这个是一整段已经死了、靠正史接着往下走。
+   * 必须显式发出来：否则宿主会看到一个 `done(error)` 之后又冒出一堆事件，
+   * 完全读不懂（V-01 那条「段终止 ≠ run 终止」的同族）。
+   */
+  | { type: "segment_resume"; attempt: number; reason: string; priorTurns: number }
   | { type: "done"; result: AgentRunResult };

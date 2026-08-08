@@ -620,3 +620,100 @@ describe("预算用尽后的收口（案例 #8 的 9.7 / 9.2）", () => {
     expect(outcome.verdict.summary).toBe("产出正确");
   });
 });
+
+// ================================================================
+// 9.8 段级瞬时失败的续跑
+// ================================================================
+
+describe("段级续跑（案例 #8 的 9.8）", () => {
+  const cfg = { ...baseConfig, tools: [makeTool({ name: "probe" })] };
+
+  /** 前 k 次正常干活，第 k+1 次抛指定错误，之后按脚本继续 */
+  function failsOnceThen(k: number, err: unknown, then: Anthropic.Message[]): ModelClient {
+    let n = 0;
+    const rest = [...then];
+    return {
+      requests: [] as ModelRequest[],
+      send(req: ModelRequest): Promise<ModelTurn> {
+        (this as any).requests.push(structuredClone(req));
+        n += 1;
+        if (n <= k) {
+          const m = fakeMessage([toolUseBlock(`tu_${n}`, "probe", {})], "tool_use");
+          return Promise.resolve({ message: m, stopReason: m.stop_reason, usage: m.usage });
+        }
+        if (n === k + 1) return Promise.reject(err);
+        const m = rest.shift() ?? fakeMessage([textBlock("（脚本耗尽）")], "end_turn");
+        return Promise.resolve({ message: m, stopReason: m.stop_reason, usage: m.usage });
+      },
+    } as unknown as ModelClient;
+  }
+
+  const timeout = () => Object.assign(new Error("upstream timeout"), { status: 408 });
+
+  it("瞬时失败 → 带正史续跑，之前的工具往返不作废", async () => {
+    const model = failsOnceThen(2, timeout(), [
+      fakeMessage([textBlock("接着做完了")], "end_turn"),
+      fakeMessage([textBlock('{"passed": true, "issues": [], "summary": "ok"}')], "end_turn"),
+    ]);
+    const seen: string[] = [];
+    const outcome = await runVerified({ ...cfg, errorRetries: 0 }, model, "任务", {
+      onEvent: (src, e) => {
+        if (e.type === "segment_resume") seen.push(`${src}:${e.type}:${e.priorTurns}`);
+      },
+    });
+
+    // 续跑事件显式发出（否则宿主看到 done(error) 后又冒事件，读不懂）
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatch(/^main:segment_resume:\d+$/);
+    // 整段没有作废：核查照常跑到并通过
+    expect(outcome.finalPassed).toBe(true);
+    expect(outcome.main.stopReason).toBe("completed");
+
+    // 续跑请求带着正史：之前那两次工具往返都在
+    const reqs = (model as unknown as { requests: ModelRequest[] }).requests;
+    const resumeReq = reqs.find((r) => JSON.stringify(r.messages).includes("【接续】"))!;
+    expect(resumeReq, "未发出带正史的续跑请求").toBeDefined();
+    const flat = JSON.stringify(resumeReq.messages);
+    expect(flat).toContain("tu_1");
+    expect(flat).toContain("tu_2");
+    expect(flat).toContain("不要从头重来");
+  });
+
+  it("永久性错误（401）不续跑——续跑只是重复失败", async () => {
+    const model = failsOnceThen(1, Object.assign(new Error("bad key"), { status: 401 }), []);
+    const seen: string[] = [];
+    const outcome = await runVerified({ ...cfg, errorRetries: 0 }, model, "任务", {
+      onEvent: (_s, e) => {
+        if (e.type === "segment_resume") seen.push(e.type);
+      },
+    });
+    expect(seen).toHaveLength(0);
+    expect(outcome.main.stopReason).toBe("error");
+    expect(outcome.finalPassed).toBe(false);
+    expect(outcome.verifications).toHaveLength(0); // 宿主级失败照旧短路核查
+  });
+
+  it("transientResumes=0 关闭续跑（eval 统计失败率时要的是原始形态）", async () => {
+    const model = failsOnceThen(1, timeout(), []);
+    const outcome = await runVerified({ ...cfg, errorRetries: 0 }, model, "任务", {
+      transientResumes: 0,
+    });
+    expect(outcome.main.stopReason).toBe("error");
+    expect(outcome.finalPassed).toBe(false);
+  });
+
+  it("续跑次数有上限——不会对持续故障无限重开", async () => {
+    // 每次调用都超时：首轮 error，续跑 1 次仍 error，然后停手
+    let calls = 0;
+    const model: ModelClient = {
+      send() {
+        calls += 1;
+        return Promise.reject(timeout());
+      },
+    };
+    const outcome = await runVerified({ ...cfg, errorRetries: 0 }, model, "任务", {});
+    expect(outcome.main.stopReason).toBe("error");
+    // 首轮 1 次 + 续跑 1 次 = 2；没有正史时不该续跑，这里首轮 messages 非空（含 user）
+    expect(calls).toBeLessThanOrEqual(2);
+  });
+});

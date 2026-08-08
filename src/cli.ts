@@ -422,6 +422,11 @@ async function main(): Promise<void> {
             c.yellow(`${tag} ⟳ API 瞬时错误，同轮重试 #${event.attempt}（等待 ${event.backoffMs}ms）`),
           );
           break;
+        case "segment_resume":
+          console.log(
+            c.yellow(`${tag} ⟲ 整段因瞬时故障终止，带 ${event.priorTurns} 轮正史续跑：${event.reason}`),
+          );
+          break;
         case "done": {
           const u = event.result.usage;
           console.log(
@@ -629,6 +634,12 @@ async function main(): Promise<void> {
         endStreamLine();
         console.log(
           c.yellow(`⟳ API 瞬时错误，同轮重试 #${event.attempt}（等待 ${event.backoffMs}ms）：${event.reason}`),
+        );
+        break;
+      case "segment_resume":
+        endStreamLine();
+        console.log(
+          c.yellow(`⟲ 整段因瞬时故障终止，带 ${event.priorTurns} 轮正史续跑（不是从头重来）：${event.reason}`),
         );
         break;
       case "compaction":

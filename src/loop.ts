@@ -212,7 +212,11 @@ export class AgentLoop {
           break;
         } catch (err) {
           if (signal.aborted || !isTransientApiError(err) || attempt >= this.errorRetries) {
-            return finish("error", new Error(classifyApiError(err)));
+            // 原始错误挂在 cause 上：分类过的消息是给人看的，但编排层要靠
+            // isTransientApiError(原始错误) 决定"这段能不能带着正史续跑"（9.8）。
+            // 此前这里只留下一句字符串，上游再想分类只能字符串匹配——那正是
+            // 本项目一贯反对的做法。
+            return finish("error", new Error(classifyApiError(err), { cause: err }));
           }
           const backoffMs = backoffWithJitter(this.errorRetryBackoffMs, attempt);
           q.push({

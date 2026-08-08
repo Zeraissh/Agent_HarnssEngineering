@@ -308,6 +308,26 @@ export function reduceEvent(state, sseEvent) {
       planApproval: { status: "expired", seq: Number(event.requestSeq ?? seq), at: 0 },
     };
   }
+  // 9.8 段级续跑：整段因瞬时错误死掉后带着正史接着跑。必须显式呈现——
+  // 否则宿主看到一个 done(error) 之后又冒出一堆事件，完全读不懂
+  if (type === "segment_resume") {
+    return {
+      ...state,
+      // 段死了又续上：状态回到运行中，清掉那条已经不成立的错误
+      status: "running",
+      error: null,
+      stopReason: null,
+      timeline: [
+        ...state.timeline,
+        {
+          seq, source, type: "segment_resume",
+          attempt: Number(event.attempt ?? 1),
+          reason: String(event.reason ?? ""),
+          priorTurns: Number(event.priorTurns ?? 0),
+        },
+      ],
+    };
+  }
   if (type === "plan_result") {
     return { ...state, planResult: { ...event, type: undefined } };
   }
@@ -1181,6 +1201,7 @@ function defaultCollapsed(entry) {
   if (entry.type === "approval_request") return false;
   // API 重试 → 展开
   if (entry.type === "api_retry") return false;
+  if (entry.type === "segment_resume") return false;
   // 上下文压缩 → 展开
   if (entry.type === "compaction") return false;
   // 其余（turn_start、tool_call、成功 tool_result、assistant_text）→ 折叠
@@ -3072,6 +3093,8 @@ function renderLogEntryBody(e) {
       return `<div class="log-entry-body log-entry-text md">${renderMarkdown(e.text ?? "")}</div>`;
     case "approval_request":
       return `<pre class="log-entry-body">${esc(formatInput(e.input))}</pre>`;
+    case "segment_resume":
+      return `<div class="log-entry-body">整段因瞬时故障终止，已带着之前 ${esc(String(e.priorTurns ?? "?"))} 轮的会话正史接着跑（不是从头重来）。<br>原因：${esc(e.reason ?? "")}</div>`;
     case "api_retry":
       // 等待时长要看得见：抖动之后同一 attempt 的等待不再是定值，
       // 只显示"第几次重试"会让人以为退避是固定的
@@ -3101,6 +3124,7 @@ function entryIcon(type, isError) {
     case "assistant_text": return "¶";   // CLI 直接流式打印无标记，列表里需要一个
     case "approval_request": return "⚠"; // cli.ts:539
     case "api_retry": return "⟳";        // cli.ts:563
+    case "segment_resume": return "⟲";   // 与 ⟳(同轮重试) 区分：这是整段续跑
     // CLI 对压缩也用 ⚠，这里刻意分开：V-19 要求不可逆自成语域，
     // 与普通警告共用符号会让人对它脱敏
     case "compaction": return "⊟";
@@ -3120,6 +3144,7 @@ function entryActionLabel(e) {
     case "assistant_text": return "助手消息";
     case "approval_request": return `审批请求：${e.name ?? ""}`;
     case "api_retry": return `API 重试（第${e.attempt ?? "?"}次）`;
+    case "segment_resume": return `瞬时失败后带正史续跑（已完成 ${e.priorTurns ?? "?"} 轮）`;
     case "compaction": return "上下文压缩";
     case "usage": return "本轮用量";
     case "user_message": return `追加指令（第 ${e.turn ?? "?"} 轮对话）`;
