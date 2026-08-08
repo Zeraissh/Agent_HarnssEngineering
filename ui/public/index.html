@@ -61,10 +61,23 @@
     连接中断，正在重连…（运行仍在服务端继续）
   </div>
 
-  <!-- 提交栏 -->
+  <!-- 内容区 -->
+  <div id="main-area" class="content-area">
+    <div class="empty-state">
+      <div class="empty-icon">◌</div>
+      <p>尚无运行。</p>
+    </div>
+  </div>
+  <!-- 需你决定：钉在输入框正上方，**在滚动容器之外**。
+       它不随内容滚走——这正是委托方那条反馈的结构解法。 -->
+  <div id="action-dock" class="action-dock" hidden></div>
+
+  <!-- 提交栏：**在底部**（委托方建议）。
+       理由不只是习惯：待办钉在输入框上方 = 固定可见位置，新审批出现在哪都看得见，
+       从结构上消掉了"内容变高把待办推出视野"那个问题，不必再靠滚动补偿。 -->
   <form id="submit-form" class="submit-bar" autocomplete="off">
     <label for="task-input" class="task-label">任务描述</label>
-    <textarea id="task-input" placeholder="输入任务描述…" rows="1"></textarea>
+    <textarea id="task-input" placeholder="输入新任务描述…（提交会新建一次运行；要追加指令请用运行详情里的追加框）" rows="1"></textarea>
     <label class="checkbox-label">
       <input type="checkbox" id="verify-toggle" />
       <span>开启独立核查</span>
@@ -147,13 +160,6 @@
     </div>
   </form>
 
-  <!-- 内容区 -->
-  <div id="main-area" class="content-area">
-    <div class="empty-state">
-      <div class="empty-icon">◌</div>
-      <p>尚无运行。</p>
-    </div>
-  </div>
 </main>
 
 <script type="module" src="/app.js"></script>

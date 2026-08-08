@@ -705,9 +705,12 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
   flex-wrap: wrap;
   gap: var(--space-sm);
   padding: var(--space-md) var(--space-lg);
-  border-bottom: 1px solid var(--border);
+  /* 提交栏移到底部之后分隔线也得换边——留着 border-bottom 会在页面最下沿
+     画一条悬空的线，而它和上方内容之间反倒没有分界 */
+  border-top: 1px solid var(--border);
   background: var(--bg2);
   align-items: center;
+  flex: 0 0 auto;
 }
 
 /* 输入框吃掉剩余空间，但不得被压到无法辨认 */
@@ -874,7 +877,7 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
 }
 .approvals-done > summary {
   cursor: pointer;
-  color: var(--fg-dim);
+  color: var(--text-3);
   list-style: revert;
 }
 .approvals-done > summary:focus-visible {
@@ -886,7 +889,7 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
   padding-left: 18px;
   line-height: var(--leading-normal);
 }
-.approvals-done-list li { color: var(--fg-dim); }
+.approvals-done-list li { color: var(--text-3); }
 .approvals-done-mark { font-variant-numeric: tabular-nums; }
 
 /* 计划确认门（§5.1）——签字位。与审批卡同族但语域更重：它管的是
@@ -1755,7 +1758,7 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
   margin: 0 0 8px;
   padding: 4px 12px;
   border-left: 3px solid var(--border);
-  color: var(--fg-dim);
+  color: var(--text-3);
 }
 .md .md-hr { border: 0; border-top: 1px solid var(--border); margin: 12px 0; }
 .md .md-code {
@@ -1779,7 +1782,7 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
 .md a,
 .md-inline a { color: var(--accent); }
 .md del,
-.md-inline del { color: var(--fg-dim); }
+.md-inline del { color: var(--text-3); }
 
 /* 思考过程条目：与对话视图的 .chat-thinking 同一语域（深梅虚线），
    既不与正文抢，也不与工具旁支混。默认折叠，展开才占版面。 */
@@ -1788,3 +1791,37 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
   padding-left: 10px;
   color: var(--text-2);
 }
+
+/* ===== 「需你决定」固定坞（钉在输入框上方，滚动容器之外）===== */
+.action-dock {
+  flex: 0 0 auto;
+  border-top: 1px solid var(--border);
+  background: var(--bg2);
+  padding: var(--space-sm) var(--space-lg) 0;
+  /* 待办多时不许吃掉整屏——自己内部滚 */
+  max-height: 42vh;
+  overflow-y: auto;
+}
+.action-dock .action-rail { margin: 0; }
+
+/* ===== Markdown 表格 ===== */
+.md .md-table {
+  border-collapse: collapse;
+  margin: 0 0 8px;
+  font-size: var(--font-md);
+}
+.md .md-table th,
+.md .md-table td {
+  border: 1px solid var(--border);
+  padding: 4px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+.md .md-table th {
+  background: var(--bg3);
+  font-weight: 600;
+}
+.md .md-table tbody tr:nth-child(even) { background: var(--bg2); }
+/* 宽表自己横滚，不撑破布局（与 .md-code 同款纪律） */
+.md .md-table-wrap { overflow-x: auto; margin: 0 0 8px; }
+.md .md-table-wrap .md-table { margin: 0; }

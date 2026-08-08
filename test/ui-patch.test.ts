@@ -24,7 +24,6 @@ import {
   patchList,
   appendOnly,
   keepScrollAnchored,
-  keepViewportAnchored,
   createBatcher,
 } from "../ui/public/app.js";
 
@@ -730,51 +729,50 @@ describe("思考流式：直播条在正文之前显示它在想什么", () => {
   });
 });
 
-describe("keepViewportAnchored：长高让它长，变矮才补偿", () => {
+
+// ================================================================
+// 「需你决定」的固定坞（委托方建议的结构解法）
+// ================================================================
+
+describe("需你决定：钉在输入框上方的固定坞", () => {
+  const dock = () => document.getElementById("action-dock") as HTMLElement;
+  const rail = () => document.querySelector(".action-rail") as HTMLElement;
+
   /**
-   * 委托方实测反馈：初版对称补偿反而更糟——新审批卡冒出来时视口被一起往下拉，
-   * 顶部那张正等着人点的卡被推出视野。这一组用可注入的假锚点直测，
-   * 绕开 jsdom 里 getBoundingClientRect 恒为 0 的限制（那正是上一版没测出来的原因）。
+   * 结构约束：坞必须在滚动容器【外面】。
+   *
+   * 这是整件事的根据——在里面它就会被内容推走，得靠滚动补偿去追；
+   * 在外面它变高变矮只改变滚动容器的高度，容器里的内容一动不动。
+   * 哪天有人把它挪回 #main-area 里，这条会当场炸。
    */
-  function fakeAnchor(tops: number[]) {
-    let i = 0;
-    return { getBoundingClientRect: () => ({ top: tops[Math.min(i++, tops.length - 1)] }) };
-  }
-  const scroller = (top = 500) => ({ scrollTop: top });
-
-  it("上方变高（新审批卡出现）→ 不补偿，让新卡看得见", () => {
-    const sc = scroller(500);
-    // 锚点从 300 被推到 460：上方长高了 160
-    const d = keepViewportAnchored(sc, fakeAnchor([300, 460]), () => {});
-    expect(d).toBe(0);
-    expect(sc.scrollTop, "长高时不该动视口——那会把新出现的待办藏起来").toBe(500);
+  it("坞在 #main-area 之外，且排在提交栏之前", () => {
+    const main = document.getElementById("main-area")!;
+    expect(main.contains(dock())).toBe(false);
+    const form = document.querySelector("#task-form, form")!;
+    // compareDocumentPosition：FOLLOWING 表示 form 在 dock 之后
+    expect(dock().compareDocumentPosition(form) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
-  it("上方变矮（审批被应答、卡片离开）→ 补偿，压住下方内容的跳动", () => {
-    const sc = scroller(500);
-    const d = keepViewportAnchored(sc, fakeAnchor([460, 300]), () => {});
-    expect(d).toBe(-160);
-    expect(sc.scrollTop).toBe(340);
+  /**
+   * 实测抓到的接线漏：坞在 HTML 里初始 hidden，渲染层却只切了里面的 rail。
+   * 结果 rail 显示了、坞还盖着，整块「需你决定」永远看不见——
+   * 而所有既有测试都只查 `.deny-reason` 之类的节点存在性，隐藏与否照样通过。
+   */
+  it("有待办时坞与栏一起露出，没待办时一起收起", () => {
+    const s = stateWithPendingApproval();
+    renderRunDetail(s, { activeTab: "loop" });
+    expect(rail().hasAttribute("hidden"), "有待审批却仍隐藏 action-rail").toBe(false);
+    expect(dock().hasAttribute("hidden"), "有待审批却仍隐藏 action-dock").toBe(false);
+
+    const idle = createInitialState("run-idle", "无审批任务", true);
+    renderRunDetail(idle, { activeTab: "loop" });
+    expect(dock().hasAttribute("hidden"), "没待办时坞不该占位").toBe(true);
   });
 
-  it("补偿不会把 scrollTop 压成负数", () => {
-    const sc = scroller(20);
-    keepViewportAnchored(sc, fakeAnchor([200, 0]), () => {});
-    expect(sc.scrollTop).toBe(0);
-  });
-
-  it('mode="both" 仍可对称补偿（保留给确实需要的场景）', () => {
-    const sc = scroller(500);
-    const d = keepViewportAnchored(sc, fakeAnchor([300, 460]), () => {}, "both");
-    expect(d).toBe(160);
-    expect(sc.scrollTop).toBe(660);
-  });
-
-  it("锚点缺失时只执行 mutate，不碰滚动", () => {
-    const sc = scroller(500);
-    let ran = false;
-    keepViewportAnchored(sc, null, () => { ran = true; });
-    expect(ran).toBe(true);
-    expect(sc.scrollTop).toBe(500);
+  it("审批卡渲染在坞里，不在滚动区里", () => {
+    renderRunDetail(stateWithPendingApproval(), { activeTab: "loop" });
+    const card = document.querySelector(".approval-card")!;
+    expect(dock().contains(card)).toBe(true);
+    expect(document.getElementById("main-area")!.contains(card)).toBe(false);
   });
 });

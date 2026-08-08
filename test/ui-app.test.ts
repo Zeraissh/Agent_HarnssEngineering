@@ -1563,6 +1563,24 @@ describe("V-20 hidden 必须真的隐藏", () => {
 // R-07: 核查区视觉收敛 — magenta 仅身份标识，不大面积铺底
 // ================================================================
 
+/**
+ * CSS 变量的引用完整性。
+ *
+ * 实测抓到的：`var(--fg-dim)` 被引用了四处，而这个变量从来没定义过。
+ * 后果不是报错而是**静默失效**——`var()` 引用未定义变量时该声明在计算值阶段
+ * 作废，颜色回退成继承值，看起来"就是没生效"，改半天找不到原因。
+ * 变量名是手写字符串，拼错/改名漏改是必然会再发生的，所以用一条全量扫描锁住。
+ */
+describe("CSS 变量：引用的必须定义过", () => {
+  it("styles.css 里每个 var(--x) 都能在同文件找到定义", () => {
+    const css = readFileSync(join(__dirname, "..", "ui", "public", "styles.css"), "utf-8");
+    const used = new Set([...css.matchAll(/var\(\s*(--[\w-]+)/g)].map((m) => m[1]));
+    const defined = new Set([...css.matchAll(/(--[\w-]+)\s*:/g)].map((m) => m[1]));
+    const missing = [...used].filter((v) => !defined.has(v));
+    expect(missing, `引用了未定义的 CSS 变量：${missing.join(", ")}`).toEqual([]);
+  });
+});
+
 describe("R-07 核查区视觉收敛", () => {
   it("37. CSS 中无大面积 magenta 背景（仅小元素使用）", () => {
     const cssPath = join(__dirname, "..", "ui", "public", "styles.css");

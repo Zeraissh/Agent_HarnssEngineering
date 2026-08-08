@@ -8,12 +8,11 @@ import {
   setAttr,
   setClass,
   keepScrollAnchored,
-  keepViewportAnchored,
   withFocusPreserved,
 } from "./dom/patch.js";
 
 // 桶文件转出：现有 import 路径（测试与控制器都从 /app.js 取）保持不变
-export { createBatcher, diffKeyed, signature, patchList, appendOnly, setText, setAttr, setClass, keepScrollAnchored, keepViewportAnchored, withFocusPreserved };
+export { createBatcher, diffKeyed, signature, patchList, appendOnly, setText, setAttr, setClass, keepScrollAnchored, withFocusPreserved };
 
 /**
  * Harness Web UI — 纯函数 reducer + DOM 渲染层。
@@ -1558,17 +1557,15 @@ export function renderRunDetail(state, callbacks) {
 
   patchDetailHeader(parts, state, isRunning, faces);
   /**
-   * 需你决定区（签字位 + 审批栏 + 待复核）在页面顶部，它一变高变矮，下面的
-   * 内容就整体平移——委托方反馈"点一下允许就被弹到最上方"。锚点取结果卡
-   * （紧邻 rail 下方、始终存在），补丁后按位移反向补偿滚动位置。
+   * 「需你决定」现在钉在滚动容器【之外】（#action-dock），它变高变矮只会改变
+   * 滚动容器的高度，不会平移容器里的内容——所以**不再需要任何滚动补偿**。
+   * 此前为它写过一个视口锚定补偿函数，那是在给布局问题打补丁：补偿方向还得
+   * 分"变高别动、变矮才补"两种情形，判反一次就把刚冒出来的待办推出视野。
+   * 布局改对之后这段逻辑连同它的测试一起删掉了——**根因修掉，补丁就是负债**。
    */
-  // mode 默认 "shrink"：长高让它长（新审批卡就是人要看的东西，不能藏），
-  // 变矮才补偿（否则下面正在读的内容会整块往上跳）
-  keepViewportAnchored(mainEl, parts.outcome, () => {
-    patchPlanGate(parts, state, faces, callbacks);
-    patchApprovalRail(parts, state, isRunning, callbacks);
-    patchUnverifiedRail(parts, faces);
-  });
+  patchPlanGate(parts, state, faces, callbacks);
+  patchApprovalRail(parts, state, isRunning, callbacks);
+  patchUnverifiedRail(parts, faces);
   patchLiveStrip(parts, state, isRunning, callbacks.liveText ?? "", callbacks.liveThinking ?? "");
   patchOutcomeCard(parts, state, overview, faces);
   patchFactorGrid(parts, faces, activeTab, callbacks);
@@ -1591,6 +1588,40 @@ export function normalizeTab(tab) {
  * （renderEmptyState 会这么干，测试里的 beforeEach 也会）。
  * 其余情况一律复用——这正是输入值与焦点得以存活的根据。
  */
+/**
+ * 「需你决定」的固定坞：钉在输入框正上方、**在滚动容器之外**。
+ *
+ * 为什么搬出来（委托方建议 + 实测）：它原本在滚动区顶部，于是
+ *   ① 内容一长它就被推走，得靠滚动补偿去追——补偿方向还容易搞反；
+ *   ② 用户往下看日志时，新冒出来的待办完全在视野之外。
+ * 钉住之后这两件事一起消失，且不再需要任何滚动补偿。
+ *
+ * 骨架只建一次（内容切换靠补丁），所以这里判空即返回既有节点。
+ */
+function ensureActionDock() {
+  const dock = document.getElementById("action-dock");
+  if (!dock) return { actionRail: null, planGate: null, approvals: null, approvalsDone: null, unverified: null };
+  if (!dock.querySelector(".action-rail")) {
+    dock.innerHTML =
+      '<div class="action-rail" hidden>' +
+      // 签字位排在审批卡之前：它挂起时一个子任务都还没发射，此刻决定成本最低
+      '<div class="plan-gate" hidden></div>' +
+      '<div class="approval-cards" hidden></div>' +
+      // 已处理的折叠成一行，不与待处理的混排
+      '<div class="approval-cards-done" hidden></div>' +
+      '<div class="unverified-rail" hidden></div>' +
+      "</div>";
+  }
+  return {
+    dock,
+    actionRail: dock.querySelector(".action-rail"),
+    planGate: dock.querySelector(".plan-gate"),
+    approvals: dock.querySelector(".approval-cards"),
+    approvalsDone: dock.querySelector(".approval-cards-done"),
+    unverified: dock.querySelector(".unverified-rail"),
+  };
+}
+
 function ensureDetailSkeleton(mainEl, state, callbacks) {
   const showBack = Boolean(callbacks.showBack && callbacks.onBack);
   const intact = mainEl.__parts && mainEl.querySelector(".detail-header");
@@ -1614,14 +1645,6 @@ function ensureDetailSkeleton(mainEl, state, callbacks) {
     '<button type="button" class="ctx-gauge" hidden aria-live="polite"></button>' +
     '<span class="detail-hint" hidden></span>' +
     "</div></div>" +
-    '<div class="action-rail" hidden>' +
-    // 签字位排在审批卡之前：它挂起时一个子任务都还没发射，此刻决定成本最低
-    '<div class="plan-gate" hidden></div>' +
-    '<div class="approval-cards" hidden></div>' +
-    // 已处理的折叠成一行，不与待处理的混排（委托方反馈：无限堆叠难读难操作）
-    '<div class="approval-cards-done" hidden></div>' +
-    '<div class="unverified-rail" hidden></div>' +
-    "</div>" +
     '<div class="live-strip" hidden aria-live="polite"></div>' +
     '<div class="outcome-card"></div>' +
     // 四张因子卡**本身就是标签栏**：它们既是四个决定因素的摘要，也是切到对应
@@ -1642,11 +1665,9 @@ function ensureDetailSkeleton(mainEl, state, callbacks) {
     verifyBadge: mainEl.querySelector(".verify-badge"),
     ctxGauge: mainEl.querySelector(".ctx-gauge"),
     hint: mainEl.querySelector(".detail-hint"),
-    actionRail: mainEl.querySelector(".action-rail"),
-    planGate: mainEl.querySelector(".plan-gate"),
-    approvals: mainEl.querySelector(".approval-cards"),
-    approvalsDone: mainEl.querySelector(".approval-cards-done"),
-    unverified: mainEl.querySelector(".unverified-rail"),
+    // 「需你决定」在滚动容器之外（#action-dock，钉在输入框上方）——
+    // 它不随内容滚走，新审批出现在哪都看得见（委托方建议的结构解法）
+    ...ensureActionDock(),
     liveStrip: mainEl.querySelector(".live-strip"),
     outcome: mainEl.querySelector(".outcome-card"),
     factorGrid: mainEl.querySelector(".factor-grid"),
@@ -1791,6 +1812,14 @@ function patchUnverifiedRail(parts, faces) {
   const items = faces.action.unverifiedItems;
   const sig = signature([items.length, items.join("|")]);
   setAttr(parts.actionRail, "hidden", faces.action.needsAttention ? null : "");
+  /**
+   * 坞和栏要**一起**切显隐。
+   *
+   * 坞在 index.html 里初始就是 hidden（没事时不该在输入框上方占一条空白），
+   * 只切里面的 rail 的话，rail 显示了坞还盖着——整块「需你决定」永远看不见。
+   * 这正是搬出滚动容器新引入的接线，容易漏，所以下面有一条专门的回归锁。
+   */
+  if (parts.dock) setAttr(parts.dock, "hidden", faces.action.needsAttention ? null : "");
   if (parts.sig.unverified === sig) return;
   parts.sig.unverified = sig;
 

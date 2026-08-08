@@ -138,3 +138,73 @@ describe("Markdown 渲染：安全（模型输出是不可信输入）", () => {
     expect(() => renderMarkdownInline(undefined)).not.toThrow();
   });
 });
+
+describe("Markdown 表格（模型极爱用，原样铺出来最难读）", () => {
+  const TABLE = [
+    "| # | 源文件 | 测试数 | 状态 |",
+    "|---|--------|--------|------|",
+    "| 1 | `src/clamp.ts` | 5 | ✅ |",
+    "| 2 | `src/chunk.ts` | 6 | ✅ |",
+  ].join("\n");
+
+  it("渲染成真表格，表头与数据行分开", () => {
+    const host = mount(renderMarkdown(TABLE));
+    const t = host.querySelector("table.md-table")!;
+    expect(t).toBeTruthy();
+    expect([...t.querySelectorAll("thead th")].map((e) => e.textContent)).toEqual([
+      "#", "源文件", "测试数", "状态",
+    ]);
+    expect(t.querySelectorAll("tbody tr")).toHaveLength(2);
+    // 单元格里的行内记法照常解析
+    expect(t.querySelector("tbody code")!.textContent).toBe("src/clamp.ts");
+  });
+
+  it("对齐记法生效（:--- / :---: / ---:）", () => {
+    const host = mount(
+      renderMarkdown(["| a | b | c |", "|:---|:---:|---:|", "| 1 | 2 | 3 |"].join("\n")),
+    );
+    const th = [...host.querySelectorAll("th")] as HTMLElement[];
+    expect(th[0].style.textAlign).toBe("left");
+    expect(th[1].style.textAlign).toBe("center");
+    expect(th[2].style.textAlign).toBe("right");
+  });
+
+  it("列数以表头为准：多的截掉、少的补空", () => {
+    const host = mount(
+      renderMarkdown(["| a | b |", "|---|---|", "| 1 |", "| 1 | 2 | 3 |"].join("\n")),
+    );
+    const rows = [...host.querySelectorAll("tbody tr")];
+    expect(rows[0].querySelectorAll("td")).toHaveLength(2);
+    expect(rows[1].querySelectorAll("td")).toHaveLength(2);
+  });
+
+  it("宽表包在横滚容器里，不撑破布局", () => {
+    const host = mount(renderMarkdown(TABLE));
+    expect(host.querySelector(".md-table-wrap > table.md-table")).toBeTruthy();
+  });
+
+  it("没有分隔行就不是表格——正文里带竖线的句子不该被误判", () => {
+    const host = mount(renderMarkdown("| 这只是 | 一句带竖线的话 |\n下一行普通文字"));
+    expect(host.querySelector("table")).toBeNull();
+    expect(host.textContent).toContain("一句带竖线的话");
+  });
+
+  it("分隔行必须含 `-`（纯 `| | |` 不算）", () => {
+    const host = mount(renderMarkdown("| a | b |\n|   |   |\n| 1 | 2 |"));
+    expect(host.querySelector("table")).toBeNull();
+  });
+
+  it("表格里的 HTML 一样不执行", () => {
+    const host = mount(
+      renderMarkdown(["| x |", "|---|", "| <script>alert(1)</script> |"].join("\n")),
+    );
+    expect(hasExecutableInjection(host)).toBe(false);
+    expect(host.querySelector("td")!.textContent).toContain("<script>");
+  });
+
+  it("表格后面的普通段落照常成段", () => {
+    const host = mount(renderMarkdown(TABLE + "\n\n结论：全部通过。"));
+    expect(host.querySelector("table")).toBeTruthy();
+    expect([...host.querySelectorAll("p")].some((p) => p.textContent!.includes("结论"))).toBe(true);
+  });
+});

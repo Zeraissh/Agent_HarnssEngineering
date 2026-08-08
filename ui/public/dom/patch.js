@@ -143,47 +143,6 @@ export function keepScrollAnchored(scroller, mutate, threshold = 40) {
   return pinned;
 }
 
-/**
- * 视口锚定：一次会改变元素高度的补丁前后，让 `anchor` 在视口中的位置保持不变。
- *
- * 动机（委托方反馈）：审批栏在页面顶部，它一变高变矮，下面的全部内容就跟着
- * 平移——用户点一下"允许"，正在看的地方就被甩走了。`keepScrollAnchored` 解决
- * 的是另一件事（日志贴底跟随），这里要的是"别动我正在看的东西"。
- *
- * 做法是标准的 scroll anchoring：记下锚点相对视口的位置，补丁后按位移反向
- * 补偿 scrollTop。锚点应选在会变高的区域【下方】——那才是用户在读的内容。
- *
- * @param {HTMLElement} scroller 滚动容器
- * @param {HTMLElement} anchor   锚点元素（取其 getBoundingClientRect().top）
- * @param {() => void} mutate
- */
-export function keepViewportAnchored(scroller, anchor, mutate, mode = "shrink") {
-  if (!scroller || !anchor || typeof anchor.getBoundingClientRect !== "function") {
-    mutate();
-    return 0;
-  }
-  const before = anchor.getBoundingClientRect().top;
-  mutate();
-  const delta = anchor.getBoundingClientRect().top - before;
-
-  /**
-   * **只在内容变矮时补偿**（`mode="shrink"`，默认）。这条不对称是委托方实测
-   * 反馈出来的，初版对称补偿反而更糟：
-   *
-   * - 上方区域**变高**（新审批卡冒出来）→ 锚点下移 → 对称补偿会把视口一起往下
-   *   拉，于是顶部那张刚出现的、正等着人点的卡被推出视野。这恰好和人的意图相反：
-   *   新出现的待办就是他要看的东西，**不该被藏起来**。
-   * - 上方区域**变矮**（审批被应答、卡片离开待办区）→ 锚点上移 → 不补偿的话
-   *   下面正在读的内容会整块往上跳一截。这才是需要压住的抖动。
-   *
-   * 一句话：**长高让它长，变矮才补偿。**
-   */
-  const shouldApply = mode === "both" ? delta !== 0 : delta < 0;
-  // jsdom 里 rect 恒为 0，delta 恒为 0——真机才有效；helper 本身可注入锚点直测
-  if (shouldApply) scroller.scrollTop = Math.max(0, scroller.scrollTop + delta);
-  return shouldApply ? delta : 0;
-}
-
 /** CSS.escape 的最小替身（jsdom 里不一定有） */
 function cssEscape(s) {
   if (typeof CSS !== "undefined" && CSS.escape) return CSS.escape(s);
