@@ -1879,13 +1879,70 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
 }
 
 /* ===== 对话主干（委托方："还是希望做成对话框的形式"）===== */
-/* 单列、限宽、留白——按"读文章"排版，而不是按"看仪表盘"排版 */
+/**
+ * 对话 + 右栏并排。右栏 `hidden` 时 grid 只剩一列，对话自然铺满。
+ *
+ * 宽度：委托方指出原来的 78ch 太窄——那是纯文章排版的经验值，可这里的内容
+ * 一半是工具行、命令、路径与代码，挤在 78ch 里会大量折行，反而更难读。
+ * 放宽到 108ch，并给右栏预留 clamp 宽度：子 agent 面板出现时对话收窄但不塌。
+ */
+.detail-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--space-lg);
+  align-items: start;
+}
 .conversation {
-  max-width: 78ch;
+  /* 132ch ≈ 在 1280 视口下几乎铺满可用宽度；上限仍在，避免超宽屏上一行拉到
+     两千像素——那种行长眼睛跟不回行首。铺不满时靠 auto 居中。 */
+  max-width: min(132ch, 100%);
   margin: 0 auto var(--space-lg);
+  width: 100%;
   display: flex;
   flex-direction: column;
   gap: var(--space-md);
+}
+
+/* 右栏：子任务 / 将来的子 agent 面板。可折叠成一条竖柄，不占版面 */
+.detail-rail {
+  width: clamp(240px, 26vw, 340px);
+  border-left: 1px solid var(--border);
+  padding-left: var(--space-md);
+  position: sticky;
+  top: 0;
+  max-height: calc(100vh - 220px);
+  overflow-y: auto;
+}
+.detail-rail--collapsed { width: auto; overflow: visible; }
+.detail-rail--collapsed .rail-body { display: none; }
+.rail-toggle {
+  background: none;
+  border: none;
+  color: var(--text-2);
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--font-md);
+  padding: var(--space-xs) 0;
+  white-space: nowrap;
+}
+.rail-toggle:hover { color: var(--text-1); }
+
+/* 收尾条：只说"这次是怎么结束的"，其余都在对话里 */
+.outcome-note { color: var(--text-2); font-size: var(--font-md); margin-left: var(--space-sm); }
+.outcome-hint { color: var(--text-2); font-size: var(--font-md); margin-top: var(--space-xs); }
+
+/* 窄屏：右栏落到对话下方，不再并排 */
+@media (max-width: 900px) {
+  .detail-layout { grid-template-columns: minmax(0, 1fr); }
+  .detail-rail {
+    width: auto;
+    border-left: none;
+    border-top: 1px solid var(--border);
+    padding-left: 0;
+    padding-top: var(--space-md);
+    position: static;
+    max-height: none;
+  }
 }
 
 /* 工具调用：一行摘要，展开才看细节。它是旁支，不该和正文抢视觉权重 */
@@ -1904,6 +1961,23 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
   list-style: none;
 }
 .chat-tool > summary::-webkit-details-marker { display: none; }
+/**
+ * 摘要行的收缩规则。两个真实症状都出在这里：
+ *   · 长命令把行撑出视口（390px 下实测 .aside-peek 右边越界）；
+ *   · 右侧的「经放行」被挤成两行「经放 / 行」——委托方截图里就是这样。
+ * 判据：**可省略的让它省略，不可省略的不许换行**。摘要文字可截断（展开看全的），
+ * 而状态标记与耗时是这一行的结论，宁可挤也不能断。
+ */
+.chat-tool > summary .aside-peek {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-tool > summary > code,
+.chat-tool-gate,
+.chat-tool > summary > .aside-mark { flex: 0 0 auto; white-space: nowrap; }
 .chat-tool--err { border-color: var(--red); }
 .chat-tool--live { border-style: dashed; }
 .chat-tool .chat-body {
@@ -1962,3 +2036,18 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
   padding: var(--space-xs) 0;
 }
 .drawer-summary:hover { color: var(--text-1); }
+
+/**
+ * 未读星：跑完了但还没看过。
+ *
+ * 它接替了详情页那条横贯整屏的「■ 已完成」——同一件事，从"占一整行"
+ * 变成"占一个字符"，而且挪到了真正需要它的地方（你同时开着几个运行时，
+ * 需要的是扫一眼列表，不是切进去看一行废话）。
+ */
+.run-item-unread {
+  color: var(--accent);
+  font-size: var(--font-md);
+  line-height: 1;
+}
+/* 整项轻微提亮，扫视时不必逐个找那颗星 */
+.run-item--unread .run-item-task { font-weight: 600; }

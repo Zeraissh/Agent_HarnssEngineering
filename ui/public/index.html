@@ -233,6 +233,15 @@ const transcripts = new Map();
 /** @type {Map<string, string>} */
 const followUpErrors = new Map();
 
+/**
+ * 跑完了但还没看过的运行。
+ *
+ * 取代详情页那条横贯整屏的「■ 已完成」——"这次结束了"是**列表**该说的事：
+ * 你可能同时开着好几个运行、正在别处忙，需要的是扫一眼就知道哪条有新结果，
+ * 而不是切进去之后被一行废话占掉版面。
+ */
+const unreadRuns = new Set();
+
 // ---- 统一 composer 的三个事实（派生逻辑在 app.js，这里只存输入）----
 /** @type {ReturnType<typeof deriveComposerMode>|null} */
 let composerMode = null;
@@ -319,7 +328,7 @@ function getFilteredRuns() {
 
 function refreshRunListView() {
   const filtered = getFilteredRuns();
-  const metaMap = deriveRunListItems(filtered, runStates);
+  const metaMap = deriveRunListItems(filtered, runStates, unreadRuns);
   renderRunList(filtered, selectedRunId, selectRun, metaMap);
   if (!selectedRunId) {
     renderEmptyState(runs.length > 0);
@@ -357,6 +366,7 @@ if (runSearch) {
 function selectRun(runId) {
   if (selectedRunId === runId) return;
   selectedRunId = runId;
+  unreadRuns.delete(runId); // 看了就算读过
   refreshRunListView();
 
   // 拆成两件事：确保有 state、确保有订阅。旧实现在"已有 state"时直接 return，
@@ -681,6 +691,8 @@ const batcher = createBatcher((batches) => {
         setConnectionState(runId, "live");
         announceStatus(`运行已完成：${next.task}`);
         refreshTranscriptIfWatching(runId);
+        // 不在看的那条跑完了 → 记一颗未读星（在看的那条不必提醒，你就在看）
+        if (selectedRunId !== runId) unreadRuns.add(runId);
         // canContinue 由服务端算，run 收尾后要拉一次列表才知道能不能追加
         void loadRuns();
       }
@@ -991,6 +1003,15 @@ function subscribeLifecycle() {
         runs = payload.runs;
       } else if (payload.run) {
         const idx = runs.findIndex((r) => r.runId === payload.run.runId);
+        // 生命周期流也要记未读：没订阅事件流的那些运行（你根本没点开过）
+        // 只能从这里知道它们跑完了——只靠 SSE done 分支会漏掉一整类
+        if (
+          payload.run.status === "done" &&
+          runs[idx]?.status === "running" &&
+          payload.run.runId !== selectedRunId
+        ) {
+          unreadRuns.add(payload.run.runId);
+        }
         if (idx >= 0) runs[idx] = payload.run;
         else runs = [payload.run, ...runs];
       }

@@ -29,6 +29,8 @@ import {
   deriveChatItems,
   toolPeek,
   foldChain,
+  deriveRunListItems,
+  renderRunList,
   applyCollapseOverrides,
   nextCollapseOverride,
 } from "../ui/public/app.js";
@@ -907,12 +909,13 @@ describe("AC-04 展开一条默认折叠的日志：点一下就该展开", () =
   });
 });
 
-describe("R-03 结果卡必须排在下钻面之前（无需展开日志即可判断结果）", () => {
+describe("R-03 无需展开下钻面即可判断结果", () => {
   /**
-   * 此前这条只有 app.js 骨架里的字面顺序在守：把 outcome-card 挪到
-   * tab-content 之后（正是 R-03 存在的理由），326 条测试无一变红。
+   * 承载物换过两次，判据没变。v1 是"三标签的概览页"，v2 是"结果卡排在下钻面之前"，
+   * 现在是"裁决就地长在对话里 + 一条收尾条"——**旧锁必须跟着迁移**，
+   * 否则就是 case-07 §六 那条：验收还写着 ✅，看守它的断言却已经不在被测范围内。
    */
-  it("outcome-card 在 tab-content 之前，且裁决在执行者报告之前", () => {
+  it("裁决在对话里、终止原因在收尾条上，两者都在下钻抽屉之前", () => {
     let s = createInitialState("run-r3", "任务", true);
     s = reduceEvents(s, [
       sse(0, "main", "turn_start", { turn: 1 }),
@@ -921,7 +924,6 @@ describe("R-03 结果卡必须排在下钻面之前（无需展开日志即可�
         round: 0,
         verdict: { passed: false, issues: ["缺收尾"], unverified: [], advisory: [], summary: "未通过" },
       }),
-      // verdict 事件才是最终裁决（verification 是逐轮记录），outcome-card 读的是它
       sse(3, "host", "verdict", {
         verdict: { passed: false, issues: ["缺收尾"], unverified: [], advisory: [], summary: "未通过" },
       }),
@@ -929,17 +931,53 @@ describe("R-03 结果卡必须排在下钻面之前（无需展开日志即可�
     ]);
     renderRunDetail(s, { activeTab: "loop", harness: null });
 
+    const conv = document.querySelector(".conversation")!;
     const outcome = document.querySelector(".outcome-card")!;
     const tabs = document.getElementById("tab-content")!;
-    expect(outcome, "结果卡不见了").toBeTruthy();
+
+    // 不合格项就地长在对话里
+    expect(conv.textContent, "裁决没有出现在对话主干里").toContain("缺收尾");
+    expect(conv.querySelector(".chat-verdict")).toBeTruthy();
+    // 正常收尾时那条「■ 已完成」不出现——读对话就知道，占一整行是浪费
+    expect(outcome.hidden, "正常收尾不该再占一整行说废话").toBe(true);
+    // 对话排在下钻抽屉之前
     expect(
-      outcome.compareDocumentPosition(tabs) & Node.DOCUMENT_POSITION_FOLLOWING,
-      "结果卡被排到下钻面之后了——那正是 R-03 要修的毛病",
+      conv.compareDocumentPosition(tabs) & Node.DOCUMENT_POSITION_FOLLOWING,
+      "对话被排到下钻面之后了——那正是 R-03 要修的毛病",
     ).toBeTruthy();
-    expect(outcome.textContent).toContain("缺收尾");
+  });
+
+  /**
+   * 反过来：**非正常收尾必须留着**。对话里只表现为"停了"，看不出是撞了轮数上限；
+   * 而这几种各有各的下一步（六值分档的全部意义就在这个提示上）。
+   */
+  it("撞轮数上限这类收尾要说出来，并给出下一步", () => {
+    let s = createInitialState("run-mt", "任务", false);
+    s = reduceEvents(s, [
+      sse(0, "main", "turn_start", { turn: 1 }),
+      sse(1, "main", "done", { stopReason: "max_turns", usage: { turns: 40 } }),
+    ]);
+    renderRunDetail(s, { activeTab: "loop", harness: null });
+    const outcome = document.querySelector(".outcome-card") as HTMLElement;
+    expect(outcome.hidden).toBe(false);
+    expect(outcome.textContent).toContain("核查救不了这一类");
+  });
+
+  /** 委托方：「这个框框可以不用了」——运行中它只会说一句"尚无最终结果" */
+  it("运行中收尾条整条隐藏，且不重复对话里已有的执行者报告", () => {
+    let s = createInitialState("run-r3b", "任务", false);
+    s = reduceEvents(s, [
+      sse(0, "main", "turn_start", { turn: 1 }),
+      sse(1, "main", "assistant_text", { text: "让我再快速看几个关键文件。" }),
+    ]);
+    renderRunDetail(s, { activeTab: "loop", harness: null });
+    const outcome = document.querySelector(".outcome-card") as HTMLElement;
+    expect(outcome.hidden, "运行中不该挂一个说'尚无结果'的空框").toBe(true);
+    // 那句话只在对话里出现一次
+    const body = document.querySelector(".conversation")!.textContent!;
+    expect(body.split("让我再快速看几个关键文件").length - 1).toBe(1);
   });
 });
-
 describe("R-01 运行结束后，页面上不该有任何可点的审批按钮", () => {
   /**
    * 此前只有 reducer 与服务端 409 在守；渲染层那道 `operable = isPending && isRunning`
@@ -1095,5 +1133,41 @@ describe("foldChain：连续主轮折叠成计数", () => {
   it("空链不炸", () => {
     expect(foldChain([])).toEqual([]);
     expect(foldChain(undefined)).toEqual([]);
+  });
+});
+
+// ================================================================
+// 未读星：跑完了但还没看过
+// ================================================================
+
+describe("未读星取代那条「■ 已完成」", () => {
+  const runs = [
+    { runId: "a", task: "任务甲", status: "done", verify: false, createdAt: 1, finishedAt: 2 },
+    { runId: "b", task: "任务乙", status: "done", verify: false, createdAt: 1, finishedAt: 2 },
+  ];
+
+  it("未读集合里的运行带 unread 标记", () => {
+    const meta = deriveRunListItems(runs, new Map(), new Set(["a"]));
+    expect(meta.get("a")!.unread).toBe(true);
+    expect(meta.get("b")!.unread).toBe(false);
+  });
+
+  it("不传未读集合时一律为 false（旧调用点不受影响）", () => {
+    const meta = deriveRunListItems(runs, new Map());
+    expect(meta.get("a")!.unread).toBe(false);
+  });
+
+  it("选中的那条不亮星——你就在看它", () => {
+    renderRunList(runs, "a", () => {}, deriveRunListItems(runs, new Map(), new Set(["a", "b"])));
+    const star = (id: string) =>
+      (document.querySelector(`[data-run-id="${id}"] .run-item-unread`) as HTMLElement).hidden;
+    expect(star("a"), "选中的那条不该还亮着未读星").toBe(true);
+    expect(star("b"), "没选中且未读的那条应该亮星").toBe(false);
+  });
+
+  it("星带可及名称——读屏用户也得知道这条有新结果", () => {
+    renderRunList(runs, null, () => {}, deriveRunListItems(runs, new Map(), new Set(["a"])));
+    const star = document.querySelector('[data-run-id="a"] .run-item-unread')!;
+    expect(star.getAttribute("aria-label")).toContain("尚未查看");
   });
 });

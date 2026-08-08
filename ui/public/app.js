@@ -1497,7 +1497,7 @@ export function nextCollapseOverride(entries, overrides, seq) {
  * @param {Map<string, RunState>} runStates
  * @returns {Map<string, RunListItemMeta>}
  */
-export function deriveRunListItems(runs, runStates) {
+export function deriveRunListItems(runs, runStates, unread) {
   /** @type {Map<string, RunListItemMeta>} */
   const map = new Map();
   for (const r of runs) {
@@ -1514,6 +1514,14 @@ export function deriveRunListItems(runs, runStates) {
       startTime: r.createdAt,
       duration,
       verdictConclusion,
+      /**
+       * 跑完了但你还没看过。
+       *
+       * 取代那条横贯整屏的「■ 已完成」——"这次结束了"是**列表**该说的事
+       * （你可能同时开着好几个运行、正在别处忙），不是详情页该占一整行去说的事。
+       * 判据由宿主维护：run 收尾时若它不是当前选中的那个就记上，选中即清。
+       */
+      unread: Boolean(unread && unread.has(r.runId)),
     });
   }
   return map;
@@ -1719,6 +1727,8 @@ function patchRunItems(host, runs, metaMap, selectedRunId, onSelect) {
       el.innerHTML =
         '<div class="run-item-status">' +
         '<span class="status-dot"></span>' +
+        // 未读星：跑完了但还没看过。放在状态行最前，扫一眼列表就知道哪条有新结果
+        '<span class="run-item-unread" hidden aria-label="已完成，尚未查看">★</span>' +
         '<span class="verify-badge" hidden>核查</span>' +
         '<span class="run-item-verdict" hidden></span>' +
         '<span class="run-item-state-label"></span>' +
@@ -1751,6 +1761,11 @@ function updateRunItem(el, r, metaMap, selectedRunId) {
   setAttr(el, "aria-selected", String(isSelected));
 
   setClass(el.querySelector(".status-dot"), "status-dot--live", r.status === "running");
+
+  // 未读星只在"没被选中 且 标记未读"时亮——选中即视为看过
+  const unreadEl = el.querySelector(".run-item-unread");
+  setAttr(unreadEl, "hidden", meta && meta.unread && !isSelected ? null : "");
+  setClass(el, "run-item--unread", Boolean(meta && meta.unread && !isSelected));
 
   const verifyBadge = el.querySelector(".verify-badge");
   setAttr(verifyBadge, "hidden", r.verify ? null : "");
@@ -1826,6 +1841,7 @@ export function renderRunDetail(state, callbacks) {
   patchUnverifiedRail(parts, faces);
   patchLiveStrip(parts, state, isRunning, callbacks.liveText ?? "", callbacks.liveThinking ?? "");
   patchConversation(parts, state);
+  patchDetailRail(parts, faces);
   patchOutcomeCard(parts, state, overview, faces);
   patchFactorGrid(parts, faces, activeTab, callbacks);
   patchTabContent(parts, state, activeTab, overview, logEntries, callbacks, faces);
@@ -1917,7 +1933,21 @@ function ensureDetailSkeleton(mainEl, state, callbacks) {
      * 这不是把特色藏起来——恰恰相反：别家把 agent 的内部收进一个转圈图标，
      * 我们把它按时间顺序织进对话里。低切换成本与"明显不同"在这个形态下不冲突。
      */
+    /**
+     * 对话与**右栏**并排。右栏现在装编排模式的子任务盘（planner 拆出来的
+     * 那张 DAG），将来的子 agent 面板也落这里——委托方要求"做好后续右侧
+     * 可能出现子 agent 任务的准备"。
+     *
+     * 没有东西可放时右栏整个不占位（`hidden`），所以单任务模式下对话仍然铺满。
+     * 折叠按钮只在有内容时出现——一个永远空着的折叠柄比没有更糟。
+     */
+    '<div class="detail-layout">' +
     '<div class="conversation" id="conversation"></div>' +
+    '<aside class="detail-rail" id="detail-rail" hidden aria-label="子任务">' +
+    '<button type="button" class="rail-toggle" id="rail-toggle" aria-expanded="true" aria-controls="rail-body">子任务 ⟩</button>' +
+    '<div class="rail-body" id="rail-body"><div class="plan-board"></div></div>' +
+    "</aside>" +
+    "</div>" +
     // 结果卡排在对话之后：它是这次运行的收尾，不是开场白
     '<div class="outcome-card"></div>' +
     '<div class="usage-footer" hidden></div>' +
@@ -1930,6 +1960,16 @@ function ensureDetailSkeleton(mainEl, state, callbacks) {
 
   if (showBack) {
     mainEl.querySelector("#back-to-list-btn").addEventListener("click", callbacks.onBack);
+  }
+  const railToggle = mainEl.querySelector("#rail-toggle");
+  if (railToggle) {
+    railToggle.addEventListener("click", () => {
+      const rail = mainEl.querySelector(".detail-rail");
+      const open = !rail.classList.contains("detail-rail--collapsed");
+      rail.classList.toggle("detail-rail--collapsed", open);
+      railToggle.setAttribute("aria-expanded", String(!open));
+      railToggle.textContent = open ? "⟨ 子任务" : "子任务 ⟩";
+    });
   }
 
   const parts = {
@@ -1944,6 +1984,8 @@ function ensureDetailSkeleton(mainEl, state, callbacks) {
     ...ensureActionDock(),
     liveStrip: mainEl.querySelector(".live-strip"),
     conversation: mainEl.querySelector(".conversation"),
+    rail: mainEl.querySelector(".detail-rail"),
+    railBoard: mainEl.querySelector(".detail-rail .plan-board"),
     drawer: mainEl.querySelector(".detail-drawer"),
     outcome: mainEl.querySelector(".outcome-card"),
     factorGrid: mainEl.querySelector(".factor-grid"),
@@ -2345,6 +2387,22 @@ function patchConversation(parts, state) {
   parts.conversation.innerHTML = renderChatStream(items, state);
 }
 
+/**
+ * 右栏：有子任务才出现。
+ *
+ * 编排模式下 planner 会把任务拆成一张带依赖的子任务图——那正是"子 agent 在做
+ * 什么"。它此前埋在 Loop 面的下钻里，跟"当前这一步进行到哪"隔了两层。
+ * 放到对话右侧之后，读对话与看进度是同一屏。
+ */
+function patchDetailRail(parts, faces) {
+  if (!parts.rail) return;
+  const plan = faces.plan;
+  // 判据是"这是不是一次编排运行"，**不是"有没有子任务"**：
+  // planner fail-closed 时子任务为空，而那句"未能产出可解析计划"最该被看见
+  setAttr(parts.rail, "hidden", plan ? null : "");
+  if (plan) patchPlanBoard(parts, parts.railBoard, plan);
+}
+
 function patchOutcomeCard(parts, state, overview, faces) {
   const v = faces.verification;
   const loop = faces.loop;
@@ -2356,45 +2414,53 @@ function patchOutcomeCard(parts, state, overview, faces) {
   if (parts.sig.outcome === sig) return;
   parts.sig.outcome = sig;
 
-  let html = "";
+  /**
+   * **对话成为主干之后，这张卡里三样东西变成了重复展示**（V-16 的老问题换了个现场）：
+   *   · 「执行者报告」= 最后一条 assistant 文本 = 对话里的最后一条消息；
+   *   · 裁决徽章 / summary / issues = 对话末尾那张 `.chat-verdict`；
+   *   · 「运行中，尚无最终结果。」——运行中本来就在对话里逐条长出来，这句纯噪声。
+   * 委托方直接指了第三样：「这个框框可以不用了」。
+   *
+   * 于是收缩成**一条收尾条**，只保留对话里没有的那件事：**这次是怎么结束的**
+   * （六值终止原因 + 它的补救提示 + 错误原文 + 返工轮数）。运行中整条隐藏。
+   */
   if (state.status === "running") {
-    html += '<p class="outcome-pending">运行中，尚无最终结果。</p>';
-  } else {
-    const cls = classifyStopReason(state.stopReason);
-    html += `<div class="outcome-line outcome-line--${cls.tone}">`;
-    html += `<span class="outcome-mark">■</span> ${esc(cls.label)}`;
-    html += "</div>";
-    if (state.error) html += `<p class="outcome-error">${esc(state.error)}</p>`;
+    setAttr(parts.outcome, "hidden", "");
+    parts.outcome.innerHTML = "";
+    return;
+  }
+  setAttr(parts.outcome, "hidden", null);
+
+  const cls = classifyStopReason(state.stopReason);
+  const rework = loop.reworks > 0
+    ? `<span class="outcome-note">返工 ${loop.reworks} 轮后${v.verdict && v.verdict.passed ? "通过" : "仍未过"}</span>`
+    : "";
+
+  /**
+   * **正常收尾什么都不显示。**（委托方："这个可以不用了……过于占空间了"）
+   *
+   * 一条横贯整屏、只写着「■ 已完成」的条，说的是读对话就能知道的事——
+   * 对话到此为止本身就是"完成了"。占一整行去讲一句废话，是在跟真正有话说的
+   * 那几种收尾抢版面。
+   *
+   * 反过来，**非正常收尾必须留着**：撞轮数上限、撞 token、出错、被否决——
+   * 这几种对话里看不出来（对话只是"停了"），而且各有各的下一步。
+   * 返工过的也留：那是"通过之前失败过几次"，不说就丢了。
+   * 判据一句话：**只在有话要说的时候占位。**
+   */
+  const quiet = cls.tone === "ok" && !cls.hint && !state.error && loop.reworks === 0;
+  if (quiet) {
+    setAttr(parts.outcome, "hidden", "");
+    parts.outcome.innerHTML = "";
+    return;
   }
 
-  if (v.verdict) {
-    const reworkNote = loop.reworks > 0 ? `（返工 ${loop.reworks} 轮后${v.verdict.passed ? "通过" : "仍未过"}）` : "";
-    html += `<div class="outcome-verdict outcome-verdict--${v.badge}">`;
-    html += `<span class="outcome-verdict-badge">${verdictBadgeLabel(v.badge)}</span>`;
-    html += `<span class="outcome-verdict-note">${esc(reworkNote)}</span>`;
-    html += "</div>";
-    if (v.verdict.summary) {
-      html += `<p class="outcome-verdict-summary md-inline">${renderMarkdownInline(v.verdict.summary)}</p>`;
-    }
-    if (v.verdict.issues.length > 0) {
-      // V-19：passed=true 时 issues 降级为黄色备注而不是红色不符——
-      // 项目有两个真实案例是"通过但备注里藏着真 bug"，这一态不能被绿色吞掉
-      const mark = v.verdict.passed ? "⚠" : "✗";
-      const tone = v.verdict.passed ? "warn" : "bad";
-      html += `<ul class="outcome-issues outcome-issues--${tone}">`;
-      html += v.verdict.issues.map((i) => `<li class="md-inline">${mark} ${renderMarkdownInline(i)}</li>`).join("");
-      html += "</ul>";
-    }
-  }
-
-  if (summary) {
-    const lines = summary.split("\n");
-    const long = lines.length > 6;
-    html += '<details class="outcome-summary"' + (long ? "" : " open") + ">";
-    html += `<summary>执行者报告${long ? `（${lines.length} 行）` : ""}</summary>`;
-    html += `<div class="outcome-summary-text">${esc(summary)}</div>`;
-    html += "</details>";
-  }
+  let html =
+    `<div class="outcome-line outcome-line--${cls.tone}">` +
+    `<span class="outcome-mark">■</span> ${esc(cls.label)}${rework}</div>`;
+  // 终止原因的补救提示：撞轮数 / 撞 token 各有各的下一步，这是六值分档的全部意义
+  if (cls.hint) html += `<p class="outcome-hint">${esc(cls.hint)}</p>`;
+  if (state.error) html += `<p class="outcome-error">${esc(state.error)}</p>`;
 
   parts.outcome.innerHTML = html;
 }
@@ -2572,7 +2638,7 @@ function patchTabContent(parts, state, activeTab, overview, logEntries, callback
        * 事件流留在这里的定位随之收窄：逐工具、逐结果的**取证视图**。
        */
       container.innerHTML =
-        '<div class="plan-board"></div>' +
+        // 计划盘已搬到右栏（子任务是"谁在做什么"，属于进度不属于取证）
         '<h3 class="overview-section-title">执行事件流</h3>' +
         '<div class="rework-chain"></div>' +
         '<div class="log-entries"></div>';
@@ -2581,7 +2647,6 @@ function patchTabContent(parts, state, activeTab, overview, logEntries, callback
   }
 
   if (activeTab === "loop") {
-    patchPlanBoard(parts, container.querySelector(".plan-board"), faces.plan);
     patchReworkChain(container.querySelector(".rework-chain"), faces.loop);
     patchLoopView(parts, container, state, logEntries, callbacks);
     return;
