@@ -69,9 +69,21 @@ export interface ModelTurn {
   usage: Anthropic.Usage;
 }
 
+/**
+ * 流式增量。**带 kind 而不是两个回调**：调用方十有八九要把它们送进同一条通道
+ * （事件流 / 直播条），分成两个回调只会让每个宿主各写一遍分发。
+ *
+ * `thinking` 需要 SDK 的 `stream.on("thinking")`——compat 端点未必吐它，
+ * 吐不出来就只是没有思考增量，不影响文本增量与控制流。
+ */
+export interface StreamDelta {
+  kind: "text" | "thinking";
+  text: string;
+}
+
 export interface ModelClient {
-  /** 一律流式发送；text delta 通过 onDelta 旁路（仅供渲染），控制流只依赖最终 ModelTurn */
-  send(req: ModelRequest, onDelta?: (text: string) => void): Promise<ModelTurn>;
+  /** 一律流式发送；增量通过 onDelta 旁路（仅供渲染），控制流只依赖最终 ModelTurn */
+  send(req: ModelRequest, onDelta?: (delta: StreamDelta) => void): Promise<ModelTurn>;
 }
 
 // ---------------------------------------------------------------- L1: 循环与事件
@@ -155,6 +167,12 @@ export type TurnEvent =
     }
   | { type: "usage"; turn: number; usage: Anthropic.Usage }
   | { type: "compaction"; droppedBlocks: number }
+  /**
+   * 思考增量（逐字）。与 `assistant_thinking`（turn 级整块）互补：
+   * 这条用于"运行中看它在想什么"，那条用于事后回看。
+   * 与 text_delta 同族——不占 seq、不进事件缓冲，走 SSE 命名通道。
+   */
+  | { type: "thinking_delta"; text: string }
   /** backoffMs = 本次实际等待毫秒（含抖动）——不带它宿主就看不出重试到底等了多久 */
   | { type: "api_retry"; turn: number; attempt: number; reason: string; backoffMs: number }
   /**

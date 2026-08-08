@@ -27,7 +27,7 @@ import {
   textBlock,
   toolUseBlock,
 } from "./helpers.js";
-import type { Tool, ModelClient, ModelRequest, ModelTurn } from "../src/types.js";
+import type { Tool, ModelClient, ModelRequest, ModelTurn, StreamDelta } from "../src/types.js";
 
 // ------------------------------------------------------
 // Helpers
@@ -1408,10 +1408,12 @@ describe("ui-server", () => {
   it("v2-11. text_delta 不占 seq、不进事件缓冲（走命名通道）", async () => {
     let deltasEmitted = 0;
     const model: ModelClient = {
-      async send(_req: ModelRequest, onDelta?: (text: string) => void): Promise<ModelTurn> {
-        // text_delta 经 send 的第二个参数旁路发出（见 src/types.ts 的 ModelClient 契约）
-        onDelta?.("流式");
-        onDelta?.("片段");
+      async send(_req: ModelRequest, onDelta?: (delta: StreamDelta) => void): Promise<ModelTurn> {
+        // 增量经 send 的第二个参数旁路发出（见 src/types.ts 的 ModelClient 契约）。
+        // 思考增量与文本增量同族：都不占 seq、都走命名通道
+        onDelta?.({ kind: "text", text: "流式" });
+        onDelta?.({ kind: "text", text: "片段" });
+        onDelta?.({ kind: "thinking", text: "想一想" });
         deltasEmitted += 2;
         const message = fakeMessage([textBlock("最终文本")], "end_turn");
         return { message, stopReason: message.stop_reason, usage: message.usage };

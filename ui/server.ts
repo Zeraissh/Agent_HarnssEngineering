@@ -618,10 +618,17 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     // V-15：流式增量走命名通道，不占 seq、不进 run.events。
     // 此前它和其它事件一样被全量缓冲——一次长运行几万条 delta，晚订阅或重连
     // 时全部重放一遍，纯粹是带宽与内存的浪费（而前端还主动丢弃它们）。
-    if (event.type === "text_delta") {
+    if (event.type === "text_delta" || event.type === "thinking_delta") {
+      // kind 区分文本/思考：两者都不占 seq、都不进缓冲（否则重连重放会把几万条
+      // 增量全喷一遍），但前端要分开显示——"它在想什么"与"它在说什么"混成一条
+      // 直播条会前言不搭后语
       broadcastSSE(
         run,
-        `event: delta\ndata: ${JSON.stringify({ source, text: event.text })}\n\n`,
+        `event: delta\ndata: ${JSON.stringify({
+          source,
+          kind: event.type === "thinking_delta" ? "thinking" : "text",
+          text: event.text,
+        })}\n\n`,
       );
       return -1;
     }

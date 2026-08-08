@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type Anthropic from "@anthropic-ai/sdk";
 import { AgentLoop, backoffWithJitter } from "../src/loop.js";
-import type { AgentRunResult, ModelClient, ModelTurn, TurnEvent } from "../src/types.js";
+import type { AgentRunResult, ModelClient, ModelRequest, ModelTurn, TurnEvent } from "../src/types.js";
 import { FakeModelClient, fakeMessage, makeTool, textBlock, toolUseBlock } from "./helpers.js";
 
 async function collect(events: AsyncIterable<TurnEvent>): Promise<{
@@ -388,5 +388,39 @@ describe("思考过程透出（委托方反馈：运行中只有直播条一行�
     const { result } = await collect(new AgentLoop({ ...baseConfig, tools: [] }, model).run("t"));
     const assistant = result.messages.find((m) => m.role === "assistant")!;
     expect(JSON.stringify(assistant.content)).toContain("想一想");
+  });
+});
+
+describe("思考流式增量（thinking_delta）", () => {
+  class DeltaClient implements ModelClient {
+    constructor(private deltas: { kind: "text" | "thinking"; text: string }[]) {}
+    send(_req: ModelRequest, onDelta?: (d: any) => void): Promise<ModelTurn> {
+      for (const d of this.deltas) onDelta?.(d);
+      const m = fakeMessage([textBlock("答")], "end_turn");
+      return Promise.resolve({ message: m, stopReason: m.stop_reason, usage: m.usage });
+    }
+  }
+
+  it("两路增量分别发成 thinking_delta / text_delta，不混成一路", async () => {
+    const model = new DeltaClient([
+      { kind: "thinking", text: "想…" },
+      { kind: "text", text: "说…" },
+    ]);
+    const { events } = await collect(new AgentLoop({ ...baseConfig, tools: [] }, model).run("t"));
+    const think = events.filter((e) => e.type === "thinking_delta");
+    const text = events.filter((e) => e.type === "text_delta");
+    expect(think).toHaveLength(1);
+    expect(text).toHaveLength(1);
+    expect((think[0] as any).text).toBe("想…");
+    expect((text[0] as any).text).toBe("说…");
+  });
+
+  it("端点不吐思考增量时只是没有这一路，不影响文本与控制流", async () => {
+    const model = new DeltaClient([{ kind: "text", text: "只有正文" }]);
+    const { events, result } = await collect(
+      new AgentLoop({ ...baseConfig, tools: [] }, model).run("t"),
+    );
+    expect(events.some((e) => e.type === "thinking_delta")).toBe(false);
+    expect(result.stopReason).toBe("completed");
   });
 });

@@ -16,7 +16,7 @@
  */
 import OpenAI from "openai";
 import type Anthropic from "@anthropic-ai/sdk";
-import type { ModelClient, ModelRequest, ModelTurn } from "./types.js";
+import type { ModelClient, ModelRequest, ModelTurn, StreamDelta } from "./types.js";
 
 export interface OpenAIClientOptions {
   baseURL?: string;
@@ -43,7 +43,7 @@ export class OpenAIModelClient implements ModelClient {
       });
   }
 
-  async send(req: ModelRequest, onDelta?: (text: string) => void): Promise<ModelTurn> {
+  async send(req: ModelRequest, onDelta?: (delta: StreamDelta) => void): Promise<ModelTurn> {
     const stream = await this.client.chat.completions.create({
       model: this.model,
       max_tokens: req.maxTokens,
@@ -66,7 +66,16 @@ export class OpenAIModelClient implements ModelClient {
       if (!choice) continue;
       if (choice.delta?.content) {
         text += choice.delta.content;
-        onDelta?.(choice.delta.content);
+        onDelta?.({ kind: "text", text: choice.delta.content });
+      }
+      // 推理增量：OpenAI 协议没有统一字段名——DeepSeek 用 reasoning_content，
+      // 另有端点用 reasoning。两个都认，都没有就只是没有这一路。
+      const reasoning =
+        (choice.delta as { reasoning_content?: unknown; reasoning?: unknown } | undefined)
+          ?.reasoning_content ??
+        (choice.delta as { reasoning?: unknown } | undefined)?.reasoning;
+      if (typeof reasoning === "string" && reasoning) {
+        onDelta?.({ kind: "thinking", text: reasoning });
       }
       for (const tc of choice.delta?.tool_calls ?? []) {
         const slot = (calls[tc.index] ??= { id: "", name: "", args: "" });

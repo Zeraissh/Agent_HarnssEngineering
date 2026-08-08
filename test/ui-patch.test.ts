@@ -698,3 +698,33 @@ describe("计划确认门的签字位", () => {
     expect(head).not.toContain("异常终止");
   });
 });
+
+describe("思考流式：直播条在正文之前显示它在想什么", () => {
+  function running() {
+    let s = createInitialState("run-th", "任务", false);
+    return reduceEvents(s, [sse(0, "main", "turn_start", { turn: 1 })]);
+  }
+  const liveText = () => document.querySelector(".live-strip .live-text")?.textContent ?? "";
+
+  it("只有思考增量时显示思考（此前这段是「等待模型响应…」的空窗）", () => {
+    renderRunDetail(running(), { activeTab: "loop", liveThinking: "先看 package.json 再决定" });
+    expect(liveText()).toContain("✽");
+    expect(liveText()).toContain("package.json");
+    expect(liveText()).not.toContain("等待模型响应");
+  });
+
+  it("正文一来就压过思考——它已经想完了", () => {
+    renderRunDetail(running(), {
+      activeTab: "loop",
+      liveThinking: "还在想",
+      liveText: "我先读一下配置",
+    });
+    expect(liveText()).toContain("我先读一下配置");
+    expect(liveText()).not.toContain("还在想");
+  });
+
+  it("两者都空时退回原行为", () => {
+    renderRunDetail(running(), { activeTab: "loop" });
+    expect(liveText()).toContain("等待模型响应");
+  });
+});

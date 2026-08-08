@@ -436,6 +436,7 @@ function renderDetailWithState(state) {
     onToggleEntry: handleToggleEntry,
     harness: harnessSnapshot,
     liveText: liveTexts.get(runId) ?? "",
+    liveThinking: liveThinking.get(runId) ?? "",
     onPlanDecision: (decision) => postPlanDecision(runId, decision),
     loopView: loopViews.get(runId) ?? "events",
     transcript: transcripts.get(runId) ?? null,
@@ -572,6 +573,8 @@ async function loadHarness() {
  * @type {Map<string, string>}
  */
 const liveTexts = new Map();
+/** 思考增量缓冲。与 liveTexts 同族（不进 RunState），但分开存——正文一来就清掉它 */
+const liveThinking = new Map();
 /** 缓冲上限：只用来显示尾部 80 字，没必要为一次长生成攒下几十 KB */
 const LIVE_TEXT_CAP = 2000;
 
@@ -580,9 +583,16 @@ const LIVE_TEXT_CAP = 2000;
  * rAF 不触发"那个坑同样适用，所以复用同一个调度器实现而不是自己写节流。
  */
 const deltaBatcher = createBatcher((batches) => {
+  const cap = (s) => (s.length > LIVE_TEXT_CAP ? s.slice(-LIVE_TEXT_CAP) : s);
   for (const [runId, chunks] of batches) {
-    const merged = (liveTexts.get(runId) ?? "") + chunks.join("");
-    liveTexts.set(runId, merged.length > LIVE_TEXT_CAP ? merged.slice(-LIVE_TEXT_CAP) : merged);
+    const textPart = chunks.filter((c) => c.kind === "text").map((c) => c.text).join("");
+    const thinkPart = chunks.filter((c) => c.kind === "thinking").map((c) => c.text).join("");
+    if (thinkPart) liveThinking.set(runId, cap((liveThinking.get(runId) ?? "") + thinkPart));
+    if (textPart) {
+      liveTexts.set(runId, cap((liveTexts.get(runId) ?? "") + textPart));
+      // 正文一开始流，思考就该让位——它已经想完了
+      liveThinking.delete(runId);
+    }
     if (selectedRunId !== runId) continue;
     const state = runStates.get(runId);
     if (state) renderDetailWithState(state);
@@ -602,6 +612,7 @@ const batcher = createBatcher((batches) => {
       const t = item?.event?.type;
       if (t === "turn_start" || t === "tool_call" || t === "done") {
         liveTexts.delete(runId);
+        liveThinking.delete(runId);
         break;
       }
     }
@@ -614,6 +625,7 @@ const batcher = createBatcher((batches) => {
     // run_end 是唯一的"可以收工"信号：此时主动 close，浏览器才不会再自动重连
     if (next.status === "done") {
       liveTexts.delete(runId); // 运行结束，直播条隐藏，缓冲没有留存意义
+      liveThinking.delete(runId);
       const es = eventSources.get(runId);
       if (es) {
         es.close();
@@ -657,9 +669,10 @@ function ensureSubscription(runId) {
   // 只取 main 来源——verifier/planner 的思考流不该抢占委托方的直播条。
   es.addEventListener("delta", (msg) => {
     try {
-      const { source, text } = JSON.parse(msg.data);
+      const { source, kind, text } = JSON.parse(msg.data);
       if (source !== "main" || typeof text !== "string" || text === "") return;
-      deltaBatcher.push(runId, text);
+      // 思考与正文分两路：混进一条直播条会前言不搭后语
+      deltaBatcher.push(runId, { kind: kind === "thinking" ? "thinking" : "text", text });
     } catch {
       // 解析失败静默：直播条是锦上添花，不能因为一条坏帧影响主流程
     }

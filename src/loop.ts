@@ -206,8 +206,12 @@ export class AgentLoop {
       let modelTurn;
       for (let attempt = 0; ; attempt++) {
         try {
-          modelTurn = await this.model.send(request, (text) =>
-            q.push({ type: "text_delta", text }),
+          modelTurn = await this.model.send(request, (delta) =>
+            q.push(
+              delta.kind === "thinking"
+                ? { type: "thinking_delta", text: delta.text }
+                : { type: "text_delta", text: delta.text },
+            ),
           );
           break;
         } catch (err) {

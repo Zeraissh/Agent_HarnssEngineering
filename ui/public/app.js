@@ -1567,7 +1567,7 @@ export function renderRunDetail(state, callbacks) {
     patchApprovalRail(parts, state, isRunning, callbacks);
     patchUnverifiedRail(parts, faces);
   });
-  patchLiveStrip(parts, state, isRunning, callbacks.liveText ?? "");
+  patchLiveStrip(parts, state, isRunning, callbacks.liveText ?? "", callbacks.liveThinking ?? "");
   patchOutcomeCard(parts, state, overview, faces);
   patchFactorGrid(parts, faces, activeTab, callbacks);
   patchTabContent(parts, state, activeTab, overview, logEntries, callbacks, faces);
@@ -1816,18 +1816,23 @@ function patchUnverifiedRail(parts, faces) {
  * assistant_text 都是已经发生完的。控制器在 turn_start / tool_call / done
  * 时清空缓冲，所以文本阶段一结束就自动让位给工具标签。
  */
-function patchLiveStrip(parts, state, isRunning, liveText = "") {
+function patchLiveStrip(parts, state, isRunning, liveText = "", liveThinking = "") {
   if (!isRunning) {
     setAttr(parts.liveStrip, "hidden", "");
     parts.sig.live = null;
     return;
   }
   const streaming = String(liveText ?? "").trim();
+  const thinking = String(liveThinking ?? "").trim();
   const recent = [...state.timeline].reverse();
   const call = recent.find((e) => e.type === "tool_call");
   const text = recent.find((e) => e.type === "assistant_text");
+  // 优先级：正文 > 思考 > 工具 > 最后一句。思考排在工具之前是因为它是【此刻】
+  // 在发生的——委托方反馈的那段"只有一行流动对话"的空窗正是它
   const label = streaming
     ? tailOf(streaming, 80)
+    : thinking
+    ? `✽ ${tailOf(thinking, 76)}`
     : call
       ? `${call.name}(${summarizeInput(call.input)})`
       : text

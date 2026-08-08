@@ -3,7 +3,7 @@
  * 决策（docs/02）：一律流式；adaptive thinking 显式开启；不暴露已移除的采样参数。
  */
 import Anthropic from "@anthropic-ai/sdk";
-import type { ModelClient, ModelRequest, ModelTurn } from "./types.js";
+import type { ModelClient, ModelRequest, ModelTurn, StreamDelta } from "./types.js";
 
 export interface ModelClientOptions {
   /**
@@ -27,7 +27,7 @@ export class AnthropicModelClient implements ModelClient {
     this.compat = opts?.compat ?? !model.startsWith("claude");
   }
 
-  async send(req: ModelRequest, onDelta?: (text: string) => void): Promise<ModelTurn> {
+  async send(req: ModelRequest, onDelta?: (delta: StreamDelta) => void): Promise<ModelTurn> {
     const stream = this.client.messages.stream({
       model: this.model,
       max_tokens: req.maxTokens,
@@ -42,7 +42,9 @@ export class AnthropicModelClient implements ModelClient {
     });
 
     if (onDelta) {
-      stream.on("text", (delta) => onDelta(delta));
+      stream.on("text", (delta) => onDelta({ kind: "text", text: delta }));
+      // 思考增量：compat 端点未必吐，吐不出来就只是没有这一路，不影响其它
+      stream.on("thinking", (delta) => onDelta({ kind: "thinking", text: delta }));
     }
 
     // 重试（429/5xx 指数退避）由 SDK 内置处理；耗尽后异常向上抛给 loop 分类
