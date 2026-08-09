@@ -548,6 +548,15 @@ async function main(): Promise<void> {
       },
       onEvent: async (source, event) => {
         noteForLedger(source, event);
+        /**
+         * planner 的审批不进宿主应答路径：它的只读契约由 drainPlannerEvents
+         * 自答 deny 执行。此前 --yes 会在这里抢答 allow（onEvent 先于 drain 的
+         * switch 运行，respond 先到先得）——planner 的 bash 全被放行执行，
+         * 只读纪律被打穿。这是"宿主审批抢答"的第三次现身：eval 宿主打穿
+         * verifier（已修：只放行 main/rework）、本处打穿 planner。
+         * verifier 靠下面的 isVerifier 分支挡住，planner 在这里挡。
+         */
+        if (source === "planner" && event.type === "approval_request") return;
         if (effectiveConcurrency > 1 && source !== "planner") {
           await renderParallelEvent(source, event);
           return;

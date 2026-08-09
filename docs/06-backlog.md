@@ -217,13 +217,39 @@ source/事件流/台账/文档保持结构名（planner/verifier/sN/main），�
 「◆ 某某（核查 · 全新上下文）」）——verifier 的公信力来自"独立上下文"这个
 结构事实，别让名字把它盖住。→ 等委托方定命名风格（人名/代号/自定义）再动。
 
+**B0b.（新，案例 #9 第二跑实弹暴露）收口续跑会被"继续取证"吃掉——提示挡不住，要结构化禁工具。**
+planner 12 轮跑满触发收口续跑，收口提示明写"**现在不要再调用任何工具**"，
+模型照样连调两轮 bash（cat fp-lib-table / sym-lib-table），把
+`PLANNER_WRAPUP_MAX_TURNS=2` 全烧在取证上，一个字的计划都没写 → 转写兜底
+诚实拒编（`{"subtasks": []}`）→ fail-closed。**这是 P6（不变量靠 harness 不靠
+自觉）在收口这一层的欠账**：verifier 的 9.7 四跑恰好没撞上，不等于不存在。
+→ 正解候选：收口续跑的那个 loop 强制 `tool_choice: "none"`（Anthropic 与
+OpenAI wire 都支持；工具面保留在请求里，历史 tool 块不受影响）——需要给
+ModelRequest/两个客户端加 toolChoice 透传，planner 与 verifier 的收口调用点
+同改，行为锁：脚本模型在收口轮请求工具 → 请求体里 tool_choice=none 且模型
+文本被采纳。**先于"再加收口预算"做**——预算加大只是让不服管的取证跑更久
+（同 9.7 那条"三层归因"的教训）。
+
 **D5. 案例 #9 首跑：编排未完成（fast-fail 正当，证据已入册）。**
 s1（原理图）主轮与返工各跑满 40 轮（台账 turns=80=40+40），7 个官方库符号
 抽进 `_extracted/` 但 `.kicad_sch` 从未组装出来；verifier 两轮拒签正当，s2 未发射。
 顺带两条首证：verifier 收口续跑（9.7）首次实弹救回裁决（round 0
 recovery=wrapup）；§2.1 裁决样本开始入账。已按实测把 kicad 执行者护栏
 40→70（对照案例 #5：更小的板全流程 36 轮；本案件数约两倍），TASK.md 补了
-`_extracted/` 复用提示。**续跑待发**（LAUNCH.ps1 原样可用）。
+`_extracted/` 复用提示。
+
+**第二跑（2026-08-09 上午）另收获三条**：
+- 403 秒败一次：发射脚本"进程已有值不覆盖"的礼貌逻辑从 agent 会话 shell
+  发射时继承了那个会话自己的 ANTHROPIC_*（指向 api.anthropic.com）——
+  观测装置的性质，不是被测对象；LAUNCH.ps1 已改强制设定；
+- planner 12 轮跑满未收口（38 次调用还在"再查一件事"）→ kicad 包已声明
+  `plan.maxTurns: 20`（B0 机制的第一个实测数字）；收口续跑被继续取证吃掉
+  → 立项 B0b（见上）；
+- **CLI `--yes` 抢答打穿 planner 只读纪律（已修）**：onEvent 先于 drain 的
+  deny 应答 allow，planner 的 bash 全被放行执行。宿主审批抢答第三次现身
+  （eval 打穿 verifier → CLI 打穿 planner），修在路由层：planner 的
+  approval_request 不进宿主应答路径。CLI 无测试基建，此修暂无自动化锁——
+  接手时留意。**第三跑已带全部三项修正发射。**
 
 ### C. 研究线
 

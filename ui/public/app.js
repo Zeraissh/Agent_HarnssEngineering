@@ -2499,7 +2499,7 @@ function patchPlanGate(parts, state, faces, callbacks) {
   parts.planGate.innerHTML =
     '<div class="plan-gate-card">' +
     '<h3 class="rail-title">◈ 计划待你签字</h3>' +
-    `<p class="plan-gate-body">planner 已拆出 <strong>${count}</strong> 个子任务（详见 Plan 面）。` +
+    `<p class="plan-gate-body">${ROLE_PERSONA.planner}（planner）已拆出 <strong>${count}</strong> 个子任务（详见 Plan 面）。` +
     "批准后才会发射第一个子任务；此刻否决没有任何副作用。</p>" +
     '<div class="plan-gate-actions">' +
     '<button class="btn btn--allow" data-action="approve">批准并开跑</button>' +
@@ -3696,7 +3696,10 @@ export function deriveChatItems(state, live) {
         }
         break;
       case "assistant_text":
-        if (String(e.text ?? "").trim()) items.push({ kind: "text", text: e.text, seq: e.seq });
+        // role 是给发言署名用的（人名映射在渲染层，见 ROLE_PERSONA）
+        if (String(e.text ?? "").trim()) {
+          items.push({ kind: "text", text: e.text, seq: e.seq, role: segmentRole(e.source) });
+        }
         break;
       case "tool_call":
         callAt.set(e.toolUseId, items.length);
@@ -3750,7 +3753,8 @@ export function deriveChatItems(state, live) {
   const liveText = String(live?.text ?? "");
   const liveThinking = String(live?.thinking ?? "");
   if (state.status === "running" && (liveText.trim() || liveThinking.trim())) {
-    items.push({ kind: "live", text: liveText, thinking: liveThinking });
+    // 直播只有 main 来源（planner/verifier 的流不进直播缓冲），署名跟着走
+    items.push({ kind: "live", text: liveText, thinking: liveThinking, role: "main" });
   }
 
   // 稳定 key：节点靠它复用，不复用就保不住 details 的展开状态与滚动位置
@@ -3883,7 +3887,7 @@ export function renderChatItem(it, thinkingOpen = false) {
         break;
       case "text":
         html +=
-          '<div class="chat-msg chat-msg--assistant"><div class="chat-role">¶ Agent</div>' +
+          `<div class="chat-msg chat-msg--assistant"><div class="chat-role">¶ ${esc(ROLE_PERSONA[it.role] ?? "Agent")}</div>` +
           `<div class="chat-body chat-body--text md">${renderAssistantText(it.text)}</div></div>`;
         break;
       case "thinking":
@@ -3914,7 +3918,7 @@ export function renderChatItem(it, thinkingOpen = false) {
         }
         if (it.text.trim()) {
           html +=
-            '<div class="chat-msg chat-msg--assistant chat-msg--live"><div class="chat-role">¶ Agent</div>' +
+            `<div class="chat-msg chat-msg--assistant chat-msg--live"><div class="chat-role">¶ ${esc(ROLE_PERSONA[it.role] ?? "Agent")}</div>` +
             `<div class="chat-body chat-body--text md chat-live-text">${renderLiveText(it.text)}</div></div>`;
         }
         break;
@@ -4005,13 +4009,31 @@ function firstLine(text, max) {
   return truncate(line.trim(), max);
 }
 
+/**
+ * 角色人名（backlog D4，委托方要求）。**显示层别名 only**：
+ * source/事件流/台账/正史全部保持结构名（planner/verifier/sN/main），
+ * 人名只在渲染时映射——进了协议层就是记录串味、改名即漂移。
+ *
+ * 姓名即角色：计明远——"计"划，谋定而后动，只看不改；施敢当——"施"工 +
+ * 石敢当（顶得住事的那位，返工也是他，同一个人回来修自己的活）；
+ * 严不苟——"严"格 + 一丝不苟，拒签是他的本职。
+ * 人名必须与角色语义**并列显示**：严不苟的公信力来自"全新上下文"这个
+ * 结构事实，不来自名字——名字不许把它盖住。
+ */
+export const ROLE_PERSONA = {
+  planner: "计明远",
+  main: "施敢当",
+  rework: "施敢当",
+  verifier: "严不苟",
+};
+
 /** 段分界：main→verifier 用 ━，返工用 CLI 同款 ↺（src/cli.ts:449） */
 function renderSegmentBoundary(seg) {
   const label = {
-    verifier: "核查 Agent 独立复核（全新上下文）",
-    rework: `核查未通过，开始返工（第 ${seg.round} 轮）`,
-    planner: "计划单元（planner，只读拆解）",
-    main: "Agent 执行",
+    verifier: `${ROLE_PERSONA.verifier} · 核查（全新上下文独立复核）`,
+    rework: `${ROLE_PERSONA.rework} · 核查未通过，返工（第 ${seg.round} 轮）`,
+    planner: `${ROLE_PERSONA.planner} · 计划单元（只读拆解）`,
+    main: `${ROLE_PERSONA.main} · Agent 执行`,
   }[seg.role];
   const mark = seg.role === "rework" ? "↺" : seg.role === "verifier" ? "◆" : seg.role === "planner" ? "❑" : "▸";
   // 编排模式下来源形如 "s1/main"：并行时多个子任务的日志按 seq 交错，

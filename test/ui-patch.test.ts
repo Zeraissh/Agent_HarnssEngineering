@@ -1546,6 +1546,52 @@ describe("对话贴底跟随", () => {
   });
 });
 
+describe("角色人名（backlog D4：显示层别名，与角色语义并列）", () => {
+  function crewState() {
+    const s = createInitialState("run-crew", "任务", true);
+    return reduceEvents(s, [
+      sse(0, "planner", "assistant_text", { text: "我先拆解任务" }),
+      sse(1, "s1/main", "assistant_text", { text: "开始施工" }),
+      sse(2, "s1/verifier", "assistant_text", { text: "开始核查" }),
+    ]);
+  }
+
+  it("段分界带人名，且角色语义并列在同一条分界上——名字不许盖住「全新上下文」", () => {
+    renderRunDetail(crewState(), { activeTab: "loop" });
+    // 锁必须打在分界元素本身：初版断言整段对话文本，发言署名里的人名会把
+    // "分界丢了人名"的变异救绿（变异测试当场抓出来的教训）
+    const boundaries = [...document.querySelectorAll(".segment-boundary")].map(
+      (n) => n.textContent ?? "",
+    );
+    expect(boundaries.some((b) => b.includes("计明远") && b.includes("只读拆解"))).toBe(true);
+    expect(boundaries.some((b) => b.includes("施敢当") && b.includes("Agent 执行"))).toBe(true);
+    expect(boundaries.some((b) => b.includes("严不苟") && b.includes("全新上下文"))).toBe(true);
+  });
+
+  it("发言署名跟角色走：计明远/施敢当各自具名，不再一律「Agent」", () => {
+    renderRunDetail(crewState(), { activeTab: "loop" });
+    const roles = [...document.querySelectorAll(".chat-msg--assistant .chat-role")].map(
+      (n) => n.textContent ?? "",
+    );
+    expect(roles.some((r) => r.includes("计明远"))).toBe(true);
+    expect(roles.some((r) => r.includes("施敢当"))).toBe(true);
+  });
+
+  it("人名只在显示层——事件流与派生层的 source 仍是结构名（改名不漂移记录）", () => {
+    const s = crewState();
+    expect(s.timeline.every((e: any) => !/计明远|施敢当|严不苟/.test(String(e.source)))).toBe(true);
+    const boundary = deriveChatItems(s, null).find((it: any) => it.kind === "boundary");
+    expect(boundary!.source).toBe("planner");
+  });
+
+  it("直播条目署名施敢当（直播只有 main 来源）", () => {
+    let s = createInitialState("run-crew2", "任务", false);
+    s = reduceEvents(s, [sse(0, "main", "turn_start", { turn: 1 })]);
+    renderRunDetail(s, { activeTab: "loop", liveText: "正在写……" });
+    expect(document.querySelector(".chat-msg--live .chat-role")!.textContent).toContain("施敢当");
+  });
+});
+
 describe("paceReveal：把上游的一阵一阵摊成匀速", () => {
   /**
    * 委托方："有时候会卡住然后突然冒一长串。"

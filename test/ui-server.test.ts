@@ -23,6 +23,8 @@ import { readFileSync, existsSync } from "node:fs";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createUiServer, contentTypeOf, planGateStopReason, revealCommand, type UiServerHandle } from "../ui/server.js";
+import { resolvePlannerMaxTurns } from "../src/planner.js";
+import { PACKS } from "../src/presets.js";
 import { DEFAULT_HISTORY_KEEP, historyKeepCount, historyRootPath } from "../ui/history.js";
 import {
   FakeModelClient,
@@ -1315,9 +1317,13 @@ describe("ui-server", () => {
     expect(snap.pack.verify.readOnlyCommands.length).toBeGreaterThan(0);
     expect(snap.pack.verify.mode).toBeTruthy();
     expect(snap.verifierBudgetTurns).toBe(15);
-    // planner 预算同款（B0）：数字 + 来源，缺一不可
-    expect(snap.plannerBudgetTurns).toBe(12);
-    expect(snap.plannerBudgetSource).toBe("default");
+    // planner 预算同款（B0）：数字 + 来源，缺一不可。
+    // 不写死数字（初版写 12，kicad 声明 plan.maxTurns 当天就过期了）——
+    // 锁的是"快照与解析器同答案"这条装配一致性，数字归 presets 管
+    expect(snap.plannerBudgetTurns).toBe(resolvePlannerMaxTurns(Object.values(PACKS)));
+    expect(snap.plannerBudgetSource).toBe(
+      Object.values(PACKS).some((p) => p.plan?.maxTurns !== undefined) ? "pack" : "default",
+    );
     expect(snap.compactWatermark).toBe(0.8);
     expect(Array.isArray(snap.tools)).toBe(true);
     expect(snap.tools.every((t: any) => t.name && t.permission)).toBe(true);
