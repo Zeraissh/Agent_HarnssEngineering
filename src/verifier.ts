@@ -144,7 +144,9 @@ export async function runVerifier(
    */
   if (isParseFailure(verdict) && first.stopReason === "max_turns" && first.messages.length > 0) {
     const wrapUp = await drainVerifierEvents(
-      new AgentLoop({ ...cfg, maxTurns: VERIFIER_WRAPUP_MAX_TURNS }, model).runContinuation(
+      // toolChoice none（B0b）：收口段结构化禁工具——案例 #9 实测收口提示会被
+      // "继续取证"无视，2 轮收口预算全烧在工具上
+      new AgentLoop({ ...cfg, maxTurns: VERIFIER_WRAPUP_MAX_TURNS, toolChoice: "none" }, model).runContinuation(
         first.messages as Anthropic.MessageParam[],
         buildWrapUpPrompt(first.turns),
       ),

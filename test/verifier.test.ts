@@ -576,6 +576,9 @@ describe("预算用尽后的收口（案例 #8 的 9.7 / 9.2）", () => {
     expect(flat).toContain("独立验证员");
     expect(flat).toContain("tu_1");
     expect(flat).toContain("tu_3");
+    // B0b：收口段结构化禁工具——调查轮不带、收口轮必须带（提示挡不住"继续取证"）
+    expect(reqs[0]!.toolChoice).toBeUndefined();
+    expect(wrapUp.toolChoice).toBe("none");
     // 且收口提示明确禁止继续取证
     expect(flat).toContain("不要再调用任何工具");
     expect(flat).toContain("不得因为没查完就判 failed");

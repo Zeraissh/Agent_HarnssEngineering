@@ -60,6 +60,12 @@ export interface ModelRequest {
   tools: Anthropic.Tool[];
   maxTokens: number;
   effort: Effort;
+  /**
+   * 结构化禁工具（B0b）：设 "none" 时两个 wire 都下发对应的 tool_choice
+   * （Anthropic `{type:"none"}` / OpenAI `"none"`；DeepSeek 兼容端点实测接受）。
+   * 工具面保留在请求里——历史含 tool_use 块时不能撤 tools 声明。
+   */
+  toolChoice?: "none";
 }
 
 /** 归一化后的一次模型往返 */
@@ -124,6 +130,14 @@ export interface AgentConfig {
   compat?: boolean;
   /** 上下文 token 上限（触发 compact 的依据，按上一轮实际输入衡量）。默认 150_000 */
   contextTokenLimit?: number;
+  /**
+   * 结构化禁工具（B0b，案例 #9 第二跑实弹催生）：收口续跑的"别再调工具"
+   * 不能靠模型自觉——实测收口提示被无视、2 轮收口预算全烧在继续取证上。
+   * 设 "none" 时：① 请求下发 tool_choice=none；② loop 对仍然返回的 tool_use
+   * **不执行**，回一条可操作的拒绝让模型改写结论（双保险：端点可能只收不认）。
+   * 用途：verifier/planner 的收口 loop。
+   */
+  toolChoice?: "none";
   /**
    * loop 层对瞬时 API 错误（网络/超时/429/5xx）的同轮重试次数，默认 1。
    * 与 SDK 内置的 HTTP 重试是两层：SDK 耗尽后 loop 再兜一次，避免整个 run 因

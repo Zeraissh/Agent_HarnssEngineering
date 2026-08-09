@@ -53,6 +53,8 @@ export class OpenAIModelClient implements ModelClient {
       max_tokens: req.maxTokens,
       messages: toOpenAIMessages(req),
       ...(req.tools.length > 0 ? { tools: toOpenAITools(req.tools) } : {}),
+      // B0b 结构化禁工具（OpenAI wire 的标准取值）
+      ...(req.toolChoice && req.tools.length > 0 ? { tool_choice: req.toolChoice } : {}),
       stream: true,
       stream_options: { include_usage: true },
     },

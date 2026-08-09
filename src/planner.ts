@@ -321,7 +321,8 @@ export async function runStructuredPlanner(
   // 正解是续跑同一会话：正史与工具返回都还在，只要求"别查了，现在写清单"。
   if (!inventory && first.stopReason === "max_turns" && first.messages.length > 0) {
     const wrapUp = await drainPlannerEvents(
-      new AgentLoop({ ...cfg, maxTurns: PLANNER_WRAPUP_MAX_TURNS }, model).runContinuation(
+      // toolChoice none（B0b）：收口段结构化禁工具，提示挡不住"再查一件事"
+      new AgentLoop({ ...cfg, maxTurns: PLANNER_WRAPUP_MAX_TURNS, toolChoice: "none" }, model).runContinuation(
         first.messages as Anthropic.MessageParam[],
         buildInventoryWrapUpPrompt(first.turns),
       ),
@@ -478,7 +479,9 @@ export async function runPlanner(
   // 正解是续跑同一会话：正史与工具返回都还在，只要求"别查了，现在写计划"。
   if (!plan && first.stopReason === "max_turns" && first.messages.length > 0) {
     const wrapUp = await drainPlannerEvents(
-      new AgentLoop({ ...cfg, maxTurns: PLANNER_WRAPUP_MAX_TURNS }, model).runContinuation(
+      // toolChoice none（B0b）：收口段结构化禁工具——案例 #9 第二跑实测收口提示
+      // 被"继续取证"无视，2 轮收口预算全烧在工具上，一个字的计划没写
+      new AgentLoop({ ...cfg, maxTurns: PLANNER_WRAPUP_MAX_TURNS, toolChoice: "none" }, model).runContinuation(
         first.messages as Anthropic.MessageParam[],
         buildPlanWrapUpPrompt(first.turns),
       ),

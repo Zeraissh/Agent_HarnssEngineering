@@ -54,6 +54,57 @@ describe("AgentLoop", () => {
     expect(blocks.every((b) => b.type === "tool_result")).toBe(true);
   });
 
+  /**
+   * B0b 结构化禁工具（案例 #9 第二跑实弹催生）：收口段的"别再调工具"不能靠
+   * 模型自觉——tool_choice=none 已随请求发出，但兼容端点可能只收不认。
+   * loop 层是真不变量：不执行、回可操作拒绝、让模型用剩余轮次写结论。
+   */
+  it("toolChoice=none：模型仍请求工具时不执行，回拒绝结果，下一轮的纯文本被采纳", async () => {
+    let executed = 0;
+    const probe = makeTool({
+      name: "probe",
+      execute: async () => {
+        executed += 1;
+        return { content: "should never run" };
+      },
+    });
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("tu_1", "probe", {})], "tool_use"),
+      fakeMessage([textBlock("最终结论")], "end_turn"),
+    ]);
+    const loop = new AgentLoop({ ...baseConfig, tools: [probe], toolChoice: "none" }, model);
+    const { events, result } = await collect(loop.run("收口"));
+
+    expect(executed, "禁工具段的工具绝不能真的执行").toBe(0);
+    // 请求层也带了 tool_choice（省轮数的优化层）
+    expect(model.requests[0]!.toolChoice).toBe("none");
+    // 拒绝以 tool_result 形式回给模型（API 结构约束：每个 tool_use 必须有对应结果）
+    const refusal = events.find((e) => e.type === "tool_result");
+    expect(refusal && refusal.type === "tool_result" && refusal.result.isError).toBe(true);
+    const resultMsg = result.messages[2]!;
+    expect(JSON.stringify(resultMsg.content)).toContain("此阶段工具不可用");
+    expect(result.stopReason).toBe("completed");
+  });
+
+  it("未设 toolChoice 的 loop 不受影响：请求不带 tool_choice，工具照常执行", async () => {
+    let executed = 0;
+    const probe = makeTool({
+      name: "probe",
+      execute: async () => {
+        executed += 1;
+        return { content: "ran" };
+      },
+    });
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("tu_1", "probe", {})], "tool_use"),
+      fakeMessage([textBlock("done")], "end_turn"),
+    ]);
+    const { result } = await collect(new AgentLoop({ ...baseConfig, tools: [probe] }, model).run("go"));
+    expect(executed).toBe(1);
+    expect(model.requests[0]!.toolChoice).toBeUndefined();
+    expect(result.stopReason).toBe("completed");
+  });
+
   it("parallelSafe 工具并发执行，非 parallelSafe 串行", async () => {
     const timeline: string[] = [];
     const slowParallel = (name: string) =>

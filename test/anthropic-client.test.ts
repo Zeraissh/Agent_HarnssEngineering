@@ -89,6 +89,20 @@ describe("AnthropicModelClient 请求构造契约", () => {
     }
   });
 
+  it("toolChoice=none → tool_choice {type:none}，compat 与否都发（B0b；DeepSeek 兼容端点实测接受）", async () => {
+    for (const compat of [false, true]) {
+      const { client, calls } = makeFakeSdk();
+      await new AnthropicModelClient("m", client as never, { compat }).send({ ...req, toolChoice: "none" });
+      expect(calls[0]!["tool_choice"], `compat=${compat}`).toEqual({ type: "none" });
+    }
+  });
+
+  it("未设 toolChoice 时不发 tool_choice 字段", async () => {
+    const { client, calls } = makeFakeSdk();
+    await new AnthropicModelClient("m", client as never, { compat: true }).send(req);
+    expect(calls[0]).not.toHaveProperty("tool_choice");
+  });
+
   it("基础字段原样透传（model / max_tokens / system / messages / tools）", async () => {
     const { client, calls } = makeFakeSdk();
     await new AnthropicModelClient("claude-opus-4-8", client as never, { compat: false }).send(req);

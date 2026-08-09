@@ -204,6 +204,9 @@ describe("预算用尽后的收口（B0——9.7/9.2 的 planner 版）", () => 
     const wrapReq = model.requests[3]!;
     expect(wrapReq.messages.length).toBeGreaterThan(1);
     expect(JSON.stringify(wrapReq.messages.at(-1)!.content)).toContain("预算已经用尽");
+    // B0b：收口段结构化禁工具——调查轮不带、收口轮必须带
+    expect(model.requests[0]!.toolChoice).toBeUndefined();
+    expect(wrapReq.toolChoice).toBe("none");
   });
 
   it("结构化协议同款收口（契约换成分片清单）", async () => {
@@ -217,6 +220,7 @@ describe("预算用尽后的收口（B0——9.7/9.2 的 planner 版）", () => 
     expect(outcome.plan).toBeDefined();
     expect(outcome.recovery).toBe("wrapup");
     expect(JSON.stringify(model.requests[2]!.messages.at(-1)!.content)).toContain("分片清单");
+    expect(model.requests[2]!.toolChoice).toBe("none"); // B0b：结构化协议的收口同样禁工具
   });
 
   it("兜底都没救回 → failureSummary 带轮数与工具分布（区分「胡言乱语」与「没来得及收口」）", async () => {

@@ -38,6 +38,42 @@ describe("resolveInWorkdir", () => {
   });
 });
 
+/**
+ * read_file 切片（案例 #9 第四跑催生）：verifier 读大 s-expression 文件时
+ * **幻觉了 offset 参数**，被失败开放校验静默放行、返回文件头，还把"参数没生效"
+ * 写进了裁决。模型自发想要的参数是真需求的最诚实信号——补上，语义按行、1 基。
+ */
+describe("read_file offset/limit 切片", () => {
+  beforeAll(async () => {
+    await writeFileTool.execute(
+      { path: "sliced.txt", content: "L1\nL2\nL3\nL4\nL5" },
+      { workdir, toolUseId: "tu_seed_slice", signal: new AbortController().signal },
+    );
+  });
+
+  it("offset+limit：1 基行号切片，带范围头", async () => {
+    const r = await readFileTool.execute({ path: "sliced.txt", offset: 2, limit: 2 }, ctx());
+    expect(r.isError).toBeUndefined();
+    expect(r.content).toBe("[lines 2-3 of 5]\nL2\nL3");
+  });
+
+  it("只给 offset：读到文件尾", async () => {
+    const r = await readFileTool.execute({ path: "sliced.txt", offset: 4 }, ctx());
+    expect(r.content).toBe("[lines 4-5 of 5]\nL4\nL5");
+  });
+
+  it("offset 越界给明确报错，不给静默空串（空串会被当成「文件到头了」）", async () => {
+    const r = await readFileTool.execute({ path: "sliced.txt", offset: 99 }, ctx());
+    expect(r.isError).toBe(true);
+    expect(r.content).toContain("exceeds");
+  });
+
+  it("不带 offset/limit 时行为与从前逐字相同", async () => {
+    const r = await readFileTool.execute({ path: "sliced.txt" }, ctx());
+    expect(r.content).toBe("L1\nL2\nL3\nL4\nL5");
+  });
+});
+
 describe("额外只读根（readRoots，案例 #5 催生）", () => {
   let readRoot: string;
 

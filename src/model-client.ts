@@ -38,6 +38,8 @@ export class AnthropicModelClient implements ModelClient {
       system: req.system,
       messages: req.messages,
       tools: req.tools,
+      // B0b 结构化禁工具。非 Claude 专属参数，compat 端点也发（DeepSeek 实测接受）
+      ...(req.toolChoice ? { tool_choice: { type: req.toolChoice } } : {}),
       // Claude 专属参数：Opus 4.8 上省略 thinking = 不思考，必须显式开启 adaptive；
       // 第三方兼容端点不认识这些字段，compat 模式下不发送
       ...(this.compat

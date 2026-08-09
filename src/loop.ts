@@ -201,6 +201,7 @@ export class AgentLoop {
       }
 
       const request = this.context.render(messages, this.registry.toApiTools());
+      if (this.cfg.toolChoice === "none") request.toolChoice = "none";
 
       // 同轮重试：SDK 的 HTTP 重试耗尽后，loop 层对瞬时错误再兜 errorRetries 次。
       // 请求是幂等的（同一 request 重发），非瞬时错误（认证/4xx/abort）立即终止。
@@ -310,6 +311,34 @@ export class AgentLoop {
           );
           for (const b of blocks) {
             q.push({ type: "tool_call", toolUseId: b.id, name: b.name, input: b.input });
+          }
+
+          /**
+           * 结构化禁工具（B0b）：tool_choice=none 已随请求发出，但兼容端点
+           * 可能只收不认（探针只证明了"接受"，没证明"遵守"）。这里是真不变量：
+           * 不执行、回可操作的拒绝，让模型用剩余轮次写结论——收口段的
+           * "别再调工具"从此不靠自觉（P6）。
+           */
+          if (this.cfg.toolChoice === "none") {
+            const refusal = "此阶段工具不可用（收口段只许写结论）。立即以纯文本输出最终结论，不要再请求任何工具。";
+            for (const b of blocks) {
+              q.push({
+                type: "tool_result",
+                toolUseId: b.id,
+                result: { content: refusal, isError: true },
+                durationMs: 0,
+              });
+            }
+            messages.push({
+              role: "user",
+              content: blocks.map((b) => ({
+                type: "tool_result" as const,
+                tool_use_id: b.id,
+                content: refusal,
+                is_error: true,
+              })),
+            });
+            continue;
           }
 
           const results = await this.executor.executeAll(
