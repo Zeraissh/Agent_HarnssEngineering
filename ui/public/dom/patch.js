@@ -139,16 +139,60 @@ export function withFocusPreserved(fn) {
  * 滚动跟随：贴底时保持贴底，否则不动用户的滚动位置。
  * 这是 GitHub Actions / Copilot 日志面板的标准行为——用户往上翻看历史时
  * 不该被新事件拽回底部。
+ *
+ * 2026-08-09 重做为**意图状态**（委托方实测：批准卡出现、思考流式时
+ * 跟随停在半路不动）。旧实现每次变更前按"距底 ≤ threshold"的瞬时几何判定，
+ * 两类现实都会把它误杀：
+ *   1. `.content-area` 的 scroll-behavior 是 smooth——程序化贴底是一段动画，
+ *      流式每帧一批，下一批到达时动画还在半路，中途位置被读成"用户不在
+ *      底部"，跟随从此断掉，画面停在半途（正是"停在中间不动了"）；
+ *   2. 批准卡挂在滚动容器之外，出现时容器 clientHeight 突然变小、距底瞬间
+ *      超阈——而这不产生任何 scroll 事件，用户什么都没做就被判了"上翻"。
+ *
+ * 意图态的规则：**只有用户自己的滚动才改变跟随与否**；程序化贴底自己触发的
+ * 那次 scroll 事件由 `__autoScroll` 哨兵消掉。跟随中的贴底必须**瞬时落点**
+ * （临时把 scroll-behavior 压成 auto）——逐帧追加的跟随本就不该逐帧动画，
+ * smooth 只留给用户点「↓」这类单次跳转；这也是对样式表那句"平滑滚动只在
+ * CSS 定义"的一个成文例外：这里不是在选动画，是在关掉一段会破坏判定的动画。
+ *
  * @param {HTMLElement} scroller
  * @param {() => void} mutate
  * @param {number} [threshold] 距底多少像素内算"贴底"
  */
 export function keepScrollAnchored(scroller, mutate, threshold = 40) {
-  const pinned =
+  const atBottom = () =>
     scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <= threshold;
+
+  if (scroller.__followBottom === undefined) {
+    scroller.__followBottom = atBottom();
+    // 意图只被 scroll 事件改写。程序化贴底是瞬时落点，它触发的事件读到的
+    // 就是底部几何，算出来仍是"跟随"——不需要哨兵去区分谁触发的
+    // （初版写过哨兵：贴底若因内容不可滚而没产生事件，哨兵会吃掉下一次
+    // **真实**的用户滚动——被测试当场抓出来）。
+    // 测试里会传入纯对象桩（没有事件机制）——那就退化为逐次几何判定，与旧行为一致。
+    if (typeof scroller.addEventListener === "function") {
+      scroller.addEventListener(
+        "scroll",
+        () => {
+          scroller.__followBottom = atBottom();
+        },
+        { passive: true },
+      );
+    }
+  }
+  // 几何上就在底部 → 无条件跟随。覆盖"内容变短到不可滚"这类漂移，
+  // 也让首次接触与旧行为一致。
+  if (atBottom()) scroller.__followBottom = true;
+
   mutate();
-  if (pinned) scroller.scrollTop = scroller.scrollHeight;
-  return pinned;
+
+  if (scroller.__followBottom) {
+    const prevBehavior = scroller.style ? scroller.style.scrollBehavior : undefined;
+    if (scroller.style) scroller.style.scrollBehavior = "auto";
+    scroller.scrollTop = scroller.scrollHeight;
+    if (scroller.style) scroller.style.scrollBehavior = prevBehavior ?? "";
+  }
+  return scroller.__followBottom;
 }
 
 /** CSS.escape 的最小替身（jsdom 里不一定有） */

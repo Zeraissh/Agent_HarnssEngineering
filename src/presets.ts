@@ -436,7 +436,14 @@ export const PACKS: Record<string, DomainPack> = {
       // 判官重跑 + 网表导出 + 库件保真抽查所需的最小命令集
       readOnlyCommands: ["kicad-cli", "ls", "grep", "wc"],
     },
-    guardrails: { maxTurns: 40 },
+    /**
+     * 执行者轮次（案例 #9 实测把 40 打穿）：调试底板（3 连接器 + 按钮 + LED +
+     * 电源开关 + 去耦）主轮与返工各跑满 40 轮，7 个官方库符号抽取完毕但
+     * 原理图从未组装出来——预算在"库件保真"工序就烧完了。对照案例 #5：
+     * 更小的转接板（2 连接器）全流程用了 36 轮。件数约两倍 → 70 ≈ 36×2。
+     * 与核查/计划预算的关系不变（verify 15、plan 12 均远低于它）。
+     */
+    guardrails: { maxTurns: 70 },
   },
 };
 

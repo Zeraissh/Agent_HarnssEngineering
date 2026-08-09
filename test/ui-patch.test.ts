@@ -212,6 +212,68 @@ describe("keepScrollAnchored", () => {
     expect(pinned).toBe(false);
     expect(el.scrollTop).toBe(100); // 原地不动
   });
+
+  /**
+   * 2026-08-09 重做为意图态的三条新锁（委托方实测：批准卡出现、思考流式时
+   * 跟随停在半路）。共同判据：**只有用户自己的滚动事件才改变跟随与否**——
+   * 瞬时几何位移（容器变矮、贴底动画走到半路）不算数。
+   */
+  it("批准卡出现（clientHeight 突变、无 scroll 事件）不打断跟随", () => {
+    const el = makeScroller(1000, 200, 800); // 贴底
+    keepScrollAnchored(el, () => {}); // 建立跟随意图
+    el.scrollTop = 800; // 浏览器会把 scrollTop 钳到 scrollHeight-clientHeight
+    (el as any).clientHeight = 120; // 批准卡把容器压矮 80px——距底瞬间超阈（80 > 40）
+    const pinned = keepScrollAnchored(el, () => {
+      (el as any).scrollHeight = 1300;
+    });
+    expect(pinned, "容器变矮不该被当成用户上翻").toBe(true);
+    expect(el.scrollTop).toBe(1300);
+  });
+
+  it("贴底动画走到半路时下一批到达，跟随不断（smooth 竞态）", () => {
+    const el = makeScroller(1000, 200, 800);
+    keepScrollAnchored(el, () => {}); // 建立跟随意图
+    el.scrollTop = 400; // 模拟平滑动画的中途位置（无用户滚动事件）
+    const pinned = keepScrollAnchored(el, () => {
+      (el as any).scrollHeight = 1400;
+    });
+    expect(pinned, "动画中途位置不该被读成「用户不在底部」").toBe(true);
+    expect(el.scrollTop).toBe(1400);
+  });
+
+  it("用户滚动事件才是意图：上翻停跟随、翻回底部恢复", () => {
+    const el = makeScroller(1000, 200, 800);
+    keepScrollAnchored(el, () => {}); // 跟随中
+    // 用户上翻：位置 + 真实 scroll 事件
+    el.scrollTop = 100;
+    el.dispatchEvent(new Event("scroll"));
+    let pinned = keepScrollAnchored(el, () => {
+      (el as any).scrollHeight = 1600;
+    });
+    expect(pinned).toBe(false);
+    expect(el.scrollTop).toBe(100);
+    // 用户翻回底部
+    el.scrollTop = 1600 - 200;
+    el.dispatchEvent(new Event("scroll"));
+    pinned = keepScrollAnchored(el, () => {
+      (el as any).scrollHeight = 1800;
+    });
+    expect(pinned).toBe(true);
+    expect(el.scrollTop).toBe(1800);
+  });
+
+  it("程序化贴底自己触发的 scroll 事件不搞坏跟随（落点即底部，无需哨兵）", () => {
+    const el = makeScroller(1000, 200, 800);
+    keepScrollAnchored(el, () => {
+      (el as any).scrollHeight = 1200;
+    }); // 瞬时贴底：事件送达时几何就在底部
+    el.dispatchEvent(new Event("scroll"));
+    const pinned = keepScrollAnchored(el, () => {
+      (el as any).scrollHeight = 1500;
+    });
+    expect(pinned, "贴底自触发的 scroll 不该停掉跟随").toBe(true);
+    expect(el.scrollTop).toBe(1500);
+  });
 });
 
 // ================================================================
