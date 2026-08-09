@@ -576,11 +576,61 @@ describe("流式输出直接长在对话里", () => {
     expect(d, "流式思考应当是一块可折叠的 details").toBeTruthy();
   });
 
-  /** 半截 Markdown 每来一个字重排一次，看着像抽搐；整轮结束后再按 Markdown 渲染 */
-  it("流式正文按纯文本渲染，不做 Markdown", () => {
+  /**
+   * 判据翻转记录（委托方 2026-08-09："能否做到流式输出的时候就是以 markdown
+   * 形式"）：旧锁「流式正文按纯文本渲染，不做 Markdown」就地退役。当年顾虑的
+   * "半截记法抽搐"如今有两层缓冲——增量经匀速放行按帧批量落下，且渲染器对
+   * 未闭合围栏本就容忍（余下部分整体成码块）。以下四条是新判据。
+   */
+  it("流式正文按 Markdown 渲染——闭合的记法立即成型", () => {
+    renderRunDetail(runningState(), { activeTab: "loop", liveText: "**已闭合的粗体** 后面还在写" });
+    expect(document.querySelector(".chat-msg--live strong")).toBeTruthy();
+    expect(conv()).toContain("已闭合的粗体");
+  });
+
+  it("未闭合的行内记法保持字面——不闪成半个粗体，闭合时与终稿同向收敛", () => {
     renderRunDetail(runningState(), { activeTab: "loop", liveText: "**还没写完的粗体" });
     expect(document.querySelector(".chat-msg--live strong")).toBeNull();
     expect(conv()).toContain("**还没写完的粗体");
+  });
+
+  it("未闭合的围栏从第一行起就是代码块（渲染器的缺收尾容忍是这条的地基）", () => {
+    renderRunDetail(runningState(), { activeTab: "loop", liveText: "```ts\nconst a = 1;" });
+    expect(document.querySelector(".chat-msg--live pre.md-code")).toBeTruthy();
+    expect(conv()).toContain("const a = 1;");
+  });
+
+  it("裸 JSON 流（planner 的输出契约）以代码块形态流入，不是一面正文墙", () => {
+    renderRunDetail(runningState(), { activeTab: "loop", liveText: '{"subtasks": [{"id": "s1"' });
+    expect(document.querySelector(".chat-msg--live pre.md-code")).toBeTruthy();
+  });
+
+  /**
+   * 落定条目的同族判据（同一条委托方反馈："只有 planner 的输出没做成 markdown，
+   * 很突兀"）：根因不在渲染分支——所有来源本就走同一支 renderMarkdown——
+   * 在内容：planner 的契约输出是裸 JSON，对 Markdown 渲染器是无事可做的散文。
+   * 判据按内容不按来源：整体 parse 得过才算，花括号开头的散文零误伤。
+   */
+  it("落定的裸 JSON 正文渲染为高亮代码块并 pretty-print（展示层，事件流原文不动）", () => {
+    let s = runningState();
+    s = reduceEvents(s, [
+      sse(1, "planner", "assistant_text", { text: '{"subtasks": [{"id": "s1", "title": "改固件"}]}' }),
+    ]);
+    renderRunDetail(s, { activeTab: "loop" });
+    const pre = document.querySelector(".chat-msg--assistant pre.md-code");
+    expect(pre, "裸 JSON 应当渲染为代码块").toBeTruthy();
+    expect(pre!.textContent).toContain('"subtasks"');
+    expect(pre!.textContent, "展示层应当 pretty-print（原文是单行）").toContain("\n");
+  });
+
+  it("以花括号开头的散文不被误判为 JSON，仍按 Markdown 走", () => {
+    let s = runningState();
+    s = reduceEvents(s, [
+      sse(1, "main", "assistant_text", { text: "{占位符} 表示模板里的槽位，**这是散文**。" }),
+    ]);
+    renderRunDetail(s, { activeTab: "loop" });
+    expect(document.querySelector(".chat-msg--assistant strong")).toBeTruthy();
+    expect(document.querySelector(".chat-msg--assistant pre.md-code")).toBeNull();
   });
 
   /**

@@ -2083,15 +2083,17 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
 }
 .chat-msg--live { border-left: 2px dashed var(--accent); padding-left: var(--space-sm); }
 .chat-thinking--live > summary { color: var(--identity-verifier); }
-/* 光标：让"它还在写"这件事不必靠猜 */
-.chat-live-text::after {
+/* 光标：让"它还在写"这件事不必靠猜。
+   直播正文如今是 Markdown 块级元素（p/pre/ul…），caret 挂在最后一个块的
+   末尾才跟着文字走；挂容器 ::after 会自己另起一行，像光标掉了出来 */
+.chat-live-text > :last-child::after {
   content: "▌";
   color: var(--accent);
   animation: chat-caret 1s steps(2) infinite;
 }
 @keyframes chat-caret { 50% { opacity: 0; } }
 @media (prefers-reduced-motion: reduce) {
-  .chat-live-text::after { animation: none; }
+  .chat-live-text > :last-child::after { animation: none; }
 }
 
 /* ===== 产物清单（委托方："生成的文件能不能点击直接打开"）===== */

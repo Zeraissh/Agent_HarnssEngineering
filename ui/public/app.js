@@ -3826,6 +3826,43 @@ export function renderChatStream(items, state) {
 }
 
 /**
+ * 模型正文的渲染入口：散文走 Markdown，**纯 JSON 输出走代码块**。
+ *
+ * 动机（委托方反馈："只有 planner 的输出没做成 markdown，很突兀"）：
+ * planner / verifier 的输出契约是**裸 JSON**（不带围栏），Markdown 渲染器对它
+ * 无事可做，于是一面墙的原始 JSON 以正文段落的样子杵在对话里。根因不在
+ * 渲染分支——所有来源本就走同一支 renderMarkdown——在内容本身。
+ *
+ * 判据是【内容】不是【来源】：整体 JSON.parse 得过的对象/数组才算，
+ * 散文零误伤；这样 verifier 若有裸 JSON 落进对话也一并受益。
+ * pretty-print 只发生在展示层，事件流里的原文一字未动（审计面不受影响）。
+ */
+function renderAssistantText(text) {
+  const t = String(text ?? "").trim();
+  if (t.startsWith("{") || t.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(t);
+      return renderMarkdown("```json\n" + JSON.stringify(parsed, null, 2) + "\n```");
+    } catch {
+      // 不是纯 JSON（散文里恰好以花括号开头）——按散文走
+    }
+  }
+  return renderMarkdown(text);
+}
+
+/**
+ * 直播文本的渲染：与落定条目同一支 Markdown，外加一个流式特化——
+ * 开头就像 JSON 的流（planner/verifier 的契约输出）直接套上 json 围栏，
+ * 借渲染器"缺收尾围栏也成块"的既有容忍，让它**从第一个字起就以代码块的
+ * 样子流入**；整轮落定后由 renderAssistantText 接手 pretty-print，形态连续。
+ */
+function renderLiveText(text) {
+  const t = String(text ?? "");
+  if (/^\s*[{[]/.test(t)) return renderMarkdown("```json\n" + t);
+  return renderMarkdown(t);
+}
+
+/**
  * 单条对话条目。
  *
  * @param {any} it
@@ -3847,7 +3884,7 @@ export function renderChatItem(it, thinkingOpen = false) {
       case "text":
         html +=
           '<div class="chat-msg chat-msg--assistant"><div class="chat-role">¶ Agent</div>' +
-          `<div class="chat-body chat-body--text md">${renderMarkdown(it.text)}</div></div>`;
+          `<div class="chat-body chat-body--text md">${renderAssistantText(it.text)}</div></div>`;
         break;
       case "thinking":
         html += it.redacted
@@ -3860,21 +3897,25 @@ export function renderChatItem(it, thinkingOpen = false) {
        * 正在流入的这一轮。思考在上、正文在下，与已落定的形态一致，
        * 所以它结束时被真正的条目接替不会有视觉跳变。
        *
-       * 正文用**纯文本**而不是 Markdown：半截的 Markdown（没闭合的围栏、
-       * 写到一半的表格）每来一个字就重排一次，看着像抽搐。整轮结束后
-       * `assistant_text` 那条会用 Markdown 重新渲染同一段。
+       * 正文与落定条目走**同一支 Markdown**（委托方："流式输出的时候就是
+       * markdown 形式"）。此前流式按纯文本、落定再换 Markdown——同一段字在
+       * 结束瞬间整体变脸，那才是真正的跳变。当年顾虑的"半截记法抽搐"如今
+       * 有两层缓冲：增量经匀速放行按帧批量落下（不是每个字一次重排），
+       * 且渲染器对没闭合的围栏本就容忍（余下部分整体成码块，见
+       * core/markdown.js 的围栏分支）。未闭合的行内记法保持字面，闭合瞬间
+       * 才变换——这与最终形态是同向收敛，不是抖动。
        */
       case "live":
         if (it.thinking.trim()) {
           html +=
             `<details class="chat-thinking chat-thinking--live"${thinkingOpen ? " open" : ""}>` +
             `<summary>✽ 正在思考 <span class="aside-peek">${it.thinking.length} 字</span></summary>` +
-            `<div class="chat-body chat-body--text chat-live-text">${esc(it.thinking)}</div></details>`;
+            `<div class="chat-body chat-body--text md chat-live-text">${renderLiveText(it.thinking)}</div></details>`;
         }
         if (it.text.trim()) {
           html +=
             '<div class="chat-msg chat-msg--assistant chat-msg--live"><div class="chat-role">¶ Agent</div>' +
-            `<div class="chat-body chat-body--text chat-live-text">${esc(it.text)}</div></div>`;
+            `<div class="chat-body chat-body--text md chat-live-text">${renderLiveText(it.text)}</div></div>`;
         }
         break;
       case "tool":
