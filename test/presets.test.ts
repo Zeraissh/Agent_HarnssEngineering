@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { getPack, getPreset, PACKS } from "../src/presets.js";
+import { getPack, getPreset, PACKS, selectPackTools } from "../src/presets.js";
+import { makeTool } from "./helpers.js";
 import { runVerified } from "../src/orchestrate.js";
 import type Anthropic from "@anthropic-ai/sdk";
 import type { ModelClient, ModelRequest, ModelTurn } from "../src/types.js";
@@ -94,6 +95,22 @@ describe("domain packs", () => {
 
   it("兼容别名 getPreset 仍可用（v0.8 及之前的调用方）", () => {
     expect(getPreset("stm32-debug")).toBe(getPack("stm32-debug"));
+  });
+});
+
+describe("kicad 包的眼睛（describe_image，案例 #9 收官催生）", () => {
+  const basePool = [makeTool({ name: "bash" }), makeTool({ name: "read_file" }), makeTool({ name: "write_file" })];
+
+  it("配了视觉模型（池里有 describe_image）→ kicad 工具面带眼睛", () => {
+    const pool = [...basePool, makeTool({ name: "describe_image" })];
+    const face = selectPackTools(PACKS["kicad"], pool, []);
+    expect(face.some((t) => t.name === "describe_image")).toBe(true);
+  });
+
+  it("没配视觉模型（池里没有）→ 干净缺席，不摆一个调不通的工具", () => {
+    const face = selectPackTools(PACKS["kicad"], basePool, []);
+    expect(face.some((t) => t.name === "describe_image")).toBe(false);
+    expect(face).toHaveLength(3);
   });
 });
 

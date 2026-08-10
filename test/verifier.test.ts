@@ -78,17 +78,46 @@ describe("runVerifier", () => {
     const writer = makeTool({ name: "writer", permission: "ask" });
     const outcome = await runVerifier({ ...baseConfig, tools: [writer] }, model, {
       task: "写一个文件",
-      executorReport: "我写好了",
+      executorReport: "已写",
     });
-
     expect(outcome.verdict.passed).toBe(false);
     expect(outcome.verdict.issues).toEqual(["产物缺失"]);
     // 第二次请求里应包含 deny 的 is_error tool_result（read-only 理由回传了模型）
     const second = model.requests[1]!;
-    const lastMsg = second.messages.at(-1)!;
-    const blocks = lastMsg.content as Anthropic.ToolResultBlockParam[];
+    const blocks = second.messages.at(-1)!.content as Anthropic.ToolResultBlockParam[];
     expect(blocks[0]!.is_error).toBe(true);
     expect(String(blocks[0]!.content)).toContain("read-only");
+  });
+
+  it("verifier 审批门放行 describe_image——视觉取证只读（案例 #9 收官催生的眼睛）", async () => {
+    let looked = 0;
+    const eyes = makeTool({
+      name: "describe_image",
+      permission: "ask",
+      execute: async () => {
+        looked += 1;
+        return { content: "板框内无越界元件，丝印参考号可读" };
+      },
+    });
+    const model = new FakeModelClient([
+      fakeMessage(
+        [toolUseBlock("tu_1", "describe_image", { path: "preview/board.png", question: "元件有越出板框吗" })],
+        "tool_use",
+      ),
+      fakeMessage([textBlock('{"passed": true, "issues": [], "summary": "视觉核查通过"}')], "end_turn"),
+    ]);
+    const outcome = await runVerifier({ ...baseConfig, tools: [eyes] }, model, {
+      task: "画一块板",
+      executorReport: "板已画好",
+    });
+
+    expect(looked, "看图应当被放行执行").toBe(1);
+    expect(outcome.verdict.passed).toBe(true);
+    // 第二次请求里带的是真实描述结果，不是 deny
+    const second = model.requests[1]!;
+    const blocks = second.messages.at(-1)!.content as Anthropic.ToolResultBlockParam[];
+    expect(blocks[0]!.is_error, "视觉取证不该被拒").not.toBe(true);
+    expect(String(blocks[0]!.content)).toContain("板框内无越界元件");
   });
 
   it("verifier 与父级共享 system prompt（缓存前缀一致）", async () => {

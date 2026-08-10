@@ -297,6 +297,12 @@ const KICAD_VERIFY_INSTRUCTIONS = `这是一次【KiCad 设计文件交付】的
    **不要凭记忆断言默认值,也不要采信执行者报告的自述(包括"自首")**。
    案例 #9 实测:执行者报告自称降级了一项严重度,核查者凭记忆认定默认是 warning
    而拒签——对照 demo 才发现该项默认就是 ignore,"降级"根本不存在。
+6. 视觉核查(工具面上有 describe_image 才做,没有就跳过本条——那说明宿主没配视觉模型):
+   kicad-cli pcb render -o <系统临时目录>/board.png 渲染板子,用 describe_image 带
+   **具体问题**核查可数的客观事实——元件是否越出板框、连接器是否贴板边、丝印
+   参考号是否可读、有无明显元件重叠。可数事实不符可进 issues(写清看到什么/期望
+   什么);"好不好看"类观感只进 advisory。视觉描述是**二手证据**:判 failed 前先用
+   DRC 报告或文件坐标交叉印证,两者矛盾时以程序化判官为准并把矛盾写进 advisory。
 只要有任何一项对不上(违例数与声明不符、网络拓扑与验收不符、库件几何被改),判 passed=false
 并在 issues 里写明:期望什么、实际什么、用什么命令得到。`;
 
@@ -455,7 +461,10 @@ export const PACKS: Record<string, DomainPack> = {
     name: "kicad",
     description: "KiCad EDA 文件工程：直写原理图/PCB s-expression + kicad-cli ERC/DRC 程序化验收（不碰 GUI/MCP）",
     systemPrompt: KICAD_SYSTEM + RULE_PRECEDENCE_DISCIPLINE,
-    builtinTools: ["bash", "read_file", "write_file"],
+    // describe_image：配置了 AGENT_VISION_MODEL 时才真实在场（宿主按池过滤，
+    // 没配就干净缺席）。给执行者与核查者同一双眼睛——文本盲是本包全部三条
+    // 几何缝（布网/布线/排版，案例 #9）的共同根因
+    builtinTools: ["bash", "read_file", "write_file", "describe_image"],
     mcp: false, // MCP 创作面已实测判死(见包头注释);文件路线全程不需要
     verify: {
       enabled: true,

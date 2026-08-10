@@ -387,8 +387,22 @@ PDF——排版类缺陷（标签穿件体、文本互压）第一次能被宿�
 （锚点=电气），装饰文本随便挪；每刀之后 ERC + 网表比对双验。
 **两个 oracle 互为保险的实证**：删"看似冗余"的标签时网表比对器全绿
 （power flag 不进网表——比对器盲区）而 ERC 当场抓出 PWR_FLAG 孤岛。
-→ 晋升候选：verifier 侧同款闭环 = 配 AGENT_VISION_MODEL 后
-"导 PDF/SVG → describe_image"进 kicad 包核查方法（材料齐，只差接线）。
+→ **verifier 侧接线已完成（2026-08-10 晚，808 单测 + 变异抓红）**：
+① verifier 审批门放行 describe_image（看图=只读取证，与 bash 白名单同性质；
+没配视觉模型时工具不在面上，分支天然不触发）；② kicad 包 builtinTools 加
+describe_image（宿主按池过滤，没配即干净缺席，有测试锁两种形态）；
+③ KICAD_VERIFY_INSTRUCTIONS 第 6 条视觉核查方法（pcb render → 带具体问题
+describe_image；可数事实才可进 issues，观感进 advisory；视觉是二手证据，
+与 DRC 矛盾时以程序化判官为准）。
+**激活还差一件事（委托方侧）**：配一个真的认图的端点。实测排除与待测：
+DeepSeek 端点**不认图**（200 但静默替换 "[Unsupported Image]"——探针
+`eval/probe-vision.mjs` 就是为此写的）；kimi（moonshot）探测被代理超时挡住
+（Clash 规则漂移，修好后 `node eval/probe-vision.mjs
+https://api.moonshot.cn/anthropic kimi-k3 <key>` 一键判定）；qwen-cloud
+（SiliconFlow Qwen-VL）等 key。**已知边界**：kicad-cli 的 sch export 无 PNG
+（只有 pdf/svg），机器上无 SVG/PDF 转换器——现阶段 verifier 的眼睛只覆盖
+**板级**（pcb render 原生 PNG）；原理图视觉复核仍走宿主（读 PDF）。
+候选：装一个 resvg/inkscape 类转换器后把原理图也接进去。
 
 **D6. 案例 #10（Juice Breakout，2026-08-09）：一发通过——快判官领域的对照组。**
 ts-coding 包 + 任务级 rubric + 单模式 --verify（单领域不编排，按 A/B 定论）。

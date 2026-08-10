@@ -263,7 +263,14 @@ async function drainVerifierEvents(
         finalText = event.text; // 只留最后一条：契约要求最终消息为纯 JSON
         break;
       case "approval_request": {
-        // 硬约束：verifier 只读。唯一例外：bash 命令命中领域包声明的只读白名单
+        // 硬约束：verifier 只读。例外一：bash 命中领域包声明的只读白名单。
+        // 例外二（案例 #9 收官催生的"给核查者装眼睛"）：describe_image——
+        // 看图是只读取证，与白名单同性质；没配视觉模型时该工具根本不进
+        // 工具面（宿主装配纪律），此分支天然不触发。
+        if (event.name === "describe_image") {
+          event.respond("allow");
+          break;
+        }
         const command =
           event.name === "bash" ? String((event.input as { command?: unknown })?.command ?? "") : "";
         if (command && readOnlyCommands && isReadOnlyCommand(command, readOnlyCommands)) {
