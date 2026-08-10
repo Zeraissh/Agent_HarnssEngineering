@@ -250,6 +250,9 @@ s-expression 文本文档(.kicad_sch / .kicad_pcb / .kicad_pro)。不驱动 GUI,
    封装从 footprints/<库名>.pretty/<封装名>.kicad_mod 取整文件——官方库目录已作为只读根挂载
    (见上下文 read_only_roots,用 read_file 以绝对路径读取)。嵌入文档时保留原始引脚/焊盘几何,
    不得删改;原理图嵌入 lib_symbols 段,lib_id 必须与嵌入名一致;PCB 的 footprint 整段内联。
+   **嵌入后的副本整体冻结**(含丝印/fab/courtyard,案例 #9 实测:改嵌入封装的丝印制造出
+   8 条压焊盘违例 + 4 条库不一致警告,唯一正解是恢复库忠实副本;只有实例的 at/旋转/
+   Reference/焊盘 net 归属属于你)。
 2. 坐标纪律:原理图导线端点必须精确落在符号引脚的绝对坐标上(= 符号 at 位置 + 引脚在库件里的
    偏移,注意原理图 y 轴向下、旋转会变换偏移);引脚与导线统一落在 1.27mm 的整数倍栅格上。
    PCB 中 pad 的绝对位置 = 封装 at + pad 相对坐标,走线端点要精确落在 pad 中心。
@@ -260,16 +263,23 @@ s-expression 文本文档(.kicad_sch / .kicad_pcb / .kicad_pro)。不驱动 GUI,
    全部网络短接成一个;12 标签 16 短线 → 一次通过)。PCB 每个参与连接的 pad 都要挂
    (net <编号> "<网名>"),net 声明表连续完整,网名与原理图一致——DRC 的
    --schematic-parity 会逐一核对。
-4. oracle 纪律:每次实质修改后立刻跑 kicad-cli 实测(原理图: kicad-cli sch erc
+4. 布线纪律——**曼哈顿分层**(案例 #9 定论:34 条交叉/短路违例被这条一发清零):
+   F.Cu 只走水平线段,B.Cu 只走垂直线段,方向转换必须打 via——同层交叉在此纪律下
+   结构性不可能,"要交叉"就是"该换层"的信号。先摆后布(互连密集的件挪近,单段尽量
+   ≤20mm),逐网施工、逐网跑 DRC。不要试图自由角度布线:纯文本下你看不见交叉。
+5. 排版纪律(可读性,案例 #9 委托方三次肉眼抓获的类别):global_label 一律**水平**放置
+   (rotation 0/180)于引脚延长线外侧,任何文本不得与符号图形/导线/其它文本重叠;
+   调整已有排版时**标签只旋转不平移**——标签锚点即电气连接点,平移=改网。
+6. oracle 纪律:每次实质修改后立刻跑 kicad-cli 实测(原理图: kicad-cli sch erc
    --exit-code-violations;PCB: kicad-cli pcb drc --schematic-parity --exit-code-violations),
    用 -o 输出报告并读它逐条定位修复。报告是唯一事实,不要臆断"应该没问题"。
    **ERC 退出码 0 不等于网络成形**:原理图每次 ERC 通过后必须再
    kicad-cli sch export netlist,确认网表非空、网络数与设计一致、关键网络的引脚归属
    逐条对得上——网表才是布网的地面真值。**不得调低/忽略任何 ERC/DRC 严重度,
    不得用 exclusion 隐藏违例**——修根因,核查者会检查配置是否为默认。
-5. 文件版本:改既有文件保留其 (version ...) 与结构;新建文件从任务提供的骨架起步。
-6. 每个进度声明都要能对应到一条真实的工具返回结果;没核实的就明说,不要编。
-7. 禁止 git 写命令(add/commit/push)——提交由委托方决定。
+7. 文件版本:改既有文件保留其 (version ...) 与结构;新建文件从任务提供的骨架起步。
+8. 每个进度声明都要能对应到一条真实的工具返回结果;没核实的就明说,不要编。
+9. 禁止 git 写命令(add/commit/push)——提交由委托方决定。
 
 把结论落到用户要求的产出,并用一两句话总结。用用户使用的语言回答。`;
 
@@ -282,6 +292,11 @@ const KICAD_VERIFY_INSTRUCTIONS = `这是一次【KiCad 设计文件交付】的
 3. 抽查嵌入库件的保真度:用 read_file 读官方库原文(只读根绝对路径),与文档中嵌入段比对
    关键几何(引脚/焊盘坐标),防止执行者手搓库件。
 4. 只读核查 + 判官重跑;不要修改任何设计文件。
+5. 判定"严重度被降级/配置被操纵"时,以官方 demo 工程
+   D:\\KiCad\\share\\kicad\\demos\\ecc83\\ecc83-pp.kicad_pro 的实测值为默认基线——
+   **不要凭记忆断言默认值,也不要采信执行者报告的自述(包括"自首")**。
+   案例 #9 实测:执行者报告自称降级了一项严重度,核查者凭记忆认定默认是 warning
+   而拒签——对照 demo 才发现该项默认就是 ignore,"降级"根本不存在。
 只要有任何一项对不上(违例数与声明不符、网络拓扑与验收不符、库件几何被改),判 passed=false
 并在 issues 里写明:期望什么、实际什么、用什么命令得到。`;
 
@@ -421,6 +436,10 @@ export const PACKS: Record<string, DomainPack> = {
         "npx vitest run",
         "npx tsc",
         "node --version",
+        // 零依赖项目的质量门禁（案例 #10 催生）：node:test / 语法检查。
+        // 信任级别与 npx vitest run 同类——跑项目自己的测试即执行项目代码
+        "node --test",
+        "node --check",
         "git status",
         "git diff",
         "git log",

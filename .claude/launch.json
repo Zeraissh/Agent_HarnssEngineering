@@ -1,0 +1,10 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "case10-game",
+      "url": "http://localhost:8099",
+      "port": 8099
+    }
+  ]
+}
