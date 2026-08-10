@@ -403,6 +403,11 @@ https://api.moonshot.cn/anthropic kimi-k3 <key>` 一键判定）；qwen-cloud
 （只有 pdf/svg），机器上无 SVG/PDF 转换器——现阶段 verifier 的眼睛只覆盖
 **板级**（pcb render 原生 PNG）；原理图视觉复核仍走宿主（读 PDF）。
 候选：装一个 resvg/inkscape 类转换器后把原理图也接进去。
+**过渡安排（2026-08-10，委托方指定）**：VLM 就绪前视觉核查由**宿主代行**——
+`eval/host-visual-review.ps1` 一键出双判官 + 原理图 PDF + 3D 双面渲染 + 层
+SVG，宿主亲读按第 6 条证据等级出结论（已在案例 #9 交付物上自测）。协作面：
+verifier 无眼时照旧把视觉项诚实落 unverified，宿主复核补完那一环——三值裁决
+的"移交委托方"通道现在多了一个宿主档位。VLM 探针通过（答出"红"）即交接退位。
 
 **D6. 案例 #10（Juice Breakout，2026-08-09）：一发通过——快判官领域的对照组。**
 ts-coding 包 + 任务级 rubric + 单模式 --verify（单领域不编排，按 A/B 定论）。
