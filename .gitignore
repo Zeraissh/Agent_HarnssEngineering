@@ -16,3 +16,4 @@ uploads/
 .agent-run-history/
 # vitest --coverage 的中间产物（子代理跑覆盖率时会留下）
 coverage/
+__pycache__/

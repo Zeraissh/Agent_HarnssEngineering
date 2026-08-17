@@ -1,0 +1,21 @@
+{
+  "profile": { "id": "00000000-0000-0000-0000-000000000000", "email": "", "allow_telemetry": false, "allow_contact": false },
+  "gui": { "enabled": false, "input_directory": "", "dialog_confirmation_timeout": 1 },
+  "router": {
+    "max_passes": 400,
+    "max_threads": 1,
+    "automatic_neckdown": false,
+    "neck_width_um": 250,
+    "strict_drc": true,
+    "fanout": { "enabled": false },
+    "optimizer": {},
+    "scoring": {}
+  },
+  "drc": { "include_warnings": true, "include_errors": true },
+  "usage_and_diagnostic_data": { "disable_analytics": true },
+  "feature_flags": { "multi_threading": false, "inspection_mode": false, "other_menu": false, "save_jobs": false },
+  "api_server": { "enabled": false },
+  "mcp_server": { "enabled": false },
+  "logging": { "console": { "enabled": true, "level": "INFO" }, "file": { "enabled": false, "level": "INFO", "location": "" } },
+  "version": "2.3.0"
+}

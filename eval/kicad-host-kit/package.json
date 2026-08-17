@@ -1,0 +1,9 @@
+{
+  "name": "kicad-host-kit-visual",
+  "private": true,
+  "type": "module",
+  "description": "SVG->PNG zoom for host visual review of KiCad exports (kicad-cli export svg -> zoom.mjs)",
+  "dependencies": {
+    "sharp": "^0.35.3"
+  }
+}
