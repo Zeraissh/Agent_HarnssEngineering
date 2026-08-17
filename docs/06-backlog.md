@@ -431,6 +431,26 @@ module（file:// 双击即玩）、核心/壳分离让纯逻辑可被 node 测�
 发射：修法按"最后输入者接管"，并把输入仲裁提成 core.js 纯状态机补测试
 （把这条缝从"不可测的壳"挪进"可测的核"，是结构性修复不是补丁）。
 
+**D7. 案例 #11（L151 最小系统 → 蓝药丸式开发板，2026-08-10 ~ 08-17）：十一发任务书 + 宿主工具箱入仓。**
+全案见 [`docs/cases/case-11-l151-minsys-devboard.md`](cases/case-11-l151-minsys-devboard.md)。
+交付:S1/S3 原理图 ERC 0(45 处排版整形后 PDF 亲读通过)、S2 最小系统 PCB DRC 0、
+开发板 PCB v6 **嘉立创口径 DRC 0 / ERC 0 / 量产校准审计 5/7 / 417 个 45° 角 / 逐引脚丝印 / gerber**。
+三条主定论:① 文本模型不能结构性编辑 8000 行 `.kicad_pcb`(S2/S2B/S2C 三发同形写坏)——
+答案是**结构化工具**不是更严的任务书;② 自动布线守规矩 = **约束 + 事后审计 + 混合返工**,
+判据先写(量产板 WR350/AT_v0.74 校准的 7 条)不为结论改阈值;③ 委托方三次红框
+(90°/锐角/无解绕线;排针无逐引脚丝印;过孔/线距按嘉立创)全部固化为包纪律 4c/4d/4e + 核查 #8。
+已落地:`eval/kicad-host-kit/`(拆/算/落板分进程的返工循环、freerouting headless 桥、
+mitre 切角、audit/islands/bruns/fab_check、丝印工具、示例与 README,v6 副本冒烟通过);
+`src/presets.ts` kicad 包布线 #4 成品口径 + 核查 #8 体检单(测试锁 + 变异验证);
+`docs/reference/l151-production-board-conventions.md`。
+**待做(下一案例的起点)**:
+- kit 的 rip/restore/mitre/audit 收成 kicad 包 agent 可调用工具(`src/tools/kicad-py/`),
+  让"执行者不碰原文件"从纪律变成能力;verifier 白名单直接放行 `audit_routing/fab_check`;
+- freerouting 桥进包(约束导出 → 布线 → 导入 → 审计,一条命令);
+- kit 已知边界:0.125 栅 A* 复现不了 freerouting 的 0.45 节距紧密排线(v6 拆 PA9 恢复不了),
+  紧密带要么整束拆掉重排要么手工;`place_silk` 密区找不到位时保留原位;
+- 领域包经验来源定论:少而精、成对(sch+pcb)、量产、**按需蒸馏**——Wafer 仓库 ~80 块 Altium 板留作后续。
+
 **C1. 开案例 #9（推荐）。** 前八案里 STM32 占四个，而三角编排在**跨领域交接**
 上只被案例 #8 验过一次。现在有了台账，跑真实任务会**自动攒 §2.1 的样本**——
 一举两得。案例文档写法见 `docs/cases/case-08-*.md`（四跑 A/B/C/D 那种控制变量法），
