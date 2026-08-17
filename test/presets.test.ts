@@ -69,6 +69,37 @@ describe("domain packs", () => {
     expect(p!.verify.instructions).toContain("保真");
   });
 
+  it("kicad 包：原理图排版可读性纪律（案例 #11 阶段一 45 处整形手术催生）", () => {
+    const p = getPack("kicad");
+    // 执行侧:标签朝外/文本零相交/功能分块/电气冻结三件套
+    expect(p!.systemPrompt).toContain("标签方向随引脚朝外");
+    expect(p!.systemPrompt).toContain("零相交");
+    expect(p!.systemPrompt).toContain("功能分块");
+    expect(p!.systemPrompt).toContain("逐网逐节点语义相等");
+    // 核查侧:视觉工具缺席时排版验收必须 unverified 移交而非默默跳过,
+    // 且程序化部分(对齐/栅格/锚点/网表等价)不因视觉缺席而豁免
+    expect(p!.verify.instructions).toContain("unverified 移交");
+    expect(p!.verify.instructions).toContain("视觉工具缺席不豁免");
+  });
+
+  it("kicad 包：PCB 布线成品口径 + 体检单（案例 #11 量产校准 + 委托方红框三连催生）", () => {
+    const p = getPack("kicad");
+    // 执行侧:曼哈顿只是脚手架;成品口径 = 底层参考面 / 45° 拐角 / 晶振禁区 / 逐引脚丝印 / 板厂约束
+    expect(p!.systemPrompt).toContain("执行者的脚手架,不是成品口径");
+    expect(p!.systemPrompt).toContain("底层是参考面");
+    expect(p!.systemPrompt).toContain("拐角只允许 45° 倍数");
+    expect(p!.systemPrompt).toContain("逐引脚**丝印标注");
+    expect(p!.systemPrompt).toContain("板级最小约束");
+    // 结构化工具优先,不许文本手改 pcb
+    expect(p!.systemPrompt).toContain("不要用 read_file/write_file 手改 .kicad_pcb");
+    // 核查侧:体检单五项 + 规则活在 .kicad_pro
+    expect(p!.verify.instructions).toContain("PCB 布线体检");
+    expect(p!.verify.instructions).toContain("90° 折角/锐角回折");
+    expect(p!.verify.instructions).toContain("≤ F.Cu 的 40%");
+    expect(p!.verify.instructions).toContain("排针逐引脚丝印");
+    expect(p!.verify.instructions).toContain("读 .kicad_pro");
+  });
+
   it("ts-coding 包：vitest/tsc 双门禁白名单 + 不接 MCP（案例 #7 催生）", () => {
     const p = getPack("ts-coding");
     expect(p).toBeDefined();
