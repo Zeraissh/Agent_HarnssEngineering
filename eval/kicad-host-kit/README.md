@@ -55,10 +55,22 @@
 
 嵌套扇出要**由内向外**恢复(PB14 → PB13 → PB12),外圈先占道内圈就无路——这是 `--deep` 存在的原因之一。
 
+### 外科手术(v7 清理轮加入——比"全拆重布"更可控)
+| 脚本 | 作用 |
+|---|---|
+| `edit_tracks.py <pcb> <ops.json>` | 按坐标精确增删走线/via(remove 匹配不到即整体退出,不做半截手术);重填铺铜 |
+| `dedupe_tracks.py <pcb> [--dry]` | 删完全重复段/同位 via(freerouting 会留 3–5 份同一段) |
+| `trim_pad_stubs.py <pcb> [--dry] [--margin 0.12]` | 删"焊盘内桩"/"via 环内桩":两端都深入同一焊盘铜皮(≥margin,防把唯一入线削成擦边)或同网 via 焊环内的微段 |
+| `trim_dust.py <pcb> [--max 0.05]` | 删走线中段的度数-2 灰尘段,邻段端点顺移保持连通 |
+| `via_in_pad.py <pcb>` | via 压 SMD 焊盘体检(不塞孔时吸锡)+ 每个给出焊盘旁合法新位候选(含 F 直连段与 B 侧检查),不改板 |
+
 ### 审计 / 视觉
 | 脚本 | 作用 |
 |---|---|
 | `audit_routing.py <pcb> [--xtal box] [--xtal-nets]` | 7 判据:B 长 ≤40% F;最长 B 段 ≤15mm;via ≤80 且 ≤0.35/段;晶振盒无外网;GND B 池轮廓=1;线宽 ≥0.25;via 0.6/0.3 |
+| `redundancy.py <pcb> [--net] [--par-gap] [--par-len] [--cross]` | 同网冗余:完全重复/共线重叠段、环路边(冗余并行路径)、平行贴走对(委托方"NRST 好几条并行"就是它抓的) |
+| `net_stats.py <pcb>` | 逐网段数/via/F·B 长度/绕行比(走线长 ÷ 焊盘 MST);绕行比 ≥1.5 的网值得看图 |
+| `net_view.py <pcb> <out.svg> --net A,B [--islands]` | 网络高亮示意图(F 红/B 蓝/via 黑,他网淡色,铺铜轮廓可叠)→ `zoom.mjs` 裁区给宿主看 |
 | `islands.py <pcb>` / `bruns.py <pcb>` | 孤岛数量面积;底层跑道成串排名(找切池元凶) |
 | `place_silk.py <pcb> REFS` | 位号自动安置(几何净空含板级文本——否则位号压排针标注) |
 | `silk_labels.py <pcb> <labels.json>` | 排针逐引脚丝印 + 板名(幂等);`examples/case11_silk_labels.json` |
@@ -72,7 +84,13 @@ build → pour_gnd → keepout → export_dsn → run_freerouting → audit
   → jlc_rules → DRC 0 → fab_check → gerber
 ```
 
-审计不过就回到拆/返工,不动阈值。最终 v6:DRC 0(嘉立创口径)、ERC 0、审计 5/7(via 81 vs 80;孤岛主池 + 12.7mm² + 1.0mm² 已桥接)、417 个 45° 角。
+审计不过就回到拆/返工,不动阈值。v6:DRC 0(嘉立创口径)、ERC 0、审计 5/7(via 81 vs 80;孤岛主池 + 12.7mm² + 1.0mm² 已桥接)、417 个 45° 角。
+**v7 清理轮(2026-08-17,委托方点名"via 81→80 / 孤岛 / NRST 好几条并行重复线")**:`redundancy.py` 抓到 NRST 一条整段冗余支路 + +3V3 三处
+0.05–0.12mm 贴走的重复段 + 三条环路边 + 5 份重复段;`edit_tracks.py` 外科手术;`net_stats.py` 抓到 32k 晶振网绕行比 1.97(负载电容交叉接线)→
+C11↔C12 互换 + C10 下移 0.9mm,四条晶振网由 kit 路由器 4.6 秒全 F 重布(0 via)。五镜头独立核查后又补:`via_in_pad.py`
+(6 个压焊盘 via 迁走 5 个)、`trim_dust.py`(走线中段灰尘段)、`trim_pad_stubs` 深度余量 + via 环内桩。
+结果:DRC(--severity-all)0、审计 **7/7**、via **69**、孤岛 **1**、拐角全 45°、并行/重复/灰尘/焊盘内桩 0。
+教训:自动布线器的"全通"里藏着整段冗余环路与叠线,**先 redundancy/net_stats/via_in_pad 体检再谈美观**。
 
 ## 已知边界(诚实记录,不是待办)
 

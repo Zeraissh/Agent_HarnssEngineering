@@ -450,6 +450,11 @@ mitre 切角、audit/islands/bruns/fab_check、丝印工具、示例与 README,v
 - kit 已知边界:0.125 栅 A* 复现不了 freerouting 的 0.45 节距紧密排线(v6 拆 PA9 恢复不了),
   紧密带要么整束拆掉重排要么手工;`place_silk` 密区找不到位时保留原位;
 - 领域包经验来源定论:少而精、成对(sch+pcb)、量产、**按需蒸馏**——Wafer 仓库 ~80 块 Altium 板留作后续。
+- **v7 清理轮已收(2026-08-18)**:委托方点名 via 81→80 / 孤岛 / "NRST 好几条并行线"→ 新工具 `redundancy.py`/`net_stats.py`/
+  `edit_tracks.py`/`dedupe_tracks.py`/`trim_pad_stubs.py`/`trim_dust.py`/`via_in_pad.py`/`net_view.py`;结果 DRC 0、审计 7/7、
+  via **69**、孤岛 1、拐角全 45°、并行/重复 0、via-in-pad 6→1、32k 晶振簇重排(负载电容交叉 → 各归其位,四网 0 via)。
+  五镜头独立核查 workflow 全 confirmed(细节见案例文档 §4.6)。**留下的边界**:OSC32_OUT∥OSC_IN 走廊贴走 5mm@0.34(根治要竖放晶振)、
+  C12 离 Y2-2 3.8mm、C7-2 via-in-pad(被逃逸线围死)、右板边 +3V3 距 J2 焊盘 0.315;下一步若继续:晶振簇整体竖放重摆一次。
 
 **C1. 开案例 #9（推荐）。** 前八案里 STM32 占四个，而三角编排在**跨领域交接**
 上只被案例 #8 验过一次。现在有了台账，跑真实任务会**自动攒 §2.1 的样本**——

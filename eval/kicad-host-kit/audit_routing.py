@@ -22,6 +22,27 @@ def ok(cond, name, detail):
     verdicts.append((cond, name, detail))
 
 
+def seg_hits_box(x0, y0, x1, y1, b):
+    """线段与轴对齐矩形是否相交(Liang–Barsky 裁剪)。"""
+    dx, dy = x1 - x0, y1 - y0
+    t0, t1 = 0.0, 1.0
+    for p, q in ((-dx, x0 - b[0]), (dx, b[2] - x0), (-dy, y0 - b[1]), (dy, b[3] - y0)):
+        if p == 0:
+            if q < 0:
+                return False
+            continue
+        r = q / p
+        if p < 0:
+            if r > t1:
+                return False
+            t0 = max(t0, r)
+        else:
+            if r < t0:
+                return False
+            t1 = min(t1, r)
+    return t0 <= t1
+
+
 tracks = [t for t in board.GetTracks() if t.GetClass() == "PCB_TRACK"]
 vias = [t for t in board.GetTracks() if t.GetClass() == "PCB_VIA"]
 lay_len = defaultdict(float)
@@ -42,10 +63,10 @@ for t in tracks:
     if dx or dy:
         ang = math.degrees(math.atan2(dy, dx))
         dirstat[lname]["H" if ang < 5 else ("V" if ang > 85 else ("45" if 40 < ang < 50 else "odd"))] += 1
-    if XTAL_BOX:
-        for px, py in ((s.x / 1e6, s.y / 1e6), (e.x / 1e6, e.y / 1e6)):
-            if XTAL_BOX[0] <= px <= XTAL_BOX[2] and XTAL_BOX[1] <= py <= XTAL_BOX[3] and t.GetNetname() not in XTAL_NETS:
-                intruders.add(t.GetNetname())
+    if XTAL_BOX and t.GetNetname() not in XTAL_NETS:
+        # 线段-矩形相交(不只查端点——v7 核查发现两条 45° 线切盒角而端点都在盒外的盲区)
+        if seg_hits_box(s.x / 1e6, s.y / 1e6, e.x / 1e6, e.y / 1e6, XTAL_BOX):
+            intruders.add(t.GetNetname())
 f_len, b_len = lay_len.get("F.Cu", 0.0), lay_len.get("B.Cu", 0.0)
 ok(b_len <= 0.4 * max(f_len, 1e-9), "底层走线量(≤顶层40%)", "F=%.1fmm B=%.1fmm ratio=%.2f" % (f_len, b_len, b_len / max(f_len, 1e-9)))
 ok(longest_b[0] <= 15.0, "最长底层单段(≤15mm)", "%.1fmm on %s" % longest_b)
