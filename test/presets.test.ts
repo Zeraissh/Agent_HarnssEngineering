@@ -82,6 +82,23 @@ describe("domain packs", () => {
     expect(p!.verify.instructions).toContain("视觉工具缺席不豁免");
   });
 
+  it("kicad 包：库件大块搬运不经过模型上下文（案例 #11 的 140 轮失败催生）", () => {
+    const p = getPack("kicad");
+    const prompt = p!.systemPrompt;
+
+    // 这条纪律直接针对实测失效形态：模型用 read_file/write_file 转录完整
+    // LQFP-48 库件，烧满 140 轮仍未拼出成品。正确动作是让 shell 忠实地
+    // 文件到文件抽取/拼装；模型只写小而关键的实例、导线、标签与骨架。
+    expect(prompt).toContain("大块搬运用 shell 而不是上下文");
+    expect(prompt).toContain("内容不过");
+    expect(prompt).toContain("模型上下文");
+    expect(prompt).toContain("文件到文件的忠实抽取/拼装");
+    expect(prompt).toContain("符号实例、导线、标签、文档骨架");
+
+    // 防止后续把这条误读成“允许脚本从头生成库件”；两类动作的边界也要在。
+    expect(prompt).toContain("禁的是**从头编造内容**的脚本");
+  });
+
   it("kicad 包：PCB 布线成品口径 + 体检单（案例 #11 量产校准 + 委托方红框三连催生）", () => {
     const p = getPack("kicad");
     // 执行侧:曼哈顿只是脚手架;成品口径 = 底层参考面 / 45° 拐角 / 晶振禁区 / 逐引脚丝印 / 板厂约束
