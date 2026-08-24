@@ -212,9 +212,14 @@ async function readSSESnapshot(
   return events;
 }
 
-/** 等待 run 变为 done */
+/**
+ * 等待 run 变为 done。截止线 15s 而非固定 50 次轮询：旧预算 ~2.5s 在
+ * 满载 CI 跑道上会把慢跑误伤成失败（2026-08-24 CI 实测一例，本地与
+ * 重跑均绿）；真卡死的 run 仍然会在截止线处红。
+ */
 async function waitForDone(base: string, runId: string): Promise<void> {
-  for (let i = 0; i < 50; i++) {
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
     const res = await fetch(`${base}/api/runs`);
     const list: { runId: string; status: string }[] = await res.json();
     const entry = list.find((r) => r.runId === runId);
