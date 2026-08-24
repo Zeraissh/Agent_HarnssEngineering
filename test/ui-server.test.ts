@@ -2573,12 +2573,39 @@ describe("在文件夹中显示：从网页请求启动本机进程，圈禁只�
    * 交给命令行解析器——一个含 `&` 或反引号的文件名即可执行任意命令。
    */
   it("revealCommand 返回参数数组，且不含 shell 元字符拼接", () => {
-    const cmd = revealCommand("/tmp/a b & c.txt");
-    if (!cmd) return; // 不支持的平台返回 null，本身就是安全的
-    expect(Array.isArray(cmd.args)).toBe(true);
-    expect(cmd.file).not.toContain(" ");
-    // 文件名原样落在某个参数里，而不是被拼进一条串
-    expect(cmd.args.some((a) => a.includes("a b & c.txt"))).toBe(true);
+    // 三个平台分支全部钉死（stub process.platform 而不是跟着宿主走）：
+    // 修前断言"文件名必落参数"——Linux 分支打开的是所在目录，文件名本就不在，
+    // 测试只在 Windows/macOS 上有意义（CI 首跑实测：本机绿、ubuntu 红）。
+    const dangerous = "/tmp/a b & c.txt";
+    const withPlatform = (platform: string, fn: () => void) => {
+      const desc = Object.getOwnPropertyDescriptor(process, "platform")!;
+      Object.defineProperty(process, "platform", { value: platform });
+      try {
+        fn();
+      } finally {
+        Object.defineProperty(process, "platform", desc);
+      }
+    };
+    for (const platform of ["win32", "darwin"]) {
+      withPlatform(platform, () => {
+        const cmd = revealCommand(dangerous);
+        expect(cmd).not.toBeNull();
+        expect(Array.isArray(cmd!.args)).toBe(true);
+        expect(cmd!.file).not.toContain(" ");
+        // 文件名原样落在某个参数里，而不是被拼进一条串
+        expect(cmd!.args.some((a) => a.includes("a b & c.txt"))).toBe(true);
+      });
+    }
+    withPlatform("linux", () => {
+      // Linux 没有"选中文件"的标准动词：打开所在目录，目录路径原样落参
+      const cmd = revealCommand(dangerous);
+      expect(cmd).not.toBeNull();
+      expect(cmd!.file).toBe("xdg-open");
+      expect(cmd!.args).toEqual(["/tmp"]);
+    });
+    withPlatform("freebsd", () => {
+      expect(revealCommand(dangerous)).toBeNull(); // 不支持的平台返回 null，本身就是安全的
+    });
   });
 
   it("目录与文件的系统动作不同：目录直接打开，文件定位到所在文件夹", () => {

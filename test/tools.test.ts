@@ -30,7 +30,14 @@ describe("resolveInWorkdir", () => {
   });
 
   it("拒绝工作区外的绝对路径", () => {
-    expect(() => resolveInWorkdir(workdir, "C:\\Windows\\system32\\x.txt")).toThrow(/escapes/);
+    // 在任何平台都是绝对路径且在工作区外（workdir 的兄弟目录）。
+    // 修前这里写死 "C:\\..."——在 Linux 上那是相对路径，测试只在 Windows 有牙齿
+    // （CI 首跑实测抓到：本机绿、ubuntu 红）。
+    const outsideAbs = path.join(tmpdir(), "definitely-outside", "x.txt");
+    expect(() => resolveInWorkdir(workdir, outsideAbs)).toThrow(/escapes/);
+    if (process.platform === "win32") {
+      expect(() => resolveInWorkdir(workdir, "C:\\Windows\\system32\\x.txt")).toThrow(/escapes/);
+    }
   });
 
   it("接受工作区内的相对与嵌套路径", () => {
