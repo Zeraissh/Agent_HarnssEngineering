@@ -38,6 +38,24 @@ export function resolveReadable(workdir: string, readRoots: string[] | undefined
   );
 }
 
+/**
+ * 凭据形状的文件名（审计 2026-08-24 high）：read_file 走 auto 权限，默认
+ * workdir=cwd 时 agent 可**无审批**读走 .env 真实密钥，且内容随 transcript
+ * 明文进运行历史归档。bash `cat .env` 仍可行——但 bash 在审批门后，操作员
+ * 看得见命令；这里堵的是唯一一条无人看见的路径。
+ * `.example` / `.sample` 是不含真值的模板，放行。名单刻意收紧到"几乎不可能
+ * 误伤"的形状——宁可漏（还有审批门兜底），不可把正常文件误拒成新失效模式。
+ */
+export function credentialLikeName(p: string): boolean {
+  const base = path.basename(p).toLowerCase();
+  if (base.endsWith(".example") || base.endsWith(".sample")) return false;
+  if (base === ".env" || base.startsWith(".env.")) return true;
+  if (base === ".npmrc" || base === ".netrc") return true;
+  if (base.startsWith("id_rsa") || base.startsWith("id_ed25519") || base.startsWith("id_ecdsa")) return true;
+  if (base.endsWith(".pem")) return true;
+  return false;
+}
+
 /** 输出截断：超长内容回填给模型只会烧 token，不会更有用 */
 export function truncate(text: string, limit = 30_000): string {
   if (text.length <= limit) return text;

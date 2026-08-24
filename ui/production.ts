@@ -77,3 +77,14 @@ export function resolveUiLaunchPolicy(env: NodeJS.ProcessEnv = process.env): UiL
     insecureHttpAcknowledged,
   };
 }
+
+/**
+ * 启动横幅里的访问引导行。**令牌本体绝不进 stdout**——launcher 的输出在被
+ * 服务管理器/容器托管时会被日志采集持久化（json-file、journald），打印一次
+ * 等于永久落盘一份凭据；runbook 还要求事故时保全日志，等于要求保存令牌。
+ * 占位符由操作员自行代入（审计 2026-08-24：token 打进 stdout，high）。
+ */
+export function accessHintLine(policy: UiLaunchPolicy, localUrl: string): string | undefined {
+  if (!policy.accessToken || policy.remote) return undefined;
+  return `${localUrl}/?access_token=<AGENT_UI_ACCESS_TOKEN 的值>`;
+}

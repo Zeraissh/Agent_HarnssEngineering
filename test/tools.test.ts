@@ -3,9 +3,10 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { ToolRegistry } from "../src/tools/registry.js";
-import { resolveInWorkdir, truncate } from "../src/tools/fs-util.js";
+import { credentialLikeName, resolveInWorkdir, truncate } from "../src/tools/fs-util.js";
 import { readFileTool } from "../src/tools/read-file.js";
 import { writeFileTool } from "../src/tools/write-file.js";
+import { SHELL_DESC, bashTool, sanitizeChildEnv } from "../src/tools/bash.js";
 import { makeTool } from "./helpers.js";
 
 let workdir: string;
@@ -168,4 +169,101 @@ describe("ToolRegistry", () => {
     reg.register(makeTool({ name: "dup" }));
     expect(() => reg.register(makeTool({ name: "dup" }))).toThrow(/already registered/);
   });
+});
+
+/**
+ * 三条 high 安全修复（审计 2026-08-24）之二/之三的行为锁。
+ * 之一（启动横幅不打令牌）锁在 test/ui-production.test.ts。
+ */
+describe("read_file 凭据文件防线：auto 权限对密钥形状关门", () => {
+  it("credentialLikeName 分类：密钥形状拒、模板放行、普通文件放行", () => {
+    for (const p of [".env", ".env.local", "config/.env.production", ".npmrc", ".netrc", "id_rsa", "id_rsa.pub", "id_ed25519", "certs/server.pem"]) {
+      expect(credentialLikeName(p), p).toBe(true);
+    }
+    for (const p of [".env.example", ".env.production.example", "sample/.env.sample", "environment.ts", "envelope.txt", "README.md", "src/main.rs"]) {
+      expect(credentialLikeName(p), p).toBe(false);
+    }
+  });
+
+  it("读 .env → 拒绝，报错说明原因并指出审批门改道；防线先于文件系统触发", async () => {
+    await writeFileTool.execute(
+      { path: ".env", content: "ANTHROPIC_API_KEY=sk-real-secret" },
+      ctx("tu_seed_env"),
+    );
+    const r = await readFileTool.execute({ path: ".env" }, ctx());
+    expect(r.isError).toBe(true);
+    expect(r.content).toMatch(/credential/i);
+    expect(r.content).toMatch(/approval-gated bash/);
+    // 内容绝不外漏——把防线挪到读取之后，这一条立即红
+    expect(r.content).not.toContain("sk-real-secret");
+    // 防线在 resolve/读盘之前：不存在的凭据形状路径也给同一种拒绝，而不是"not found"
+    const ghost = await readFileTool.execute({ path: "config/.env.local" }, ctx());
+    expect(ghost.isError).toBe(true);
+    expect(ghost.content).toMatch(/credential/i);
+  });
+
+  it("模板 .env.example 照常可读", async () => {
+    await writeFileTool.execute(
+      { path: ".env.example", content: "ANTHROPIC_API_KEY=" },
+      ctx("tu_seed_env_example"),
+    );
+    const r = await readFileTool.execute({ path: ".env.example" }, ctx());
+    expect(r.isError).toBeUndefined();
+    expect(r.content).toBe("ANTHROPIC_API_KEY=");
+  });
+});
+
+describe("bash 子进程环境剥密钥", () => {
+  it("sanitizeChildEnv 分类：凭据名剥除、端点与常规变量保留", () => {
+    const input: NodeJS.ProcessEnv = {
+      ANTHROPIC_API_KEY: "a",
+      OPENAI_API_KEY: "b",
+      AGENT_VERIFIER_API_KEY: "c",
+      AGENT_UI_ACCESS_TOKEN: "d",
+      GITHUB_TOKEN: "e",
+      NPM_TOKEN: "f",
+      AWS_SECRET_ACCESS_KEY: "g",
+      AWS_ACCESS_KEY_ID: "h",
+      DB_PASSWORD: "i",
+      // 保留组：端点地址不是凭据；TOKENIZERS_* 是"TOKEN 子串误伤"的回归哨兵
+      ANTHROPIC_BASE_URL: "https://api.deepseek.com/anthropic",
+      TOKENIZERS_PARALLELISM: "false",
+      PATH: "/usr/bin",
+      HOME: "/home/u",
+    };
+    const out = sanitizeChildEnv(input);
+    for (const gone of ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "AGENT_VERIFIER_API_KEY", "AGENT_UI_ACCESS_TOKEN", "GITHUB_TOKEN", "NPM_TOKEN", "AWS_SECRET_ACCESS_KEY", "AWS_ACCESS_KEY_ID", "DB_PASSWORD"]) {
+      expect(out, gone).not.toHaveProperty(gone);
+    }
+    for (const kept of ["ANTHROPIC_BASE_URL", "TOKENIZERS_PARALLELISM", "PATH", "HOME"]) {
+      expect(out, kept).toHaveProperty(kept);
+    }
+  });
+
+  it("AGENT_BASH_KEEP_ENV 显式放行个别变量（精确名字匹配）", () => {
+    const out = sanitizeChildEnv({
+      AGENT_BASH_KEEP_ENV: "GITHUB_TOKEN",
+      GITHUB_TOKEN: "keepme",
+      NPM_TOKEN: "gone",
+    });
+    expect(out.GITHUB_TOKEN).toBe("keepme");
+    expect(out).not.toHaveProperty("NPM_TOKEN");
+  });
+
+  // 真跑 shell 的行为锁：纯函数测试盖不住调用点——把 execute 里那行 env 删掉，
+  // exec 会隐式继承完整 process.env，只有这条测试会红（cmd.exe 环境无 $VAR 语义，跳过）
+  it.runIf(!SHELL_DESC.includes("cmd.exe"))(
+    "运行期设置的密钥环境变量在 bash 子进程里不可见",
+    async () => {
+      process.env.HARNESS_LEAK_TEST_API_KEY = "leak-canary";
+      try {
+        const r = await bashTool.execute({ command: 'echo "[$HARNESS_LEAK_TEST_API_KEY]"' }, ctx());
+        expect(r.isError).toBeUndefined();
+        expect(r.content).toContain("[]");
+        expect(r.content).not.toContain("leak-canary");
+      } finally {
+        delete process.env.HARNESS_LEAK_TEST_API_KEY;
+      }
+    },
+  );
 });

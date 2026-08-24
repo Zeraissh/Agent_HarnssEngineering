@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import type { Tool } from "../types.js";
-import { resolveReadable, truncate } from "./fs-util.js";
+import { credentialLikeName, resolveReadable, truncate } from "./fs-util.js";
 
 export const readFileTool: Tool = {
   name: "read_file",
@@ -25,6 +25,18 @@ export const readFileTool: Tool = {
     const { path: p, offset, limit } = input as { path: string; offset?: number; limit?: number };
     if (typeof p !== "string" || p.length === 0) {
       return { content: 'Invalid input: expected {"path": string}.', isError: true };
+    }
+    // 凭据文件对无审批的 read_file 关门（fail-closed），报错写给模型看：说清为什么、指出改道
+    if (credentialLikeName(p)) {
+      return {
+        content:
+          `Reading credential-style files is blocked for read_file: "${p}" looks like key material ` +
+          "(.env*, .npmrc, .netrc, id_rsa*, *.pem). This tool runs without approval, so its reads are " +
+          "invisible to the operator and would land in plaintext run archives. If the task genuinely " +
+          "needs values from this file, ask the operator to provide them, or read it via the " +
+          "approval-gated bash tool so a human sees exactly what is accessed.",
+        isError: true,
+      };
     }
     const resolved = resolveReadable(ctx.workdir, ctx.readRoots, p);
     const text = await readFile(resolved, "utf8");

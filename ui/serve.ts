@@ -27,7 +27,7 @@
  */
 import { delimiter } from "node:path";
 import { createUiServer } from "./server.js";
-import { resolveUiLaunchPolicy } from "./production.js";
+import { accessHintLine, resolveUiLaunchPolicy } from "./production.js";
 import { warnEnvConflicts } from "../src/env-check.js";
 
 // .env 被残留环境变量压掉时大声说出来——那可能意味着凭据被发往另一家端点
@@ -69,9 +69,9 @@ handle.server.listen(port, host, () => {
     const m = process.env[`AGENT_${role}_MODEL`];
     if (m) console.log(`  ${role.toLowerCase()} model: ${m}`);
   }
-  if (!policy.remote && policy.accessToken) {
-    console.log(`  open:    ${localUrl}/?access_token=${encodeURIComponent(policy.accessToken)}`);
-  }
+  // 令牌本体不进 stdout（占位符引导，见 accessHintLine 的注释）
+  const hint = accessHintLine(policy, localUrl);
+  if (hint) console.log(`  open:    ${hint}`);
   if (policy.remote) {
     console.log(`  remote boundary: ${policy.trustProxy ? "trusted TLS proxy" : "insecure HTTP explicitly acknowledged"}`);
   }

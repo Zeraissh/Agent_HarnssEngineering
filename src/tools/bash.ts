@@ -33,8 +33,8 @@ const WINDOWS_BASH = process.platform === "win32" ? detectWindowsBash() : undefi
  * PATH 全靠父进程传入。父进程是 Git Bash 时碰巧有；是 PowerShell/任务计划时
  * 没有 → "wc: command not found"。工具必须自带运行时完整性，不赌宿主环境。
  */
-function bashEnv(): NodeJS.ProcessEnv | undefined {
-  if (!WINDOWS_BASH) return undefined;
+function bashPathMissing(): string[] {
+  if (!WINDOWS_BASH) return [];
   // bash 可能在 <root>\usr\bin 或 <root>\bin —— 两种推导都试，existsSync 筛掉错的
   const binDir = path.dirname(WINDOWS_BASH);
   const candidates = [
@@ -45,12 +45,54 @@ function bashEnv(): NodeJS.ProcessEnv | undefined {
     .filter((p, i, arr) => arr.indexOf(p) === i)
     .filter((p) => existsSync(p));
   const current = process.env["PATH"] ?? "";
-  const missing = candidates.filter((p) => !current.toLowerCase().includes(p.toLowerCase()));
-  if (missing.length === 0) return undefined;
-  return { ...process.env, PATH: [...missing, current].join(path.delimiter) };
+  return candidates.filter((p) => !current.toLowerCase().includes(p.toLowerCase()));
 }
 
-const BASH_ENV = bashEnv();
+const BASH_PATH_MISSING = bashPathMissing();
+
+/**
+ * 子进程环境剥密钥（审计 2026-08-24 high）：bash 以宿主完整权限执行，此前
+ * 原样继承 process.env——任何一条被批准的命令都能 `echo $ANTHROPIC_API_KEY`
+ * 或把它外发。审批门让操作员看得见**命令**，看不见环境里躺着什么；密钥不该
+ * 靠每次审批时的人肉警觉来守。
+ *
+ * 按名字形状匹配：含 SECRET，或以 API_KEY / TOKEN / PASSWORD / CREDENTIAL(S) /
+ * PRIVATE_KEY / ACCESS_KEY(_ID) 结尾（覆盖 ANTHROPIC/OPENAI/AGENT_*_API_KEY、
+ * AGENT_UI_ACCESS_TOKEN、GITHUB_TOKEN、AWS 三件套）。刻意不匹配 BASE_URL 类
+ * ——端点地址不是凭据，剥了只会逼操作员整体关掉这层。
+ * 确需透传的变量走 AGENT_BASH_KEEP_ENV（逗号分隔，名字精确匹配）：放行成为
+ * 一个留在部署清单里的显式配置动作，而不是默认全给。
+ */
+const SENSITIVE_ENV_NAME =
+  /SECRET|(?:^|_)(?:API_?KEY|TOKEN|PASSWORD|PASSWD|CREDENTIALS?|PRIVATE_KEY|ACCESS_KEY(?:_ID)?)$/i;
+
+export function sanitizeChildEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const keep = new Set(
+    (env["AGENT_BASH_KEEP_ENV"] ?? "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean),
+  );
+  const out: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(env)) {
+    if (!keep.has(k) && SENSITIVE_ENV_NAME.test(k)) continue;
+    out[k] = v;
+  }
+  return out;
+}
+
+/**
+ * 每次执行时从**活的** process.env 合成（而非模块加载快照——快照会漏掉
+ * 运行期设置的变量，剥密钥就有了绕过窗口），再补 Git Bash 的 PATH、过安检。
+ */
+function childEnv(): NodeJS.ProcessEnv {
+  const base: NodeJS.ProcessEnv = { ...process.env };
+  if (BASH_PATH_MISSING.length) {
+    base["PATH"] = [...BASH_PATH_MISSING, base["PATH"] ?? ""].join(path.delimiter);
+  }
+  return sanitizeChildEnv(base);
+}
+
 /** 实际使用的 shell 描述（宿主注入 dynamicContext 用，保持与工具行为一致） */
 export const SHELL_DESC =
   process.platform !== "win32"
@@ -90,7 +132,8 @@ export const bashTool: Tool = {
           signal: ctx.signal,
           windowsHide: true,
           ...(WINDOWS_BASH ? { shell: WINDOWS_BASH } : {}),
-          ...(BASH_ENV ? { env: BASH_ENV } : {}),
+          // 必须显式给 env：不传时 exec 隐式继承完整 process.env，剥密钥即失效
+          env: childEnv(),
         },
         (err, stdout, stderr) => {
           const combined = [stdout, stderr].filter(Boolean).join("\n--- stderr ---\n");
