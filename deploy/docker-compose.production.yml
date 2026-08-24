@@ -9,6 +9,13 @@ services:
     image: ${AGENT_IMAGE:?set the digest-pinned release image from the GitHub Release notes}
     restart: unless-stopped
     stop_grace_period: 10s
+    # 无轮转的 json-file 日志会无界增长直至盘满——盘满连带打断历史落盘，
+    # 触发的正是自家 readiness 降级与 P0 告警（审计 2026-08-24 medium）
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
     read_only: true
     init: true
     ports:

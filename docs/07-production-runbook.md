@@ -59,6 +59,10 @@ from the remote tool surface by default. Enabling it requires the separate
 `AGENT_UI_ALLOW_REMOTE_EXECUTION=1` acknowledgement and an OS/container isolation review.
 Load `deploy/prometheus-alerts.yml` into the monitoring stack and configure the scraper with the same
 Bearer token used by the operator; `/metrics` is authenticated whenever the host token is enabled.
+Name the scrape job exactly `agent-harness` — the process-death alert (`AgentHarnessDown`) matches on
+that job label and stays silent under any other name. Run outcomes are queryable as
+`agent_harness_runs_finished_total{outcome=...}`; the rollback trigger "run errors exceed baseline"
+is backed by the `AgentHarnessRunErrorRatio` alert.
 
 ## Canary and smoke checks
 

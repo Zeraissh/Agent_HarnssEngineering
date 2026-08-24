@@ -91,6 +91,13 @@ interface ResolvedApproval {
   at: number;
 }
 
+/**
+ * outcome 值域的唯一事实源（B1 的教训：同一枚举写两处必漂移）。
+ * RunEndInfo.outcome 从这里派生；/metrics 按它逐值输出 outcome 标签——
+ * 新增一个 outcome 值时这里不加，赋值处直接类型报错，指标不会静默漏一档。
+ */
+export const RUN_OUTCOMES = ["completed", "partial", "blocked", "error", "closed", "rejected"] as const;
+
 /** run 级终止信息，由 startPlainRun/startVerifiedRun 算出后交给 finalizeRun */
 interface RunEndInfo {
   /**
@@ -98,7 +105,7 @@ interface RunEndInfo {
    * rejected = 计划确认门被否决——**不是 error**：那是委托方的决定，不是失败。
    * 混进 error 会让界面说谎（V-04 的教训：stopReason 不能压值域）。
    */
-  outcome: "completed" | "partial" | "blocked" | "error" | "closed" | "rejected";
+  outcome: (typeof RUN_OUTCOMES)[number];
   mainStopReason?: string;
 }
 
@@ -949,7 +956,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     httpRequests: 0,
     httpStatuses: new Map<number, number>(),
     runsStarted: 0,
-    runsFinished: 0,
+    // 按 outcome 分档（审计 2026-08-24 high：无成败率指标，runbook 的
+    // "run errors 超基线即回滚"条款没有任何可查询的数据支撑）
+    runsFinished: new Map<RunEndInfo["outcome"], number>(),
     originRejected: 0,
     authRejected: 0,
     hostRejected: 0,
@@ -1775,7 +1784,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     run.status = "done";
     run.finishedAt = Date.now();
     if (endInfo.mainStopReason) run.mainStopReason = endInfo.mainStopReason;
-    metrics.runsFinished += 1;
+    metrics.runsFinished.set(endInfo.outcome, (metrics.runsFinished.get(endInfo.outcome) ?? 0) + 1);
     if (realHost) {
       operationalLog("info", "run_finished", {
         runId: run.id,
@@ -2551,7 +2560,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       "# TYPE agent_harness_runs_started_total counter",
       `agent_harness_runs_started_total ${metrics.runsStarted}`,
       "# TYPE agent_harness_runs_finished_total counter",
-      `agent_harness_runs_finished_total ${metrics.runsFinished}`,
+      // 全部 outcome 逐值输出（含 0）：错误率的 PromQL 比值查询需要稳定的序列集，
+      // "出现过才有序列"会让告警在第一次错误前后看到不同的向量形状
+      ...RUN_OUTCOMES.map(
+        (o) => `agent_harness_runs_finished_total{outcome="${o}"} ${metrics.runsFinished.get(o) ?? 0}`,
+      ),
       "# TYPE agent_harness_security_rejections_total counter",
       `agent_harness_security_rejections_total{reason="origin"} ${metrics.originRejected}`,
       `agent_harness_security_rejections_total{reason="auth"} ${metrics.authRejected}`,

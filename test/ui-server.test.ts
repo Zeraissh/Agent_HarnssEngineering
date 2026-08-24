@@ -3800,3 +3800,104 @@ describe("P0 production host boundary", () => {
     }
   });
 });
+
+/**
+ * 监控闭环锁（审计 2026-08-24）：
+ * ① runs_finished 按 outcome 分档——runbook 的"run errors 超基线即回滚"从此有数可查；
+ * ② 告警文件引用的每个 agent_harness_* 指标必须真实存在于 /metrics 输出
+ *    （告警引用幽灵指标 = 永远不响的保险丝，与"有指标没告警"同族但更隐蔽）；
+ * ③ 进程死亡告警必须存在且钉在 job="agent-harness" 上——其余告警全基于自产指标，
+ *    进程一死序列转 stale，全部失聪；up/absent 是唯一不依赖被监控者自己的规则。
+ */
+describe("监控闭环：outcome 分档指标与告警文件一致性", () => {
+  it("跑完一个 run 后 outcome 档计 1，六档序列全部在场（含 0），无标签旧形状消失", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "metrics-outcome-"));
+    const handle = createUiServer({
+      modelClient: new FakeModelClient([fakeMessage([textBlock("done")], "end_turn")]),
+      workdir: dir,
+    });
+    try {
+      const port = await startServer(handle);
+      const base = baseUrl(port);
+      const res = await fetch(`${base}/api/runs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task: "t" }),
+      });
+      const { runId } = await res.json();
+      await waitForDone(base, runId);
+      const text = await (await fetch(`${base}/metrics`)).text();
+      const buckets = [...text.matchAll(/^agent_harness_runs_finished_total\{outcome="([a-z]+)"\} (\d+)$/gm)]
+        .map(([, outcome, n]) => [outcome, Number(n)] as const);
+      // 六档全部在场
+      expect(buckets.map(([o]) => o).sort()).toEqual(
+        ["blocked", "closed", "completed", "error", "partial", "rejected"],
+      );
+      // 恰好一档计 1（这次 run 的归宿），其余为 0——分档丢计数或重复计数都会红
+      expect(buckets.reduce((sum, [, n]) => sum + n, 0)).toBe(1);
+      // 无标签的旧形状必须消失（半新半旧的双形状会让 sum() 查询翻倍）
+      expect(text).not.toMatch(/^agent_harness_runs_finished_total \d/m);
+    } finally {
+      await handle.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("抛错的 run 落 error 档——分档归属可辨（把增量恒计某一档的变异在此红）", async () => {
+    class CrashClient implements ModelClient {
+      async send(): Promise<ModelTurn> {
+        throw new Error("simulated model crash");
+      }
+    }
+    const dir = await mkdtemp(join(tmpdir(), "metrics-outcome-err-"));
+    const handle = createUiServer({ modelClient: new CrashClient(), workdir: dir });
+    try {
+      const port = await startServer(handle);
+      const base = baseUrl(port);
+      const res = await fetch(`${base}/api/runs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task: "t" }),
+      });
+      const { runId } = await res.json();
+      await waitForDone(base, runId);
+      const text = await (await fetch(`${base}/metrics`)).text();
+      expect(text).toContain('agent_harness_runs_finished_total{outcome="error"} 1');
+      expect(text).toContain('agent_harness_runs_finished_total{outcome="completed"} 0');
+    } finally {
+      await handle.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("告警文件：引用的自产指标逐一真实存在；进程死亡告警钉在 job=agent-harness", async () => {
+    const alertsYml = readFileSync(
+      fileURLToPath(new URL("../deploy/prometheus-alerts.yml", import.meta.url)),
+      "utf8",
+    );
+    // ③ up==0 与 absent 双臂都在，job 名精确（改名/删规则即红）
+    expect(alertsYml).toMatch(/up\{job="agent-harness"\} == 0/);
+    expect(alertsYml).toMatch(/absent\(up\{job="agent-harness"\}\)/);
+    // ② 告警表达式引用的每个 agent_harness_* 指标名都必须出现在 /metrics 输出里
+    const referenced = [...new Set(alertsYml.match(/agent_harness_[a-z_]+/g) ?? [])];
+    expect(referenced.length).toBeGreaterThanOrEqual(5);
+    const dir = await mkdtemp(join(tmpdir(), "metrics-alerts-"));
+    const handle = createUiServer({
+      modelClient: new FakeModelClient([fakeMessage([textBlock("done")], "end_turn")]),
+      workdir: dir,
+    });
+    try {
+      const port = await startServer(handle);
+      const text = await (await fetch(`${baseUrl(port)}/metrics`)).text();
+      for (const name of referenced) {
+        expect(text, `告警引用的指标 ${name} 不在 /metrics 输出里`).toContain(name);
+      }
+      // 错误率告警的分子序列（outcome="error"）从第 0 次错误起就存在
+      expect(text).toContain('agent_harness_runs_finished_total{outcome="error"} 0');
+    } finally {
+      await handle.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+

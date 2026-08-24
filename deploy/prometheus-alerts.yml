@@ -1,6 +1,18 @@
 groups:
   - name: agent-harness-p0
     rules:
+      # 进程死亡是最基本的失效形态，此前恰恰是唯一不告警的一种：其余规则全部
+      # 基于 agent_harness_* 自身指标，进程挂掉后序列转 stale，什么都匹配不到
+      # （审计 2026-08-24 high）。up/absent 只依赖 Prometheus 自身——
+      # 前提：scrape job 必须命名为 agent-harness（runbook 部署步骤已写明）。
+      - alert: AgentHarnessDown
+        expr: up{job="agent-harness"} == 0 or absent(up{job="agent-harness"})
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Agent Harness target is down or missing from scrape config
+
       - alert: AgentHarnessNotReady
         expr: agent_harness_ready == 0
         for: 2m
@@ -8,6 +20,21 @@ groups:
           severity: critical
         annotations:
           summary: Agent Harness has remained unready for two minutes
+
+      # runbook 回滚触发条件"run errors materially exceed baseline"的可查询落地
+      # （此前无成败率指标，该条款只能人工翻日志）。要求 ≥3 次错误再看占比，
+      # 避免单次失败的 1/1=100% 噪声。
+      - alert: AgentHarnessRunErrorRatio
+        expr: >-
+          sum(increase(agent_harness_runs_finished_total{outcome="error"}[30m])) >= 3
+          and
+          sum(increase(agent_harness_runs_finished_total{outcome="error"}[30m]))
+          / clamp_min(sum(increase(agent_harness_runs_finished_total[30m])), 1) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: More than half of finished agent runs errored over the last 30 minutes
 
       - alert: AgentHarnessHistoryWriteFailure
         expr: increase(agent_harness_history_errors_total[5m]) > 0
