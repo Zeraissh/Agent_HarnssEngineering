@@ -3832,13 +3832,17 @@ describe("监控闭环：outcome 分档指标与告警文件一致性", () => {
       const { runId } = await res.json();
       await waitForDone(base, runId);
       const text = await (await fetch(`${base}/metrics`)).text();
-      const buckets = [...text.matchAll(/^agent_harness_runs_finished_total\{outcome="([a-z]+)"\} (\d+)$/gm)]
+      // 字符类含 _ 与数字：仓库枚举先例大量 snake_case（plan_rejected 等），
+      // [a-z]+ 会让未来的新档被 matchAll 静默跳过、绊线恰好在新增形态上失效（评审抓出）
+      const buckets = [...text.matchAll(/^agent_harness_runs_finished_total\{outcome="([a-z0-9_]+)"\} (\d+)$/gm)]
         .map(([, outcome, n]) => [outcome, Number(n)] as const);
       // 六档全部在场
       expect(buckets.map(([o]) => o).sort()).toEqual(
         ["blocked", "closed", "completed", "error", "partial", "rejected"],
       );
-      // 恰好一档计 1（这次 run 的归宿），其余为 0——分档丢计数或重复计数都会红
+      // 成功 run 必须落 completed 档（注入模型 + end_turn 是确定性的）——
+      // 只查总和不查归属，会放过"恒计 error 档"这类变异（评审抓出的假绿缝）
+      expect(buckets.find(([o]) => o === "completed")?.[1]).toBe(1);
       expect(buckets.reduce((sum, [, n]) => sum + n, 0)).toBe(1);
       // 无标签的旧形状必须消失（半新半旧的双形状会让 sum() 查询翻倍）
       expect(text).not.toMatch(/^agent_harness_runs_finished_total \d/m);
@@ -3883,8 +3887,11 @@ describe("监控闭环：outcome 分档指标与告警文件一致性", () => {
     // ③ up==0 与 absent 双臂都在，job 名精确（改名/删规则即红）
     expect(alertsYml).toMatch(/up\{job="agent-harness"\} == 0/);
     expect(alertsYml).toMatch(/absent\(up\{job="agent-harness"\}\)/);
-    // ② 告警表达式引用的每个 agent_harness_* 指标名都必须出现在 /metrics 输出里
-    const referenced = [...new Set(alertsYml.match(/agent_harness_[a-z_]+/g) ?? [])];
+    // ② 告警表达式引用的每个 agent_harness_* 指标名都必须以**真实样本行**存在
+    //    （评审抓出两个假绿缝：toContain 子串会被 "# TYPE" 声明行命中——http
+    //    状态在响应 finish 事件才记账，首个响应构建时 httpStatuses 为空、该指标
+    //    彼时只有 TYPE 行；前缀子串还会放过漏写 _total 的告警名）
+    const referenced = [...new Set(alertsYml.match(/agent_harness_[a-z0-9_]+/g) ?? [])];
     expect(referenced.length).toBeGreaterThanOrEqual(5);
     const dir = await mkdtemp(join(tmpdir(), "metrics-alerts-"));
     const handle = createUiServer({
@@ -3893,12 +3900,19 @@ describe("监控闭环：outcome 分档指标与告警文件一致性", () => {
     });
     try {
       const port = await startServer(handle);
+      // 暖场请求：让至少一个 HTTP 状态完成记账（status 在 finish 事件落账）
+      await (await fetch(`${baseUrl(port)}/api/runs`)).json();
       const text = await (await fetch(`${baseUrl(port)}/metrics`)).text();
+      const sampleNames = new Set(
+        [...text.matchAll(/^(agent_harness_[a-z0-9_]+)[ {]/gm)].map(([, name]) => name),
+      );
       for (const name of referenced) {
-        expect(text, `告警引用的指标 ${name} 不在 /metrics 输出里`).toContain(name);
+        expect(sampleNames.has(name), `告警引用的指标 ${name} 没有真实样本行（全名比对）`).toBe(true);
       }
-      // 错误率告警的分子序列（outcome="error"）从第 0 次错误起就存在
+      // 错误率告警的分子序列（outcome="error"）从第 0 次错误起就存在；
+      // 5xx 序列同理预注册（HighHttpErrorRate 的首爆盲区，评审抓出）
       expect(text).toContain('agent_harness_runs_finished_total{outcome="error"} 0');
+      expect(text).toContain('agent_harness_http_responses_total{status="500"} 0');
     } finally {
       await handle.close();
       await rm(dir, { recursive: true, force: true });

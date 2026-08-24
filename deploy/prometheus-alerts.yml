@@ -1,5 +1,8 @@
 groups:
   - name: agent-harness-p0
+    # 全部自产指标选择器统一带 {job="agent-harness"}（评审 2026-08-24）：
+    # 同一 Prometheus 还抓第二个同名目标（staging/HA 副本/撞名 exporter）时，
+    # 裸名字的 sum() 会跨目标混算，且告警不带任何定位标签。
     rules:
       # 进程死亡是最基本的失效形态，此前恰恰是唯一不告警的一种：其余规则全部
       # 基于 agent_harness_* 自身指标，进程挂掉后序列转 stale，什么都匹配不到
@@ -14,7 +17,7 @@ groups:
           summary: Agent Harness target is down or missing from scrape config
 
       - alert: AgentHarnessNotReady
-        expr: agent_harness_ready == 0
+        expr: agent_harness_ready{job="agent-harness"} == 0
         for: 2m
         labels:
           severity: critical
@@ -24,12 +27,15 @@ groups:
       # runbook 回滚触发条件"run errors materially exceed baseline"的可查询落地
       # （此前无成败率指标，该条款只能人工翻日志）。要求 ≥3 次错误再看占比，
       # 避免单次失败的 1/1=100% 噪声。
+      # 口径提示：outcome="error" 是 fail-closed 的兜底档——预算耗尽、轮数上限、
+      # 停滞等非崩溃终止也计入（runOutcomeForStopReason 的既定设计）。告警响起
+      # 先看 stopReason 分布再定回滚：预算风暴的处置是调预算，不是回滚镜像。
       - alert: AgentHarnessRunErrorRatio
         expr: >-
-          sum(increase(agent_harness_runs_finished_total{outcome="error"}[30m])) >= 3
+          sum(increase(agent_harness_runs_finished_total{job="agent-harness",outcome="error"}[30m])) >= 3
           and
-          sum(increase(agent_harness_runs_finished_total{outcome="error"}[30m]))
-          / clamp_min(sum(increase(agent_harness_runs_finished_total[30m])), 1) > 0.5
+          sum(increase(agent_harness_runs_finished_total{job="agent-harness",outcome="error"}[30m]))
+          / clamp_min(sum(increase(agent_harness_runs_finished_total{job="agent-harness"}[30m])), 1) > 0.5
         for: 10m
         labels:
           severity: warning
@@ -37,7 +43,7 @@ groups:
           summary: More than half of finished agent runs errored over the last 30 minutes
 
       - alert: AgentHarnessHistoryWriteFailure
-        expr: increase(agent_harness_history_errors_total[5m]) > 0
+        expr: increase(agent_harness_history_errors_total{job="agent-harness"}[5m]) > 0
         labels:
           severity: critical
         annotations:
@@ -45,8 +51,8 @@ groups:
 
       - alert: AgentHarnessHighHttpErrorRate
         expr: >-
-          sum(rate(agent_harness_http_responses_total{status=~"5.."}[5m]))
-          / clamp_min(sum(rate(agent_harness_http_requests_total[5m])), 0.001) > 0.01
+          sum(rate(agent_harness_http_responses_total{job="agent-harness",status=~"5.."}[5m]))
+          / clamp_min(sum(rate(agent_harness_http_requests_total{job="agent-harness"}[5m])), 0.001) > 0.01
         for: 5m
         labels:
           severity: critical
@@ -54,7 +60,7 @@ groups:
           summary: Agent Harness HTTP 5xx rate is above one percent
 
       - alert: AgentHarnessSecurityRejectionsSpike
-        expr: increase(agent_harness_security_rejections_total{reason=~"origin|host|auth"}[5m]) > 10
+        expr: increase(agent_harness_security_rejections_total{job="agent-harness",reason=~"origin|host|auth"}[5m]) > 10
         for: 1m
         labels:
           severity: warning

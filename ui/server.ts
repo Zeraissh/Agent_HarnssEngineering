@@ -2545,7 +2545,13 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   }
 
   function prometheusMetrics(): string {
-    const statusLines = [...metrics.httpStatuses.entries()]
+    // 5xx 序列预注册为 0（评审 2026-08-24）："见过才存在"的序列首次出现时
+    // 以非零值出生，rate() 把出生初值记 0 增量——两次抓取间隔内的一次 5xx
+    // 爆发若随后恢复，HighHttpErrorRate 告警永远看不到那段增量。与
+    // runs_finished 的六档全集输出同一个道理。
+    const statuses = new Map<number, number>([[500, 0], [502, 0], [503, 0], [504, 0]]);
+    for (const [status, count] of metrics.httpStatuses) statuses.set(status, count);
+    const statusLines = [...statuses.entries()]
       .sort(([left], [right]) => left - right)
       .map(([status, count]) => `agent_harness_http_responses_total{status="${status}"} ${count}`);
     return [
