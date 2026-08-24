@@ -1,0 +1,99 @@
+# release：推 vX.Y.Z 标签即出一个可回滚的发布。
+# 门禁（与 runbook 的 release gate 逐条一致）全过 → 镜像推 GHCR（版本 tag + git-sha tag）
+# → GitHub Release 正文记录镜像 digest——runbook 回滚程序"redeploy the previously
+# recorded image digest"的那个 digest 从此有一个不随构建机丢失的家。
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm audit
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - run: npm run pack:check
+      - run: npm ci --ignore-scripts
+        working-directory: cross-app
+      - run: npm audit
+        working-directory: cross-app
+      - run: npm test
+        working-directory: cross-app
+      - run: npm run build
+        working-directory: cross-app
+      - run: node --check electron/main.cjs
+        working-directory: cross-app
+
+  image:
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push
+        id: push
+        run: |
+          # GHCR 引用必须全小写；镜像名固定 agent-harness，与仓库名解耦
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/agent-harness"
+          TAG="${GITHUB_REF_NAME}"
+          SHA_TAG="sha-${GITHUB_SHA::12}"
+          docker build --tag "$IMAGE:$TAG" --tag "$IMAGE:$SHA_TAG" .
+          docker push "$IMAGE:$TAG"
+          docker push "$IMAGE:$SHA_TAG"
+          DIGEST="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$TAG")"
+          test -n "$DIGEST"
+          {
+            echo "image=$IMAGE"
+            echo "tag=$TAG"
+            echo "digest=$DIGEST"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "## 发布镜像"
+            echo '```'
+            echo "AGENT_IMAGE=$DIGEST"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Create GitHub Release (records the digest)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+          IMAGE: ${{ steps.push.outputs.image }}
+          IMG_TAG: ${{ steps.push.outputs.tag }}
+        run: |
+          {
+            echo "部署引用（digest 固定，回滚时把 AGENT_IMAGE 换回上一个 Release 记录的 digest）："
+            echo
+            echo '```'
+            echo "AGENT_IMAGE=${DIGEST}"
+            echo '```'
+            echo
+            echo "同镜像的可读 tag：\`${IMAGE}:${IMG_TAG}\`（tag 可被覆盖，生产部署一律用上面的 digest 引用）。"
+            echo "发布门禁（typecheck / 单测 / build / pack 白名单 / cross-app / audit）在本 workflow 的 gate job 全过后才构建镜像。"
+          } > release-notes.md
+          gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --notes-file release-notes.md

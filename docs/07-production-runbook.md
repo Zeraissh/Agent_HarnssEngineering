@@ -33,6 +33,12 @@ the npm manifest; local histories, `.env`, worktrees, demos, and customer artifa
 `desktop:dist` refuses Windows/macOS production artifacts when signing credentials are absent.
 `desktop:dist:unsigned` is local-test-only and must never be uploaded as a release.
 
+Releases are cut by pushing a `vX.Y.Z` tag. The `Release` workflow re-runs this entire gate on CI,
+builds the container image, pushes it to GHCR (`ghcr.io/<owner>/agent-harness`, version tag plus
+`sha-<commit>` tag), and records the digest-pinned reference in the GitHub Release notes. Production
+always deploys that digest reference, never a mutable tag — the recorded digest survives builder
+cache pruning and machine changes, which is what makes the rollback procedure below executable.
+
 ## Deployment
 
 1. Back up the history volume and record the currently running image digest.
@@ -41,7 +47,8 @@ the npm manifest; local histories, `.env`, worktrees, demos, and customer artifa
    `X-Forwarded-Proto`. Keep the container port bound to loopback.
 4. Copy `.env.production.example` outside the repository, populate secrets, and set an absolute
    `AGENT_WORKSPACE`.
-5. Start `deploy/docker-compose.production.yml` with a unique immutable image tag.
+5. Set `AGENT_IMAGE` to the digest-pinned reference from the target GitHub Release notes, then
+   start `deploy/docker-compose.production.yml`.
 6. Confirm `/health` is HTTP 200 and `/ready` is HTTP 200. A 503 readiness response means history
    protection or shutdown state is degraded; do not send traffic.
 7. Open `https://<public-host>/?access_token=<token>` once. The host exchanges it for an HttpOnly,
@@ -73,8 +80,8 @@ Origin bypass, history write degradation, inability to answer `ask_user`, gracef
 10 seconds, or a canary run losing its terminal event. Also rollback when 5xx responses exceed 1%
 for five minutes or run errors materially exceed the previous release baseline.
 
-Stop new traffic, preserve the failed release logs/history volume, and redeploy the previously
-recorded image digest. The current history format remains version 1 and no migration is performed,
+Stop new traffic, preserve the failed release logs/history volume, set `AGENT_IMAGE` back to the
+digest recorded in the previous GitHub Release, and start the compose file again. The current history format remains version 1 and no migration is performed,
 so rollback does not require rewriting stored runs. Re-run the canary checks before restoring normal
 traffic. Desktop rollback is installation of the previous signed artifact; never replace it with an
 unsigned build.

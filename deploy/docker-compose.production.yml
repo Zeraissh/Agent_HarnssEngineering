@@ -1,9 +1,12 @@
 services:
   harness:
-    build:
-      context: ..
-      dockerfile: Dockerfile
-    image: agent-harness:${AGENT_IMAGE_TAG:-local}
+    # 生产镜像由 release workflow（推 vX.Y.Z 标签触发）构建并推到 GHCR，
+    # digest 记录在对应 GitHub Release 正文。部署与回滚都只改 AGENT_IMAGE：
+    # 按 digest 固定引用（ghcr.io/<owner>/agent-harness@sha256:...），
+    # 回滚 = 换回上一个 Release 记录的 digest 再 up。
+    # 本地冒烟不走这份文件的构建：docker build -t agent-harness:local . 之后
+    # AGENT_IMAGE=agent-harness:local 即可。
+    image: ${AGENT_IMAGE:?set the digest-pinned release image from the GitHub Release notes}
     restart: unless-stopped
     stop_grace_period: 10s
     read_only: true
