@@ -1,0 +1,1558 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agent Harness</title>
+<link rel="stylesheet" href="./styles.css">
+<script>
+// 主题在样式表生效前就定下来，否则从 localStorage 恢复暗色时会先闪一帧亮色。
+// 只有三种取值：light / dark / auto（auto 交给 prefers-color-scheme）。
+(function () {
+  try {
+    var t = localStorage.getItem("agent-ui-theme");
+    if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t);
+  } catch (e) { /* 隐私模式下 localStorage 可能抛错，忽略即可 */ }
+})();
+</script>
+</head>
+<body>
+
+<!-- 页面级标题：屏幕阅读器靠 h1 建立文档大纲与"跳到标题"导航；视觉上由侧栏/
+     详情页头承担，故 sr-only 隐藏。必须包在 header（banner 地标）里——裸 h1
+     游离于所有地标之外会触发 axe region 规则（页面内容须归属地标） -->
+<header class="sr-only">
+  <h1>Agent Harness 控制台</h1>
+</header>
+
+<!-- 侧栏：运行列表 -->
+<aside class="sidebar" id="sidebar">
+  <div class="sidebar-header">
+    <span>运行列表</span>
+    <!-- R-08 状态筛选 -->
+    <select class="run-filter" id="run-filter" aria-label="按状态筛选运行">
+      <option value="all">全部</option>
+      <option value="running">运行中</option>
+      <option value="done">已完成</option>
+      <option value="failed">未通过</option>
+    </select>
+    <button type="button" class="theme-toggle" id="theme-toggle" aria-label="切换配色主题">◐</button>
+    <button type="button" class="server-toggle" id="server-toggle" aria-label="设置服务端地址" aria-expanded="false">⚙</button>
+  </div>
+  <div class="server-settings" id="server-settings" hidden>
+    <label for="server-input" class="sr-only">服务端地址</label>
+    <input type="text" id="server-input" class="server-input" placeholder="http://127.0.0.1:4173" autocomplete="off" />
+    <div class="server-actions">
+      <button type="button" class="btn btn--ghost" id="server-save">连接</button>
+      <button type="button" class="btn btn--ghost" id="server-clear">同源</button>
+    </div>
+    <p class="server-hint">同源部署留空；App 外壳填宿主机的 Harness UI 服务地址（保存后刷新）。</p>
+  </div>
+  <div class="sidebar-search">
+    <button type="button" class="btn btn--primary new-chat-btn" id="new-chat-btn">＋ 新建对话</button>
+    <label for="run-search" class="sr-only">搜索运行</label>
+    <input type="search" id="run-search" class="run-search" placeholder="搜索任务描述…" autocomplete="off" />
+  </div>
+  <!-- role=listbox / aria-label 由 renderRunList 动态挂载：listbox 必须含 option
+       子项（aria-required-children），空态/加载态若静态带着 role 反而是 critical
+       违规——这条是 axe 扫描器上线首跑抓到的（s3d 手工修复引入的新问题） -->
+  <div id="run-list" class="run-list">
+    <div class="run-list-empty">加载中…</div>
+  </div>
+</aside>
+
+<!-- 主区 -->
+<main class="main" id="main-panel">
+  <!-- R-05: aria-live 状态播报区域 -->
+  <div id="status-announcer" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+
+  <!-- 传输层状态条：断线只提示，不改运行状态、不作废挂起审批（V-05） -->
+  <div id="reconnect-banner" class="reconnect-banner" role="status" hidden>
+    连接中断，正在重连…（运行仍在服务端继续）
+  </div>
+
+  <!-- 内容区 -->
+  <div id="main-area" class="content-area">
+    <div class="empty-state">
+      <div class="empty-icon">◌</div>
+      <p>尚无运行。</p>
+    </div>
+  </div>
+  <!-- 跳转箭头：**在滚动容器之外**，所以它自己不会被滚走。
+       ↓ 回到底部（流式时往上翻过之后用），↑ 回到四决定因素（读进下钻面之后用）。 -->
+  <div id="scroll-nav" class="scroll-nav">
+    <button type="button" class="scroll-nav-btn" data-nav="top" hidden aria-label="回到四决定因素">↑</button>
+    <button type="button" class="scroll-nav-btn" data-nav="bottom" hidden aria-label="回到最新">↓</button>
+  </div>
+
+  <!-- 需你决定：钉在输入框正上方，**在滚动容器之外**。
+       它不随内容滚走——这正是委托方那条反馈的结构解法。 -->
+  <div id="action-dock" class="action-dock" hidden></div>
+
+  <!-- 提交栏：**在底部**，且**一个框两种去向**（都来自委托方反馈）。
+       在底部的理由不只是习惯：待办钉在输入框上方 = 固定可见位置，新审批出现在
+       哪都看得见，从结构上消掉了"内容变高把待办推出视野"那个问题。
+       共用一个框的理由：分开纯粹是实现遗留（一个打 /api/runs、一个打 /messages），
+       对用户来说它们长得一样、位置也挨着。选中一个可续跑的运行 → 「继续对话」，
+       没选中 → 「运行任务」；文案、placeholder、说明行、data-mode 四处一起变。
+       派生逻辑在 app.js 的 deriveComposerMode / patchComposer 里（因此可测）。 -->
+  <form id="submit-form" class="submit-bar" autocomplete="off">
+    <!-- 文案由 patchComposer 按模式改写（「任务描述」↔「追加指令」）。
+         for/id 不许动：整页 axe 与文案闸门都钉着这一对。 -->
+    <label for="task-input" class="task-label">任务描述</label>
+    <textarea id="task-input" placeholder="输入新任务描述…（Ctrl+Enter 发送）" rows="1"></textarea>
+    <label class="checkbox-label">
+      <input type="checkbox" id="verify-toggle" />
+      <span>开启独立核查</span>
+    </label>
+    <button type="submit" class="btn btn--primary" id="submit-btn">运行任务</button>
+    <!-- input **排在 label 之前**：它是 sr-only（宽高 1px + clip），焦点环会被
+         整个裁掉，键盘用户 Tab 到附件时屏幕上没有任何反应。把它放前面，
+         就能用最朴素的相邻兄弟选择器把环画到那个可见的 label 上
+         （#file-upload:focus-visible + .upload-label）。 -->
+    <input type="file" id="file-upload" class="sr-only" multiple />
+    <label class="btn btn--ghost upload-label" for="file-upload">＋ 附件</label>
+    <button type="button" class="btn btn--ghost" id="knobs-toggle" aria-expanded="false" aria-controls="run-knobs">装配 ▾</button>
+    <!-- 模式说明。独立于 #submit-error：后者是 role="alert"，
+         "这次提交会去哪儿"不是错误，不该被当成警报播报 -->
+    <p id="composer-note" class="composer-note knob-hint" hidden></p>
+    <p id="submit-error" class="inline-error" role="alert" hidden></p>
+    <ul id="upload-list" class="upload-list" hidden></ul>
+
+    <!-- V-24：harness 的旋钮此前只能靠重启换环境变量。默认折叠，不打扰
+         "填个任务就跑"的主路径 -->
+    <div class="run-knobs" id="run-knobs" hidden>
+      <div class="knob">
+        <label for="pack-select">领域包</label>
+        <select id="pack-select">
+          <option value="">（不用领域包）</option>
+        </select>
+        <span class="knob-hint" id="pack-hint"></span>
+      </div>
+      <div class="knob">
+        <label for="effort-select">思考预算</label>
+        <select id="effort-select">
+          <option value="">（默认）</option>
+        </select>
+        <span class="knob-hint" id="effort-hint"></span>
+      </div>
+      <div class="knob">
+        <label for="workdir-select">工作目录</label>
+        <select id="workdir-select"></select>
+        <span class="knob-hint">工具的写入圈禁根。可选集合由宿主用 AGENT_UI_WORKDIRS 声明。</span>
+      </div>
+      <div class="knob" id="role-models-knob" hidden>
+        <label id="role-models-label">角色模型</label>
+        <div class="role-toggles" role="group" aria-labelledby="role-models-label">
+          <label class="checkbox-label" id="verifier-role-row" hidden>
+            <input type="checkbox" id="use-verifier-model" checked />
+            <span id="verifier-role-text"></span>
+          </label>
+          <label class="checkbox-label" id="planner-role-row" hidden>
+            <input type="checkbox" id="use-planner-model" checked />
+            <span id="planner-role-text"></span>
+          </label>
+        </div>
+        <span class="knob-hint" id="role-models-hint"></span>
+      </div>
+      <div class="knob">
+        <label for="mode-select">编排模式</label>
+        <select id="mode-select">
+          <option value="single">单任务（直接执行）</option>
+          <option value="plan">计划编排（拆解 + 依赖调度）</option>
+        </select>
+        <span class="knob-hint" id="mode-hint">单领域任务上编排是纯开销——它的价值在跨领域交接。</span>
+      </div>
+      <div class="knob">
+        <label for="concurrency-select">并行度</label>
+        <select id="concurrency-select" disabled>
+          <option value="auto">auto（min(3, 层宽)）</option>
+          <option value="1">1（串行）</option>
+          <option value="2">2</option>
+          <option value="3">3</option>
+          <option value="4">4</option>
+        </select>
+        <span class="knob-hint">并行买的是时间不是 token。cap=3 是收益曲线拐点。</span>
+      </div>
+      <div class="knob">
+        <label id="plan-gate-label">计划确认门</label>
+        <label class="checkbox-label">
+          <input type="checkbox" id="plan-gate-toggle" disabled />
+          <span>计划产出后等我签字再开跑</span>
+        </label>
+        <span class="knob-hint">挂起点在第一个子任务发射之前——此时否决零副作用。仅编排模式可用。</span>
+      </div>
+      <div class="knob knob--wide">
+        <label for="rubric-input">主观评分表</label>
+        <textarea id="rubric-input" rows="2" placeholder="逐条列出评分项，核查者按表评估进 advisory——不影响 passed，也不触发返工"></textarea>
+        <span class="knob-hint">需同时勾选「开启独立核查」才会生效。</span>
+      </div>
+    </div>
+  </form>
+
+</main>
+
+<script type="module" src="./app.js"></script>
+<script type="module">
+/**
+ * Harness Web UI — 主控制器（浏览器端入口）。
+ * 连接 DOM 渲染与纯 reducer，管理 SSE 订阅与 HTTP 调用。
+ * 阶段二新增：标签页切换、日志折叠、筛选器、无障碍语义。
+ */
+import {
+  createBatcher,
+  normalizeTab,
+  createInitialState,
+  reduceEvent,
+  reduceEvents,
+  markApprovalResolved,
+  expirePendingApprovals,
+  deriveLogEntries,
+  applyCollapseOverrides,
+  nextCollapseOverride,
+  deriveRunListItems,
+  filterRunsByStatus,
+  filterRunsByQuery,
+  renderRunList,
+  renderRunDetail,
+  renderEmptyState,
+  deriveComposerMode,
+  composerSubmitPlan,
+  patchComposer,
+  shouldShowReconnecting,
+  deriveScrollNav,
+  paceReveal,
+} from "./app.js";
+
+// ---- 服务端地址（跨源 App 外壳专用）----
+// 浏览器同源部署时留空（相对路径直连 Harness UI 服务）；
+// Electron / Capacitor 这类 App 外壳里，必须填宿主机的服务地址，
+// 例如 http://192.168.1.20:4173（手机与电脑同一局域网）。
+// 存 localStorage，保存后整页刷新以重连全部 SSE。
+const SERVER_BASE_KEY = "agent-ui-server";
+/**
+ * 读取用户显式设置的服务端地址。
+ * 返回 null 表示从未设置过（此时才应用下面的平台默认值）；
+ * 返回 "" 表示用户显式选择了"同源"。
+ */
+function readServerBase() {
+  try {
+    const value = localStorage.getItem(SERVER_BASE_KEY);
+    if (value === null) return null;
+    return value.trim().replace(/\/+$/, "");
+  } catch {
+    return null;
+  }
+}
+function defaultServerBase() {
+  // Electron 打包态从 file:// 加载页面，相对 /api 只会打到文件系统上；
+  // 桌面宿主默认就在本机 4173 端口，直接替用户填上。
+  if (location.protocol === "file:") return "http://127.0.0.1:4173";
+  // 浏览器开发态（Vite / vite preview）会把 /api 代理到本机宿主，无需跨源。
+  // Capacitor 真机无法猜到电脑的局域网 IP，留空并提示用户填写。
+  return "";
+}
+let serverBase = readServerBase();
+if (serverBase === null) serverBase = defaultServerBase();
+function apiPath(path) {
+  return serverBase ? `${serverBase}${path}` : path;
+}
+function applyServerBase(next) {
+  try {
+    localStorage.setItem(SERVER_BASE_KEY, next.trim().replace(/\/+$/, ""));
+  } catch { /* 隐私模式下写入可能抛错 */ }
+  location.reload();
+}
+// app.js 生成产物链接时也要走同一前缀（Vite/App 外壳下不能再用同源绝对路径）
+window.__AGENT_UI_API__ = apiPath;
+
+// ---- 状态 ----
+/** @type {Map<string, import('/app.js').RunState>} */
+const runStates = new Map();
+let selectedRunId = /** @type {string|null} */ (null);
+let runs = /** @type {{runId:string, task:string, status:string, verify:boolean, createdAt:number, finishedAt:number|null}[]} */ ([]);
+let eventSources = /** @type {Map<string, EventSource>} */ (new Map());
+
+// R-03 标签页状态（每个 run 独立）
+/** @type {Map<string, string>} */
+const activeTabs = new Map();
+
+// R-04 日志折叠状态（每个 run 独立的展开/折叠覆盖）
+/** @type {Map<string, Map<number, boolean>>} */
+const logCollapseOverrides = new Map();
+
+// R-08 筛选器状态
+let currentFilter = "all";
+let currentQuery = "";
+
+// V-23 Loop 面的读法（事件流 / 对话），以及按需拉来的会话正文
+/** @type {Map<string, "events"|"chat">} */
+const loopViews = new Map();
+/** @type {Map<string, any>} */
+const transcripts = new Map();
+/** V-28：追加指令的报错，逐 run 独立 */
+/** @type {Map<string, string>} */
+const followUpErrors = new Map();
+
+/**
+ * 跑完了但还没看过的运行。
+ *
+ * 取代详情页那条横贯整屏的「■ 已完成」——"这次结束了"是**列表**该说的事：
+ * 你可能同时开着好几个运行、正在别处忙，需要的是扫一眼就知道哪条有新结果，
+ * 而不是切进去之后被一行废话占掉版面。
+ */
+const unreadRuns = new Set();
+
+/**
+ * 跳转箭头的接线。
+ *
+ * 判据在 app.js 的 `deriveScrollNav`（纯函数，可测）；这里只负责量几何、
+ * 按结果切显隐、以及点下去真的滚过去。
+ *
+ * 监听挂在滚动容器上而不是逐次渲染时算：人**只滚动不产生新事件**的那段时间
+ * 里箭头也得跟着变，靠渲染驱动就会迟一步或干脆不动。
+ */
+function syncScrollNav() {
+  const scroller = document.getElementById("main-area");
+  const nav = document.getElementById("scroll-nav");
+  if (!scroller || !nav) return;
+  const drawer = document.getElementById("detail-drawer");
+  const grid = document.querySelector(".factor-grid");
+  const nvis = deriveScrollNav({
+    scrollTop: scroller.scrollTop,
+    scrollHeight: scroller.scrollHeight,
+    clientHeight: scroller.clientHeight,
+    // 四张卡相对滚动容器的位置：<0 就是已经滚出上边界
+    anchorTop: grid ? grid.getBoundingClientRect().top - scroller.getBoundingClientRect().top : null,
+    drawerOpen: Boolean(drawer && drawer.open),
+  });
+  nav.querySelector('[data-nav="top"]').hidden = !nvis.showTop;
+  nav.querySelector('[data-nav="bottom"]').hidden = !nvis.showBottom;
+}
+
+/**
+ * 空态的示例任务：点一下**填进输入框**，不直接开跑。
+ *
+ * 让人看清自己要提交什么再按，是这个 harness 一贯的做法——
+ * 同一条纪律在计划确认门、审批门上各出现过一次。
+ * 用事件委托绑在 #main-area 上：空态会被重渲染，逐次绑会漏也会重。
+ */
+(function bindExamples() {
+  const area = document.getElementById("main-area");
+  if (!area) return;
+  area.addEventListener("click", (e) => {
+    const btn = e.target.closest?.("[data-example]");
+    if (!btn) return;
+    taskInput.value = btn.getAttribute("data-example");
+    taskInput.focus();
+    // 光标放到末尾，人可以直接接着改
+    taskInput.setSelectionRange(taskInput.value.length, taskInput.value.length);
+  });
+})();
+
+(function bindScrollNav() {
+  const scroller = document.getElementById("main-area");
+  const nav = document.getElementById("scroll-nav");
+  if (!scroller || !nav) return;
+  scroller.addEventListener("scroll", syncScrollNav, { passive: true });
+  // 抽屉开合会改变可滚高度与四张卡的位置，也得重算
+  document.addEventListener("toggle", syncScrollNav, true);
+  nav.addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-nav]");
+    if (!btn) return;
+    /**
+     * **落点用直接赋值，平滑交给 CSS 的 `scroll-behavior`。**
+     *
+     * 不在 JS 里写 `behavior:"smooth"`：那样"要不要动画"这件事就散在两处
+     * （JS 一处、CSS 一处），而 `prefers-reduced-motion` 只管得住 CSS 那处。
+     * 现在 JS 只负责"滚到哪"，动不动画由样式表统一决定——
+     * **动效可以降级，落点不能。**
+     *
+     * 附一条自动化验证的边界（省得下一个人重复踩）：本项目的浏览器自动化面板
+     * 不合成画面，**任何带动画的滚动在那里都不会推进**（scrollTop 停在原地且
+     * 不报错），所以验证落点必须临时把 `scroll-behavior` 置成 auto 再量。
+     * 我第一次就是没意识到这点，差点把它当成产品缺陷记下来。
+     */
+    if (btn.getAttribute("data-nav") === "bottom") {
+      scroller.scrollTop = scroller.scrollHeight;
+    } else {
+      const grid = document.querySelector(".factor-grid");
+      if (grid) {
+        scroller.scrollTop +=
+          grid.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
+      }
+    }
+    syncScrollNav();
+  });
+})();
+
+// ---- 统一 composer 的三个事实（派生逻辑在 app.js，这里只存输入）----
+/** @type {ReturnType<typeof deriveComposerMode>|null} */
+let composerMode = null;
+/** 提交在飞。**必须进模式**，不能命令式改 btn.disabled——服务端在返回响应
+    之前就广播了 run_created，列表刷新会立刻把按钮重算成"可点" */
+let submitting = false;
+/** 与具体 run 无关的提交错误（新建路径） */
+let newRunError = null;
+
+// ---- DOM 引用 ----
+const submitForm = /** @type {HTMLFormElement} */ (document.getElementById("submit-form"));
+const taskInput = /** @type {HTMLTextAreaElement} */ (document.getElementById("task-input"));
+const verifyToggle = /** @type {HTMLInputElement} */ (document.getElementById("verify-toggle"));
+const submitBtn = /** @type {HTMLButtonElement} */ (document.getElementById("submit-btn"));
+const submitError = /** @type {HTMLElement} */ (document.getElementById("submit-error"));
+const themeToggle = /** @type {HTMLButtonElement} */ (document.getElementById("theme-toggle"));
+const knobsToggle = /** @type {HTMLButtonElement} */ (document.getElementById("knobs-toggle"));
+const runKnobs = /** @type {HTMLElement} */ (document.getElementById("run-knobs"));
+const packSelect = /** @type {HTMLSelectElement} */ (document.getElementById("pack-select"));
+const effortSelect = /** @type {HTMLSelectElement} */ (document.getElementById("effort-select"));
+const rubricInput = /** @type {HTMLTextAreaElement} */ (document.getElementById("rubric-input"));
+const modeSelect = /** @type {HTMLSelectElement} */ (document.getElementById("mode-select"));
+const concurrencySelect = /** @type {HTMLSelectElement} */ (document.getElementById("concurrency-select"));
+const planGateToggle = /** @type {HTMLInputElement} */ (document.getElementById("plan-gate-toggle"));
+const workdirSelect = /** @type {HTMLSelectElement} */ (document.getElementById("workdir-select"));
+const useVerifierModel = /** @type {HTMLInputElement} */ (document.getElementById("use-verifier-model"));
+const usePlannerModel = /** @type {HTMLInputElement} */ (document.getElementById("use-planner-model"));
+const sidebar = /** @type {HTMLElement} */ (document.getElementById("sidebar"));
+const mainPanel = /** @type {HTMLElement} */ (document.getElementById("main-panel"));
+const runFilter = /** @type {HTMLSelectElement} */ (document.getElementById("run-filter"));
+const runSearch = /** @type {HTMLInputElement} */ (document.getElementById("run-search"));
+const statusAnnouncer = /** @type {HTMLElement} */ (document.getElementById("status-announcer"));
+const newChatBtn = /** @type {HTMLButtonElement} */ (document.getElementById("new-chat-btn"));
+const fileUpload = /** @type {HTMLInputElement} */ (document.getElementById("file-upload"));
+const uploadList = /** @type {HTMLElement} */ (document.getElementById("upload-list"));
+
+// ---- 响应式：窄屏视图状态 ----
+const NARROW_BP = 700;
+function isNarrow() {
+  return window.innerWidth <= NARROW_BP;
+}
+
+function enterDetailMode() {
+  if (isNarrow()) {
+    sidebar.classList.add("narrow-hidden");
+    mainPanel.classList.add("narrow-full");
+  }
+}
+
+function exitDetailMode() {
+  if (isNarrow()) {
+    sidebar.classList.remove("narrow-hidden");
+    mainPanel.classList.remove("narrow-full");
+  }
+  /**
+   * 清选中这件事**两种屏宽都要做**。
+   *
+   * 此前整个函数体包在 `isNarrow()` 里，于是宽屏下按浏览器后退（hash 回到
+   * `#/`）什么都没发生，`selectedRunId` 仍指着那个 run。合并之后这个不一致
+   * 会直接变成骗人：地址栏说"没选中任何运行"，底栏却停在「继续对话」——
+   * 而按 F5 之后同一个 URL 又会变成「运行任务」。同一条链接、两种去向。
+   */
+  selectedRunId = null;
+  refreshRunListView();
+  renderEmptyState(runs.length > 0);
+}
+
+function backToList() {
+  exitDetailMode();
+  writeHash(null, null);
+}
+
+/** R-05: 更新屏幕阅读器播报 */
+function announceStatus(msg) {
+  if (statusAnnouncer) {
+    statusAnnouncer.textContent = msg;
+  }
+}
+
+// ---- 运行列表刷新 ----
+function getFilteredRuns() {
+  return filterRunsByQuery(filterRunsByStatus(runs, runStates, currentFilter), currentQuery);
+}
+
+function refreshRunListView() {
+  const filtered = getFilteredRuns();
+  const metaMap = deriveRunListItems(filtered, runStates, unreadRuns);
+  renderRunList(filtered, selectedRunId, selectRun, metaMap);
+  if (!selectedRunId) {
+    renderEmptyState(runs.length > 0);
+  }
+  // 选中态、列表内容、run 状态三者任一变了底栏就可能换模式——这里是它们的汇合点
+  syncComposer();
+}
+
+async function loadRuns() {
+  try {
+    const res = await fetch(apiPath("/api/runs"));
+    if (!res.ok) return;
+    runs = await res.json();
+    refreshRunListView();
+  } catch {
+    // 服务器未就绪时静默
+  }
+}
+
+// ---- R-08 筛选器 ----
+runFilter.addEventListener("change", () => {
+  currentFilter = runFilter.value;
+  refreshRunListView();
+});
+
+// 搜索：列表用键控补丁更新，不重建节点，所以边打字边过滤不会打断输入焦点
+if (runSearch) {
+  runSearch.addEventListener("input", () => {
+    currentQuery = runSearch.value;
+    refreshRunListView();
+  });
+}
+
+// ---- 选择运行 ----
+function selectRun(runId) {
+  if (selectedRunId === runId) return;
+  selectedRunId = runId;
+  unreadRuns.delete(runId); // 看了就算读过
+  refreshRunListView();
+
+  // 拆成两件事：确保有 state、确保有订阅。旧实现在"已有 state"时直接 return，
+  // 于是一个断过线的 run 被重新打开时永远不会重新订阅，界面就此定格。
+  const state = ensureState(runId);
+  if (!state) return;
+  syncConnectionBanner();
+  renderDetailWithState(state);
+  enterDetailMode();
+  writeHash(runId, activeTabs.get(runId));
+  announceStatus(`已选择运行：${state.task}`);
+  ensureSubscription(runId);
+}
+
+function ensureState(runId) {
+  const existing = runStates.get(runId);
+  if (existing) return existing;
+  const info = runs.find((r) => r.runId === runId);
+  if (!info) return null;
+  const state = createInitialState(runId, info.task, info.verify);
+  runStates.set(runId, state);
+  return state;
+}
+
+// ---- 标签页切换 (R-03) ----
+document.addEventListener("tab-switch", (e) => {
+  const tab = normalizeTab(/** @type {CustomEvent} */ (e).detail.tab);
+  if (selectedRunId) {
+    activeTabs.set(selectedRunId, tab);
+    writeHash(selectedRunId, tab);
+    const state = runStates.get(selectedRunId);
+    if (state) {
+      renderDetailWithState(state);
+      // 重渲染换掉了 DOM 节点：把焦点交还给新选中的标签，
+      // 否则方向键切换一次后焦点掉回 body，键盘用户被踢出标签组
+      const next = document.getElementById(`tab-${tab}`);
+      if (next) next.focus();
+    }
+  }
+});
+
+// ---- hash 路由（V-17）----
+// 深链与刷新不丢位置：#/run/<id>/<face>。零依赖，不引路由库。
+let suppressHashHandling = false;
+
+function writeHash(runId, tab) {
+  const next = runId ? `#/run/${runId}/${tab || "loop"}` : "#/";
+  if (location.hash === next) return;
+  suppressHashHandling = true;
+  location.hash = next;
+  // hashchange 是异步派发的，标志位要等它跑完再清
+  setTimeout(() => { suppressHashHandling = false; }, 0);
+}
+
+function parseHash() {
+  const m = /^#\/run\/([^/]+)(?:\/([^/?]+))?/.exec(location.hash || "");
+  if (!m) return null;
+  return { runId: decodeURIComponent(m[1]), tab: normalizeTab(m[2]) };
+}
+
+function applyHash() {
+  const route = parseHash();
+  if (!route) {
+    if (selectedRunId) backToList();
+    return;
+  }
+  activeTabs.set(route.runId, route.tab);
+  if (route.runId !== selectedRunId) {
+    selectRun(route.runId);
+  } else {
+    const state = runStates.get(route.runId);
+    if (state) renderDetailWithState(state);
+  }
+}
+
+window.addEventListener("hashchange", () => {
+  if (suppressHashHandling) return;
+  applyHash();
+});
+
+// ---- 日志折叠切换 (R-04) ----
+function handleToggleEntry(seq) {
+  if (!selectedRunId) return;
+  const state = runStates.get(selectedRunId);
+  if (!state) return;
+  let overrides = logCollapseOverrides.get(selectedRunId);
+  if (!overrides) {
+    overrides = new Map();
+    logCollapseOverrides.set(selectedRunId, overrides);
+  }
+  // 翻转交给纯函数：它会**先把默认折叠态算进来**。此前这里是直接对覆盖表
+  // 取反，而表里没有这一条时取反得到 true，多数条目默认本来就是 true——
+  // 于是第一次点一条默认折叠的条目等于把 true 写成 true，
+  // 一次完全没有反馈的死点击（AC2-18 复验抓到）
+  const next = nextCollapseOverride(deriveLogEntries(state), overrides, seq);
+  if (next === null) return;
+  overrides.set(seq, next);
+  renderDetailWithState(state);
+}
+
+// ---- 渲染详情（统一入口） ----
+function renderDetailWithState(state) {
+  const runId = state.runId;
+  const activeTab = normalizeTab(activeTabs.get(runId));
+
+  // 构建日志条目（应用折叠覆盖）
+  // 与 handleToggleEntry 共用同一个应用函数——两处各写一份就会漂
+  const logEntries = applyCollapseOverrides(
+    deriveLogEntries(state),
+    logCollapseOverrides.get(runId),
+  );
+
+  renderRunDetail(state, {
+    showBack: isNarrow(),
+    onBack: backToList,
+    onAllow: (approvalId) => postApproval(runId, approvalId, "allow"),
+    onAllowAlways: (approvalId) => postApproval(runId, approvalId, "allow", undefined, "conversation"),
+    onDenyReason: (approvalId, reason) =>
+      postApproval(runId, approvalId, "deny", reason || ""),
+    activeTab,
+    logEntries,
+    onToggleEntry: handleToggleEntry,
+    harness: harnessSnapshot,
+    liveText: revealedSlice(runId, liveTexts.get(runId) ?? "", false),
+    liveThinking: revealedSlice(runId, liveThinking.get(runId) ?? "", true),
+    onPlanDecision: (decision) => postPlanDecision(runId, decision),
+    onReveal: (path) => revealArtifact(runId, path),
+  });
+  // 本地 SSE 把状态推到 done 时列表未必同步刷新过——底栏要立刻从「运行中」
+  // 变回「继续对话」，否则用户盯着一个死按钮等
+  if (runId === selectedRunId) syncComposer();
+  syncScrollNav();
+}
+
+/**
+ * 切换 Loop 面的读法。对话视图的正文按需拉——会话可达数 MB，没必要在
+ * 用户根本没点开它的时候付这笔代价。
+ */
+function switchLoopView(runId, view) {
+  loopViews.set(runId, view === "chat" ? "chat" : "events");
+  const state = runStates.get(runId);
+  if (state) renderDetailWithState(state);
+  if (view === "chat" && !transcripts.has(runId)) void loadTranscript(runId);
+}
+
+async function loadTranscript(runId) {
+  try {
+    const res = await fetch(apiPath(`/api/runs/${runId}/transcript`));
+    if (!res.ok) return;
+    transcripts.set(runId, await res.json());
+    const state = runStates.get(runId);
+    if (state && selectedRunId === runId) renderDetailWithState(state);
+  } catch {
+    // 拉不到就保持"正在载入会话…"，不伪造内容
+  }
+}
+
+// run 结束时会话才落盘：若用户正停在对话视图上，收尾后自动补一次
+function refreshTranscriptIfWatching(runId) {
+  if (loopViews.get(runId) !== "chat") return;
+  transcripts.delete(runId);
+  void loadTranscript(runId);
+}
+
+/**
+ * 底栏 composer 与当前选中态对齐。
+ *
+ * 这是**唯一**改写底栏 DOM 的入口——模式派生（deriveComposerMode）和 DOM
+ * 应用（patchComposer）都在 app.js 里，所以"按钮该写什么、能不能点"这件事
+ * 第一次变成可测的；这里只负责喂它当前的四个事实。
+ *
+ * 服务端算好的 canContinue 仍是权威（V-28：不能让用户点了才吃 409），
+ * 只是现在"不能追加"不再表现为"没有输入框"，而是同一个框换个去向 + 说明原因。
+ */
+function syncComposer() {
+  const info = selectedRunId ? runs.find((r) => r.runId === selectedRunId) ?? null : null;
+  composerMode = deriveComposerMode({
+    info: info ? { ...info, runId: selectedRunId } : null,
+    localStatus: selectedRunId ? runStates.get(selectedRunId)?.status ?? null : null,
+    submitting,
+    // 错误按 run 隔离：否则 run A 的 409 会原样挂在切过去的 run B 头上
+    // 刚发生的错误压过 run 上挂着的旧错；两者都按各自的时机清，
+    // 所以切到另一个 run 时不会看见上一个 run 的 409
+    error: newRunError ?? (selectedRunId ? followUpErrors.get(selectedRunId) ?? null : null),
+  });
+  patchComposer(composerMode);
+}
+
+async function postFollowUp(runId, text) {
+  followUpErrors.delete(runId);
+  try {
+    const res = await fetch(apiPath(`/api/runs/${runId}/messages`), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+    if (!res.ok) {
+      let detail = `HTTP ${res.status}`;
+      try {
+        const b = await res.json();
+        if (b?.error) detail = b.error;
+      } catch { /* 非 JSON 响应体，保留状态码 */ }
+      followUpErrors.set(runId, detail);
+      const st = runStates.get(runId);
+      if (st) renderDetailWithState(st);
+      return;
+    }
+    // run 从终态回到运行中：本地先置位再重订阅。事件流里的 user_message 会
+    // 把状态坐实，reduceEvents 的 seq 闸门保证重放不产生重复条目
+    const st = runStates.get(runId);
+    if (st) runStates.set(runId, { ...st, status: "running", runEnd: null });
+    const info = runs.find((r) => r.runId === runId);
+    if (info) info.status = "running";
+    transcripts.delete(runId);
+    refreshRunListView();
+    ensureSubscription(runId);
+    const cur = runStates.get(runId);
+    if (cur) renderDetailWithState(cur);
+  } catch (err) {
+    followUpErrors.set(runId, `追加失败：${err.message ?? "网络错误"}`);
+    const st = runStates.get(runId);
+    if (st) renderDetailWithState(st);
+  }
+}
+
+/**
+ * 在系统文件管理器里选中一件产物。
+ *
+ * 路径原样交给宿主——圈禁在服务端做（同一套 resolveInWorkdir，与写类工具
+ * 共用判据）。前端不做校验不是偷懒：前端的校验对攻击者不存在，
+ * 判据放在唯一说了算的地方。
+ */
+async function revealArtifact(runId, path) {
+  if (!path) return;
+  try {
+    const res = await fetch(apiPath(`/api/runs/${runId}/reveal`), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+    if (!res.ok) {
+      const b = await res.json().catch(() => ({}));
+      showSubmitError(b.error ?? `打开失败（HTTP ${res.status}）`);
+    }
+  } catch (err) {
+    showSubmitError(`打开失败：${err.message ?? "网络错误"}`);
+  }
+}
+
+// ---- 宿主真相快照（Tools/Context/Loop 面的数据源）----
+// 拉一次即可：它描述的是本次进程的装配，run 与 run 之间不变
+let harnessSnapshot = null;
+async function loadHarness() {
+  try {
+    const res = await fetch(apiPath("/api/harness"));
+    if (!res.ok) return;
+    harnessSnapshot = await res.json();
+    populateKnobs(harnessSnapshot);
+    // 快照到达前渲染过的详情要补一次——四决定因素的护栏/工具面全靠它
+    if (selectedRunId) {
+      const state = runStates.get(selectedRunId);
+      if (state) renderDetailWithState(state);
+    }
+  } catch {
+    // 拿不到就照实降级：Tools 面会显示"未获取到工具清单"
+  }
+}
+
+// ---- SSE 订阅 ----
+/**
+ * 建立事件订阅。只在"尚无订阅 且 run 未终态"时建立——旧实现把这个判断和
+ * "是否已有 state"混在 selectRun 里，导致重新打开一个断过线的 run 不会重订阅。
+ */
+// ---- 事件批处理（V-10）----
+// 调度细节见 core/batch.js（含"隐藏标签页 rAF 不触发"那个坑的处理）
+/**
+ * 文本流式的接收端（backlog §4）。
+ *
+ * 服务端 R2 起就在推 `event: delta` 命名通道，前端一直丢弃——直播条显示的是
+ * 上一条【完整】assistant_text，不是逐字。（AC2-06 那次真机跑，一次约 90 秒的
+ * 运行流了 1133 条 delta，全被扔掉。）
+ *
+ * 它**不进 RunState**：delta 不占 seq、不进服务端事件缓冲（V-15 的设计），
+ * 重连重放时根本不存在。放进 state 会打破 reducer 的重放幂等性。所以按
+ * connectionStates 的同款办法，由控制器单独持有、渲染时作为参数传入。
+ *
+ * @type {Map<string, string>}
+ */
+const liveTexts = new Map();
+/** 思考增量缓冲。与 liveTexts 同族（不进 RunState），但分开存——正文一来就清掉它 */
+const liveThinking = new Map();
+/** 缓冲上限：只用来显示尾部 80 字，没必要为一次长生成攒下几十 KB */
+const LIVE_TEXT_CAP = 2000;
+
+/**
+ * delta 自己一个 batcher：它走的不是 reduce 那条路，但节流与"隐藏标签页
+ * rAF 不触发"那个坑同样适用，所以复用同一个调度器实现而不是自己写节流。
+ */
+const deltaBatcher = createBatcher((batches) => {
+  const cap = (s) => (s.length > LIVE_TEXT_CAP ? s.slice(-LIVE_TEXT_CAP) : s);
+  for (const [runId, chunks] of batches) {
+    const textPart = chunks.filter((c) => c.kind === "text").map((c) => c.text).join("");
+    const thinkPart = chunks.filter((c) => c.kind === "thinking").map((c) => c.text).join("");
+    if (thinkPart) liveThinking.set(runId, cap((liveThinking.get(runId) ?? "") + thinkPart));
+    if (textPart) {
+      liveTexts.set(runId, cap((liveTexts.get(runId) ?? "") + textPart));
+      // 正文一开始流，思考就该让位——它已经想完了
+      liveThinking.delete(runId);
+    }
+    if (selectedRunId !== runId) continue;
+    startRevealTicker(runId);
+  }
+});
+
+/**
+ * 匀速放行的节拍器。
+ *
+ * 上游是一阵一阵来的（实测相邻两批最长静默 943ms），直接照搬到屏幕上就是
+ * "卡一下、蹦一长串"。这里按帧把已到达的文本匀速放出去，判据在 app.js 的
+ * `paceReveal`（纯函数，可测）。
+ *
+ * 追平之后**自动停表**——没有内容要放时还空转 rAF 是白烧电。
+ */
+const revealed = new Map();
+let revealTicker = null;
+
+function startRevealTicker(runId) {
+  if (revealTicker !== null) return;
+  let last = performance.now();
+  const tick = (now) => {
+    const dtMs = now - last;
+    last = now;
+    const arrived = (liveTexts.get(runId) ?? "").length + (liveThinking.get(runId) ?? "").length;
+    const state = runStates.get(runId);
+    const done = !state || state.status !== "running";
+    const next = paceReveal({ arrived, revealed: revealed.get(runId) ?? 0, dtMs, done });
+    const changed = next !== (revealed.get(runId) ?? 0);
+    revealed.set(runId, next);
+    if (changed && state && selectedRunId === runId) renderDetailWithState(state);
+    // 追平且没在跑了就停表
+    if (next >= arrived && done) {
+      revealTicker = null;
+      return;
+    }
+    revealTicker = requestAnimationFrame(tick);
+  };
+  revealTicker = requestAnimationFrame(tick);
+}
+
+/** 取"该显示到第几个字"的那一截。思考与正文各自截，互不影响 */
+function revealedSlice(runId, full, isThinking) {
+  const n = revealed.get(runId);
+  if (n === undefined) return full;
+  // 思考在前、正文在后：正文的可见额度要扣掉思考已经占掉的
+  const thinkLen = (liveThinking.get(runId) ?? "").length;
+  const budget = isThinking ? n : Math.max(0, n - thinkLen);
+  return full.slice(0, budget);
+}
+
+const batcher = createBatcher((batches) => {
+  for (const [runId, queue] of batches) {
+    const state = runStates.get(runId);
+    if (!state) continue;
+
+    // 文本阶段的边界：新一轮开始、模型转去调工具、或整段结束——
+    // 三者都意味着"正在流入的那段文本"已经不是此刻在发生的事了，让位给
+    // 工具标签/最终文本。不在 assistant_text 处清：那条只是把同一段文本
+    // 完整地又给了一遍，清了会让直播条闪一下。
+    for (const item of queue) {
+      const t = item?.event?.type;
+      if (t === "turn_start" || t === "tool_call" || t === "done") {
+        liveTexts.delete(runId);
+        liveThinking.delete(runId);
+        revealed.delete(runId); // 换轮了，放行位置跟着归零
+        break;
+      }
+    }
+
+    const next = reduceEvents(state, queue);
+    runStates.set(runId, next);
+
+    if (selectedRunId === runId) renderDetailWithState(next);
+
+    // run_end 是唯一的"可以收工"信号：此时主动 close，浏览器才不会再自动重连
+    if (next.status === "done") {
+      liveTexts.delete(runId); // 运行结束，直播条隐藏，缓冲没有留存意义
+      liveThinking.delete(runId);
+      const es = eventSources.get(runId);
+      if (es) {
+        es.close();
+        eventSources.delete(runId);
+        // 收尾前多半已经吃过一次 error（服务端 res.end 先到、run_end 后 flush），
+        // 横幅正挂着。close 不触发任何事件，不在这儿落它就会一直挂到下次切换。
+        setConnectionState(runId, "live");
+        announceStatus(`运行已完成：${next.task}`);
+        refreshTranscriptIfWatching(runId);
+        // 不在看的那条跑完了 → 记一颗未读星（在看的那条不必提醒，你就在看）
+        if (selectedRunId !== runId) unreadRuns.add(runId);
+        // canContinue 由服务端算，run 收尾后要拉一次列表才知道能不能追加
+        void loadRuns();
+      }
+    }
+  }
+});
+
+const enqueueEvent = (runId, sseEvent) => batcher.push(runId, sseEvent);
+
+// 切回前台时立刻补齐一次，不必等下一个节拍
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") {
+    batcher.flushNow();
+    deltaBatcher.flushNow();
+  }
+});
+
+function ensureSubscription(runId) {
+  if (eventSources.has(runId)) return;
+  const state = runStates.get(runId);
+  if (state && state.status === "done") return;
+
+  const es = new EventSource(apiPath(`/api/runs/${runId}/events`));
+  eventSources.set(runId, es);
+
+  es.addEventListener("message", (msg) => {
+    try {
+      enqueueEvent(runId, JSON.parse(msg.data));
+    } catch {
+      // 解析失败静默
+    }
+  });
+
+  // 文本流式：命名通道，不占 seq、不进事件缓冲（V-15）。
+  // 只取 main 来源——verifier/planner 的思考流不该抢占委托方的直播条。
+  es.addEventListener("delta", (msg) => {
+    try {
+      const { source, kind, text } = JSON.parse(msg.data);
+      if (source !== "main" || typeof text !== "string" || text === "") return;
+      // 思考与正文分两路：混进一条直播条会前言不搭后语
+      deltaBatcher.push(runId, { kind: kind === "thinking" ? "thinking" : "text", text });
+    } catch {
+      // 解析失败静默：直播条是锦上添花，不能因为一条坏帧影响主流程
+    }
+  });
+
+  es.addEventListener("error", () => {
+    // 关键：既不 close 也不把挂起审批标成过期。
+    //   · close() 会掐死浏览器原生的自动重连（带 Last-Event-ID 续传）；
+    //   · 把 pending 标 expired 更糟——一次网络抖动就让活着的审批卡消失，
+    //     运行随即无人可应答而永久挂起。审批过期只由服务端 approval_expired 宣告。
+    // 这里只反映"传输层断了"，不改 harness 事实。
+    //
+    // 但"断了"和"服务端正常收流了"在这一层长得一模一样（见 shouldShowReconnecting）——
+    // 委托方截图里一个**已完成**的运行顶上就挂着这条横幅。所以先用 harness
+    // 事实分辨一次，别把正常收尾报成故障。
+    if (!shouldShowReconnecting({
+      info: runs.find((r) => r.runId === runId) ?? null,
+      localStatus: runStates.get(runId)?.status ?? null,
+    })) {
+      setConnectionState(runId, "live");
+      return;
+    }
+    setConnectionState(runId, "reconnecting");
+    loadRuns();
+  });
+
+  es.addEventListener("open", () => {
+    setConnectionState(runId, "live");
+  });
+}
+
+// ---- 连接态（控制器状态，不进 RunState：它是传输层的事，不是 harness 事实） ----
+/** @type {Map<string, "live"|"reconnecting">} */
+const connectionStates = new Map();
+
+function setConnectionState(runId, next) {
+  const prev = connectionStates.get(runId);
+  if (prev === next) return;
+  connectionStates.set(runId, next);
+  if (selectedRunId !== runId) return;
+  syncConnectionBanner();
+  if (next === "reconnecting") announceStatus("连接中断，正在重连…");
+}
+
+/**
+ * 横幅只反映**当前选中**那个运行的连接态。
+ *
+ * 必须能单独调：setConnectionState 在 `selectedRunId !== runId` 时只写 Map
+ * 不动 DOM，所以切换运行时，上一个运行的横幅会原样挂在新运行头上。
+ */
+function syncConnectionBanner() {
+  const banner = document.getElementById("reconnect-banner");
+  if (!banner) return;
+  banner.hidden = !(selectedRunId && connectionStates.get(selectedRunId) === "reconnecting");
+}
+
+// ---- 审批回调 ----
+/**
+ * @param {string} approvalId 形如 `toolUseId#requestSeq`——返工轮复用同一
+ *   toolUseId，只有带请求序号才能指明是哪一轮的那张卡（V-03）。
+ *   `#` 是 URL 片段分隔符，必须编码后再拼路径。
+ */
+/**
+ * 计划确认门应答（§5.1）。与工具审批同款口径：409 静默（幂等），不做乐观更新
+ * ——服务端随后推 `plan_approval_resolved`，那条才是权威审计记录。
+ */
+async function postPlanDecision(runId, decision) {
+  try {
+    const res = await fetch(apiPath(`/api/runs/${runId}/plan-approval`), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision }),
+    });
+    if (res.status === 409) return; // 已决或已收尾——重复点击不该报错
+    if (!res.ok) {
+      showSubmitError(`计划门应答失败（HTTP ${res.status}）：${await res.text()}`);
+    }
+  } catch (err) {
+    showSubmitError(`计划门应答失败：${err && err.message ? err.message : err}`);
+  }
+}
+
+async function postApproval(runId, approvalId, decision, reason, scope) {
+  try {
+    const res = await fetch(
+      apiPath(`/api/runs/${runId}/approvals/${encodeURIComponent(approvalId)}`),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        // scope="conversation" 建一条本次对话内的常驻放行规则（只对这个工具名）
+        body: JSON.stringify({ decision, reason, ...(scope ? { scope } : {}) }),
+      },
+    );
+    if (res.status === 409) return;
+    if (!res.ok) return;
+    // 乐观更新，让点击立刻有反馈；服务端随后会推 approval_resolved，
+    // 那条才是权威记录（刷新/换标签页后靠它复原，见 V-02）
+    const state = runStates.get(runId);
+    if (state) {
+      const next = markApprovalResolved(
+        state,
+        approvalId,
+        decision === "allow" ? "allowed" : "denied",
+        reason,
+      );
+      runStates.set(runId, next);
+      if (selectedRunId === runId) {
+        renderDetailWithState(next);
+      }
+    }
+  } catch {
+    // 网络错误静默
+  }
+}
+
+// ---- 提交：一个框，两种去向 ----
+/**
+ * 提交入口。去哪儿由 `composerSubmitPlan` 说了算——它是纯函数，
+ * 所以"这一下会新建还是会追加"这件事可以在测试里锁死，而不是靠人点。
+ */
+submitForm.addEventListener("submit", (e) => {
+  e.preventDefault();
+  const plan = composerSubmitPlan(composerMode, taskInput.value);
+  if (!plan) {
+    // 不能提交时**不能静默**：运行中那个模式恰恰是主动邀请用户打字的
+    // （placeholder 写着"可以先把下一条指令打好"），按了却零反馈最伤人
+    if (composerMode && !composerMode.canSubmit && taskInput.value.trim()) {
+      announceStatus(composerMode.note || "现在不能提交");
+    }
+    return;
+  }
+  if (plan.kind === "stop") void stopRun(plan.runId);
+  else if (plan.kind === "append") void submitAppend(plan);
+  else void submitNewRun(plan);
+});
+
+/**
+ * Ctrl/Cmd+Enter 发送。**只绑在 textarea 上，不绑在 form 上**——
+ * `#rubric-input` 也在这个 form 里，绑 form 的话在评分表里按 Ctrl+Enter
+ * 会带着半截 rubric 直接发车。单独 Enter 留给换行，多行指令是常态。
+ */
+taskInput.addEventListener("keydown", (e) => {
+  if (e.key !== "Enter" || !(e.ctrlKey || e.metaKey)) return;
+  e.preventDefault();
+  if (typeof submitForm.requestSubmit === "function") submitForm.requestSubmit();
+  else submitForm.dispatchEvent(new Event("submit", { cancelable: true, bubbles: true }));
+});
+
+async function submitNewRun({ text: task }) {
+  submitting = true;
+  newRunError = null;
+  syncComposer();
+  try {
+    const verify = verifyToggle.checked;
+    const res = await fetch(apiPath("/api/runs"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        task,
+        verify,
+        ...(packSelect?.value ? { pack: packSelect.value } : {}),
+        ...(effortSelect?.value ? { effort: effortSelect.value } : {}),
+        ...(rubricInput?.value.trim() ? { rubric: rubricInput.value.trim() } : {}),
+        ...(modeSelect?.value === "plan"
+          ? {
+              mode: "plan",
+              ...(concurrencySelect?.value ? { concurrency: concurrencySelect.value } : {}),
+              // 只在编排模式下带上：服务端对 single + planGate 会 400（不静默忽略）
+              ...(planGateToggle?.checked ? { planGate: true } : {}),
+            }
+          : {}),
+        ...(workdirSelect?.value ? { workdir: workdirSelect.value } : {}),
+        // 只在显式关掉时才传：默认"配了就用"，与 CLI 口径一致
+        ...(useVerifierModel && !useVerifierModel.checked ? { useVerifierModel: false } : {}),
+        ...(usePlannerModel && !usePlannerModel.checked ? { usePlannerModel: false } : {}),
+      }),
+    });
+    if (!res.ok) {
+      let detail = "";
+      try {
+        const body = await res.json();
+        detail = body?.error ? `：${body.error}` : "";
+      } catch { /* 响应体不是 JSON，只报状态码 */ }
+      newRunError = `提交失败（HTTP ${res.status}）${detail}`;
+      return;
+    }
+    const { runId } = await res.json();
+
+    const state = createInitialState(runId, task, verify);
+    runStates.set(runId, state);
+
+    runs.unshift({ runId, task, status: "running", verify, createdAt: Date.now(), finishedAt: null });
+    selectedRunId = runId;
+    activeTabs.set(runId, "loop");
+    renderDetailWithState(state);
+    enterDetailMode();
+    writeHash(runId, "loop");
+    announceStatus(`新任务已提交：${task}`);
+
+    ensureSubscription(runId);
+    taskInput.value = "";
+    clearUploads();
+  } catch (err) {
+    newRunError = `提交失败：${err.message ?? "网络错误"}`;
+  } finally {
+    submitting = false;
+    // 焦点交还输入框：按钮这一刻会变成 disabled（运行中），鼠标用户的焦点
+    // 否则当场掉回 body
+    if (document.activeElement === submitBtn) taskInput.focus();
+    refreshRunListView();
+  }
+}
+
+/**
+ * 停止这次运行。
+ *
+ * 语义要说准：中止只保证**不再往下走**（循环在下一次模型调用之前收手），
+ * 已经在飞的那个请求不撤——HTTP 已经发出去、钱已经花了。
+ * 把它说成"立刻停"是骗人。
+ */
+async function stopRun(runId) {
+  if (!runId) return;
+  try {
+    const res = await fetch(apiPath(`/api/runs/${runId}/stop`), { method: "POST" });
+    if (!res.ok) {
+      const b = await res.json().catch(() => ({}));
+      showSubmitError(b.error ?? `停止失败（HTTP ${res.status}）`);
+    }
+  } catch (err) {
+    showSubmitError(`停止失败：${err.message ?? "网络错误"}`);
+  }
+}
+
+async function submitAppend({ runId, text }) {
+  submitting = true;
+  syncComposer();
+  try {
+    await postFollowUp(runId, text);
+    if (!followUpErrors.has(runId)) {
+      taskInput.value = "";
+      clearUploads();
+    }
+  } finally {
+    submitting = false;
+    if (document.activeElement === submitBtn) taskInput.focus();
+    syncComposer();
+  }
+}
+
+/**
+ * 提交错误就地显示（V-16）。
+ *
+ * 此前用 alert()：它抢焦点、阻塞整页、在窄屏上盖住内容，而且屏幕阅读器
+ * 的播报时机不受控。改成 role="alert" 的行内区域——辅助技术会自动播报，
+ * 键盘焦点不动，错误内容还能带上 HTTP 状态码与服务端文案。
+ */
+function showSubmitError(message) {
+  // 合并之后 #submit-error 由 patchComposer 统一写。这里改成设状态再同步，
+  // 否则两个写入方会互相覆盖：一次列表刷新就能把刚报出来的错抹掉。
+  newRunError = message || null;
+  syncComposer();
+}
+
+// ---- 全局生命周期流（V-10：取代 3 秒轮询）----
+// 轮询本身不是问题，"每 3 秒整体重建侧栏"才是——实测焦点停在运行项上 3.6 秒后
+// 就变成 BODY。改成推送 + 键控补丁：只在真有变化时更新，且不重建节点。
+// 兜底轮询保留但降到 30 秒，且仅在推送流断开期间生效。
+let lifecycleStream = null;
+let fallbackPoll = null;
+
+function startFallbackPoll() {
+  if (fallbackPoll !== null) return;
+  fallbackPoll = setInterval(loadRuns, 30000);
+}
+
+function stopFallbackPoll() {
+  if (fallbackPoll === null) return;
+  clearInterval(fallbackPoll);
+  fallbackPoll = null;
+}
+
+function subscribeLifecycle() {
+  lifecycleStream = new EventSource(apiPath("/api/stream"));
+
+  lifecycleStream.addEventListener("message", (msg) => {
+    try {
+      const payload = JSON.parse(msg.data);
+      if (payload.type === "snapshot") {
+        runs = payload.runs;
+      } else if (payload.run) {
+        const idx = runs.findIndex((r) => r.runId === payload.run.runId);
+        // 生命周期流也要记未读：没订阅事件流的那些运行（你根本没点开过）
+        // 只能从这里知道它们跑完了——只靠 SSE done 分支会漏掉一整类
+        if (
+          payload.run.status === "done" &&
+          runs[idx]?.status === "running" &&
+          payload.run.runId !== selectedRunId
+        ) {
+          unreadRuns.add(payload.run.runId);
+        }
+        if (idx >= 0) runs[idx] = payload.run;
+        else runs = [payload.run, ...runs];
+      }
+      refreshRunListView();
+    } catch {
+      // 解析失败静默
+    }
+  });
+
+  lifecycleStream.addEventListener("open", stopFallbackPoll);
+  // 不 close：浏览器会自己重连，届时服务端重发 snapshot 补齐缺口
+  lifecycleStream.addEventListener("error", startFallbackPoll);
+}
+
+// ---- 启动 ----
+/** 用宿主快照填充旋钮选项——可选值由服务端给，前端不硬编码 */
+function populateKnobs(snap) {
+  if (packSelect && Array.isArray(snap.availablePacks)) {
+    for (const p of snap.availablePacks) {
+      const opt = document.createElement("option");
+      opt.value = p.name;
+      opt.textContent = `${p.name} — ${p.description ?? ""}`;
+      packSelect.appendChild(opt);
+    }
+    if (snap.pack?.name) packSelect.value = snap.pack.name;
+    updatePackHint();
+  }
+  if (effortSelect && Array.isArray(snap.effortLevels)) {
+    for (const lv of snap.effortLevels) {
+      const opt = document.createElement("option");
+      opt.value = lv;
+      opt.textContent = lv;
+      effortSelect.appendChild(opt);
+    }
+    if (snap.effort) effortSelect.value = snap.effort;
+  }
+  const eh = document.getElementById("effort-hint");
+  // compat 端点不认识 output_config.effort——不说清楚，用户会以为自己设的档位生效了
+  if (eh && snap.compat) eh.textContent = "compat 模式下该参数不会发送";
+
+  // V-29 工作目录：只列宿主声明过的，浏览器不给自由输入
+  if (workdirSelect && Array.isArray(snap.availableWorkdirs)) {
+    for (const d of snap.availableWorkdirs) {
+      const opt = document.createElement("option");
+      opt.value = d;
+      opt.textContent = d;
+      workdirSelect.appendChild(opt);
+    }
+    if (snap.workdir) workdirSelect.value = snap.workdir;
+    workdirSelect.disabled = snap.availableWorkdirs.length <= 1;
+  }
+
+  // V-30 角色模型：没配就整块不显示——显示一个永远灰着的开关只会让人困惑
+  const rm = snap.roleModels;
+  const knob = document.getElementById("role-models-knob");
+  if (rm && knob) {
+    const wire = (role, rowId, textId, hintWhenOff) => {
+      const row = document.getElementById(rowId);
+      if (!row || !rm[role]?.configured) return false;
+      row.hidden = false;
+      document.getElementById(textId).textContent =
+        `${role === "verifier" ? "核查者" : "planner"}用 ${rm[role].model}（${rm[role].provider}）`;
+      return true;
+    };
+    const anyVerifier = wire("verifier", "verifier-role-row", "verifier-role-text");
+    const anyPlanner = wire("planner", "planner-role-row", "planner-role-text");
+    knob.hidden = !anyVerifier && !anyPlanner;
+    const hint = document.getElementById("role-models-hint");
+    if (hint) {
+      // 有实测依据的才说"更好"：D2 支持强 verifier，B3 证伪了强 planner
+      hint.textContent = anyVerifier
+        ? "取消勾选即与执行者同一个模型——这正是 A/B 对照臂的做法。"
+        : "取消勾选即与执行者同一个模型。";
+    }
+  }
+}
+
+function updatePackHint() {
+  const hint = document.getElementById("pack-hint");
+  if (!hint || !harnessSnapshot?.availablePacks) return;
+  const p = harnessSnapshot.availablePacks.find((x) => x.name === packSelect.value);
+  hint.textContent = p
+    ? `核查 ${p.verifyMode ?? "—"}${p.hasRubric ? " · 自带评分表" : ""}`
+    : "用默认 system prompt 与全部内置工具";
+}
+
+if (packSelect) packSelect.addEventListener("change", updatePackHint);
+
+// 并行度只在编排模式下有意义——单任务模式下禁用而不是藏起来，
+// 让"这个旋钮属于哪个模式"这件事本身可见
+if (modeSelect && concurrencySelect) {
+  modeSelect.addEventListener("change", () => {
+    const isPlan = modeSelect.value === "plan";
+    concurrencySelect.disabled = !isPlan;
+    if (planGateToggle) {
+      planGateToggle.disabled = !isPlan;
+      // 切回单任务时把勾去掉：留着一个"勾了但不生效"的复选框，就是
+      // 界面与实际行为不一致——这个项目为此单独立过一条纪律（V-24）
+      if (!isPlan) planGateToggle.checked = false;
+    }
+    const hint = document.getElementById("mode-hint");
+    if (hint) {
+      hint.textContent = isPlan
+        ? "planner 先拆解出带依赖图的子任务，再按就绪顺序调度；每个子任务各自核查。"
+        : "单领域任务上编排是纯开销——它的价值在跨领域交接。";
+    }
+  });
+}
+
+if (knobsToggle && runKnobs) {
+  knobsToggle.addEventListener("click", () => {
+    const open = runKnobs.hidden;
+    runKnobs.hidden = !open;
+    knobsToggle.setAttribute("aria-expanded", String(open));
+    knobsToggle.textContent = open ? "装配 ▴" : "装配 ▾";
+  });
+}
+
+/**
+ * 新建对话（V-32）。
+ *
+ * 委托方报告 §10 点过"任务输入不区分创建新任务和追加指令"。现在两者已经靠
+ * 位置区分（顶栏 = 新建，对话底部 = 追加），这个按钮再把它显式化：
+ * 退出当前详情、清空输入、把焦点交给任务框。选哪个工作目录仍在装配面板里，
+ * 因为那是一次运行的护栏，不该藏在一个按钮的副作用里。
+ */
+if (newChatBtn) {
+  newChatBtn.addEventListener("click", () => {
+    selectedRunId = null;
+    writeHash(null, null);
+    refreshRunListView();
+    renderEmptyState(runs.length > 0);
+    sidebar.classList.remove("narrow-hidden");
+    mainPanel.classList.remove("narrow-full");
+    taskInput.value = "";
+    clearUploads();
+    newRunError = null;
+    syncComposer();
+    taskInput.focus();
+    announceStatus("已开始新对话，请输入任务描述");
+  });
+}
+
+/**
+ * 附件上传（V-34）。
+ *
+ * 文件落进工作目录下的 uploads/，服务端返回**相对工作目录的路径**——那正是
+ * agent 的工具能直接用的形式。上传完把路径追加进任务描述，模型才知道东西在
+ * 哪；否则文件躺在磁盘上而它无从得知。
+ *
+ * 配了视觉模型时，图片可以直接让 describe_image 去看；没配的话上传仍然有用
+ * （bash / read_file 处理文本与数据文件），只是看不了图。
+ */
+const uploaded = [];
+
+function renderUploads() {
+  if (!uploadList) return;
+  uploadList.hidden = uploaded.length === 0;
+  uploadList.innerHTML = uploaded
+    .map((u) => `<li><code>${escapeHtml(u.path)}</code> <span class="knob-hint">${(u.bytes / 1024).toFixed(0)} KB</span></li>`)
+    .join("");
+}
+
+/**
+ * 清单清空。合并之前这个数组**从来没被清过**——因为提交完页面重心就转走了，
+ * 看不见。现在 composer 常驻底栏，不清的话上一次的附件清单会挂到下一次提交
+ * 头上，一眼就能看出错。
+ */
+function clearUploads() {
+  if (uploaded.length === 0) return;
+  uploaded.length = 0;
+  renderUploads();
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+}
+
+async function uploadFiles(files) {
+  showSubmitError(null);
+  /**
+   * 附件落在**哪个工作目录**取决于这次提交去哪儿。
+   *
+   * 续跑复用原运行的 loop，工具的写入圈禁根是那个运行的 workdir；而
+   * `#workdir-select` 反映的是"下一次新建"的选择（追加模式下它还被禁用了）。
+   * 照旧取 select 的值，文件会落进另一个目录，agent 按路径读不到——
+   * 而且不报错，只表现为"它说找不到文件"。
+   */
+  const at = { mode: composerMode?.mode ?? "new", runId: composerMode?.runId ?? null };
+  const targetWorkdir = at.mode === "append" ? composerMode?.workdir : workdirSelect?.value;
+  for (const file of files) {
+    try {
+      const buf = await file.arrayBuffer();
+      // 大文件用 chunk 转 base64——一次性 apply 整个数组会爆调用栈
+      let binary = "";
+      const view = new Uint8Array(buf);
+      for (let i = 0; i < view.length; i += 0x8000) {
+        binary += String.fromCharCode(...view.subarray(i, i + 0x8000));
+      }
+      const res = await fetch(apiPath("/api/upload"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: file.name,
+          data: btoa(binary),
+          ...(targetWorkdir ? { workdir: targetWorkdir } : {}),
+        }),
+      });
+      if (!res.ok) {
+        const b = await res.json().catch(() => ({}));
+        showSubmitError(b.error ?? `上传失败（HTTP ${res.status}）`);
+        continue;
+      }
+      const info = await res.json();
+      // 上传是 fire-and-forget（change 处理器不 await）。等它回来时用户可能
+      // 已经切走了——那条路径属于另一个工作目录，写进现在的框里就是错配。
+      if ((composerMode?.mode ?? "new") !== at.mode || (composerMode?.runId ?? null) !== at.runId) {
+        showSubmitError(`附件已上传到原来的工作目录（${info.path}），但你已经切换了对话——没有写进输入框。`);
+        continue;
+      }
+      uploaded.push(info);
+      // 把路径写进任务描述——模型只有看到路径才知道文件存在
+      const line = `附件：${info.path}`;
+      taskInput.value = taskInput.value ? `${taskInput.value}
+${line}` : line;
+    } catch (err) {
+      showSubmitError(`上传失败：${err.message ?? "未知错误"}`);
+    }
+  }
+  renderUploads();
+}
+
+if (fileUpload) {
+  fileUpload.addEventListener("change", () => {
+    if (fileUpload.files?.length) void uploadFiles([...fileUpload.files]);
+    fileUpload.value = "";
+  });
+}
+
+// ---- 主题切换（V-20）----
+// 三态循环 auto → light → dark：auto 跟随系统，另外两个是显式覆盖。
+// 显式态写进 localStorage，由 <head> 里的内联脚本在样式生效前恢复，避免闪白。
+const THEME_KEY = "agent-ui-theme";
+const THEME_LABEL = { auto: "◐", light: "☀", dark: "☾" };
+
+function currentTheme() {
+  const explicit = document.documentElement.getAttribute("data-theme");
+  return explicit === "light" || explicit === "dark" ? explicit : "auto";
+}
+
+function applyTheme(next) {
+  if (next === "auto") document.documentElement.removeAttribute("data-theme");
+  else document.documentElement.setAttribute("data-theme", next);
+  try {
+    if (next === "auto") localStorage.removeItem(THEME_KEY);
+    else localStorage.setItem(THEME_KEY, next);
+  } catch { /* 隐私模式下写入可能抛错，主题仍在本次会话内生效 */ }
+  if (themeToggle) {
+    themeToggle.textContent = THEME_LABEL[next];
+    themeToggle.setAttribute("aria-label", `切换配色主题（当前：${
+      { auto: "跟随系统", light: "浅色", dark: "深色" }[next]
+    }）`);
+  }
+}
+
+if (themeToggle) {
+  applyTheme(currentTheme());
+  themeToggle.addEventListener("click", () => {
+    const order = ["auto", "light", "dark"];
+    applyTheme(order[(order.indexOf(currentTheme()) + 1) % order.length]);
+  });
+}
+
+// ---- 服务端地址设置 ----
+const serverToggle = document.getElementById("server-toggle");
+const serverSettings = document.getElementById("server-settings");
+const serverInput = document.getElementById("server-input");
+const serverSave = document.getElementById("server-save");
+const serverClear = document.getElementById("server-clear");
+
+if (serverToggle && serverSettings && serverInput && serverSave && serverClear) {
+  serverInput.value = serverBase;
+  serverToggle.addEventListener("click", () => {
+    const willShow = serverSettings.hidden;
+    serverSettings.hidden = !willShow;
+    serverToggle.setAttribute("aria-expanded", String(willShow));
+    if (willShow) serverInput.focus();
+  });
+  serverSave.addEventListener("click", () => applyServerBase(serverInput.value));
+  serverClear.addEventListener("click", () => {
+    serverInput.value = "";
+    applyServerBase("");
+  });
+}
+
+// 底栏先派生一次：loadRuns 失败时是静默的（见其 catch），
+// 不显式同步的话 composer 会停在 HTML 里那份未经派生的静态文案上
+syncComposer();
+loadHarness();
+loadRuns().then(applyHash);
+subscribeLifecycle();
+</script>
+
+</body>
+</html>

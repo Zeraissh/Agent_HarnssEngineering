@@ -1,0 +1,21 @@
+appId: com.self.agentharness
+productName: Agent Harness
+directories:
+  output: dist-electron
+asar: true
+npmRebuild: false
+files:
+  - electron
+win:
+  target: nsis
+  artifactName: ${productName}-${version}-${arch}-setup.${ext}
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+mac:
+  target: dmg
+  hardenedRuntime: true
+  artifactName: ${productName}-${version}-${arch}.${ext}
+linux:
+  target: AppImage
+  artifactName: ${productName}-${version}-${arch}.${ext}
