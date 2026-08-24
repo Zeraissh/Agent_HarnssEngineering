@@ -1,0 +1,43 @@
+services:
+  harness:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: agent-harness:${AGENT_IMAGE_TAG:-local}
+    restart: unless-stopped
+    stop_grace_period: 10s
+    read_only: true
+    init: true
+    ports:
+      - "127.0.0.1:${AGENT_UI_PORT:-4173}:4173"
+    environment:
+      AGENT_UI_ACCESS_TOKEN: ${AGENT_UI_ACCESS_TOKEN:?set a 32+ character access token}
+      AGENT_UI_BEHIND_TLS_PROXY: "1"
+      AGENT_UI_ALLOWED_ORIGINS: ${AGENT_UI_ALLOWED_ORIGINS:?set the public HTTPS origin}
+      AGENT_UI_ENABLE_BASH: "0"
+      AGENT_UI_MAX_ACTIVE_RUNS: ${AGENT_UI_MAX_ACTIVE_RUNS:-4}
+      AGENT_UI_MAX_STORED_RUNS: ${AGENT_UI_MAX_STORED_RUNS:-100}
+      AGENT_UI_MUTATIONS_PER_MINUTE: ${AGENT_UI_MUTATIONS_PER_MINUTE:-120}
+      AGENT_TOTAL_MAX_TURNS: ${AGENT_TOTAL_MAX_TURNS:-120}
+      AGENT_TOTAL_TOKEN_BUDGET: ${AGENT_TOTAL_TOKEN_BUDGET:-500000}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      AGENT_MODEL: ${AGENT_MODEL:-claude-opus-4-8}
+      AGENT_PROVIDER: ${AGENT_PROVIDER:-anthropic}
+    volumes:
+      - type: bind
+        source: ${AGENT_WORKSPACE:?set an absolute workspace path}
+        target: /workspace
+      - harness-history:/data/history
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 2g
+    cpus: 2.0
+
+volumes:
+  harness-history:

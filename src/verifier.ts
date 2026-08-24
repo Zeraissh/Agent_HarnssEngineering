@@ -10,8 +10,10 @@
  *   permission="ask" 的写类工具在 verifier 里永远执行不了。
  */
 import type Anthropic from "@anthropic-ai/sdk";
-import { AgentLoop } from "./loop.js";
-import type { AgentConfig, AggregateUsage, ModelClient, TurnEvent } from "./types.js";
+import { AgentLoop, createRunBudget } from "./loop.js";
+import { withoutTaskCompletion } from "./task-completion.js";
+import { withoutAskUser } from "./tools/ask-user.js";
+import type { AgentConfig, AggregateUsage, ModelClient, Tool, TurnEvent } from "./types.js";
 
 export interface Verdict {
   passed: boolean;
@@ -78,7 +80,97 @@ export interface VerifyOptions {
  * - `reformat` 产出了散文但不是 JSON，靠重问转写救回
  * - `failed`   兜底都没救回，落 fail-closed（此时 summary 带过程摘要，见 9.2）
  */
-export type VerdictRecovery = "direct" | "wrapup" | "reformat" | "failed";
+export type VerdictRecovery = "tool" | "direct" | "wrapup" | "reformat" | "failed";
+
+/**
+ * 终结工具名（§2.1）。裁决从"最后一条消息里恰好是 JSON"变成**一次调用**。
+ *
+ * 为什么这才是 §2.1 该做的形状：台账 52 次裁决里 wrapup 69.2% / reformat 1.9%。
+ * backlog 原案（`response_format: json_schema`）治的是 reformat 那 1.9%——
+ * 模型写了散文。真正的大头是**跑满预算从没写出结论**，而那不是格式问题：
+ * 在自由文本契约下，"停止取证、开始下结论"这个转换没有任何可执行的着力点，
+ * 模型永远可以"再查一件事"。给它一个工具，这个转换才第一次变成一个动作——
+ * 模型有得可做，harness 也才有地方强制它做（P6）。
+ */
+export const VERDICT_TOOL_NAME = "submit_verdict";
+
+/**
+ * 裁决交付工具。
+ *
+ * `execute` 在 loop 里**永远不会被调用**——AgentLoop 见到 `terminalTool` 就地收尾，
+ * 走不到执行器。但 `Tool.execute` 是可直接调用的公开面（测试就这么用，见 §2.2
+ * 那条分工说明），所以它得有个说得通的实现，而不是 throw。
+ */
+export function createVerdictTool(): Tool {
+  return {
+    name: VERDICT_TOOL_NAME,
+    description:
+      "提交最终裁决，结束本次核查。这是交付裁决的**唯一**方式——证据取够了就调用它。" +
+      "调用之后核查立即结束，不会再有下一轮，所以调用前请确认该查的都查了。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        passed: {
+          type: "boolean",
+          description:
+            "你【实际核查过的客观项】是否全部符合。unverified 与 advisory 都不影响它。",
+        },
+        issues: {
+          type: "array",
+          items: { type: "string" },
+          description: "客观项不符之处，每条一个字符串（含标准值 vs 实测值）；无则空数组",
+        },
+        unverified: {
+          type: "array",
+          items: { type: "string" },
+          description: "缺手段或没来得及核查的项，每条注明缺什么手段；无则省略。不得因此判 failed",
+        },
+        advisory: {
+          type: "array",
+          items: { type: "string" },
+          description: "主观质量意见/评分表结论，自陈判法；无则省略。不影响 passed",
+        },
+        summary: { type: "string", description: "一句话结论" },
+      },
+      required: ["passed", "summary"],
+    },
+    permission: "auto",
+    parallelSafe: false,
+    execute(input) {
+      const v = verdictFromToolInput(input);
+      return Promise.resolve(
+        v
+          ? { content: "裁决已记录。" }
+          : { content: "裁决入参不合法：passed 必须是布尔、summary 必须是字符串。", isError: true },
+      );
+    },
+  };
+}
+
+/**
+ * 终结工具入参 → Verdict。**自己校验，不假定端点校验过**。
+ *
+ * loop 在执行器之前就截住了终结工具，所以 `validateToolInput` 那一层
+ * （registry 里的 schema 校验）根本不经过；而"端点会按 schema 校验入参"正是
+ * §2.1 想买的东西，却也正是兼容端点最可能不兑现的东西。所以这里自己查。
+ *
+ * 形状不合法时返回 undefined 而不是抛——降级回文本解析那条路（§2.2 定的
+ * 降级语义：裁决侧缺字段应该降级，不是拒绝）。
+ */
+export function verdictFromToolInput(input: unknown): Verdict | undefined {
+  if (typeof input !== "object" || input === null) return undefined;
+  const o = input as Partial<Verdict>;
+  if (typeof o.passed !== "boolean") return undefined;
+  const unverified = Array.isArray(o.unverified) ? o.unverified.map(String) : [];
+  const advisory = Array.isArray(o.advisory) ? o.advisory.map(String) : [];
+  return {
+    passed: o.passed,
+    issues: Array.isArray(o.issues) ? o.issues.map(String) : [],
+    summary: typeof o.summary === "string" ? o.summary : "",
+    ...(unverified.length ? { unverified } : {}),
+    ...(advisory.length ? { advisory } : {}),
+  };
+}
 
 export interface VerifyOutcome {
   verdict: Verdict;
@@ -115,17 +207,50 @@ export async function runVerifier(
   // 但解耦≠一个常数走天下（案例 #8）：15 是按软件域定的，真机域每条验收都要
   // 多次探针往返，装不下。领域包可用 verify.maxTurns 声明自己需要多少。
   const verifierMaxTurns = opts.maxTurns ?? DEFAULT_VERIFIER_MAX_TURNS;
+  const roleBase = withoutTaskCompletion(cfg);
+  const verifierBudget = createRunBudget({
+    ...(cfg.maxTotalTurns !== undefined ? { maxTurns: cfg.maxTotalTurns } : {}),
+    ...(cfg.maxTokensBudget !== undefined ? { maxTokens: cfg.maxTokensBudget } : {}),
+  });
+  /**
+   * §2.1：把裁决交付做成一个工具，挂在 verifier 的工具面上。
+   *
+   * 代价要说清楚：verifier 的 tools 块从此**与父级不同**，文件头那句
+   * "请求前缀与父级一致，能蹭到 tools/system 层的缓存"对 verifier 不再成立
+   * （缓存是前缀字节匹配，tools 渲染在最前）。这笔账实测很小——兼容端点上
+   * 父子共享前缀本来就没兑现（cache_creation 恒 0、planner 首轮命中 0%），
+   * 而 verifier 自己 run 内的增量缓存（实测 74~93%）完全不受影响。
+   */
+  const verifierCfg: AgentConfig = {
+    ...roleBase,
+    // withoutAskUser 是 §5.2 决定 3 的硬执行点：核查者不许问委托方要答案，
+    // 它的公信力来自自己动手查。宿主一旦给执行者装了 ask_user，
+    // 这份工具面会被 {...cfg} 原样继承过来——所以在这里剔，不在装配处指望人记得
+    tools: [...withoutAskUser(roleBase.tools), createVerdictTool()],
+    terminalTool: VERDICT_TOOL_NAME,
+    runBudget: verifierBudget,
+  };
   const first = await drainVerifierEvents(
-    new AgentLoop({ ...cfg, maxTurns: verifierMaxTurns }, model).run(buildVerifierPrompt(opts)),
+    new AgentLoop({ ...verifierCfg, maxTurns: verifierMaxTurns }, model).run(
+      buildVerifierPrompt(opts),
+    ),
     onEvent,
     opts.readOnlyCommands,
   );
 
-  let verdict = parseVerdict(first.text);
-  let raw = first.text;
+  // 交付路径一：终结工具。入参形状不合法时**降级**回文本解析而不是拒绝——
+  // 端点未必真按 schema 校验，而裁决侧的缺字段语义是降级（§2.2 的定论）。
+  const firstFromTool = verdictFromTerminal(first.terminalInput);
+  let verdict = firstFromTool ?? parseVerdict(first.text);
+  let raw = firstFromTool ? JSON.stringify(first.terminalInput) : first.text;
   let usage = first.usage;
-  // 裁决获得路径：首轮直接解析成功即 direct，被兜底救回则记录是哪一条救的
-  let recovery: VerdictRecovery = isParseFailure(verdict) ? "failed" : "direct";
+  // 裁决获得路径：tool = 走了终结工具（§2.1 上线后的理想路径）；
+  // direct = 末条消息恰好可解析（端点不认强制工具时的形态）；其余记录是哪一条兜底救的
+  let recovery: VerdictRecovery = firstFromTool
+    ? "tool"
+    : isParseFailure(verdict)
+      ? "failed"
+      : "direct";
 
   /**
    * 兜底一：**预算用尽的收口续跑**（案例 #8 的 9.7）。
@@ -144,9 +269,23 @@ export async function runVerifier(
    */
   if (isParseFailure(verdict) && first.stopReason === "max_turns" && first.messages.length > 0) {
     const wrapUp = await drainVerifierEvents(
-      // toolChoice none（B0b）：收口段结构化禁工具——案例 #9 实测收口提示会被
-      // "继续取证"无视，2 轮收口预算全烧在工具上
-      new AgentLoop({ ...cfg, maxTurns: VERIFIER_WRAPUP_MAX_TURNS, toolChoice: "none" }, model).runContinuation(
+      /**
+       * §2.1 把这一段从"禁工具"改成"**强制**交付工具"。
+       *
+       * B0b 那版是 `toolChoice:"none"`——它只说得出"别再调工具"，说不出
+       * "现在就产出这个形状"。台账里 wrapup 占 69.2%，正说明"别查了、写结论"
+       * 这句话即使被听进去，也还差一个可执行的动作。`{type:"tool"}` 两件事
+       * 一起给：不许再取证（点名了唯一可调的工具），且必须交付（端点按 schema
+       * 校验入参）。loop 层的 terminalTool 兜住"端点只收不认"的情形。
+       */
+      new AgentLoop(
+        {
+          ...verifierCfg,
+          maxTurns: VERIFIER_WRAPUP_MAX_TURNS,
+          toolChoice: { type: "tool", name: VERDICT_TOOL_NAME },
+        },
+        model,
+      ).runContinuation(
         first.messages as Anthropic.MessageParam[],
         buildWrapUpPrompt(first.turns),
       ),
@@ -154,10 +293,13 @@ export async function runVerifier(
       opts.readOnlyCommands,
     );
     usage = sumUsage(usage, wrapUp.usage);
-    const concluded = parseVerdict(wrapUp.text);
+    const wrapFromTool = verdictFromTerminal(wrapUp.terminalInput);
+    const concluded = wrapFromTool ?? parseVerdict(wrapUp.text);
     if (!isParseFailure(concluded)) {
       verdict = concluded;
-      raw = wrapUp.text;
+      raw = wrapFromTool ? JSON.stringify(wrapUp.terminalInput) : wrapUp.text;
+      // 仍记 wrapup：这一档记的是"多付了一段续跑"，与它靠什么机制收口无关。
+      // tool 与 direct 的对比才是"端点认不认强制工具"的读数。
       recovery = "wrapup";
     }
   }
@@ -167,7 +309,15 @@ export async function runVerifier(
   // 一次重问便宜得多。空输出没有可转写的结论，不重问（转写会变成无依据的编造）。
   if (isParseFailure(verdict) && first.text.trim() !== "") {
     const retry = await drainVerifierEvents(
-      new AgentLoop({ ...cfg, maxTurns: 3 }, model).run(buildReformatPrompt(first.text)),
+      new AgentLoop(
+        {
+          ...roleBase,
+          tools: withoutAskUser(roleBase.tools),
+          maxTurns: 3,
+          runBudget: verifierBudget,
+        },
+        model,
+      ).run(buildReformatPrompt(first.text)),
       onEvent,
     );
     usage = sumUsage(usage, retry.usage);
@@ -228,6 +378,11 @@ function isParseFailure(v: Verdict): boolean {
   return !v.passed && v.issues[0] === VERDICT_PARSE_FAIL;
 }
 
+/** 没调终结工具，或调了但入参不合法 → undefined（两种都该降级回文本解析） */
+function verdictFromTerminal(input: unknown): Verdict | undefined {
+  return input === undefined ? undefined : verdictFromToolInput(input);
+}
+
 /**
  * 消费一段 verifier 事件流。
  *
@@ -249,12 +404,15 @@ async function drainVerifierEvents(
   stopReason: string | null;
   turns: number;
   toolCalls: string[];
+  /** 终结工具的入参（§2.1 的交付载体）。没调过它就是 undefined */
+  terminalInput: unknown;
 }> {
   let finalText = "";
   let usage: AggregateUsage | undefined;
   let messages: unknown[] = [];
   let stopReason: string | null = null;
   const toolCalls: string[] = [];
+  let terminalInput: unknown;
 
   for await (const event of events) {
     await onEvent?.(event);
@@ -285,6 +443,8 @@ async function drainVerifierEvents(
       }
       case "tool_call":
         toolCalls.push(event.name);
+        // 终结工具的入参就是裁决本身。取最后一次——重复调用时以最终那次为准
+        if (event.name === VERDICT_TOOL_NAME) terminalInput = event.input;
         break;
       case "done":
         usage = event.result.usage;
@@ -303,6 +463,7 @@ async function drainVerifierEvents(
     stopReason,
     turns: usage?.turns ?? 0,
     toolCalls,
+    terminalInput,
   };
 }
 
@@ -313,15 +474,15 @@ async function drainVerifierEvents(
  * 就是把"没查"当成"没做对"——fail-closed 第三种误伤形态（案例 #4 烧过 22 轮空转）。
  */
 function buildWrapUpPrompt(turns: number): string {
-  return `你的核查轮次预算已经用尽（已跑 ${turns} 轮）。**现在不要再调用任何工具**，就用你手里已经取到的证据把裁决写出来。
+  return `你的核查轮次预算已经用尽（已跑 ${turns} 轮）。**现在立刻调用 ${VERDICT_TOOL_NAME} 交付裁决**，用你手里已经取到的证据下结论——不要再取证，这一步只许交付。
 
 - 已经查实的验收项照常判：全部符合 → passed=true；有明确不符 → 写进 issues；
 - 因为预算用尽而**没来得及查完**的项，写进 unverified 并注明"预算用尽未及核查"——
   **不得因为没查完就判 failed**，那是把"没查"错当成"没做对"；
 - 主观质量类判断写进 advisory 并自陈判法。
 
-你的回复必须只包含一个 JSON 对象（不要代码围栏、不要多余文字）：
-{"passed": true/false, "issues": ["客观项不符之处；无则空数组"], "unverified": ["缺手段或没来得及核查的项；无则省略"], "advisory": ["主观意见；无则省略"], "summary": "一句话结论"}`;
+（若该工具在你这里不可用，退而把同样的对象作为最后一条消息原样输出：
+{"passed": true/false, "issues": [...], "unverified": [...], "advisory": [...], "summary": "一句话结论"}）`;
 }
 
 /** 管道下游允许的通用只读过滤器 */
@@ -476,8 +637,11 @@ ${opts.executorReport}
    passed 只由你【实际核查过的客观项】决定：客观项全过 = true（哪怕有 unverified/advisory），
    任一客观项不符 = false。
 ${opts.readOnlyCommands?.length ? `\n你的 bash 只放行以下核查命令（前缀匹配，禁止重定向/链式）：${opts.readOnlyCommands.join("、")}。用它们独立重新推导（如亲自重新构建、查符号），不要只依赖间接证据。\n` : ""}${opts.verifyInstructions ? `\n领域核查方法：\n${opts.verifyInstructions}\n` : ""}${opts.rubric ? `\n主观评分表（rubric）——本任务的主要验收是主观质量,按下表逐维度评估,每条意见进 advisory,格式"维度 | 结论 | 依据与判法"。评分表意见不影响 passed(主观裁决权在委托方),客观 side 条款照常按字面进 issues：\n${opts.rubric}\n` : ""}
-你的最后一条消息必须只包含一个 JSON 对象（不要代码围栏、不要多余文字）：
-{"passed": true/false, "issues": ["客观项不符之处，每条一个字符串；无则空数组"], "unverified": ["缺手段核查的项及原因；无则省略"], "advisory": ["主观意见/评分；无则省略"], "summary": "一句话结论"}`;
+交付方式：证据取够了就调用 **${VERDICT_TOOL_NAME}** 工具提交裁决——那是本次核查的唯一交付口，
+调用之后核查立即结束。**不要把裁决写成正文再等下一轮**：轮次预算有限，"再查一件事"
+永远还有下一件，你需要自己判断什么时候证据已经够了。
+（若该工具在你这里不可用，退而把同样的对象作为最后一条消息原样输出，不要代码围栏、不要多余文字：
+{"passed": true/false, "issues": ["客观项不符之处，每条一个字符串；无则空数组"], "unverified": ["缺手段核查的项及原因；无则省略"], "advisory": ["主观意见/评分；无则省略"], "summary": "一句话结论"}）`;
 }
 
 /** 解析失败的哨兵 issue 文本（fail-closed 裁决的第一条 issue 恒为它） */

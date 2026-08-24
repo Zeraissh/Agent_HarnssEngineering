@@ -37,10 +37,13 @@ import {
   composerSubmitPlan,
   deriveScrollNav,
   paceReveal,
+  revealedWindow,
   keepScrollAnchored,
   renderRunList,
   applyCollapseOverrides,
   nextCollapseOverride,
+  buildLocalPathProbePlan,
+  toolPathCandidates,
 } from "../ui/public/app.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -60,6 +63,129 @@ const sse = (seq: number, source: string, type: string, extra = {}) => ({
 
 beforeEach(() => {
   document.body.innerHTML = loadSkeleton();
+});
+
+describe("消息正文路径探测计划", () => {
+  it("工具入参只从有路径语义的结构化字段提取，并递归处理数组", () => {
+    expect(toolPathCandidates({
+      path: "src/main.ts",
+      file_path: "docs/guide.md",
+      metadata: {
+        directory: "assets/",
+        filenames: ["hero.png", "hero.png"],
+      },
+      cwd: "build/",
+    })).toEqual([
+      "src/main.ts",
+      "docs/guide.md",
+      "assets/",
+      "hero.png",
+      "build/",
+    ]);
+  });
+
+  it("工具路径不猜 shell、URL 或普通正文里的文件名", () => {
+    expect(toolPathCandidates({
+      command: "cat src/main.ts",
+      url: "https://example.com/out/report.md",
+      content: "请打开 out/report.md",
+      label: "README.md",
+    })).toEqual([]);
+  });
+
+  it("同消息目录能把裸文件名解析到真实组合路径", () => {
+    const plan = buildLocalPathProbePlan(
+      ["threejs-fps-game/", "index.html", "threejs-fps-game/index.html"],
+      [],
+    );
+    const index = plan.entries.find((entry) => entry.label === "index.html");
+    expect(index?.choices).toEqual(["threejs-fps-game/index.html", "index.html"]);
+    expect(plan.probes).toContain("threejs-fps-game/");
+    expect(plan.probes).toContain("threejs-fps-game/index.html");
+  });
+
+  it("唯一产物 basename 优先；重名时不猜", () => {
+    const unique = buildLocalPathProbePlan(["report.md"], ["out/report.md"]);
+    expect(unique.entries[0].choices[0]).toBe("out/report.md");
+
+    const ambiguous = buildLocalPathProbePlan(
+      ["report.md"],
+      ["a/report.md", "b/report.md"],
+    );
+    expect(ambiguous.entries[0].choices).toEqual(["report.md"]);
+  });
+
+  it("file.ts:12:4 探测时去掉行列号，显示标签保持原样", () => {
+    const plan = buildLocalPathProbePlan(["src/file.ts:12:4"]);
+    expect(plan.entries[0]).toEqual({ label: "src/file.ts:12:4", choices: ["src/file.ts"] });
+  });
+
+  it("宿主确认后：文件可打开且可定位，目录可直接打开", async () => {
+    let state = createInitialState("run-path", "生成文件", false);
+    state = reduceEvents(state, [
+      sse(0, "main", "assistant_text", {
+        text: "文件 `out/report.md`，目录 `out/`。",
+      }),
+    ]);
+    const onReveal = vi.fn();
+    renderRunDetail(state, {
+      activeTab: "loop",
+      onReveal,
+      inspectPaths: async (paths: string[]) => paths.map((input) => ({
+        input,
+        exists: true,
+        path: input.replace(/[\\/]$/, ""),
+        kind: /[\\/]$/.test(input) ? "directory" : "file",
+      })),
+    });
+
+    await vi.waitFor(() => {
+      expect(document.querySelector('.local-path-link[href*="artifact"]')).toBeTruthy();
+      expect(document.querySelector('.local-path-link--directory')).toBeTruthy();
+    });
+    const fileLink = document.querySelector('.local-path-link[href*="artifact"]') as HTMLAnchorElement;
+    expect(decodeURIComponent(fileLink.href)).toContain("path=out/report.md");
+    const reveal = document.querySelector(".local-path-folder") as HTMLButtonElement;
+    expect(reveal.getAttribute("aria-label")).toContain("out/report.md");
+    reveal.click();
+    expect(onReveal).toHaveBeenCalledWith("out/report.md");
+  });
+
+  it("折叠的工具调用日志也显示经宿主确认的文件链接与定位按钮", async () => {
+    let state = createInitialState("run-tool-path", "读取报告", false);
+    state = reduceEvents(state, [
+      sse(0, "main", "turn_start", { turn: 1 }),
+      sse(1, "main", "tool_call", {
+        toolUseId: "tool-path-1",
+        name: "read_file",
+        input: { path: "out/report.md" },
+      }),
+    ]);
+    const onReveal = vi.fn();
+    renderRunDetail(state, {
+      activeTab: "loop",
+      onReveal,
+      inspectPaths: async (paths: string[]) => paths.map((input) => ({
+        input,
+        exists: true,
+        path: input,
+        kind: "file",
+      })),
+    });
+
+    await vi.waitFor(() => {
+      expect(document.querySelector(
+        '.log-entries .log-entry--collapsed .tool-path-strip .local-path-link[href*="artifact"]',
+      )).toBeTruthy();
+    });
+    const row = document.querySelector('.log-entries .log-entry[data-seq="1"]') as HTMLElement;
+    const fileLink = row.querySelector('.local-path-link[href*="artifact"]') as HTMLAnchorElement;
+    expect(decodeURIComponent(fileLink.href)).toContain("path=out/report.md");
+    const reveal = row.querySelector(".local-path-folder") as HTMLButtonElement;
+    expect(reveal.getAttribute("aria-label")).toContain("out/report.md");
+    reveal.click();
+    expect(onReveal).toHaveBeenCalledWith("out/report.md");
+  });
 });
 
 // ================================================================
@@ -1797,8 +1923,107 @@ describe("空态给的是能点的例子", () => {
     expect(btn.getAttribute("data-example")!.length).toBeGreaterThan(5);
   });
 
-  it("已有运行时不列示例——那时人已经知道怎么用了", () => {
+  it("已有运行时的新建对话面仍给示例——示例属于启动器，不属于首次安装", () => {
     renderEmptyState(true);
-    expect(document.querySelector("[data-example]")).toBeNull();
+    expect(document.querySelectorAll("[data-example]").length).toBeGreaterThanOrEqual(3);
+    expect(document.querySelector(".empty-state h2")!.textContent).toBe("开始一段新对话");
+  });
+});
+
+
+/**
+ * §直播条 · 滑动窗口换算（2026-08-15 委托方实测缺陷）。
+ *
+ * 现象：Web UI 里思考流到**约 2000 字就停住**，要过好一会才整块出现。
+ *
+ * 根因是绝对计数去 slice 一个滑动窗口：`revealed` 单调增长，而直播缓冲
+ * 有上限（LIVE_TEXT_CAP=2000）且只留尾部。撞上限那刻——
+ *   ① 旧代码的 `arrived` 取自缓冲长度 → 被钉死在 2000，不再增长；
+ *   ② 于是 `revealed` 也不再变化，节拍器的 `changed` 恒为 false；
+ *   ③ **再也不重绘**，屏幕冻在那一帧，直到本轮结束、turn 级
+ *      `assistant_thinking` 走正常 reducer 整块到达——正是"过一会才显示"。
+ *
+ * 这段逻辑原来住在 `index.html`，**没有任何测试够得着**——本仓库那条
+ * "核心可测、壳不可测的分界线就是缺陷分布线"的活标本。挪进 app.js 是
+ * 结构性修复，下面这组锁才有地方立。
+ */
+describe("revealedWindow：绝对放行计数 → 滑动窗口内的偏移", () => {
+  const CAP = 2000;
+
+  it("没到上限时就是原样放行（缓冲=全部，没有丢弃）", () => {
+    expect(revealedWindow({ revealed: 300, precedingTotal: 0, total: 500, bufferLength: 500 })).toBe(300);
+    expect(revealedWindow({ revealed: 500, precedingTotal: 0, total: 500, bufferLength: 500 })).toBe(500);
+  });
+
+  /** 这一条就是那个 bug：撞上限之后，追平的过程必须还能推进 */
+  it("超过上限后 revealed 前进则可见位置前进——旧实现在这里冻住", () => {
+    const at = (revealed: number) =>
+      revealedWindow({ revealed, precedingTotal: 0, total: 5000, bufferLength: CAP });
+    expect(at(4900)).toBe(1900); // 丢弃 5000-2000=3000；4900-3000
+    expect(at(4950)).toBe(1950);
+    expect(at(4950), "同一累计下 revealed 走一步，屏幕就得走一步").toBeGreaterThan(at(4900));
+  });
+
+  /**
+   * 滞后量相同时窗口位置相同——这不是 bug 而是正确性质：内容在滑，
+   * 位置不动照样看到新尾巴。真正修掉冻结的是"累计不再被上限钉死"，
+   * 由下面那条逐批流入的锁负责。
+   */
+  it("累计与 revealed 同步增长时位置稳定（内容在滑，不靠位置动）", () => {
+    const a = revealedWindow({ revealed: 4900, precedingTotal: 0, total: 5000, bufferLength: CAP });
+    const b = revealedWindow({ revealed: 4950, precedingTotal: 0, total: 5050, bufferLength: CAP });
+    expect(b).toBe(a);
+  });
+
+  it("追平时正好落在窗口末尾，不越界", () => {
+    expect(revealedWindow({ revealed: 5000, precedingTotal: 0, total: 5000, bufferLength: CAP })).toBe(CAP);
+    // 即使 revealed 因为舍入跑过头也夹在窗口内
+    expect(revealedWindow({ revealed: 9999, precedingTotal: 0, total: 5000, bufferLength: CAP })).toBe(CAP);
+  });
+
+  it("正文的额度扣掉思考已占的（思考在前、正文在后）", () => {
+    // 思考累计 800，正文刚到 100，全局放行 850 → 正文该显示 50
+    expect(revealedWindow({ revealed: 850, precedingTotal: 800, total: 100, bufferLength: 100 })).toBe(50);
+    // 全局还没走完思考那段，正文一个字都不该露
+    expect(revealedWindow({ revealed: 700, precedingTotal: 800, total: 100, bufferLength: 100 })).toBe(0);
+  });
+
+  it("永不返回负数或超过缓冲长度（下游直接拿去 slice）", () => {
+    for (const m of [
+      { revealed: 0, precedingTotal: 999, total: 10, bufferLength: 10 },
+      { revealed: -5, precedingTotal: 0, total: 0, bufferLength: 0 },
+      { revealed: 1e9, precedingTotal: 0, total: 1e9, bufferLength: 50 },
+    ]) {
+      const n = revealedWindow(m);
+      expect(n).toBeGreaterThanOrEqual(0);
+      expect(n).toBeLessThanOrEqual(m.bufferLength);
+    }
+  });
+
+  /**
+   * 端到端的形态复现：模拟一段 5000 字的思考按 250 字一批流进来，
+   * 缓冲按 2000 截尾。**每一批之后可见位置都必须前进**——只要有一批不动，
+   * 就是那个"冻住"的形态回来了。
+   */
+  it("逐批流入 5000 字：可见位置每批都前进，一次都不冻", () => {
+    let total = 0;
+    let buffer = "";
+    let lastVisibleTail = "";
+    const positions: number[] = [];
+    for (let i = 0; i < 20; i++) {
+      const chunk = "想".repeat(250);
+      total += chunk.length;
+      buffer = (buffer + chunk).slice(-CAP);
+      // 节拍器追平后的稳态：revealed == arrived == total
+      const n = revealedWindow({ revealed: total, precedingTotal: 0, total, bufferLength: buffer.length });
+      positions.push(total);
+      const tail = buffer.slice(0, n).slice(-80);
+      expect(tail.length, `第 ${i + 1} 批尾部不该为空`).toBeGreaterThan(0);
+      lastVisibleTail = tail;
+    }
+    expect(lastVisibleTail.length).toBe(80);
+    // 累计单调递增：旧实现里这个数会在 2000 处永久钉死
+    expect(positions.at(-1)).toBe(5000);
+    expect(positions.every((p, i) => i === 0 || p > positions[i - 1]!)).toBe(true);
   });
 });

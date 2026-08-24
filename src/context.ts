@@ -19,6 +19,8 @@ export interface ContextConfig {
   contextTokenLimit?: number;
   /** 压缩时保护最近 N 条消息不动。默认 6 */
   protectRecent?: number;
+  /** 从持久化检查点恢复时的上一轮实际输入水位；缺省 0（全新会话） */
+  initialInputTokens?: number;
 }
 
 export interface CompactResult {
@@ -50,6 +52,7 @@ export class DefaultContextManager {
     this.cacheBreakpoints = cfg.cacheBreakpoints ?? true;
     this.contextTokenLimit = cfg.contextTokenLimit ?? 150_000;
     this.protectRecent = cfg.protectRecent ?? 6;
+    this.lastInputTokens = Math.max(0, Math.floor(cfg.initialInputTokens ?? 0));
   }
 
   /** loop 每轮调用，喂入实际 usage —— compact 的触发依据 */
@@ -58,6 +61,11 @@ export class DefaultContextManager {
       usage.input_tokens +
       (usage.cache_creation_input_tokens ?? 0) +
       (usage.cache_read_input_tokens ?? 0);
+  }
+
+  /** 持久化检查点只需要这个水位，不暴露其余内部策略状态。 */
+  checkpointInputTokens(): number {
+    return this.lastInputTokens;
   }
 
   /**

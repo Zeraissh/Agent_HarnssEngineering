@@ -62,6 +62,7 @@ $env:AGENT_MODEL        = "deepseek-chat"
 npm run cli -- "阅读 docs/ 下所有文档，生成 SUMMARY.md"          # 交互审批 y/n
 npm run cli -- --yes "……"                                        # 自动批准（CI）
 npm run cli -- --verify "……"                                     # 完成后 verifier 独立核查，未通过自动返工
+npm run cli -- --ask "……"                                        # 允许执行前集中提出 1~4 个选择题（可自由输入）
 npm run cli -- --plan "……"                                       # 三角编排：planner 拆解→执行→核查→交接；
                                                                   #   互不依赖的子任务默认并行（auto=min(3,层宽)），--parallel=N 覆盖
 npm run eval                                                      # 全量用例回归基线（31 用例，纯产物评分）
@@ -71,6 +72,20 @@ npm run smoke:local                                               # 离线端点
 npm test                                                          # 单元测试
 ```
 
+真实 CLI/Web 宿主默认要求 `finish_task` 结构化收尾，`end_turn` 不再直接等于完成。
+长任务可用以下总账与恢复参数（PowerShell）：
+
+```powershell
+$env:AGENT_TOTAL_MAX_TURNS = "120"          # continuation/返工共用，不会每段重置
+$env:AGENT_TOTAL_TOKEN_BUDGET = "500000"    # 整个执行 lineage 的 token 总账
+$env:AGENT_PROGRESS_EXTENSION_TURNS = "8"   # 仍有新证据时最多一次有界续跑
+$env:AGENT_STAGNATION_WINDOW = "3"          # 连续相同调用+结果后要求换策略
+$env:AGENT_MAX_ASK_ROUNDS = "3"             # 打断次数；每次可集中问 1~4 题
+```
+
+显式 token 总账按完整模型调用结算：单次在途响应可能自然越过剩余额度；并行子任务会在
+同一总账上串行取得调用资格，避免多条轨基于旧余额同时起跑、按并发数放大超支。
+
 `--verify` 支持独立的核查模型（核查者应 ≥ 执行者强度，见 A/B 研究结论）：
 
 ```powershell
@@ -79,6 +94,48 @@ $env:AGENT_VERIFIER_BASE_URL = "https://api.deepseek.com/anthropic"  # 可选，
 $env:AGENT_VERIFIER_API_KEY  = "sk-..."                           # 可选，缺省沿用执行者
 npm run cli -- --verify "……"
 ```
+
+## Web 控制台与跨端 App
+
+浏览器控制台在 [`ui/`](ui/)（`ui/server.ts` + `ui/public`，任务提交 / 事件流直播 /
+审批应答 / 核查裁决 / 计划编排确认门 / 产物取件）。桌面端（Electron）与移动端
+（Capacitor Android）外壳在 [`cross-app/`](cross-app/)——它是把 `ui/public` 原样
+打包成 App 的客户端，连接宿主机上的同一个 Harness UI 服务：
+
+```powershell
+npm run ui                              # 浏览器控制台 http://127.0.0.1:4173
+cd cross-app
+$env:AGENT_UI_URL = "http://127.0.0.1:4173"
+npm run desktop                         # Electron 直接加载当前宿主，无复制 UI 漂移
+npm run desktop:dist                    # 生产打包；Windows/macOS 缺签名凭据会拒绝
+npm run desktop:dist:unsigned           # 只供本机安装测试，不得发布
+```
+
+真实编译产物用 `npm run build && npm start` 启动；`npm run pack:check` 会审计发布包
+allowlist。非 loopback 监听现在是 fail-closed：必须提供至少 32 字符的
+`AGENT_UI_ACCESS_TOKEN`，并声明可信 TLS 反代或显式接受明文风险；远程模式默认从工具面
+移除 `bash`。完整 Docker、探针、canary 和回滚步骤见
+[`docs/07-production-runbook.md`](docs/07-production-runbook.md)。
+
+PowerShell 中临时清除继承的端点变量要用：
+
+```powershell
+Remove-Item Env:ANTHROPIC_BASE_URL, Env:OPENAI_BASE_URL -ErrorAction SilentlyContinue
+npm run ui
+```
+
+`env -u ...` 是 POSIX shell 命令，在 PowerShell 中不可用。
+
+Web 宿主默认把运行历史写到 `<cwd>/.agent-run-history`（可用
+`AGENT_RUN_HISTORY_DIR` 改位置，`AGENT_RUN_HISTORY_KEEP` 改保留数）。完整结束的
+单执行者运行会同时保存事件、会话正史、Context 水位与累计总预算。宿主重启后点
+「从归档继续」会从检查点**派生一个新运行**：父档案保持只读，正史与总预算延续；
+模型、工具、策略与审批规则以当前宿主为准，旧上限与当前上限取更严格者。旧格式档案、
+核查/编排运行、预算已耗尽或工作目录不在当前白名单时只允许回看。
+
+`/health` 提供 liveness，`/ready` 在历史写入失败或关停时返回 503，`/metrics`
+提供 Prometheus 文本指标（配置访问令牌时同样需要认证）。Android 客户端已禁止明文
+HTTP，但在平台凭据存储、签名流水线和 HTTPS 真机验收完成前仍属于实验目标。
 
 ## 路线图
 

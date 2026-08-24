@@ -9,7 +9,11 @@
  *      转义漏了是 XSS。
  */
 import { describe, expect, it } from "vitest";
-import { renderMarkdown, renderMarkdownInline } from "../ui/public/core/markdown.js";
+import {
+  isLocalPathCandidate,
+  renderMarkdown,
+  renderMarkdownInline,
+} from "../ui/public/core/markdown.js";
 
 /** 把 HTML 串挂进真实 DOM 再断言——比字符串包含更能反映浏览器实际怎么解析 */
 function mount(html: string): HTMLElement {
@@ -47,6 +51,35 @@ describe("Markdown 渲染：模型常用记法", () => {
     expect(host.querySelector("em")!.textContent).toBe("斜");
     expect(host.querySelector("del")!.textContent).toBe("删");
     expect(host.querySelector("code")!.textContent).toBe("code");
+  });
+
+  it("路径样式的行内代码只挂候选标记，不在 Markdown 层伪造链接", () => {
+    const host = mount(
+      renderMarkdown(
+        "目录 `threejs-fps-game/`，文件 `index.html`、`threejs-fps-game/index.html`；普通代码 `Math.max`。",
+      ),
+    );
+    const candidates = [...host.querySelectorAll("code[data-local-path]")]
+      .map((node) => node.getAttribute("data-local-path"));
+    expect(candidates).toEqual([
+      "threejs-fps-game/",
+      "index.html",
+      "threejs-fps-game/index.html",
+    ]);
+    expect(host.querySelectorAll("a")).toHaveLength(0);
+    expect([...host.querySelectorAll("code")].at(-1)!.textContent).toBe("Math.max");
+  });
+
+  it.each([
+    ["D:\\Work\\demo\\main.ts:12", true],
+    ["../docs/readme.md", true],
+    ["My Report.docx", true],
+    [".env", true],
+    ["npm run test", false],
+    ["Math.max", false],
+    ["https://example.com/a.txt", false],
+  ])("本地路径候选初筛：%s → %s", (value, expected) => {
+    expect(isLocalPathCandidate(value)).toBe(expected);
   });
 
   it("无序与有序列表", () => {

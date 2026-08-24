@@ -108,6 +108,41 @@ describe("AgentLoop 集成：compaction 事件与正史替换", () => {
     const flat = JSON.stringify(done.result.messages);
     expect(flat).toContain("[compacted]");
   });
+
+  it("从持久化检查点恢复时，首个请求先按旧水位压缩，不能盲发完整大历史", async () => {
+    const history: Anthropic.MessageParam[] = [
+      { role: "user", content: "原始任务" },
+      { role: "assistant", content: [toolUseBlock("old", "reader", {})] },
+      bigToolResultMsg("old", 3000),
+      { role: "assistant", content: "阶段 1 完成" },
+      { role: "user", content: "阶段 2" },
+      { role: "assistant", content: "阶段 2 完成" },
+      { role: "user", content: "阶段 3" },
+      { role: "assistant", content: "阶段 3 完成" },
+    ];
+    const model = new FakeModelClient([
+      fakeMessage([textBlock("从检查点继续完成")], "end_turn", { input_tokens: 120 }),
+    ]);
+    const loop = new AgentLoop(
+      {
+        systemPrompt: "frozen",
+        tools: [makeTool({ name: "reader" })],
+        workdir: process.cwd(),
+        contextTokenLimit: 1000,
+        initialContextInputTokens: 900,
+      },
+      model,
+    );
+
+    const events: TurnEvent[] = [];
+    for await (const event of loop.runContinuation(history, "请继续")) events.push(event);
+
+    expect(events.some((event) => event.type === "compaction")).toBe(true);
+    expect(JSON.stringify(model.requests[0]!.messages)).toContain("[compacted]");
+    const done = events.at(-1);
+    expect(done?.type).toBe("done");
+    if (done?.type === "done") expect(done.result.contextInputTokens).toBe(120);
+  });
 });
 
 describe("system prompt 冻结（P3 断言）", () => {

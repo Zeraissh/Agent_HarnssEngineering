@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type Anthropic from "@anthropic-ai/sdk";
-import { AgentLoop, backoffWithJitter } from "../src/loop.js";
+import { AgentLoop, backoffWithJitter, createRunBudget } from "../src/loop.js";
+import {
+  FINISH_TASK_TOOL_NAME,
+  withTaskCompletion,
+} from "../src/task-completion.js";
 import type { AgentRunResult, ModelClient, ModelRequest, ModelTurn, TurnEvent } from "../src/types.js";
 import { FakeModelClient, fakeMessage, makeTool, textBlock, toolUseBlock } from "./helpers.js";
 
@@ -473,5 +477,416 @@ describe("思考流式增量（thinking_delta）", () => {
     );
     expect(events.some((e) => e.type === "thinking_delta")).toBe(false);
     expect(result.stopReason).toBe("completed");
+  });
+});
+
+describe("终结工具（§2.1：交付即调用）", () => {
+  /**
+   * 判据来自台账：52 次裁决里 wrapup 69.2%——主要失效不是"写了散文不是 JSON"，
+   * 是"跑满预算从没写出结论"。所以这一组锁的不是格式，是**终止**：
+   * 模型一旦交付，运行必须就地结束，且不得再有副作用。
+   */
+  const deliverTool = makeTool({ name: "submit_x" });
+  const sideEffect = makeTool({ name: "writes_stuff" });
+
+  it("调用终结工具 → 就地以 completed 收尾，不再发请求", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("tu_1", "submit_x", { ok: true })], "tool_use"),
+      // 脚本里还有第二条——真被消费掉就说明 loop 没有就地收尾
+      fakeMessage([textBlock("不该走到这里")], "end_turn"),
+    ]);
+    const { result } = await collect(
+      new AgentLoop(
+        { ...baseConfig, tools: [deliverTool], terminalTool: "submit_x" },
+        model,
+      ).run("t"),
+    );
+    expect(result.stopReason).toBe("completed");
+    expect(model.requests, "交付之后不该再有第二次模型调用").toHaveLength(1);
+  });
+
+  it("同轮的其它工具一律不执行——交付之后再取证会让「完成」变得可争议", async () => {
+    let executed = 0;
+    const counting = makeTool({
+      name: "writes_stuff",
+      execute: async () => {
+        executed += 1;
+        return { content: "ran" };
+      },
+    });
+    const model = new FakeModelClient([
+      fakeMessage(
+        [
+          toolUseBlock("tu_1", "writes_stuff", {}),
+          toolUseBlock("tu_2", "submit_x", { ok: true }),
+        ],
+        "tool_use",
+      ),
+    ]);
+    const { events, result } = await collect(
+      new AgentLoop(
+        { ...baseConfig, tools: [deliverTool, counting], terminalTool: "submit_x" },
+        model,
+      ).run("t"),
+    );
+    expect(executed, "同轮的副作用工具必须零执行").toBe(0);
+    expect(result.stopReason).toBe("completed");
+
+    // 每条 tool_call 都要有回执，否则界面留下一条永远转圈的调用
+    const calls = events.filter((e) => e.type === "tool_call");
+    const results = events.filter((e) => e.type === "tool_result");
+    expect(calls).toHaveLength(2);
+    expect(results.map((r) => (r as { toolUseId: string }).toolUseId).sort()).toEqual([
+      "tu_1",
+      "tu_2",
+    ]);
+  });
+
+  it("正史保持 API 合法：每个 tool_use 都有对应 tool_result（这段可能被续跑复用）", async () => {
+    const model = new FakeModelClient([
+      fakeMessage(
+        [toolUseBlock("tu_1", "writes_stuff", {}), toolUseBlock("tu_2", "submit_x", {})],
+        "tool_use",
+      ),
+    ]);
+    const { result } = await collect(
+      new AgentLoop(
+        { ...baseConfig, tools: [deliverTool, sideEffect], terminalTool: "submit_x" },
+        model,
+      ).run("t"),
+    );
+    const uses = new Set<string>();
+    const answered = new Set<string>();
+    for (const m of result.messages) {
+      if (typeof m.content === "string") continue;
+      for (const b of m.content) {
+        if (b.type === "tool_use") uses.add(b.id);
+        if (b.type === "tool_result") answered.add(b.tool_use_id);
+      }
+    }
+    expect(uses.size).toBe(2);
+    expect([...uses].every((id) => answered.has(id)), "每个 tool_use 都得有回执").toBe(true);
+  });
+
+  it("未声明 terminalTool 时同名工具照常执行——这个机制不得误伤普通工具面", async () => {
+    let executed = 0;
+    const normal = makeTool({
+      name: "submit_x",
+      execute: async () => {
+        executed += 1;
+        return { content: "ran" };
+      },
+    });
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("tu_1", "submit_x", {})], "tool_use"),
+      fakeMessage([textBlock("done")], "end_turn"),
+    ]);
+    await collect(new AgentLoop({ ...baseConfig, tools: [normal] }, model).run("t"));
+    expect(executed).toBe(1);
+    expect(model.requests).toHaveLength(2);
+  });
+
+  it("请求体带上 tool_choice：强制交付这件事必须真的发到 wire 上", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("tu_1", "submit_x", {})], "tool_use"),
+    ]);
+    await collect(
+      new AgentLoop(
+        {
+          ...baseConfig,
+          tools: [deliverTool],
+          terminalTool: "submit_x",
+          toolChoice: { type: "tool", name: "submit_x" },
+        },
+        model,
+      ).run("t"),
+    );
+    expect(model.requests[0]!.toolChoice).toEqual({ type: "tool", name: "submit_x" });
+  });
+});
+
+describe("目标级闭环：共享预算 + 结构化完成门", () => {
+  it("harness 自身意外异常也必须以 done(error) 关队列，不能让宿主永久挂起", async () => {
+    const brokenModel: ModelClient = {
+      // 故意破坏 ModelTurn 内部形状，模拟 client 适配器的实现缺陷而非正常 API 错误。
+      send: async () => ({ message: undefined, stopReason: "end_turn", usage: undefined } as never),
+    };
+    const { events, result } = await collect(
+      new AgentLoop({ ...baseConfig, tools: [] }, brokenModel).run("触发意外异常"),
+    );
+    expect(events.at(-1)?.type).toBe("done");
+    expect(result.stopReason).toBe("error");
+    expect(result.error).toBeInstanceOf(Error);
+  });
+
+  it("同一个 AgentLoop 的 continuation 共享总轮次预算，不得每段清零", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([textBlock("第一段")], "end_turn"),
+      fakeMessage([textBlock("第二段")], "end_turn"),
+      // 不应被消费：总预算已经用完
+      fakeMessage([textBlock("第三段")], "end_turn"),
+    ]);
+    const budget = createRunBudget({ maxTurns: 2 });
+    const loop = new AgentLoop({ ...baseConfig, tools: [], runBudget: budget }, model);
+
+    const first = await collect(loop.run("开始"));
+    const second = await collect(loop.runContinuation(first.result.messages, "继续"));
+    const third = await collect(loop.runContinuation(second.result.messages, "再继续"));
+
+    expect(first.result.stopReason).toBe("completed");
+    expect(second.result.stopReason).toBe("completed");
+    expect(third.result.stopReason).toBe("budget_exhausted");
+    expect(model.requests).toHaveLength(2);
+    expect(budget.usedTurns).toBe(2);
+  });
+
+  it("并行 AgentLoop 对共享总轮次先预占，maxTurns=1 不得同时发出两次请求", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([textBlock("唯一允许的请求")], "end_turn"),
+      fakeMessage([textBlock("不应被消费")], "end_turn"),
+    ]);
+    const budget = createRunBudget({ maxTurns: 1 });
+    const cfg = { ...baseConfig, tools: [], runBudget: budget };
+    const [a, b] = await Promise.all([
+      collect(new AgentLoop(cfg, model).run("A")),
+      collect(new AgentLoop(cfg, model).run("B")),
+    ]);
+
+    expect([a.result.stopReason, b.result.stopReason].sort()).toEqual([
+      "budget_exhausted",
+      "completed",
+    ]);
+    expect(model.requests).toHaveLength(1);
+    expect(budget.usedTurns).toBe(1);
+  });
+
+  it("并行 AgentLoop 在显式 token 总账下串行记账，不得基于旧余额同时起跑", async () => {
+    const model = new FakeModelClient([
+      fakeMessage(
+        [textBlock("唯一允许的请求")],
+        "end_turn",
+        { input_tokens: 100, output_tokens: 50 },
+      ),
+      fakeMessage([textBlock("不应被消费")], "end_turn"),
+    ]);
+    const budget = createRunBudget({ maxTokens: 150 });
+    const cfg = { ...baseConfig, tools: [], runBudget: budget };
+    const [a, b] = await Promise.all([
+      collect(new AgentLoop(cfg, model).run("A")),
+      collect(new AgentLoop(cfg, model).run("B")),
+    ]);
+
+    expect([a.result.stopReason, b.result.stopReason].sort()).toEqual([
+      "budget_exhausted",
+      "completed",
+    ]);
+    expect(model.requests).toHaveLength(1);
+    expect(budget.usedTokens).toBe(150);
+    expect(budget.usedTurns).toBe(1);
+  });
+
+  it("maxTokensBudget 在 continuation 中仍是整个 run 的预算（修前会重新起算）", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([textBlock("第一段")], "end_turn", { input_tokens: 100, output_tokens: 50 }),
+      fakeMessage([textBlock("不应执行")], "end_turn"),
+    ]);
+    const loop = new AgentLoop(
+      { ...baseConfig, tools: [], maxTokensBudget: 150 },
+      model,
+    );
+    const first = await collect(loop.run("开始"));
+    const second = await collect(loop.runContinuation(first.result.messages, "继续"));
+    expect(second.result.stopReason).toBe("budget_exhausted");
+    expect(model.requests).toHaveLength(1);
+  });
+
+  it("end_turn 不再冒充完成：先提醒使用 ask_user/finish_task，再以结构化 blocked 收尾", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([textBlock("请告诉我你所在的城市")], "end_turn"),
+      fakeMessage(
+        [
+          toolUseBlock("tu_finish", FINISH_TASK_TOOL_NAME, {
+            status: "blocked",
+            summary: "缺少查询天气所需的城市",
+            artifacts: [],
+            verification: [],
+            assumptions: [],
+            blockers: ["委托方尚未提供城市"],
+          }),
+        ],
+        "tool_use",
+      ),
+    ]);
+    const cfg = withTaskCompletion({ ...baseConfig, tools: [] }, { progressExtensionTurns: 0 });
+    const { events, result } = await collect(new AgentLoop(cfg, model).run("今天天气怎么样"));
+
+    expect(result.stopReason).toBe("blocked");
+    expect(result.completion?.summary).toContain("城市");
+    expect(model.requests).toHaveLength(2);
+    expect(JSON.stringify(model.requests[1]!.messages.at(-1)!.content)).toContain("ask_user");
+    expect(events.some((e) => e.type === "recovery_decision" && e.action === "request_completion")).toBe(true);
+  });
+
+  it("兼容端点无视强制 tool_choice 时最多再给一轮，且不得执行其它工具", async () => {
+    let probeCalls = 0;
+    const probe = makeTool({
+      name: "probe",
+      execute: async () => {
+        probeCalls += 1;
+        return { content: "不应执行" };
+      },
+    });
+    const model = new FakeModelClient([
+      fakeMessage([textBlock("文字收尾 1")], "end_turn"),
+      fakeMessage([textBlock("文字收尾 2")], "end_turn"),
+      // 第三轮已被宿主限定为 finish_task；兼容端点故意无视 tool_choice。
+      fakeMessage([toolUseBlock("ignored", "probe", {})], "tool_use"),
+      fakeMessage([textBlock("不应再请求")], "end_turn"),
+    ]);
+    const cfg = withTaskCompletion({ ...baseConfig, tools: [probe] }, { progressExtensionTurns: 0 });
+    const { result } = await collect(new AgentLoop(cfg, model).run("任务"));
+
+    expect(result.stopReason).toBe("incomplete");
+    expect(model.requests).toHaveLength(3);
+    expect(model.requests[2]!.toolChoice).toEqual({ type: "tool", name: FINISH_TASK_TOOL_NAME });
+    expect(probeCalls).toBe(0);
+  });
+
+  it("finish_task 入参无效时不许收尾：回 is_error 后给模型一次修正机会", async () => {
+    const model = new FakeModelClient([
+      fakeMessage(
+        [toolUseBlock("bad", FINISH_TASK_TOOL_NAME, { status: "completed", summary: "" })],
+        "tool_use",
+      ),
+      fakeMessage(
+        [
+          toolUseBlock("good", FINISH_TASK_TOOL_NAME, {
+            status: "completed",
+            summary: "交付完成",
+            artifacts: ["out.txt"],
+            verification: ["tests passed"],
+            assumptions: [],
+            blockers: [],
+          }),
+        ],
+        "tool_use",
+      ),
+    ]);
+    const cfg = withTaskCompletion({ ...baseConfig, tools: [] }, { progressExtensionTurns: 0 });
+    const { events, result } = await collect(new AgentLoop(cfg, model).run("做任务"));
+
+    expect(result.stopReason).toBe("completed");
+    const invalid = events.find(
+      (e) => e.type === "tool_result" && e.toolUseId === "bad",
+    );
+    expect(invalid?.type === "tool_result" && invalid.result.isError).toBe(true);
+    expect(model.requests).toHaveLength(2);
+  });
+
+  it("执行轮次用尽但仍有新证据 → 同上下文追加一小段，而不是盲目整段提额", async () => {
+    const probe = makeTool({
+      name: "probe",
+      execute: async (input) => ({ content: `evidence:${JSON.stringify(input)}` }),
+    });
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("t1", "probe", { step: 1 })], "tool_use"),
+      fakeMessage([toolUseBlock("t2", "probe", { step: 2 })], "tool_use"),
+      fakeMessage(
+        [
+          toolUseBlock("done", FINISH_TASK_TOOL_NAME, {
+            status: "completed",
+            summary: "两步取证完成",
+            artifacts: [],
+            verification: ["step 1", "step 2"],
+            assumptions: [],
+            blockers: [],
+          }),
+        ],
+        "tool_use",
+      ),
+    ]);
+    const cfg = withTaskCompletion(
+      { ...baseConfig, tools: [probe], maxTurns: 2 },
+      { progressExtensionTurns: 2 },
+    );
+    const { events, result } = await collect(new AgentLoop(cfg, model).run("长任务"));
+
+    expect(result.stopReason).toBe("completed");
+    expect(model.requests).toHaveLength(3);
+    expect(events.some((e) => e.type === "recovery_decision" && e.action === "continue_with_context")).toBe(true);
+  });
+});
+
+describe("目标级闭环：停滞检测与恢复路由", () => {
+  it("同工具+同入参+同结果连续重复：先要求换策略，再强制结构化收口", async () => {
+    let calls = 0;
+    const probe = makeTool({
+      name: "probe",
+      execute: async () => {
+        calls += 1;
+        return { content: "still locked" };
+      },
+    });
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("t1", "probe", { target: "A" })], "tool_use"),
+      fakeMessage([toolUseBlock("t2", "probe", { target: "A" })], "tool_use"),
+      fakeMessage([toolUseBlock("t3", "probe", { target: "A" })], "tool_use"),
+      fakeMessage(
+        [
+          toolUseBlock("stop", FINISH_TASK_TOOL_NAME, {
+            status: "blocked",
+            summary: "目标持续被锁定",
+            artifacts: [],
+            verification: [],
+            assumptions: [],
+            blockers: ["probe 连续返回 still locked"],
+          }),
+        ],
+        "tool_use",
+      ),
+    ]);
+    const cfg = withTaskCompletion(
+      { ...baseConfig, tools: [probe], maxTurns: 10 },
+      { stagnationWindow: 2, maxStagnationRecoveries: 1, progressExtensionTurns: 0 },
+    );
+    const { events, result } = await collect(new AgentLoop(cfg, model).run("处理 A"));
+
+    expect(result.stopReason).toBe("blocked");
+    expect(calls).toBe(3);
+    const decisions = events.filter((e) => e.type === "recovery_decision");
+    expect(decisions.some((e) => e.type === "recovery_decision" && e.action === "change_strategy")).toBe(true);
+    expect(decisions.some((e) => e.type === "recovery_decision" && e.action === "force_completion")).toBe(true);
+    expect(model.requests.at(-1)!.toolChoice).toEqual({ type: "tool", name: FINISH_TASK_TOOL_NAME });
+  });
+
+  it("输入或结果持续变化不算停滞", async () => {
+    const probe = makeTool({
+      name: "probe",
+      execute: async (input) => ({ content: `changed:${JSON.stringify(input)}` }),
+    });
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("t1", "probe", { n: 1 })], "tool_use"),
+      fakeMessage([toolUseBlock("t2", "probe", { n: 2 })], "tool_use"),
+      fakeMessage(
+        [
+          toolUseBlock("done", FINISH_TASK_TOOL_NAME, {
+            status: "completed",
+            summary: "完成",
+            artifacts: [],
+            verification: [],
+            assumptions: [],
+            blockers: [],
+          }),
+        ],
+        "tool_use",
+      ),
+    ]);
+    const cfg = withTaskCompletion(
+      { ...baseConfig, tools: [probe] },
+      { stagnationWindow: 2, progressExtensionTurns: 0 },
+    );
+    const { events, result } = await collect(new AgentLoop(cfg, model).run("处理"));
+    expect(result.stopReason).toBe("completed");
+    expect(events.some((e) => e.type === "recovery_decision" && e.reason === "stagnation")).toBe(false);
   });
 });

@@ -20,10 +20,23 @@ import { join, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { mkdtemp, rm, readFile, readdir, writeFile, mkdir } from "node:fs/promises";
 import { readFileSync, existsSync } from "node:fs";
+import { request as httpRequest } from "node:http";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createUiServer, contentTypeOf, planGateStopReason, revealCommand, type UiServerHandle } from "../ui/server.js";
+import {
+  createUiServer,
+  contentTypeOf,
+  localPathTarget,
+  planGateStopReason,
+  revealCommand,
+  runOutcomeForStopReason,
+  type UiServerHandle,
+} from "../ui/server.js";
 import { resolvePlannerMaxTurns } from "../src/planner.js";
+import { PLAN_TOOL_NAME } from "../src/planner.js";
+import { REQUIREMENTS_TOOL_NAME } from "../src/clarifier.js";
+import { FINISH_TASK_TOOL_NAME } from "../src/task-completion.js";
+import { VERDICT_TOOL_NAME } from "../src/verifier.js";
 import { PACKS } from "../src/presets.js";
 import { DEFAULT_HISTORY_KEEP, historyKeepCount, historyRootPath } from "../ui/history.js";
 import {
@@ -235,6 +248,29 @@ describe("ui-server", () => {
       await handle.close();
       handle = undefined;
     }
+  });
+
+  it("静态图标库只读本地固定文件，CSS 与字体 MIME 正确", async () => {
+    handle = createUiServer({
+      modelClient: new FakeModelClient([]),
+      tools: [],
+      workdir: process.cwd(),
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+
+    const css = await fetch(`${base}/vendor/phosphor/style.css`);
+    expect(css.status).toBe(200);
+    expect(css.headers.get("content-type")).toContain("text/css");
+    expect(await css.text()).toContain('font-family: "Phosphor"');
+
+    const font = await fetch(`${base}/vendor/phosphor/Phosphor.woff2`);
+    expect(font.status).toBe(200);
+    expect(font.headers.get("content-type")).toContain("font/woff2");
+    expect((await font.arrayBuffer()).byteLength).toBeGreaterThan(1000);
+
+    const hiddenDependency = await fetch(`${base}/vendor/phosphor/selection.json`);
+    expect(hiddenDependency.status).toBe(404);
   });
 
   // ---- a. verify=false run → 完整事件序列，seq 单调递增 ----
@@ -2450,6 +2486,33 @@ describe("产物取件：圈禁比功能更要紧", () => {
     const res = await get("blob.weird");
     expect(res.headers.get("content-type")).toContain("application/octet-stream");
   });
+
+  it("正文路径探测只确认工作目录内真实存在的文件与目录", async () => {
+    const res = await fetch(`${base}/api/runs/${runId}/paths/inspect`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        paths: ["report.html", "report.html:12:4", "sub/", "nope.txt", "../outside.txt"],
+      }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    const byInput = new Map(body.paths.map((item: any) => [item.input, item]));
+    expect(byInput.get("report.html")).toMatchObject({ exists: true, path: "report.html", kind: "file" });
+    expect(byInput.get("report.html:12:4")).toMatchObject({ exists: true, path: "report.html", kind: "file" });
+    expect(byInput.get("sub/")).toMatchObject({ exists: true, path: "sub", kind: "directory" });
+    expect(byInput.get("nope.txt")).toEqual({ input: "nope.txt", exists: false });
+    expect(byInput.get("../outside.txt")).toEqual({ input: "../outside.txt", exists: false });
+  });
+
+  it("正文路径探测有批量上限，不能把接口变成目录扫描器", async () => {
+    const res = await fetch(`${base}/api/runs/${runId}/paths/inspect`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ paths: Array.from({ length: 65 }, (_, i) => `f${i}.txt`) }),
+    });
+    expect(res.status).toBe(400);
+  });
 });
 
 describe("在文件夹中显示：从网页请求启动本机进程，圈禁只能更严", () => {
@@ -2518,6 +2581,16 @@ describe("在文件夹中显示：从网页请求启动本机进程，圈禁只�
     expect(cmd.args.some((a) => a.includes("a b & c.txt"))).toBe(true);
   });
 
+  it("目录与文件的系统动作不同：目录直接打开，文件定位到所在文件夹", () => {
+    const target = resolve("some folder");
+    const file = revealCommand(target, "file");
+    const directory = revealCommand(target, "directory");
+    if (!file || !directory) return;
+    expect(directory.args).not.toEqual(file.args);
+    expect(directory.args.some((arg) => arg.includes(target))).toBe(true);
+    expect(localPathTarget("src/main.ts:12:4")).toBe("src/main.ts");
+  });
+
   it("contentTypeOf：源码按纯文本，未知按 octet-stream", () => {
     expect(contentTypeOf("x.html")).toContain("text/html");
     expect(contentTypeOf("x.ts")).toContain("text/plain");
@@ -2557,12 +2630,14 @@ describe("凭据装载：npm 脚本必须自己读 .env", () => {
 
   it("模板里所有敏感字段都是空值——不能提交一个填着真 key 的样例", () => {
     const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-    const text = readFileSync(join(root, ".env.example"), "utf-8");
-    for (const line of text.split(/\r?\n/)) {
-      if (line.startsWith("#") || !line.includes("=")) continue;
-      const [k, v] = line.split("=", 2);
-      if (/KEY|TOKEN|SECRET/i.test(k!)) {
-        expect(v!.trim(), `${k} 在模板里有值`).toBe("");
+    for (const name of [".env.example", ".env.production.example"]) {
+      const text = readFileSync(join(root, name), "utf-8");
+      for (const line of text.split(/\r?\n/)) {
+        if (line.startsWith("#") || !line.includes("=")) continue;
+        const [k, v] = line.split("=", 2);
+        if (/(?:API_KEY|ACCESS_TOKEN|SECRET|PASSWORD)$/i.test(k!)) {
+          expect(v!.trim(), `${name}: ${k} 在模板里有值`).toBe("");
+        }
       }
     }
   });
@@ -2733,10 +2808,15 @@ describe("B2 · 运行历史落盘", () => {
       body: JSON.stringify(body),
     });
 
-  it("重启后运行仍在：列表、事件重放、正文都来自档案，且照实说不能续跑", async () => {
+  it("重启后从检查点派生新 run：父档案不变、正史与共享预算继续", async () => {
     dir = await mkdtemp(join(tmpdir(), "history-"));
     await boot({
-      modelClient: new FakeModelClient([fakeMessage([textBlock("完事了")], "end_turn")]),
+      modelClient: new FakeModelClient([
+        fakeMessage([textBlock("第一段记住 alpha-7")], "end_turn", {
+          input_tokens: 90,
+          output_tokens: 10,
+        }),
+      ]),
       tools: [autoTool("noop")],
       workdir: process.cwd(),
       history: dir,
@@ -2747,7 +2827,13 @@ describe("B2 · 运行历史落盘", () => {
     await handle!.close();
     handle = undefined;
 
-    await boot({ modelClient: new FakeModelClient([]), tools: [], workdir: process.cwd(), history: dir });
+    const resumedModel = new FakeModelClient([
+      fakeMessage([textBlock("第二段仍记得 alpha-7")], "end_turn", {
+        input_tokens: 40,
+        output_tokens: 10,
+      }),
+    ]);
+    await boot({ modelClient: resumedModel, tools: [autoTool("noop")], workdir: process.cwd(), history: dir });
     const list = (await (await fetch(`${base}/api/runs`)).json()) as any[];
     const restored = list.find((r) => r.runId === runId);
     expect(restored, "重启后列表里没有这个 run").toBeDefined();
@@ -2755,8 +2841,8 @@ describe("B2 · 运行历史落盘", () => {
     expect(restored.status).toBe("done");
     expect(restored.stopReason).toBe("completed");
     expect(restored.task).toBe("归档我");
-    // 判据④：归档只能回看，服务端与界面都不许骗人
-    expect(restored.canContinue).toBe(false);
+    expect(restored.canContinue).toBe(true);
+    expect(restored.continuationMode).toBe("fork");
 
     // 事件重放逐条等价——界面的一切都从重放长出来，这是档案的硬契约（V-05 的延伸）
     const after = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
@@ -2765,9 +2851,142 @@ describe("B2 · 运行历史落盘", () => {
     const transcript = (await (await fetch(`${base}/api/runs/${runId}/transcript`)).json()) as any;
     expect(transcript.segments.length).toBeGreaterThan(0);
 
-    const follow = await post(`/api/runs/${runId}/messages`, { text: "再来一轮" });
-    expect(follow.status).toBe(409);
-    expect(((await follow.json()) as any).error).toContain("归档");
+    const follow = await post(`/api/runs/${runId}/messages`, { text: "暗号是什么？" });
+    expect(follow.status).toBe(200);
+    const fork = (await follow.json()) as any;
+    expect(fork.runId).not.toBe(runId);
+    expect(fork.continuedFrom).toBe(runId);
+    expect(fork.continuationMode).toBe("fork");
+    await waitForDone(base, fork.runId);
+
+    // 真正送到模型的是父运行的完整正史 + 新反馈，不是只拿摘要重新开局。
+    const request = resumedModel.requests[0]!;
+    const flattened = JSON.stringify(request.messages);
+    expect(flattened).toContain("alpha-7");
+    expect(flattened).toContain("暗号是什么？");
+
+    const childEvents = (await readSSEAll(await fetch(`${base}/api/runs/${fork.runId}/events`))) as any[];
+    const lineage = childEvents.find((item) => item.event.type === "run_forked");
+    expect(lineage?.event.parentRunId).toBe(runId);
+    const childDone = childEvents.find((item) => item.source === "main" && item.event.type === "done");
+    expect(childDone.event.runBudget.usedTurns).toBe(2);
+    expect(childDone.event.runBudget.usedTokens).toBe(150);
+
+    const afterList = (await (await fetch(`${base}/api/runs`)).json()) as any[];
+    const parent = afterList.find((item) => item.runId === runId);
+    const child = afterList.find((item) => item.runId === fork.runId);
+    expect(parent.archived).toBe(true);
+    expect(parent.status).toBe("done");
+    expect(child.continuedFrom).toBe(runId);
+    expect(child.rootRunId).toBe(runId);
+
+    // 派生不会往父档案追加事件；旧运行保持不可变、可独立审计。
+    const parentAfter = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+    expect(parentAfter).toEqual(before);
+  });
+
+  it("重启不能绕过当前宿主更严格的总预算：列表提前阻断，模型零调用", async () => {
+    dir = await mkdtemp(join(tmpdir(), "history-budget-"));
+    await boot({
+      modelClient: new FakeModelClient([fakeMessage([textBlock("第一段完成")], "end_turn")]),
+      tools: [],
+      workdir: process.cwd(),
+      history: dir,
+    });
+    const { runId } = (await (await post("/api/runs", { task: "预算边界", verify: false })).json()) as { runId: string };
+    await waitForDone(base, runId);
+    await handle!.close();
+    handle = undefined;
+
+    const resumedModel = new FakeModelClient([fakeMessage([textBlock("不应被调用")], "end_turn")]);
+    process.env.AGENT_TOTAL_MAX_TURNS = "1";
+    try {
+      await boot({ modelClient: resumedModel, tools: [], workdir: process.cwd(), history: dir });
+      const restored = ((await (await fetch(`${base}/api/runs`)).json()) as any[])
+        .find((item) => item.runId === runId);
+      expect(restored.canContinue).toBe(false);
+      expect(restored.continuationMode).toBeNull();
+      expect(restored.continuationBlockReason).toContain("总轮次预算已用尽");
+
+      const response = await post(`/api/runs/${runId}/messages`, { text: "再跑一轮" });
+      expect(response.status).toBe(409);
+      expect(((await response.json()) as any).error).toContain("总轮次预算已用尽");
+      expect(resumedModel.requests).toHaveLength(0);
+    } finally {
+      delete process.env.AGENT_TOTAL_MAX_TURNS;
+    }
+  });
+
+  it("重启不能移除检查点里的旧上限；子 run 用尽后 live 入口也提前关闭", async () => {
+    dir = await mkdtemp(join(tmpdir(), "history-old-budget-"));
+    process.env.AGENT_TOTAL_MAX_TURNS = "2";
+    try {
+      await boot({
+        modelClient: new FakeModelClient([fakeMessage([textBlock("第一段")], "end_turn")]),
+        tools: [],
+        workdir: process.cwd(),
+        history: dir,
+      });
+      const { runId } = (await (await post("/api/runs", { task: "旧上限", verify: false })).json()) as { runId: string };
+      await waitForDone(base, runId);
+      await handle!.close();
+      handle = undefined;
+      delete process.env.AGENT_TOTAL_MAX_TURNS;
+
+      const resumedModel = new FakeModelClient([
+        fakeMessage([textBlock("第二段，正好耗尽旧上限")], "end_turn"),
+      ]);
+      await boot({ modelClient: resumedModel, tools: [], workdir: process.cwd(), history: dir });
+      const follow = await post(`/api/runs/${runId}/messages`, { text: "继续" });
+      const childId = ((await follow.json()) as any).runId as string;
+      await waitForDone(base, childId);
+
+      const events = (await readSSEAll(await fetch(`${base}/api/runs/${childId}/events`))) as any[];
+      const done = events.find((item) => item.source === "main" && item.event.type === "done");
+      expect(done.event.runBudget).toMatchObject({ maxTurns: 2, usedTurns: 2 });
+
+      const child = ((await (await fetch(`${base}/api/runs`)).json()) as any[])
+        .find((item) => item.runId === childId);
+      expect(child.canContinue).toBe(false);
+      expect(child.continuationBlockReason).toContain("总轮次预算已用尽");
+
+      const blocked = await post(`/api/runs/${childId}/messages`, { text: "第三段" });
+      expect(blocked.status).toBe(409);
+      expect(((await blocked.json()) as any).error).toContain("总轮次预算已用尽");
+      expect(resumedModel.requests).toHaveLength(1);
+    } finally {
+      delete process.env.AGENT_TOTAL_MAX_TURNS;
+    }
+  });
+
+  it("归档工作目录不在当前白名单时拒绝派生，不把旧权限带进新宿主", async () => {
+    dir = await mkdtemp(join(tmpdir(), "history-workdir-"));
+    const oldWorkdir = join(dir, "old-workdir");
+    const currentWorkdir = join(dir, "current-workdir");
+    await mkdir(oldWorkdir);
+    await mkdir(currentWorkdir);
+    await boot({
+      modelClient: new FakeModelClient([fakeMessage([textBlock("完成")], "end_turn")]),
+      tools: [],
+      workdir: oldWorkdir,
+      history: dir,
+    });
+    const { runId } = (await (await post("/api/runs", { task: "目录边界", verify: false })).json()) as { runId: string };
+    await waitForDone(base, runId);
+    await handle!.close();
+    handle = undefined;
+
+    const resumedModel = new FakeModelClient([fakeMessage([textBlock("不应被调用")], "end_turn")]);
+    await boot({ modelClient: resumedModel, tools: [], workdir: currentWorkdir, history: dir });
+    const restored = ((await (await fetch(`${base}/api/runs`)).json()) as any[])
+      .find((item) => item.runId === runId);
+    expect(restored.canContinue).toBe(false);
+    expect(restored.continuationBlockReason).toContain("不在当前宿主白名单");
+
+    const response = await post(`/api/runs/${runId}/messages`, { text: "继续" });
+    expect(response.status).toBe(409);
+    expect(((await response.json()) as any).error).toContain("不在当前宿主白名单");
+    expect(resumedModel.requests).toHaveLength(0);
   });
 
   it("宿主收尾时在飞的 run 也归档：审批过期宣告与 run_end(closed) 都在档案里", async () => {
@@ -2816,6 +3035,7 @@ describe("B2 · 运行历史落盘", () => {
     const r = ((await (await fetch(`${base}/api/runs`)).json()) as any[]).find((x) => x.runId === "crash-run");
     expect(r.status).toBe("done");
     expect(r.stopReason).toBe("error");
+    expect(r.canContinue).toBe(false);
     // 事件流缺 run_end 时合成一条，否则重放出来的界面会永远"运行中"
     const events = (await readSSEAll(await fetch(`${base}/api/runs/crash-run/events`))) as any[];
     expect(events.at(-1)!.event.type).toBe("run_end");
@@ -2901,5 +3121,655 @@ describe("B2 · 运行历史落盘", () => {
     expect(historyKeepCount({ AGENT_RUN_HISTORY_KEEP: "7" })).toBe(7);
     expect(historyKeepCount({ AGENT_RUN_HISTORY_KEEP: "abc" })).toBe(DEFAULT_HISTORY_KEEP);
     expect(historyKeepCount({ AGENT_RUN_HISTORY_KEEP: "0" })).toBe(DEFAULT_HISTORY_KEEP);
+  });
+});
+
+
+/**
+ * §5.2 需求澄清的宿主接线（第零节那条规律：harness 加能力必须同提交接宿主）。
+ *
+ * 锁的是**阻塞式交互的三个出口**：答、跳过、收尾过期。任何一个不通，
+ * 执行协程就会永远吊在 ask_user 的 execute 里——V-01 那类失效的原样重演。
+ */
+describe("§5.2 需求澄清：Web 宿主接线", () => {
+  let handle: UiServerHandle | undefined;
+  let port = 0;
+  let base = "";
+
+  afterEach(async () => {
+    await handle?.close();
+    handle = undefined;
+  });
+
+  /** 委托方实测场景：一句「做一版 Desktop UI」带出三个正交未知（决定 6） */
+  const QUESTIONS = {
+    questions: [
+      { question: "桌面端用哪个框架？", options: ["Electron", "Tauri"], fallback: "默认 Tauri" },
+      { question: "UI 风格？", options: ["沿用现有暗色系", "重做一套"], fallback: "默认沿用" },
+    ],
+  };
+
+  /** 模型先问一次，拿到答复后收笔 */
+  function askingScript() {
+    return [
+      fakeMessage([toolUseBlock("tu_1", "ask_user", QUESTIONS)], "tool_use"),
+      fakeMessage([textBlock("知道了，照办")], "end_turn"),
+    ];
+  }
+
+  async function start(body: Record<string, unknown>) {
+    handle = createUiServer({
+      modelClient: new FakeModelClient(askingScript()),
+      tools: [autoTool("noop")],
+      workdir: process.cwd(),
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    })).json() as { runId: string };
+    return runId;
+  }
+
+  async function waitForQuestion(runId: string): Promise<any> {
+    for (let i = 0; i < 150; i++) {
+      const list = await (await fetch(`${base}/api/runs`)).json() as any[];
+      const r = list.find((x) => x.runId === runId);
+      if (r?.awaitingQuestion) return r.awaitingQuestion;
+      if (r?.status === "done") throw new Error("run 已收尾但从未挂起提问");
+      await new Promise((res) => setTimeout(res, 20));
+    }
+    throw new Error("等待提问超时");
+  }
+
+  it("默认关：没勾选时 ask_user 根本不在工具面上（决定 1）", async () => {
+    const runId = await start({ task: "做一版 Desktop UI" });
+    await waitForDone(base, runId);
+    const events = await readSSESnapshot(base, runId);
+    expect(events.some((e: any) => e.event.type === "user_question_request")).toBe(false);
+  });
+
+  it("显式开启 → 一次挂起一组问题，问题与候选进事件流（刷新后仍看得到）", async () => {
+    const runId = await start({ task: "做一版 Desktop UI", askUser: true });
+    const pending = await waitForQuestion(runId);
+    expect(pending.questions, "一次打断带一组问题，不是一个").toHaveLength(2);
+    expect(pending.questions[0].question).toContain("框架");
+    expect(pending.questions[0].options).toEqual(["Electron", "Tauri"]);
+    expect(pending.questions[1].fallback).toBe("默认沿用");
+
+    const events = await readSSESnapshot(base, runId);
+    const req = events.find((e: any) => e.event.type === "user_question_request");
+    expect(req, "提问必须进事件流——重连重放要能复原").toBeDefined();
+  });
+
+  it("逐题答复回到模型手里，run 正常收尾；漏答那题带上它自己的默认", async () => {
+    const runId = await start({ task: "做一版 Desktop UI", askUser: true });
+    await waitForQuestion(runId);
+    const res = await fetch(`${base}/api/runs/${runId}/answer`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ answers: ["Tauri", null] }),
+    });
+    expect(res.status).toBe(200);
+    await waitForDone(base, runId);
+
+    const events = await readSSESnapshot(base, runId);
+    const resolved = events.find((e: any) => e.event.type === "user_question_resolved") as any;
+    expect(resolved.event.answers).toEqual(["Tauri", null]);
+    expect(resolved.event.skipped).toBe(false);
+    const toolResult = events.find(
+      (e: any) => e.event.type === "tool_result" && String(e.event.result?.content ?? "").includes("Tauri"),
+    );
+    expect(toolResult, "答复必须回到模型的 tool_result").toBeDefined();
+    // 没答的那题不含糊过去：照实说并带上模型自己写的默认
+    expect(String((toolResult as any).event.result.content)).toContain("默认沿用");
+  });
+
+  it("答复条数与问题数不符 → 400（对不齐的回填比没有更危险）", async () => {
+    const runId = await start({ task: "做一版 Desktop UI", askUser: true });
+    await waitForQuestion(runId);
+    const res = await fetch(`${base}/api/runs/${runId}/answer`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ answers: ["Tauri"] }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('「都让它自己定」照实记为 skipped，而不是画成"没人答"（V-04）', async () => {
+    const runId = await start({ task: "做一版 Desktop UI", askUser: true });
+    await waitForQuestion(runId);
+    const res = await fetch(`${base}/api/runs/${runId}/answer`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ skip: true }),
+    });
+    expect(res.status).toBe(200);
+    await waitForDone(base, runId);
+
+    const events = await readSSESnapshot(base, runId);
+    const resolved = events.find((e: any) => e.event.type === "user_question_resolved") as any;
+    expect(resolved.event.skipped, "主动跳过与超时是两件事").toBe(true);
+    expect(resolved.event.answers).toBeNull();
+  });
+
+  it("收尾时宣告过期并解除挂起——否则执行协程永远吊在 execute 里（V-01）", async () => {
+    const runId = await start({ task: "做一版 Desktop UI", askUser: true });
+    await waitForQuestion(runId);
+    // 不回答，直接停止：这是最容易把 run 挂死的路径
+    await fetch(`${base}/api/runs/${runId}/stop`, { method: "POST" });
+    await waitForDone(base, runId);
+
+    const events = await readSSESnapshot(base, runId);
+    const expired = events.filter((e: any) => e.event.type === "user_question_expired");
+    expect(expired.length, "过期必须进事件流，且只发一次").toBe(1);
+    // cause 要照实说是"委托方停止的"。靠 finalizeRun 顺手补会写成 run_finished——
+    // 把委托方的决定说成宿主收尾，V-04 同族
+    expect((expired[0] as any).event.cause).toBe("stopped");
+    const list = await (await fetch(`${base}/api/runs`)).json() as any[];
+    expect(list.find((x) => x.runId === runId)?.awaitingQuestion, "挂起态必须解除").toBeNull();
+  });
+
+  /**
+   * M13 那条变异逃过第一版测试，因为停止路径顺手把它盖住了。
+   * 宿主关停是**唯一**不经过停止按钮、却仍可能留下挂起提问的路径——
+   * 收尾侧那道闸只有在这里才看得见。
+   */
+  it("宿主关停时也宣告过期，cause=run_finished（收尾侧那道闸的唯一现场）", async () => {
+    const runId = await start({ task: "做一版 Desktop UI", askUser: true });
+    await waitForQuestion(runId);
+
+    // 挂着一条 live SSE：关停时发出的帧只能在这里收——HTTP 一断就查不到了
+    const res = await fetch(`${base}/api/runs/${runId}/events`);
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    let seen = "";
+    const pump = (async () => {
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          seen += decoder.decode(value, { stream: true });
+        }
+      } catch { /* 关停时连接被掐断，正常 */ }
+    })();
+
+    await handle!.close();
+    handle = undefined;
+    await pump;
+
+    expect(seen, "关停必须宣告过期，否则执行协程永远吊着").toContain("user_question_expired");
+    expect(seen, "关停不是委托方按的停止，cause 要照实说").toContain("run_finished");
+  });
+
+  it("没有挂起提问时应答 409——「我到底答没答」必须有确定答案（R-01 口径）", async () => {
+    const runId = await start({ task: "做一版 Desktop UI", askUser: true });
+    await waitForQuestion(runId);
+    await fetch(`${base}/api/runs/${runId}/answer`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ answers: ["Tauri", "沿用现有暗色系"] }),
+    });
+    const dup = await fetch(`${base}/api/runs/${runId}/answer`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ answers: ["Electron", "重做一套"] }),
+    });
+    expect(dup.status).toBe(409);
+  });
+
+  it("一题都没答被拒 400——要么给内容，要么显式 skip（不静默转换）", async () => {
+    const runId = await start({ task: "做一版 Desktop UI", askUser: true });
+    await waitForQuestion(runId);
+    const res = await fetch(`${base}/api/runs/${runId}/answer`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ answers: ["   ", null] }),
+    });
+    expect(res.status).toBe(400);
+  });
+});
+
+describe("目标级闭环：Web 真实宿主接线", () => {
+  let handle: UiServerHandle | undefined;
+  let base = "";
+
+  afterEach(async () => {
+    await handle?.close();
+    handle = undefined;
+  });
+
+  async function boot(model: ModelClient, options: { taskCompletion?: boolean } = {}): Promise<void> {
+    handle = createUiServer({
+      modelClient: model,
+      tools: [autoTool("noop")],
+      workdir: process.cwd(),
+      ...options,
+    });
+    base = baseUrl(await startServer(handle));
+  }
+
+  async function createRun(body: Record<string, unknown>): Promise<string> {
+    const response = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    expect(response.status).toBe(200);
+    return ((await response.json()) as { runId: string }).runId;
+  }
+
+  async function waitQuestion(runId: string, previousId?: string): Promise<any> {
+    for (let i = 0; i < 150; i++) {
+      const list = (await (await fetch(`${base}/api/runs`)).json()) as any[];
+      const pending = list.find((item) => item.runId === runId)?.awaitingQuestion;
+      if (pending && pending.id !== previousId) return pending;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    throw new Error("等待 Web 提问超时");
+  }
+
+  it("run_end 结果映射 fail-closed：只有明确 completed 才能标绿", () => {
+    expect(runOutcomeForStopReason("completed")).toBe("completed");
+    expect(runOutcomeForStopReason("partial")).toBe("partial");
+    expect(runOutcomeForStopReason("blocked")).toBe("blocked");
+    expect(runOutcomeForStopReason("aborted")).toBe("closed");
+    expect(runOutcomeForStopReason("plan_gate_expired")).toBe("closed");
+    expect(runOutcomeForStopReason("plan_rejected")).toBe("rejected");
+    for (const reason of [
+      "incomplete",
+      "stalled",
+      "max_tokens",
+      "max_turns",
+      "budget_exhausted",
+      "refusal",
+      "error",
+      "未来新增但尚未分类的值",
+      undefined,
+    ]) {
+      expect(runOutcomeForStopReason(reason)).toBe("error");
+    }
+  });
+
+  it("end_turn 不能把 Web run 标绿；finish_task 的 partial 与证据原样进入 done/run_end/列表", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([textBlock("看起来做完了")], "end_turn"),
+      fakeMessage([
+        toolUseBlock("finish", FINISH_TASK_TOOL_NAME, {
+          status: "partial",
+          summary: "UI 骨架可运行，但尚未签名打包",
+          artifacts: ["ui/public/app.js"],
+          verification: ["npm test 通过"],
+          assumptions: [],
+          blockers: ["缺少代码签名证书"],
+        }),
+      ], "tool_use"),
+    ]);
+    await boot(model, { taskCompletion: true });
+    const runId = await createRun({ task: "实现 Desktop UI" });
+    await waitForDone(base, runId);
+
+    const events = await readSSESnapshot(base, runId);
+    expect(events.some((item: any) => item.event.type === "recovery_decision")).toBe(true);
+    const done = events.find((item: any) => item.source === "main" && item.event.type === "done") as any;
+    expect(done.event.stopReason).toBe("partial");
+    expect(done.event.completion.blockers).toEqual(["缺少代码签名证书"]);
+    expect(done.event.runBudget.usedTurns).toBe(2);
+    const end = events.find((item: any) => item.event.type === "run_end") as any;
+    expect(end.event.outcome).toBe("partial");
+    const list = (await (await fetch(`${base}/api/runs`)).json()) as any[];
+    expect(list.find((item) => item.runId === runId)?.stopReason).toBe("partial");
+  });
+
+  it("plan 模式先在 Web 挂起成组问题，答复合并进 planner 唯一任务输入", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("ask", "ask_user", {
+        questions: [
+          { question: "桌面框架？", options: ["Tauri", "Electron"], fallback: "Tauri" },
+          { question: "交付深度？", options: ["可运行 MVP", "发布版"], fallback: "可运行 MVP" },
+        ],
+      })], "tool_use"),
+      fakeMessage([toolUseBlock("requirements", REQUIREMENTS_TOOL_NAME, {
+        task: "使用 Tauri 实现可运行 Desktop UI MVP",
+        acceptance: ["能够启动"],
+        assumptions: [],
+      })], "tool_use"),
+      fakeMessage([toolUseBlock("plan", PLAN_TOOL_NAME, {
+        subtasks: [{
+          id: "s1", title: "实现 UI", description: "使用 Tauri 实现 MVP",
+          acceptance: ["能够启动"], dependsOn: [],
+        }],
+      })], "tool_use"),
+      fakeMessage([toolUseBlock("finish", FINISH_TASK_TOOL_NAME, {
+        status: "completed", summary: "MVP 已实现", artifacts: ["src-tauri"],
+        verification: ["能够启动"], assumptions: [], blockers: [],
+      })], "tool_use"),
+      fakeMessage([toolUseBlock("verdict", VERDICT_TOOL_NAME, {
+        passed: true, issues: [], unverified: [], advisory: [], summary: "通过",
+      })], "tool_use"),
+    ]);
+    await boot(model, { taskCompletion: true });
+    const runId = await createRun({
+      task: "给项目开发一版 Desktop UI",
+      mode: "plan",
+      concurrency: 1,
+      askUser: true,
+    });
+    const pending = await waitQuestion(runId);
+    expect(pending.questions).toHaveLength(2);
+    const answer = await fetch(`${base}/api/runs/${runId}/answer`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ answers: ["Tauri", "可运行 MVP"] }),
+    });
+    expect(answer.status).toBe(200);
+    await waitForDone(base, runId);
+
+    expect(JSON.stringify(model.requests[2]!.messages)).toContain("使用 Tauri 实现可运行 Desktop UI MVP");
+    expect(JSON.stringify(model.requests[2]!.messages)).toContain("能够启动");
+    expect(model.requests[2]!.tools.some((tool) => tool.name === "ask_user")).toBe(false);
+    expect(model.requests[2]!.tools.some((tool) => tool.name === FINISH_TASK_TOOL_NAME)).toBe(false);
+    const events = await readSSESnapshot(base, runId);
+    const planResult = events.find((item: any) => item.event.type === "plan_result") as any;
+    expect(planResult.event.clarification.asked).toBe(true);
+  });
+
+  it("并行子任务同时 ask_user 时宿主逐组排队，不覆盖 pendingQuestion", async () => {
+    let askId = 0;
+    const plan = {
+      subtasks: [
+        { id: "s1", title: "A", description: "A", acceptance: [], dependsOn: [] },
+        { id: "s2", title: "B", description: "B", acceptance: [], dependsOn: [] },
+      ],
+    };
+    const adaptive: ModelClient = {
+      async send(req) {
+        const names = new Set(req.tools.map((tool) => tool.name));
+        let message;
+        if (names.has(REQUIREMENTS_TOOL_NAME)) {
+          message = fakeMessage([toolUseBlock("requirements", REQUIREMENTS_TOOL_NAME, {
+            task: "并行任务", acceptance: [], assumptions: [],
+          })], "tool_use");
+        } else if (names.has(PLAN_TOOL_NAME)) {
+          message = fakeMessage([toolUseBlock("plan", PLAN_TOOL_NAME, plan)], "tool_use");
+        } else if (names.has(VERDICT_TOOL_NAME)) {
+          message = fakeMessage([toolUseBlock(`verdict-${askId}`, VERDICT_TOOL_NAME, {
+            passed: true, issues: [], unverified: [], advisory: [], summary: "通过",
+          })], "tool_use");
+        } else if (JSON.stringify(req.messages).includes("委托方答复")) {
+          message = fakeMessage([textBlock("完成")], "end_turn");
+        } else {
+          askId += 1;
+          message = fakeMessage([toolUseBlock(`ask-${askId}`, "ask_user", {
+            questions: [{
+              question: `并行问题 ${askId}？`, options: ["选项 A", "选项 B"], fallback: "选项 A",
+            }],
+          })], "tool_use");
+        }
+        return { message, stopReason: message.stop_reason, usage: message.usage };
+      },
+    };
+    await boot(adaptive);
+    const runId = await createRun({ task: "并行任务", mode: "plan", concurrency: 2, askUser: true });
+
+    const first = await waitQuestion(runId);
+    let events = await readSSESnapshot(base, runId);
+    expect(events.filter((item: any) => item.event.type === "user_question_request")).toHaveLength(1);
+    await fetch(`${base}/api/runs/${runId}/answer`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ answers: ["选项 A"] }),
+    });
+    const second = await waitQuestion(runId, first.id);
+    expect(second.id).not.toBe(first.id);
+    await fetch(`${base}/api/runs/${runId}/answer`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ answers: ["选项 B"] }),
+    });
+    await waitForDone(base, runId);
+    events = await readSSESnapshot(base, runId);
+    expect(events.filter((item: any) => item.event.type === "user_question_request")).toHaveLength(2);
+    expect(events.filter((item: any) => item.event.type === "user_question_resolved")).toHaveLength(2);
+  });
+});
+
+describe("P0 production host boundary", () => {
+  let handle: UiServerHandle | undefined;
+  let base = "";
+
+  afterEach(async () => {
+    await handle?.close();
+    handle = undefined;
+  });
+
+  async function boot(
+    options: Omit<Parameters<typeof createUiServer>[0], "modelClient" | "workdir"> = {},
+    model: ModelClient = new FakeModelClient([
+      fakeMessage([textBlock("done")], "end_turn"),
+      fakeMessage([textBlock("done")], "end_turn"),
+      fakeMessage([textBlock("done")], "end_turn"),
+    ]),
+  ): Promise<void> {
+    handle = createUiServer({
+      modelClient: model,
+      tools: [autoTool("noop")],
+      workdir: process.cwd(),
+      ...options,
+    });
+    base = baseUrl(await startServer(handle));
+  }
+
+  it("拒绝跨源副作用、缺失访问令牌和非 JSON 创建请求", async () => {
+    await boot({ accessToken: "p0-secret" });
+
+    const evil = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer p0-secret",
+        "Content-Type": "application/json",
+        Origin: "https://evil.example",
+      },
+      body: JSON.stringify({ task: "csrf", verify: false }),
+    });
+    expect(evil.status).toBe(403);
+
+    const unauthenticated = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "no token", verify: false }),
+    });
+    expect(unauthenticated.status).toBe(401);
+
+    const plain = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer p0-secret",
+        "Content-Type": "text/plain",
+      },
+      body: JSON.stringify({ task: "simple request", verify: false }),
+    });
+    expect(plain.status).toBe(415);
+
+    const rebindingStatus = await new Promise<number>((resolveStatus, rejectStatus) => {
+      const target = new URL(base);
+      const body = JSON.stringify({ task: "dns rebinding", verify: false });
+      const request = httpRequest({
+        hostname: target.hostname,
+        port: target.port,
+        path: "/api/runs",
+        method: "POST",
+        headers: {
+          Authorization: "Bearer p0-secret",
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(body),
+          Host: "attacker.example",
+          Origin: "http://attacker.example",
+        },
+      }, (response) => {
+        response.resume();
+        response.on("end", () => resolveStatus(response.statusCode ?? 0));
+      });
+      request.on("error", rejectStatus);
+      request.end(body);
+    });
+    expect(rebindingStatus).toBe(421);
+
+    const accepted = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer p0-secret",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ task: "authorized", verify: false }),
+    });
+    expect(accepted.status, await accepted.text()).toBe(200);
+
+    expect((await fetch(`${base}/metrics`)).status).toBe(401);
+    const metrics = await fetch(`${base}/metrics`, {
+      headers: { Authorization: "Bearer p0-secret" },
+    });
+    expect(metrics.status).toBe(200);
+    const metricText = await metrics.text();
+    expect(metricText).toContain('agent_harness_security_rejections_total{reason="origin"} 1');
+    expect(metricText).toContain('agent_harness_security_rejections_total{reason="host"} 1');
+  });
+
+  it("浏览器引导把 URL 令牌换成 HttpOnly cookie 并立即清理查询串", async () => {
+    await boot({ accessToken: "p0-secret" });
+    const bootstrap = await fetch(`${base}/?access_token=p0-secret`, { redirect: "manual" });
+    expect(bootstrap.status).toBe(303);
+    expect(bootstrap.headers.get("location")).toBe("/");
+    const setCookie = bootstrap.headers.get("set-cookie") ?? "";
+    expect(setCookie).toContain("HttpOnly");
+    expect(setCookie).toContain("SameSite=Strict");
+
+    const cookie = setCookie.split(";", 1)[0] ?? "";
+    const harness = await fetch(`${base}/api/harness`, { headers: { Cookie: cookie } });
+    expect(harness.status).toBe(200);
+  });
+
+  it("请求体超限返回 413，不能把任意大载荷缓存在内存", async () => {
+    await boot({ requestBodyMaxBytes: 96 });
+    const response = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "x".repeat(256), verify: false }),
+    });
+    expect(response.status).toBe(413);
+  });
+
+  it("单一来源的副作用请求超过窗口上限后返回 429", async () => {
+    await boot({ mutationRateLimitPerMinute: 1 });
+    const first = await fetch(`${base}/unknown-mutation`, { method: "POST" });
+    expect(first.status).toBe(404);
+    const second = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "rate limited", verify: false }),
+    });
+    expect(second.status).toBe(429);
+    expect(Number(second.headers.get("retry-after"))).toBeGreaterThan(0);
+  });
+
+  it("关闭 bash 后工具快照与宿主限制都如实报告", async () => {
+    await boot({ enableBash: false, tools: undefined });
+    const snapshot = await (await fetch(`${base}/api/harness`)).json() as any;
+    expect(snapshot.tools.map((tool: any) => tool.name)).not.toContain("bash");
+    expect(snapshot.shell).toBeNull();
+    expect(snapshot.hostLimits.bashEnabled).toBe(false);
+  });
+
+  it("达到活动运行上限时以 429 拒绝新任务", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("hold", "danger", {})], "tool_use"),
+      fakeMessage([textBlock("stopped")], "end_turn"),
+    ]);
+    await boot({ maxActiveRuns: 1, tools: [askTool("danger")] }, model);
+
+    const first = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "hold slot", verify: false }),
+    });
+    expect(first.status).toBe(200);
+    const { runId } = await first.json() as { runId: string };
+    let pending = 0;
+    for (let i = 0; i < 100; i++) {
+      const list = await (await fetch(`${base}/api/runs`)).json() as any[];
+      pending = list.find((item) => item.runId === runId)?.pendingApprovals ?? 0;
+      if (pending > 0) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(pending).toBe(1);
+
+    const second = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "overflow", verify: false }),
+    });
+    expect(second.status).toBe(429);
+    expect(second.headers.get("retry-after")).toBeTruthy();
+  });
+
+  it("内存中的已完成运行按上限淘汰，长期常驻不会无限增长", async () => {
+    await boot({ maxStoredRuns: 2 });
+    for (const task of ["one", "two", "three"]) {
+      const response = await fetch(`${base}/api/runs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task, verify: false }),
+      });
+      const { runId } = await response.json() as { runId: string };
+      await waitForDone(base, runId);
+    }
+    const runs = await (await fetch(`${base}/api/runs`)).json() as any[];
+    expect(runs.map((run) => run.task)).toEqual(["three", "two"]);
+  });
+
+  it("打开全局 SSE 时 close 仍会在期限内完成并结束流", async () => {
+    await boot();
+    const stream = await fetch(`${base}/api/stream`);
+    expect(stream.status).toBe(200);
+    const reader = stream.body!.getReader();
+    await reader.read(); // snapshot
+
+    const closePromise = handle!.close();
+    const result = await Promise.race([
+      closePromise.then(() => "closed" as const),
+      new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 500)),
+    ]);
+
+    if (result === "timeout") {
+      await reader.cancel().catch(() => {});
+      handle!.server.closeAllConnections();
+      await closePromise.catch(() => {});
+    }
+    expect(result).toBe("closed");
+    const end = await reader.read().catch(() => ({ done: true, value: undefined }));
+    expect(end.done).toBe(true);
+    handle = undefined;
+  });
+
+  it("历史写入失败会让 readiness 降级，但 liveness 与运行闭环仍存活", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "p0-health-"));
+    const file = join(dir, "not-a-directory");
+    await writeFile(file, "x", "utf8");
+    try {
+      await boot({ history: join(file, "child") });
+      const created = await fetch(`${base}/api/runs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task: "health", verify: false }),
+      });
+      const { runId } = await created.json() as { runId: string };
+      await waitForDone(base, runId);
+
+      let ready: Response | undefined;
+      for (let i = 0; i < 40; i++) {
+        ready = await fetch(`${base}/ready`);
+        if (ready.status === 503) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect((await fetch(`${base}/health`)).status).toBe(200);
+      expect(ready?.status).toBe(503);
+      expect(await ready!.json()).toMatchObject({ status: "degraded", history: { healthy: false } });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

@@ -7,6 +7,11 @@
  * 环境变量：
  *   AGENT_UI_PORT / PORT   监听端口，默认 4173
  *   AGENT_UI_HOST          监听地址，默认 127.0.0.1
+ *   AGENT_UI_ACCESS_TOKEN  访问令牌；非 loopback 监听时必填且至少 32 字符
+ *   AGENT_UI_BEHIND_TLS_PROXY=1  位于可信 TLS 反代之后，并信任 forwarded proto/host
+ *   AGENT_UI_ALLOW_INSECURE_HTTP=1  显式接受远程明文风险（生产不建议）
+ *   AGENT_UI_ALLOWED_ORIGINS      精确跨源白名单，逗号分隔
+ *   AGENT_UI_ALLOW_REMOTE_EXECUTION=1  非 loopback 时显式装回 bash（默认移除）
  *   AGENT_UI_WORKDIR       默认工作目录（工具圈禁根），默认 process.cwd()
  *   AGENT_UI_WORKDIRS      逐 run 可选的工作目录白名单（路径分隔符分隔）。
  *                          workdir 同时是工具的写入圈禁边界,所以合法集合由宿主
@@ -17,19 +22,23 @@
  *   AGENT_PACK / AGENT_PRESET  领域包
  *   其余 AGENT_* 旋钮见 src/cli.ts 头部注释
  *
- * 默认只绑 127.0.0.1 是硬要求，不是保守：这个宿主能执行 bash、能批准写文件，
- * 对外暴露等于把一个可远程执行任意命令的入口挂到网上。要跨机访问请自己在前面
- * 放带认证的反向代理，而不是把 AGENT_UI_HOST 改成 0.0.0.0。
+ * 默认只绑 127.0.0.1。非 loopback 不再只打印 warning：缺少强令牌或 TLS 边界会
+ * fail-closed；即使满足二者，也默认从工具面移除 bash。
  */
 import { delimiter } from "node:path";
 import { createUiServer } from "./server.js";
+import { resolveUiLaunchPolicy } from "./production.js";
 import { warnEnvConflicts } from "../src/env-check.js";
 
 // .env 被残留环境变量压掉时大声说出来——那可能意味着凭据被发往另一家端点
 warnEnvConflicts();
 
 const port = Number(process.env.AGENT_UI_PORT ?? process.env.PORT ?? 4173);
-const host = process.env.AGENT_UI_HOST ?? "127.0.0.1";
+if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+  throw new Error(`Invalid AGENT_UI_PORT/PORT: ${process.env.AGENT_UI_PORT ?? process.env.PORT}`);
+}
+const policy = resolveUiLaunchPolicy();
+const host = policy.host;
 const packName = process.env.AGENT_PACK ?? process.env.AGENT_PRESET;
 
 const workdirs = (process.env.AGENT_UI_WORKDIRS ?? "")
@@ -41,21 +50,30 @@ const handle = createUiServer({
   ...(packName ? { packName } : {}),
   workdir: process.env.AGENT_UI_WORKDIR ?? process.cwd(),
   ...(workdirs.length ? { workdirs } : {}),
+  ...(policy.accessToken ? { accessToken: policy.accessToken } : {}),
+  ...(policy.allowedOrigins.length ? { allowedOrigins: policy.allowedOrigins } : {}),
+  ...(policy.allowedHosts.length ? { allowedHosts: policy.allowedHosts } : {}),
+  enableBash: policy.enableBash,
+  trustProxy: policy.trustProxy,
 });
 
 handle.server.listen(port, host, () => {
-  console.log(`Harness UI → http://${host}:${port}`);
+  const localUrl = `http://${host}:${port}`;
+  console.log(`Harness UI → ${localUrl}`);
   console.log(`  workdir: ${process.env.AGENT_UI_WORKDIR ?? process.cwd()}`);
   console.log(`  pack:    ${packName ?? "(none)"}`);
+  console.log(`  auth:    ${policy.accessToken ? "token" : "loopback origin boundary"}`);
+  console.log(`  bash:    ${policy.enableBash ? "enabled" : "disabled"}`);
   if (workdirs.length) console.log(`  可选工作目录: ${workdirs.join(" | ")}`);
   for (const role of ["VERIFIER", "PLANNER"] as const) {
     const m = process.env[`AGENT_${role}_MODEL`];
     if (m) console.log(`  ${role.toLowerCase()} model: ${m}`);
   }
-  if (host !== "127.0.0.1" && host !== "localhost") {
-    console.warn(
-      `  ⚠ 正在监听 ${host}——该宿主可执行 bash 并批准写文件，请确认前面有认证代理`,
-    );
+  if (!policy.remote && policy.accessToken) {
+    console.log(`  open:    ${localUrl}/?access_token=${encodeURIComponent(policy.accessToken)}`);
+  }
+  if (policy.remote) {
+    console.log(`  remote boundary: ${policy.trustProxy ? "trusted TLS proxy" : "insecure HTTP explicitly acknowledged"}`);
   }
 });
 

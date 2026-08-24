@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type Anthropic from "@anthropic-ai/sdk";
-import { fromAccumulated, toOpenAIMessages, toOpenAITools } from "../src/model-client-openai.js";
+import { fromAccumulated, toOpenAIMessages, toOpenAIToolChoice, toOpenAITools } from "../src/model-client-openai.js";
 import type { ModelRequest } from "../src/types.js";
 
 const baseReq = (messages: Anthropic.MessageParam[]): ModelRequest => ({
@@ -209,5 +209,25 @@ describe("图像块 → OpenAI image_url（视觉模型走 compat 端点的前�
     expect(out.find((m) => m.role === "tool")).toBeDefined();
     const user = out.filter((m) => m.role === "user").at(-1)!;
     expect((user.content as any[]).some((p) => p.type === "image_url")).toBe(true);
+  });
+});
+
+describe("tool_choice 映射（§2.1，补上 B0b 记着的那笔欠账）", () => {
+  /**
+   * B0b 的实施笔记原话：「OpenAI 客户端的 create 捕获桩不存在，那一行 spread
+   * 映射暂靠 loop 层锁间接盖住——补桩时顺手锁」。提成纯函数即可直接锁，
+   * 不必为此建一整套 create 桩。
+   */
+  it('"none" 走 OpenAI 的字符串取值，强制交付走 {type:"function"}', () => {
+    expect(toOpenAIToolChoice("none")).toBe("none");
+    expect(toOpenAIToolChoice({ type: "tool", name: "submit_verdict" })).toEqual({
+      type: "function",
+      function: { name: "submit_verdict" },
+    });
+  });
+
+  it("两个 wire 的形状确实不同——这正是需要各自映射函数的原因", () => {
+    const anthropic = { type: "tool", name: "submit_plan" };
+    expect(toOpenAIToolChoice({ type: "tool", name: "submit_plan" })).not.toEqual(anthropic);
   });
 });

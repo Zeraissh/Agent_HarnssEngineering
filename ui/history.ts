@@ -14,18 +14,32 @@
  *    root 缺省 `<cwd>/.agent-run-history`，`AGENT_RUN_HISTORY_DIR` 可覆盖。
  * ③ **存多久**：只保留最近 DEFAULT_HISTORY_KEEP 个 run（启动与每次收尾后
  *    修剪，在跑的永不删）。没有清理策略的持久化最后都会变成没人敢删的占用。
- * ④ **能不能恢复续跑**：**不能，且要说清楚**。loop 与 ContextManager 的
- *    水位记忆是活对象，跨重启复原等于重建整套执行上下文（V-28 的反面）；
- *    归档 run 是只读回看，runSummary 带 `archived: true`，界面照实说。
+ * ④ **怎样恢复续跑**：归档本身保持只读；每个已完成 main 段把 transcript 段号、
+ *    ContextManager 水位和共享预算快照写进 meta。重启后从该检查点**派生新 run**，
+ *    新 run 使用当前宿主的模型/工具/策略并显式记录 lineage，不冒充原进程无缝继续。
+ *    没有检查点的旧档案仍只能回看。
  *
- * 仪器纪律与 L6 台账相同（src/ledger.ts）：**写失败静默熄火，永不影响
- * 正在跑的 run**。档案是研究资料，不是业务数据。
+ * 写失败不打断正在跑的 run，但必须通过健康状态显式上报；生产宿主不能把
+ * “任务完成但历史全丢了”伪装成健康。meta 采用同目录临时文件 + rename，避免
+ * 进程中断留下半截 JSON。
  */
-import { appendFile, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
+import type { SharedRunBudget } from "../src/types.js";
 
 /** 保留的 run 目录数上限（判据③）。先写死再收数据——口径同 STRUCTURED_OUTPUT_RULE */
 export const DEFAULT_HISTORY_KEEP = 50;
+
+export interface ArchivedCheckpoint {
+  /** transcript.jsonl 中承载这份 messages 的 main 段号 */
+  segmentIndex: number;
+  conversationTurn: number;
+  /** ContextManager 首次恢复请求前的 compact 水位 */
+  contextInputTokens: number;
+  /** continuation / 返工谱系共用的累计预算快照 */
+  runBudget: SharedRunBudget;
+}
 
 /** meta.json 的形状。version 是将来格式演进的逃生口 */
 export interface ArchivedMeta {
@@ -46,6 +60,13 @@ export interface ArchivedMeta {
   planGate: boolean;
   planDecision: { decision: "approve" | "reject"; at: number } | null;
   mainStopReason: string | null;
+  /** ask_user 是否开启；派生 run 只继承开关，不继承已用配额或审批放行 */
+  askUser?: boolean;
+  /** 归档可恢复检查点；旧档案缺省 = 只读 */
+  checkpoint?: ArchivedCheckpoint | null;
+  /** 派生谱系；父档案始终不可变 */
+  continuedFrom?: string | null;
+  rootRunId?: string | null;
   /** 列表列所需的裁决摘要；完整裁决在事件流里，不重复存 */
   outcome: { finalPassed: boolean | null; reworks: number | null; verdict: unknown } | null;
 }
@@ -78,21 +99,44 @@ export function historyKeepCount(env: NodeJS.ProcessEnv = process.env): number {
 export class RunHistoryWriter {
   private chain: Promise<unknown> = Promise.resolve();
   private dead = false;
+  private failure: Error | null = null;
 
-  constructor(readonly dir: string) {
+  constructor(
+    readonly dir: string,
+    private readonly onError?: (error: Error) => void,
+  ) {
     this.enqueue(() => mkdir(this.dir, { recursive: true }));
   }
 
   private enqueue(op: () => Promise<unknown>): void {
     if (this.dead) return;
-    this.chain = this.chain.then(op).catch(() => {
-      this.dead = true;
-    });
+    this.chain = this.chain
+      .then(async () => {
+        // 多个写会在 mkdir 真正失败前排进链；失败后这些已排队步骤也必须短路。
+        if (this.dead) return;
+        await op();
+      })
+      .catch((cause: unknown) => {
+        if (this.dead) return;
+        this.dead = true;
+        this.failure = cause instanceof Error ? cause : new Error(String(cause));
+        this.onError?.(this.failure);
+      });
   }
 
-  /** 整写 meta.json（创建 / 追加轮开始 / 收尾各一次——小文件，重写比补丁简单可靠） */
+  /** 整写 meta.json；rename 的源/目标同目录，因此不会跨卷退化成复制。 */
   writeMeta(meta: ArchivedMeta): void {
-    this.enqueue(() => writeFile(join(this.dir, "meta.json"), JSON.stringify(meta), "utf8"));
+    this.enqueue(async () => {
+      const target = join(this.dir, "meta.json");
+      const temporary = join(this.dir, `.meta.${process.pid}.${randomUUID()}.tmp`);
+      try {
+        await writeFile(temporary, JSON.stringify(meta), "utf8");
+        await rename(temporary, target);
+      } catch (error) {
+        await rm(temporary, { force: true }).catch(() => {});
+        throw error;
+      }
+    });
   }
 
   appendEvent(sseEvent: unknown): void {
@@ -115,6 +159,14 @@ export class RunHistoryWriter {
   /** 宿主 close() 用：等待已入队的写全部落盘，收尾事件不能丢在半路 */
   flush(): Promise<unknown> {
     return this.chain;
+  }
+
+  get healthy(): boolean {
+    return !this.dead;
+  }
+
+  get lastError(): Error | null {
+    return this.failure;
   }
 }
 

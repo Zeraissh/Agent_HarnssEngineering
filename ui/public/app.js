@@ -1,6 +1,6 @@
 import { createBatcher } from "./core/batch.js";
 import { diffKeyed, signature } from "./core/diff.js";
-import { renderMarkdown, renderMarkdownInline } from "./core/markdown.js";
+import { isLocalPathCandidate, renderMarkdown, renderMarkdownInline } from "./core/markdown.js";
 import {
   patchList,
   appendOnly,
@@ -45,6 +45,9 @@ export { createBatcher, diffKeyed, signature, patchList, appendOnly, setText, se
  *   usage: UsageModel|null,
  *   error: string|null,
  *   stopReason: string|null,
+ *   completion: {status:string,summary:string,artifacts:string[],verification:string[],assumptions:string[],blockers:string[]}|null,
+ *   runBudget: {maxTurns?:number,maxTokens?:number,usedTurns:number,usedTokens:number}|null,
+ *   lineage: {parentRunId:string,rootRunId:string,boundary:string,inheritedBudget:object|null,reset:string[]}|null,
  *   lastSeq: number,
  *   runEnd: {outcome:string, mainStopReason?:string, finishedAt:number}|null
  * }} RunState
@@ -63,6 +66,9 @@ export { createBatcher, diffKeyed, signature, patchList, appendOnly, setText, se
  *   text?: string,
  *   attempt?: number,
  *   reason?: string,
+ *   action?: string,
+ *   detail?: string,
+ *   extraTurns?: number,
  *   droppedBlocks?: number
  * }} TimelineEntry
  *
@@ -97,8 +103,9 @@ export { createBatcher, diffKeyed, signature, patchList, appendOnly, setText, se
  * @typedef {{
  *   finalStatus: string,
  *   resultSummary: string|null,
+ *   completion: object|null,
  *   verdict: VerdictModel|null,
- *   actionItems: {pendingApprovals: PendingApproval[], unverifiedItems: string[]},
+ *   actionItems: {pendingApprovals: PendingApproval[], unverifiedItems: string[], blockers:string[]},
  *   resolvedApprovals: PendingApproval[],
  *   usage: UsageModel|null
  * }} OverviewModel
@@ -131,6 +138,10 @@ export function createInitialState(runId, task, verify) {
     usage: null,
     error: null,
     stopReason: null,
+    completion: null,
+    runBudget: null,
+    /** 归档检查点派生边界；null = 本 run 不是跨宿主恢复出来的子级。 */
+    lineage: null,
     lastSeq: -1,
     runEnd: null,
     /** 逐轮 token（来自 usage 事件）——上下文水位与成本的唯一来源 */
@@ -153,6 +164,9 @@ export function createInitialState(runId, task, verify) {
      * status: pending 等签字 | approved | rejected | expired（run 收尾时未应答）
      */
     planApproval: null,
+    // §5.2 需求澄清：当前挂起的提问（null = 没有）+ 已决记录（审计）
+    question: null,
+    questionLog: [],
     /** V-28：已进行的对话轮数（第 1 轮 = 建 run 时那次提交） */
     conversationTurn: 1,
   };
@@ -188,6 +202,30 @@ export function classifyStopReason(stopReason) {
         tone: "bad",
         label: "撞轮次护栏",
         hint: "执行未自然结束，核查救不了这一类——即使核查通过也不代表任务做完",
+      };
+    case "partial":
+      return {
+        tone: "warn",
+        label: "部分完成",
+        hint: "已有可用交付，但仍有未完成项；请查看结构化阻塞清单",
+      };
+    case "blocked":
+      return {
+        tone: "warn",
+        label: "等待外部条件",
+        hint: "执行者已明确列出无法自行解除的阻塞条件",
+      };
+    case "incomplete":
+      return {
+        tone: "bad",
+        label: "未能结构化收口",
+        hint: "模型多次结束生成却没有提交有效完成状态，不能按成功处理",
+      };
+    case "stalled":
+      return {
+        tone: "bad",
+        label: "重复空转已停止",
+        hint: "连续获得相同工具观察，换策略后仍无进展，宿主已停止继续烧轮次",
       };
     /**
      * 人主动叫停：判 warn 不判 bad。把委托方自己的决定画成"异常终止"
@@ -280,6 +318,22 @@ export function reduceEvent(state, sseEvent) {
   if (type === "approval_expired") {
     return applyApprovalExpired(state, event);
   }
+  if (type === "run_forked") {
+    const entry = buildTimelineEntry(seq, source, type, event);
+    return {
+      ...state,
+      lineage: {
+        parentRunId: String(event.parentRunId ?? ""),
+        rootRunId: String(event.rootRunId ?? event.parentRunId ?? ""),
+        boundary: String(event.boundary ?? ""),
+        inheritedBudget: event.checkpoint && typeof event.checkpoint === "object"
+          ? /** @type {any} */ (event.checkpoint).runBudget ?? null
+          : null,
+        reset: Array.isArray(event.reset) ? event.reset.map(String) : [],
+      },
+      timeline: [...state.timeline, entry],
+    };
+  }
   if (type === "user_message") {
     // 追加的这句话既是会话内容，也标志 run 从终态回到运行中——
     // 状态由事件本身驱动，客户端不必另写一套特判
@@ -329,6 +383,46 @@ export function reduceEvent(state, sseEvent) {
       planApproval: { status: "expired", seq: Number(event.requestSeq ?? seq), at: 0 },
     };
   }
+  // ---- 需求澄清（§5.2）。三条事件同计划门：durable 合成事件，重连重放即复原 ----
+  if (type === "user_question_request") {
+    return {
+      ...state,
+      question: {
+        status: "pending",
+        id: String(event.id ?? seq),
+        seq,
+        // 一次打断一组问题（决定 6）
+        questions: (Array.isArray(event.questions) ? event.questions : []).map((q) => ({
+          question: String(q.question ?? ""),
+          options: Array.isArray(q.options) ? q.options.map(String) : [],
+          fallback: String(q.fallback ?? ""),
+        })),
+        at: Number(event.at ?? 0),
+      },
+    };
+  }
+  if (type === "user_question_resolved") {
+    const answered = {
+      status: event.skipped ? "skipped" : "answered",
+      id: String(event.id ?? ""),
+      seq: Number(event.requestSeq ?? seq),
+      questions: state.question ? state.question.questions : [],
+      answers: Array.isArray(event.answers)
+        ? event.answers.map((a) => (a === null || a === undefined ? null : String(a)))
+        : [],
+      at: Number(event.at ?? 0),
+    };
+    return { ...state, question: null, questionLog: [...state.questionLog, answered] };
+  }
+  if (type === "user_question_expired") {
+    // 只有仍挂起时才转过期：已答过的是审计记录，不能被覆盖（同计划门口径）
+    if (!state.question || state.question.status !== "pending") return state;
+    return {
+      ...state,
+      question: null,
+      questionLog: [...state.questionLog, { ...state.question, status: "expired", answers: [] }],
+    };
+  }
   // 9.8 段级续跑：整段因瞬时错误死掉后带着正史接着跑。必须显式呈现——
   // 否则宿主看到一个 done(error) 之后又冒出一堆事件，完全读不懂
   if (type === "segment_resume") {
@@ -338,6 +432,7 @@ export function reduceEvent(state, sseEvent) {
       status: "running",
       error: null,
       stopReason: null,
+      completion: null,
       timeline: [
         ...state.timeline,
         {
@@ -580,6 +675,25 @@ function buildTimelineEntry(seq, source, type, event) {
         // 只在存在时带上（渲染层据此决定显不显示，不能显示 undefined）
         ...(typeof event.backoffMs === "number" ? { backoffMs: event.backoffMs } : {}),
       };
+    case "recovery_decision":
+      return {
+        ...base,
+        reason: String(event.reason ?? ""),
+        action: String(event.action ?? ""),
+        detail: String(event.detail ?? ""),
+        ...(typeof event.extraTurns === "number" ? { extraTurns: event.extraTurns } : {}),
+      };
+    case "run_forked":
+      return {
+        ...base,
+        parentRunId: String(event.parentRunId ?? ""),
+        rootRunId: String(event.rootRunId ?? event.parentRunId ?? ""),
+        boundary: String(event.boundary ?? ""),
+        inheritedBudget: event.checkpoint && typeof event.checkpoint === "object"
+          ? /** @type {any} */ (event.checkpoint).runBudget ?? null
+          : null,
+        reset: Array.isArray(event.reset) ? event.reset.map(String) : [],
+      };
     case "compaction":
       return { ...base, droppedBlocks: /** @type {number} */ (event.droppedBlocks) };
     default:
@@ -711,6 +825,12 @@ function applySegmentDone(state, event, source = "main") {
   const next = {
     ...state,
     stopReason,
+    ...(event.completion && typeof event.completion === "object"
+      ? { completion: { ...event.completion } }
+      : {}),
+    ...(event.runBudget && typeof event.runBudget === "object"
+      ? { runBudget: { ...event.runBudget } }
+      : {}),
     // 服务端此前把 error 整条丢掉，前端只能写死一句话；现在有真实消息就用真实的
     error: stopReason === "error" ? errorMessage || "运行异常终止" : null,
     usage: usage
@@ -1163,7 +1283,7 @@ export function deriveVerificationFace(state, harness) {
  * 说明行、`data-mode` 四处同时变，绝不静默。
  *
  * @param {{
- *   info?: {status?: string, canContinue?: boolean, mode?: string, verify?: boolean, workdir?: string, runId?: string, archived?: boolean}|null,
+ *   info?: {status?: string, canContinue?: boolean, continuationMode?: string, continuationBlockReason?: string|null, mode?: string, verify?: boolean, workdir?: string, runId?: string, archived?: boolean}|null,
  *   localStatus?: string|null,   // 本地 SSE 观测到的状态；见下方"默认值不是观测"
  *   submitting?: boolean,        // 提交在飞：服务端还没回、列表也还没更新
  *   error?: string|null,
@@ -1242,6 +1362,19 @@ export function deriveComposerMode({ info, localStatus, submitting, error } = {}
   }
 
   if (info.canContinue) {
+    if (info.continuationMode === "fork") {
+      return {
+        ...base,
+        mode: "fork",
+        kind: "append",
+        buttonLabel: "从归档继续",
+        labelText: "续跑指令",
+        placeholder: "从归档检查点派生新运行继续…（Ctrl+Enter 发送）",
+        note: "将从检查点派生新运行：会话正史与总预算继续累计；模型、工具和策略使用当前宿主，父归档保持只读。",
+        canSubmit: true,
+        optionsEnabled: false,
+      };
+    }
     return {
       ...base,
       mode: "append",
@@ -1250,7 +1383,7 @@ export function deriveComposerMode({ info, localStatus, submitting, error } = {}
       labelText: "追加指令",
       placeholder: "追加一条指令，接着这次会话继续…（Ctrl+Enter 发送）",
       // 轮次预算每轮重新起算，不说清楚用户会以为 maxTurns 是整场对话的总额
-      note: "续跑复用这次运行的装配（包 / 思考预算 / 工作目录 / 核查）；轮次预算每轮重新起算。",
+      note: "续跑复用这次运行的装配（包 / 思考预算 / 工作目录 / 核查）；单段轮次预算每轮重新起算，总轮次 / token 预算沿执行谱系累计。",
       canSubmit: true,
       // 装配项在续跑里**构造上无效**：startContinuation 只取 run.loop 与
       // run.history，pack/effort/workdir/mode/rubric 一个都不读
@@ -1279,16 +1412,18 @@ export function deriveComposerMode({ info, localStatus, submitting, error } = {}
 
 /** 不能追加的原因（V-28：不能只是"没有输入框"，要说为什么） */
 function blockedReason(info) {
-  // B2 判据④：归档运行（宿主重启前的历史）排最前——它同样没有 loop，
-  // 落到最后那句"可能执行阶段就失败了"就是对着好端端的历史说谎
+  // B2：旧格式、预算耗尽、目录越权等阻断理由由服务端按当前宿主边界计算。
   if (info.archived) {
-    return "这是宿主重启前的归档运行：事件与会话可回看，但执行上下文没有跨重启保存，无法续跑。";
+    return `这是只读归档，当前不能派生续跑：${info.continuationBlockReason || "没有可用的持久化检查点"}。`;
   }
   if (info.mode === "plan") {
     return "计划编排的运行不支持追加：runPlanned 每次都从拆解开始，没有续跑入口。";
   }
   if (info.verify) {
     return "开启独立核查的运行不支持追加：追加会绕过已出具的裁决。";
+  }
+  if (info.continuationBlockReason) {
+    return `${info.continuationBlockReason}。`;
   }
   return "这次运行没有可续跑的会话正史（可能执行阶段就失败了）。";
 }
@@ -1307,6 +1442,81 @@ export function composerSubmitPlan(mode, rawText) {
 }
 
 /**
+ * 新建运行的网络载荷。保持为纯函数，避免某个 UI 开关只在特定分支里“看起来接上”。
+ * `askUser` 是执行方式，不是 plan 专属能力：single 任务遇到地点、环境或交付边界
+ * 不明确时同样需要先问人。
+ */
+export function buildNewRunRequest({
+  task,
+  verify = false,
+  pack,
+  effort,
+  rubric,
+  mode = "single",
+  concurrency,
+  planGate = false,
+  askUser = false,
+  workdir,
+  useVerifierModel = true,
+  usePlannerModel = true,
+} = {}) {
+  const trimmedRubric = String(rubric ?? "").trim();
+  return {
+    task: String(task ?? ""),
+    verify: Boolean(verify),
+    ...(pack ? { pack } : {}),
+    ...(effort ? { effort } : {}),
+    ...(trimmedRubric ? { rubric: trimmedRubric } : {}),
+    ...(mode === "plan"
+      ? {
+          mode: "plan",
+          ...(concurrency ? { concurrency } : {}),
+          ...(planGate ? { planGate: true } : {}),
+        }
+      : {}),
+    ...(askUser ? { askUser: true } : {}),
+    ...(workdir ? { workdir } : {}),
+    // 与宿主既有契约一致：角色模型默认启用，只有显式关闭才传 false。
+    ...(!useVerifierModel ? { useVerifierModel: false } : {}),
+    ...(!usePlannerModel ? { usePlannerModel: false } : {}),
+  };
+}
+
+/**
+ * 把 archived follow-up 的 HTTP 响应并入列表。纯函数的目的不是“少写几行 DOM”，
+ * 而是锁住两个竞态不变量：父归档绝不改成 running；生命周期 SSE 若已把极短的
+ * 子 run 推到 done，较旧的 HTTP running 快照不能让它倒退。
+ *
+ * @returns {{targetRunId:string, summary:object, runs:object[]}|null} null = 同 run 续跑
+ */
+export function mergeForkedFollowUp(runList, parentRunId, payload, feedback, now = Date.now()) {
+  const targetRunId = typeof payload?.runId === "string" ? payload.runId : parentRunId;
+  if (targetRunId === parentRunId) return null;
+
+  const existingIndex = runList.findIndex((run) => run.runId === targetRunId);
+  const existing = existingIndex >= 0 ? runList[existingIndex] : null;
+  const parent = runList.find((run) => run.runId === parentRunId);
+  const incoming = payload?.run && typeof payload.run === "object"
+    ? payload.run
+    : {
+        runId: targetRunId,
+        task: parent?.task ?? feedback,
+        status: "running",
+        verify: false,
+        createdAt: now,
+        finishedAt: null,
+        continuedFrom: parentRunId,
+      };
+  const summary = existing?.status === "done"
+    ? { ...incoming, ...existing }
+    : { ...(existing ?? {}), ...incoming };
+  const runs = [...runList];
+  if (existingIndex >= 0) runs[existingIndex] = summary;
+  else runs.unshift(summary);
+  return { targetRunId, summary, runs };
+}
+
+/**
  * 把模式应用到底栏 DOM。**这里一行 addEventListener 都没有**——
  * 监听只在启动时由 `bindComposer` 绑一次。合并把输入框从"每次重建"变成
  * "永久存在"，重复绑定从不可能变成一步之遥，所以用职责切分把它堵死。
@@ -1315,15 +1525,37 @@ export function patchComposer(mode, root = document) {
   const q = (sel) => root.querySelector(sel);
   const form = q("#submit-form");
   const btn = q("#submit-btn");
+  const btnLabel = q("#submit-btn-label");
+  const btnIcon = btn?.querySelector?.("i");
   const input = q("#task-input");
   const label = q('label[for="task-input"]');
+  const modeLabel = q("#composer-mode-label");
   const note = q("#composer-note");
   const err = q("#submit-error");
 
   if (form) setAttr(form, "data-mode", mode.mode);
   if (btn) {
-    setText(btn, mode.buttonLabel);
+    setText(btnLabel ?? btn, mode.buttonLabel);
     setAttr(btn, "disabled", mode.canSubmit ? null : "");
+  }
+  if (btnIcon) {
+    const icon = mode.mode === "running"
+      ? "ph-stop"
+      : mode.mode === "submitting"
+        ? "ph-spinner-gap"
+        : "ph-paper-plane-right";
+    btnIcon.className = `ph ${icon}${mode.mode === "submitting" ? " is-spinning" : ""}`;
+  }
+  if (modeLabel) {
+    const text = {
+      new: "新建对话",
+      append: "继续当前对话",
+      fork: "从归档派生续跑",
+      running: "任务运行中",
+      submitting: "正在创建",
+      "new-blocked": "另建新对话",
+    }[mode.mode] ?? "新建对话";
+    setText(modeLabel, text);
   }
   if (label) setText(label, mode.labelText);
   if (input) {
@@ -1355,10 +1587,16 @@ export function patchComposer(mode, root = document) {
    */
   const knobs = [
     q("#verify-toggle"),
+    ...(q("#composer-scopebar")
+      ? q("#composer-scopebar").querySelectorAll("input, select")
+      : []),
     ...(q("#run-knobs") ? q("#run-knobs").querySelectorAll("input, select, textarea, button") : []),
   ].filter(Boolean);
   const active = root.activeElement ?? document.activeElement;
-  for (const el of knobs) setAttr(el, "disabled", mode.optionsEnabled ? null : "");
+  for (const el of knobs) {
+    const fixed = el.getAttribute?.("data-fixed") === "true";
+    setAttr(el, "disabled", mode.optionsEnabled && !fixed ? null : "");
+  }
   // 禁用一个正被聚焦的控件会让焦点掉回 body（后续按键全丢）。把它交还给输入框。
   if (!mode.optionsEnabled && active && knobs.includes(active) && input?.focus) input.focus();
 }
@@ -1395,12 +1633,23 @@ export function deriveActionState(state) {
   // 计划确认门（§5.1）：签字位也是"需你决定"，而且是最靠前的那一件——
   // 它挂起时一个子任务都还没发射，此刻的决定成本最低
   const planPending = state.planApproval?.status === "pending";
+  /**
+   * §5.2 提问同属"需你现在决定"，而且是**阻塞式**的——执行协程正吊在
+   * ask_user 的 execute 里等这一下。不进 needsAttention 就等于整个运行卡死
+   * 而界面上什么都没有（V-01/V-05 那一族）。
+   */
+  const questionPending = state.question?.status === "pending";
+  const blockers = Array.isArray(state.completion?.blockers) ? state.completion.blockers : [];
   return {
     pendingApprovals: pending,
     unverifiedItems: unverified,
     planApproval: state.planApproval ?? null,
     awaitingPlan: planPending,
-    needsAttention: planPending || pending.length > 0 || unverified.length > 0,
+    question: state.question ?? null,
+    awaitingQuestion: questionPending,
+    blockers,
+    needsAttention:
+      planPending || questionPending || pending.length > 0 || unverified.length > 0 || blockers.length > 0,
   };
 }
 
@@ -1428,14 +1677,17 @@ export function deriveOverview(state) {
     (a) => a.status !== "pending",
   );
   const unverifiedItems = state.verdict ? state.verdict.unverified : [];
+  const blockers = Array.isArray(state.completion?.blockers) ? state.completion.blockers : [];
 
   return {
     finalStatus: state.error ? "error" : state.status,
-    resultSummary: lastAssistant ? lastAssistant.text ?? null : null,
+    resultSummary: state.completion?.summary ?? (lastAssistant ? lastAssistant.text ?? null : null),
+    completion: state.completion,
     verdict: state.verdict,
     actionItems: {
       pendingApprovals,
       unverifiedItems,
+      blockers,
     },
     resolvedApprovals,
     usage: state.usage,
@@ -1482,6 +1734,8 @@ function defaultCollapsed(entry) {
   // API 重试 → 展开
   if (entry.type === "api_retry") return false;
   if (entry.type === "segment_resume") return false;
+  if (entry.type === "recovery_decision") return false;
+  if (entry.type === "run_forked") return false;
   // 上下文压缩 → 展开
   if (entry.type === "compaction") return false;
   // 其余（turn_start、tool_call、成功 tool_result、assistant_text）→ 折叠
@@ -1754,39 +2008,45 @@ export function renderRunList(runs, selectedRunId, onSelect, metaMap) {
   }
   // 有 option 子项时才挂 listbox 身份
   listEl.setAttribute("role", "listbox");
-  listEl.setAttribute("aria-label", "运行列表");
+  listEl.setAttribute("aria-label", "项目与对话");
   // 空态留下的占位节点不属于 patchList 管辖，先清掉
   const placeholder = listEl.querySelector(".run-list-empty");
   if (placeholder) placeholder.remove();
 
-  // V-32：按工作目录分组。只有一个组时**自动摊平**——凭空多一层标题
-  // 只会增加噪声，层级要在真有多个项目时才出现。
+  // V-32/R6：始终按工作目录分组。此前只有一个目录时自动摊平，但这会让
+  // 同一套侧栏在「一个项目」与「两个项目」之间突然变结构，也把最重要的
+  // 工具圈禁边界藏掉。项目 → 对话现在是稳定的信息架构，不随数量漂移。
   const groups = groupRunsByWorkdir(runs);
-  const grouped = groups.length > 1;
 
   // 分组时用 listbox > group > option（ARIA 1.2 允许的结构）。
-  // 摊平时组容器不出现，option 直接挂在 listbox 下。
-  patchList(listEl, grouped ? groups : [{ key: "", label: "", runs }], {
+  patchList(listEl, groups, {
     key: (g) => g.key,
     create: (g) => {
       const box = document.createElement("div");
       box.className = "run-group";
-      if (g.key) {
-        box.setAttribute("role", "group");
-        box.setAttribute("aria-label", g.label);
-        box.innerHTML = '<div class="run-group-label"></div><div class="run-group-items"></div>';
-        setText(box.querySelector(".run-group-label"), g.label);
-      } else {
-        box.innerHTML = '<div class="run-group-items"></div>';
-      }
+      box.setAttribute("role", "group");
+      box.setAttribute("aria-label", g.label);
+      box.innerHTML =
+        '<div class="run-group-label">' +
+        '<span class="run-group-identity"><i class="ph ph-folder-simple" aria-hidden="true"></i><span class="run-group-name"></span></span>' +
+        '<span class="run-group-count"></span>' +
+        '</div><div class="run-group-items"></div>';
+      patchRunGroupHeader(box, g);
       patchRunItems(box.querySelector(".run-group-items"), g.runs, metaMap, selectedRunId, onSelect);
       return box;
     },
     update: (box, g) => {
-      if (g.key) setText(box.querySelector(".run-group-label"), g.label);
+      patchRunGroupHeader(box, g);
       patchRunItems(box.querySelector(".run-group-items"), g.runs, metaMap, selectedRunId, onSelect);
     },
   });
+}
+
+function patchRunGroupHeader(box, group) {
+  const label = box.querySelector(".run-group-label");
+  setText(box.querySelector(".run-group-name"), group.label);
+  setText(box.querySelector(".run-group-count"), String(group.runs.length));
+  setAttr(label, "title", group.key === "(default)" ? "默认工作目录" : group.key);
 }
 
 /**
@@ -1825,13 +2085,14 @@ function patchRunItems(host, runs, metaMap, selectedRunId, onSelect) {
         '<div class="run-item-status">' +
         '<span class="status-dot"></span>' +
         // 未读星：跑完了但还没看过。放在状态行最前，扫一眼列表就知道哪条有新结果
-        '<span class="run-item-unread" hidden aria-label="已完成，尚未查看">★</span>' +
+        '<span class="run-item-unread" hidden aria-label="已完成，尚未查看"><i class="ph ph-sparkle" aria-hidden="true"></i></span>' +
         '<span class="verify-badge" hidden>核查</span>' +
         '<span class="run-item-verdict" hidden></span>' +
         '<span class="run-item-state-label"></span>' +
         "</div>" +
         '<div class="run-item-task"></div>' +
         '<div class="run-item-meta">' +
+        '<span class="run-item-turns"></span>' +
         '<span class="run-item-time"></span>' +
         '<span class="run-item-duration"></span>' +
         "</div>";
@@ -1869,10 +2130,11 @@ function updateRunItem(el, r, metaMap, selectedRunId) {
 
   const verdictEl = el.querySelector(".run-item-verdict");
   const conclusion = meta ? meta.verdictConclusion : null;
-  const marks = { passed: "✓", failed: "✗", pending: "⋯" };
+  const marks = { passed: "ph-check", failed: "ph-x", pending: "ph-dots-three" };
   if (conclusion && marks[conclusion]) {
     setAttr(verdictEl, "hidden", null);
-    setText(verdictEl, marks[conclusion]);
+    verdictEl.innerHTML = `<i class="ph ${marks[conclusion]}" aria-hidden="true"></i>`;
+    setAttr(verdictEl, "aria-label", conclusion === "passed" ? "核查通过" : conclusion === "failed" ? "核查未通过" : "等待核查");
     verdictEl.className = `run-item-verdict run-item-verdict--${conclusion === "passed" ? "pass" : conclusion === "failed" ? "fail" : "pending"}`;
   } else {
     setAttr(verdictEl, "hidden", "");
@@ -1882,6 +2144,7 @@ function updateRunItem(el, r, metaMap, selectedRunId) {
   // 标题是算出来的短句；完整任务原文挂 title，鼠标停一下就能看全
   setText(el.querySelector(".run-item-task"), deriveRunTitle(r.task));
   setAttr(el.querySelector(".run-item-task"), "title", r.task);
+  setText(el.querySelector(".run-item-turns"), `${Math.max(1, Number(r.conversationTurn ?? 1))} 轮`);
   setText(el.querySelector(".run-item-time"), meta ? formatTimeShort(meta.startTime) : "");
   setText(
     el.querySelector(".run-item-duration"),
@@ -1899,7 +2162,9 @@ function updateRunItem(el, r, metaMap, selectedRunId) {
  *   onBack?:()=>void,
  *   activeTab?:string,
  *   logEntries?:LogEntry[],
- *   onToggleEntry?:(seq:number)=>void
+ *   onToggleEntry?:(seq:number)=>void,
+ *   onReveal?:(path:string)=>void,
+ *   inspectPaths?:(paths:string[])=>Promise<any[]>
  * }} callbacks
  */
 export function renderRunDetail(state, callbacks) {
@@ -1936,11 +2201,17 @@ export function renderRunDetail(state, callbacks) {
    * 分"变高别动、变矮才补"两种情形，判反一次就把刚冒出来的待办推出视野。
    * 布局改对之后这段逻辑连同它的测试一起删掉了——**根因修掉，补丁就是负债**。
    */
+  patchUserQuestion(parts, faces, callbacks);
   patchPlanGate(parts, state, faces, callbacks);
   patchApprovalRail(parts, state, isRunning, callbacks);
   patchUnverifiedRail(parts, faces);
   patchLiveStrip(parts, state, isRunning, callbacks.liveText ?? "", callbacks.liveThinking ?? "");
-  patchConversation(parts, state, { text: callbacks.liveText, thinking: callbacks.liveThinking });
+  patchConversation(
+    parts,
+    state,
+    { text: callbacks.liveText, thinking: callbacks.liveThinking },
+    callbacks,
+  );
   patchDetailRail(parts, state, faces, callbacks);
   patchOutcomeCard(parts, state, overview, faces);
   patchFactorGrid(parts, faces, activeTab, callbacks);
@@ -1975,10 +2246,12 @@ export function normalizeTab(tab) {
  */
 function ensureActionDock() {
   const dock = document.getElementById("action-dock");
-  if (!dock) return { actionRail: null, planGate: null, approvals: null, approvalsDone: null, unverified: null };
+  if (!dock) return { actionRail: null, userQuestion: null, planGate: null, approvals: null, approvalsDone: null, unverified: null };
   if (!dock.querySelector(".action-rail")) {
     dock.innerHTML =
       '<div class="action-rail" hidden>' +
+      // 提问排在最前：它是**阻塞式**的，执行协程此刻正吊在 ask_user 里等答复
+      '<div class="user-question" hidden></div>' +
       // 签字位排在审批卡之前：它挂起时一个子任务都还没发射，此刻决定成本最低
       '<div class="plan-gate" hidden></div>' +
       '<div class="approval-cards" hidden></div>' +
@@ -1990,6 +2263,7 @@ function ensureActionDock() {
   return {
     dock,
     actionRail: dock.querySelector(".action-rail"),
+    userQuestion: dock.querySelector(".user-question"),
     planGate: dock.querySelector(".plan-gate"),
     approvals: dock.querySelector(".approval-cards"),
     approvalsDone: dock.querySelector(".approval-cards-done"),
@@ -2017,7 +2291,11 @@ function ensureDetailSkeleton(mainEl, state, callbacks) {
     '<span class="verify-badge" hidden>核查模式</span>' +
     // V-33：上下文水位常驻页头。压缩是不可逆的（置换掉的 tool_result 原文
     // 永不可恢复），所以"快满了"必须在第一屏就看得见，而不是要下钻才发现
-    '<button type="button" class="ctx-gauge" hidden aria-live="polite"></button>' +
+    '<button type="button" class="ctx-gauge" hidden aria-live="polite">' +
+    '<i class="ph ph-gauge" aria-hidden="true"></i>' +
+    '<span class="ctx-gauge-value"></span>' +
+    '<span class="ctx-gauge-compactions" hidden></span>' +
+    '</button>' +
     '<span class="detail-hint" hidden></span>' +
     "</div>" +
     // 装配状态条：条上是这次运行的真实装配，点开才是那句设计思想
@@ -2214,6 +2492,41 @@ export function paceReveal(m) {
   const cps = Math.max(REVEAL_MIN_CPS, backlog / REVEAL_DRAIN_SEC);
   const step = Math.ceil((cps * Math.max(0, m.dtMs)) / 1000);
   return Math.min(arrived, revealed + Math.max(1, step));
+}
+
+/**
+ * 匀速放行的**窗口换算**：全局"该显示到第几个字"→ 当前缓冲里该切几个字。
+ *
+ * 为什么需要它（2026-08-15 委托方实测：思考流到约 2000 字就停住，过一会才整块出现）：
+ * `revealed` 是一个**单调增长的绝对计数**，而直播缓冲有上限（LIVE_TEXT_CAP）
+ * 且**只留尾部**——是一个滑动窗口。用绝对计数直接去 slice 一个滑动窗口，
+ * 到达上限那一刻两件事同时发生：
+ *   ① `arrived` 不再增长（缓冲长度被钉死在上限）；
+ *   ② 于是 `revealed` 也不再变化，节拍器里 `changed` 恒为 false → **再也不重绘**。
+ * 屏幕就冻在撞上限的那一帧，直到本轮结束、turn 级 `assistant_thinking`
+ * 走正常 reducer 路径整块到达——正是"过好一会才显示"。
+ *
+ * 修法是把绝对计数与窗口分开：另记**单调累计到达字数**（不受上限影响），
+ * revealed 对它计数；这里再把它换算成窗口内的偏移。
+ *
+ * 提成纯函数放在 app.js，是因为原来那段逻辑住在 index.html——**没有任何测试
+ * 够得着它**（本仓库那条"核心可测、壳不可测的分界线就是缺陷分布线"的活标本）。
+ * 挪进来是结构性修复，不是补丁。
+ *
+ * @param {{revealed:number, precedingTotal:number, total:number, bufferLength:number}} m
+ *   revealed       全局已放行字数（paceReveal 的产物）
+ *   precedingTotal 排在本段之前的那些段的累计字数（思考在前、正文在后）
+ *   total          本段**累计**到达字数（单调，不受缓冲上限影响）
+ *   bufferLength   本段当前缓冲长度（≤ 上限）
+ * @returns {number} 该从缓冲头部切多少个字
+ */
+export function revealedWindow(m) {
+  const bufferLength = Math.max(0, m.bufferLength | 0);
+  const total = Math.max(0, m.total | 0);
+  // 已经被挤出缓冲的字数：它们早就该显示了，不该再占放行额度
+  const dropped = Math.max(0, total - bufferLength);
+  const budget = (m.revealed | 0) - Math.max(0, m.precedingTotal | 0) - dropped;
+  return Math.max(0, Math.min(bufferLength, budget));
 }
 
 /** 积压排空的时间常数。指数衰减，配合下面的收尾闸才能真的追平 */
@@ -2430,17 +2743,15 @@ function patchContextGauge(parts, ctx) {
   const tone = ctx.compactions.length > 0 ? "irreversible" : ctx.nearWatermark ? "warn" : "ok";
   el.className = `ctx-gauge ctx-gauge--${tone}`;
 
-  // 五格文本刻度：不依赖 SVG、能被屏幕阅读器念出来，也不会在窄屏里被挤没。
-  // 没配上限时**不画刻度**——五个空格看起来像"0%"，而事实是"不知道"，
-  // 用空刻度表达未知就是在说谎。这时只报绝对值。
-  const glyph =
-    pct === null
-      ? ""
-      : "▮".repeat(Math.min(5, Math.max(1, Math.ceil(pct / 20)))) +
-        "▯".repeat(5 - Math.min(5, Math.max(1, Math.ceil(pct / 20))));
-  const label = pct === null ? `上下文 ${formatTokens(ctx.lastInputTokens)}` : `${pct}%`;
-  const compacted = ctx.compactions.length > 0 ? ` ⊟${ctx.compactions.length}` : "";
-  setText(el, `${glyph ? `${glyph} ` : ""}${label}${compacted}`);
+  // 应用层操作图标统一由 Phosphor 提供；数值仍用文字直接报真值。
+  // 没配上限时只报绝对值，不画一个看似 0% 的伪水位。
+  const label = pct === null
+    ? `上下文 ${formatTokens(ctx.lastInputTokens)}`
+    : `上下文 ${pct}%`;
+  setText(el.querySelector(".ctx-gauge-value"), label);
+  const compacted = el.querySelector(".ctx-gauge-compactions");
+  setText(compacted, ctx.compactions.length > 0 ? `压缩 ${ctx.compactions.length}` : "");
+  setAttr(compacted, "hidden", ctx.compactions.length > 0 ? null : "");
 
   // 无障碍名称要说全口径与后果——光念"48%"没有信息量
   const parts2 = [
@@ -2474,6 +2785,84 @@ function patchContextGauge(parts, ctx) {
  * 决策做出后不隐藏，转成只读的审计记录留在原地——与审批卡同款口径（V-02）：
  * "我到底批没批、什么时候批的"必须刷新后还看得见。
  */
+/**
+ * §5.2 提问卡。与计划门同款口径：**阻塞式交互必须可见且可键盘操作**——
+ * 看不见就等于运行卡死了而界面上什么都没有。
+ *
+ * 三个出口都给（选项 / 自由输入 / 让它自己定），因为决定 4 说得很清楚：
+ * 不答不是错误。把「让它自己定」做成一个明确的按钮，而不是逼人关窗口，
+ * 是同一条纪律——委托方的选择要有地方表达。
+ */
+function patchUserQuestion(parts, faces, callbacks) {
+  if (!parts.userQuestion) return;
+  const q = faces.action.question;
+  if (!q || q.status !== "pending") {
+    setAttr(parts.userQuestion, "hidden", "");
+    parts.sig.userQuestion = null;
+    parts.userQuestion.innerHTML = "";
+    return;
+  }
+  const sig = signature([q.id, q.questions.map((x) => x.question + x.options.join("|")).join("§")]);
+  if (parts.sig.userQuestion === sig) return;
+  parts.sig.userQuestion = sig;
+  setAttr(parts.userQuestion, "hidden", null);
+
+  const n = q.questions.length;
+  /**
+   * 一屏答完（决定 6）。每题一组选项 + 一个自由输入，底部**一个**提交按钮——
+   * 三个正交的问题分三轮问是三次打断，一屏答完是一次。
+   * 选项用 radio 而不是按钮：选了要能看出选了哪个，还要能改主意。
+   */
+  const blocks = q.questions
+    .map((item, i) => {
+      const opts = item.options
+        .map(
+          (o, j) =>
+            `<label class="question-opt"><input type="radio" name="q-${i}" value="${esc(o)}" />` +
+            `<span>${esc(o)}</span></label>`,
+        )
+        .join("");
+      return (
+        `<fieldset class="question-item">` +
+        `<legend class="question-legend">${n > 1 ? `${i + 1}. ` : ""}${esc(item.question)}</legend>` +
+        `<div class="question-options">${opts}</div>` +
+        `<label class="question-free-label" for="q-free-${i}">或自己写</label>` +
+        `<input id="q-free-${i}" class="question-free" data-free="${i}" type="text" placeholder="不在上面的答案" />` +
+        `<p class="rail-note">不答这题就按：${esc(item.fallback)}</p>` +
+        `</fieldset>`
+      );
+    })
+    .join("");
+
+  parts.userQuestion.innerHTML =
+    '<div class="question-card">' +
+    `<h3 class="rail-title">◆ ${esc(ROLE_PERSONA.main)} 有 ${n} 个问题需要你定</h3>` +
+    blocks +
+    '<div class="question-actions">' +
+    '<button class="btn btn--allow" data-action="send">提交答复</button>' +
+    '<button class="btn" data-action="skip">都让它自己定</button>' +
+    "</div></div>";
+
+  const collect = () =>
+    q.questions.map((_, i) => {
+      const free = parts.userQuestion.querySelector(`[data-free="${i}"]`);
+      if (free && free.value.trim()) return free.value.trim();
+      const picked = parts.userQuestion.querySelector(`input[name="q-${i}"]:checked`);
+      return picked ? picked.value : null;
+    });
+
+  parts.userQuestion
+    .querySelector("[data-action='send']")
+    .addEventListener("click", () => {
+      const answers = collect();
+      // 一题都没答就等同"都让它自己定"——不让它变成一次无效往返
+      callbacks.onAnswer?.(answers.some((a) => a !== null) ? answers : null);
+    });
+  parts.userQuestion
+    .querySelector("[data-action='skip']")
+    .addEventListener("click", () => callbacks.onAnswer?.(null));
+}
+
 function patchPlanGate(parts, state, faces, callbacks) {
   const gate = faces.action.planApproval;
   if (!gate) {
@@ -2770,13 +3159,165 @@ function updateApprovalCard(card, a, isRunning) {
  * 排序刻意把核查结论放在执行者报告之前——委托方 §6 的要求是"无需展开日志
  * 即可判断结果"，而执行者的自述与核查者的裁决不是一回事，后者才是结论。
  */
+function pathWithoutLineRef(value) {
+  return String(value ?? "").trim().replace(/:\d+(?::\d+)?$/, "");
+}
+
+function pathBasename(value) {
+  const clean = pathWithoutLineRef(value).replace(/[\\/]+$/, "");
+  return clean.slice(Math.max(clean.lastIndexOf("/"), clean.lastIndexOf("\\")) + 1);
+}
+
+function joinDisplayedPath(dir, file) {
+  const clean = String(dir ?? "").replace(/[\\/]+$/, "");
+  const separator = clean.includes("\\") && !clean.includes("/") ? "\\" : "/";
+  return `${clean}${separator}${file}`;
+}
+
+/**
+ * 给每个显示值列出按优先级排列的实际探测路径。
+ *
+ * 裸文件名本身信息不足：截图里的 `index.html` 实际位于同一句已经提到的
+ * `threejs-fps-game/` 下。这里先用已确认产物的唯一 basename，再试同消息目录，
+ * 最后才试工作目录根；只有服务端 stat 成功的那一项会真正变成链接。
+ */
+export function buildLocalPathProbePlan(labels, artifactPaths = []) {
+  const uniqueLabels = [...new Set((labels ?? []).map((v) => String(v ?? "").trim()).filter(Boolean))];
+  const directories = uniqueLabels
+    .map(pathWithoutLineRef)
+    .filter((v) => /[\\/]$/.test(v));
+  const artifacts = [...new Set((artifactPaths ?? []).map((v) => String(v ?? "").trim()).filter(Boolean))];
+
+  const entries = uniqueLabels.map((label) => {
+    const target = pathWithoutLineRef(label);
+    const choices = [];
+    const hasSeparator = /[\\/]/.test(target);
+    const isDirectory = /[\\/]$/.test(target);
+    if (!hasSeparator && !isDirectory) {
+      const byBasename = artifacts.filter(
+        (path) => pathBasename(path).toLocaleLowerCase() === target.toLocaleLowerCase(),
+      );
+      if (byBasename.length === 1) choices.push(byBasename[0]);
+      for (const dir of directories) choices.push(joinDisplayedPath(dir, target));
+    }
+    choices.push(target);
+    const deduped = [...new Map(choices.map((v) => [v.toLocaleLowerCase(), v])).values()];
+    return { label, choices: deduped };
+  });
+  return {
+    entries,
+    probes: [...new Map(entries.flatMap((e) => e.choices).map((v) => [v.toLocaleLowerCase(), v])).values()],
+  };
+}
+
+function makePathIcon(name) {
+  const icon = document.createElement("i");
+  icon.className = `ph ph-${name}`;
+  icon.setAttribute("aria-hidden", "true");
+  return icon;
+}
+
+function decorateLocalPathCode(code, hit, runId) {
+  if (!code?.parentNode || !hit?.path || !hit?.kind) return;
+  const shell = document.createElement("span");
+  shell.className = `local-path-ref local-path-ref--${hit.kind}`;
+  code.classList.add("local-path-code");
+  code.removeAttribute("data-local-path");
+  code.setAttribute("data-path-state", "linked");
+
+  if (hit.kind === "file") {
+    const href = `/api/runs/${encodeURIComponent(runId)}/artifact?path=${encodeURIComponent(hit.path)}`;
+    const link = document.createElement("a");
+    link.className = "local-path-link";
+    link.href = href;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.title = `打开文件：${hit.path}`;
+    code.parentNode.insertBefore(shell, code);
+    link.append(code, makePathIcon("arrow-square-out"));
+    shell.append(link);
+
+    const reveal = document.createElement("button");
+    reveal.type = "button";
+    reveal.className = "local-path-folder";
+    reveal.dataset.pathReveal = hit.path;
+    reveal.title = "在文件夹中显示";
+    reveal.setAttribute("aria-label", `在文件夹中显示 ${hit.path}`);
+    reveal.append(makePathIcon("folder-open"));
+    shell.append(reveal);
+    return;
+  }
+
+  const open = document.createElement("button");
+  open.type = "button";
+  open.className = "local-path-link local-path-link--directory";
+  open.dataset.pathReveal = hit.path;
+  open.title = `打开文件夹：${hit.path}`;
+  open.setAttribute("aria-label", `打开文件夹 ${hit.path}`);
+  code.parentNode.insertBefore(shell, code);
+  open.append(code, makePathIcon("folder-open"));
+  shell.append(open);
+}
+
+function bindLocalPathActions(host, callbacks) {
+  if (!host) return;
+  host.__pathReveal = callbacks?.onReveal;
+  if (host.__pathActionBound) return;
+  host.__pathActionBound = true;
+  host.addEventListener("click", (event) => {
+    const target = event.target instanceof Element
+      ? event.target.closest("[data-path-reveal]")
+      : null;
+    if (!target) return;
+    event.preventDefault();
+    host.__pathReveal?.(target.getAttribute("data-path-reveal"));
+  });
+}
+
+async function hydrateLocalPathLinks(host, state, callbacks) {
+  if (!host || typeof callbacks?.inspectPaths !== "function") return;
+  bindLocalPathActions(host, callbacks);
+  const nodes = [...host.querySelectorAll('code[data-local-path]:not([data-path-state])')];
+  if (nodes.length === 0) return;
+  for (const node of nodes) node.setAttribute("data-path-state", "checking");
+
+  const labels = nodes.map((node) => node.getAttribute("data-local-path") ?? "");
+  const artifactPaths = deriveArtifacts(state).map((artifact) => artifact.path);
+  const plan = buildLocalPathProbePlan(labels, artifactPaths);
+  let inspected = [];
+  try {
+    inspected = await callbacks.inspectPaths(plan.probes.slice(0, 64));
+  } catch {
+    // 路径链接是渐进增强：宿主不可达时正文仍完整可读
+  }
+  const byInput = new Map(
+    (Array.isArray(inspected) ? inspected : [])
+      .filter((item) => item?.exists && item?.input)
+      .map((item) => [String(item.input).toLocaleLowerCase(), item]),
+  );
+  const choiceByLabel = new Map(
+    plan.entries.map((entry) => [
+      entry.label,
+      entry.choices.map((choice) => byInput.get(choice.toLocaleLowerCase())).find(Boolean) ?? null,
+    ]),
+  );
+
+  for (const node of nodes) {
+    if (!host.contains(node) || node.getAttribute("data-path-state") !== "checking") continue;
+    const label = node.getAttribute("data-local-path") ?? "";
+    const hit = choiceByLabel.get(label);
+    if (hit) decorateLocalPathCode(node, hit, state.runId);
+    else node.setAttribute("data-path-state", "plain");
+  }
+}
+
 /**
  * 对话主干的补丁。
  *
  * 签名只看 `lastSeq` 与条目数：事件流单调追加，这两个数不变就没有新内容。
  * 与日志面同款——重画整段对话会打断正在展开的 details 与用户的滚动位置。
  */
-function patchConversation(parts, state, live) {
+function patchConversation(parts, state, live, callbacks) {
   const host = parts.conversation;
   if (!host) return;
   const items = deriveChatItems(state, live);
@@ -2834,6 +3375,7 @@ function patchConversation(parts, state, live) {
     },
   });
   });
+  void hydrateLocalPathLinks(host, state, callbacks);
 }
 
 /**
@@ -3506,6 +4048,10 @@ function patchLogPanel(container, logEntries, callbacks, state) {
       },
     });
   });
+  // 工具日志同样走“语法候选 → 宿主 workdir/stat 确认 → 再升级为链接”的
+  // 渐进增强链。这里不能只靠 renderLogEntry 直接造 href：历史 run 的 workdir
+  // 可能不同，且日志正文是模型/工具输入，未经确认的路径只能继续当普通代码。
+  if (state) void hydrateLocalPathLinks(host, state, callbacks);
 }
 
 /** 编排面板：依赖分层 + 甘特 + 并行收益（V-27） */
@@ -3951,9 +4497,10 @@ function renderToolRow(it) {
   const dur = it.durationMs != null ? `<span class="aside-peek">${it.durationMs}ms</span>` : "";
   const gate = it.gated ? '<span class="chat-tool-gate" title="这一步曾等待人工放行">⚠ 经放行</span>' : "";
   const peek = esc(truncate(toolPeek(it.name, it.input), 88));
-  const body = it.result
+  const paths = renderToolPathStrip(it.input);
+  const body = paths + (it.result
     ? `<pre class="chat-body">${esc(truncate(String(it.result), 4000))}</pre>`
-    : `<pre class="chat-body">${esc(truncate(formatInput(it.input), 1200))}</pre>`;
+    : `<pre class="chat-body">${esc(truncate(formatInput(it.input), 1200))}</pre>`);
   return (
     `<details class="chat-tool${cls}">` +
     `<summary><span class="aside-mark">${mark}</span> <code>${esc(it.name ?? "")}</code> ` +
@@ -3963,6 +4510,59 @@ function renderToolRow(it) {
 
 /** 各工具的"主参数"——摘要行只说这一个，别的展开再看 */
 const TOOL_PEEK_KEYS = ["command", "path", "file_path", "url", "query", "name", "expression", "pattern"];
+
+/**
+ * 工具入参里哪些字段具有明确的“路径所有权”。
+ *
+ * 不解析 shell command：`cd a && node b.js` 不是路径，猜命令语义会把可执行文本
+ * 误画成文件。只收结构化字段；最终仍由服务端按该 run 的 workdir + stat 确认。
+ */
+const TOOL_PATH_KEY = /(?:^|_)(?:path|paths|file|files|filename|filenames|dir|dirs|directory|directories|cwd|workdir|root)(?:$|_)/i;
+
+/** @returns {string[]} */
+export function toolPathCandidates(input) {
+  const found = [];
+  const seen = new Set();
+  const add = (value) => {
+    const clean = String(value ?? "").trim();
+    const key = clean.toLocaleLowerCase();
+    if (!clean || seen.has(key) || !isLocalPathCandidate(clean)) return;
+    seen.add(key);
+    found.push(clean);
+  };
+  const visit = (value, key = "", inherited = false, depth = 0) => {
+    if (found.length >= 16 || depth > 5 || value == null) return;
+    const pathField = inherited || TOOL_PATH_KEY.test(key);
+    if (typeof value === "string") {
+      if (pathField) add(value);
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item, key, pathField, depth + 1);
+      return;
+    }
+    if (typeof value !== "object") return;
+    for (const [childKey, child] of Object.entries(value)) {
+      visit(child, childKey, pathField || TOOL_PATH_KEY.test(childKey), depth + 1);
+      if (found.length >= 16) break;
+    }
+  };
+
+  if (typeof input === "string") add(input);
+  else visit(input);
+  return found;
+}
+
+function renderToolPathStrip(input) {
+  const paths = toolPathCandidates(input);
+  if (paths.length === 0) return "";
+  return (
+    '<div class="tool-path-strip" role="group" aria-label="工具涉及的路径">' +
+    '<span class="tool-path-strip-label"><i class="ph ph-folder-simple" aria-hidden="true"></i>路径</span>' +
+    paths.map((path) => `<code data-local-path="${esc(path)}">${esc(path)}</code>`).join("") +
+    "</div>"
+  );
+}
 
 export function toolPeek(name, input) {
   if (input === null || input === undefined) return "";
@@ -4165,6 +4765,24 @@ function renderOverviewTab(overview, state) {
     html += `</div>`;
   }
 
+  // finish_task 的证据字段必须在 UI 可见；只显示 summary 会把结构化契约又压回散文。
+  if (overview.completion) {
+    const groups = [
+      ["产物", overview.completion.artifacts],
+      ["验证", overview.completion.verification],
+      ["关键假设", overview.completion.assumptions],
+    ].filter(([, items]) => Array.isArray(items) && items.length > 0);
+    if (groups.length > 0) {
+      html += `<div class="overview-section"><h3 class="overview-section-title">结构化交付</h3>`;
+      for (const [label, items] of groups) {
+        html += `<div class="overview-summary-text"><strong>${esc(label)}</strong><ul class="action-items">`;
+        for (const item of items) html += `<li>${esc(item)}</li>`;
+        html += `</ul></div>`;
+      }
+      html += `</div>`;
+    }
+  }
+
   // 验证结论
   if (overview.verdict) {
     html += renderVerdictCard(overview.verdict);
@@ -4173,7 +4791,8 @@ function renderOverviewTab(overview, state) {
   // 需介入事项
   const hasActionItems =
     overview.actionItems.pendingApprovals.length > 0 ||
-    overview.actionItems.unverifiedItems.length > 0;
+    overview.actionItems.unverifiedItems.length > 0 ||
+    overview.actionItems.blockers.length > 0;
   if (hasActionItems) {
     html += `<div class="overview-section overview-section--action">`;
     html += `<h3 class="overview-section-title">⚠ 需介入事项</h3>`;
@@ -4183,6 +4802,9 @@ function renderOverviewTab(overview, state) {
     }
     for (const u of overview.actionItems.unverifiedItems) {
       html += `<li class="action-item action-item--unverified">⋯ 待复核：${esc(u)}</li>`;
+    }
+    for (const blocker of overview.actionItems.blockers) {
+      html += `<li class="action-item action-item--unverified">⋯ 未完成/阻塞：${esc(blocker)}</li>`;
     }
     html += `</ul>`;
     html += `</div>`;
@@ -4229,11 +4851,17 @@ function renderLogEntry(e) {
   if (e.type === "tool_result" && e.resultIsError) cls += " log-entry--error";
   if (e.type === "approval_request") cls += " log-entry--approval";
   if (e.type === "api_retry") cls += " log-entry--warning";
+  if (e.type === "recovery_decision") cls += " log-entry--warning";
+  if (e.type === "run_forked") cls += " log-entry--warning";
   if (e.type === "compaction") cls += " log-entry--warning";
   if (collapsed) cls += " log-entry--collapsed";
 
+  // 折叠的工具调用也必须看得到路径入口：路径条独立于 body，避免用户为了打开
+  // 一个文件先展开整块 JSON；同时避开在 role=button 的 header 里嵌套链接。
+  const pathHtml = e.type === "tool_call" ? renderToolPathStrip(e.input) : "";
   return `<div class="${cls}" data-seq="${e.seq}">
     ${headerHtml}
+    ${pathHtml}
     ${bodyHtml}
   </div>`;
 }
@@ -4283,6 +4911,21 @@ function renderLogEntryBody(e) {
       return `<div class="log-entry-body">原因：${esc(e.reason ?? "")}${
         typeof e.backoffMs === "number" ? `<br>退避等待：${esc(formatDuration(e.backoffMs))}（含抖动）` : ""
       }</div>`;
+    case "recovery_decision":
+      return `<div class="log-entry-body">${esc(e.detail ?? "")}${
+        typeof e.extraTurns === "number" ? `<br>追加额度：${esc(String(e.extraTurns))} 轮` : ""
+      }</div>`;
+    case "run_forked": {
+      const budget = e.inheritedBudget ?? {};
+      const budgetText = [
+        budget.maxTurns != null ? `轮次 ${budget.usedTurns ?? 0}/${budget.maxTurns}` : `已用轮次 ${budget.usedTurns ?? 0}`,
+        budget.maxTokens != null ? `token ${budget.usedTokens ?? 0}/${budget.maxTokens}` : `已用 token ${budget.usedTokens ?? 0}`,
+      ].join("；");
+      return `<div class="log-entry-body">${esc(e.boundary ?? "")}` +
+        `<br>直接父运行：<code>${esc(e.parentRunId ?? "")}</code>` +
+        `<br>继承总账：${esc(budgetText)}` +
+        `${Array.isArray(e.reset) && e.reset.length ? `<br>已重置：${esc(e.reset.join("、"))}` : ""}</div>`;
+    }
     case "compaction":
       return `<div class="log-entry-body">丢弃 ${e.droppedBlocks ?? "?"} 个块</div>`;
     default:
@@ -4308,6 +4951,8 @@ function entryIcon(type, isError) {
     case "approval_request": return "⚠"; // cli.ts:539
     case "api_retry": return "⟳";        // cli.ts:563
     case "segment_resume": return "⟲";   // 与 ⟳(同轮重试) 区分：这是整段续跑
+    case "recovery_decision": return "⤷";
+    case "run_forked": return "↗";
     // CLI 对压缩也用 ⚠，这里刻意分开：V-19 要求不可逆自成语域，
     // 与普通警告共用符号会让人对它脱敏
     case "compaction": return "⊟";
@@ -4330,6 +4975,16 @@ function entryActionLabel(e) {
     case "approval_request": return `审批请求：${e.name ?? ""}`;
     case "api_retry": return `API 重试（第${e.attempt ?? "?"}次）`;
     case "segment_resume": return `瞬时失败后带正史续跑（已完成 ${e.priorTurns ?? "?"} 轮）`;
+    case "recovery_decision": {
+      const labels = {
+        request_completion: "要求业务收口",
+        continue_with_context: "同上下文有界续跑",
+        change_strategy: "检测停滞，要求换策略",
+        force_completion: "强制结构化收口",
+      };
+      return labels[e.action] ?? "恢复路由";
+    }
+    case "run_forked": return "从归档检查点派生";
     case "compaction": return "上下文压缩";
     case "usage": return "本轮用量";
     case "user_message": return `追加指令（第 ${e.turn ?? "?"} 轮对话）`;
@@ -4350,6 +5005,10 @@ function entryDetail(e) {
       return truncate(formatInput(e.input), 60);
     case "api_retry":
       return e.reason ?? "";
+    case "recovery_decision":
+      return e.detail ?? e.reason ?? "";
+    case "run_forked":
+      return e.boundary ?? "";
     case "user_message":
       return truncate(e.text ?? "", 80);
     default:
@@ -4422,13 +5081,26 @@ function renderVerifyTab(state, face) {
      * （措辞避开"核查"+"过程"连写：那是 v1 的旧标签名，AC7 文案门禁仍在禁它。）
      */
     const recoveries = face.rounds.map((r) => r.recovery).filter(Boolean);
-    if (recoveries.length > 0 && recoveries.some((r) => r !== "direct")) {
-      const label = { direct: "首轮直接给出", wrapup: "预算用尽后收口续跑救回", reformat: "重问转写救回", failed: "兜底未救回（fail-closed）" };
+    /**
+     * §2.1 之后**健康路径有两条**：tool（走终结工具交付，新的理想路径）与
+     * direct（末条消息恰好可解析，端点不认强制工具时的形态）。
+     * 这个集合必须跟着 VerdictRecovery 走——漏一个值，那条运行就会被界面
+     * 说成"收口不稳"，而它其实一切正常（V-04：界面不得对委托方说谎）。
+     */
+    const HEALTHY_RECOVERY = new Set(["tool", "direct"]);
+    if (recoveries.length > 0 && recoveries.some((r) => !HEALTHY_RECOVERY.has(r))) {
+      const label = {
+        tool: "首轮直接交付（结构化）",
+        direct: "首轮直接给出",
+        wrapup: "预算用尽后收口续跑救回",
+        reformat: "重问转写救回",
+        failed: "兜底未救回（fail-closed）",
+      };
       html += '<h3 class="overview-section-title">裁决获得路径</h3><ul class="unverified-list">';
       html += face.rounds
         .map((r, i) => `<li>第 ${r.round ?? i} 轮：${esc(label[r.recovery] ?? String(r.recovery ?? "—"))}</li>`)
         .join("");
-      html += "</ul><p class=\"rail-note\">非「首轮直接给出」说明核查者收口不稳——问题出在核查这一环，不是产物本身。</p>";
+      html += "</ul><p class=\"rail-note\">有轮次靠兜底才拿到裁决，说明核查者收口不稳——问题出在核查这一环，不是产物本身。</p>";
     }
 
     html += '<h3 class="overview-section-title">核查者的边界</h3><dl class="boundary-list">';
@@ -4518,22 +5190,25 @@ export const EXAMPLE_TASKS = [
 export function renderEmptyState(hasRuns) {
   const mainEl = document.getElementById("main-area");
   if (!mainEl) return;
-  if (hasRuns) {
-    mainEl.innerHTML =
-      '<div class="empty-state"><div class="empty-icon">◌</div>' +
-      "<p>选择左侧运行查看详情，或在下面写一个新任务。</p></div>";
-    return;
-  }
+  const icons = ["ph-chats-circle", "ph-file-plus", "ph-code"];
   mainEl.innerHTML =
-    '<div class="empty-state">' +
-    '<div class="empty-icon">◌</div>' +
-    "<p>还没有运行。试试这些——点一下会填进下面的输入框，你确认后再提交。</p>" +
+    '<div class="empty-state empty-state--welcome">' +
+    '<div class="empty-icon" aria-hidden="true"><i class="ph ph-chat-centered-dots"></i></div>' +
+    '<span class="empty-eyebrow">HARNESS WORKSPACE</span>' +
+    `<h2>${hasRuns ? "开始一段新对话" : "从一个明确目标开始"}</h2>` +
+    `<p>${hasRuns
+      ? "工作目录决定工具可触碰的边界；选好项目与角色模型，再把目标交给 Agent。"
+      : "先选工作目录与角色模型，再描述目标。下面的例子只会填入输入框，由你确认后提交。"}</p>` +
     '<ul class="example-tasks">' +
     EXAMPLE_TASKS.map(
-      (e) =>
+      (e, index) =>
         `<li><button type="button" class="example-task" data-example="${esc(e.text)}">` +
+        `<i class="ph ${icons[index] ?? "ph-chat"}" aria-hidden="true"></i>` +
+        '<span class="example-copy">' +
         `<span class="example-label">${esc(e.label)}</span>` +
-        `<span class="example-text">${esc(e.text)}</span></button></li>`,
+        `<span class="example-text">${esc(e.text)}</span></span>` +
+        '<i class="ph ph-arrow-up-right example-arrow" aria-hidden="true"></i>' +
+        "</button></li>",
     ).join("") +
     "</ul></div>";
 }

@@ -1,12 +1,16 @@
 import { describe, expect, it } from "vitest";
 import type Anthropic from "@anthropic-ai/sdk";
 import { runVerified } from "../src/orchestrate.js";
+import { FINISH_TASK_TOOL_NAME, withTaskCompletion } from "../src/task-completion.js";
 import {
   DEFAULT_VERIFIER_MAX_TURNS,
   VERIFIER_WRAPUP_MAX_TURNS,
   VERDICT_PARSE_FAIL,
+  VERDICT_TOOL_NAME,
+  createVerdictTool,
   parseVerdict,
   runVerifier,
+  verdictFromToolInput,
 } from "../src/verifier.js";
 import { PACKS } from "../src/presets.js";
 import type { ModelClient, ModelRequest, ModelTurn } from "../src/types.js";
@@ -182,6 +186,34 @@ describe("runVerifier", () => {
 });
 
 describe("runVerified（编排：执行 → 核查 → 返工）", () => {
+  it("执行者只调用 finish_task 时，结构化摘要/产物/验证仍进入 verifier 任务书", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("finish", FINISH_TASK_TOOL_NAME, {
+        status: "completed",
+        summary: "生成了桌面 UI",
+        artifacts: ["ui/app.ts"],
+        verification: ["npm test 通过"],
+        assumptions: [],
+        blockers: [],
+      })], "tool_use"),
+      fakeMessage([toolUseBlock("verdict", VERDICT_TOOL_NAME, {
+        passed: true,
+        issues: [],
+        unverified: [],
+        advisory: [],
+        summary: "通过",
+      })], "tool_use"),
+    ]);
+    const cfg = withTaskCompletion({ ...baseConfig, tools: [] });
+    const outcome = await runVerified(cfg, model, "实现 UI", { maxReworks: 0 });
+
+    expect(outcome.finalPassed).toBe(true);
+    const verifierInput = JSON.stringify(model.requests[1]!.messages);
+    expect(verifierInput).toContain("生成了桌面 UI");
+    expect(verifierInput).toContain("ui/app.ts");
+    expect(verifierInput).toContain("npm test 通过");
+  });
+
   /** 按调用顺序分派给 main/verifier/rework 的脚本模型 */
   class ScriptedClient implements ModelClient {
     requests: ModelRequest[] = [];
@@ -605,11 +637,17 @@ describe("预算用尽后的收口（案例 #8 的 9.7 / 9.2）", () => {
     expect(flat).toContain("独立验证员");
     expect(flat).toContain("tu_1");
     expect(flat).toContain("tu_3");
-    // B0b：收口段结构化禁工具——调查轮不带、收口轮必须带（提示挡不住"继续取证"）
-    expect(reqs[0]!.toolChoice).toBeUndefined();
-    expect(wrapUp.toolChoice).toBe("none");
-    // 且收口提示明确禁止继续取证
-    expect(flat).toContain("不要再调用任何工具");
+    /**
+     * 收口段不许继续取证——**判据不变，承载物换了**（C2 的迁移纪律）。
+     * B0b 的承载物是 `toolChoice:"none"`（只说得出"别调工具"）；
+     * §2.1 换成强制终结工具，它把两件事一起给：唯一可调的就是交付工具，
+     * 且必须交付。是收紧不是放宽——旧断言在新承载物下逐条对得上。
+     */
+    expect(reqs[0]!.toolChoice, "调查轮不设约束：那时就该自由取证").toBeUndefined();
+    expect(wrapUp.toolChoice).toEqual({ type: "tool", name: VERDICT_TOOL_NAME });
+    // 且收口提示明确禁止继续取证、点名交付口
+    expect(flat).toContain("不要再取证");
+    expect(flat).toContain(VERDICT_TOOL_NAME);
     expect(flat).toContain("不得因为没查完就判 failed");
   });
 
@@ -811,5 +849,87 @@ describe("裁决获得路径（recovery）", () => {
     ]);
     const outcome = await runVerified({ ...baseConfig, tools: [] }, model, "任务");
     expect(outcome.verifications[0]!.recovery).toBe("direct");
+  });
+});
+
+describe("§2.1 结构化交付：裁决走终结工具", () => {
+  const probeCfg = { ...baseConfig, tools: [makeTool({ name: "probe" })], maxTurns: 50 };
+
+  /**
+   * 判据（台账 52 次裁决，2026-08-15）：direct 28.8% / wrapup 69.2% / reformat 1.9%。
+   * backlog 原案 `response_format` 治的是 reformat 那 1.9%；这一组锁的是那 69.2%——
+   * "停止取证、开始下结论"这个转换在自由文本契约下没有着力点，工具给了它一个。
+   */
+  it("首轮调用 submit_verdict → recovery=tool，裁决从入参直接取", async () => {
+    const model = new FakeModelClient([
+      fakeMessage(
+        [
+          toolUseBlock("tu_1", VERDICT_TOOL_NAME, {
+            passed: true,
+            issues: [],
+            unverified: ["AC3 缺手段"],
+            summary: "客观项全过",
+          }),
+        ],
+        "tool_use",
+      ),
+    ]);
+    const outcome = await runVerifier({ ...probeCfg }, model, { task: "t", executorReport: "r" });
+    expect(outcome.recovery).toBe("tool");
+    expect(outcome.verdict.passed).toBe(true);
+    expect(outcome.verdict.summary).toBe("客观项全过");
+    expect(outcome.verdict.unverified).toEqual(["AC3 缺手段"]);
+  });
+
+  it("终结工具在工具面上——不在面上，tool_choice 点名它就是 400", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("tu_1", VERDICT_TOOL_NAME, { passed: true, summary: "s" })], "tool_use"),
+    ]);
+    await runVerifier({ ...probeCfg }, model, { task: "t", executorReport: "r" });
+    const names = model.requests[0]!.tools.map((t) => t.name);
+    expect(names).toContain(VERDICT_TOOL_NAME);
+  });
+
+  it("入参形状不合法 → **降级**回文本解析，不是拒绝（裁决侧的缺字段语义是降级）", async () => {
+    const model = new FakeModelClient([
+      // passed 不是布尔：端点没按 schema 兜住的情形
+      fakeMessage(
+        [
+          textBlock('{"passed": false, "issues": ["真问题"], "summary": "文本兜住了"}'),
+          toolUseBlock("tu_1", VERDICT_TOOL_NAME, { passed: "yes", summary: "坏形状" }),
+        ],
+        "tool_use",
+      ),
+    ]);
+    const outcome = await runVerifier({ ...probeCfg }, model, { task: "t", executorReport: "r" });
+    expect(outcome.recovery, "没走成工具就不该记 tool").not.toBe("tool");
+    expect(outcome.verdict.issues).toEqual(["真问题"]);
+  });
+
+  it("端点完全不认强制工具时，旧的文本契约仍然收得住（降级臂）", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([textBlock('{"passed": true, "issues": [], "summary": "纯文本裁决"}')], "end_turn"),
+    ]);
+    const outcome = await runVerifier({ ...probeCfg }, model, { task: "t", executorReport: "r" });
+    expect(outcome.recovery).toBe("direct");
+    expect(outcome.verdict.passed).toBe(true);
+  });
+
+  it("verdictFromToolInput：passed 必须是布尔，空的 unverified/advisory 不落字段", () => {
+    expect(verdictFromToolInput({ passed: "true", summary: "s" })).toBeUndefined();
+    expect(verdictFromToolInput(null)).toBeUndefined();
+    expect(verdictFromToolInput("{}")).toBeUndefined();
+    const v = verdictFromToolInput({ passed: true, summary: "s", unverified: [], advisory: [] })!;
+    expect(v).toEqual({ passed: true, issues: [], summary: "s" });
+    expect("unverified" in v, "空数组不落字段——与 parseVerdict 逐字同判").toBe(false);
+  });
+
+  it("工具的 execute 是公开面：合法入参回确认，非法入参回可操作报错而不是抛", async () => {
+    const tool = createVerdictTool();
+    const ok = await tool.execute({ passed: true, summary: "s" }, {} as never);
+    expect(ok.isError).toBeUndefined();
+    const bad = await tool.execute({ summary: "缺 passed" }, {} as never);
+    expect(bad.isError).toBe(true);
+    expect(bad.content).toContain("passed");
   });
 });

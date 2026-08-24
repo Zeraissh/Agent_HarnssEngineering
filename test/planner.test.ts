@@ -3,15 +3,22 @@ import type Anthropic from "@anthropic-ai/sdk";
 import {
   DEFAULT_PLANNER_MAX_TURNS,
   PLANNER_WRAPUP_MAX_TURNS,
+  PLAN_TOOL_NAME,
+  SHARDS_TOOL_NAME,
+  createPlanTool,
+  createShardsTool,
   parsePlan,
+  parseShardInventory,
+  planFromObject,
   runPlanner,
   runStructuredPlanner,
+  shardInventoryFromObject,
 } from "../src/planner.js";
 import { runPlanned } from "../src/orchestrate.js";
 import { PACKS } from "../src/presets.js";
 import type { DomainPack } from "../src/presets.js";
 import type { ModelClient, ModelRequest, ModelTurn } from "../src/types.js";
-import { fakeMessage, makeTool, textBlock, toolUseBlock } from "./helpers.js";
+import { FakeModelClient, fakeMessage, makeTool, textBlock, toolUseBlock } from "./helpers.js";
 
 const baseConfig = {
   systemPrompt: "shared frozen system",
@@ -204,9 +211,9 @@ describe("预算用尽后的收口（B0——9.7/9.2 的 planner 版）", () => 
     const wrapReq = model.requests[3]!;
     expect(wrapReq.messages.length).toBeGreaterThan(1);
     expect(JSON.stringify(wrapReq.messages.at(-1)!.content)).toContain("预算已经用尽");
-    // B0b：收口段结构化禁工具——调查轮不带、收口轮必须带
+    // 收口段不许继续取证——判据不变、承载物换了（B0b 的 none → §2.1 的强制交付工具）
     expect(model.requests[0]!.toolChoice).toBeUndefined();
-    expect(wrapReq.toolChoice).toBe("none");
+    expect(wrapReq.toolChoice).toEqual({ type: "tool", name: PLAN_TOOL_NAME });
   });
 
   it("结构化协议同款收口（契约换成分片清单）", async () => {
@@ -220,7 +227,8 @@ describe("预算用尽后的收口（B0——9.7/9.2 的 planner 版）", () => 
     expect(outcome.plan).toBeDefined();
     expect(outcome.recovery).toBe("wrapup");
     expect(JSON.stringify(model.requests[2]!.messages.at(-1)!.content)).toContain("分片清单");
-    expect(model.requests[2]!.toolChoice).toBe("none"); // B0b：结构化协议的收口同样禁工具
+    // 结构化协议的收口同样只许交付（承载物同上）
+    expect(model.requests[2]!.toolChoice).toEqual({ type: "tool", name: SHARDS_TOOL_NAME });
   });
 
   it("兜底都没救回 → failureSummary 带轮数与工具分布（区分「胡言乱语」与「没来得及收口」）", async () => {
@@ -333,5 +341,97 @@ describe("runPlanned（三角编排）", () => {
     });
     expect(order[0]).toBe("plan:2");
     expect(order).toContain("s1/main");
+  });
+});
+
+describe("§2.1 结构化交付：计划走终结工具", () => {
+  it("freeform：调用 submit_plan → recovery=tool，计划从入参直接取", async () => {
+    const model = new FakeModelClient([
+      fakeMessage(
+        [
+          toolUseBlock("tu_1", PLAN_TOOL_NAME, {
+            subtasks: [
+              { id: "s1", title: "抽符号", description: "抽 7 个符号", acceptance: ["7 个文件"], dependsOn: [] },
+              { id: "s2", title: "组装", description: "拼 sch", acceptance: ["ERC 0"], dependsOn: ["s1"] },
+            ],
+          }),
+        ],
+        "tool_use",
+      ),
+    ]);
+    const outcome = await runPlanner(probeCfg, model, "任务", []);
+    expect(outcome.recovery).toBe("tool");
+    expect(outcome.plan!.subtasks).toHaveLength(2);
+    expect(outcome.plan!.subtasks[1]!.dependsOn).toEqual(["s1"]);
+  });
+
+  it("structured：调用 submit_shards → recovery=tool", async () => {
+    const model = new FakeModelClient([
+      fakeMessage(
+        [
+          toolUseBlock("tu_1", SHARDS_TOOL_NAME, {
+            shards: [
+              { id: "s1", title: "A", description: "做 A", acceptance: ["a"], estTurns: 3 },
+              { id: "s2", title: "B", description: "做 B", acceptance: ["b"], estTurns: 3 },
+            ],
+          }),
+        ],
+        "tool_use",
+      ),
+    ]);
+    const outcome = await runStructuredPlanner(probeCfg, model, "任务", []);
+    expect(outcome.recovery).toBe("tool");
+    expect(outcome.inventory!.shards).toHaveLength(2);
+    // 拆不拆仍由宿主规则判定——工具交付没有把裁量还给模型
+    expect(outcome.plan!.subtasks.length).toBeGreaterThan(1);
+  });
+
+  it("非法依赖图经工具进来照样 fail-closed——强制交付不等于放宽校验", async () => {
+    const model = new FakeModelClient([
+      fakeMessage(
+        [
+          toolUseBlock("tu_1", PLAN_TOOL_NAME, {
+            subtasks: [
+              { id: "s1", title: "A", description: "a", acceptance: [], dependsOn: ["s2"] },
+              { id: "s2", title: "B", description: "b", acceptance: [], dependsOn: ["s1"] }, // 成环
+            ],
+          }),
+        ],
+        "tool_use",
+      ),
+    ]);
+    const outcome = await runPlanner(probeCfg, model, "任务", []);
+    expect(outcome.plan, "成环的图必须整份作废").toBeUndefined();
+    expect(outcome.recovery).toBe("failed");
+  });
+
+  it("两条入口共用同一份判定：planFromObject 与 parsePlan 对同一份计划同判", () => {
+    const obj = {
+      subtasks: [{ id: "s1", title: "A", description: "a", acceptance: ["x"], dependsOn: [] }],
+    };
+    expect(planFromObject(obj)).toEqual(parsePlan(JSON.stringify(obj)));
+    const bad = { subtasks: [{ id: "s1", title: "A", description: "  ", acceptance: [] }] };
+    expect(planFromObject(bad)).toBeUndefined();
+    expect(parsePlan(JSON.stringify(bad))).toBeUndefined();
+  });
+
+  it("两条入口共用同一份判定：shardInventoryFromObject 与 parseShardInventory 同判", () => {
+    const obj = { shards: [{ id: "s1", title: "A", description: "a", acceptance: [], estTurns: 2 }] };
+    expect(shardInventoryFromObject(obj)).toEqual(parseShardInventory(JSON.stringify(obj)));
+    const dupIds = {
+      shards: [
+        { id: "s1", title: "A", description: "a", acceptance: [] },
+        { id: "s1", title: "B", description: "b", acceptance: [] },
+      ],
+    };
+    expect(shardInventoryFromObject(dupIds)).toBeUndefined();
+    expect(parseShardInventory(JSON.stringify(dupIds))).toBeUndefined();
+  });
+
+  it("两个终结工具的 execute 对非法入参回可操作报错", async () => {
+    const bad = await createPlanTool().execute({ subtasks: [] }, {} as never);
+    expect(bad.isError).toBe(true);
+    const badShards = await createShardsTool().execute({ shards: [] }, {} as never);
+    expect(badShards.isError).toBe(true);
   });
 });

@@ -1,0 +1,35 @@
+groups:
+  - name: agent-harness-p0
+    rules:
+      - alert: AgentHarnessNotReady
+        expr: agent_harness_ready == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Agent Harness has remained unready for two minutes
+
+      - alert: AgentHarnessHistoryWriteFailure
+        expr: increase(agent_harness_history_errors_total[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: Agent Harness could not persist run history
+
+      - alert: AgentHarnessHighHttpErrorRate
+        expr: >-
+          sum(rate(agent_harness_http_responses_total{status=~"5.."}[5m]))
+          / clamp_min(sum(rate(agent_harness_http_requests_total[5m])), 0.001) > 0.01
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Agent Harness HTTP 5xx rate is above one percent
+
+      - alert: AgentHarnessSecurityRejectionsSpike
+        expr: increase(agent_harness_security_rejections_total{reason=~"origin|host|auth"}[5m]) > 10
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: Agent Harness is rejecting an unusual number of untrusted requests

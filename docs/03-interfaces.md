@@ -106,6 +106,9 @@ interface ContextManager {
   /** loop 每轮喂入实际 usage —— compact 的触发依据（上一轮 input+cacheW+cacheR） */
   noteUsage(usage: Anthropic.Usage): void;
 
+  /** 最近一轮实际输入水位；持久化检查点恢复首请求的 compact 判据 */
+  checkpointInputTokens(): number;
+
   /**
    * v0.3 实现：上一轮输入超过 contextTokenLimit 的 80% 时，把保护窗口
    * （protectRecent，默认 6 条）之外的大体积 tool_result 内容置换为占位文本。
@@ -134,11 +137,14 @@ interface AgentConfig {
   tools: Tool[];
   effort?: "low" | "medium" | "high" | "xhigh";   // 默认 "high"
   maxTokens?: number;                     // 默认 64000（流式）
-  maxTurns?: number;                      // 默认 50，硬护栏
-  maxTokensBudget?: number;               // 可选：整个 run 的累计 token 上限
+  maxTurns?: number;                      // 默认 50，单执行段护栏
+  maxTotalTurns?: number;                 // 可选：continuation/返工共用的总轮次上限
+  maxTokensBudget?: number;               // 可选：整个执行 lineage 的累计 token 上限
+  runBudget?: SharedRunBudget;             // 宿主注入：跨 AgentLoop 实例共享同一总账
   workdir: string;
   compat?: boolean;                       // 第三方 Anthropic 兼容端点：去掉 Claude 专属参数
   contextTokenLimit?: number;             // 触发 compact 的上下文上限，默认 150000
+  initialContextInputTokens?: number;     // 从持久化检查点恢复的上一轮输入水位
   dynamicContext?: Record<string, string>; // 易变信息（时间/环境）注入首条 user 消息
 }
 
@@ -154,7 +160,27 @@ type TurnEvent =
       respond: (decision: "allow" | "deny", reason?: string) => void }
   | { type: "usage"; turn: number; usage: Anthropic.Usage }
   | { type: "compaction"; droppedBlocks: number }
+  | { type: "recovery_decision";
+      reason: "end_turn_without_completion" | "max_tokens_without_completion" | "max_turns" | "stagnation";
+      action: "request_completion" | "continue_with_context" | "change_strategy" | "force_completion";
+      detail: string; extraTurns?: number }
   | { type: "done"; result: AgentRunResult };
+
+interface SharedRunBudget {
+  maxTurns?: number;
+  maxTokens?: number;
+  usedTurns: number;
+  usedTokens: number;
+}
+
+interface TaskCompletion {
+  status: "completed" | "partial" | "blocked";
+  summary: string;
+  artifacts: string[];
+  verification: string[];
+  assumptions: string[];
+  blockers: string[];
+}
 
 interface AggregateUsage {
   inputTokens: number;            // 未缓存部分
@@ -169,15 +195,21 @@ interface AggregateUsage {
 interface AgentRunResult {
   /**
    * 具名值全集与分层以 src/types.ts 的 STOP_REASONS 为准（三处口径一致锁的
-   * 事实源，test/ui-app.test.ts 有逐值锁）。loop 只发射下面七值；
+   * 事实源，test/ui-app.test.ts 有逐值锁）。loop 只发射下面十一值；
    * `"plan_rejected"` 与 `"plan_gate_expired"` 是 run 级值，由 Web 宿主在
    * 计划确认门路径写入，不会出现在这里。
    */
-  stopReason: "completed" | "max_tokens" | "max_turns" | "budget_exhausted"
-    | "refusal" | "aborted" | "error";
+  stopReason: "completed" | "partial" | "blocked" | "incomplete" | "stalled"
+    | "max_tokens" | "max_turns" | "budget_exhausted" | "refusal" | "aborted" | "error";
   /** 完整会话历史（SDK 类型），可用于持久化或子代理接力 */
   messages: Anthropic.MessageParam[];
   usage: AggregateUsage;
+  /** finish_task 的结构化交付；预算/中止/协议失败等路径可能缺省 */
+  completion?: TaskCompletion;
+  /** 当前执行 lineage 的累计总账快照 */
+  runBudget?: SharedRunBudget;
+  /** 最后一轮实际输入水位；宿主与 transcript 段号一起写入检查点 */
+  contextInputTokens?: number;
   /** stopReason = "error" 时的宿主级错误（API 不可达等；工具错误不会出现在这里） */
   error?: Error;
 }
@@ -193,6 +225,12 @@ interface AgentLoop {
   run(userInput: string, signal?: AbortSignal): AsyncIterable<TurnEvent>;
 }
 ```
+
+Web 归档续跑契约：`POST /api/runs/:id/messages` 对进程内 live run 返回同一 `runId`
+（`continuationMode: "same"`）；对带完整检查点的 archived run 创建并返回新的子
+`runId`（`continuationMode: "fork"`、`continuedFrom`、`rootRunId`）。父归档不追加
+事件。子 run 首条 durable 事件为 `run_forked`；当前宿主的模型/工具/策略重新装配，
+审批状态重置，共享预算的已用量延续，旧/新上限取更严格者。
 
 ---
 
@@ -258,5 +296,6 @@ function createMemoryTools(store: MemoryStore): Tool[];
 1. **完整 push assistant content**：每轮把 `ModelTurn.message.content` 原样加入历史——丢弃 tool_use / thinking 块会导致下一次请求 400 或行为退化。
 2. **tool_result 单条合并**：一轮内所有 ToolResult（含 error 的）合并为一条 user 消息；每个 `tool_use_id` 必须有且仅有一个对应 result。
 3. **审批语义**：`approval_request` 的 `respond("deny", reason)` 不终止循环——生成 `is_error: true` 的 tool_result（内容含 reason）回传模型。
-4. **护栏优先级**：轮数/预算检查发生在每次模型调用**之前**；触发时不再发请求，直接以对应 stopReason 收尾并发 done 事件。
+4. **护栏优先级**：轮数/预算检查发生在每次模型调用**之前**；`maxTurns` 约束单段，`runBudget` 约束 continuation/返工共用总账。共享轮次在发送前预占；token 按完整响应结算，显式 token 上限会串行化同一总账下的模型调用，允许最后一次响应自然越界，但禁止并发轨基于旧余额同时起跑。触发时以对应 stopReason 收尾并发 done 事件。
 5. **compact 触发点**：由 loop 在 render 前根据累计输入 token 估算决定是否调用 `compact()`；触发时发 `compaction` 事件保证可观测。
+6. **业务完成不等于 wire 结束**：启用完成门时，`end_turn` / `stop_sequence` 只表示本次生成结束；只有合法 `finish_task` 才能产生 `"completed"`、`"partial"` 或 `"blocked"`。重复文字收尾会被路由到有界强制收口，不能标绿。

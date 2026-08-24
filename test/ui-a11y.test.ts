@@ -262,6 +262,65 @@ describe("axe 自动扫描：空态 / 列表 / 详情三种画面零 violations"
     const violations = await runAxe();
     expect(violations, JSON.stringify(violations, null, 2)).toEqual([]);
   });
+
+  /**
+   * §5.2：提问卡与计划门同族，但**阻塞得更死**——执行协程正吊在 ask_user 的
+   * execute 里等这一下。读屏/键盘用不了它，运行就永远停在那儿。
+   * 而且它比计划门多一个自由输入框，那是最容易漏 label 的地方。
+   */
+  it("需求澄清提问挂起态零 violations（含自由输入框的 label）", async () => {
+    let s = createInitialState("run-q", "配一块板", false);
+    let n = 0;
+    const push = (source: string, event: Record<string, unknown>) => {
+      s = reduceEvent(s, { seq: n++, source, event });
+    };
+    push("host", { type: "turn_start", turn: 1 });
+    // 委托方实测场景（决定 6）：一次打断带一组正交问题，一屏答完
+    push("host", {
+      type: "user_question_request",
+      id: "q7",
+      questions: [
+        {
+          question: "桌面端用哪个框架？",
+          options: ["Electron", "Tauri"],
+          fallback: "默认 Tauri（体积小、已有 Rust 工具链）",
+        },
+        {
+          question: "UI 风格跟现有 Web 宿主一致，还是重做？",
+          options: ["沿用现有暗色系", "重做一套"],
+          fallback: "默认沿用现有暗色系",
+        },
+        {
+          question: "这次做到什么程度？",
+          options: ["可运行骨架", "核心页面齐全", "对齐 Web 全功能"],
+          fallback: "默认做到可运行骨架",
+        },
+      ],
+      at: 1000,
+    });
+
+    renderRunDetail(s, { activeTab: "loop", harness: FAKE_HARNESS });
+
+    openDrawer();
+    // 先确认它真的渲染了——否则这条会变成"什么都没扫也算通过"的假绿
+    expect(document.querySelector(".user-question")?.hasAttribute("hidden")).toBe(false);
+    /**
+     * **坞和栏要一起显**。这不是多余的断言：变异测试实测，把提问从
+     * needsAttention 里拿掉时，卡片自身照样 hidden=false，但外层的坞仍盖着——
+     * 于是整块「需你决定」一个像素都看不见，而运行正吊着等这一下。
+     * 那正是 app.js 里那段注释警告过的接线，只有连坞一起断言才拦得住。
+     */
+    expect(document.getElementById("action-dock")?.hasAttribute("hidden")).toBe(false);
+    expect(document.querySelector(".action-rail")?.hasAttribute("hidden")).toBe(false);
+    // 三题各自成块，每块一组 radio + 一个自由输入；底部只有两个按钮
+    expect(document.querySelectorAll(".user-question fieldset")).toHaveLength(3);
+    expect(document.querySelectorAll(".user-question button")).toHaveLength(2);
+    expect(document.querySelectorAll('.user-question input[type="radio"]')).toHaveLength(7);
+    expect(document.querySelectorAll('.user-question input[type="text"]')).toHaveLength(3);
+
+    const violations = await runAxe();
+    expect(violations, JSON.stringify(violations, null, 2)).toEqual([]);
+  });
 });
 
 describe("运行列表的 ARIA 语义（真实 DOM 断言，取代原先的源码字符串扫描）", () => {
@@ -499,10 +558,10 @@ describe("环境边界声明（防止把 incomplete 误当通过）", () => {
 });
 
 // ================================================================
-// v2 R5：双主题下的结构语义（V-20）
+// v2 R5：多主题下的结构语义（V-20）
 // ================================================================
 
-describe("双主题：data-theme 切换不改变结构语义", () => {
+describe("多主题：data-theme 切换不改变结构语义", () => {
   const SCREENS: [string, () => void][] = [
     ["空态", () => renderEmptyState(false)],
     [
@@ -535,7 +594,7 @@ describe("双主题：data-theme 切换不改变结构语义", () => {
   // 主题只改颜色不改结构；但"只改颜色"是需要被证明的，不是假设的。
   // jsdom 不判对比度（那由 ui-app.test.ts 的 WCAG 实算守护），这里守的是
   // 换主题后 ARIA 结构、地标、名称计算不发生任何漂移。
-  for (const theme of ["light", "dark"] as const) {
+  for (const theme of ["light", "dark", "graphite", "contrast"] as const) {
     describe(`${theme} 主题`, () => {
       it.each(SCREENS)("%s 零 violations", async (_name, render) => {
         document.documentElement.setAttribute("data-theme", theme);
@@ -546,7 +605,7 @@ describe("双主题：data-theme 切换不改变结构语义", () => {
     });
   }
 
-  it("切换主题不改变可访问性树（同一画面两套主题的 ARIA 快照一致）", () => {
+  it("切换主题不改变可访问性树（同一画面各主题的 ARIA 快照一致）", () => {
     const snapshot = (theme: string) => {
       document.documentElement.setAttribute("data-theme", theme);
       document.body.innerHTML = loadSkeleton();
@@ -563,7 +622,23 @@ describe("双主题：data-theme 切换不改变结构语义", () => {
           ].join("|"),
         );
     };
-    expect(snapshot("dark")).toEqual(snapshot("light"));
+    const light = snapshot("light");
+    for (const theme of ["dark", "graphite", "contrast"]) {
+      expect(snapshot(theme), `${theme} 不应改变结构语义`).toEqual(light);
+    }
+  });
+
+  it("展开的主题菜单零 violations，当前项用单选语义表达", async () => {
+    document.body.innerHTML = loadSkeleton();
+    const menu = document.getElementById("theme-menu") as HTMLElement;
+    const toggle = document.getElementById("theme-toggle") as HTMLButtonElement;
+    menu.hidden = false;
+    toggle.setAttribute("aria-expanded", "true");
+    const choices = [...menu.querySelectorAll('[role="menuitemradio"]')];
+    choices.forEach((choice, index) => choice.setAttribute("aria-checked", index === 2 ? "true" : "false"));
+    expect(choices).toHaveLength(5);
+    const violations = await runAxe();
+    expect(violations, JSON.stringify(violations, null, 2)).toEqual([]);
   });
 });
 
@@ -677,8 +752,8 @@ describe("编排面板", () => {
     expect((document.getElementById("detail-rail") as HTMLElement).hidden).toBe(true);
   });
 
-  it("编排面板零 violations（两套主题）", async () => {
-    for (const theme of ["light", "dark"]) {
+  it("编排面板零 violations（全部主题）", async () => {
+    for (const theme of ["light", "dark", "graphite", "contrast"]) {
       document.body.innerHTML = loadSkeleton();
       document.documentElement.setAttribute("data-theme", theme);
       renderRunDetail(planState(), { activeTab: "loop", harness: FAKE_HARNESS });
@@ -732,6 +807,28 @@ describe("统一 composer：一个框，两种去向", () => {
     expect(m1.note).toContain("每轮重新起算");
   });
 
+  it("归档检查点显示为显式派生续跑，不冒充原进程无缝继续", () => {
+    const mode = deriveComposerMode({
+      info: {
+        ...CONTINUABLE,
+        archived: true,
+        continuationMode: "fork",
+        continuedFrom: null,
+      },
+      localStatus: "done",
+    });
+    expect(mode.mode).toBe("fork");
+    expect(mode.kind).toBe("append");
+    expect(mode.buttonLabel).toBe("从归档继续");
+    expect(mode.note).toContain("派生新运行");
+    expect(mode.note).toContain("当前宿主");
+    expect(mode.note).toContain("总预算");
+
+    patchComposer(mode);
+    expect(document.getElementById("composer-mode-label")!.textContent).toBe("从归档派生续跑");
+    expect(document.getElementById("submit-form")!.dataset.mode).toBe("fork");
+  });
+
   /**
    * `createInitialState` 把 status 初始化成 "running"——那是**默认值不是观测**。
    * 拿它当"在跑"的证据，会让点开一条早已结束的运行走出 append→running→append
@@ -764,6 +861,16 @@ describe("统一 composer：一个框，两种去向", () => {
     const plan = deriveComposerMode({ info: { ...CONTINUABLE, canContinue: false, mode: "plan" } });
     expect(plan.note).toContain("没有续跑入口");
     expect(plan.note).toContain("将新建一次运行");
+
+    const exhausted = deriveComposerMode({
+      info: {
+        ...CONTINUABLE,
+        canContinue: false,
+        continuationBlockReason: "执行谱系的总轮次预算已用尽（2/2）",
+      },
+    });
+    expect(exhausted.note).toContain("总轮次预算已用尽");
+    expect(exhausted.note).toContain("将新建一次运行");
   });
 
   it("提交在飞时按钮不可点——服务端在返回响应之前就广播了 run_created", () => {
@@ -802,7 +909,7 @@ describe("统一 composer：一个框，两种去向", () => {
 
   it("追加模式：按钮/标签/说明一起变，装配项禁用但附件仍可用", () => {
     patchComposer(deriveComposerMode({ info: CONTINUABLE, localStatus: "done" }));
-    expect(q("#submit-btn").textContent).toBe("继续对话");
+    expect(q("#submit-btn-label").textContent).toBe("继续对话");
     expect((q("#submit-btn") as HTMLButtonElement).disabled).toBe(false);
     // 可及名称不能说谎：这一刻它不是「任务描述」
     expect(q('label[for="task-input"]').textContent).toBe("追加指令");
@@ -823,7 +930,7 @@ describe("统一 composer：一个框，两种去向", () => {
       info: { ...CONTINUABLE, status: "running", canContinue: false }, localStatus: "running",
     }));
     // 从"灰着的运行任务"改成"可点的停止"：同一个位置，两种状态，不加第二个控件
-    expect(q("#submit-btn").textContent).toBe("停止");
+    expect(q("#submit-btn-label").textContent).toBe("停止");
     expect((q("#submit-btn") as HTMLButtonElement).disabled).toBe(false);
     expect((q("#task-input") as HTMLTextAreaElement).disabled).toBe(false);
     expect(q("#composer-note").textContent).toContain("等这一轮结束");
@@ -834,7 +941,7 @@ describe("统一 composer：一个框，两种去向", () => {
   it("切回新建模式时装配项解禁、说明行收起", () => {
     patchComposer(deriveComposerMode({ info: CONTINUABLE, localStatus: "done" }));
     patchComposer(deriveComposerMode({ info: null }));
-    expect(q("#submit-btn").textContent).toBe("运行任务");
+    expect(q("#submit-btn-label").textContent).toBe("运行任务");
     expect(q('label[for="task-input"]').textContent).toBe("任务描述");
     expect((q("#verify-toggle") as HTMLInputElement).disabled).toBe(false);
     expect((q("#rubric-input") as HTMLTextAreaElement).disabled).toBe(false);
@@ -906,12 +1013,12 @@ describe("统一 composer：一个框，两种去向", () => {
     expect(chat.textContent).toContain("暗号是什么？");
   });
 
-  it("composer 的两种模式各自零 violations（两套主题）", async () => {
+  it("composer 的两种模式各自零 violations（全部主题）", async () => {
     const modes = [
       deriveComposerMode({ info: CONTINUABLE, localStatus: "done" }),
       deriveComposerMode({ info: { ...CONTINUABLE, status: "running", canContinue: false }, localStatus: "running" }),
     ];
-    for (const theme of ["light", "dark"]) {
+    for (const theme of ["light", "dark", "graphite", "contrast"]) {
       for (const mode of modes) {
         document.body.innerHTML = loadSkeleton();
         document.documentElement.setAttribute("data-theme", theme);
@@ -935,10 +1042,14 @@ describe("侧栏按工作目录分组", () => {
   const runs = (dirs: string[]) =>
     dirs.map((d, i) => ({ runId: `r${i}`, task: `任务 ${i}`, status: "done", verify: false, workdir: d }));
 
-  it("只有一个工作目录时自动摊平——不制造无意义的层级", () => {
-    renderRunList(runs(["D:\\proj-a", "D:\\proj-a"]), null, () => {}, meta);
-    expect(document.querySelectorAll('#run-list [role="group"]')).toHaveLength(0);
+  it("只有一个工作目录时仍保留项目层——信息架构不随项目数量漂移", () => {
+    const list = runs(["D:\\proj-a", "D:\\proj-a"]);
+    (list[0] as any).conversationTurn = 3;
+    renderRunList(list, null, () => {}, meta);
+    expect(document.querySelectorAll('#run-list [role="group"]')).toHaveLength(1);
+    expect(document.querySelector('#run-list [role="group"]')!.getAttribute("aria-label")).toBe("proj-a");
     expect(document.querySelectorAll("#run-list .run-item")).toHaveLength(2);
+    expect(document.querySelector(".run-item-turns")!.textContent).toBe("3 轮");
   });
 
   // 两种分隔符都要覆盖：宿主主要跑在 Windows（反斜杠），但路径也可能是 posix 风格。
@@ -1021,7 +1132,7 @@ describe("常驻上下文水位", () => {
     openDrawer();
     const g = document.querySelector(".ctx-gauge")!;
     expect(g.classList.contains("ctx-gauge--irreversible")).toBe(true);
-    expect(g.textContent).toContain("⊟2");
+    expect(g.textContent).toContain("压缩 2");
     expect(g.getAttribute("aria-label")).toContain("不可恢复");
   });
 
@@ -1051,15 +1162,19 @@ describe("常驻上下文水位", () => {
     expect(g.getAttribute("aria-label")).toContain("未配置上限");
   });
 
-  it("配了上限时才画刻度，格数随水位增长", () => {
+  it("配了上限时用统一图标 + 百分比报水位，不用文本方块模拟图形", () => {
     const H2 = { ...FAKE_HARNESS, guardrails: { ...FAKE_HARNESS.guardrails, contextTokenLimit: 1000 } };
     renderRunDetail(stateWithUsage(150), { activeTab: "loop", harness: H2 });
     openDrawer();
-    const low = document.querySelector(".ctx-gauge")!.textContent!;
+    const low = document.querySelector(".ctx-gauge")!;
+    expect(low.querySelector(".ph-gauge")).toBeTruthy();
+    expect(low.textContent).toContain("15%");
+    expect(low.textContent).not.toMatch(/[▮▯]/);
     document.body.innerHTML = loadSkeleton();
     renderRunDetail(stateWithUsage(950), { activeTab: "loop", harness: H2 });
     openDrawer();
-    const high = document.querySelector(".ctx-gauge")!.textContent!;
-    expect((low.match(/▮/g) ?? []).length).toBeLessThan((high.match(/▮/g) ?? []).length);
+    const high = document.querySelector(".ctx-gauge")!;
+    expect(high.querySelector(".ph-gauge")).toBeTruthy();
+    expect(high.textContent).toContain("95%");
   });
 });

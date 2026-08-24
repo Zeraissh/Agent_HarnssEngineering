@@ -6,9 +6,9 @@ import { createServer, type IncomingMessage, type ServerResponse, type Server } 
 import { readFile, writeFile, mkdir, stat } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { join, extname, dirname, delimiter, resolve, basename, sep } from "node:path";
+import { join, extname, dirname, delimiter, resolve, basename, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { AgentLoop } from "../src/loop.js";
 import {
   runVerified,
@@ -26,6 +26,11 @@ import { resolvePlannerMaxTurns } from "../src/planner.js";
 import type { Plan, SubTask } from "../src/planner.js";
 import type Anthropic from "@anthropic-ai/sdk";
 import { bashTool, SHELL_DESC } from "../src/tools/bash.js";
+import { ASK_USER_TOOL_NAME, createAskUserTool } from "../src/tools/ask-user.js";
+import {
+  FINISH_TASK_TOOL_NAME,
+  withTaskCompletion,
+} from "../src/task-completion.js";
 import { createDescribeImageTool } from "../src/tools/describe-image.js";
 import { fetchUrlTool } from "../src/tools/fetch-url.js";
 import { readFileTool } from "../src/tools/read-file.js";
@@ -40,10 +45,18 @@ import {
   pruneHistory,
   readArchivedEvents,
   readArchivedTranscript,
+  type ArchivedCheckpoint,
   type ArchivedMeta,
 } from "./history.js";
 import { EFFORT_LEVELS } from "../src/types.js";
-import type { ModelClient, TurnEvent, AgentConfig, Tool, Effort } from "../src/types.js";
+import type {
+  ModelClient,
+  TurnEvent,
+  AgentConfig,
+  Tool,
+  Effort,
+  SharedRunBudget,
+} from "../src/types.js";
 import type { Verdict } from "../src/verifier.js";
 
 // ------------------------------------------------------
@@ -85,7 +98,7 @@ interface RunEndInfo {
    * rejected = 计划确认门被否决——**不是 error**：那是委托方的决定，不是失败。
    * 混进 error 会让界面说谎（V-04 的教训：stopReason 不能压值域）。
    */
-  outcome: "completed" | "error" | "closed" | "rejected";
+  outcome: "completed" | "partial" | "blocked" | "error" | "closed" | "rejected";
   mainStopReason?: string;
 }
 
@@ -181,10 +194,24 @@ interface StoredRun {
   /** 计划门挂起态；同一 run 至多一次（计划只出一次，不像审批会跨返工轮复用） */
   pendingPlan?: PendingPlan;
   planDecision?: { decision: "approve" | "reject"; at: number };
+  /**
+   * §5.2：给执行者装 `ask_user`。**默认关**（决定 1）——宿主也被脚本化驱动，
+   * 默认开会让无人值守的运行挂死等一个不会来的人。
+   */
+  askUser?: boolean;
+  /** 当前提问挂起态；计划并发下其它提问进入 questionQueue，不能覆盖这一项。 */
+  pendingQuestion?: PendingQuestion;
+  /** 多执行者并发调用 ask_user 时的宿主级串行队列。 */
+  questionQueue?: QueuedQuestion[];
+  /**
+   * 本 run 的 ask_user 工具实例。**必须缓存**：配额是逐实例计数的，
+   * buildConfig 每次新造一个等于配额永远用不完（决定 2 当场作废）。
+   */
+  askUserTool?: Tool;
   // ---- B2 运行历史落盘 ----
   /** 本次进程内的落盘写入器；无历史根或显式关闭时缺省（history 一名已被会话正史占用） */
   archiveWriter?: RunHistoryWriter;
-  /** true = 从磁盘恢复的归档运行：只读回看，无 loop/abort，不能续跑（判据④） */
+  /** true = 从磁盘恢复的归档运行：父档案只读；有检查点时可派生新 run 续跑。 */
   archived?: true;
   /** 归档目录（events/transcript 按需读的来源） */
   archiveDir?: string;
@@ -192,6 +219,14 @@ interface StoredRun {
   hydration?: Promise<void>;
   /** 归档的裁决摘要（列表列用）；活 run 走 outcome，两者在 runSummary 合流 */
   archivedOutcome?: { finalPassed: boolean | null; reworks: number | null; verdict: Verdict | null };
+  /** 最近一个完整 main 段的可恢复检查点；归档本身保持只读，续跑会派生新 run。 */
+  checkpoint?: ArchivedCheckpoint;
+  /** 派生谱系。continuedFrom 是直接父级，rootRunId 是最初祖先。 */
+  continuedFrom?: string;
+  rootRunId?: string;
+  /** 仅供刚派生的新 run 装配首轮；完成后 checkpoint 会从真实 done 事件重建。 */
+  resumeBudget?: SharedRunBudget;
+  initialContextInputTokens?: number;
 }
 
 interface PendingPlan {
@@ -199,6 +234,28 @@ interface PendingPlan {
   at: number;
   /** 由 waitForPlanDecision 装填：应答或过期时结束等待 */
   settle: (decision: "approve" | "reject" | "expired") => void;
+}
+
+/**
+ * §5.2 需求澄清的挂起态。与计划门同构（同一套挂起/应答/过期三事件），
+ * 但**可以出现多次**——配额内每问一次挂一次，所以带 `id` 区分。
+ */
+interface PendingQuestion {
+  id: string;
+  requestSeq: number;
+  at: number;
+  /** 一次打断里的一组问题（决定 6）——贵的是打断人，不是问题本身 */
+  questions: { question: string; options: string[]; fallback: string }[];
+  /**
+   * 逐题答复，与 questions 对齐；整体 null = 这次打断没得到任何应答。
+   * **都不是错误**——见 ask-user.ts 决定 4。
+   */
+  settle: (answers: (string | null)[] | null) => void;
+}
+
+interface QueuedQuestion {
+  questions: PendingQuestion["questions"];
+  resolve: (answers: (string | null)[] | null) => void;
 }
 
 /** 计划被否决的哨兵——不是错误，是决定，所以要与 error 路径区分开 */
@@ -273,6 +330,53 @@ export interface UiServerOptions {
   history?: false | string;
   /** 历史保留数（判据③），缺省 env AGENT_RUN_HISTORY_KEEP > DEFAULT_HISTORY_KEEP */
   historyKeep?: number;
+  /**
+   * 主执行者是否必须调用 finish_task。真实宿主默认开；注入 fake model 的测试默认关，
+   * 需要验证该能力的测试显式传 true，避免改写数百条旧脚本的 wire 预期。
+   */
+  taskCompletion?: boolean;
+  /** API 访问令牌。false = 即使环境里配置了也显式关闭（只建议注入测试）。 */
+  accessToken?: string | false;
+  /** 可跨源调用 API 的精确 Origin 白名单；同源请求天然允许。 */
+  allowedOrigins?: string[];
+  /** 可信 Host/X-Forwarded-Host 名单（仅主机名，不带端口）；用于阻断 DNS rebinding。 */
+  allowedHosts?: string[];
+  /** 单个 HTTP 请求体硬上限；真实宿主默认 32 MiB（覆盖 20 MiB 文件上传的 base64 开销）。 */
+  requestBodyMaxBytes?: number;
+  /** 同时处于 running 的 run 上限；真实宿主默认 4。 */
+  maxActiveRuns?: number;
+  /** 内存中保留的运行（含事件/正文）上限；磁盘历史仍按 historyKeep 独立保留。 */
+  maxStoredRuns?: number;
+  /** 单一远端地址每分钟可发出的 POST 数；真实宿主默认 120。 */
+  mutationRateLimitPerMinute?: number;
+  /** 优雅关停等待历史/MCP/连接的最长时间。 */
+  shutdownTimeoutMs?: number;
+  /** 是否把任意命令执行工具装进工具面；远程宿主应由 launcher 默认关闭。 */
+  enableBash?: boolean;
+  /** 只在宿主确实位于可信反向代理之后时读取 X-Forwarded-Proto/Host。 */
+  trustProxy?: boolean;
+}
+
+/**
+ * stopReason → run 级结果必须 fail-closed。只有明确的 completed 才能标绿；新增
+ * stopReason 若尚未在这里分类，会安全地落到 error，而不是被默认冒充完成。
+ */
+export function runOutcomeForStopReason(reason?: string): RunEndInfo["outcome"] {
+  switch (reason) {
+    case "completed":
+      return "completed";
+    case "partial":
+      return "partial";
+    case "blocked":
+      return "blocked";
+    case "aborted":
+    case "plan_gate_expired":
+      return "closed";
+    case "plan_rejected":
+      return "rejected";
+    default:
+      return "error";
+  }
 }
 
 export interface UiServerHandle {
@@ -287,6 +391,98 @@ export interface UiServerHandle {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const PUBLIC_DIR = join(__dirname, "public");
+const PHOSPHOR_RELATIVE = join("@phosphor-icons", "web", "src", "regular");
+const PHOSPHOR_DIR = [
+  // 源码态：<repo>/ui/server.ts → <repo>/node_modules
+  join(__dirname, "..", "node_modules", PHOSPHOR_RELATIVE),
+  // 编译态：<repo>/dist/ui/server.js → <repo>/node_modules
+  join(__dirname, "..", "..", "node_modules", PHOSPHOR_RELATIVE),
+  // npm 安装后从包根启动时的兜底
+  join(process.cwd(), "node_modules", PHOSPHOR_RELATIVE),
+].find((candidate) => existsSync(candidate))
+  ?? join(__dirname, "..", "node_modules", PHOSPHOR_RELATIVE);
+
+/**
+ * UI 图标走本地、固定版本的 Phosphor 字体，不依赖运行时 CDN。
+ *
+ * 这里只暴露实际用到的四个静态文件；不能把 node_modules 整棵目录挂到 HTTP
+ * 根下。这样既保留离线可用性，也不把依赖包里的源码与元数据意外暴露出去。
+ */
+const VENDOR_STATIC = new Map<string, string>([
+  ["vendor/phosphor/style.css", join(PHOSPHOR_DIR, "style.css")],
+  ["vendor/phosphor/Phosphor.woff2", join(PHOSPHOR_DIR, "Phosphor.woff2")],
+  ["vendor/phosphor/Phosphor.woff", join(PHOSPHOR_DIR, "Phosphor.woff")],
+  ["vendor/phosphor/Phosphor.ttf", join(PHOSPHOR_DIR, "Phosphor.ttf")],
+]);
+
+function firstForwarded(value: string | string[] | undefined): string | undefined {
+  const raw = Array.isArray(value) ? value[0] : value;
+  return raw?.split(",")[0]?.trim() || undefined;
+}
+
+function requestAuthority(req: IncomingMessage, trustProxy = false): string | undefined {
+  return trustProxy
+    ? firstForwarded(req.headers["x-forwarded-host"]) ?? req.headers.host
+    : req.headers.host;
+}
+
+function requestHostname(req: IncomingMessage, trustProxy = false): string | null {
+  const authority = requestAuthority(req, trustProxy);
+  if (!authority) return null;
+  try {
+    return new URL(`http://${authority}`).hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  } catch {
+    return null;
+  }
+}
+
+function isLoopbackHostname(hostname: string): boolean {
+  return hostname === "localhost" || hostname === "::1" || hostname.startsWith("127.");
+}
+
+function sameOriginOf(req: IncomingMessage, trustProxy = false): string | null {
+  const host = requestAuthority(req, trustProxy);
+  if (!host) return null;
+  const encrypted = Boolean((req.socket as typeof req.socket & { encrypted?: boolean }).encrypted);
+  const forwardedProto = trustProxy ? firstForwarded(req.headers["x-forwarded-proto"]) : undefined;
+  const protocol = forwardedProto === "https" || forwardedProto === "http"
+    ? forwardedProto
+    : encrypted ? "https" : "http";
+  return `${protocol}://${host}`;
+}
+
+function originAllowed(
+  req: IncomingMessage,
+  allowedOrigins: readonly string[],
+  trustProxy = false,
+): boolean {
+  const origin = req.headers.origin;
+  if (!origin) return true; // CLI/native clients do not send Origin; token still applies separately.
+  return origin === sameOriginOf(req, trustProxy)
+    || allowedOrigins.includes("*")
+    || allowedOrigins.includes(origin);
+}
+
+function applyCors(
+  req: IncomingMessage,
+  res: ServerResponse,
+  allowedOrigins: readonly string[],
+  trustProxy = false,
+): void {
+  const origin = req.headers.origin;
+  if (!origin || !originAllowed(req, allowedOrigins, trustProxy)) return;
+  if (allowedOrigins.includes("*")) {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+  } else if (origin !== sameOriginOf(req, trustProxy) && allowedOrigins.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  }
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Authorization, Content-Type, Last-Event-ID, X-Agent-Token",
+  );
+}
 
 const MIME: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
@@ -295,14 +491,46 @@ const MIME: Record<string, string> = {
   ".json": "application/json; charset=utf-8",
   ".svg": "image/svg+xml",
   ".png": "image/png",
+  ".woff2": "font/woff2",
+  ".woff": "font/woff",
+  ".ttf": "font/ttf",
 };
 
-function readBody(req: IncomingMessage): Promise<string> {
+class RequestBodyTooLargeError extends Error {}
+
+function readBody(req: IncomingMessage, maxBytes: number): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on("data", (chunk: Buffer) => chunks.push(chunk));
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
-    req.on("error", reject);
+    let bytes = 0;
+    let settled = false;
+    const declared = Number(req.headers["content-length"] ?? 0);
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      req.resume();
+      reject(new RequestBodyTooLargeError(`Request body exceeds ${maxBytes} bytes`));
+      return;
+    }
+    req.on("data", (value: Buffer | string) => {
+      if (settled) return;
+      const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+      bytes += chunk.length;
+      if (bytes > maxBytes) {
+        settled = true;
+        chunks.length = 0;
+        reject(new RequestBodyTooLargeError(`Request body exceeds ${maxBytes} bytes`));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      if (settled) return;
+      settled = true;
+      resolve(Buffer.concat(chunks).toString("utf-8"));
+    });
+    req.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    });
   });
 }
 
@@ -317,6 +545,145 @@ function notFound(res: ServerResponse, detail?: string): void {
 
 function badRequest(res: ServerResponse, detail: string): void {
   json(res, 400, { error: detail });
+}
+
+function requestBodyFailure(res: ServerResponse, error: unknown): void {
+  if (error instanceof RequestBodyTooLargeError) {
+    json(res, 413, { error: error.message });
+    return;
+  }
+  badRequest(res, "Failed to read request body");
+}
+
+function secureStringEqual(actual: string | undefined, expected: string): boolean {
+  if (actual === undefined) return false;
+  const left = Buffer.from(actual);
+  const right = Buffer.from(expected);
+  return left.length === right.length && timingSafeEqual(left, right);
+}
+
+function cookieValue(req: IncomingMessage, name: string): string | undefined {
+  const raw = req.headers.cookie;
+  if (!raw) return undefined;
+  for (const part of raw.split(";")) {
+    const [key, ...rest] = part.trim().split("=");
+    if (key !== name) continue;
+    try {
+      return decodeURIComponent(rest.join("="));
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+function requestAccessToken(req: IncomingMessage): string | undefined {
+  const authorization = req.headers.authorization;
+  if (authorization?.startsWith("Bearer ")) return authorization.slice(7);
+  const explicit = req.headers["x-agent-token"];
+  if (typeof explicit === "string") return explicit;
+  return cookieValue(req, "agent_ui_access");
+}
+
+function operationalLog(
+  level: "info" | "warn" | "error",
+  event: string,
+  fields: Record<string, unknown> = {},
+): void {
+  const line = JSON.stringify({ ts: new Date().toISOString(), level, event, ...fields });
+  if (level === "error") console.error(line);
+  else if (level === "warn") console.warn(line);
+  else console.log(line);
+}
+
+function nonNegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0;
+}
+
+/** meta.json 是可被手工修改的外部输入；恢复前不能只信 TypeScript cast。 */
+function checkpointFromUnknown(value: unknown): ArchivedCheckpoint | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  const budget = raw.runBudget;
+  if (!budget || typeof budget !== "object" || Array.isArray(budget)) return undefined;
+  const b = budget as Record<string, unknown>;
+  if (
+    !nonNegativeInteger(raw.segmentIndex) ||
+    !nonNegativeInteger(raw.conversationTurn) ||
+    raw.conversationTurn < 1 ||
+    !nonNegativeInteger(raw.contextInputTokens) ||
+    !nonNegativeInteger(b.usedTurns) ||
+    !nonNegativeInteger(b.usedTokens) ||
+    (b.maxTurns !== undefined && (!nonNegativeInteger(b.maxTurns) || b.maxTurns < 1)) ||
+    (b.maxTokens !== undefined && (!nonNegativeInteger(b.maxTokens) || b.maxTokens < 1))
+  ) {
+    return undefined;
+  }
+  return {
+    segmentIndex: raw.segmentIndex,
+    conversationTurn: raw.conversationTurn,
+    contextInputTokens: raw.contextInputTokens,
+    runBudget: {
+      ...(b.maxTurns !== undefined ? { maxTurns: b.maxTurns as number } : {}),
+      ...(b.maxTokens !== undefined ? { maxTokens: b.maxTokens as number } : {}),
+      usedTurns: b.usedTurns,
+      usedTokens: b.usedTokens,
+    },
+  };
+}
+
+function stricterLimit(a: number | undefined, b: number | undefined): number | undefined {
+  if (a === undefined) return b;
+  if (b === undefined) return a;
+  return Math.min(a, b);
+}
+
+/** 重启不能成为放宽旧上限或绕过当前宿主新上限的办法。 */
+function restoredBudget(
+  checkpoint: ArchivedCheckpoint,
+  current: Pick<AgentConfig, "maxTotalTurns" | "maxTokensBudget">,
+): SharedRunBudget {
+  const maxTurns = stricterLimit(checkpoint.runBudget.maxTurns, current.maxTotalTurns);
+  const maxTokens = stricterLimit(checkpoint.runBudget.maxTokens, current.maxTokensBudget);
+  return {
+    ...(maxTurns !== undefined ? { maxTurns } : {}),
+    ...(maxTokens !== undefined ? { maxTokens } : {}),
+    usedTurns: checkpoint.runBudget.usedTurns,
+    usedTokens: checkpoint.runBudget.usedTokens,
+  };
+}
+
+function exhaustedBudgetReason(budget: SharedRunBudget): string | null {
+  if (budget.maxTurns !== undefined && budget.usedTurns >= budget.maxTurns) {
+    return `执行谱系的总轮次预算已用尽（${budget.usedTurns}/${budget.maxTurns}）`;
+  }
+  if (budget.maxTokens !== undefined && budget.usedTokens >= budget.maxTokens) {
+    return `执行谱系的总 token 预算已用尽（${budget.usedTokens}/${budget.maxTokens}）`;
+  }
+  return null;
+}
+
+function isMessageHistory(value: unknown): value is Anthropic.MessageParam[] {
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every((message) => {
+      if (!message || typeof message !== "object" || Array.isArray(message)) return false;
+      const raw = message as Record<string, unknown>;
+      if (raw.role !== "user" && raw.role !== "assistant") return false;
+      if (typeof raw.content === "string") return true;
+      return (
+        Array.isArray(raw.content) &&
+        raw.content.every(
+          (block) =>
+            Boolean(block) &&
+            typeof block === "object" &&
+            !Array.isArray(block) &&
+            typeof (block as Record<string, unknown>).type === "string",
+        )
+      );
+    })
+  );
 }
 
 /** 把 TurnEvent 投影为可序列化对象，approval_request 去掉 respond 回调 */
@@ -338,6 +705,11 @@ function serializeEvent(
         type: event.type,
         stopReason: event.result.stopReason,
         usage: event.result.usage,
+        ...(event.result.completion ? { completion: event.result.completion } : {}),
+        ...(event.result.runBudget ? { runBudget: event.result.runBudget } : {}),
+        ...(event.result.contextInputTokens !== undefined
+          ? { contextInputTokens: event.result.contextInputTokens }
+          : {}),
         // V-04：错误详情此前被整条丢弃，前端只能写死一句"运行异常终止"
         ...(event.result.error
           ? { error: { name: event.result.error.name, message: event.result.error.message } }
@@ -390,11 +762,27 @@ export function contentTypeOf(name: string): string {
  * "在文件管理器里选中它"的平台命令。**返回参数数组而不是命令串**——
  * 拼串就等于把文件名交给命令行解析器去解释。
  */
-export function revealCommand(abs: string): { file: string; args: string[] } | null {
-  if (process.platform === "win32") return { file: "explorer.exe", args: [`/select,${abs}`] };
-  if (process.platform === "darwin") return { file: "open", args: ["-R", abs] };
-  if (process.platform === "linux") return { file: "xdg-open", args: [dirname(abs)] };
+export function revealCommand(
+  abs: string,
+  kind: "file" | "directory" = "file",
+): { file: string; args: string[] } | null {
+  if (process.platform === "win32") {
+    return kind === "directory"
+      ? { file: "explorer.exe", args: [abs] }
+      : { file: "explorer.exe", args: [`/select,${abs}`] };
+  }
+  if (process.platform === "darwin") {
+    return kind === "directory" ? { file: "open", args: [abs] } : { file: "open", args: ["-R", abs] };
+  }
+  if (process.platform === "linux") {
+    return { file: "xdg-open", args: [kind === "directory" ? abs : dirname(abs)] };
+  }
   return null;
+}
+
+/** `file.ts:12:4` 这类显示引用在文件系统里仍指向 `file.ts`。 */
+export function localPathTarget(value: string): string {
+  return String(value ?? "").trim().replace(/:\d+(?::\d+)?$/, "");
 }
 
 const BUILTIN_POOL: Tool[] = [bashTool, fetchUrlTool, readFileTool, writeFileTool];
@@ -411,9 +799,64 @@ Ground every claim of progress in an actual tool result.`;
 // ------------------------------------------------------
 
 export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
+  const realHost = options.modelClient === undefined;
+  const positiveInteger = (value: number | undefined, name: string): number | undefined => {
+    if (value === undefined) return undefined;
+    if (!Number.isInteger(value) || value < 1) throw new Error(`${name} must be a positive integer`);
+    return value;
+  };
+  const positiveIntegerEnv = (name: string): number | undefined => {
+    const raw = process.env[name];
+    if (raw === undefined || raw.trim() === "") return undefined;
+    return positiveInteger(Number(raw), name);
+  };
+  const accessToken = options.accessToken === false
+    ? null
+    : (typeof options.accessToken === "string"
+        ? options.accessToken
+        : realHost
+          ? process.env.AGENT_UI_ACCESS_TOKEN
+          : undefined)?.trim() || null;
+  const allowedOrigins = [...new Set(
+    options.allowedOrigins ?? (realHost
+      ? (process.env.AGENT_UI_ALLOWED_ORIGINS ?? process.env.AGENT_UI_CORS_ORIGIN ?? "")
+          .split(",")
+          .map((origin) => origin.trim())
+          .filter(Boolean)
+      : []),
+  )];
+  const allowedHosts = new Set([
+    ...(options.allowedHosts ?? []),
+    ...allowedOrigins.flatMap((origin) => {
+      if (origin === "*") return [];
+      try { return [new URL(origin).hostname]; } catch { return []; }
+    }),
+  ].map((host) => host.toLowerCase().replace(/^\[|\]$/g, "")));
+  if (allowedOrigins.includes("*") && !accessToken) {
+    throw new Error("Wildcard CORS requires AGENT_UI_ACCESS_TOKEN");
+  }
+  const requestBodyMaxBytes = positiveInteger(options.requestBodyMaxBytes, "requestBodyMaxBytes")
+    ?? positiveIntegerEnv("AGENT_UI_REQUEST_BODY_MAX_BYTES")
+    ?? 32 * 1024 * 1024;
+  const maxActiveRuns = positiveInteger(options.maxActiveRuns, "maxActiveRuns")
+    ?? positiveIntegerEnv("AGENT_UI_MAX_ACTIVE_RUNS")
+    ?? (realHost ? 4 : Number.MAX_SAFE_INTEGER);
+  const mutationRateLimitPerMinute = positiveInteger(
+    options.mutationRateLimitPerMinute,
+    "mutationRateLimitPerMinute",
+  ) ?? positiveIntegerEnv("AGENT_UI_MUTATIONS_PER_MINUTE")
+    ?? (realHost ? 120 : Number.MAX_SAFE_INTEGER);
+  const shutdownTimeoutMs = positiveInteger(options.shutdownTimeoutMs, "shutdownTimeoutMs")
+    ?? positiveIntegerEnv("AGENT_UI_SHUTDOWN_TIMEOUT_MS")
+    ?? 5_000;
+  const bashEnabled = options.enableBash ?? (realHost ? process.env.AGENT_UI_ENABLE_BASH !== "0" : true);
+  const trustProxy = options.trustProxy ?? (realHost && process.env.AGENT_UI_TRUST_PROXY === "1");
+
   // F1: 缺省模型从环境变量读取，compat 取自 createModelClientFromEnv 返回值
   const resolved = createModelClientFromEnv(process.env.AGENT_MODEL ?? "claude-opus-4-8");
   const modelClient = options.modelClient ?? resolved.client;
+  const taskCompletionEnabled =
+    options.taskCompletion ?? (options.modelClient ? false : process.env.AGENT_REQUIRE_FINISH_TASK !== "0");
   /**
    * L6 运行台账开关。**注入了 modelClient 就默认不记。**
    *
@@ -442,6 +885,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           ? null
           : historyRootPath();
   const historyKeep = options.historyKeep ?? historyKeepCount();
+  const maxStoredRuns = positiveInteger(options.maxStoredRuns, "maxStoredRuns")
+    ?? positiveIntegerEnv("AGENT_UI_MAX_STORED_RUNS")
+    ?? (realHost ? Math.max(100, historyKeep) : Number.MAX_SAFE_INTEGER);
   const envCompat = resolved.compat;
   // 在源头就归一：workdir 参与白名单比对、侧栏分组键、工具圈禁根三处，
   // 三处必须是同一个字符串形态。`D:/a/b` 与 `D:` 指同一个目录，
@@ -487,9 +933,42 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   const visionTool = visionRole
     ? createDescribeImageTool({ client: visionRole.provider.client, modelName: visionRole.name })
     : null;
-  const toolPool: Tool[] = visionTool ? [...BUILTIN_POOL, visionTool] : BUILTIN_POOL;
+  const enabledBuiltinPool = bashEnabled
+    ? BUILTIN_POOL
+    : BUILTIN_POOL.filter((tool) => tool.name !== bashTool.name);
+  const toolPool: Tool[] = visionTool ? [...enabledBuiltinPool, visionTool] : enabledBuiltinPool;
 
   const runs = new Map<string, StoredRun>();
+  const startedAt = Date.now();
+  let historyHealthy = true;
+  let shuttingDown = false;
+  let pendingAdmissions = 0;
+  const mutationWindows = new Map<string, { startedAt: number; count: number }>();
+  const detachedArchiveFlushes = new Set<Promise<unknown>>();
+  const metrics = {
+    httpRequests: 0,
+    httpStatuses: new Map<number, number>(),
+    runsStarted: 0,
+    runsFinished: 0,
+    originRejected: 0,
+    authRejected: 0,
+    hostRejected: 0,
+    bodyRejected: 0,
+    rateRejected: 0,
+    capacityRejected: 0,
+    historyErrors: 0,
+  };
+
+  function reportHistoryError(error: Error): void {
+    historyHealthy = false;
+    metrics.historyErrors += 1;
+    operationalLog("error", "history_write_failed", { error: error.message });
+  }
+
+  function createArchiveWriter(runId: string): RunHistoryWriter | undefined {
+    if (!historyRoot) return undefined;
+    return new RunHistoryWriter(join(historyRoot, runId), reportHistoryError);
+  }
 
   // ---- B2 运行历史落盘 ----
 
@@ -513,6 +992,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       planGate: Boolean(run.planGate),
       planDecision: run.planDecision ?? null,
       mainStopReason: run.mainStopReason ?? null,
+      askUser: Boolean(run.askUser),
+      checkpoint: run.checkpoint ?? null,
+      continuedFrom: run.continuedFrom ?? null,
+      rootRunId: run.rootRunId ?? null,
       outcome: run.outcome
         ? {
             finalPassed: run.outcome.finalPassed,
@@ -537,6 +1020,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       for (const a of await loadArchivedMetas(historyRoot)) {
         if (runs.has(a.meta.runId)) continue;
         const crashed = a.meta.status === "running";
+        const checkpoint = checkpointFromUnknown(a.meta.checkpoint);
         runs.set(a.meta.runId, {
           id: a.meta.runId,
           task: a.meta.task,
@@ -555,13 +1039,30 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           toolTally: {},
           archived: true,
           archiveDir: a.dir,
-          ...(a.meta.packName ? { packName: a.meta.packName } : {}),
+          ...(typeof a.meta.packName === "string" && a.meta.packName
+            ? { packName: a.meta.packName }
+            : {}),
           ...(a.meta.mode === "plan" ? { mode: "plan" as const } : {}),
-          ...(a.meta.effort ? { effort: a.meta.effort as Effort } : {}),
-          ...(a.meta.rubric ? { rubric: a.meta.rubric } : {}),
-          ...(a.meta.workdir ? { workdir: a.meta.workdir } : {}),
+          ...(typeof a.meta.effort === "string" &&
+          (EFFORT_LEVELS as readonly string[]).includes(a.meta.effort)
+            ? { effort: a.meta.effort as Effort }
+            : {}),
+          ...(typeof a.meta.rubric === "string" && a.meta.rubric
+            ? { rubric: a.meta.rubric }
+            : {}),
+          ...(typeof a.meta.workdir === "string" && a.meta.workdir
+            ? { workdir: a.meta.workdir }
+            : {}),
           ...(a.meta.planGate ? { planGate: true } : {}),
           ...(a.meta.planDecision ? { planDecision: a.meta.planDecision } : {}),
+          ...(a.meta.askUser ? { askUser: true } : {}),
+          ...(checkpoint ? { checkpoint } : {}),
+          ...(typeof a.meta.continuedFrom === "string" && a.meta.continuedFrom
+            ? { continuedFrom: a.meta.continuedFrom }
+            : {}),
+          ...(typeof a.meta.rootRunId === "string" && a.meta.rootRunId
+            ? { rootRunId: a.meta.rootRunId }
+            : {}),
           // 崩溃档案（meta 还停在 running）：没人正常收过尾，按宿主级异常归档
           ...(crashed
             ? { mainStopReason: "error" }
@@ -579,8 +1080,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             : {}),
         });
       }
-    } catch {
-      // 档案层任何失败都不影响宿主启动（仪器纪律）
+      pruneStoredRuns();
+    } catch (error) {
+      // 不阻断宿主启动，但 readiness 必须降级，不能把数据保护失效伪装成健康。
+      reportHistoryError(error instanceof Error ? error : new Error(String(error)));
     }
   }
   /** 所有 API 路由在此就绪后才应答——启动后的第一个 GET /api/runs 就要看得到档案 */
@@ -621,6 +1124,21 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   }
 
   /**
+   * 只从 checkpoint 指定的 main 段恢复，不拿“最后一段”猜。归档里可能同时有
+   * verifier/rework 段，按数组尾部取会把独立核查上下文误接进主会话。
+   */
+  function archivedCheckpointHistory(run: StoredRun): Anthropic.MessageParam[] | undefined {
+    const checkpoint = run.checkpoint;
+    if (!checkpoint) return undefined;
+    const segment = run.transcript.find(
+      (candidate) => candidate.index === checkpoint.segmentIndex && candidate.source === "main",
+    );
+    if (!segment || !isMessageHistory(segment.messages)) return undefined;
+    // 子 run 可以压缩自己的正史；父档案的内存投影也必须保持不可变。
+    return structuredClone(segment.messages);
+  }
+
+  /**
    * 全局生命周期流的订阅者（V-10）。
    *
    * 存在的理由：侧栏此前靠 `setInterval(loadRuns, 3000)` 保持新鲜，而那次轮询会
@@ -631,10 +1149,48 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   const lifecycleClients = new Set<ServerResponse>();
 
   /**
+   * 归档续跑不是“有 checkpoint 字段就放行”。当前宿主仍是安全边界：
+   * 工作目录必须还在白名单内、领域包必须仍然存在、旧/新两套总预算都不能
+   * 被重启绕过。返回值既供 API 409，也供列表提前算 canContinue。
+   */
+  function archivedForkBlockReason(r: StoredRun): string | null {
+    if (!r.archived) return "该运行不是归档运行";
+    if (r.verify) return "开启独立核查的归档不能派生续跑：追加会绕过已出具的裁决";
+    if (r.mode === "plan") return "计划编排的归档不能派生续跑：runPlanned 没有检查点续跑入口";
+    if (!r.checkpoint) return "该归档没有可恢复检查点（旧格式或主执行段未完整结束）";
+    if (r.packName && !getPack(r.packName)) {
+      return `归档使用的领域包 \"${r.packName}\" 在当前宿主中不存在`;
+    }
+    let target: string;
+    try {
+      target = resolve(r.workdir ?? workdir);
+    } catch {
+      return "归档工作目录无效，不能交给当前宿主执行";
+    }
+    if (!allowedWorkdirs.includes(target)) {
+      return `归档工作目录不在当前宿主白名单内：${target}`;
+    }
+    const budget = restoredBudget(r.checkpoint, { maxTotalTurns, maxTokensBudget });
+    return exhaustedBudgetReason(budget);
+  }
+
+  /**
    * 列表项摘要。V-14：元数据由服务端算好，侧栏不再依赖"这个 run 是否被订阅过"
    * ——此前核查结论一列只有打开过的 run 才有值。
    */
   function runSummary(r: StoredRun): Record<string, unknown> {
+    const liveStructurallyContinuable =
+      !r.archived &&
+      r.status === "done" &&
+      !r.verify &&
+      r.mode !== "plan" &&
+      Boolean(r.loop && r.history?.length);
+    const liveBudgetBlockReason = liveStructurallyContinuable && r.checkpoint
+      ? exhaustedBudgetReason(r.checkpoint.runBudget)
+      : null;
+    const liveCanContinue = liveStructurallyContinuable && liveBudgetBlockReason === null;
+    const archiveBlockReason = r.archived ? archivedForkBlockReason(r) : null;
+    const archiveCanFork = Boolean(r.archived && archiveBlockReason === null);
     return {
       runId: r.id,
       task: r.task,
@@ -652,20 +1208,29 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       // 计划门挂起时侧栏就该显示"需你决定"，而不是点进去才发现
       planGate: Boolean(r.planGate),
       awaitingPlanApproval: Boolean(r.pendingPlan),
+      // §5.2：挂起的提问要能被列表/底栏看见——阻塞式交互不可见等于运行卡死
+      awaitingQuestion: r.pendingQuestion
+        ? { id: r.pendingQuestion.id, questions: r.pendingQuestion.questions }
+        : null,
+      askUser: Boolean(r.askUser),
       planDecision: r.planDecision?.decision ?? null,
       verdict: r.outcome?.verifications.at(-1)?.verdict ?? r.archivedOutcome?.verdict ?? null,
       mode: r.mode ?? "single",
-      // B2 判据④：归档运行只能回看。界面据此把"不能续跑"说成真话
-      // （"执行上下文没跨重启保存"），而不是"执行阶段就失败了"
+      // B2：父档案恒只读；有完整检查点时可派生子 run，不能把两者冒充成
+      // “原进程无缝继续”。continuationMode 是这个环境边界的显式契约。
       ...(r.archived ? { archived: true } : {}),
       conversationTurn: r.conversationTurn,
+      continuedFrom: r.continuedFrom ?? null,
+      rootRunId: r.rootRunId ?? null,
       // V-32：侧栏按工作目录分组。workdir 是工具的写入圈禁边界，
       // 也就是"这段工作触碰的范围"——它是这个 harness 自己长出来的分组键，
       // 不是从别家侧栏照搬来的层级
       workdir: r.workdir ?? workdir,
-      // 能否追加：让界面据此决定要不要显示输入框，而不是点了才报错
-      canContinue:
-        r.status === "done" && !r.verify && r.mode !== "plan" && Boolean(r.loop && r.history?.length),
+      // 能否追加：让界面据此决定要不要显示输入框，而不是点了才报错。
+      canContinue: liveCanContinue || archiveCanFork,
+      continuationMode: archiveCanFork ? "fork" : liveCanContinue ? "same" : null,
+      continuationBlockReason:
+        !archiveCanFork && r.archived ? archiveBlockReason : liveBudgetBlockReason,
     };
   }
 
@@ -678,6 +1243,33 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       } catch {
         lifecycleClients.delete(client);
       }
+    }
+  }
+
+  function broadcastLifecycleRemoval(runId: string): void {
+    if (lifecycleClients.size === 0) return;
+    const frame = `data: ${JSON.stringify({ type: "run_removed", runId })}\n\n`;
+    for (const client of lifecycleClients) {
+      try { client.write(frame); } catch { lifecycleClients.delete(client); }
+    }
+  }
+
+  function pruneStoredRuns(): void {
+    if (runs.size <= maxStoredRuns) return;
+    const completed = [...runs.values()]
+      .filter((candidate) => candidate.status === "done")
+      .sort((left, right) =>
+        (left.finishedAt ?? left.createdAt) - (right.finishedAt ?? right.createdAt),
+      );
+    while (runs.size > maxStoredRuns && completed.length > 0) {
+      const oldest = completed.shift()!;
+      if (!runs.delete(oldest.id)) continue;
+      if (oldest.archiveWriter) {
+        const flush = oldest.archiveWriter.flush();
+        detachedArchiveFlushes.add(flush);
+        void flush.finally(() => detachedArchiveFlushes.delete(flush));
+      }
+      broadcastLifecycleRemoval(oldest.id);
     }
   }
 
@@ -705,6 +1297,23 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     ? Number(process.env.AGENT_MAX_TOKENS)
     : pack?.guardrails?.maxTokens;
   const maxTurns = pack?.guardrails?.maxTurns;
+  const integerEnv = (name: string, min: number): number | undefined => {
+    const raw = process.env[name];
+    if (raw === undefined || raw === "") return undefined;
+    const value = Number(raw);
+    if (!Number.isInteger(value) || value < min) {
+      throw new Error(`${name}="${raw}" 无效：需为 ≥${min} 的整数`);
+    }
+    return value;
+  };
+  // 真实常驻宿主必须有跨 continuation / rework / plan 子任务共享的硬上限；
+  // 注入 fake model 的测试保留原契约，避免用生产默认值改写研究用例。
+  const maxTotalTurns = integerEnv("AGENT_TOTAL_MAX_TURNS", 1) ?? (realHost ? 120 : undefined);
+  const maxTokensBudget = integerEnv("AGENT_TOTAL_TOKEN_BUDGET", 1) ?? (realHost ? 500_000 : undefined);
+  const progressExtensionTurns = integerEnv("AGENT_PROGRESS_EXTENSION_TURNS", 0);
+  const stagnationWindow = integerEnv("AGENT_STAGNATION_WINDOW", 0);
+  /** §5.2 打断次数上限（决定 2/6）。 */
+  const maxAskRounds = integerEnv("AGENT_MAX_ASK_ROUNDS", 1);
 
   // 任务级评分表优先于领域包声明（rubric 是任务属性，包只提供缺省）
   const rubric = process.env.AGENT_VERIFY_RUBRIC ?? pack?.verify.rubric;
@@ -790,10 +1399,19 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     const systemPrompt = runPack?.systemPrompt ?? DEFAULT_SYSTEM_PROMPT;
     // MCP 工具按包的 includeTools 收窄（selectPackTools 负责）。mcpTools 在
     // ensureMcp 之后才非空——所有 start*Run 都先 await 它，不会拿到半截工具面
-    const tools = injectedTools ?? (runPack
+    const baseTools = injectedTools ?? (runPack
       ? selectPackTools(runPack, toolPool, mcpTools)
       : [...toolPool, ...mcpTools]);
-    return {
+    /**
+     * §5.2：逐 run 显式开启才装（决定 1）。工具实例挂在 run 上而不是每次新造——
+     * 配额是逐实例计数的，重造等于配额永不耗尽。
+     * verifier/planner 拿不到它：`withoutAskUser` 在 harness 层剔除（决定 3），
+     * 宿主这边不必也不该重复实现那道闸。
+     */
+    const tools = run?.askUser
+      ? [...baseTools, (run.askUserTool ??= makeAskUserTool(run))]
+      : baseTools;
+    const cfg: AgentConfig = {
       systemPrompt,
       tools,
       workdir: runWorkdir,
@@ -806,7 +1424,19 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       ...((run?.packName ? runPack?.guardrails?.maxTurns : maxTurns) !== undefined
         ? { maxTurns: (run?.packName ? runPack?.guardrails?.maxTurns : maxTurns) as number }
         : {}),
+      ...(maxTotalTurns !== undefined ? { maxTotalTurns } : {}),
+      ...(maxTokensBudget !== undefined ? { maxTokensBudget } : {}),
+      ...(run?.resumeBudget ? { runBudget: run.resumeBudget } : {}),
+      ...(run?.initialContextInputTokens !== undefined
+        ? { initialContextInputTokens: run.initialContextInputTokens }
+        : {}),
     };
+    return taskCompletionEnabled
+      ? withTaskCompletion(cfg, {
+          ...(progressExtensionTurns !== undefined ? { progressExtensionTurns } : {}),
+          ...(stagnationWindow !== undefined ? { stagnationWindow } : {}),
+        })
+      : cfg;
   }
 
   /**
@@ -892,6 +1522,78 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       };
       broadcastLifecycle("run_updated", run);
     });
+  }
+
+  /**
+   * §5.2 的宿主侧接线：造一个绑定到本 run 的 `ask_user`。
+   *
+   * 三件事与计划确认门逐条同构（同样是 V-01/V-02/V-05 的教训）：
+   *   · 提问与答复都进事件流——刷新/重连后仍看得到问了什么、谁答的；
+   *   · run 收尾时必须宣告过期并解除挂起，否则执行协程永远吊在 execute 里；
+   *   · 未应答**不是错误**（决定 4）——工具那边会回"按你的最佳判断继续"。
+   */
+  function pumpQuestionQueue(run: StoredRun): void {
+    if (run.pendingQuestion) return;
+    const queued = run.questionQueue?.shift();
+    if (!queued) return;
+    if (run.status === "done" || run.abort?.signal.aborted) {
+      queued.resolve(null);
+      pumpQuestionQueue(run);
+      return;
+    }
+
+    const id = `q${run.events.length}`;
+    const requestSeq = pushSyntheticEvent(run, "host", {
+      type: "user_question_request",
+      id,
+      questions: queued.questions,
+      at: Date.now(),
+    });
+    run.pendingQuestion = {
+      id,
+      requestSeq,
+      at: Date.now(),
+      questions: queued.questions,
+      settle: (answers) => {
+        if (run.pendingQuestion?.id === id) delete run.pendingQuestion;
+        queued.resolve(answers);
+        // 计划模式可有多个执行者同时提问；一次只向界面挂一组，答完再开下一组。
+        pumpQuestionQueue(run);
+      },
+    };
+    broadcastLifecycle("run_updated", run);
+  }
+
+  function makeAskUserTool(run: StoredRun): Tool {
+    return createAskUserTool({
+      ...(maxAskRounds !== undefined ? { maxRounds: maxAskRounds } : {}),
+      ask: (req: { questions: { question: string; options: string[]; fallback: string }[] }) =>
+        new Promise<(string | null)[] | null>((resolve) => {
+          (run.questionQueue ??= []).push({ questions: req.questions, resolve });
+          pumpQuestionQueue(run);
+        }),
+    });
+  }
+
+  /**
+   * 解除挂起的提问且**不带答案**的唯一出口。
+   *
+   * 有两条路会走到这里（收尾、委托方按停止），此前它们各写各的——
+   * 结果是停止那条只 settle 不发事件，挂起态消失了却没有任何记录。
+   * 挂起态的每一种收场都必须进事件流（V-02 的口径），所以收敛成一个函数。
+   */
+  function expireQuestion(run: StoredRun, cause: "run_finished" | "stopped"): void {
+    // 当前问题之后排队的也必须一起解除；否则并发子任务的 execute promise 会泄漏。
+    for (const queued of run.questionQueue?.splice(0) ?? []) queued.resolve(null);
+    const pending = run.pendingQuestion;
+    if (!pending) return;
+    pushSyntheticEvent(run, "host", {
+      type: "user_question_expired",
+      requestSeq: pending.requestSeq,
+      id: pending.id,
+      cause,
+    });
+    pending.settle(null);
   }
 
   /** 向 run 的所有 SSE 客户端推送一条事件 */
@@ -1000,6 +1702,20 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       // 只认主线（main）——verifier 是全新上下文的独立复核，它的正史不属于对话
       if (source === "main" && event.result.messages?.length) {
         run.history = event.result.messages;
+        if (event.result.runBudget) {
+          const fallbackContextTokens =
+            event.result.usage.inputTokens +
+            event.result.usage.cacheCreationTokens +
+            event.result.usage.cacheReadTokens;
+          run.checkpoint = {
+            // segmentIndex 已在上面递增；检查点必须指向刚落盘的真实段号。
+            segmentIndex: segment.index,
+            conversationTurn: run.conversationTurn,
+            contextInputTokens:
+              event.result.contextInputTokens ?? fallbackContextTokens,
+            runBudget: { ...event.result.runBudget },
+          };
+        }
       }
     }
 
@@ -1041,6 +1757,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     }
     run.pendingApprovals.clear();
 
+    // §5.2 提问同理：挂着不解除，执行协程会永远吊在 ask_user 的 execute 里。
+    // 过期走 settle(null) 而不是抛——那是"没人答"，不是故障（决定 4）
+    expireQuestion(run, "run_finished");
+
     // 计划门同理：挂着不解除，编排协程会永远吊在 onPlan 里（V-01 那类失效）
     if (run.pendingPlan) {
       const pendingPlan = run.pendingPlan;
@@ -1055,6 +1775,15 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     run.status = "done";
     run.finishedAt = Date.now();
     if (endInfo.mainStopReason) run.mainStopReason = endInfo.mainStopReason;
+    metrics.runsFinished += 1;
+    if (realHost) {
+      operationalLog("info", "run_finished", {
+        runId: run.id,
+        outcome: endInfo.outcome,
+        stopReason: endInfo.mainStopReason ?? null,
+        durationMs: run.finishedAt - run.createdAt,
+      });
+    }
 
     // V-07：成本必须用 executionUsage（全部执行轮合计，含被否掉的中间轮）。
     // 前端此前用最后一条 done 的 usage——返工场景下那只是最后一轮，主轮与
@@ -1147,6 +1876,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       );
       run.archiveWriter.schedule(() => pruneHistory(historyRoot, historyKeep, running));
     }
+    pruneStoredRuns();
   }
 
   /** 启动一次不带核查的运行 */
@@ -1179,7 +1909,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       pushEvent(run, "main", errorEvent);
     } finally {
       finalizeRun(run, {
-        outcome: mainStopReason === "error" ? "error" : "completed",
+        outcome: runOutcomeForStopReason(mainStopReason),
         ...(mainStopReason ? { mainStopReason } : {}),
       });
     }
@@ -1192,8 +1922,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    * 文档字符串写着"在已有会话正史之上追加一条 user 反馈继续执行"。
    * 也就是说多轮对话在 harness 层一直可行，只是 Web 宿主从没接。
    *
-   * 轮次预算按 runContinuation 的既有语义**每轮重新起算**（不是累计），
-   * 这一点必须让界面说清楚，否则用户会误以为 maxTurns 是整场对话的总额。
+   * 每段 maxTurns 重新起算；AGENT_TOTAL_MAX_TURNS / AGENT_TOTAL_TOKEN_BUDGET
+   * 绑定在同一个 AgentLoop 上累计，不会被追加对话重置。
    */
   async function startContinuation(run: StoredRun, feedback: string): Promise<void> {
     const loop = run.loop;
@@ -1232,7 +1962,81 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       });
     } finally {
       finalizeRun(run, {
-        outcome: mainStopReason === "error" ? "error" : "completed",
+        outcome: runOutcomeForStopReason(mainStopReason),
+        ...(mainStopReason ? { mainStopReason } : {}),
+      });
+    }
+  }
+
+  /**
+   * 从磁盘检查点派生一次续跑。
+   *
+   * 这不是把 archived run “复活”：父档案没有 loop/AbortController，也不应再
+   * 接收事件。新 run 只继承可序列化的会话正史、上下文水位、累计预算与任务
+   * 装配选择；模型/工具/策略取当前宿主，审批放行与 ask_user 已用配额全部重置。
+   */
+  async function startForkedContinuation(run: StoredRun, feedback: string): Promise<void> {
+    const history = run.history;
+    const inheritedBudget = run.resumeBudget;
+    if (!history?.length || !inheritedBudget || !run.continuedFrom) {
+      pushSyntheticEvent(run, "host", {
+        type: "run_fork_failed",
+        reason: "派生 run 缺少正史、预算或父级标识",
+        at: Date.now(),
+      });
+      finalizeRun(run, { outcome: "error", mainStopReason: "error" });
+      return;
+    }
+
+    // 第一条 durable 事件就是环境边界；即使 MCP 连接很慢，人也能立刻看懂
+    // 这是从哪里来的、继承了什么、哪些权限状态已清零。
+    pushSyntheticEvent(run, "host", {
+      type: "run_forked",
+      parentRunId: run.continuedFrom,
+      rootRunId: run.rootRunId ?? run.continuedFrom,
+      boundary: "从归档检查点派生新运行；会话正史与累计预算延续，模型、工具和策略使用当前宿主，父档案保持只读。",
+      checkpoint: {
+        conversationTurn: run.conversationTurn - 1,
+        contextInputTokens: run.initialContextInputTokens ?? 0,
+        runBudget: { ...inheritedBudget },
+      },
+      reset: ["审批放行规则", "挂起交互", "ask_user 已用配额"],
+      at: Date.now(),
+    });
+    pushSyntheticEvent(run, "host", {
+      type: "user_message",
+      turn: run.conversationTurn,
+      text: feedback,
+      at: Date.now(),
+    });
+    broadcastLifecycle("run_updated", run);
+
+    await ensureMcp();
+    pushRunConfig(run);
+    const loop = new AgentLoop(buildConfig(run), modelClient);
+    run.loop = loop;
+
+    let mainStopReason: string | undefined;
+    try {
+      for await (const event of loop.runContinuation(history, feedback, run.abort?.signal)) {
+        if (event.type === "done") mainStopReason = event.result.stopReason;
+        pushEvent(run, "main", event);
+      }
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      mainStopReason = "error";
+      pushSyntheticEvent(run, "main", {
+        type: "done",
+        stopReason: "error",
+        error: { name: "Error", message: errorMsg },
+        messageCount: history.length,
+        usage: { inputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputTokens: 0, turns: 0, cacheHitRatio: 0 },
+        runBudget: { ...inheritedBudget },
+        contextInputTokens: run.initialContextInputTokens ?? 0,
+      });
+    } finally {
+      finalizeRun(run, {
+        outcome: runOutcomeForStopReason(mainStopReason),
         ...(mainStopReason ? { mainStopReason } : {}),
       });
     }
@@ -1266,6 +2070,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       const outcome = await runPlanned(baseCfg, modelClient, run.task, {
         packs: Object.values(PACKS),
         concurrency,
+        ...(run.abort ? { signal: run.abort.signal } : {}),
         ...(envPlanMaxTurns !== undefined ? { planMaxTurns: envPlanMaxTurns } : {}),
         ...(plannerRole && usePlanner
           ? { plannerModel: { client: plannerRole.provider.client, compat: plannerRole.provider.compat } }
@@ -1306,13 +2111,20 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             });
           }
           const runRubric = run.rubric || rubric || sp?.verify.rubric;
+          // 领域包只收窄业务工具；交互/完成控制面必须随执行者进入每个子任务。
+          const controlTools = baseCfg.tools.filter(
+            (tool) => tool.name === ASK_USER_TOOL_NAME || tool.name === FINISH_TASK_TOOL_NAME,
+          );
+          const domainTools = injectedTools ?? selectPackTools(sp, enabledBuiltinPool, mcpTools);
           return {
             cfg: {
               ...baseCfg,
               systemPrompt: sp?.systemPrompt ?? baseCfg.systemPrompt,
               // 逐子任务按各自的包收窄 MCP 工具面：stm32-coding 的 mcp:false
               // 拿不到任何 MCP 工具，stm32-debug 才拿到它 includeTools 里那些
-              tools: injectedTools ?? selectPackTools(sp, BUILTIN_POOL, mcpTools),
+              tools: [...domainTools, ...controlTools].filter(
+                (tool, i, all) => all.findIndex((candidate) => candidate.name === tool.name) === i,
+              ),
               ...(sp?.guardrails?.maxTurns !== undefined ? { maxTurns: sp.guardrails.maxTurns } : {}),
               ...(sp?.guardrails?.maxTokens !== undefined && maxTokens === undefined
                 ? { maxTokens: sp.guardrails.maxTokens }
@@ -1354,6 +2166,17 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           ? { plannerFailure: outcome.planOutcome.failureSummary }
           : {}),
         plannerUsage: outcome.planOutcome.usage,
+        ...(outcome.clarification
+          ? {
+              clarification: {
+                task: outcome.clarification.task,
+                acceptance: outcome.clarification.acceptance,
+                assumptions: outcome.clarification.assumptions,
+                asked: outcome.clarification.asked,
+                usage: outcome.clarification.usage,
+              },
+            }
+          : {}),
         ...(outcome.planOutcome.inventory ? { inventory: outcome.planOutcome.inventory } : {}),
         steps: outcome.steps.map((st) => ({
           id: st.sub.id,
@@ -1362,6 +2185,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           durationMs: st.durationMs,
           passed: st.result.finalPassed,
           reworks: st.result.reworks,
+          stopReason: st.result.main.stopReason,
+          ...(st.result.main.completion ? { completion: st.result.main.completion } : {}),
           verdict: st.result.verifications.at(-1)?.verdict ?? null,
           usage: st.result.executionUsage,
         })),
@@ -1394,16 +2219,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       });
     } finally {
       finalizeRun(run, {
-        outcome:
-          mainStopReason === "error"
-            ? "error"
-            // 门未应答唯一的触发路径是宿主收尾时 settle("expired")，归 closed
-            // （run 本身没跑完）；finalizeRun 幂等，这条实际只在首次收尾生效
-            : mainStopReason === "plan_gate_expired"
-              ? "closed"
-              : mainStopReason === "plan_rejected"
-                ? "rejected"
-                : "completed",
+        // 门未应答归 closed、明确否决归 rejected；与其它 stopReason 共用唯一映射。
+        outcome: runOutcomeForStopReason(mainStopReason),
         ...(mainStopReason ? { mainStopReason } : {}),
       });
     }
@@ -1457,7 +2274,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       });
     } finally {
       finalizeRun(run, {
-        outcome: mainStopReason === "error" ? "error" : "completed",
+        outcome: runOutcomeForStopReason(mainStopReason),
         ...(mainStopReason ? { mainStopReason } : {}),
       });
     }
@@ -1564,6 +2381,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         maxTurns: cfg.maxTurns ?? null,
         maxTokens: cfg.maxTokens ?? null,
         contextTokenLimit: cfg.contextTokenLimit ?? null,
+        maxTotalTurns: cfg.maxTotalTurns ?? null,
+        maxTokensBudget: cfg.maxTokensBudget ?? null,
       },
       tools: cfg.tools.map((t) => ({
         name: t.name,
@@ -1584,13 +2403,22 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       // 界面必须说清楚，否则用户以为自己设的档位生效了
       effort: effort ?? null,
       effortApplies: Boolean(effort) && !envCompat,
-      shell: SHELL_DESC,
+      shell: bashEnabled ? SHELL_DESC : null,
       workdir,
       readRoots,
       guardrails: {
         maxTurns: maxTurns ?? null,
         maxTokens: maxTokens ?? null,
         contextTokenLimit: contextTokenLimit ?? null,
+        maxTotalTurns: maxTotalTurns ?? null,
+        maxTokensBudget: maxTokensBudget ?? null,
+      },
+      hostLimits: {
+        requestBodyMaxBytes,
+        maxActiveRuns,
+        maxStoredRuns,
+        mutationRateLimitPerMinute,
+        bashEnabled,
       },
       compactWatermark: 0.8,
       uploadSubdir: UPLOAD_SUBDIR,
@@ -1642,6 +2470,101 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     };
   }
 
+  function activeRunCount(): number {
+    let count = 0;
+    for (const run of runs.values()) if (run.status === "running") count += 1;
+    return count;
+  }
+
+  /** 预留一个启动槽，覆盖“检查上限”到 runs.set/status=running 之间的竞态窗口。 */
+  function acquireRunAdmission(): (() => void) | null {
+    if (activeRunCount() + pendingAdmissions >= maxActiveRuns) return null;
+    pendingAdmissions += 1;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      pendingAdmissions = Math.max(0, pendingAdmissions - 1);
+    };
+  }
+
+  function rejectAtCapacity(res: ServerResponse): void {
+    metrics.capacityRejected += 1;
+    res.setHeader("Retry-After", "1");
+    json(res, 429, {
+      error: `Active run limit reached (${maxActiveRuns})`,
+      activeRuns: activeRunCount(),
+    });
+  }
+
+  function mutationRetryAfter(req: IncomingMessage): number | null {
+    if (mutationRateLimitPerMinute === Number.MAX_SAFE_INTEGER) return null;
+    const key = req.socket.remoteAddress ?? "unknown";
+    const now = Date.now();
+    let window = mutationWindows.get(key);
+    if (!window && mutationWindows.size >= 10_000) {
+      for (const [candidate, value] of mutationWindows) {
+        if (now - value.startedAt >= 60_000) mutationWindows.delete(candidate);
+      }
+      // 不让攻击者用无限源地址把 limiter 自己变成内存泄漏；表满时新来源先退避。
+      if (mutationWindows.size >= 10_000) return 60;
+    }
+    if (!window || now - window.startedAt >= 60_000) {
+      window = { startedAt: now, count: 0 };
+      mutationWindows.set(key, window);
+    }
+    if (window.count >= mutationRateLimitPerMinute) {
+      return Math.max(1, Math.ceil((60_000 - (now - window.startedAt)) / 1_000));
+    }
+    window.count += 1;
+    return null;
+  }
+
+  function healthBody(ready: boolean): Record<string, unknown> {
+    return {
+      status: ready ? "ready" : "degraded",
+      uptimeMs: Date.now() - startedAt,
+      shuttingDown,
+      activeRuns: activeRunCount(),
+      history: {
+        enabled: Boolean(historyRoot),
+        healthy: historyHealthy,
+        // 公共探针不回显可能带绝对路径的底层错误。
+        error: historyHealthy ? null : "history_write_failed",
+      },
+    };
+  }
+
+  function prometheusMetrics(): string {
+    const statusLines = [...metrics.httpStatuses.entries()]
+      .sort(([left], [right]) => left - right)
+      .map(([status, count]) => `agent_harness_http_responses_total{status="${status}"} ${count}`);
+    return [
+      "# TYPE agent_harness_http_requests_total counter",
+      `agent_harness_http_requests_total ${metrics.httpRequests}`,
+      "# TYPE agent_harness_http_responses_total counter",
+      ...statusLines,
+      "# TYPE agent_harness_active_runs gauge",
+      `agent_harness_active_runs ${activeRunCount()}`,
+      "# TYPE agent_harness_ready gauge",
+      `agent_harness_ready ${historyHealthy && !shuttingDown ? 1 : 0}`,
+      "# TYPE agent_harness_runs_started_total counter",
+      `agent_harness_runs_started_total ${metrics.runsStarted}`,
+      "# TYPE agent_harness_runs_finished_total counter",
+      `agent_harness_runs_finished_total ${metrics.runsFinished}`,
+      "# TYPE agent_harness_security_rejections_total counter",
+      `agent_harness_security_rejections_total{reason="origin"} ${metrics.originRejected}`,
+      `agent_harness_security_rejections_total{reason="auth"} ${metrics.authRejected}`,
+      `agent_harness_security_rejections_total{reason="host"} ${metrics.hostRejected}`,
+      `agent_harness_security_rejections_total{reason="body"} ${metrics.bodyRejected}`,
+      `agent_harness_security_rejections_total{reason="rate"} ${metrics.rateRejected}`,
+      `agent_harness_security_rejections_total{reason="capacity"} ${metrics.capacityRejected}`,
+      "# TYPE agent_harness_history_errors_total counter",
+      `agent_harness_history_errors_total ${metrics.historyErrors}`,
+      "",
+    ].join("\n");
+  }
+
   /**
    * 把 URL 里的 approvalRef 解析为挂起审批。
    * - `toolUseId#seq`：精确匹配某一轮的那张卡（前端一律用这种形式）
@@ -1672,10 +2595,14 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     url: string,
   ):
     | { type: "static"; filePath: string }
+    | { type: "health" }
+    | { type: "ready" }
+    | { type: "metrics" }
     | { type: "harness" }
     | { type: "runsList" }
     | { type: "lifecycleStream" }
     | { type: "transcript"; runId: string }
+    | { type: "inspectPaths"; runId: string }
     | { type: "artifact"; runId: string; path: string; download: boolean }
     | { type: "reveal"; runId: string }
     | { type: "stop"; runId: string }
@@ -1685,7 +2612,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     | { type: "events"; runId: string }
     | { type: "approval"; runId: string; toolUseId: string }
     | { type: "planApproval"; runId: string }
+    | { type: "answer"; runId: string }
     | { type: "malformed" } {
+    if (method === "GET" && url === "/health") return { type: "health" };
+    if (method === "GET" && url === "/ready") return { type: "ready" };
+    if (method === "GET" && url === "/metrics") return { type: "metrics" };
     if (method === "GET" && (url === "/" || url === "/index.html")) {
       return { type: "static", filePath: "index.html" };
     }
@@ -1710,6 +2641,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     const transcriptMatch = method === "GET" && url.match(/^\/api\/runs\/([^/]+)\/transcript$/);
     if (transcriptMatch) {
       return { type: "transcript", runId: transcriptMatch[1]! };
+    }
+
+    const inspectPathsMatch =
+      method === "POST" && url.match(/^\/api\/runs\/([^/]+)\/paths\/inspect$/);
+    if (inspectPathsMatch) {
+      return { type: "inspectPaths", runId: inspectPathsMatch[1]! };
     }
 
     /**
@@ -1764,6 +2701,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       return { type: "planApproval", runId: planApprovalMatch[1]! };
     }
 
+    // §5.2：委托方回答 agent 的澄清问题（或显式跳过）
+    const answerMatch = method === "POST" && url.match(/^\/api\/runs\/([^/]+)\/answer$/);
+    if (answerMatch) {
+      return { type: "answer", runId: answerMatch[1]! };
+    }
+
     const approvalMatch = method === "POST" && url.match(/^\/api\/runs\/([^/]+)\/approvals\/([^/]+)$/);
     if (approvalMatch) {
       // approvalId 形如 `toolUseId#seq`；`#` 在 URL 里是片段分隔符，客户端必须
@@ -1785,15 +2728,123 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = req.url ?? "/";
     const method = req.method ?? "GET";
+    metrics.httpRequests += 1;
+    res.once("finish", () => {
+      const status = res.statusCode;
+      metrics.httpStatuses.set(status, (metrics.httpStatuses.get(status) ?? 0) + 1);
+      if (status === 413) metrics.bodyRejected += 1;
+    });
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(url, sameOriginOf(req, trustProxy) ?? "http://localhost");
+    } catch {
+      return badRequest(res, "Malformed request URL");
+    }
+    const hostname = requestHostname(req, trustProxy);
+    if (!hostname || (!isLoopbackHostname(hostname) && !allowedHosts.has(hostname))) {
+      metrics.hostRejected += 1;
+      if (realHost) {
+        operationalLog("warn", "request_rejected", { reason: "host", method, path: parsedUrl.pathname });
+      }
+      return json(res, 421, { error: "Untrusted Host header" });
+    }
+
+    // 令牌宿主的浏览器引导：令牌只在首次 URL 中出现，校验后写 HttpOnly cookie
+    // 并立刻 303 到无查询串地址。EventSource 随后可沿同源 cookie 完成认证。
+    if (
+      method === "GET" &&
+      (parsedUrl.pathname === "/" || parsedUrl.pathname === "/index.html") &&
+      parsedUrl.searchParams.has("access_token")
+    ) {
+      const supplied = parsedUrl.searchParams.get("access_token") ?? undefined;
+      if (!accessToken || !secureStringEqual(supplied, accessToken)) {
+        res.setHeader("WWW-Authenticate", "Bearer");
+        return json(res, 401, { error: "Invalid access token" });
+      }
+      const secure = sameOriginOf(req, trustProxy)?.startsWith("https://") ? "; Secure" : "";
+      res.setHeader(
+        "Set-Cookie",
+        `agent_ui_access=${encodeURIComponent(accessToken)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800${secure}`,
+      );
+      res.writeHead(303, { Location: parsedUrl.pathname });
+      res.end();
+      return;
+    }
+
+    // CORS 头本身不会阻止 text/plain/no-cors 副作用；因此在任何路由执行前
+    // 主动拒绝不受信 Origin。该检查与访问令牌互为独立安全边界。
+    if (!originAllowed(req, allowedOrigins, trustProxy)) {
+      metrics.originRejected += 1;
+      if (realHost) {
+        operationalLog("warn", "request_rejected", { reason: "origin", method, path: parsedUrl.pathname });
+      }
+      return json(res, 403, { error: `Origin not allowed: ${req.headers.origin}` });
+    }
+    applyCors(req, res, allowedOrigins, trustProxy);
+    if (method === "OPTIONS") {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
     const route = matchRoute(method, url);
+
+    if (accessToken && (parsedUrl.pathname.startsWith("/api/") || route.type === "metrics")) {
+      if (!secureStringEqual(requestAccessToken(req), accessToken)) {
+        metrics.authRejected += 1;
+        if (realHost) {
+          operationalLog("warn", "request_rejected", { reason: "auth", method, path: parsedUrl.pathname });
+        }
+        res.setHeader("WWW-Authenticate", "Bearer");
+        return json(res, 401, { error: "Authentication required" });
+      }
+    }
+
+    if (method === "POST") {
+      const retryAfter = mutationRetryAfter(req);
+      if (retryAfter !== null) {
+        metrics.rateRejected += 1;
+        res.setHeader("Retry-After", String(retryAfter));
+        return json(res, 429, { error: "Mutation rate limit exceeded" });
+      }
+      const jsonRoute = new Set([
+        "upload",
+        "followUp",
+        "inspectPaths",
+        "reveal",
+        "createRun",
+        "planApproval",
+        "answer",
+        "approval",
+      ]).has(route.type);
+      const contentType = String(req.headers["content-type"] ?? "").toLowerCase();
+      if (jsonRoute && !/^application\/(?:[\w.-]+\+)?json(?:\s*;|$)/.test(contentType)) {
+        return json(res, 415, { error: "Content-Type must be application/json" });
+      }
+    }
 
     // B2：档案恢复完成前不应答 API——启动后的第一个 GET /api/runs 就要看得到
     // 历史，否则界面会先画一份空列表再闪一次（静态资源不用等）
-    if (route.type !== "static") await historyReady;
+    if (route.type !== "static" && route.type !== "health" && route.type !== "metrics") {
+      await historyReady;
+    }
 
     switch (route.type) {
       case "malformed":
         return notFound(res, `Unknown route: ${method} ${url}`);
+
+      case "health":
+        return json(res, 200, { status: "ok", uptimeMs: Date.now() - startedAt });
+
+      case "ready": {
+        const ready = historyHealthy && !shuttingDown;
+        return json(res, ready ? 200 : 503, healthBody(ready));
+      }
+
+      case "metrics":
+        res.writeHead(200, { "Content-Type": "text/plain; version=0.0.4; charset=utf-8" });
+        res.end(prometheusMetrics());
+        return;
 
       case "harness":
         return json(res, 200, harnessSnapshot());
@@ -1815,9 +2866,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
          */
         let body: string;
         try {
-          body = await readBody(req);
-        } catch {
-          return badRequest(res, "Failed to read request body");
+          body = await readBody(req, requestBodyMaxBytes);
+        } catch (error) {
+          return requestBodyFailure(res, error);
         }
         let parsed: { name?: string; data?: string; workdir?: string };
         try {
@@ -1884,40 +2935,41 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         const run = runs.get(route.runId);
         if (!run) return notFound(res, `Run not found: ${route.runId}`);
 
-        // B2 判据④：归档运行只能回看。这个原因必须排在最前——归档 run 也没有
-        // loop，落到下面那句"可能执行阶段就失败了"就是对着好端端的历史说谎
-        if (run.archived) {
-          return json(res, 409, {
-            error: "归档运行（宿主重启前的历史）只能回看：执行上下文没有跨重启保存，无法续跑",
-          });
-        }
-
         // 边界要说清，不能含糊地失败：
         //  · 运行中不接受追加——两条指令并发进同一个会话会互相踩
-        //  · 核查/编排模式没有续跑入口（runVerified / runPlanned 都从头开始），
-        //    这是本轮明确不做的部分，不是 bug，界面要照实说
-        if (run.status === "running") {
-          return json(res, 409, { error: "运行进行中，请等它这一轮结束再追加指令" });
-        }
-        if (run.mode === "plan") {
-          return json(res, 409, {
-            error: "计划编排的运行不支持追加指令：runPlanned 每次都从拆解开始，没有续跑入口",
-          });
-        }
-        if (run.verify) {
-          return json(res, 409, {
-            error: "开启独立核查的运行不支持追加指令：runVerified 无续跑入口，追加会绕过已出具的裁决",
-          });
-        }
-        if (!run.loop || !run.history?.length) {
-          return json(res, 409, { error: "该运行没有可续跑的会话正史（可能是执行阶段就失败了）" });
+        //  · live run 复用原 loop；archived run 只能从检查点派生新 run
+        //  · 核查/编排都没有安全的续跑入口，不能绕过裁决或调度重新接主线
+        if (run.archived) {
+          const blockReason = archivedForkBlockReason(run);
+          if (blockReason) return json(res, 409, { error: blockReason });
+        } else {
+          if (run.status === "running") {
+            return json(res, 409, { error: "运行进行中，请等它这一轮结束再追加指令" });
+          }
+          if (run.mode === "plan") {
+            return json(res, 409, {
+              error: "计划编排的运行不支持追加指令：runPlanned 每次都从拆解开始，没有续跑入口",
+            });
+          }
+          if (run.verify) {
+            return json(res, 409, {
+              error: "开启独立核查的运行不支持追加指令：runVerified 无续跑入口，追加会绕过已出具的裁决",
+            });
+          }
+          if (!run.loop || !run.history?.length) {
+            return json(res, 409, { error: "该运行没有可续跑的会话正史（可能是执行阶段就失败了）" });
+          }
+          const budgetBlockReason = run.checkpoint
+            ? exhaustedBudgetReason(run.checkpoint.runBudget)
+            : null;
+          if (budgetBlockReason) return json(res, 409, { error: budgetBlockReason });
         }
 
         let body: string;
         try {
-          body = await readBody(req);
-        } catch {
-          return badRequest(res, "Failed to read request body");
+          body = await readBody(req, requestBodyMaxBytes);
+        } catch (error) {
+          return requestBodyFailure(res, error);
         }
         let parsed: { text?: string };
         try {
@@ -1928,10 +2980,90 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         if (!parsed.text || typeof parsed.text !== "string" || !parsed.text.trim()) {
           return badRequest(res, 'Missing or invalid "text" field');
         }
+        const feedback = parsed.text.trim();
+        const releaseAdmission = acquireRunAdmission();
+        if (!releaseAdmission) return rejectAtCapacity(res);
+
+        if (run.archived) {
+          try {
+            await hydrateArchive(run);
+            const history = archivedCheckpointHistory(run);
+            const checkpoint = run.checkpoint!;
+            if (!history) {
+              return json(res, 409, {
+                error: `归档检查点损坏：transcript 中找不到 main 段 ${checkpoint.segmentIndex}`,
+              });
+            }
+
+            const id = randomUUID();
+            const rootRunId = run.rootRunId ?? run.id;
+            const child: StoredRun = {
+              id,
+              // 子 run 仍是同一项任务；新增指令由 user_message 事件精确记录。
+              task: run.task,
+              status: "running",
+              verify: false,
+              createdAt: Date.now(),
+              events: [],
+              pendingApprovals: new Map(),
+              respondedApprovals: new Map(),
+              respondedToolUseIds: new Set(),
+              sseClients: new Set(),
+              segmentIndex: 0,
+              transcript: [],
+              conversationTurn: checkpoint.conversationTurn + 1,
+              toolTally: {},
+              abort: new AbortController(),
+              history,
+              continuedFrom: run.id,
+              rootRunId,
+              resumeBudget: restoredBudget(checkpoint, { maxTotalTurns, maxTokensBudget }),
+              initialContextInputTokens: checkpoint.contextInputTokens,
+              // 继承任务选择，不继承任何活权限状态；模型/工具由 buildConfig 取当前宿主。
+              ...(run.packName ? { packName: run.packName } : {}),
+              ...(run.effort ? { effort: run.effort } : {}),
+              ...(run.rubric ? { rubric: run.rubric } : {}),
+              ...(run.workdir ? { workdir: resolve(run.workdir) } : { workdir }),
+              ...(run.askUser ? { askUser: true } : {}),
+            };
+            if (historyRoot) {
+              child.archiveWriter = createArchiveWriter(id);
+              persistMeta(child);
+            }
+            runs.set(id, child);
+            metrics.runsStarted += 1;
+            if (realHost) {
+              operationalLog("info", "run_started", {
+                runId: id,
+                mode: "single",
+                verify: false,
+                continuation: "fork",
+              });
+            }
+            broadcastLifecycle("run_created", child);
+            void startForkedContinuation(child, feedback);
+            return json(res, 200, {
+              runId: id,
+              conversationTurn: child.conversationTurn,
+              continuedFrom: run.id,
+              rootRunId,
+              continuationMode: "fork",
+              run: runSummary(child),
+            });
+          } finally {
+            releaseAdmission();
+          }
+        }
 
         // startContinuation 在第一个 await 之前就把轮数加过了，这里不能再 +1
-        void startContinuation(run, parsed.text.trim());
-        return json(res, 200, { runId: run.id, conversationTurn: run.conversationTurn });
+        void startContinuation(run, feedback);
+        releaseAdmission();
+        return json(res, 200, {
+          runId: run.id,
+          conversationTurn: run.conversationTurn,
+          continuationMode: "same",
+          run: runSummary(run),
+        });
       }
 
       case "transcript": {
@@ -1945,6 +3077,51 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           task: run.task,
           segments: run.transcript,
         });
+      }
+
+      /**
+       * 把模型正文里的“疑似路径”升级成链接之前，先做一次只读确认。
+       *
+       * 前端只负责语法初筛；这里按**该 run 自己的 workdir**解析并 stat，且只回
+       * 相对路径与 file/directory 两值。不存在、越界或特殊文件都返回 exists=false，
+       * 页面便继续把它画成普通行内代码，不制造一个点开必坏的假链接。
+       */
+      case "inspectPaths": {
+        const run = runs.get(route.runId);
+        if (!run) return notFound(res, `Run not found: ${route.runId}`);
+        let parsed: { paths?: unknown };
+        try {
+          parsed = JSON.parse(await readBody(req, requestBodyMaxBytes));
+        } catch (error) {
+          if (error instanceof RequestBodyTooLargeError) return requestBodyFailure(res, error);
+          return badRequest(res, "Body must be JSON with a paths array");
+        }
+        if (!Array.isArray(parsed.paths)) return badRequest(res, "paths must be an array");
+        if (parsed.paths.length > 64) return badRequest(res, "paths accepts at most 64 items");
+
+        const root = run.workdir ?? workdir;
+        const inputs = [...new Set(parsed.paths.map((p) => String(p ?? "").trim()))];
+        const inspected = await Promise.all(
+          inputs.map(async (input) => {
+            if (!input || input.length > 1024) return { input, exists: false as const };
+            let abs: string;
+            try {
+              abs = resolveInWorkdir(root, localPathTarget(input));
+            } catch {
+              return { input, exists: false as const };
+            }
+            try {
+              const st = await stat(abs);
+              const kind = st.isFile() ? "file" : st.isDirectory() ? "directory" : null;
+              if (!kind) return { input, exists: false as const };
+              const rel = relative(resolve(root), abs).split(sep).join("/") || ".";
+              return { input, exists: true as const, path: rel, kind };
+            } catch {
+              return { input, exists: false as const };
+            }
+          }),
+        );
+        return json(res, 200, { paths: inspected });
       }
 
       /**
@@ -2004,7 +3181,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       case "reveal": {
         const run = runs.get(route.runId);
         if (!run) return notFound(res, `Run not found: ${route.runId}`);
-        const body = await readBody(req);
+        let body: string;
+        try {
+          body = await readBody(req, requestBodyMaxBytes);
+        } catch (error) {
+          return requestBodyFailure(res, error);
+        }
         let wanted: string;
         try {
           wanted = String(JSON.parse(body).path ?? "");
@@ -2019,12 +3201,14 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         } catch (err) {
           return json(res, 400, { error: (err as Error).message });
         }
+        let targetKind: "file" | "directory" = "file";
         try {
-          await stat(abs);
+          const st = await stat(abs);
+          targetKind = st.isDirectory() ? "directory" : "file";
         } catch {
           return notFound(res, `Artifact not found: ${wanted}`);
         }
-        const cmd = revealCommand(abs);
+        const cmd = revealCommand(abs, targetKind);
         if (!cmd) return json(res, 501, { error: `Unsupported platform: ${process.platform}` });
         try {
           spawn(cmd.file, cmd.args, { detached: true, stdio: "ignore" }).unref();
@@ -2059,6 +3243,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         if (run.pendingPlan) {
           try { run.pendingPlan.settle("reject"); } catch { /* 已决 */ }
         }
+        // §5.2 提问同理。settle(null) 而不是抛——停止是委托方的决定，
+        // 工具那边会回"按你的最佳判断继续"，不是把它当故障（决定 4）
+        try { expireQuestion(run, "stopped"); } catch { /* 已应答 */ }
         broadcastLifecycle("run_updated", run);
         return json(res, 200, { stopping: true });
       }
@@ -2086,15 +3273,15 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       case "createRun": {
         let body: string;
         try {
-          body = await readBody(req);
-        } catch {
-          return badRequest(res, "Failed to read request body");
+          body = await readBody(req, requestBodyMaxBytes);
+        } catch (error) {
+          return requestBodyFailure(res, error);
         }
         let parsed: {
           task?: string; verify?: boolean; pack?: string; effort?: string; rubric?: string;
           mode?: string; concurrency?: number | string;
           workdir?: string; useVerifierModel?: boolean; usePlannerModel?: boolean;
-          planGate?: boolean;
+          planGate?: boolean; askUser?: boolean;
         };
         try {
           parsed = JSON.parse(body);
@@ -2152,6 +3339,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         }
 
         const verify = parsed.verify === true;
+        // §5.2 决定 1：默认关，逐 run 显式开
+        const askUser = parsed.askUser === true;
+        const releaseAdmission = acquireRunAdmission();
+        if (!releaseAdmission) return rejectAtCapacity(res);
         const id = randomUUID();
         const run: StoredRun = {
           id,
@@ -2178,13 +3369,24 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           ...(parsed.useVerifierModel === false ? { useVerifierModel: false } : {}),
           ...(parsed.usePlannerModel === false ? { usePlannerModel: false } : {}),
           ...(parsed.planGate === true ? { planGate: true } : {}),
+          ...(askUser ? { askUser: true } : {}),
         };
         // B2：建档要在第一条事件之前——writer 的写入链从 mkdir 开始保序
         if (historyRoot) {
-          run.archiveWriter = new RunHistoryWriter(join(historyRoot, id));
+          run.archiveWriter = createArchiveWriter(id);
           persistMeta(run);
         }
         runs.set(id, run);
+        releaseAdmission();
+        metrics.runsStarted += 1;
+        if (realHost) {
+          operationalLog("info", "run_started", {
+            runId: id,
+            mode: run.mode ?? "single",
+            verify,
+            continuation: null,
+          });
+        }
         broadcastLifecycle("run_created", run);
 
         if (run.mode === "plan") {
@@ -2220,9 +3422,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
         let body: string;
         try {
-          body = await readBody(req);
-        } catch {
-          return badRequest(res, "Failed to read request body");
+          body = await readBody(req, requestBodyMaxBytes);
+        } catch (error) {
+          return requestBodyFailure(res, error);
         }
         let parsed: { decision?: string };
         try {
@@ -2246,6 +3448,68 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           at,
         });
         pendingPlan.settle(parsed.decision);
+        broadcastLifecycle("run_updated", run);
+        return json(res, 200, { acknowledged: true });
+      }
+
+      /**
+       * §5.2 澄清答复。状态门口径同计划门（R-01）：没有挂起的问题就 409，
+       * 不是静默成功——"我到底答没答"必须有确定答案。
+       */
+      case "answer": {
+        const run = runs.get(route.runId);
+        if (!run) return notFound(res, `Run not found: ${route.runId}`);
+        if (run.status === "done" || !run.pendingQuestion) {
+          return json(res, 409, { error: "No question awaiting an answer for this run" });
+        }
+
+        let body: string;
+        try {
+          body = await readBody(req, requestBodyMaxBytes);
+        } catch (error) {
+          return requestBodyFailure(res, error);
+        }
+        let parsed: { answers?: unknown; skip?: unknown };
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          return badRequest(res, "Invalid JSON body");
+        }
+
+        const pendingQuestion = run.pendingQuestion;
+        const count = pendingQuestion.questions.length;
+        /**
+         * skip = 委托方明确表示"你自己定"（整轮）。与超时同归 null，但**来源不同**，
+         * 事件里照实记——把主动跳过写成"未应答"就是对委托方说谎（V-04）。
+         */
+        const skipped = parsed.skip === true;
+        let answers: (string | null)[] | null = null;
+        if (!skipped) {
+          if (!Array.isArray(parsed.answers) || parsed.answers.length !== count) {
+            return badRequest(
+              res,
+              `answers must be an array of ${count} items (null for unanswered), or pass {"skip": true}`,
+            );
+          }
+          answers = parsed.answers.map((a) =>
+            typeof a === "string" && a.trim() !== "" ? a.trim() : null,
+          );
+          // 一题都没答 = 等同整轮跳过，但不静默转换：让委托方显式点「让它自己定」
+          if (!answers.some((a) => a !== null)) {
+            return badRequest(res, 'at least one answer required, or pass {"skip": true}');
+          }
+        }
+
+        pushSyntheticEvent(run, "host", {
+          type: "user_question_resolved",
+          requestSeq: pendingQuestion.requestSeq,
+          id: pendingQuestion.id,
+          answers,
+          skipped,
+          actor: "user",
+          at: Date.now(),
+        });
+        pendingQuestion.settle(answers);
         broadcastLifecycle("run_updated", run);
         return json(res, 200, { acknowledged: true });
       }
@@ -2277,9 +3541,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
         let body: string;
         try {
-          body = await readBody(req);
-        } catch {
-          return badRequest(res, "Failed to read request body");
+          body = await readBody(req, requestBodyMaxBytes);
+        } catch (error) {
+          return requestBodyFailure(res, error);
         }
         let parsed: { decision?: string; reason?: string; scope?: string };
         try {
@@ -2331,7 +3595,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       }
 
       case "static": {
-        const filePath = join(PUBLIC_DIR, route.filePath);
+        const filePath = VENDOR_STATIC.get(route.filePath) ?? join(PUBLIC_DIR, route.filePath);
         if (!existsSync(filePath)) {
           return notFound(res, `File not found: ${route.filePath}`);
         }
@@ -2349,32 +3613,80 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     }
   }
 
-  const server = createServer(handleRequest);
+  const server = createServer((req, res) => {
+    void handleRequest(req, res).catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      operationalLog("error", "http_handler_failed", {
+        method: req.method ?? "GET",
+        path: req.url ?? "/",
+        error: message,
+      });
+      if (!res.headersSent) json(res, 500, { error: "Internal server error" });
+      else res.destroy(error instanceof Error ? error : undefined);
+    });
+  });
+  let closePromise: Promise<void> | null = null;
 
   return {
     server,
     close(): Promise<void> {
-      return new Promise((resolve, reject) => {
+      if (closePromise) return closePromise;
+      shuttingDown = true;
+      closePromise = (async () => {
+        if (realHost) operationalLog("info", "host_shutdown_started", { activeRuns: activeRunCount() });
         // 走正规的 finalizeRun 而不是直接掀桌：宿主关停时仍挂起的审批要被
         // 显式宣告过期、run_end 要落进事件流。否则在线客户端只会看到连接莫名断掉，
         // 而它按设计是会自动重连的——语义上就成了"运行还在，只是连不上"。
         for (const run of runs.values()) {
+          run.abort?.abort();
           finalizeRun(run, { outcome: "closed" });
         }
+        // 全局生命周期 SSE 不是某个 run 的客户端，finalizeRun 不会替它收尾。
+        // 必须主动 end；否则 server.close 会永远等待这条 keep-alive 连接。
+        for (const client of lifecycleClients) {
+          try { client.end(); } catch { /* 连接已由对端关闭 */ }
+        }
+        lifecycleClients.clear();
         // B2：等档案写入链走完再关——收尾刚排进队列的 approval_expired /
         // run_end / meta 不能丢在半路，否则重启后的档案缺最关键的那几行
         const flushes = [...runs.values()]
           .map((r) => r.archiveWriter?.flush())
           .filter((p): p is Promise<unknown> => Boolean(p));
-        runs.clear();
         // MCP 子进程必须显式断开：留着就是常驻的僵尸 server，stm32 那种还攥着
-        // 探针（案例 #3 的事故原型）。close() 不等它完成——服务器该关就关，
-        // 但断开动作要发出去
-        void mcpRuntime?.close().catch(() => {});
-        void Promise.allSettled(flushes).then(() => {
-          server.close((err) => (err ? reject(err) : resolve()));
+        // 探针（案例 #3 的事故原型）。给落盘与断开一个有界窗口，超时后仍释放 HTTP。
+        const cleanup = Promise.allSettled([
+          ...flushes,
+          ...detachedArchiveFlushes,
+          ...(mcpRuntime ? [mcpRuntime.close()] : []),
+        ]);
+        let cleanupTimer: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([
+          cleanup,
+          new Promise<void>((resolveTimeout) => {
+            cleanupTimer = setTimeout(resolveTimeout, shutdownTimeoutMs);
+          }),
+        ]);
+        if (cleanupTimer) clearTimeout(cleanupTimer);
+        runs.clear();
+        mutationWindows.clear();
+
+        if (!server.listening) return;
+        await new Promise<void>((resolveClose, rejectClose) => {
+          const forceTimer = setTimeout(() => {
+            server.closeAllConnections();
+          }, shutdownTimeoutMs);
+          server.close((error) => {
+            clearTimeout(forceTimer);
+            if (error && (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING") {
+              rejectClose(error);
+            } else {
+              resolveClose();
+            }
+          });
         });
-      });
+        if (realHost) operationalLog("info", "host_shutdown_completed");
+      })();
+      return closePromise;
     },
   };
 }

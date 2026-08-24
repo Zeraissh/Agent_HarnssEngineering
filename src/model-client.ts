@@ -3,7 +3,16 @@
  * 决策（docs/02）：一律流式；adaptive thinking 显式开启；不暴露已移除的采样参数。
  */
 import Anthropic from "@anthropic-ai/sdk";
-import type { ModelClient, ModelRequest, ModelTurn, StreamDelta } from "./types.js";
+import type { ModelClient, ModelRequest, ModelTurn, StreamDelta, ToolChoice } from "./types.js";
+
+/**
+ * ToolChoice → Anthropic wire。纯函数单独提出来是为了能被单测钉住：
+ * 这一行 spread 映射写错了不会报错，只会静默变成"没约束"——
+ * B0b 那一轮在 OpenAI 侧留下的正是这种没锁住的映射。
+ */
+export function toAnthropicToolChoice(choice: ToolChoice): Anthropic.ToolChoice {
+  return choice === "none" ? { type: "none" } : { type: "tool", name: choice.name };
+}
 
 export interface ModelClientOptions {
   /**
@@ -16,6 +25,8 @@ export interface ModelClientOptions {
 export class AnthropicModelClient implements ModelClient {
   private client: Anthropic;
   private readonly compat: boolean;
+  /** 端点拒绝过强制工具就记住，后续请求直接不带（见 send 的降级臂） */
+  private forcedToolUnsupported = false;
 
   constructor(
     private readonly model: string,
@@ -27,27 +38,71 @@ export class AnthropicModelClient implements ModelClient {
     this.compat = opts?.compat ?? !model.startsWith("claude");
   }
 
-  async send(
-    req: ModelRequest,
-    onDelta?: (delta: StreamDelta) => void,
-    signal?: AbortSignal,
-  ): Promise<ModelTurn> {
-    const stream = this.client.messages.stream({
+  /**
+   * 请求体构造（纯函数化，便于测试与降级重发共用）。
+   *
+   * **强制工具与思考模式互斥**（2026-08-15 真机探针实测）：
+   * DeepSeek 兼容端点对 `tool_choice:{type:"tool"}` + 思考模式直接 400
+   * 「Thinking mode does not support this tool_choice」；显式
+   * `thinking:{type:"disabled"}` 后同一请求 200 且真的返回 tool_use。
+   *
+   * 这**不是端点的怪癖，是 Anthropic 协议本身的约束**——扩展思考开启时
+   * tool_choice 不允许点名具体工具。所以两条路径统一处理，不做端点特判。
+   *
+   * 语义上也正好对：需要强制交付的只有收口段，那一段本来就不该再思考——
+   * 它只是把手里已有的证据写成结构化交付（B0b 同款理由）。
+   */
+  private buildParams(req: ModelRequest, dropToolChoice: boolean): Anthropic.MessageStreamParams {
+    const toolChoice = dropToolChoice ? undefined : req.toolChoice;
+    const forcedTool = toolChoice !== undefined && toolChoice !== "none";
+    return {
       model: this.model,
       max_tokens: req.maxTokens,
       system: req.system,
       messages: req.messages,
       tools: req.tools,
-      // B0b 结构化禁工具。非 Claude 专属参数，compat 端点也发（DeepSeek 实测接受）
-      ...(req.toolChoice ? { tool_choice: { type: req.toolChoice } } : {}),
+      // 工具选择约束。非 Claude 专属参数，compat 端点也发（DeepSeek 实测接受）
+      ...(toolChoice ? { tool_choice: toAnthropicToolChoice(toolChoice) } : {}),
       // Claude 专属参数：Opus 4.8 上省略 thinking = 不思考，必须显式开启 adaptive；
-      // 第三方兼容端点不认识这些字段，compat 模式下不发送
-      ...(this.compat
-        ? {}
-        : { thinking: { type: "adaptive" as const }, output_config: { effort: req.effort } }),
-    },
+      // 第三方兼容端点不认识这些字段，compat 模式下不发送。
+      // **例外**：强制工具时必须显式关思考（见上），这一条对两种模式都成立。
+      ...(forcedTool
+        ? { thinking: { type: "disabled" as const } }
+        : this.compat
+          ? {}
+          : { thinking: { type: "adaptive" as const }, output_config: { effort: req.effort } }),
+    } as Anthropic.MessageStreamParams;
+  }
+
+  async send(
+    req: ModelRequest,
+    onDelta?: (delta: StreamDelta) => void,
+    signal?: AbortSignal,
+  ): Promise<ModelTurn> {
+    try {
+      return await this.stream(this.buildParams(req, this.forcedToolUnsupported), onDelta, signal);
+    } catch (err) {
+      /**
+       * 降级臂（§2.1）：端点拒绝强制工具时**剥掉它重发一次**，而不是把整段烧掉。
+       *
+       * 为什么必须在 wire 层做：400 是永久性错误，loop 的重试分类会直接
+       * `finish("error")`——于是"强制交付"这个增强反而会杀死收口救援，
+       * 比不做还糟。端点能力差异归 L0，上面几层不该知道（P1）。
+       * 记住结论：同一个端点不必每轮撞一次墙。
+       */
+      if (this.forcedToolUnsupported || !isForcedToolRejection(err, req)) throw err;
+      this.forcedToolUnsupported = true;
+      return await this.stream(this.buildParams(req, true), onDelta, signal);
+    }
+  }
+
+  private stream(
+    params: Anthropic.MessageStreamParams,
+    onDelta?: (delta: StreamDelta) => void,
+    signal?: AbortSignal,
+  ): Promise<ModelTurn> {
     // 第二参是请求选项：signal 进到这里，abort 才能掐掉在飞的 HTTP 请求
-    signal ? { signal } : undefined);
+    const stream = this.client.messages.stream(params, signal ? { signal } : undefined);
 
     if (onDelta) {
       stream.on("text", (delta) => onDelta({ kind: "text", text: delta }));
@@ -56,9 +111,25 @@ export class AnthropicModelClient implements ModelClient {
     }
 
     // 重试（429/5xx 指数退避）由 SDK 内置处理；耗尽后异常向上抛给 loop 分类
-    const message = await stream.finalMessage();
-    return { message, stopReason: message.stop_reason, usage: message.usage };
+    return stream
+      .finalMessage()
+      .then((message) => ({ message, stopReason: message.stop_reason, usage: message.usage }));
   }
+}
+
+/**
+ * 这个错误是不是"端点不接受强制工具"。
+ *
+ * 只在本轮**确实带了**强制工具时才认——否则会把无关的 400 也吞掉重发一次，
+ * 白烧一次调用还掩盖真正的错误。判据取宽（400 且提到 tool_choice/thinking）：
+ * 各家兼容端点的措辞不统一，而误判的代价只是多发一次不带强制的请求。
+ */
+export function isForcedToolRejection(err: unknown, req: ModelRequest): boolean {
+  if (req.toolChoice === undefined || req.toolChoice === "none") return false;
+  const status = (err as { status?: number })?.status;
+  if (status !== 400) return false;
+  const msg = String((err as { message?: unknown })?.message ?? "").toLowerCase();
+  return msg.includes("tool_choice") || msg.includes("thinking");
 }
 
 /**

@@ -11,10 +11,12 @@
  * 只在【领域切换】或【产物交接】处切，且每个子任务必须带可程序化验收清单。
  */
 import type Anthropic from "@anthropic-ai/sdk";
-import { AgentLoop } from "./loop.js";
+import { AgentLoop, createRunBudget } from "./loop.js";
 import { sumUsage } from "./verifier.js";
+import { withoutTaskCompletion } from "./task-completion.js";
+import { withoutAskUser } from "./tools/ask-user.js";
 import type { DomainPack } from "./presets.js";
-import type { AgentConfig, AggregateUsage, ModelClient, TurnEvent } from "./types.js";
+import type { AgentConfig, AggregateUsage, ModelClient, Tool, TurnEvent } from "./types.js";
 
 export interface SubTask {
   id: string;
@@ -50,12 +52,13 @@ export interface Plan {
  * planner 版，backlog B0）。独立声明而不复用那个类型：两者字面相同是巧合，
  * 语义各自演化（如 planner 将来可能加 "host" 值），共享类型会把它们锁死在一起。
  *
- * - `direct`   首轮就是可解析计划——理想路径
+ * - `tool`     走了终结工具交付（§2.1 上线后的理想路径）
+ * - `direct`   首轮末条消息就是可解析计划（端点不认强制工具时的形态）
  * - `wrapup`   撞满预算没收口，靠续跑同一会话救回
  * - `reformat` 产出了散文但不是 JSON，靠重问转写救回
  * - `failed`   兜底都没救回，落 fail-closed（此时 failureSummary 带过程摘要）
  */
-export type PlanRecovery = "direct" | "wrapup" | "reformat" | "failed";
+export type PlanRecovery = "tool" | "direct" | "wrapup" | "reformat" | "failed";
 
 export interface PlanOutcome {
   /** undefined = 计划不可解析（fail-closed） */
@@ -209,12 +212,15 @@ async function drainPlannerEvents(
   stopReason: string | null;
   turns: number;
   toolCalls: string[];
+  /** 终结工具的入参（§2.1 的交付载体）。没调过就是 undefined */
+  terminalInput: unknown;
 }> {
   let text = "";
   let usage: AggregateUsage | undefined;
   let messages: unknown[] = [];
   let stopReason: string | null = null;
   const toolCalls: string[] = [];
+  let terminalInput: unknown;
 
   for await (const event of events) {
     await onEvent?.(event);
@@ -227,6 +233,10 @@ async function drainPlannerEvents(
         break;
       case "tool_call":
         toolCalls.push(event.name);
+        // 两个终结工具都收在这里：调用方按自己那套协议解释入参
+        if (event.name === PLAN_TOOL_NAME || event.name === SHARDS_TOOL_NAME) {
+          terminalInput = event.input;
+        }
         break;
       case "done":
         usage = event.result.usage;
@@ -238,7 +248,15 @@ async function drainPlannerEvents(
     }
   }
 
-  return { text, usage: usage!, messages, stopReason, turns: usage?.turns ?? 0, toolCalls };
+  return {
+    text,
+    usage: usage!,
+    messages,
+    stopReason,
+    turns: usage?.turns ?? 0,
+    toolCalls,
+    terminalInput,
+  };
 }
 
 /** 把没收口的拆解过程压成一句话，写进 fail-closed 结果的 failureSummary（9.2 同款） */
@@ -276,25 +294,25 @@ function describeAbortedPlanning(
  * 当单体执行调度），这与 fail-closed 相比保住了"计划可用"这个结果。
  */
 function buildPlanWrapUpPrompt(turns: number): string {
-  return `你的拆解轮次预算已经用尽（已跑 ${turns} 轮）。**现在不要再调用任何工具**，就用你手里已有的信息把计划写出来。
+  return `你的拆解轮次预算已经用尽（已跑 ${turns} 轮）。**现在立刻调用 ${PLAN_TOOL_NAME} 交付计划**，用你手里已有的信息下结论——不要再探索，这一步只许交付。
 
 - 拆分从保守：探索没做完就少拆——把握不足时，输出【单个子任务、description 为完整任务原文】也是合法计划，宁可不拆也不要凭空猜测拆分点；
 - description 必须自包含（绝对路径、命令、约束写全）；acceptance 必须可被独立核查者逐条程序化验证；
 - 不得编造探索中未确认的细节（不存在的文件路径、未验证的命令）。
 
-你的回复必须只包含一个 JSON 对象（不要代码围栏、不要多余文字）：
-{"subtasks": [{"id": "s1", "title": "短标题", "pack": "包名或 null", "description": "自包含的任务书", "acceptance": ["验收点，每条一个字符串"], "dependsOn": ["依赖的子任务 id，无依赖填 []"]}]}`;
+（若该工具在你这里不可用，退而把同样的对象作为最后一条消息原样输出：
+{"subtasks": [{"id": "s1", "title": "短标题", "pack": "包名或 null", "description": "自包含的任务书", "acceptance": ["验收点，每条一个字符串"], "dependsOn": ["依赖的子任务 id，无依赖填 []"]}]}）`;
 }
 
 /** 结构化协议的收口提示：契约换成分片清单，其余纪律同上 */
 function buildInventoryWrapUpPrompt(turns: number): string {
-  return `你的枚举轮次预算已经用尽（已跑 ${turns} 轮）。**现在不要再调用任何工具**，就用你手里已有的信息把分片清单写出来。
+  return `你的枚举轮次预算已经用尽（已跑 ${turns} 轮）。**现在立刻调用 ${SHARDS_TOOL_NAME} 交付分片清单**，用你手里已有的信息下结论——不要再探索，这一步只许交付。
 
 - 枚举从保守：探索没做完就少列——把握不足时，输出【单个分片、description 为完整任务原文】也是合法清单（拆不拆本来就不由你决定，由宿主规则判定）；
 - description 必须自包含；acceptance 必须可程序化核查；不得编造探索中未确认的细节。
 
-你的回复必须只包含一个 JSON 对象（不要代码围栏、不要多余文字）：
-{"shards": [{"id": "s1", "title": "短标题", "pack": "包名或 null", "description": "自包含任务书", "acceptance": ["验收点"], "estTurns": 2}]}`;
+（若该工具在你这里不可用，退而把同样的对象作为最后一条消息原样输出：
+{"shards": [{"id": "s1", "title": "短标题", "pack": "包名或 null", "description": "自包含任务书", "acceptance": ["验收点"], "estTurns": 2}]}）`;
 }
 
 export async function runStructuredPlanner(
@@ -307,32 +325,57 @@ export async function runStructuredPlanner(
   opts?: { maxTurns?: number },
 ): Promise<PlanOutcome> {
   const plannerMaxTurns = resolvePlannerMaxTurns(packs, opts?.maxTurns);
+  const roleBase = withoutTaskCompletion(cfg);
+  // §2.1：终结工具进工具面（必须在面上，tool_choice 才点得动它）
+  const plannerCfg: AgentConfig = {
+    ...roleBase,
+    // 同 verifier：§5.2 决定 3，拆解者也不许把"该问谁"变成"问委托方"
+    tools: [...withoutAskUser(roleBase.tools), createShardsTool()],
+    terminalTool: SHARDS_TOOL_NAME,
+    runBudget: createRunBudget({
+      ...(cfg.maxTotalTurns !== undefined ? { maxTurns: cfg.maxTotalTurns } : {}),
+      ...(cfg.maxTokensBudget !== undefined ? { maxTokens: cfg.maxTokensBudget } : {}),
+    }),
+  };
   const investigate = (prompt: string) =>
-    drainPlannerEvents(new AgentLoop({ ...cfg, maxTurns: plannerMaxTurns }, model).run(prompt), onEvent);
+    drainPlannerEvents(
+      new AgentLoop({ ...plannerCfg, maxTurns: plannerMaxTurns }, model).run(prompt),
+      onEvent,
+    );
 
   const first = await investigate(buildInventoryPrompt(task, packs));
-  let inventory = parseShardInventory(first.text);
-  let raw = first.text;
+  const firstFromTool = inventoryFromTerminal(first.terminalInput);
+  let inventory = firstFromTool ?? parseShardInventory(first.text);
+  let raw = firstFromTool ? JSON.stringify(first.terminalInput) : first.text;
   let usage = first.usage;
-  let recovery: PlanRecovery = inventory ? "direct" : "failed";
+  let recovery: PlanRecovery = firstFromTool ? "tool" : inventory ? "direct" : "failed";
 
   // 兜底一（9.7 的 planner 版）：撞满预算时最终消息往往是半截工具调用、文本为空
   // ——重问路径对它无能为力（无可转写内容），整场枚举连同探索证据一起作废。
   // 正解是续跑同一会话：正史与工具返回都还在，只要求"别查了，现在写清单"。
   if (!inventory && first.stopReason === "max_turns" && first.messages.length > 0) {
     const wrapUp = await drainPlannerEvents(
-      // toolChoice none（B0b）：收口段结构化禁工具，提示挡不住"再查一件事"
-      new AgentLoop({ ...cfg, maxTurns: PLANNER_WRAPUP_MAX_TURNS, toolChoice: "none" }, model).runContinuation(
+      // §2.1 把 B0b 的"禁工具"升级为"强制交付工具"：禁工具说得出"别查了"，
+      // 说不出"现在就产出这个形状"，而案例 #9 第二跑烧掉的正是后者
+      new AgentLoop(
+        {
+          ...plannerCfg,
+          maxTurns: PLANNER_WRAPUP_MAX_TURNS,
+          toolChoice: { type: "tool", name: SHARDS_TOOL_NAME },
+        },
+        model,
+      ).runContinuation(
         first.messages as Anthropic.MessageParam[],
         buildInventoryWrapUpPrompt(first.turns),
       ),
       onEvent,
     );
     usage = sumUsage(usage, wrapUp.usage);
-    const concluded = parseShardInventory(wrapUp.text);
+    const wrapFromTool = inventoryFromTerminal(wrapUp.terminalInput);
+    const concluded = wrapFromTool ?? parseShardInventory(wrapUp.text);
     if (concluded) {
       inventory = concluded;
-      raw = wrapUp.text;
+      raw = wrapFromTool ? JSON.stringify(wrapUp.terminalInput) : wrapUp.text;
       recovery = "wrapup";
     }
   }
@@ -394,59 +437,64 @@ ${raw}
 {"shards": [{"id": "s1", "title": "...", "pack": "包名或 null", "description": "...", "acceptance": ["..."], "estTurns": 2}], "join": {"title": "...", "pack": null, "description": "...", "acceptance": ["..."]}}`;
 }
 
-/**
- * 分片清单解析（宽容提取 + fail-closed）：shards 空/description 缺失/id 重复 → undefined。
- */
-export function parseShardInventory(text: string): ShardInventory | undefined {
+/** 文本里可能是 JSON 的片段：代码围栏内容优先，其次最外层 {...}（两个解析器共用） */
+function jsonCandidates(text: string): string[] {
   const candidates: string[] = [];
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/g);
   if (fenced) for (const f of fenced) candidates.push(f.replace(/```(?:json)?\s*|```/g, ""));
   const braced = text.match(/\{[\s\S]*\}/);
   if (braced) candidates.push(braced[0]);
+  return candidates;
+}
 
-  for (const candidate of candidates) {
+/** 【对象 → ShardInventory】的判定。与 planFromObject 同理：判定只该有一份 */
+export function shardInventoryFromObject(parsed: unknown): ShardInventory | undefined {
+  if (typeof parsed !== "object" || parsed === null) return undefined;
+  const { shards: rawList, join: rawJoin } = parsed as { shards?: unknown; join?: unknown };
+  if (!Array.isArray(rawList) || rawList.length === 0) return undefined;
+
+  const shards: ShardInventory["shards"] = [];
+  const seen = new Set<string>();
+  for (const [i, s] of (rawList as Record<string, unknown>[]).entries()) {
+    if (typeof s.description !== "string" || s.description.trim() === "") return undefined;
+    const id = typeof s.id === "string" && s.id ? s.id : `s${i + 1}`;
+    if (seen.has(id)) return undefined;
+    seen.add(id);
+    shards.push({
+      id,
+      title: typeof s.title === "string" ? s.title : `分片 ${i + 1}`,
+      pack: typeof s.pack === "string" && s.pack !== "null" ? s.pack : null,
+      description: s.description,
+      acceptance: Array.isArray(s.acceptance) ? s.acceptance.map(String) : [],
+      ...(typeof s.estTurns === "number" && Number.isFinite(s.estTurns)
+        ? { estTurns: Math.max(1, Math.round(s.estTurns)) }
+        : {}),
+    });
+  }
+
+  let join: ShardInventory["join"];
+  if (rawJoin && typeof rawJoin === "object") {
+    const j = rawJoin as Record<string, unknown>;
+    if (typeof j.description === "string" && j.description.trim() !== "") {
+      join = {
+        title: typeof j.title === "string" ? j.title : "汇总",
+        pack: typeof j.pack === "string" && j.pack !== "null" ? j.pack : null,
+        description: j.description,
+        acceptance: Array.isArray(j.acceptance) ? j.acceptance.map(String) : [],
+      };
+    }
+  }
+  return { shards, ...(join ? { join } : {}) };
+}
+
+/**
+ * 分片清单解析（宽容提取 + fail-closed）：shards 空/description 缺失/id 重复 → undefined。
+ */
+export function parseShardInventory(text: string): ShardInventory | undefined {
+  for (const candidate of jsonCandidates(text)) {
     try {
-      const parsed = JSON.parse(candidate) as { shards?: unknown; join?: unknown };
-      if (!Array.isArray(parsed.shards) || parsed.shards.length === 0) continue;
-      const shards: ShardInventory["shards"] = [];
-      let valid = true;
-      const seen = new Set<string>();
-      for (const [i, s] of (parsed.shards as Record<string, unknown>[]).entries()) {
-        if (typeof s.description !== "string" || s.description.trim() === "") {
-          valid = false;
-          break;
-        }
-        const id = typeof s.id === "string" && s.id ? s.id : `s${i + 1}`;
-        if (seen.has(id)) {
-          valid = false;
-          break;
-        }
-        seen.add(id);
-        shards.push({
-          id,
-          title: typeof s.title === "string" ? s.title : `分片 ${i + 1}`,
-          pack: typeof s.pack === "string" && s.pack !== "null" ? s.pack : null,
-          description: s.description,
-          acceptance: Array.isArray(s.acceptance) ? s.acceptance.map(String) : [],
-          ...(typeof s.estTurns === "number" && Number.isFinite(s.estTurns)
-            ? { estTurns: Math.max(1, Math.round(s.estTurns)) }
-            : {}),
-        });
-      }
-      if (!valid) continue;
-      let join: ShardInventory["join"];
-      if (parsed.join && typeof parsed.join === "object") {
-        const j = parsed.join as Record<string, unknown>;
-        if (typeof j.description === "string" && j.description.trim() !== "") {
-          join = {
-            title: typeof j.title === "string" ? j.title : "汇总",
-            pack: typeof j.pack === "string" && j.pack !== "null" ? j.pack : null,
-            description: j.description,
-            acceptance: Array.isArray(j.acceptance) ? j.acceptance.map(String) : [],
-          };
-        }
-      }
-      return { shards, ...(join ? { join } : {}) };
+      const inv = shardInventoryFromObject(JSON.parse(candidate));
+      if (inv) return inv;
     } catch {
       // 尝试下一个候选
     }
@@ -455,6 +503,126 @@ export function parseShardInventory(text: string): ShardInventory | undefined {
 }
 
 export const PLAN_PARSE_FAIL = "planner 输出无法解析为 JSON 计划";
+
+// ————————————————— §2.1 终结工具：交付即调用 —————————————————
+
+/**
+ * planner 有**两套契约**，所以有两个终结工具：freeform 交计划、结构化交分片清单。
+ * 不合并成一个带 mode 参数的工具——那会把"这一跑走的是哪套协议"从装配期
+ * （宿主决定）挪到运行期（模型选），而两协议并存的全部意义就是宿主说了算。
+ */
+export const PLAN_TOOL_NAME = "submit_plan";
+export const SHARDS_TOOL_NAME = "submit_shards";
+
+/** 没调终结工具，或调了但入参不合法 → undefined（两种都降级回文本解析） */
+function planFromTerminal(input: unknown): Plan | undefined {
+  return input === undefined ? undefined : planFromObject(input);
+}
+function inventoryFromTerminal(input: unknown): ShardInventory | undefined {
+  return input === undefined ? undefined : shardInventoryFromObject(input);
+}
+
+/** 子任务/分片共用的字段描述（两个 schema 只在 dependsOn / estTurns 上分叉） */
+const TASK_FIELDS = {
+  id: { type: "string", description: "子任务 id，如 s1" },
+  title: { type: "string", description: "短标题" },
+  pack: { type: ["string", "null"], description: "领域包名；不需要特定领域时填 null" },
+  description: {
+    type: "string",
+    description: "自包含任务书——执行 agent 看不到你的上下文，绝对路径/命令/口径写全",
+  },
+  acceptance: {
+    type: "array",
+    items: { type: "string" },
+    description: "可被独立核查者逐条程序化验证的验收点",
+  },
+} as const;
+
+export function createPlanTool(): Tool {
+  return {
+    name: PLAN_TOOL_NAME,
+    description:
+      "提交最终计划，结束拆解。这是交付计划的**唯一**方式——探索够了就调用它，调用之后拆解立即结束。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        subtasks: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              ...TASK_FIELDS,
+              dependsOn: {
+                type: "array",
+                items: { type: "string" },
+                description: "直接依赖的子任务 id；无依赖填 []",
+              },
+              resources: {
+                type: "array",
+                items: { type: "string" },
+                description: "独占资源标签（如具体探针）；不需要则省略",
+              },
+            },
+            required: ["title", "description", "acceptance", "dependsOn"],
+          },
+          description: "子任务列表。只有一个子任务（description = 任务原文）也是合法计划",
+        },
+      },
+      required: ["subtasks"],
+    },
+    permission: "auto",
+    parallelSafe: false,
+    execute(input) {
+      return Promise.resolve(
+        planFromObject(input)
+          ? { content: "计划已记录。" }
+          : { content: "计划入参不合法：subtasks 非空、每项需 description，且依赖图不得有悬空引用或环。", isError: true },
+      );
+    },
+  };
+}
+
+export function createShardsTool(): Tool {
+  return {
+    name: SHARDS_TOOL_NAME,
+    description:
+      "提交分片清单，结束枚举。这是交付的**唯一**方式——探索够了就调用它，调用之后枚举立即结束。" +
+      "注意拆不拆不由你决定（宿主规则判定），你只负责把事实枚举准确。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        shards: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              ...TASK_FIELDS,
+              estTurns: { type: "integer", description: "预计工具调用轮数，粗估即可" },
+            },
+            required: ["title", "description", "acceptance"],
+          },
+          description: "互不依赖的分片。任务本质是整体时只列一个分片，不要凑数硬拆",
+        },
+        join: {
+          type: "object",
+          properties: TASK_FIELDS,
+          required: ["title", "description", "acceptance"],
+          description: "可选汇总步：只消费分片产物，不得重新推导源数据。无需合并则省略",
+        },
+      },
+      required: ["shards"],
+    },
+    permission: "auto",
+    parallelSafe: false,
+    execute(input) {
+      return Promise.resolve(
+        shardInventoryFromObject(input)
+          ? { content: "分片清单已记录。" }
+          : { content: "清单入参不合法：shards 非空、每项需 description、id 不得重复。", isError: true },
+      );
+    },
+  };
+}
 
 export async function runPlanner(
   cfg: AgentConfig,
@@ -465,33 +633,58 @@ export async function runPlanner(
   opts?: { maxTurns?: number },
 ): Promise<PlanOutcome> {
   const plannerMaxTurns = resolvePlannerMaxTurns(packs, opts?.maxTurns);
+  const roleBase = withoutTaskCompletion(cfg);
+  // §2.1：终结工具进工具面（必须在面上，tool_choice 才点得动它）
+  const plannerCfg: AgentConfig = {
+    ...roleBase,
+    // 同 verifier：§5.2 决定 3，拆解者也不许把"该问谁"变成"问委托方"
+    tools: [...withoutAskUser(roleBase.tools), createPlanTool()],
+    terminalTool: PLAN_TOOL_NAME,
+    runBudget: createRunBudget({
+      ...(cfg.maxTotalTurns !== undefined ? { maxTurns: cfg.maxTotalTurns } : {}),
+      ...(cfg.maxTokensBudget !== undefined ? { maxTokens: cfg.maxTokensBudget } : {}),
+    }),
+  };
   const investigate = (prompt: string) =>
-    drainPlannerEvents(new AgentLoop({ ...cfg, maxTurns: plannerMaxTurns }, model).run(prompt), onEvent);
+    drainPlannerEvents(
+      new AgentLoop({ ...plannerCfg, maxTurns: plannerMaxTurns }, model).run(prompt),
+      onEvent,
+    );
 
   const first = await investigate(buildPlannerPrompt(task, packs));
-  let plan = parsePlan(first.text);
-  let raw = first.text;
+  const firstFromTool = planFromTerminal(first.terminalInput);
+  let plan = firstFromTool ?? parsePlan(first.text);
+  let raw = firstFromTool ? JSON.stringify(first.terminalInput) : first.text;
   let usage = first.usage;
-  let recovery: PlanRecovery = plan ? "direct" : "failed";
+  let recovery: PlanRecovery = firstFromTool ? "tool" : plan ? "direct" : "failed";
 
   // 兜底一（9.7 的 planner 版）：撞满预算时最终消息往往是半截工具调用、文本为空
   // ——重问路径对它无能为力（无可转写内容），整场拆解连同探索证据一起作废。
   // 正解是续跑同一会话：正史与工具返回都还在，只要求"别查了，现在写计划"。
   if (!plan && first.stopReason === "max_turns" && first.messages.length > 0) {
     const wrapUp = await drainPlannerEvents(
-      // toolChoice none（B0b）：收口段结构化禁工具——案例 #9 第二跑实测收口提示
-      // 被"继续取证"无视，2 轮收口预算全烧在工具上，一个字的计划没写
-      new AgentLoop({ ...cfg, maxTurns: PLANNER_WRAPUP_MAX_TURNS, toolChoice: "none" }, model).runContinuation(
+      // §2.1：B0b 的"禁工具"升级为"强制交付工具"。案例 #9 第二跑实测收口提示
+      // 被"继续取证"无视，2 轮收口预算全烧在工具上，一个字的计划没写——
+      // 禁工具挡住了取证，但没给出"现在交付"这个动作，强制调用两件事一起解决
+      new AgentLoop(
+        {
+          ...plannerCfg,
+          maxTurns: PLANNER_WRAPUP_MAX_TURNS,
+          toolChoice: { type: "tool", name: PLAN_TOOL_NAME },
+        },
+        model,
+      ).runContinuation(
         first.messages as Anthropic.MessageParam[],
         buildPlanWrapUpPrompt(first.turns),
       ),
       onEvent,
     );
     usage = sumUsage(usage, wrapUp.usage);
-    const concluded = parsePlan(wrapUp.text);
+    const wrapFromTool = planFromTerminal(wrapUp.terminalInput);
+    const concluded = wrapFromTool ?? parsePlan(wrapUp.text);
     if (concluded) {
       plan = concluded;
-      raw = wrapUp.text;
+      raw = wrapFromTool ? JSON.stringify(wrapUp.terminalInput) : wrapUp.text;
       recovery = "wrapup";
     }
   }
@@ -561,47 +754,49 @@ ${raw}
  * 调度语义变得不可判定，整份计划作废（fail-closed，与裁决/计划解析同纪律）。
  * 兼容：整份计划都没有 dependsOn 字段 → 推断为线性链（v1.0 的隐式顺序语义）。
  */
-export function parsePlan(text: string): Plan | undefined {
-  const candidates: string[] = [];
-  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/g);
-  if (fenced) for (const f of fenced) candidates.push(f.replace(/```(?:json)?\s*|```/g, ""));
-  const braced = text.match(/\{[\s\S]*\}/);
-  if (braced) candidates.push(braced[0]);
+/**
+ * 【对象 → Plan】的判定。与 `parsePlan` 分开，是因为 §2.1 之后计划有**两条**
+ * 入口：末条消息里的 JSON（文本，要先抽再 parse），和终结工具的入参（已经是
+ * 对象）。判定逻辑只该有一份——两份迟早漂开，而漂开的那天两条路会对同一份
+ * 计划给出不同结论，谁都不会发现。
+ */
+export function planFromObject(parsed: unknown): Plan | undefined {
+  if (typeof parsed !== "object" || parsed === null) return undefined;
+  const { subtasks: rawList } = parsed as { subtasks?: unknown };
+  if (!Array.isArray(rawList) || rawList.length === 0) return undefined;
 
-  for (const candidate of candidates) {
+  const subtasks: SubTask[] = [];
+  let sawDepsField = false;
+  for (const [i, s] of (rawList as Record<string, unknown>[]).entries()) {
+    if (typeof s.description !== "string" || s.description.trim() === "") return undefined;
+    const rawDeps = s.dependsOn ?? s.depends_on; // 兼容 snake_case 输出习惯
+    if (rawDeps !== undefined) sawDepsField = true;
+    subtasks.push({
+      id: typeof s.id === "string" && s.id ? s.id : `s${i + 1}`,
+      title: typeof s.title === "string" ? s.title : `子任务 ${i + 1}`,
+      pack: typeof s.pack === "string" && s.pack !== "null" ? s.pack : null,
+      description: s.description,
+      acceptance: Array.isArray(s.acceptance) ? s.acceptance.map(String) : [],
+      dependsOn: Array.isArray(rawDeps)
+        ? [...new Set(rawDeps.map(String).map((d) => d.trim()).filter((d) => d !== ""))]
+        : [],
+      ...(Array.isArray(s.resources) && s.resources.length > 0
+        ? { resources: s.resources.map(String) }
+        : {}),
+    });
+  }
+  if (!sawDepsField) {
+    // 旧格式：无任何依赖声明 → 线性链（每个子任务依赖前一个）
+    for (let i = 1; i < subtasks.length; i++) subtasks[i]!.dependsOn = [subtasks[i - 1]!.id];
+  }
+  return validateGraph(subtasks) ? { subtasks } : undefined;
+}
+
+export function parsePlan(text: string): Plan | undefined {
+  for (const candidate of jsonCandidates(text)) {
     try {
-      const parsed = JSON.parse(candidate) as { subtasks?: unknown };
-      if (!Array.isArray(parsed.subtasks) || parsed.subtasks.length === 0) continue;
-      const subtasks: SubTask[] = [];
-      let valid = true;
-      let sawDepsField = false;
-      for (const [i, s] of (parsed.subtasks as Record<string, unknown>[]).entries()) {
-        if (typeof s.description !== "string" || s.description.trim() === "") {
-          valid = false;
-          break;
-        }
-        const rawDeps = s.dependsOn ?? s.depends_on; // 兼容 snake_case 输出习惯
-        if (rawDeps !== undefined) sawDepsField = true;
-        subtasks.push({
-          id: typeof s.id === "string" && s.id ? s.id : `s${i + 1}`,
-          title: typeof s.title === "string" ? s.title : `子任务 ${i + 1}`,
-          pack: typeof s.pack === "string" && s.pack !== "null" ? s.pack : null,
-          description: s.description,
-          acceptance: Array.isArray(s.acceptance) ? s.acceptance.map(String) : [],
-          dependsOn: Array.isArray(rawDeps)
-            ? [...new Set(rawDeps.map(String).map((d) => d.trim()).filter((d) => d !== ""))]
-            : [],
-          ...(Array.isArray(s.resources) && s.resources.length > 0
-            ? { resources: s.resources.map(String) }
-            : {}),
-        });
-      }
-      if (!valid) continue;
-      if (!sawDepsField) {
-        // 旧格式：无任何依赖声明 → 线性链（每个子任务依赖前一个）
-        for (let i = 1; i < subtasks.length; i++) subtasks[i]!.dependsOn = [subtasks[i - 1]!.id];
-      }
-      if (validateGraph(subtasks)) return { subtasks };
+      const plan = planFromObject(JSON.parse(candidate));
+      if (plan) return plan;
     } catch {
       // 尝试下一个候选
     }

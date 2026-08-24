@@ -4,14 +4,17 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Agent Harness — Web UI</title>
+<link rel="stylesheet" href="/vendor/phosphor/style.css">
 <link rel="stylesheet" href="/styles.css">
 <script>
 // 主题在样式表生效前就定下来，否则从 localStorage 恢复暗色时会先闪一帧亮色。
-// 只有三种取值：light / dark / auto（auto 交给 prefers-color-scheme）。
+// auto 不写 data-theme，交给 prefers-color-scheme；其余主题在首帧前显式恢复。
 (function () {
   try {
     var t = localStorage.getItem("agent-ui-theme");
-    if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t);
+    if (["light", "dark", "graphite", "contrast"].indexOf(t) >= 0) {
+      document.documentElement.setAttribute("data-theme", t);
+    }
   } catch (e) { /* 隐私模式下 localStorage 可能抛错，忽略即可 */ }
 })();
 </script>
@@ -25,23 +28,70 @@
   <h1>Agent Harness 控制台</h1>
 </header>
 
-<!-- 侧栏：运行列表 -->
+<!-- 侧栏：项目 → 对话 -->
 <aside class="sidebar" id="sidebar">
   <div class="sidebar-header">
-    <span>运行列表</span>
-    <!-- R-08 状态筛选 -->
-    <select class="run-filter" id="run-filter" aria-label="按状态筛选运行">
-      <option value="all">全部</option>
-      <option value="running">运行中</option>
-      <option value="done">已完成</option>
-      <option value="failed">未通过</option>
-    </select>
-    <button type="button" class="theme-toggle" id="theme-toggle" aria-label="切换配色主题">◐</button>
+    <div class="sidebar-brand">
+      <span class="sidebar-brand-mark" aria-hidden="true"><i class="ph ph-circles-four"></i></span>
+      <span class="sidebar-brand-copy">
+        <strong>Harness</strong>
+        <span>项目与对话</span>
+      </span>
+    </div>
+    <div class="theme-picker" id="theme-picker">
+      <button type="button" class="theme-toggle icon-btn" id="theme-toggle"
+        aria-label="选择配色主题" aria-haspopup="menu" aria-expanded="false">
+        <i class="ph ph-circle-half" aria-hidden="true"></i>
+      </button>
+      <div class="theme-menu" id="theme-menu" role="menu" aria-label="配色主题" hidden>
+        <button type="button" class="theme-option" role="menuitemradio" aria-checked="false" data-theme-choice="auto">
+          <i class="ph ph-circle-half" aria-hidden="true"></i>
+          <span class="theme-option-copy"><strong>跟随系统</strong><small>自动匹配设备</small></span>
+          <i class="ph ph-check theme-option-check" aria-hidden="true"></i>
+        </button>
+        <button type="button" class="theme-option" role="menuitemradio" aria-checked="false" data-theme-choice="light">
+          <i class="ph ph-sun" aria-hidden="true"></i>
+          <span class="theme-option-copy"><strong>暖纸</strong><small>低眩光浅色</small></span>
+          <i class="ph ph-check theme-option-check" aria-hidden="true"></i>
+        </button>
+        <button type="button" class="theme-option" role="menuitemradio" aria-checked="false" data-theme-choice="dark">
+          <i class="ph ph-moon" aria-hidden="true"></i>
+          <span class="theme-option-copy"><strong>暖炭</strong><small>温暖深色</small></span>
+          <i class="ph ph-check theme-option-check" aria-hidden="true"></i>
+        </button>
+        <button type="button" class="theme-option" role="menuitemradio" aria-checked="false" data-theme-choice="graphite">
+          <i class="ph ph-stack" aria-hidden="true"></i>
+          <span class="theme-option-copy"><strong>石墨</strong><small>中性深色</small></span>
+          <i class="ph ph-check theme-option-check" aria-hidden="true"></i>
+        </button>
+        <button type="button" class="theme-option" role="menuitemradio" aria-checked="false" data-theme-choice="contrast">
+          <i class="ph ph-circle-half-tilt" aria-hidden="true"></i>
+          <span class="theme-option-copy"><strong>高对比</strong><small>更强文字与边界</small></span>
+          <i class="ph ph-check theme-option-check" aria-hidden="true"></i>
+        </button>
+      </div>
+    </div>
   </div>
   <div class="sidebar-search">
-    <button type="button" class="btn btn--primary new-chat-btn" id="new-chat-btn">＋ 新建对话</button>
-    <label for="run-search" class="sr-only">搜索运行</label>
-    <input type="search" id="run-search" class="run-search" placeholder="搜索任务描述…" autocomplete="off" />
+    <button type="button" class="btn btn--primary new-chat-btn" id="new-chat-btn">
+      <i class="ph ph-plus" aria-hidden="true"></i>
+      <span>新建对话</span>
+    </button>
+    <div class="run-search-field">
+      <i class="ph ph-magnifying-glass" aria-hidden="true"></i>
+      <label for="run-search" class="sr-only">搜索对话</label>
+      <input type="search" id="run-search" class="run-search" placeholder="搜索对话…" autocomplete="off" />
+    </div>
+    <div class="sidebar-filter-row">
+      <span class="sidebar-section-label">对话</span>
+      <!-- R-08 状态筛选 -->
+      <select class="run-filter" id="run-filter" aria-label="按状态筛选对话">
+        <option value="all">全部</option>
+        <option value="running">运行中</option>
+        <option value="done">已完成</option>
+        <option value="failed">未通过</option>
+      </select>
+    </div>
   </div>
   <!-- role=listbox / aria-label 由 renderRunList 动态挂载：listbox 必须含 option
        子项（aria-required-children），空态/加载态若静态带着 role 反而是 critical
@@ -63,16 +113,18 @@
 
   <!-- 内容区 -->
   <div id="main-area" class="content-area">
-    <div class="empty-state">
-      <div class="empty-icon">◌</div>
-      <p>尚无运行。</p>
+    <div class="empty-state empty-state--welcome">
+      <div class="empty-icon" aria-hidden="true"><i class="ph ph-chat-centered-dots"></i></div>
+      <span class="empty-eyebrow">HARNESS WORKSPACE</span>
+      <h2>从一个明确目标开始</h2>
+      <p>选择左侧对话继续工作，或新建一次受工作目录约束的任务。</p>
     </div>
   </div>
   <!-- 跳转箭头：**在滚动容器之外**，所以它自己不会被滚走。
        ↓ 回到底部（流式时往上翻过之后用），↑ 回到四决定因素（读进下钻面之后用）。 -->
   <div id="scroll-nav" class="scroll-nav">
-    <button type="button" class="scroll-nav-btn" data-nav="top" hidden aria-label="回到四决定因素">↑</button>
-    <button type="button" class="scroll-nav-btn" data-nav="bottom" hidden aria-label="回到最新">↓</button>
+    <button type="button" class="scroll-nav-btn" data-nav="top" hidden aria-label="回到四决定因素"><i class="ph ph-arrow-up" aria-hidden="true"></i></button>
+    <button type="button" class="scroll-nav-btn" data-nav="bottom" hidden aria-label="回到最新"><i class="ph ph-arrow-down" aria-hidden="true"></i></button>
   </div>
 
   <!-- 需你决定：钉在输入框正上方，**在滚动容器之外**。
@@ -87,22 +139,81 @@
        没选中 → 「运行任务」；文案、placeholder、说明行、data-mode 四处一起变。
        派生逻辑在 app.js 的 deriveComposerMode / patchComposer 里（因此可测）。 -->
   <form id="submit-form" class="submit-bar" autocomplete="off">
+    <div class="composer-scopebar" id="composer-scopebar">
+      <div class="composer-mode-block">
+        <span class="composer-mode-mark" aria-hidden="true"><i class="ph ph-chat-circle-dots"></i></span>
+        <span>
+          <span class="composer-caption">当前操作</span>
+          <strong id="composer-mode-label">新建对话</strong>
+        </span>
+      </div>
+      <div class="scope-field scope-field--workdir">
+        <i class="ph ph-folder-simple" aria-hidden="true"></i>
+        <label for="workdir-select">工作目录</label>
+        <select id="workdir-select"></select>
+      </div>
+      <div class="role-models" id="role-models-knob">
+        <span class="composer-caption" id="role-models-label">角色模型</span>
+        <div class="role-toggles" role="group" aria-labelledby="role-models-label">
+          <span class="role-model-pill" id="executor-role-row">
+            <i class="ph ph-terminal" aria-hidden="true"></i>
+            <span id="executor-role-text">执行 · 加载中</span>
+          </span>
+          <label class="role-model-pill role-model-pill--toggle" id="planner-role-row" hidden>
+            <input type="checkbox" id="use-planner-model" checked />
+            <span id="planner-role-text"></span>
+          </label>
+          <span class="role-model-pill role-model-pill--muted" id="planner-role-fallback">
+            <i class="ph ph-tree-structure" aria-hidden="true"></i>
+            <span>规划 · 跟随执行</span>
+          </span>
+          <label class="role-model-pill role-model-pill--toggle" id="verifier-role-row" hidden>
+            <input type="checkbox" id="use-verifier-model" checked />
+            <span id="verifier-role-text"></span>
+          </label>
+          <span class="role-model-pill role-model-pill--muted" id="verifier-role-fallback">
+            <i class="ph ph-check-circle" aria-hidden="true"></i>
+            <span>核查 · 跟随执行</span>
+          </span>
+          <span class="role-model-pill role-model-pill--muted" id="vision-role-row">
+            <i class="ph ph-image" aria-hidden="true"></i>
+            <span id="vision-role-text">识图 · 未配置</span>
+          </span>
+        </div>
+        <span class="sr-only" id="role-models-hint"></span>
+      </div>
+      <button type="button" class="btn btn--ghost knobs-toggle" id="knobs-toggle" aria-expanded="false" aria-controls="run-knobs">
+        <i class="ph ph-sliders-horizontal" aria-hidden="true"></i>
+        <span class="knobs-label">运行设置</span>
+        <i class="ph ph-caret-down knobs-caret" aria-hidden="true"></i>
+      </button>
+    </div>
+    <div class="composer-input-row">
     <!-- 文案由 patchComposer 按模式改写（「任务描述」↔「追加指令」）。
          for/id 不许动：整页 axe 与文案闸门都钉着这一对。 -->
     <label for="task-input" class="task-label">任务描述</label>
     <textarea id="task-input" placeholder="输入新任务描述…（Ctrl+Enter 发送）" rows="1"></textarea>
-    <label class="checkbox-label">
-      <input type="checkbox" id="verify-toggle" />
-      <span>开启独立核查</span>
-    </label>
-    <button type="submit" class="btn btn--primary" id="submit-btn">运行任务</button>
     <!-- input **排在 label 之前**：它是 sr-only（宽高 1px + clip），焦点环会被
          整个裁掉，键盘用户 Tab 到附件时屏幕上没有任何反应。把它放前面，
          就能用最朴素的相邻兄弟选择器把环画到那个可见的 label 上
          （#file-upload:focus-visible + .upload-label）。 -->
     <input type="file" id="file-upload" class="sr-only" multiple />
-    <label class="btn btn--ghost upload-label" for="file-upload">＋ 附件</label>
-    <button type="button" class="btn btn--ghost" id="knobs-toggle" aria-expanded="false" aria-controls="run-knobs">装配 ▾</button>
+    <label class="btn btn--ghost upload-label" for="file-upload" title="添加图片或文件">
+      <i class="ph ph-paperclip" aria-hidden="true"></i>
+      <span>附件</span>
+    </label>
+    <button type="submit" class="btn btn--primary submit-btn" id="submit-btn">
+      <span id="submit-btn-label">运行任务</span>
+      <i class="ph ph-paper-plane-right" aria-hidden="true"></i>
+    </button>
+    </div>
+    <div class="composer-quickbar">
+      <label class="checkbox-label verify-toggle-label">
+        <input type="checkbox" id="verify-toggle" />
+        <span>独立核查</span>
+      </label>
+      <span class="composer-quick-hint"><i class="ph ph-shield-check" aria-hidden="true"></i> 写入仍受审批与工作目录边界约束</span>
+    </div>
     <!-- 模式说明。独立于 #submit-error：后者是 role="alert"，
          "这次提交会去哪儿"不是错误，不该被当成警报播报 -->
     <p id="composer-note" class="composer-note knob-hint" hidden></p>
@@ -125,25 +236,6 @@
           <option value="">（默认）</option>
         </select>
         <span class="knob-hint" id="effort-hint"></span>
-      </div>
-      <div class="knob">
-        <label for="workdir-select">工作目录</label>
-        <select id="workdir-select"></select>
-        <span class="knob-hint">工具的写入圈禁根。可选集合由宿主用 AGENT_UI_WORKDIRS 声明。</span>
-      </div>
-      <div class="knob" id="role-models-knob" hidden>
-        <label id="role-models-label">角色模型</label>
-        <div class="role-toggles" role="group" aria-labelledby="role-models-label">
-          <label class="checkbox-label" id="verifier-role-row" hidden>
-            <input type="checkbox" id="use-verifier-model" checked />
-            <span id="verifier-role-text"></span>
-          </label>
-          <label class="checkbox-label" id="planner-role-row" hidden>
-            <input type="checkbox" id="use-planner-model" checked />
-            <span id="planner-role-text"></span>
-          </label>
-        </div>
-        <span class="knob-hint" id="role-models-hint"></span>
       </div>
       <div class="knob">
         <label for="mode-select">编排模式</label>
@@ -171,6 +263,14 @@
           <span>计划产出后等我签字再开跑</span>
         </label>
         <span class="knob-hint">挂起点在第一个子任务发射之前——此时否决零副作用。仅编排模式可用。</span>
+      </div>
+      <div class="knob">
+        <label id="ask-user-label">需求澄清</label>
+        <label class="checkbox-label">
+          <input type="checkbox" id="ask-user-toggle" checked />
+          <span>遇到岔路口可以问我</span>
+        </label>
+        <span class="knob-hint">交互式 Web 默认开；只问猜错会返工的岔路或只有你知道的事实。最多打断 3 次（每次 1~4 题），API 未显式传 askUser 时仍默认关。</span>
       </div>
       <div class="knob knob--wide">
         <label for="rubric-input">主观评分表</label>
@@ -208,10 +308,13 @@ import {
   renderEmptyState,
   deriveComposerMode,
   composerSubmitPlan,
+  buildNewRunRequest,
+  mergeForkedFollowUp,
   patchComposer,
   shouldShowReconnecting,
   deriveScrollNav,
   paceReveal,
+  revealedWindow,
 } from "/app.js";
 
 // ---- 状态 ----
@@ -350,6 +453,9 @@ const verifyToggle = /** @type {HTMLInputElement} */ (document.getElementById("v
 const submitBtn = /** @type {HTMLButtonElement} */ (document.getElementById("submit-btn"));
 const submitError = /** @type {HTMLElement} */ (document.getElementById("submit-error"));
 const themeToggle = /** @type {HTMLButtonElement} */ (document.getElementById("theme-toggle"));
+const themePicker = /** @type {HTMLElement} */ (document.getElementById("theme-picker"));
+const themeMenu = /** @type {HTMLElement} */ (document.getElementById("theme-menu"));
+const themeChoices = /** @type {HTMLButtonElement[]} */ ([...document.querySelectorAll("[data-theme-choice]")]);
 const knobsToggle = /** @type {HTMLButtonElement} */ (document.getElementById("knobs-toggle"));
 const runKnobs = /** @type {HTMLElement} */ (document.getElementById("run-knobs"));
 const packSelect = /** @type {HTMLSelectElement} */ (document.getElementById("pack-select"));
@@ -358,6 +464,7 @@ const rubricInput = /** @type {HTMLTextAreaElement} */ (document.getElementById(
 const modeSelect = /** @type {HTMLSelectElement} */ (document.getElementById("mode-select"));
 const concurrencySelect = /** @type {HTMLSelectElement} */ (document.getElementById("concurrency-select"));
 const planGateToggle = /** @type {HTMLInputElement} */ (document.getElementById("plan-gate-toggle"));
+const askUserToggle = /** @type {HTMLInputElement} */ (document.getElementById("ask-user-toggle"));
 const workdirSelect = /** @type {HTMLSelectElement} */ (document.getElementById("workdir-select"));
 const useVerifierModel = /** @type {HTMLInputElement} */ (document.getElementById("use-verifier-model"));
 const usePlannerModel = /** @type {HTMLInputElement} */ (document.getElementById("use-planner-model"));
@@ -585,7 +692,9 @@ function renderDetailWithState(state) {
     liveText: revealedSlice(runId, liveTexts.get(runId) ?? "", false),
     liveThinking: revealedSlice(runId, liveThinking.get(runId) ?? "", true),
     onPlanDecision: (decision) => postPlanDecision(runId, decision),
+    onAnswer: (answers) => postAnswer(runId, answers),
     onReveal: (path) => revealArtifact(runId, path),
+    inspectPaths: (paths) => inspectRunPaths(runId, paths),
   });
   // 本地 SSE 把状态推到 done 时列表未必同步刷新过——底栏要立刻从「运行中」
   // 变回「继续对话」，否则用户盯着一个死按钮等
@@ -666,12 +775,33 @@ async function postFollowUp(runId, text) {
       if (st) renderDetailWithState(st);
       return;
     }
+    const payload = await res.json().catch(() => ({ runId }));
+    const nextRunId = typeof payload.runId === "string" ? payload.runId : runId;
+
+    // 归档续跑返回的是派生子 run。父档案必须继续保持 done/只读，不能沿用
+    // live 续跑那条“把原 run 改回 running”的本地乐观更新。
+    const fork = mergeForkedFollowUp(runs, runId, payload, text);
+    if (fork) {
+      runs = fork.runs;
+      const merged = fork.summary;
+
+      if (!runStates.has(fork.targetRunId)) {
+        runStates.set(fork.targetRunId, createInitialState(fork.targetRunId, merged.task, Boolean(merged.verify)));
+      }
+      activeTabs.set(fork.targetRunId, "loop");
+      refreshRunListView();
+      selectRun(fork.targetRunId);
+      ensureSubscription(fork.targetRunId);
+      announceStatus(`已从归档派生新运行：${merged.task}`);
+      return;
+    }
+
     // run 从终态回到运行中：本地先置位再重订阅。事件流里的 user_message 会
     // 把状态坐实，reduceEvents 的 seq 闸门保证重放不产生重复条目
     const st = runStates.get(runId);
     if (st) runStates.set(runId, { ...st, status: "running", runEnd: null });
     const info = runs.find((r) => r.runId === runId);
-    if (info) info.status = "running";
+    if (info) Object.assign(info, payload.run ?? {}, { status: "running" });
     transcripts.delete(runId);
     refreshRunListView();
     ensureSubscription(runId);
@@ -705,6 +835,28 @@ async function revealArtifact(runId, path) {
     }
   } catch (err) {
     showSubmitError(`打开失败：${err.message ?? "网络错误"}`);
+  }
+}
+
+/**
+ * 只读确认模型正文里的路径候选。不存在/越界时宿主回 exists=false，前端不报错、
+ * 不造链接；这不是一次用户操作，只是把“看起来像路径”变成“确实存在”的链接。
+ */
+async function inspectRunPaths(runId, paths) {
+  const candidates = [...new Set((paths ?? []).map((p) => String(p ?? "").trim()).filter(Boolean))]
+    .slice(0, 64);
+  if (candidates.length === 0) return [];
+  try {
+    const res = await fetch(`/api/runs/${encodeURIComponent(runId)}/paths/inspect`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ paths: candidates }),
+    });
+    if (!res.ok) return [];
+    const body = await res.json();
+    return Array.isArray(body.paths) ? body.paths : [];
+  } catch {
+    return [];
   }
 }
 
@@ -752,6 +904,15 @@ const liveTexts = new Map();
 const liveThinking = new Map();
 /** 缓冲上限：只用来显示尾部 80 字，没必要为一次长生成攒下几十 KB */
 const LIVE_TEXT_CAP = 2000;
+/**
+ * **单调累计到达字数**（不受上限影响），revealed 就是对它计数的。
+ * 没有它就只能拿绝对计数去 slice 一个滑动窗口——撞上限那刻 arrived 停止增长、
+ * revealed 随之不变、节拍器的 changed 恒 false，屏幕直接冻住（实测现象：
+ * 思考流到约 2000 字停住，本轮结束才整块出现）。换算见 app.js 的 revealedWindow。
+ * @type {Map<string, {think:number, text:number}>}
+ */
+const liveTotals = new Map();
+const totalsOf = (runId) => liveTotals.get(runId) ?? { think: 0, text: 0 };
 
 /**
  * delta 自己一个 batcher：它走的不是 reduce 那条路，但节流与"隐藏标签页
@@ -762,12 +923,20 @@ const deltaBatcher = createBatcher((batches) => {
   for (const [runId, chunks] of batches) {
     const textPart = chunks.filter((c) => c.kind === "text").map((c) => c.text).join("");
     const thinkPart = chunks.filter((c) => c.kind === "thinking").map((c) => c.text).join("");
-    if (thinkPart) liveThinking.set(runId, cap((liveThinking.get(runId) ?? "") + thinkPart));
+    const totals = { ...totalsOf(runId) };
+    if (thinkPart) {
+      liveThinking.set(runId, cap((liveThinking.get(runId) ?? "") + thinkPart));
+      totals.think += thinkPart.length;
+    }
     if (textPart) {
       liveTexts.set(runId, cap((liveTexts.get(runId) ?? "") + textPart));
-      // 正文一开始流，思考就该让位——它已经想完了
+      totals.text += textPart.length;
+      // 正文一开始流，思考就该让位——它已经想完了。累计也一并归零，
+      // 否则正文的放行额度会被一段早已不显示的思考永久占住
       liveThinking.delete(runId);
+      totals.think = 0;
     }
+    liveTotals.set(runId, totals);
     if (selectedRunId !== runId) continue;
     startRevealTicker(runId);
   }
@@ -783,15 +952,26 @@ const deltaBatcher = createBatcher((batches) => {
  * 追平之后**自动停表**——没有内容要放时还空转 rAF 是白烧电。
  */
 const revealed = new Map();
-let revealTicker = null;
+/**
+ * 节拍器**逐 run 一个**（原来是一个全局的）。
+ *
+ * 原实现 `if (revealTicker !== null) return` 加上闭包里捕获的 runId，会造成：
+ * A 在流时选到 B，B 的节拍器起不来（被全局锁挡住），而 A 的那个还在按 A 跑——
+ * 于是 B 的直播条一个字都不动。同一次排查里顺手修掉，因为它与 2000 字冻住
+ * 是同一个函数的两处缺陷，分开修等于要再读一遍同一段代码。
+ * @type {Map<string, number>}
+ */
+const revealTickers = new Map();
 
 function startRevealTicker(runId) {
-  if (revealTicker !== null) return;
+  if (revealTickers.has(runId)) return;
   let last = performance.now();
   const tick = (now) => {
     const dtMs = now - last;
     last = now;
-    const arrived = (liveTexts.get(runId) ?? "").length + (liveThinking.get(runId) ?? "").length;
+    // 对**累计**计数而不是缓冲长度——缓冲会被上限钉死，累计不会
+    const totals = totalsOf(runId);
+    const arrived = totals.think + totals.text;
     const state = runStates.get(runId);
     const done = !state || state.status !== "running";
     const next = paceReveal({ arrived, revealed: revealed.get(runId) ?? 0, dtMs, done });
@@ -800,22 +980,29 @@ function startRevealTicker(runId) {
     if (changed && state && selectedRunId === runId) renderDetailWithState(state);
     // 追平且没在跑了就停表
     if (next >= arrived && done) {
-      revealTicker = null;
+      revealTickers.delete(runId);
       return;
     }
-    revealTicker = requestAnimationFrame(tick);
+    revealTickers.set(runId, requestAnimationFrame(tick));
   };
-  revealTicker = requestAnimationFrame(tick);
+  revealTickers.set(runId, requestAnimationFrame(tick));
 }
 
-/** 取"该显示到第几个字"的那一截。思考与正文各自截，互不影响 */
+/** 取"该显示到第几个字"的那一截。窗口换算是 app.js 的纯函数，这里只做接线 */
 function revealedSlice(runId, full, isThinking) {
   const n = revealed.get(runId);
   if (n === undefined) return full;
-  // 思考在前、正文在后：正文的可见额度要扣掉思考已经占掉的
-  const thinkLen = (liveThinking.get(runId) ?? "").length;
-  const budget = isThinking ? n : Math.max(0, n - thinkLen);
-  return full.slice(0, budget);
+  const totals = totalsOf(runId);
+  return full.slice(
+    0,
+    revealedWindow({
+      revealed: n,
+      // 思考在前、正文在后：正文的额度要扣掉思考已经占掉的
+      precedingTotal: isThinking ? 0 : totals.think,
+      total: isThinking ? totals.think : totals.text,
+      bufferLength: full.length,
+    }),
+  );
 }
 
 const batcher = createBatcher((batches) => {
@@ -832,6 +1019,7 @@ const batcher = createBatcher((batches) => {
       if (t === "turn_start" || t === "tool_call" || t === "done") {
         liveTexts.delete(runId);
         liveThinking.delete(runId);
+        liveTotals.delete(runId);
         revealed.delete(runId); // 换轮了，放行位置跟着归零
         break;
       }
@@ -846,6 +1034,7 @@ const batcher = createBatcher((batches) => {
     if (next.status === "done") {
       liveTexts.delete(runId); // 运行结束，直播条隐藏，缓冲没有留存意义
       liveThinking.delete(runId);
+      liveTotals.delete(runId);
       const es = eventSources.get(runId);
       if (es) {
         es.close();
@@ -980,6 +1169,27 @@ async function postPlanDecision(runId, decision) {
   }
 }
 
+/**
+ * §5.2 澄清答复。`answers === null` = 委托方明确表示"都让它自己定"——
+ * 与超时同归未应答，但**来源不同**，服务端照实记（V-04：不把主动跳过写成没人答）。
+ * 非 null 时逐题对齐（未答那题为 null），长度必须等于问题数。
+ */
+async function postAnswer(runId, answers) {
+  try {
+    const res = await fetch(`/api/runs/${runId}/answer`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(answers === null ? { skip: true } : { answers }),
+    });
+    if (res.status === 409) return; // 已答或已收尾——重复点击不该报错
+    if (!res.ok) {
+      showSubmitError(`澄清答复失败（HTTP ${res.status}）：${await res.text()}`);
+    }
+  } catch (err) {
+    showSubmitError(`澄清答复失败：${err && err.message ? err.message : err}`);
+  }
+}
+
 async function postApproval(runId, approvalId, decision, reason, scope) {
   try {
     const res = await fetch(
@@ -1055,25 +1265,21 @@ async function submitNewRun({ text: task }) {
     const res = await fetch("/api/runs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
+      body: JSON.stringify(buildNewRunRequest({
         task,
         verify,
-        ...(packSelect?.value ? { pack: packSelect.value } : {}),
-        ...(effortSelect?.value ? { effort: effortSelect.value } : {}),
-        ...(rubricInput?.value.trim() ? { rubric: rubricInput.value.trim() } : {}),
-        ...(modeSelect?.value === "plan"
-          ? {
-              mode: "plan",
-              ...(concurrencySelect?.value ? { concurrency: concurrencySelect.value } : {}),
-              // 只在编排模式下带上：服务端对 single + planGate 会 400（不静默忽略）
-              ...(planGateToggle?.checked ? { planGate: true } : {}),
-            }
-          : {}),
-        ...(workdirSelect?.value ? { workdir: workdirSelect.value } : {}),
-        // 只在显式关掉时才传：默认"配了就用"，与 CLI 口径一致
-        ...(useVerifierModel && !useVerifierModel.checked ? { useVerifierModel: false } : {}),
-        ...(usePlannerModel && !usePlannerModel.checked ? { usePlannerModel: false } : {}),
-      }),
+        pack: packSelect?.value,
+        effort: effortSelect?.value,
+        rubric: rubricInput?.value,
+        mode: modeSelect?.value,
+        concurrency: concurrencySelect?.value,
+        // planGate 仍只在编排模式下进入载荷；ask_user 对 single 与 plan 都生效。
+        planGate: planGateToggle?.checked,
+        askUser: askUserToggle?.checked,
+        workdir: workdirSelect?.value,
+        useVerifierModel: !useVerifierModel || useVerifierModel.checked,
+        usePlannerModel: !usePlannerModel || usePlannerModel.checked,
+      })),
     });
     if (!res.ok) {
       let detail = "";
@@ -1187,6 +1393,17 @@ function subscribeLifecycle() {
       const payload = JSON.parse(msg.data);
       if (payload.type === "snapshot") {
         runs = payload.runs;
+      } else if (payload.type === "run_removed" && payload.runId) {
+        runs = runs.filter((run) => run.runId !== payload.runId);
+        unreadRuns.delete(payload.runId);
+        runStates.delete(payload.runId);
+        const stream = eventSources.get(payload.runId);
+        if (stream) stream.close();
+        eventSources.delete(payload.runId);
+        if (selectedRunId === payload.runId) {
+          selectedRunId = null;
+          writeHash(null, null);
+        }
       } else if (payload.run) {
         const idx = runs.findIndex((r) => r.runId === payload.run.runId);
         // 生命周期流也要记未读：没订阅事件流的那些运行（你根本没点开过）
@@ -1243,34 +1460,65 @@ function populateKnobs(snap) {
     for (const d of snap.availableWorkdirs) {
       const opt = document.createElement("option");
       opt.value = d;
-      opt.textContent = d;
+      opt.textContent = d.split(/[\\/]/).filter(Boolean).pop() ?? d;
+      opt.title = d;
       workdirSelect.appendChild(opt);
     }
     if (snap.workdir) workdirSelect.value = snap.workdir;
-    workdirSelect.disabled = snap.availableWorkdirs.length <= 1;
+    workdirSelect.title = workdirSelect.value;
+    const fixedWorkdir = snap.availableWorkdirs.length <= 1;
+    workdirSelect.disabled = fixedWorkdir;
+    workdirSelect.dataset.fixed = String(fixedWorkdir);
+    workdirSelect.addEventListener("change", () => {
+      workdirSelect.title = workdirSelect.value;
+    });
   }
 
-  // V-30 角色模型：没配就整块不显示——显示一个永远灰着的开关只会让人困惑
+  // V-30/V-31：四个角色都常驻可见。独立模型没配时明确写「跟随执行」或
+  // 「未配置」，而不是把整块藏掉后让用户猜这次到底用了什么。
   const rm = snap.roleModels;
   const knob = document.getElementById("role-models-knob");
   if (rm && knob) {
-    const wire = (role, rowId, textId, hintWhenOff) => {
+    const executorText = document.getElementById("executor-role-text");
+    if (executorText && rm.executor) {
+      executorText.textContent = `执行 · ${rm.executor.model}`;
+      executorText.parentElement.title = `${rm.executor.model}（${rm.executor.provider}）`;
+    }
+
+    const wire = (role, rowId, fallbackId, textId, label) => {
       const row = document.getElementById(rowId);
-      if (!row || !rm[role]?.configured) return false;
-      row.hidden = false;
-      document.getElementById(textId).textContent =
-        `${role === "verifier" ? "核查者" : "planner"}用 ${rm[role].model}（${rm[role].provider}）`;
+      const fallback = document.getElementById(fallbackId);
+      const configured = Boolean(rm[role]?.configured);
+      if (row) row.hidden = !configured;
+      if (fallback) fallback.hidden = configured;
+      if (!configured) return false;
+      const text = document.getElementById(textId);
+      if (text) text.textContent = `${label} · ${rm[role].model}`;
+      row.title = `${label}使用 ${rm[role].model}（${rm[role].provider}）；取消勾选则跟随执行模型`;
       return true;
     };
-    const anyVerifier = wire("verifier", "verifier-role-row", "verifier-role-text");
-    const anyPlanner = wire("planner", "planner-role-row", "planner-role-text");
-    knob.hidden = !anyVerifier && !anyPlanner;
+    const anyVerifier = wire("verifier", "verifier-role-row", "verifier-role-fallback", "verifier-role-text", "核查");
+    const anyPlanner = wire("planner", "planner-role-row", "planner-role-fallback", "planner-role-text", "规划");
+
+    const visionRow = document.getElementById("vision-role-row");
+    const visionText = document.getElementById("vision-role-text");
+    if (visionRow && visionText) {
+      const configured = Boolean(rm.vision?.configured);
+      visionRow.classList.toggle("role-model-pill--muted", !configured);
+      visionText.textContent = configured ? `识图 · ${rm.vision.model}` : "识图 · 未配置";
+      visionRow.title = configured
+        ? `图片由 ${rm.vision.model}（${rm.vision.provider}）通过 describe_image 工具处理`
+        : "未配置视觉模型；图片仍可上传，但不提供 describe_image 工具";
+    }
+
     const hint = document.getElementById("role-models-hint");
     if (hint) {
       // 有实测依据的才说"更好"：D2 支持强 verifier，B3 证伪了强 planner
       hint.textContent = anyVerifier
-        ? "取消勾选即与执行者同一个模型——这正是 A/B 对照臂的做法。"
-        : "取消勾选即与执行者同一个模型。";
+        ? "独立角色模型可逐次关闭；关闭后跟随执行模型。识图模型只作为工具接入。"
+        : anyPlanner
+          ? "独立角色模型可逐次关闭；关闭后跟随执行模型。"
+          : "规划与核查跟随执行模型；识图模型独立作为工具接入。";
     }
   }
 }
@@ -1312,7 +1560,8 @@ if (knobsToggle && runKnobs) {
     const open = runKnobs.hidden;
     runKnobs.hidden = !open;
     knobsToggle.setAttribute("aria-expanded", String(open));
-    knobsToggle.textContent = open ? "装配 ▴" : "装配 ▾";
+    const caret = knobsToggle.querySelector(".knobs-caret");
+    if (caret) caret.className = `ph ${open ? "ph-caret-up" : "ph-caret-down"} knobs-caret`;
   });
 }
 
@@ -1388,7 +1637,9 @@ async function uploadFiles(files) {
    * 而且不报错，只表现为"它说找不到文件"。
    */
   const at = { mode: composerMode?.mode ?? "new", runId: composerMode?.runId ?? null };
-  const targetWorkdir = at.mode === "append" ? composerMode?.workdir : workdirSelect?.value;
+  const targetWorkdir = at.mode === "append" || at.mode === "fork"
+    ? composerMode?.workdir
+    : workdirSelect?.value;
   for (const file of files) {
     try {
       const buf = await file.arrayBuffer();
@@ -1438,39 +1689,83 @@ if (fileUpload) {
   });
 }
 
-// ---- 主题切换（V-20）----
-// 三态循环 auto → light → dark：auto 跟随系统，另外两个是显式覆盖。
-// 显式态写进 localStorage，由 <head> 里的内联脚本在样式生效前恢复，避免闪白。
+// ---- 主题选择（V-20）----
+// 主题超过三项后，单按钮盲循环已经无法预判“下一次会变成什么”。改成显式菜单：
+// 用户先看名称与用途再选；选择仍写入 localStorage，并由 head 脚本首帧恢复。
 const THEME_KEY = "agent-ui-theme";
-const THEME_LABEL = { auto: "◐", light: "☀", dark: "☾" };
+const THEME_META = {
+  auto: { label: "跟随系统", icon: "ph-circle-half" },
+  light: { label: "暖纸", icon: "ph-sun" },
+  dark: { label: "暖炭", icon: "ph-moon" },
+  graphite: { label: "石墨", icon: "ph-stack" },
+  contrast: { label: "高对比", icon: "ph-circle-half-tilt" },
+};
 
 function currentTheme() {
   const explicit = document.documentElement.getAttribute("data-theme");
-  return explicit === "light" || explicit === "dark" ? explicit : "auto";
+  return explicit && THEME_META[explicit] ? explicit : "auto";
 }
 
 function applyTheme(next) {
-  if (next === "auto") document.documentElement.removeAttribute("data-theme");
-  else document.documentElement.setAttribute("data-theme", next);
+  const theme = THEME_META[next] ? next : "auto";
+  if (theme === "auto") document.documentElement.removeAttribute("data-theme");
+  else document.documentElement.setAttribute("data-theme", theme);
   try {
-    if (next === "auto") localStorage.removeItem(THEME_KEY);
-    else localStorage.setItem(THEME_KEY, next);
+    if (theme === "auto") localStorage.removeItem(THEME_KEY);
+    else localStorage.setItem(THEME_KEY, theme);
   } catch { /* 隐私模式下写入可能抛错，主题仍在本次会话内生效 */ }
   if (themeToggle) {
-    themeToggle.textContent = THEME_LABEL[next];
-    themeToggle.setAttribute("aria-label", `切换配色主题（当前：${
-      { auto: "跟随系统", light: "浅色", dark: "深色" }[next]
-    }）`);
+    const icon = themeToggle.querySelector("i");
+    if (icon) icon.className = `ph ${THEME_META[theme].icon}`;
+    themeToggle.setAttribute("aria-label", `选择配色主题（当前：${THEME_META[theme].label}）`);
+  }
+  for (const choice of themeChoices) {
+    choice.setAttribute("aria-checked", String(choice.getAttribute("data-theme-choice") === theme));
+  }
+}
+
+function setThemeMenuOpen(open, focusSelected = false) {
+  if (!themeMenu || !themeToggle) return;
+  themeMenu.hidden = !open;
+  themeToggle.setAttribute("aria-expanded", String(open));
+  if (open && focusSelected) {
+    const selected = /** @type {HTMLElement|null} */ (themeMenu.querySelector('[aria-checked="true"]'));
+    const fallback = /** @type {HTMLElement|null} */ (themeMenu.querySelector("[data-theme-choice]"));
+    (selected ?? fallback)?.focus();
   }
 }
 
 if (themeToggle) {
   applyTheme(currentTheme());
   themeToggle.addEventListener("click", () => {
-    const order = ["auto", "light", "dark"];
-    applyTheme(order[(order.indexOf(currentTheme()) + 1) % order.length]);
+    setThemeMenuOpen(themeToggle.getAttribute("aria-expanded") !== "true", true);
   });
 }
+if (themeMenu) {
+  themeMenu.addEventListener("click", (event) => {
+    const choice = event.target instanceof Element ? event.target.closest("[data-theme-choice]") : null;
+    if (!choice) return;
+    applyTheme(choice.getAttribute("data-theme-choice"));
+    setThemeMenuOpen(false);
+    themeToggle?.focus();
+  });
+  themeMenu.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      setThemeMenuOpen(false);
+      themeToggle?.focus();
+      return;
+    }
+    if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+    event.preventDefault();
+    const at = Math.max(0, themeChoices.indexOf(/** @type {HTMLButtonElement} */ (document.activeElement)));
+    const step = event.key === "ArrowDown" ? 1 : -1;
+    themeChoices[(at + step + themeChoices.length) % themeChoices.length]?.focus();
+  });
+}
+document.addEventListener("click", (event) => {
+  if (themePicker && !themePicker.contains(event.target)) setThemeMenuOpen(false);
+});
 
 // 底栏先派生一次：loadRuns 失败时是静默的（见其 catch），
 // 不显式同步的话 composer 会停在 HTML 里那份未经派生的静态文案上

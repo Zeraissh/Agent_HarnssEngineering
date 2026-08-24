@@ -8,7 +8,7 @@
  * 出参，把契约钉死。
  */
 import { describe, expect, it } from "vitest";
-import { AnthropicModelClient } from "../src/model-client.js";
+import { AnthropicModelClient, toAnthropicToolChoice } from "../src/model-client.js";
 import type { ModelRequest } from "../src/types.js";
 
 /** 捕获 messages.stream 入参的假 SDK client（形状够用即可，不实现整个 SDK） */
@@ -113,5 +113,119 @@ describe("AnthropicModelClient 请求构造契约", () => {
       messages: req.messages,
       tools: req.tools,
     });
+  });
+});
+
+describe("tool_choice 映射（§2.1）", () => {
+  it('"none" → {type:"none"}；强制交付 → {type:"tool", name}', () => {
+    expect(toAnthropicToolChoice("none")).toEqual({ type: "none" });
+    expect(toAnthropicToolChoice({ type: "tool", name: "submit_verdict" })).toEqual({
+      type: "tool",
+      name: "submit_verdict",
+    });
+  });
+
+  it("工具名原样透传——写错这里不会报错，只会静默退化成「没约束」", () => {
+    expect(toAnthropicToolChoice({ type: "tool", name: "submit_plan" })).toEqual({
+      type: "tool",
+      name: "submit_plan",
+    });
+  });
+});
+
+/**
+ * 强制工具 × 思考模式（2026-08-15 真机探针催生）。
+ *
+ * 探针实测（api.deepseek.com/anthropic）：
+ *   tool_choice:{type:"tool"} + 思考模式 → 400「Thinking mode does not support this tool_choice」
+ *   同一请求加 thinking:{type:"disabled"} → 200 且真的返回 tool_use
+ * 这是 Anthropic 协议本身的约束（扩展思考开启时 tool_choice 不能点名具体工具），
+ * 不是某个端点的怪癖，所以两种模式统一处理。
+ *
+ * **没有这条锁，§2.1 会在真机上把收口救援直接烧成 error**——400 是永久性错误，
+ * loop 的分类会 finish("error")，比不做还糟。
+ */
+describe("强制工具必须关掉思考（否则真机 400）", () => {
+  const forced: ModelRequest = { ...req, toolChoice: { type: "tool", name: "submit_verdict" } };
+
+  it("非 compat + 强制工具 → thinking 显式 disabled（不是 adaptive）", async () => {
+    const { client, calls } = makeFakeSdk();
+    await new AnthropicModelClient("claude-opus-4-8", client as never, { compat: false }).send(forced);
+    expect(calls[0]!["thinking"]).toEqual({ type: "disabled" });
+    expect(calls[0]!["tool_choice"]).toEqual({ type: "tool", name: "submit_verdict" });
+  });
+
+  it("compat + 强制工具 → 同样显式关思考（端点默认可能替你开着）", async () => {
+    const { client, calls } = makeFakeSdk();
+    await new AnthropicModelClient("deepseek-v4-pro", client as never, { compat: true }).send(forced);
+    expect(calls[0]!["thinking"]).toEqual({ type: "disabled" });
+  });
+
+  it("tool_choice=none 不受影响——禁工具与思考并不冲突", async () => {
+    const { client, calls } = makeFakeSdk();
+    await new AnthropicModelClient("claude-opus-4-8", client as never, { compat: false }).send({
+      ...req,
+      toolChoice: "none",
+    });
+    expect(calls[0]!["thinking"]).toEqual({ type: "adaptive" });
+  });
+});
+
+describe("降级臂：端点拒绝强制工具时剥掉重发，而不是烧掉整段", () => {
+  /** 前 n 次调用抛 400，之后正常 */
+  function rejectingSdk(n: number, message: string) {
+    const base = makeFakeSdk();
+    let seen = 0;
+    const calls: Record<string, unknown>[] = [];
+    const client = {
+      messages: {
+        stream(params: Record<string, unknown>) {
+          calls.push(params);
+          seen += 1;
+          if (seen <= n) {
+            const err = Object.assign(new Error(message), { status: 400 });
+            return { on() {}, finalMessage: async () => { throw err; } };
+          }
+          return base.client.messages.stream(params);
+        },
+      },
+    };
+    return { client, calls };
+  }
+
+  const forced: ModelRequest = { ...req, toolChoice: { type: "tool", name: "submit_verdict" } };
+
+  it("400 提到 thinking → 剥掉 tool_choice 重发一次并成功", async () => {
+    const { client, calls } = rejectingSdk(1, "Thinking mode does not support this tool_choice");
+    const turn = await new AnthropicModelClient("m", client as never, { compat: true }).send(forced);
+    expect(calls).toHaveLength(2);
+    expect(calls[0]!["tool_choice"], "第一次带强制").toBeDefined();
+    expect(calls[1]!["tool_choice"], "重发不带").toBeUndefined();
+    expect(turn.stopReason).toBe("end_turn");
+  });
+
+  it("记住结论：同一个端点不再每轮撞一次墙", async () => {
+    const { client, calls } = rejectingSdk(1, "unsupported tool_choice");
+    const c = new AnthropicModelClient("m", client as never, { compat: true });
+    await c.send(forced);
+    await c.send(forced);
+    expect(calls).toHaveLength(3); // 1 撞 + 1 重发 + 第二轮直接不带
+    expect(calls[2]!["tool_choice"]).toBeUndefined();
+  });
+
+  it("无关的 400 原样抛出——不吞掉真错误，也不白烧一次调用", async () => {
+    const { client, calls } = rejectingSdk(1, "messages.0: text content blocks must be non-empty");
+    await expect(
+      new AnthropicModelClient("m", client as never, { compat: true }).send(forced),
+    ).rejects.toThrow("non-empty");
+    expect(calls).toHaveLength(1);
+  });
+
+  it("没带强制工具时不触发降级——那条路径与本机制无关", async () => {
+    const { client, calls } = rejectingSdk(1, "Thinking mode does not support this tool_choice");
+    await expect(
+      new AnthropicModelClient("m", client as never, { compat: true }).send(req),
+    ).rejects.toThrow();
+    expect(calls).toHaveLength(1);
   });
 });

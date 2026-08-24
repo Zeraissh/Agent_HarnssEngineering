@@ -9,6 +9,7 @@
  * （verifier 会发现产出不对），而"路由挂了导致任务跑不了"没有任何纠错机会。
  */
 import { AgentLoop } from "./loop.js";
+import { withoutTaskCompletion } from "./task-completion.js";
 import type { DomainPack } from "./presets.js";
 import type { AgentConfig, AggregateUsage, ModelClient, TurnEvent } from "./types.js";
 
@@ -33,7 +34,8 @@ export async function routeToPack(
   onEvent?: (event: TurnEvent) => void | Promise<void>,
 ): Promise<RouteOutcome> {
   // 无工具、两轮上限：router 只做判断，不做探索
-  const loop = new AgentLoop({ ...cfg, tools: [], maxTurns: 2 }, model);
+  const roleCfg = withoutTaskCompletion(cfg);
+  const loop = new AgentLoop({ ...roleCfg, tools: [], maxTurns: 2 }, model);
   let text = "";
   let usage: AggregateUsage | undefined;
 

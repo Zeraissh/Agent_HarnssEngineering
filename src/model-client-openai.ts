@@ -16,7 +16,18 @@
  */
 import OpenAI from "openai";
 import type Anthropic from "@anthropic-ai/sdk";
-import type { ModelClient, ModelRequest, ModelTurn, StreamDelta } from "./types.js";
+import type { ModelClient, ModelRequest, ModelTurn, StreamDelta, ToolChoice } from "./types.js";
+
+/**
+ * ToolChoice → OpenAI wire。**这一行此前是本文件唯一没被锁住的映射**
+ * （B0b 的实施笔记自己记着这笔欠账：该文件只测纯翻译函数，没有 create 捕获桩，
+ * 那行 spread 只能靠 loop 层间接盖住）。提成纯函数即可直接钉死。
+ */
+export function toOpenAIToolChoice(
+  choice: ToolChoice,
+): OpenAI.Chat.Completions.ChatCompletionToolChoiceOption {
+  return choice === "none" ? "none" : { type: "function", function: { name: choice.name } };
+}
 
 export interface OpenAIClientOptions {
   baseURL?: string;
@@ -53,8 +64,10 @@ export class OpenAIModelClient implements ModelClient {
       max_tokens: req.maxTokens,
       messages: toOpenAIMessages(req),
       ...(req.tools.length > 0 ? { tools: toOpenAITools(req.tools) } : {}),
-      // B0b 结构化禁工具（OpenAI wire 的标准取值）
-      ...(req.toolChoice && req.tools.length > 0 ? { tool_choice: req.toolChoice } : {}),
+      // 工具选择约束（OpenAI wire 形状）。无工具面时不发——点名一个不存在的工具是 400
+      ...(req.toolChoice && req.tools.length > 0
+        ? { tool_choice: toOpenAIToolChoice(req.toolChoice) }
+        : {}),
       stream: true,
       stream_options: { include_usage: true },
     },

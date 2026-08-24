@@ -7,14 +7,19 @@
  */
 import type Anthropic from "@anthropic-ai/sdk";
 import { DefaultContextManager, userMessageWithContext } from "./context.js";
+import { createHash } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { classifyApiError, isTransientApiError } from "./model-client.js";
+import { decideRecovery } from "./recovery.js";
 import { ToolExecutor, ToolRegistry } from "./tools/registry.js";
 import type {
   AgentConfig,
   AgentRunResult,
   AggregateUsage,
   ModelClient,
+  SharedRunBudget,
+  TaskCompletion,
+  TerminalResolution,
   TurnEvent,
 } from "./types.js";
 
@@ -24,6 +29,93 @@ const DEFAULTS = {
   maxTokens: 64_000,
   maxTurns: 50,
 } as const;
+
+/** 终结工具（§2.1）的回执：交付被接收 */
+export const TERMINAL_TOOL_ACK = "已收到，交付完成。";
+/** 同轮里与终结工具一起发出的其它调用的回执：未执行，且说清为什么 */
+export const TERMINAL_TOOL_SUPERSEDED =
+  "未执行：本轮已通过终结工具交付，运行到此结束。";
+export const TERMINAL_TOOL_INVALID =
+  "终结工具入参不符合交付契约，未收尾。请根据工具 schema 修正后重新提交。";
+
+/**
+ * 创建可跨 AgentLoop 实例共享的总预算。省略上限仍会累计读数，便于宿主观察；
+ * 真正的硬上限由 maxTurns / maxTokens 字段决定。
+ */
+export function createRunBudget(
+  limits: { maxTurns?: number; maxTokens?: number } = {},
+): SharedRunBudget {
+  return {
+    ...(limits.maxTurns !== undefined ? { maxTurns: limits.maxTurns } : {}),
+    ...(limits.maxTokens !== undefined ? { maxTokens: limits.maxTokens } : {}),
+    usedTurns: 0,
+    usedTokens: 0,
+  };
+}
+
+/**
+ * token 用量只有响应返回后才知道，不能像 turns 一样在请求前精确预占。显式设置
+ * maxTokens 时，同一共享总账下的模型调用因此需要串行记账：允许最后一个已获准的
+ * 调用按实际响应自然越界，但不会让多条并发轨同时基于同一个旧余额起跑。
+ *
+ * WeakMap 以总账对象本身为锁域；最后一个等待者释放后删除，避免长期宿主泄漏。
+ */
+const tokenBudgetTails = new WeakMap<SharedRunBudget, Promise<void>>();
+
+async function acquireTokenBudgetSlot(budget: SharedRunBudget): Promise<() => void> {
+  const previous = tokenBudgetTails.get(budget) ?? Promise.resolve();
+  let releaseGate!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    releaseGate = resolve;
+  });
+  const tail = previous.then(() => gate);
+  tokenBudgetTails.set(budget, tail);
+  await previous;
+
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    releaseGate();
+    if (tokenBudgetTails.get(budget) === tail) tokenBudgetTails.delete(budget);
+  };
+}
+
+function turnTokenCost(usage: Anthropic.Usage): number {
+  return (
+    usage.input_tokens +
+    (usage.cache_creation_input_tokens ?? 0) +
+    (usage.cache_read_input_tokens ?? 0) +
+    usage.output_tokens
+  );
+}
+
+/** 工具观察签名故意不含 tool_use_id——每次 id 都变，拿它比较永远检测不到重复。 */
+function stableValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableValue);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([k, v]) => [k, stableValue(v)]),
+    );
+  }
+  return value;
+}
+
+function observationSignature(
+  blocks: Anthropic.ToolUseBlock[],
+  results: Anthropic.ToolResultBlockParam[],
+): string {
+  const canonical = blocks.map((block, i) => ({
+    name: block.name,
+    input: stableValue(block.input),
+    result: results[i]?.content ?? "",
+    isError: results[i]?.is_error === true,
+  }));
+  // 工具结果可能是 MB 级文件/日志；只保留固定长度摘要，不能让停滞检测复制一份正文。
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+}
 
 /**
  * 重试退避 + 抖动。
@@ -88,7 +180,7 @@ export class AgentLoop {
   private readonly executor: ToolExecutor;
   private readonly context: DefaultContextManager;
   private readonly maxTurns: number;
-  private readonly maxTokensBudget: number | undefined;
+  private readonly runBudget: SharedRunBudget;
   private readonly errorRetries: number;
   private readonly errorRetryBackoffMs: number;
 
@@ -104,21 +196,30 @@ export class AgentLoop {
       effort: cfg.effort ?? DEFAULTS.effort,
       cacheBreakpoints: !cfg.compat,
       contextTokenLimit: cfg.contextTokenLimit,
+      ...(cfg.initialContextInputTokens !== undefined
+        ? { initialInputTokens: cfg.initialContextInputTokens }
+        : {}),
     });
     this.maxTurns = cfg.maxTurns ?? DEFAULTS.maxTurns;
-    this.maxTokensBudget = cfg.maxTokensBudget;
+    this.runBudget =
+      cfg.runBudget ??
+      createRunBudget({
+        ...(cfg.maxTotalTurns !== undefined ? { maxTurns: cfg.maxTotalTurns } : {}),
+        ...(cfg.maxTokensBudget !== undefined ? { maxTokens: cfg.maxTokensBudget } : {}),
+      });
     this.errorRetries = cfg.errorRetries ?? 1;
     this.errorRetryBackoffMs = cfg.errorRetryBackoffMs ?? 1500;
   }
 
   run(userInput: string, signal?: AbortSignal): AsyncIterable<TurnEvent> {
     const queue = new AsyncEventQueue<TurnEvent>();
-    void this.drive(userInput, signal ?? new AbortController().signal, queue);
+    this.startDrive(userInput, signal ?? new AbortController().signal, queue);
     return queue;
   }
 
   /**
-   * 续跑：在已有会话正史之上追加一条 user 反馈继续执行（轮次预算重新起算）。
+   * 续跑：在已有会话正史之上追加一条 user 反馈继续执行。
+   * 当前段的 maxTurns 重新起算；runBudget 的总轮次/token 账不会重置。
    * 用途：返工继承上下文——agent 保留此前的探索/工具结果，不必从零重烧
    * （A/B 实测 fresh 返工最贵一例白烧 127k tokens）。上下文增长由 compact 兜底。
    */
@@ -128,8 +229,46 @@ export class AgentLoop {
     signal?: AbortSignal,
   ): AsyncIterable<TurnEvent> {
     const queue = new AsyncEventQueue<TurnEvent>();
-    void this.drive(feedback, signal ?? new AbortController().signal, queue, history);
+    this.startDrive(feedback, signal ?? new AbortController().signal, queue, history);
     return queue;
+  }
+
+  /**
+   * drive 是后台 promise；若未捕获异常，AsyncEventQueue 永远不会 end，所有宿主的
+   * for-await 都会永久挂住。预期 API/工具失败在 drive 内有细分路径，这里只兜
+   * harness 自身的意外异常，并仍履行“最后一条事件恒为 done”的总契约。
+   */
+  private startDrive(
+    userInput: string,
+    signal: AbortSignal,
+    queue: AsyncEventQueue<TurnEvent>,
+    history?: Anthropic.MessageParam[],
+  ): void {
+    void this.drive(userInput, signal, queue, history).catch((cause: unknown) => {
+      const error = cause instanceof Error ? cause : new Error(String(cause));
+      const messages: Anthropic.MessageParam[] = history
+        ? [...history, { role: "user", content: userInput }]
+        : [{ role: "user", content: userInput }];
+      queue.push({
+        type: "done",
+        result: {
+          stopReason: "error",
+          messages,
+          usage: {
+            inputTokens: 0,
+            cacheCreationTokens: 0,
+            cacheReadTokens: 0,
+            outputTokens: 0,
+            turns: 0,
+            cacheHitRatio: 0,
+          },
+          runBudget: { ...this.runBudget },
+          contextInputTokens: this.context.checkpointInputTokens(),
+          error,
+        },
+      });
+      queue.end();
+    });
   }
 
   private async drive(
@@ -170,89 +309,200 @@ export class AgentLoop {
     const finish = (
       stopReason: AgentRunResult["stopReason"],
       error?: Error,
+      completion?: TaskCompletion,
     ): void => {
       const denom = usage.inputTokens + usage.cacheCreationTokens + usage.cacheReadTokens;
       usage.cacheHitRatio = denom > 0 ? usage.cacheReadTokens / denom : 0;
-      q.push({ type: "done", result: { stopReason, messages, usage, ...(error ? { error } : {}) } });
+      q.push({
+        type: "done",
+        result: {
+          stopReason,
+          messages,
+          usage,
+          ...(completion ? { completion } : {}),
+          runBudget: { ...this.runBudget },
+          contextInputTokens: this.context.checkpointInputTokens(),
+          ...(error ? { error } : {}),
+        },
+      });
       q.end();
     };
 
-    for (let turn = 1; turn <= this.maxTurns; turn++) {
+    /**
+     * 恢复提示要并进末条 user（通常是 tool_result）而不是再造连续两条 user；
+     * 第三方兼容端点对连续同角色消息的容忍度不一致。
+     */
+    const appendControlMessage = (text: string): void => {
+      const last = messages.at(-1);
+      if (last?.role === "user") {
+        const content: Anthropic.ContentBlockParam[] =
+          typeof last.content === "string"
+            ? [{ type: "text", text: last.content }]
+            : [...last.content];
+        content.push({ type: "text", text });
+        messages = [...messages.slice(0, -1), { role: "user", content }];
+      } else {
+        messages.push({ role: "user", content: text });
+      }
+    };
+
+    let turn = 0;
+    let turnCeiling = this.maxTurns;
+    let extensionUsed = false;
+    let completionReminderUsed = false;
+    let forceTerminal = false;
+    let terminalCorrectionUsed = false;
+    let forcedFailureReason: "incomplete" | "stalled" = "incomplete";
+    let hasProgress = false;
+    let lastObservation: string | undefined;
+    let repeatedObservationTurns = 0;
+    let stagnationRecoveries = 0;
+
+    while (true) {
       // 护栏检查发生在每次模型调用之前（契约 4）
       if (signal.aborted) {
         // 不是 error：人叫停是决定不是故障（见 AgentRunResult.stopReason 注释）
         return finish("aborted");
       }
-      if (this.maxTokensBudget !== undefined) {
-        const spent =
-          usage.inputTokens + usage.cacheCreationTokens + usage.cacheReadTokens + usage.outputTokens;
-        if (spent >= this.maxTokensBudget) {
+      if (
+        (this.runBudget.maxTurns !== undefined &&
+          this.runBudget.usedTurns >= this.runBudget.maxTurns) ||
+        (this.runBudget.maxTokens !== undefined &&
+          this.runBudget.usedTokens >= this.runBudget.maxTokens)
+      ) {
+        return finish("budget_exhausted");
+      }
+
+      /**
+       * 普通 loop 到 maxTurns 仍保持旧语义。只有显式装了业务完成门，宿主才会
+       * 根据进展做一次有界续跑或强制收口——不会偷偷把所有任务的护栏调大。
+       */
+      if (turn >= turnCeiling) {
+        if (!this.cfg.requireTerminalTool || !this.cfg.terminalTool) {
+          return finish("max_turns");
+        }
+        if (forceTerminal) return finish(forcedFailureReason);
+
+        const decision = decideRecovery({
+          trigger: "max_turns",
+          policy: this.cfg.recovery,
+          hasProgress,
+          extensionUsed,
+        });
+        q.push({
+          type: "recovery_decision",
+          reason: "max_turns",
+          action: decision.action,
+          detail: decision.detail,
+          ...(decision.extraTurns !== undefined ? { extraTurns: decision.extraTurns } : {}),
+        });
+        appendControlMessage(`【恢复决策】${decision.detail}`);
+        if (decision.action === "continue_with_context") {
+          extensionUsed = true;
+          turnCeiling += decision.extraTurns ?? 0;
+        } else {
+          forceTerminal = true;
+          forcedFailureReason = "incomplete";
+          // 强制交付本身是一轮短工具调用，不从执行预算里偷。
+          turnCeiling = turn + 1;
+        }
+        continue;
+      }
+
+      let modelTurn;
+      const releaseTokenBudget =
+        this.runBudget.maxTokens !== undefined
+          ? await acquireTokenBudgetSlot(this.runBudget)
+          : undefined;
+      try {
+        // 等锁期间其它并发轨可能已经把共享总账用完，必须在真正发请求前复查。
+        if (signal.aborted) return finish("aborted");
+        if (
+          (this.runBudget.maxTurns !== undefined &&
+            this.runBudget.usedTurns >= this.runBudget.maxTurns) ||
+          (this.runBudget.maxTokens !== undefined &&
+            this.runBudget.usedTokens >= this.runBudget.maxTokens)
+        ) {
           return finish("budget_exhausted");
         }
-      }
 
-      q.push({ type: "turn_start", turn });
+        turn += 1;
+        q.push({ type: "turn_start", turn });
 
-      // 压缩替换正史（一次性、确定性），保证后续请求前缀稳定（见 context.ts 注释）
-      const compacted = this.context.compact(messages);
-      if (compacted.droppedBlocks > 0) {
-        messages = compacted.messages;
-        q.push({ type: "compaction", droppedBlocks: compacted.droppedBlocks });
-      }
-
-      const request = this.context.render(messages, this.registry.toApiTools());
-      if (this.cfg.toolChoice === "none") request.toolChoice = "none";
-
-      // 同轮重试：SDK 的 HTTP 重试耗尽后，loop 层对瞬时错误再兜 errorRetries 次。
-      // 请求是幂等的（同一 request 重发），非瞬时错误（认证/4xx/abort）立即终止。
-      let modelTurn;
-      for (let attempt = 0; ; attempt++) {
-        try {
-          modelTurn = await this.model.send(
-            request,
-            (delta) =>
-              q.push(
-                delta.kind === "thinking"
-                  ? { type: "thinking_delta", text: delta.text }
-                  : { type: "text_delta", text: delta.text },
-              ),
-            // 中止位不能只在轮与轮之间查：一次长生成就是一次调用，
-            // 不把 signal 交给 SDK，"停止"就要等这一整轮吐完才生效
-            signal,
-          );
-          break;
-        } catch (err) {
-          /**
-           * 中止把在飞的请求掐断，SDK 会抛 AbortError——那不是故障。
-           * 不在这里分出去的话，"我按了停止"会被画成"它崩了"，
-           * 而且 error 路径还会触发段级续跑（9.8），变成"停一下又自己接着跑"。
-           */
-          if (signal.aborted) return finish("aborted");
-          if (!isTransientApiError(err) || attempt >= this.errorRetries) {
-            // 原始错误挂在 cause 上：分类过的消息是给人看的，但编排层要靠
-            // isTransientApiError(原始错误) 决定"这段能不能带着正史续跑"（9.8）。
-            // 此前这里只留下一句字符串，上游再想分类只能字符串匹配——那正是
-            // 本项目一贯反对的做法。
-            return finish("error", new Error(classifyApiError(err), { cause: err }));
-          }
-          const backoffMs = backoffWithJitter(this.errorRetryBackoffMs, attempt);
-          q.push({
-            type: "api_retry",
-            turn,
-            attempt: attempt + 1,
-            reason: classifyApiError(err),
-            backoffMs,
-          });
-          await delay(backoffMs);
+        // 压缩替换正史（一次性、确定性），保证后续请求前缀稳定（见 context.ts 注释）
+        const compacted = this.context.compact(messages);
+        if (compacted.droppedBlocks > 0) {
+          messages = compacted.messages;
+          q.push({ type: "compaction", droppedBlocks: compacted.droppedBlocks });
         }
-      }
 
-      usage.turns = turn;
-      this.context.noteUsage(modelTurn.usage);
-      usage.inputTokens += modelTurn.usage.input_tokens;
-      usage.cacheCreationTokens += modelTurn.usage.cache_creation_input_tokens ?? 0;
-      usage.cacheReadTokens += modelTurn.usage.cache_read_input_tokens ?? 0;
-      usage.outputTokens += modelTurn.usage.output_tokens;
+        const request = this.context.render(messages, this.registry.toApiTools());
+        if (forceTerminal && this.cfg.terminalTool) {
+          request.toolChoice = { type: "tool", name: this.cfg.terminalTool };
+        } else if (this.cfg.toolChoice) {
+          request.toolChoice = this.cfg.toolChoice;
+        }
+
+        /**
+         * 总轮次在模型请求发出【之前】预占。并行计划下多个 AgentLoop 共享同一对象；
+         * 若等响应回来才加，cap=1 时两条并发轨都会先看到 0 并各发一请求，硬上限
+         * 会按并发度超卖。JS 在第一个 await 前同步执行，这一步就是原子预占点。
+         */
+        this.runBudget.usedTurns += 1;
+
+        // 同轮重试：SDK 的 HTTP 重试耗尽后，loop 层对瞬时错误再兜 errorRetries 次。
+        // 请求是幂等的（同一 request 重发），非瞬时错误（认证/4xx/abort）立即终止。
+        for (let attempt = 0; ; attempt++) {
+          try {
+            modelTurn = await this.model.send(
+              request,
+              (delta) =>
+                q.push(
+                  delta.kind === "thinking"
+                    ? { type: "thinking_delta", text: delta.text }
+                    : { type: "text_delta", text: delta.text },
+                ),
+              // 中止位不能只在轮与轮之间查：一次长生成就是一次调用，
+              // 不把 signal 交给 SDK，"停止"就要等这一整轮吐完才生效
+              signal,
+            );
+            break;
+          } catch (err) {
+            /**
+             * 中止把在飞的请求掐断，SDK 会抛 AbortError——那不是故障。
+             * 不在这里分出去的话，"我按了停止"会被画成"它崩了"，
+             * 而且 error 路径还会触发段级续跑（9.8），变成"停一下又自己接着跑"。
+             */
+            if (signal.aborted) return finish("aborted");
+            if (!isTransientApiError(err) || attempt >= this.errorRetries) {
+              // 原始错误挂在 cause 上：分类过的消息是给人看的，但编排层要靠
+              // isTransientApiError(原始错误) 决定"这段能不能带着正史续跑"（9.8）。
+              // 此前这里只留下一句字符串，上游再想分类只能字符串匹配——那正是
+              // 本项目一贯反对的做法。
+              return finish("error", new Error(classifyApiError(err), { cause: err }));
+            }
+            const backoffMs = backoffWithJitter(this.errorRetryBackoffMs, attempt);
+            q.push({
+              type: "api_retry",
+              turn,
+              attempt: attempt + 1,
+              reason: classifyApiError(err),
+              backoffMs,
+            });
+            await delay(backoffMs);
+          }
+        }
+
+        usage.turns = turn;
+        this.context.noteUsage(modelTurn.usage);
+        usage.inputTokens += modelTurn.usage.input_tokens;
+        usage.cacheCreationTokens += modelTurn.usage.cache_creation_input_tokens ?? 0;
+        usage.cacheReadTokens += modelTurn.usage.cache_read_input_tokens ?? 0;
+        usage.outputTokens += modelTurn.usage.output_tokens;
+        this.runBudget.usedTokens += turnTokenCost(modelTurn.usage);
+      } finally {
+        releaseTokenBudget?.();
+      }
       q.push({ type: "usage", turn, usage: modelTurn.usage });
 
       // 完整 push assistant content（契约 1）：丢块会导致 400 或行为退化
@@ -288,21 +538,69 @@ export class AgentLoop {
 
       switch (modelTurn.stopReason) {
         case "end_turn":
-        case "stop_sequence":
-          return finish("completed");
+        case "stop_sequence": {
+          if (!this.cfg.requireTerminalTool || !this.cfg.terminalTool) {
+            return finish("completed");
+          }
+          if (forceTerminal) return finish(forcedFailureReason);
+
+          const decision = decideRecovery({
+            trigger: "end_turn_without_completion",
+            policy: this.cfg.recovery,
+            completionReminderUsed,
+          });
+          q.push({
+            type: "recovery_decision",
+            reason: "end_turn_without_completion",
+            action: decision.action,
+            detail: decision.detail,
+          });
+          appendControlMessage(
+            `${this.cfg.terminalReminder ?? decision.detail}\n【宿主判定】${decision.detail}`,
+          );
+          completionReminderUsed = true;
+          if (decision.action === "force_completion") {
+            forceTerminal = true;
+            forcedFailureReason = "incomplete";
+            // 只给一轮结构化收口。不能保留原来的大 ceiling，否则兼容端点无视
+            // tool_choice 后还能继续空转几十轮，“强制”就只剩名字。
+            turnCeiling = turn + 1;
+          }
+          continue;
+        }
 
         case "refusal":
           // 不用同一 prompt 重试（API 硬约束 7）
           return finish("refusal");
 
-        case "max_tokens":
+        case "max_tokens": {
           // 优雅终止而非报废整轮：部分 assistant 内容已入历史、assistant_text 已发出，
           // 都得以保留。max_tokens 是刻意的护栏（防本地模型跑飞/上下文预算），撞上限
           // 说明本轮输出需要更多空间——提高 maxTokens 即可，而非丢弃已完成的工作。
-          return finish("max_tokens");
+          if (!this.cfg.requireTerminalTool || !this.cfg.terminalTool) {
+            return finish("max_tokens");
+          }
+          if (forceTerminal) return finish(forcedFailureReason);
+          const decision = decideRecovery({
+            trigger: "max_tokens_without_completion",
+            policy: this.cfg.recovery,
+          });
+          q.push({
+            type: "recovery_decision",
+            reason: "max_tokens_without_completion",
+            action: decision.action,
+            detail: decision.detail,
+          });
+          appendControlMessage(`【收口】${decision.detail}`);
+          forceTerminal = true;
+          forcedFailureReason = "incomplete";
+          turnCeiling = turn + 1;
+          continue;
+        }
 
         case "pause_turn":
           // 原样重发，不追加任何用户文本（API 硬约束 2）
+          hasProgress = false;
           continue;
 
         case "tool_use": {
@@ -311,6 +609,94 @@ export class AgentLoop {
           );
           for (const b of blocks) {
             q.push({ type: "tool_call", toolUseId: b.id, name: b.name, input: b.input });
+          }
+
+          /**
+           * 终结工具（§2.1）：模型调用它 = 交付完成，立刻收尾。
+           *
+           * 同轮里的其它工具调用**不执行**：模型既然已经交付，再跑取证只会
+           * 让"完成"这件事变得可争议（同轮多调用是常态，不是异常）。但每个
+           * tool_use 都要有对应的 tool_result——① API 硬约束 1，这段正史可能
+           * 被 runContinuation 复用；② 事件流上每条 tool_call 都得有回执，
+           * 否则界面留下一条永远转圈的调用。
+           */
+          if (this.cfg.terminalTool) {
+            const terminal = blocks.find((b) => b.name === this.cfg.terminalTool);
+            if (terminal) {
+              let resolution: TerminalResolution | undefined;
+              try {
+                resolution = this.cfg.resolveTerminal?.(terminal.input);
+              } catch {
+                resolution = undefined;
+              }
+              const invalid = Boolean(this.cfg.resolveTerminal) && !resolution;
+              const ackOf = (id: string): string => {
+                if (id !== terminal.id) return TERMINAL_TOOL_SUPERSEDED;
+                return invalid ? TERMINAL_TOOL_INVALID : TERMINAL_TOOL_ACK;
+              };
+              for (const b of blocks) {
+                q.push({
+                  type: "tool_result",
+                  toolUseId: b.id,
+                  result: {
+                    content: ackOf(b.id),
+                    ...(invalid && b.id === terminal.id ? { isError: true } : {}),
+                  },
+                  durationMs: 0,
+                });
+              }
+              messages.push({
+                role: "user",
+                content: blocks.map((b) => ({
+                  type: "tool_result" as const,
+                  tool_use_id: b.id,
+                  content: ackOf(b.id),
+                  ...(invalid && b.id === terminal.id ? { is_error: true } : {}),
+                })),
+              });
+              if (invalid) {
+                // 强制收口段也给一次修正 schema 的机会；仍受总预算约束。
+                if (forceTerminal) {
+                  if (terminalCorrectionUsed) return finish(forcedFailureReason);
+                  terminalCorrectionUsed = true;
+                  turnCeiling = turn + 1;
+                }
+                continue;
+              }
+              return finish(
+                resolution?.stopReason ?? "completed",
+                undefined,
+                resolution?.completion,
+              );
+            }
+          }
+
+          /**
+           * 强制收口时兼容端点仍可能无视 tool_choice。此时其它工具绝不执行：
+           * 否则“最后一轮只许交付”又会退回继续取证，正是 B0b 修过的失效。
+           */
+          if (forceTerminal && this.cfg.terminalTool) {
+            const refusal =
+              `当前处于强制收口阶段，只允许调用 ${this.cfg.terminalTool}。` +
+              "其它工具未执行；请立即提交真实的 completed / partial / blocked 状态。";
+            for (const b of blocks) {
+              q.push({
+                type: "tool_result",
+                toolUseId: b.id,
+                result: { content: refusal, isError: true },
+                durationMs: 0,
+              });
+            }
+            messages.push({
+              role: "user",
+              content: blocks.map((b) => ({
+                type: "tool_result" as const,
+                tool_use_id: b.id,
+                content: refusal,
+                is_error: true,
+              })),
+            });
+            continue;
           }
 
           /**
@@ -363,8 +749,51 @@ export class AgentLoop {
               }),
           );
 
-          // 所有 tool_result 合并进【同一条】user 消息（API 硬约束 1）
-          messages.push({ role: "user", content: results });
+          // 目标级进展判定：相同调用与相同观察才算重复；tool_use_id 不参与签名。
+          const signature = observationSignature(blocks, results);
+          if (signature === lastObservation) {
+            repeatedObservationTurns += 1;
+            hasProgress = false;
+          } else {
+            lastObservation = signature;
+            repeatedObservationTurns = 1;
+            hasProgress = true;
+          }
+
+          const resultContent: Anthropic.ContentBlockParam[] = [...results];
+          const stagnationWindow = Math.max(
+            0,
+            Math.floor(this.cfg.recovery?.stagnationWindow ?? 0),
+          );
+          if (
+            this.cfg.requireTerminalTool &&
+            this.cfg.terminalTool &&
+            stagnationWindow > 0 &&
+            repeatedObservationTurns >= stagnationWindow
+          ) {
+            const decision = decideRecovery({
+              trigger: "stagnation",
+              policy: this.cfg.recovery,
+              stagnationRecoveries,
+            });
+            q.push({
+              type: "recovery_decision",
+              reason: "stagnation",
+              action: decision.action,
+              detail: decision.detail,
+            });
+            resultContent.push({ type: "text", text: `【停滞检测】${decision.detail}` });
+            if (decision.action === "change_strategy") {
+              stagnationRecoveries += 1;
+            } else {
+              forceTerminal = true;
+              forcedFailureReason = "stalled";
+              turnCeiling = turn + 1;
+            }
+          }
+
+          // 所有 tool_result + 恢复指令合并进【同一条】user 消息（API 硬约束 1）
+          messages.push({ role: "user", content: resultContent });
           continue;
         }
 
@@ -375,7 +804,5 @@ export class AgentLoop {
           );
       }
     }
-
-    finish("max_turns");
   }
 }

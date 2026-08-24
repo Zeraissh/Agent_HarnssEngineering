@@ -35,6 +35,8 @@ import {
   isEntryCollapsedByDefault,
   deriveRunListItems,
   filterRunsByStatus,
+  mergeForkedFollowUp,
+  buildNewRunRequest,
 } from "../ui/public/app.js";
 import { plannedStopReason } from "../src/orchestrate.js";
 import { STOP_REASONS } from "../src/types.js";
@@ -67,6 +69,33 @@ function makeState(overrides = {}) {
 // ---- tests ----
 
 describe("reduceEvent", () => {
+  it("归档分叉事件保留 lineage 与继承预算，并在日志中默认展开", () => {
+    let state = createInitialState("child", "继续任务", false);
+    state = reduceEvent(state, {
+      seq: 0,
+      source: "host",
+      event: {
+        type: "run_forked",
+        parentRunId: "parent",
+        rootRunId: "root",
+        boundary: "使用当前宿主",
+        checkpoint: { runBudget: { maxTurns: 8, usedTurns: 3, usedTokens: 120 } },
+        reset: ["审批放行规则"],
+      },
+    });
+
+    expect(state.lineage).toEqual({
+      parentRunId: "parent",
+      rootRunId: "root",
+      boundary: "使用当前宿主",
+      inheritedBudget: { maxTurns: 8, usedTurns: 3, usedTokens: 120 },
+      reset: ["审批放行规则"],
+    });
+    const [entry] = deriveLogEntries(state);
+    expect(entry.type).toBe("run_forked");
+    expect(entry.collapsed).toBe(false);
+  });
+
   // ---- AC3-1: 时间线折叠 ----
   it("1. 时间线折叠: turn_start → tool_call → tool_result 顺序", () => {
     let state = createInitialState("r1", "test task", false);
@@ -363,10 +392,9 @@ describe("reduceEvent", () => {
     const appPath = join(__dirname, "..", "ui", "public", "app.js");
     const appSrc = readFileSync(appPath, "utf-8");
 
-    expect(appSrc).toContain("尚无运行。");
-    // 文案随控件位置更新：提交栏已移到底部，"创建新任务"那句指的按钮不在原处了。
-    // 闸门盯的是**空态必须说清下一步怎么做**，不是盯某个具体字符串。
-    expect(appSrc).toContain("选择左侧运行查看详情，或在下面写一个新任务。");
+    expect(appSrc).toContain("从一个明确目标开始");
+    // R6 的空态是新建对话工作台：必须把工作目录这条安全边界说出来。
+    expect(appSrc).toContain("工作目录决定工具可触碰的边界");
     expect(appSrc).not.toContain("尚无运行。提交一个任务开始。");
   });
 
@@ -423,6 +451,47 @@ describe("reduceEvent", () => {
 
     // 关键断言：expired 审批不可操作（状态不是 pending）
     expect(state.pendingApprovals[0].status).not.toBe("pending");
+  });
+});
+
+describe("归档 follow-up 列表切换", () => {
+  it("插入子 run 且父归档保持逐字段不变", () => {
+    const parent = {
+      runId: "parent",
+      task: "原任务",
+      status: "done",
+      archived: true,
+      canContinue: true,
+      continuationMode: "fork",
+    };
+    const transition = mergeForkedFollowUp(
+      [parent],
+      "parent",
+      {
+        runId: "child",
+        run: { runId: "child", task: "原任务", status: "running", verify: false, continuedFrom: "parent" },
+      },
+      "继续",
+      123,
+    );
+
+    expect(transition.targetRunId).toBe("child");
+    expect(transition.runs.find((run) => run.runId === "parent")).toEqual(parent);
+    expect(transition.runs.find((run) => run.runId === "child")?.continuedFrom).toBe("parent");
+  });
+
+  it("SSE 已先把子 run 推到 done 时，不被较旧 HTTP running 快照倒退", () => {
+    const transition = mergeForkedFollowUp(
+      [
+        { runId: "parent", task: "t", status: "done", archived: true },
+        { runId: "child", task: "t", status: "done", finishedAt: 999 },
+      ],
+      "parent",
+      { runId: "child", run: { runId: "child", task: "t", status: "running", finishedAt: null } },
+      "继续",
+    );
+    expect(transition.summary.status).toBe("done");
+    expect(transition.summary.finishedAt).toBe(999);
   });
 });
 
@@ -575,6 +644,10 @@ describe("v2 R1 · stopReason 六值分档 (V-04)", () => {
     expect(classifyStopReason("budget_exhausted").tone).toBe("bad");
     expect(classifyStopReason("refusal").tone).toBe("bad");
     expect(classifyStopReason("error").tone).toBe("bad");
+    expect(classifyStopReason("partial").tone).toBe("warn");
+    expect(classifyStopReason("blocked").tone).not.toBe("ok");
+    expect(classifyStopReason("incomplete").tone).toBe("bad");
+    expect(classifyStopReason("stalled").tone).toBe("bad");
     // 运行中（尚无 stopReason）
     expect(classifyStopReason(null).label).toBe("运行中");
   });
@@ -821,17 +894,17 @@ describe("AC7 第 12 节文案", () => {
     const app = readFileSync(appPath, "utf-8");
     const combined = html + "\n" + app;
 
-    expect(combined).toContain("开启独立核查");
+    expect(combined).toContain("独立核查");
     expect(combined).toContain("运行任务");
     expect(combined).toContain("Agent 执行");
     expect(combined).toContain("核查 Agent");
     expect(combined).toContain("允许本次");
     expect(combined).toContain("拒绝并说明");
-    expect(combined).toContain("选择左侧运行查看详情，或在下面写一个新任务。");
+    expect(combined).toContain("工作目录决定工具可触碰的边界");
 
-    const checkboxLabel = html.match(/<span>(核查|开启独立核查)<\/span>/);
+    const checkboxLabel = html.match(/<span>(核查|独立核查)<\/span>/);
     expect(checkboxLabel).not.toBeNull();
-    expect(checkboxLabel[1]).toBe("开启独立核查");
+    expect(checkboxLabel[1]).toBe("独立核查");
 
     expect(html).not.toContain('>提交</button>');
     expect(app).not.toContain("主时间线");
@@ -845,6 +918,40 @@ describe("AC7 第 12 节文案", () => {
 
 // ---- AC3: 概览模型 deriveOverview (R-03) ----
 describe("AC3 概览模型 deriveOverview (R-03)", () => {
+  it("finish_task 的结构化摘要、证据与 blockers 不会被 done reducer 丢失", () => {
+    let state = createInitialState("structured", "task", false);
+    state = reduceEvent(state, sse("main", "done", {
+      stopReason: "partial",
+      usage: { inputTokens: 10, outputTokens: 5, turns: 2, cacheHitRatio: 0 },
+      completion: {
+        status: "partial",
+        summary: "已完成 UI 骨架",
+        artifacts: ["ui/app.js"],
+        verification: ["npm test 通过"],
+        assumptions: ["沿用暗色风格"],
+        blockers: ["缺少签名证书"],
+      },
+      runBudget: { maxTurns: 10, usedTurns: 2, usedTokens: 15 },
+    }));
+
+    const overview = deriveOverview(state);
+    expect(state.completion.status).toBe("partial");
+    expect(state.runBudget.usedTurns).toBe(2);
+    expect(overview.resultSummary).toBe("已完成 UI 骨架");
+    expect(overview.completion.verification).toEqual(["npm test 通过"]);
+    expect(overview.actionItems.blockers).toEqual(["缺少签名证书"]);
+  });
+
+  it("编排聚合不把子任务的 partial/blocked 压回笼统 error", () => {
+    for (const reason of ["partial", "blocked"]) {
+      const outcome = {
+        completed: false,
+        steps: [{ result: { main: { stopReason: reason } } }],
+      };
+      expect(plannedStopReason(outcome)).toBe(reason);
+    }
+  });
+
   it("15. 从事件流派生出 finalStatus / resultSummary / verdict / 待介入事项 / usage", () => {
     let state = createInitialState("ro1", "overview task", true);
 
@@ -1028,6 +1135,19 @@ describe("AC3 概览模型 deriveOverview (R-03)", () => {
 
 // ---- AC4: 日志分层 deriveLogEntries / toggleEntryCollapsed (R-04) ----
 describe("AC4 日志分层 (R-04)", () => {
+  it("恢复路由保留 action/detail 并默认展开", () => {
+    let state = createInitialState("recover", "task", false);
+    state = reduceEvent(state, sse("main", "recovery_decision", {
+      reason: "stagnation",
+      action: "change_strategy",
+      detail: "停止重复调用并换路径",
+    }));
+    const [entry] = deriveLogEntries(state);
+    expect(entry.action).toBe("change_strategy");
+    expect(entry.detail).toContain("换路径");
+    expect(entry.collapsed).toBe(false);
+  });
+
   it("20. 成功 tool_call / tool_result → collapsed=true", () => {
     const state = makeState({
       timeline: [
@@ -1129,7 +1249,7 @@ describe("AC5 WCAG 对比度 (R-06)", () => {
    * 括号配平扫描：抓出所有主题定义块。
    *
    * 旧实现用 /:root\s*\{([^}]*)\}/s，只抓第一个 :root 且 [^}] 不跨嵌套——
-   * @media 内的 :root 一个都抓不到。双主题落地后这个解析器必须先升级，
+   * @media 内的 :root 一个都抓不到。多主题落地后这个解析器必须先升级，
    * 否则整套对比度门禁会在"只看了浅色"的情况下全绿。
    */
   function extractBlocks(css) {
@@ -1162,18 +1282,22 @@ describe("AC5 WCAG 对比度 (R-06)", () => {
   }
 
   /**
-   * 解析出两套主题的最终变量表。
-   * 浅色 = 顶层 :root；深色 = 顶层 :root ⊕ [data-theme="dark"] 覆盖。
-   * 深色只重定义 Layer 1 原始色板，语义层靠 var() 自动跟随——这正是分层的意义。
+   * 解析出全部显式主题的最终变量表。
+   * 暖纸 = 顶层 :root；其余 = 顶层 :root ⊕ 对应 [data-theme] 覆盖。
+   * 各主题只重定义 Layer 1 原始色板，语义层靠 var() 自动跟随——这正是分层的意义。
    */
   function parseThemes(css) {
     const blocks = extractBlocks(css);
     const base = blocks.find((b) => b.selector === ":root");
     if (!base) throw new Error("styles.css 缺少顶层 :root 块");
     const light = parseDecls(base.body);
-    const darkBlock = blocks.find((b) => b.selector.includes('[data-theme="dark"]'));
-    if (!darkBlock) throw new Error('styles.css 缺少 [data-theme="dark"] 块');
-    return { light, dark: { ...light, ...parseDecls(darkBlock.body) }, blocks };
+    const themes = { light };
+    for (const theme of ["dark", "graphite", "contrast"]) {
+      const block = blocks.find((b) => b.selector.includes(`[data-theme="${theme}"]`));
+      if (!block) throw new Error(`styles.css 缺少 [data-theme="${theme}"] 块`);
+      themes[theme] = { ...light, ...parseDecls(block.body) };
+    }
+    return { ...themes, blocks };
   }
 
   /** 顺着 var() 链一路解析到字面色值（分层后引用深度可达三层） */
@@ -1187,7 +1311,7 @@ describe("AC5 WCAG 对比度 (R-06)", () => {
     return v;
   }
 
-  const THEMES = ["light", "dark"];
+  const THEMES = ["light", "dark", "graphite", "contrast"];
 
   /** 每套主题都要过的色对清单：[标签, 前景令牌, 背景令牌, 最低比值] */
   const PAIRS = [
@@ -1222,7 +1346,7 @@ describe("AC5 WCAG 对比度 (R-06)", () => {
     ["正文 / 通过底", "text-1", "status-ok-surface", 4.5],
   ];
 
-  // 24-28 合并升级为「两套主题 × 全部色对」——断言面积从 5 条扩到 46 条。
+  // 24-28 合并升级为「全部主题 × 全部色对」——新增主题不能绕过既有 WCAG 门禁。
   // 门禁只准加强不准削弱：旧版覆盖的五组色对全部包含在 PAIRS 里。
   describe.each(THEMES)("%s 主题", (theme) => {
     const css = readFileSync(join(__dirname, "..", "ui", "public", "styles.css"), "utf-8");
@@ -1238,25 +1362,27 @@ describe("AC5 WCAG 对比度 (R-06)", () => {
     });
   });
 
-  it("两套主题定义的原始色板令牌名集合完全一致", () => {
+  it("全部显式主题定义的原始色板令牌名集合完全一致", () => {
     const css = readFileSync(join(__dirname, "..", "ui", "public", "styles.css"), "utf-8");
     const { blocks } = parseThemes(css);
     const base = blocks.find((b) => b.selector === ":root");
-    const dark = blocks.find((b) => b.selector.includes('[data-theme="dark"]'));
     const raw = (o) => Object.keys(o).filter((k) => k.startsWith("p-")).sort();
-    // 浅色漏定义某个 --p-*，深色就会静默沿用浅色值——这是双主题最难肉眼发现的 bug
-    expect(raw(parseDecls(dark.body))).toEqual(raw(parseDecls(base.body)));
+    const expected = raw(parseDecls(base.body));
+    for (const theme of THEMES.filter((theme) => theme !== "light")) {
+      const block = blocks.find((b) => b.selector.includes(`[data-theme="${theme}"]`));
+      expect(raw(parseDecls(block.body)), `${theme} 原始色板与暖纸主题不对称`).toEqual(expected);
+    }
   });
 
   it("媒体查询暗色块与手动暗色块逐字段一致（防漂移）", () => {
     const css = readFileSync(join(__dirname, "..", "ui", "public", "styles.css"), "utf-8");
     const { blocks } = parseThemes(css);
     // 零构建下这段值无法复用，只能写两遍；写两遍就必须有东西盯着它们不分家
-    const darkBlocks = blocks.filter(
-      (b) => b.selector.includes('[data-theme="dark"]') || b.selector.includes(':not([data-theme="light"])'),
-    );
-    expect(darkBlocks.length).toBe(2);
-    expect(parseDecls(darkBlocks[0].body)).toEqual(parseDecls(darkBlocks[1].body));
+    const explicitDark = blocks.find((b) => b.selector.includes('[data-theme="dark"]'));
+    const automaticDark = blocks.find((b) => b.selector.includes(":not([data-theme])"));
+    expect(explicitDark).toBeTruthy();
+    expect(automaticDark).toBeTruthy();
+    expect(parseDecls(explicitDark.body)).toEqual(parseDecls(automaticDark.body));
   });
 
   it("组件层不得直接引用 Layer 1 原始色板", () => {
@@ -1274,6 +1400,50 @@ describe("AC5 WCAG 对比度 (R-06)", () => {
 
 // ---- AC6: 无障碍语义静态断言 (R-05) ----
 describe("AC6 无障碍语义 (R-05)", () => {
+  it("主题选择器提供系统、暖纸、暖炭、石墨与高对比五种互斥选择", () => {
+    const html = readFileSync(join(__dirname, "..", "ui", "public", "index.html"), "utf-8");
+    const choices = [...html.matchAll(/data-theme-choice="([^"]+)"/g)].map((m) => m[1]);
+    expect(choices).toEqual(["auto", "light", "dark", "graphite", "contrast"]);
+    expect(html).toMatch(/id="theme-toggle"[^>]*aria-haspopup="menu"[^>]*aria-expanded="false"/);
+    expect(html).toMatch(/id="theme-menu"[^>]*role="menu"/);
+    expect(html.match(/role="menuitemradio"/g)).toHaveLength(5);
+    // 首帧恢复脚本必须认识新增主题；否则刷新会短暂/永久退回系统主题。
+    expect(html).toContain('["light", "dark", "graphite", "contrast"]');
+  });
+
+  it("交互式 Web 默认启用 ask_user，但提示明确 API 仍需显式开启", () => {
+    const html = readFileSync(join(__dirname, "..", "ui", "public", "index.html"), "utf-8");
+    expect(html).toMatch(/id="ask-user-toggle"[^>]*checked/);
+    expect(html).toContain("API 未显式传 askUser 时仍默认关");
+  });
+
+  it("单任务与计划模式都把 ask_user 开关接进真实提交载荷", () => {
+    expect(buildNewRunRequest({
+      task: "今天天气怎么样",
+      verify: false,
+      mode: "single",
+      askUser: true,
+    })).toMatchObject({
+      task: "今天天气怎么样",
+      verify: false,
+      askUser: true,
+    });
+
+    expect(buildNewRunRequest({
+      task: "开发 Desktop UI",
+      verify: true,
+      mode: "plan",
+      concurrency: "auto",
+      planGate: true,
+      askUser: true,
+    })).toMatchObject({
+      mode: "plan",
+      concurrency: "auto",
+      planGate: true,
+      askUser: true,
+    });
+  });
+
   // 29 已升级为真实 DOM 断言，见 test/ui-a11y.test.ts 的
   // 「运行列表项的 role / tabindex / aria-selected 在真实 DOM 上成立」。
   //
@@ -1317,7 +1487,7 @@ describe("AC6 无障碍语义 (R-05)", () => {
     expect(appSrc).toMatch(/removeAttribute\("aria-label"\)/);
     // 有 option 子项时才挂上 listbox 身份
     expect(appSrc).toMatch(/setAttribute\("role", "listbox"\)/);
-    expect(appSrc).toMatch(/setAttribute\("aria-label", "运行列表"\)/);
+    expect(appSrc).toMatch(/setAttribute\("aria-label", "项目与对话"\)/);
     // 静态 HTML 不得预挂 role，否则加载态即违规
     const html = readFileSync(join(__dirname, "..", "ui", "public", "index.html"), "utf-8");
     expect(html).not.toMatch(/id="run-list"[^>]*role="listbox"/);
@@ -1434,7 +1604,7 @@ describe("AC8 CSS 令牌统一 (P2)", () => {
     const cssPath = join(__dirname, "..", "ui", "public", "styles.css");
     const css = readFileSync(cssPath, "utf-8");
 
-    // 双主题落地后不能只剔除第一个 :root：暗色块也是合法的色值出处。
+    // 多主题落地后不能只剔除第一个 :root：显式主题块也是合法的色值出处。
     // 用括号配平剔除**全部**含 :root 的块（顶层、@media 内、[data-theme] 覆盖），
     // 再扫剩余部分——这样断言仍是"组件层零裸色值"，覆盖面反而扩大了。
     const blank = css.replace(/\/\*[\s\S]*?\*\//g, (c) => " ".repeat(c.length));
@@ -1841,5 +2011,105 @@ describe("AC2-11 长日志的单帧预算靠 content-visibility 守住", () => {
 
   it("不许用 content-visibility:hidden——那会把内容从可访问性树里摘掉", () => {
     expect(css).not.toMatch(/content-visibility:\s*hidden/);
+  });
+});
+
+/**
+ * §2.1 · 裁决获得路径三处口径一致锁（B1 那条锁的同族）。
+ *
+ * 缺口的形状是这个项目的常客：harness 加了一个 recovery 取值（`tool`），
+ * 宿主渲染层的 label 表与"健康路径"集合没跟上。**它不会报错**——只会把一次
+ * 完全正常的结构化交付画成"核查者收口不稳"，即 V-04（界面对委托方说谎）。
+ * 所以按 B1 的办法抠源码逐值比对，而不是靠人记得改两处。
+ */
+describe("§2.1 · 裁决获得路径口径一致锁", () => {
+  const appSrc = readFileSync(join(__dirname, "..", "ui", "public", "app.js"), "utf-8");
+  /** 事实源：src/verifier.ts 的 VerdictRecovery */
+  const RECOVERIES = ["tool", "direct", "wrapup", "reformat", "failed"];
+
+  it("label 表覆盖每一个 recovery 取值——漏一个就会渲染成裸值", () => {
+    // 文件里有不止一个 `const label = {`，锚到本块特有的首个取值上
+    const start = appSrc.indexOf('tool: "首轮直接交付');
+    expect(start, "找不到裁决获得路径的 label 表").toBeGreaterThan(0);
+    const block = appSrc.slice(start, appSrc.indexOf("}", start));
+    for (const r of RECOVERIES) {
+      expect(block, `label 表缺 ${r}`).toContain(`${r}:`);
+    }
+  });
+
+  it("健康路径恰好是 tool 与 direct——多一个少一个都会让界面说谎", () => {
+    const m = appSrc.match(/HEALTHY_RECOVERY\s*=\s*new Set\(\[([^\]]*)\]\)/);
+    expect(m, "找不到 HEALTHY_RECOVERY 集合").toBeTruthy();
+    const values = m[1].match(/"([a-z]+)"/g).map((s) => s.replace(/"/g, "")).sort();
+    expect(values).toEqual(["direct", "tool"]);
+  });
+
+  it("兜底路径不得被算作健康——它们正是这块面板要报的事", () => {
+    const m = appSrc.match(/HEALTHY_RECOVERY\s*=\s*new Set\(\[([^\]]*)\]\)/);
+    for (const bad of ["wrapup", "reformat", "failed"]) {
+      expect(m[1], `${bad} 不该在健康集合里`).not.toContain(`"${bad}"`);
+    }
+  });
+
+  it("提示语不再写死「非首轮直接给出」——tool 也是首轮，那句话已经不成立了", () => {
+    expect(appSrc).not.toContain("非「首轮直接给出」说明核查者收口不稳");
+    expect(appSrc).toContain("有轮次靠兜底才拿到裁决");
+  });
+});
+
+
+/**
+ * 直播条冻结（2026-08-15 实测）的**壳侧**回归锁。
+ *
+ * 纯函数那半边（revealedWindow）在 ui-patch 里锁着了，但真正把屏幕冻住的
+ * 是 index.html 里 `arrived` 的取法——原来取自**缓冲长度**，而缓冲有上限，
+ * 于是撞上限那刻 arrived 停止增长 → revealed 不变 → changed 恒 false → 不再重绘。
+ *
+ * 这一段没有 DOM 可断言（它是控制器接线），所以照 B1 那条口径抠源码。
+ * 不加这条，改回 `.length` 的那天全套测试照样全绿。
+ */
+describe("直播条：arrived 必须取自累计计数，不是缓冲长度", () => {
+  const htmlSrc = readFileSync(join(__dirname, "..", "ui", "public", "index.html"), "utf-8");
+
+  it("节拍器对累计计数计数——缓冲会被上限钉死，累计不会", () => {
+    const m = htmlSrc.match(/const arrived = ([^;]+);/);
+    expect(m, "找不到 arrived 的计算").toBeTruthy();
+    expect(m![1], "取缓冲长度就会在上限处冻住").not.toContain(".length");
+    expect(m![1]).toContain("totals.think");
+    expect(m![1]).toContain("totals.text");
+  });
+
+  it("累计随 delta 增长且不受上限影响（cap 只作用在缓冲上）", () => {
+    expect(htmlSrc).toContain("totals.think += thinkPart.length");
+    expect(htmlSrc).toContain("totals.text += textPart.length");
+    // cap 只包缓冲，不包累计
+    expect(htmlSrc).toMatch(/liveThinking\.set\(runId, cap\(/);
+    expect(htmlSrc).not.toMatch(/totals\.(think|text) = cap\(/);
+  });
+
+  it("正文接管时思考累计归零——否则正文额度被一段不再显示的思考永久占住", () => {
+    expect(htmlSrc).toContain("totals.think = 0");
+  });
+
+  it("窗口换算走 app.js 的纯函数，不在壳里重写一遍（缺陷分布线）", () => {
+    expect(htmlSrc).toContain("revealedWindow({");
+    // 而且真的 import 了——没 import 的话整个 app.js 模块加载即失败，界面全白
+    expect(htmlSrc).toMatch(/import\s*\{[^}]*revealedWindow[^}]*\}\s*from\s*"\/app\.js"/s);
+  });
+
+  /**
+   * 变异实测：只断言"有 revealTickers 这个名字"抓不住退化——
+   * 把守卫改成 `revealTickers.size > 0` 就又变回全局单例了，名字还在。
+   * 要盯的是**守卫按 runId 判定**这件事本身。
+   */
+  it("节拍器逐 run 一个——全局单例会让第二个在流的 run 一个字都不动", () => {
+    expect(htmlSrc).toContain("revealTickers");
+    expect(htmlSrc).not.toMatch(/let revealTicker = null/);
+    // 守卫必须问"这个 run 有没有表"，而不是"有没有任何表在跑"
+    expect(htmlSrc).toContain("if (revealTickers.has(runId)) return;");
+    expect(htmlSrc).not.toMatch(/revealTickers\.size/);
+    // 停表与续表也都要按 runId
+    expect(htmlSrc).toContain("revealTickers.delete(runId)");
+    expect(htmlSrc).toContain("revealTickers.set(runId,");
   });
 });

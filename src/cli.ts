@@ -1,8 +1,13 @@
 /**
  * CLI 宿主：事件流的一个消费者示例。
- * 用法：npx tsx src/cli.ts "任务描述" [--yes] [--verify] [--plan [--parallel[=N]]] [--auto]
+ * 用法：npx tsx src/cli.ts "任务描述" [--yes] [--verify] [--plan [--parallel[=N]]] [--auto] [--ask]
  *   --yes       自动批准所有审批请求（非交互环境/CI 用；交互终端下走 y/n 提示）
  *   --verify    完成后由 verifier 子代理独立核查，未通过自动返工一轮
+ *   --ask       给执行者装 ask_user（§5.2 需求澄清）。**默认关**——宿主也被脚本化
+ *               驱动，默认开会让无人值守场景挂死等人。配额见 AGENT_MAX_ASK_ROUNDS。
+ *               与 --yes 互斥（无人值守没人可问，给了会提示并忽略）。
+ *               verifier/planner 永远拿不到这个工具（harness 层强制）。
+ *               每次提交 1~4 个问题，每题带 2~4 个候选，回车跳过单题
  *   --plan      三角编排：planner 拆解子任务（自选领域包+依赖图）→ 执行→核查→交接；
  *               互不依赖的子任务默认并发执行（并行度 auto = min(3, 计划层宽)）
  *   --parallel=N  显式并行度覆盖 auto；=1 退回全串行
@@ -36,6 +41,9 @@
  *   AGENT_PLAN_MAX_TURNS 可选，planner 探索轮次预算（env > 包 plan.maxTurns 取最大
  *                       > 默认 12,见 B0——planner 面对整个包菜单,故取声明值最大）。
  *                       非法值退出码 1,口径同 AGENT_VERIFY_MAX_TURNS
+ *   AGENT_MAX_ASK_ROUNDS 可选，--ask 时整个 run 的【打断次数】上限（默认 3）。
+ *                       单位是打断不是问题数：一次可提交 1~4 个问题（§5.2 决定 6）——
+ *                       贵的是打断人，不是问题本身。配额由 harness 硬执行
  *   AGENT_READ_ROOTS    可选，额外只读根（分号/路径分隔符分隔的绝对路径）：
  *                       read_file 可读取这些目录（写类工具不受益）。用于工作区外的
  *                       领域素材库（如 KiCad 官方符号/封装库）
@@ -55,6 +63,11 @@ import type { VerifyOutcome } from "./verifier.js";
 import { getPack, PACKS, RULE_PRECEDENCE_DISCIPLINE, selectPackTools } from "./presets.js";
 import { routeToPack } from "./router.js";
 import { createModelClientFromEnv } from "./provider.js";
+import { ASK_USER_TOOL_NAME, createAskUserTool } from "./tools/ask-user.js";
+import {
+  FINISH_TASK_TOOL_NAME,
+  withTaskCompletion,
+} from "./task-completion.js";
 import { bashTool, SHELL_DESC } from "./tools/bash.js";
 import { createDescribeImageTool } from "./tools/describe-image.js";
 import { fetchUrlTool } from "./tools/fetch-url.js";
@@ -204,6 +217,31 @@ async function main(): Promise<void> {
     ? Number(process.env.AGENT_MAX_TOKENS)
     : pack?.guardrails?.maxTokens;
   const maxTurns = pack?.guardrails?.maxTurns;
+  const positiveEnv = (name: string): number | undefined => {
+    const raw = process.env[name];
+    if (raw === undefined || raw === "") return undefined;
+    const value = Number(raw);
+    if (!Number.isInteger(value) || value < 1) {
+      console.error(c.red(`${name} "${raw}" 无效：需为 ≥1 的整数`));
+      process.exit(1);
+    }
+    return value;
+  };
+  const nonNegativeEnv = (name: string): number | undefined => {
+    const raw = process.env[name];
+    if (raw === undefined || raw === "") return undefined;
+    const value = Number(raw);
+    if (!Number.isInteger(value) || value < 0) {
+      console.error(c.red(`${name} "${raw}" 无效：需为 ≥0 的整数`));
+      process.exit(1);
+    }
+    return value;
+  };
+  const maxTotalTurns = positiveEnv("AGENT_TOTAL_MAX_TURNS");
+  const maxTokensBudget = positiveEnv("AGENT_TOTAL_TOKEN_BUDGET");
+  const progressExtensionTurns = nonNegativeEnv("AGENT_PROGRESS_EXTENSION_TURNS");
+  const stagnationWindow = nonNegativeEnv("AGENT_STAGNATION_WINDOW");
+  const maxAskRounds = positiveEnv("AGENT_MAX_ASK_ROUNDS");
 
   // 跨会话记忆（L5）：默认 <cwd>/.agent-memory，可用 AGENT_MEMORY_DIR 覆盖
   const memory = new MemoryStore(
@@ -256,10 +294,22 @@ async function main(): Promise<void> {
     ),
   );
   const builtinNames = pack?.builtinTools ?? [...builtinByName.keys()];
-  const builtins = builtinNames.map((n) => {
+  /**
+   * 条件性内置工具：包可以声明，但只在宿主配好依赖时在场（缺席=干净省略+提示，
+   * 不炸）。严格校验保留给真正的拼写错误——两类错误的处置必须不同：
+   * 前者是合法配置组合，后者是包写错了。案例 #11 首发实测：kicad 包声明
+   * describe_image 而未配 AGENT_VISION_MODEL，启动即炸——省略才是正确语义
+   * （plan 模式的 selectPackTools 本就静默过滤，两条装配路径的语义要一致）。
+   */
+  const CONDITIONAL_BUILTINS = new Set(["describe_image"]);
+  const builtins = builtinNames.flatMap((n) => {
     const t = builtinByName.get(n);
-    if (!t) throw new Error(`Pack "${pack?.name}" 声明了未知内置工具: ${n}`);
-    return t;
+    if (t) return [t];
+    if (CONDITIONAL_BUILTINS.has(n)) {
+      console.log(c.dim(`（包声明的 ${n} 未配置对应模型，本次不带）`));
+      return [];
+    }
+    throw new Error(`Pack "${pack?.name}" 声明了未知内置工具: ${n}`);
   });
 
   // 思考预算档：外部输入,非法值当场报错而不是静默退回默认——
@@ -313,9 +363,64 @@ async function main(): Promise<void> {
     .filter(Boolean);
 
   const memTools = createMemoryTools(memory);
-  const config: AgentConfig = {
+
+  /**
+   * §5.2 需求澄清。**决定 1：默认关，逐 run 显式开**（`--ask`）。
+   * 与计划确认门同一条理由：CLI 也被脚本化驱动（eval、契约测试、cron），
+   * 默认开会让那些场景挂死等一个不会来的人。
+   *
+   * `--yes`（无人值守）下即使显式开也不装：那条路径根本没有 readline，
+   * 装了等于每个问题都立刻走"未应答"，白烧一轮往返。
+   */
+  const askEnabled = args.includes("--ask") && !autoYes;
+  if (args.includes("--ask") && autoYes) {
+    console.log(c.yellow("提示：--ask 与 --yes 同时给出，本次不装 ask_user（无人值守没人可问）"));
+  }
+  const rl = autoYes ? null : readline.createInterface({ input: process.stdin, output: process.stdout });
+  // 计划并发下多个执行者可能同时触发同一个 ask_user。readline 不能并排挂多个
+  // question；这里把“向人提问”串行化，执行工具本身仍可并发。
+  let terminalQuestionTail: Promise<unknown> = Promise.resolve();
+  const askUserTools = askEnabled
+    ? [
+        createAskUserTool({
+          ...(maxAskRounds !== undefined ? { maxRounds: maxAskRounds } : {}),
+          // 一次一组（决定 6）：终端里逐题问，但这**是一次打断**，不是三次
+          ask({ questions }) {
+            const job = terminalQuestionTail.then(async () => {
+              endStreamLine();
+              console.log(
+                c.cyan(`\n◆ agent 有 ${questions.length} 个问题需要你定（回车跳过单题）`),
+              );
+              const answers: (string | null)[] = [];
+              for (const [i, q] of questions.entries()) {
+                console.log(c.cyan(`\n[${i + 1}/${questions.length}] ${q.question}`));
+                q.options.forEach((o, n) => console.log(c.dim(`   ${n + 1}) ${o}`)));
+                console.log(c.dim(`   （回车跳过，按此默认执行：${q.fallback}）`));
+                const raw = (await rl!.question("> ")).trim();
+                if (raw === "") {
+                  answers.push(null);
+                  continue;
+                }
+                // 数字 = 选项序号：让"点一下就能答"在终端里也成立
+                const pick = Number(raw);
+                answers.push(
+                  Number.isInteger(pick) && pick >= 1 && pick <= q.options.length
+                    ? q.options[pick - 1]!
+                    : raw,
+                );
+              }
+              return answers;
+            });
+            terminalQuestionTail = job.catch(() => undefined);
+            return job;
+          },
+        }),
+      ]
+    : [];
+
+  const baseConfig: AgentConfig = {
     systemPrompt: pack?.systemPrompt ?? SYSTEM_PROMPT,
-    tools: [...builtins, ...memTools, ...(mcp?.tools ?? [])],
+    tools: [...builtins, ...memTools, ...askUserTools, ...(mcp?.tools ?? [])],
     workdir: process.cwd(),
     ...(readRoots.length ? { readRoots } : {}),
     compat,
@@ -323,6 +428,8 @@ async function main(): Promise<void> {
     contextTokenLimit,
     maxTokens,
     ...(maxTurns !== undefined ? { maxTurns } : {}),
+    ...(maxTotalTurns !== undefined ? { maxTotalTurns } : {}),
+    ...(maxTokensBudget !== undefined ? { maxTokensBudget } : {}),
     // 易变信息走 messages 注入（P3），system prompt 保持字节冻结
     dynamicContext: {
       date: new Date().toISOString().slice(0, 10),
@@ -333,9 +440,16 @@ async function main(): Promise<void> {
       memory_index: await memory.indexBlock(),
     },
   };
+  // 主执行者默认走结构化完成门；设 AGENT_REQUIRE_FINISH_TASK=0 可为兼容端点退回旧语义。
+  const config: AgentConfig =
+    process.env.AGENT_REQUIRE_FINISH_TASK === "0"
+      ? baseConfig
+      : withTaskCompletion(baseConfig, {
+          ...(progressExtensionTurns !== undefined ? { progressExtensionTurns } : {}),
+          ...(stagnationWindow !== undefined ? { stagnationWindow } : {}),
+        });
   const modelClient = resolvedClient;
 
-  const rl = autoYes ? null : readline.createInterface({ input: process.stdin, output: process.stdout });
   let streamingText = false;
   const endStreamLine = () => {
     if (streamingText) {
@@ -478,6 +592,9 @@ async function main(): Promise<void> {
             c.yellow(`${tag} ⟲ 整段因瞬时故障终止，带 ${event.priorTurns} 轮正史续跑：${event.reason}`),
           );
           break;
+        case "recovery_decision":
+          console.log(c.yellow(`${tag} ⤷ ${event.detail}`));
+          break;
         case "done": {
           const u = event.result.usage;
           console.log(
@@ -523,11 +640,19 @@ async function main(): Promise<void> {
       resolveSubtask: (sub) => {
         const p = sub.pack ? getPack(sub.pack) : undefined;
         if (sub.pack && !p) console.log(c.yellow(`⚠ 未知领域包 "${sub.pack}"，子任务 ${sub.id} 用默认配置执行`));
+        // 包选择只收窄领域工具；ask_user / finish_task 是执行控制面，不能被覆盖掉。
+        const controlTools = config.tools.filter(
+          (tool) => tool.name === ASK_USER_TOOL_NAME || tool.name === FINISH_TASK_TOOL_NAME,
+        );
         return {
           cfg: {
             ...config,
             systemPrompt: p?.systemPrompt ?? SYSTEM_PROMPT,
-            tools: [...selectPackTools(p, builtinPool, mcpPool), ...memTools],
+            tools: [
+              ...selectPackTools(p, builtinPool, mcpPool),
+              ...memTools,
+              ...controlTools,
+            ].filter((tool, i, all) => all.findIndex((candidate) => candidate.name === tool.name) === i),
             ...(p?.guardrails?.maxTurns !== undefined ? { maxTurns: p.guardrails.maxTurns } : {}),
             ...(p?.guardrails?.maxTokens !== undefined && !process.env.AGENT_MAX_TOKENS
               ? { maxTokens: p.guardrails.maxTokens }
@@ -567,6 +692,8 @@ async function main(): Promise<void> {
           endStreamLine();
           if (stepId === "planner") {
             console.log(c.cyan("\n━━━ 计划单元（planner，只读拆解）━━━"));
+          } else if (stepId === "clarifier") {
+            console.log(c.cyan("\n━━━ 需求澄清门（planner 开始前）━━━"));
           } else {
             const sub = planRef?.subtasks.find((s) => s.id === stepId);
             console.log(
@@ -778,6 +905,10 @@ async function main(): Promise<void> {
           c.yellow(`⟲ 整段因瞬时故障终止，带 ${event.priorTurns} 轮正史续跑（不是从头重来）：${event.reason}`),
         );
         break;
+      case "recovery_decision":
+        endStreamLine();
+        console.log(c.yellow(`⤷ 恢复决策：${event.detail}`));
+        break;
       case "compaction":
         console.log(c.yellow(`⚠ context compacted: dropped ${event.droppedBlocks} blocks`));
         break;
@@ -785,8 +916,13 @@ async function main(): Promise<void> {
         endStreamLine();
         const u = event.result.usage;
         const reason = event.result.stopReason;
-        // completed = 绿；max_tokens = 黄（截断但已完成内容保留，非错误）；其余 = 红
-        const color = reason === "completed" ? c.green : reason === "max_tokens" ? c.yellow : c.red;
+        // completed=绿；partial/max_tokens/aborted=黄；blocked/incomplete/stalled 与其它失败=红
+        const color =
+          reason === "completed"
+            ? c.green
+            : reason === "partial" || reason === "max_tokens" || reason === "aborted"
+              ? c.yellow
+              : c.red;
         console.log(color(`\n■ ${reason}`) + c.dim(` (${u.turns} turns)`));
         console.log(
           c.dim(
@@ -799,6 +935,11 @@ async function main(): Promise<void> {
               `  末轮输出撞 max_tokens 被截断，已生成内容保留在结果中。若任务需要更长回复，提高 AGENT_MAX_TOKENS`,
             ),
           );
+        }
+        if (event.result.completion) {
+          const completion = event.result.completion;
+          console.log(c.dim(`  ${completion.status}: ${completion.summary}`));
+          for (const blocker of completion.blockers) console.log(c.yellow(`  blocker: ${blocker}`));
         }
         if (event.result.error) console.error(c.red(`  error: ${event.result.error.message}`));
         break;

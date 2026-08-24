@@ -23,6 +23,32 @@ import { highlight, normalizeLang } from "./highlight.js";
 const ESC = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
 const escapeHtml = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ESC[c]);
 
+/**
+ * 行内代码里哪些值值得交给宿主做“本地路径是否存在”的只读探测。
+ *
+ * 这里只做低误报的语法初筛，**不决定它真的是路径**：最终是否升级成链接由
+ * 服务端按该 run 的 workdir + stat 决定。像 `Math.max`、`npm run test` 仍是普通
+ * 代码；目录、带分隔符的路径、常见文件名与常见工程扩展名才进入候选集。
+ */
+export function isLocalPathCandidate(value) {
+  const s = String(value ?? "").trim();
+  if (!s || s.length > 1024 || /[\0\r\n]/.test(s)) return false;
+  if (/^(?:https?|data|javascript|mailto):/i.test(s)) return false;
+  if (/^[A-Za-z]:[\\/]/.test(s)) return true;
+  if (/^(?:\.{1,2}[\\/]|[\\/])/.test(s)) return true;
+  if (/[\\/]/.test(s)) return !/[<>|?*]/.test(s);
+  if (/^\.[A-Za-z0-9][\w.-]*$/.test(s)) return true;
+  if (/^(?:README|LICENSE|Makefile|Dockerfile|AGENTS)(?:\.[\w.-]+)?(?::\d+(?::\d+)?)?$/i.test(s)) {
+    return true;
+  }
+  const commonExt =
+    "html?|css|scss|sass|less|m?js|cjs|jsx|tsx?|json|mdx?|txt|csv|log|ya?ml|toml|ini|env|" +
+    "py|c|h|cc|cpp|cxx|hpp|cs|java|go|rs|sh|ps1|bat|cmd|sln|csproj|vcxproj|xml|" +
+    "pdf|png|jpe?g|gif|webp|svg|docx?|xlsx?|pptx?|zip|7z|tar|gz|elf|hex|bin|map|" +
+    "kicad_(?:pcb|sch|pro)";
+  return new RegExp(`^[^\\/:*?\"<>|]+\\.(?:${commonExt})(?::\\d+(?::\\d+)?)?$`, "i").test(s);
+}
+
 /** 只放行 http/https —— javascript:/data: 等伪协议一律降级为纯文本 */
 function safeHref(url) {
   const u = String(url).trim();
@@ -60,7 +86,7 @@ function inline(text) {
    */
   const codes = [];
   s = s.replace(/`([^`\n]+)`/g, (_, code) => {
-    codes.push(code);
+    codes.push({ code, pathCandidate: isLocalPathCandidate(code) });
     return `C${codes.length - 1}`;
   });
 
@@ -76,7 +102,11 @@ function inline(text) {
   s = s.replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
   s = s.replace(/~~([^~\n]+)~~/g, "<del>$1</del>");
 
-  return s.replace(/C(\d+)/g, (_, i) => `<code>${codes[Number(i)]}</code>`);
+  return s.replace(/C(\d+)/g, (_, i) => {
+    const item = codes[Number(i)];
+    const attr = item.pathCandidate ? ` data-local-path="${item.code}"` : "";
+    return `<code${attr}>${item.code}</code>`;
+  });
 }
 
 /**

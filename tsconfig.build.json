@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "rootDir": ".",
+    "outDir": "dist",
+    "sourceMap": true,
+    "declaration": false
+  },
+  "include": ["src", "ui"],
+  "exclude": ["test", "eval", "dist", "cross-app"]
+}

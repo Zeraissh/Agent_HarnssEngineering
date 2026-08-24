@@ -54,6 +54,25 @@ export type Effort = "low" | "medium" | "high" | "xhigh" | "max";
 /** 运行时校验用（CLI 解析 AGENT_EFFORT 等外部输入时使用） */
 export const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 
+/**
+ * 工具选择约束。两种取值解决的是**相反**的两件事：
+ *
+ * - `"none"`（B0b）：结构化禁工具，收口段只许写结论。
+ * - `{type:"tool",name}`（§2.1）：**强制**调用指定工具——把"交付裁决/计划"
+ *   从一段自由文本变成一次 schema 受检的工具调用。
+ *
+ * 为什么是强制工具而不是 `response_format: json_schema`（backlog §2.1 原案）：
+ * 台账 52 次裁决的分布是 **wrapup 69.2% / reformat 1.9%**——主要失效形态不是
+ * "写了散文不是 JSON"（那才是 response_format 治的病，只占 1.9%），而是
+ * **跑满预算从没写出任何结论**。后者的根因是"停止取证、开始下结论"这个转换
+ * 在自由文本契约下没有任何着力点；给它一个显式的工具，模型才有"我完成了"
+ * 这个动作可做，harness 也才有地方强制它做（P6）。
+ *
+ * 两个 wire 都原生支持：Anthropic `{type:"tool",name}`、
+ * OpenAI `{type:"function",function:{name}}`。
+ */
+export type ToolChoice = "none" | { type: "tool"; name: string };
+
 export interface ModelRequest {
   system: Anthropic.TextBlockParam[];
   messages: Anthropic.MessageParam[];
@@ -61,11 +80,10 @@ export interface ModelRequest {
   maxTokens: number;
   effort: Effort;
   /**
-   * 结构化禁工具（B0b）：设 "none" 时两个 wire 都下发对应的 tool_choice
-   * （Anthropic `{type:"none"}` / OpenAI `"none"`；DeepSeek 兼容端点实测接受）。
-   * 工具面保留在请求里——历史含 tool_use 块时不能撤 tools 声明。
+   * 见 ToolChoice。工具面**始终保留在请求里**——历史含 tool_use 块时不能撤
+   * tools 声明，且强制调用的那个工具本来就得在面上才能被点名。
    */
-  toolChoice?: "none";
+  toolChoice?: ToolChoice;
 }
 
 /** 归一化后的一次模型往返 */
@@ -105,6 +123,45 @@ export interface ModelClient {
 
 // ---------------------------------------------------------------- L1: 循环与事件
 
+/**
+ * 跨 segment / continuation 共享的硬预算。
+ *
+ * `AgentRunResult.usage` 仍然描述【这一段】（否则 orchestrate 现有的 sumUsage 会
+ * 重复计数）；这个对象描述【同一执行谱系】已经花掉的总量。它是有意可变的：
+ * 多个 AgentLoop 实例拿到同一个引用，才能让返工、瞬时续跑与收口段共同扣账。
+ */
+export interface SharedRunBudget {
+  maxTurns?: number;
+  maxTokens?: number;
+  usedTurns: number;
+  usedTokens: number;
+}
+
+/** 主执行者的结构化交付。三态不能压成 completed：那会让界面再次说谎。 */
+export interface TaskCompletion {
+  status: "completed" | "partial" | "blocked";
+  summary: string;
+  artifacts: string[];
+  verification: string[];
+  assumptions: string[];
+  blockers: string[];
+}
+
+/** 终结工具入参经角色自己的语义校验后，告诉 loop 应如何收尾。 */
+export interface TerminalResolution {
+  stopReason: "completed" | "partial" | "blocked";
+  completion?: TaskCompletion;
+}
+
+export interface RecoveryPolicy {
+  /** 正在产生新证据但撞执行轮次时，允许同上下文追加的短段。0 = 关闭 */
+  progressExtensionTurns?: number;
+  /** 同工具+同入参+同结果连续多少轮算停滞。0 = 关闭 */
+  stagnationWindow?: number;
+  /** 停滞后允许“换策略”几次，再出现就强制结构化收口 */
+  maxStagnationRecoveries?: number;
+}
+
 export interface AgentConfig {
   /** 默认 "claude-opus-4-8" */
   model?: string;
@@ -115,10 +172,14 @@ export interface AgentConfig {
   effort?: Effort;
   /** 默认 64000（流式） */
   maxTokens?: number;
-  /** 默认 50，硬护栏 */
+  /** 默认 50，单执行段硬护栏 */
   maxTurns?: number;
-  /** 可选：整个 run 的累计 token 上限（input+cacheCreation+cacheRead+output） */
+  /** 可选：同一执行谱系的累计轮次上限；continuation / 返工不得清零 */
+  maxTotalTurns?: number;
+  /** 可选：同一执行谱系的累计 token 上限（input+cacheCreation+cacheRead+output） */
   maxTokensBudget?: number;
+  /** 高阶装配口：多个 AgentLoop 共享同一个实例；通常由 orchestrate 自动创建 */
+  runBudget?: SharedRunBudget;
   workdir: string;
   /** 额外只读根（见 ToolContext.readRoots）。CLI 经 AGENT_READ_ROOTS 注入 */
   readRoots?: string[];
@@ -130,14 +191,36 @@ export interface AgentConfig {
   compat?: boolean;
   /** 上下文 token 上限（触发 compact 的依据，按上一轮实际输入衡量）。默认 150_000 */
   contextTokenLimit?: number;
+  /** 从持久化检查点恢复时注入的上一轮实际输入水位；全新会话不得设置 */
+  initialContextInputTokens?: number;
   /**
    * 结构化禁工具（B0b，案例 #9 第二跑实弹催生）：收口续跑的"别再调工具"
    * 不能靠模型自觉——实测收口提示被无视、2 轮收口预算全烧在继续取证上。
    * 设 "none" 时：① 请求下发 tool_choice=none；② loop 对仍然返回的 tool_use
    * **不执行**，回一条可操作的拒绝让模型改写结论（双保险：端点可能只收不认）。
-   * 用途：verifier/planner 的收口 loop。
+   * 设 `{type:"tool",name}` 时反过来——强制交付（§2.1），见 ToolChoice。
    */
-  toolChoice?: "none";
+  toolChoice?: ToolChoice;
+  /**
+   * 终结工具（§2.1）：模型调用它 = 提交业务状态。loop 发 `tool_call` 事件把入参
+   * 交出去、回一条确认 tool_result 保持正史合法，再按角色的 resolveTerminal
+   * 映射为 `completed` / `partial` / `blocked`；旧角色不提供解析器时仍按 completed。
+   *
+   * 该工具**必须同时出现在 `tools` 里**——否则 `tool_choice` 点名一个不存在的
+   * 工具会被端点判 400。装配责任在调用方（verifier/planner）。
+   */
+  terminalTool?: string;
+  /**
+   * 终结工具的语义校验。undefined = 沿用旧语义（调用即 completed）；
+   * 返回 undefined = 入参无效，loop 回 is_error 并继续，绝不假装交付完成。
+   */
+  resolveTerminal?: (input: unknown) => TerminalResolution | undefined;
+  /** end_turn / max_tokens 不能收尾，必须先调用 terminalTool；主执行者与澄清门使用 */
+  requireTerminalTool?: boolean;
+  /** 未调用必需终结工具时回给模型的动作提示 */
+  terminalReminder?: string;
+  /** 目标级恢复策略；未设置时保持传统的“到 maxTurns 即停”语义 */
+  recovery?: RecoveryPolicy;
   /**
    * loop 层对瞬时 API 错误（网络/超时/429/5xx）的同轮重试次数，默认 1。
    * 与 SDK 内置的 HTTP 重试是两层：SDK 耗尽后 loop 再兜一次，避免整个 run 因
@@ -163,15 +246,19 @@ export interface AggregateUsage {
 
 export interface AgentRunResult {
   /**
-   * completed = end_turn 正常结束；max_tokens = 末轮输出撞单次上限被截断
-   * （非错误：已生成内容保留在 messages 中，提高 maxTokens 可让其写完）；
-   * 其余为护栏/拒绝/宿主错误。
+   * 未启用完成门时 completed 可由 end_turn 产生；启用后 completed/partial/blocked
+   * 只能来自合法终结工具。max_tokens = 末轮输出撞单次上限被截断；
+   * incomplete/stalled = 宿主有界恢复后仍未能业务收口。
    */
   stopReason:
     | "completed"
     | "max_tokens"
     | "max_turns"
     | "budget_exhausted"
+    | "partial"
+    | "blocked"
+    | "incomplete"
+    | "stalled"
     | "refusal"
     /**
      * 宿主主动中止（人按了停止）。**与 error 分开**：那是委托方的决定，不是失败。
@@ -183,13 +270,19 @@ export interface AgentRunResult {
   /** 完整会话历史（SDK 类型），可用于持久化或子代理接力 */
   messages: Anthropic.MessageParam[];
   usage: AggregateUsage;
+  /** requireTerminalTool 的结构化交付；非主执行角色通常为空 */
+  completion?: TaskCompletion;
+  /** 跨段预算的收尾快照，便于宿主解释“为什么这段还没满却停了” */
+  runBudget?: SharedRunBudget;
+  /** 最后一轮实际输入水位；宿主恢复 ContextManager 时用于首个请求前的压缩判定 */
+  contextInputTokens?: number;
   /** stopReason = "error" 时的宿主级错误；工具错误不会出现在这里 */
   error?: Error;
 }
 
 /**
  * run 级终止原因**全集**——三处口径一致锁的唯一事实源（backlog B1）。
- * = loop 的七值（AgentRunResult.stopReason）+ 宿主计划门两值：
+ * = loop 的十一值（AgentRunResult.stopReason）+ 宿主计划门两值：
  * plan_rejected / plan_gate_expired 由 Web 宿主在计划确认门路径写入
  * run 级 stopReason，AgentLoop 永远不会发射它们。
  * 加新值**先加这里**——ui/public/app.js 的 classifyStopReason 与
@@ -201,6 +294,10 @@ export const STOP_REASONS = [
   "max_tokens",
   "max_turns",
   "budget_exhausted",
+  "partial",
+  "blocked",
+  "incomplete",
+  "stalled",
   "refusal",
   "aborted",
   "error",
@@ -240,6 +337,22 @@ export type TurnEvent =
   | { type: "thinking_delta"; text: string }
   /** backoffMs = 本次实际等待毫秒（含抖动）——不带它宿主就看不出重试到底等了多久 */
   | { type: "api_retry"; turn: number; attempt: number; reason: string; backoffMs: number }
+  | {
+      /** 目标级恢复决策：不是模型散文，而是 harness 的确定性分支 */
+      type: "recovery_decision";
+      reason:
+        | "end_turn_without_completion"
+        | "max_tokens_without_completion"
+        | "max_turns"
+        | "stagnation";
+      action:
+        | "request_completion"
+        | "continue_with_context"
+        | "change_strategy"
+        | "force_completion";
+      detail: string;
+      extraTurns?: number;
+    }
   /**
    * 段级续跑（9.8）：整段因**瞬时**宿主级错误终止后，带着已有正史再续一次，
    * 而不是把整段工作作废。与 api_retry 是两回事——那个是同一轮内重发同一个请求，

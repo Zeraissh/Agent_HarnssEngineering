@@ -74,11 +74,11 @@ while true:
     turn = ModelClient.send(context.render(messages))
     messages.push(turn 的完整 assistant content)      // 必须完整 push，不能只留文本
     switch turn.stop_reason:
-      end_turn     → 结束，stopReason = completed
+      end_turn     → 若启用完成门：提醒继续/提问/调用 finish_task；否则按旧语义 completed
       tool_use     → 提取全部 tool_use 块 → ToolExecutor 执行 →
                      所有 tool_result 合并进【同一条】user 消息 push → continue
       pause_turn   → 直接 continue（原样重发，不追加任何用户文本）
-      max_tokens   → 输出被截断：报事件，按策略重试一次（提高 max_tokens）或结束
+      max_tokens   → 保留已有输出；启用完成门时只追加一轮短结构化收口
       refusal      → 结束，stopReason = refusal（不重试同一 prompt）
 ```
 
@@ -86,7 +86,8 @@ while true:
 
 - **并行工具调用**：一条 assistant 消息可含多个 `tool_use`。parallel-safe 的工具并发执行，非 parallel-safe 的串行；但无论怎么执行，**全部 `tool_result` 必须合并进单条 user 消息**——拆成多条会让模型逐渐不再发并行调用。
 - **工具失败不中断**：执行异常 → 捕获 → `{is_error: true, content: 给模型看的错误说明}`；每个 `tool_use_id` 必须有对应 `tool_result`，缺一个 API 直接拒绝下一次请求。
-- **护栏**：`maxTurns`（默认 50）与 `maxTokensBudget`（可选）由 loop 每轮检查强制执行；触发时以明确的 stopReason 结束而非抛异常。
+- **护栏**：`maxTurns`（默认 50）约束单执行段；`AGENT_TOTAL_MAX_TURNS` 与 `AGENT_TOTAL_TOKEN_BUDGET` 绑定共享 `runBudget`，continuation、返工和瞬时续跑不会重置总账。轮次在发送前原子预占；token 按完整响应结算，显式 token 上限会串行化同一总账下的模型调用，允许最后一次响应自然越界，但不会因并发轨同时读取旧余额而放大超支。触发时以明确的 stopReason 结束而非抛异常。
+- **结构化完成门**：真实 CLI/Web 宿主默认注册 `finish_task`。`end_turn` 是 wire 事实，不是业务完成；合法工具入参保真返回 `completed / partial / blocked`。重复观察触发换策略，仍停滞则有界强制收口。
 - **事件流**：`run()` 返回 `AsyncIterable<TurnEvent>`。审批门（permission = "ask" 的工具）实现为一种需要宿主应答的事件——loop 挂起等待宿主回 allow/deny，这样 UI 形态（CLI 提示、GUI 弹窗）完全是宿主的事。
 
 ### 一轮完整 turn 的时序
@@ -99,7 +100,7 @@ sequenceDiagram
     participant M as ModelClient (L0)
     participant T as ToolExecutor (L2)
     H->>L: run("帮我整理这个目录")
-    loop 直到 end_turn 或护栏触发
+    loop 直到 finish_task 或护栏触发
         L->>C: render(messages) — 组装 system/tools/history + 缓存断点
         L->>M: send(request)
         M-->>L: assistant 消息 (stop_reason=tool_use, 2 个 tool_use)
@@ -109,8 +110,8 @@ sequenceDiagram
         L->>L: 合并为单条 user 消息 push
         L-->>H: 事件: tool_result ×2 + usage
     end
-    M-->>L: assistant 消息 (stop_reason=end_turn)
-    L-->>H: 事件: done (stopReason=completed, AggregateUsage)
+    M-->>L: assistant 消息 (stop_reason=tool_use, finish_task)
+    L-->>H: 事件: done (stopReason=completed, TaskCompletion, AggregateUsage)
 ```
 
 ---
@@ -143,6 +144,7 @@ sequenceDiagram
 | 缓存断点 | 两个：① system 最后一个 text 块（缓存 tools+system）；② 最近一条 user 消息的最后一个 content 块（会话增量缓存）。注意 20 块回溯窗口：单轮工具块过多时在中段补打断点 |
 | 缓存最小长度 | Opus 4.8 最小可缓存前缀为 4096 token——system+tools 太短时打了标记也不缓存，属正常现象，文档化即可 |
 | 窗口逼近策略 | v0.3 已实现：上一轮实际输入（input+cacheW+cacheR）超过 `contextTokenLimit` 的 80% 时，把保护窗口（默认最近 6 条消息）之外的大体积 tool_result 置换为占位文本；结构不破坏、操作幂等；loop 用结果**替换正史**，保证后续前缀稳定不抖缓存。后续版本可切换到 server-side compaction（beta `compact-2026-01-12`，需完整回传 compaction 块） |
+| 跨重启恢复 | 每个完整 main 段导出最后输入水位；恢复后的 `AgentLoop` 用该水位在首个请求前决定是否 compact，避免把大历史盲发一次后才发现超窗 |
 | Token 核算 | 汇总口径 = `input + cache_creation + cache_read`（`input_tokens` 只是未缓存部分）；对外报表必须区分三者，否则"缓存是否生效"无法判断 |
 
 ---
@@ -152,6 +154,18 @@ sequenceDiagram
 - **Verifier subagent**（`src/verifier.ts`）：子代理 = 复用父级 systemPrompt/tools 的全新 AgentLoop（请求前缀一致，蹭 tools/system 层缓存），但看不到主 agent 的会话历史——只拿到任务描述 + 执行者报告，必须亲自用工具核查实际产出（fresh-context 验证优于自我批评）。只读纪律是硬约束（P6）：verifier 内部对一切 approval_request 自动 deny 并回传理由，写类工具在其中永远执行不了。裁决为 JSON（`{passed, issues, summary}`），宽容解析、解析失败视为不通过（fail-closed）。
 - **编排器**（`src/orchestrate.ts`）：`runVerified()` = 主 run → 核查 → 未通过则把问题清单拼进返工输入再跑一轮（`maxReworks` 可配，默认 1）。宿主经 `onEvent(source, event)` 观察全过程，审批仍归宿主。
 - **评估基线**（`eval/`）：5 个固定用例 + 程序化判定，`npm run eval` 生成 `eval/baseline-report.md`（成功率/轮数/token 成本），作为 harness 改动的回归基准。
+
+## Web Host — 持久化检查点与运行谱系
+
+Web 宿主把 `meta.json`、`events.jsonl`、`transcript.jsonl` 分开落盘。父归档是不可变的
+审计记录；跨重启续跑不会尝试序列化/复活 `AgentLoop` 活对象，而是从最近完整 main
+段派生子 run。检查点只包含可验证恢复所需的最小状态：transcript 段号、对话轮数、
+Context 输入水位和共享 `runBudget` 快照。
+
+派生边界是 fail-closed 的：只支持无独立核查的 single run；工作目录必须仍命中当前
+宿主白名单，领域包必须仍存在；旧检查点上限与当前宿主上限逐项取更严格值，已用轮次
+和 token 不清零。子 run 使用当前模型/工具/策略，审批放行、挂起交互与 `ask_user`
+已用配额全部重置，并以 durable `run_forked` 事件记录直接父级、根运行和环境边界。
 
 ## L5 — Memory（v0.5 已实现）
 

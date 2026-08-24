@@ -5,6 +5,13 @@
       "name": "case10-game",
       "url": "http://localhost:8099",
       "port": 8099
+    },
+    {
+      "name": "harness-ui",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["tsx", "--env-file-if-exists=.env", "ui/serve.ts"],
+      "port": 4173,
+      "autoPort": true
     }
   ]
 }

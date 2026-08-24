@@ -2,7 +2,8 @@
  * L4 — 编排：主 agent 执行 → verifier 核查 → 未通过则带着问题清单返工。
  * 主 loop 与 verifier 共用 systemPrompt/tools（缓存前缀一致），上下文互相隔离。
  */
-import { AgentLoop } from "./loop.js";
+import { runClarificationGate, type ClarificationOutcome } from "./clarifier.js";
+import { AgentLoop, createRunBudget } from "./loop.js";
 import {
   runPlanner,
   runStructuredPlanner,
@@ -105,6 +106,16 @@ export async function runVerified(
   const maxReworks = opts.maxReworks ?? 1;
   const reworkMode = opts.reworkMode ?? "fresh";
   const verifications: VerifyOutcome[] = [];
+  /** main / inherit / fresh 返工 / 瞬时续跑共同扣这一份总账。 */
+  const executionCfg: AgentConfig = {
+    ...cfg,
+    runBudget:
+      cfg.runBudget ??
+      createRunBudget({
+        ...(cfg.maxTotalTurns !== undefined ? { maxTurns: cfg.maxTotalTurns } : {}),
+        ...(cfg.maxTokensBudget !== undefined ? { maxTokens: cfg.maxTokensBudget } : {}),
+      }),
+  };
 
   let main: AgentRunResult | undefined;
   let executionUsage: AggregateUsage | undefined;
@@ -116,8 +127,8 @@ export async function runVerified(
     // inherit 模式的返工在上一轮正史上续跑；fresh（与首轮）全新开局
     const events =
       round > 0 && reworkMode === "inherit"
-        ? new AgentLoop(cfg, model).runContinuation(main!.messages, feedback, opts.signal)
-        : new AgentLoop(cfg, model).run(feedback, opts.signal);
+        ? new AgentLoop(executionCfg, model).runContinuation(main!.messages, feedback, opts.signal)
+        : new AgentLoop(executionCfg, model).run(feedback, opts.signal);
     main = await drain(events, (e) => opts.onEvent?.(source, e));
     executionUsage = executionUsage ? sumUsage(executionUsage, main.usage) : main.usage;
 
@@ -157,7 +168,7 @@ export async function runVerified(
         priorTurns,
       });
       const resumed = await drain(
-        new AgentLoop(cfg, model).runContinuation(main.messages, SEGMENT_RESUME_NUDGE, opts.signal),
+        new AgentLoop(executionCfg, model).runContinuation(main.messages, SEGMENT_RESUME_NUDGE, opts.signal),
         (e) => opts.onEvent?.(source, e),
       );
       executionUsage = sumUsage(executionUsage!, resumed.usage);
@@ -216,7 +227,7 @@ async function runVerifierWithEvents(
   main: AgentRunResult,
   opts: VerifiedRunOptions,
 ): Promise<VerifyOutcome> {
-  const executorReport = lastAssistantText(main) || "(执行者没有留下文字报告)";
+  const executorReport = reportFromResult(main) || "(执行者没有留下文字或结构化报告)";
   const verifierClient = opts.verifierModel?.client ?? model;
   const verifierCfg =
     opts.verifierModel && opts.verifierModel.compat !== undefined
@@ -264,9 +275,27 @@ function lastAssistantText(result: AgentRunResult): string {
   return "";
 }
 
+/** finish_task 不是只给 UI 看：verifier 与下游交接必须真正消费这份结构化证据。 */
+function reportFromResult(result: AgentRunResult): string {
+  const prose = lastAssistantText(result).trim();
+  const completion = result.completion;
+  if (!completion) return prose;
+  const lines = [
+    `【结构化交付】状态=${completion.status}`,
+    `摘要：${completion.summary}`,
+    ...(completion.artifacts.length > 0 ? [`产物：\n${completion.artifacts.map((v) => `- ${v}`).join("\n")}`] : []),
+    ...(completion.verification.length > 0 ? [`验证：\n${completion.verification.map((v) => `- ${v}`).join("\n")}`] : []),
+    ...(completion.assumptions.length > 0 ? [`假设：\n${completion.assumptions.map((v) => `- ${v}`).join("\n")}`] : []),
+    ...(completion.blockers.length > 0 ? [`阻塞：\n${completion.blockers.map((v) => `- ${v}`).join("\n")}`] : []),
+  ];
+  return [prose, lines.join("\n")].filter(Boolean).join("\n\n");
+}
+
 // ————————————————— 三角编排：planner → executor → verifier —————————————————
 
 export interface PlannedRunOptions {
+  /** 中止所有尚未结束的澄清/执行子任务；已完成的副作用不回滚。 */
+  signal?: AbortSignal;
   /** 可用领域包（planner 的菜单 + 子任务 pack 名校验） */
   packs?: DomainPack[];
   /**
@@ -349,6 +378,8 @@ export interface PlannedStepResult {
 }
 
 export interface PlannedRunResult {
+  /** planner 前的结构化需求澄清；无 ask_user 或注入固定计划时缺省 */
+  clarification?: ClarificationOutcome;
   /** undefined = planner 产不出可解析计划（fail-closed，未执行任何子任务） */
   plan?: Plan;
   planOutcome: PlanOutcome;
@@ -363,16 +394,21 @@ export interface PlannedRunResult {
 /**
  * 编排收尾写给台账/run_end 的 stopReason——CLI 与 Web 宿主共用这一个定义。
  *
- * 值域刻意只取 "completed" / "error" 两个前端具名值（ui/public/app.js 的
- * classifyStopReason）：失败的细分（计划不可解析、某子任务未过核查）已由
- * finalPassed 与 plan_result 事件承载，stopReason 再自造新词只会加剧
- * backlog B1 记录的三处口径漂移。CLI 曾在失败分支写 String(planOutcome)，
+ * 计划不可解析或纯 verifier 未通过仍归 `error`；但执行者已经结构化声明的
+ * `partial` / `blocked` / `aborted` 等状态必须透传，不能在聚合层丢失语义。
+ * 返回值严格落在 STOP_REASONS 已知集合；CLI 曾在失败分支写 String(planOutcome)，
  * 台账里落的是 "[object Object]"——聚合值必须显式映射，不许兜底串化。
  */
 export function plannedStopReason(
-  outcome: Pick<PlannedRunResult, "completed">,
-): "completed" | "error" {
-  return outcome.completed ? "completed" : "error";
+  outcome: Pick<PlannedRunResult, "completed"> & Partial<Pick<PlannedRunResult, "steps">>,
+): AgentRunResult["stopReason"] {
+  if (outcome.completed) return "completed";
+  // 结构化执行状态不能在计划聚合层被压回笼统 error。若只是 verifier 未通过，
+  // 主执行段仍是 completed，此时才用 error 表示编排整体未通过。
+  const nonCompleted = outcome.steps
+    ?.map((step) => step.result.main.stopReason)
+    .find((reason) => reason !== "completed");
+  return nonCompleted ?? "error";
 }
 
 /**
@@ -392,6 +428,7 @@ export async function runPlanned(
 ): Promise<PlannedRunResult> {
   const packs = opts.packs ?? [];
   let planOutcome: PlanOutcome;
+  let clarification: ClarificationOutcome | undefined;
   if (opts.plan) {
     if (!validatePlanGraph(opts.plan.subtasks)) {
       throw new Error("注入的计划依赖图非法（id 重复/悬空引用/成环）");
@@ -403,15 +440,37 @@ export async function runPlanned(
       opts.plannerModel && opts.plannerModel.compat !== undefined
         ? { ...baseCfg, compat: opts.plannerModel.compat }
         : baseCfg;
+    clarification = await runClarificationGate(
+      plannerCfg,
+      plannerClient,
+      task,
+      (e) => opts.onEvent?.("clarifier", e),
+      { ...(opts.signal ? { signal: opts.signal } : {}) },
+    );
+    const clarifiedTask = [
+      clarification.task,
+      ...(clarification.acceptance.length > 0
+        ? [`【已明确的验收标准】\n${clarification.acceptance.map((item, i) => `${i + 1}. ${item}`).join("\n")}`]
+        : []),
+      ...(clarification.assumptions.length > 0
+        ? [`【未获答复时采用的假设】\n${clarification.assumptions.map((item, i) => `${i + 1}. ${item}`).join("\n")}`]
+        : []),
+    ].join("\n\n");
     const onPlannerEvent = (e: TurnEvent) => opts.onEvent?.("planner", e);
     const plannerOpts = opts.planMaxTurns !== undefined ? { maxTurns: opts.planMaxTurns } : undefined;
     planOutcome =
       opts.plannerProtocol === "structured"
-        ? await runStructuredPlanner(plannerCfg, plannerClient, task, packs, opts.splitRule, onPlannerEvent, plannerOpts)
-        : await runPlanner(plannerCfg, plannerClient, task, packs, onPlannerEvent, plannerOpts);
+        ? await runStructuredPlanner(plannerCfg, plannerClient, clarifiedTask, packs, opts.splitRule, onPlannerEvent, plannerOpts)
+        : await runPlanner(plannerCfg, plannerClient, clarifiedTask, packs, onPlannerEvent, plannerOpts);
   }
   if (!planOutcome.plan) {
-    return { planOutcome, steps: [], skipped: [], completed: false };
+    return {
+      planOutcome,
+      steps: [],
+      skipped: [],
+      completed: false,
+      ...(clarification && !clarification.skipped ? { clarification } : {}),
+    };
   }
   const plan = planOutcome.plan;
   await opts.onPlan?.(plan);
@@ -429,9 +488,24 @@ export async function runPlanned(
   let aborted = false; // 首个失败后停止发射（在飞的跑完）
   let schedulerError: unknown;
 
+  /**
+   * 整个计划 run 的所有执行者共用一份总账。不能让 resolveSubtask 为每一步复制
+   * maxTotalTurns 后各开一份——“总上限 120”在 6 个子任务下会悄悄膨胀成 720。
+   * planner/clarifier/verifier 各有独立角色预算，不从这份执行账扣。
+   */
+  const planExecutionBudget =
+    baseCfg.runBudget ??
+    createRunBudget({
+      ...(baseCfg.maxTotalTurns !== undefined ? { maxTurns: baseCfg.maxTotalTurns } : {}),
+      ...(baseCfg.maxTokensBudget !== undefined ? { maxTokens: baseCfg.maxTokensBudget } : {}),
+    });
+
   // 每个子任务只解析一次（解析结果含资源声明，调度判定与执行都要用）
   const resolvedById = new Map(
-    plan.subtasks.map((s) => [s.id, opts.resolveSubtask?.(s) ?? { cfg: baseCfg }]),
+    plan.subtasks.map((s) => {
+      const resolved = opts.resolveSubtask?.(s) ?? { cfg: baseCfg };
+      return [s.id, { ...resolved, cfg: { ...resolved.cfg, runBudget: planExecutionBudget } }] as const;
+    }),
   );
   const heldResources = new Set<string>();
 
@@ -446,6 +520,7 @@ export async function runPlanned(
       const result = await runVerified(resolved.cfg, model, input, {
         maxReworks: opts.maxReworks ?? 1,
         ...(resolved.verify ?? {}),
+        ...(opts.signal ? { signal: opts.signal } : {}),
         // 审批门只管执行/返工——verifier/planner 的 respond 由其内部自答，
         // 排队等宿主应答会死锁（内部自答在 onEvent 返回之后才发生）
         onEvent: (source, event) => forward(`${sub.id}/${source}`, event, source !== "verifier"),
@@ -453,7 +528,7 @@ export async function runPlanned(
       stepsById.set(sub.id, { sub, result, durationMs: Date.now() - startedAt });
       if (result.finalPassed) {
         passed.add(sub.id);
-        handoffs.set(sub.id, lastAssistantText(result.main) || "(上游没有留下文字报告)");
+        handoffs.set(sub.id, reportFromResult(result.main) || "(上游没有留下文字或结构化报告)");
       } else {
         aborted = true;
       }
@@ -494,7 +569,14 @@ export async function runPlanned(
     .filter((s): s is PlannedStepResult => s !== undefined);
   const skipped = plan.subtasks.filter((s) => !stepsById.has(s.id));
   const completed = skipped.length === 0 && steps.every((s) => s.result.finalPassed);
-  return { plan, planOutcome, steps, skipped, completed };
+  return {
+    plan,
+    planOutcome,
+    steps,
+    skipped,
+    completed,
+    ...(clarification && !clarification.skipped ? { clarification } : {}),
+  };
 }
 
 /** auto 并行度上限：收益曲线未测满前保守取 3（端点限流与宿主渲染都友好） */
