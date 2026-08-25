@@ -107,6 +107,11 @@ export const RUN_OUTCOMES = ["completed", "partial", "blocked", "error", "closed
 export const TOKEN_ROLES = ["execution", "verification", "planner", "vision"] as const;
 export const TOKEN_KINDS = ["input", "output", "cache_read", "cache_creation"] as const;
 
+/** 本地日界（操作员心智里的"今天"），YYYY-MM-DD。日预算的翻页判据 */
+export function localDayKey(d = new Date()): string {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
 /**
  * 把 ModelClient 包成"每次调用把 usage 交给回调"的版本（评审 2026-08-24
  * real-bug：describe_image 拿到 turn 只取文本，usage 原地丢弃——视觉调用发生
@@ -390,6 +395,13 @@ export interface UiServerOptions {
   requestBodyMaxBytes?: number;
   /** 同时处于 running 的 run 上限；真实宿主默认 4。 */
   maxActiveRuns?: number;
+  /**
+   * 宿主级日 token 预算（非 cache_read 口径，与成本告警同口径）。超限后**新的
+   * 执行准入**（新建 run / 追问续跑 / 归档派生）一律 429，在飞 run 永不掐；
+   * 本地日翻页自动恢复。缺省不启用——这是操作员的显式防线，不是隐形限速。
+   * 进程态计数：宿主重启当日账本归零（与 /metrics 同边界，runbook 已写明）。
+   */
+  dailyTokenBudget?: number;
   /** 内存中保留的运行（含事件/正文）上限；磁盘历史仍按 historyKeep 独立保留。 */
   maxStoredRuns?: number;
   /** 单一远端地址每分钟可发出的 POST 数；真实宿主默认 120。 */
@@ -886,6 +898,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   const maxActiveRuns = positiveInteger(options.maxActiveRuns, "maxActiveRuns")
     ?? positiveIntegerEnv("AGENT_UI_MAX_ACTIVE_RUNS")
     ?? (realHost ? 4 : Number.MAX_SAFE_INTEGER);
+  // 缺省不启用（undefined）：日预算是操作员显式立的防线，不做隐形缺省
+  const dailyTokenBudget = positiveInteger(options.dailyTokenBudget, "dailyTokenBudget")
+    ?? positiveIntegerEnv("AGENT_UI_DAILY_TOKEN_BUDGET");
   const mutationRateLimitPerMinute = positiveInteger(
     options.mutationRateLimitPerMinute,
     "mutationRateLimitPerMinute",
@@ -1003,6 +1018,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     runsFinished: new Map<RunEndInfo["outcome"], number>(),
     // token 累计，键 "role/kind"（审计 2026-08-24 high：无跨 run 成本观测）
     tokens: new Map<string, number>(),
+    budgetRejected: 0,
     originRejected: 0,
     authRejected: 0,
     hostRejected: 0,
@@ -1011,6 +1027,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     capacityRejected: 0,
     historyErrors: 0,
   };
+
+  /** 日预算账本（进程态；宿主重启当日归零，与 /metrics 同边界） */
+  let dailyTokens = { day: localDayKey(), used: 0 };
 
   /** token 计数累加（AggregateUsage → role 四档）。全部记账路径共用这一个入口 */
   function growTokens(
@@ -1025,6 +1044,14 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     grow("output", u.outputTokens);
     grow("cache_read", u.cacheReadTokens);
     grow("cache_creation", u.cacheCreationTokens);
+    // 日预算账本走非 cache_read 口径（与成本告警一致；cache_read 量大价低，
+    // 计入会让长循环任务两小时吃光名义预算，防线沦为噪声）
+    const nonCacheRead = u.inputTokens + u.outputTokens + u.cacheCreationTokens;
+    if (nonCacheRead > 0) {
+      const today = localDayKey();
+      if (dailyTokens.day !== today) dailyTokens = { day: today, used: 0 };
+      dailyTokens.used += nonCacheRead;
+    }
   }
 
   function reportHistoryError(error: Error): void {
@@ -2584,6 +2611,33 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     });
   }
 
+  /**
+   * 日预算门（审计 2026-08-24 high 的执行半边：此前唯一防线是操作员肉眼看账）。
+   * 只拦**新的执行准入**——在飞 run 永不掐：掐半截既毁产物又不省多少钱。
+   * 返回 null = 未启用 / 有余量 / 账本已翻日。
+   */
+  function dailyBudgetRefusal(): { used: number; budget: number } | null {
+    if (dailyTokenBudget === undefined) return null;
+    if (dailyTokens.day !== localDayKey()) return null;
+    return dailyTokens.used >= dailyTokenBudget
+      ? { used: dailyTokens.used, budget: dailyTokenBudget }
+      : null;
+  }
+
+  function rejectAtDailyBudget(res: ServerResponse, info: { used: number; budget: number }): void {
+    metrics.budgetRejected += 1;
+    const now = new Date();
+    const midnight = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+    res.setHeader("Retry-After", String(Math.max(1, Math.ceil((midnight.getTime() - now.getTime()) / 1000))));
+    json(res, 429, {
+      error:
+        `Daily token budget exhausted: ${info.used} of ${info.budget} non-cache-read tokens used today. ` +
+        "Running tasks are unaffected; admission reopens tomorrow, or raise AGENT_UI_DAILY_TOKEN_BUDGET and restart.",
+      dailyTokensUsed: info.used,
+      dailyTokenBudget: info.budget,
+    });
+  }
+
   function mutationRetryAfter(req: IncomingMessage): number | null {
     if (mutationRateLimitPerMinute === Number.MAX_SAFE_INTEGER) return null;
     const key = req.socket.remoteAddress ?? "unknown";
@@ -2663,6 +2717,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       `agent_harness_security_rejections_total{reason="body"} ${metrics.bodyRejected}`,
       `agent_harness_security_rejections_total{reason="rate"} ${metrics.rateRejected}`,
       `agent_harness_security_rejections_total{reason="capacity"} ${metrics.capacityRejected}`,
+      `agent_harness_security_rejections_total{reason="budget"} ${metrics.budgetRejected}`,
+      "# TYPE agent_harness_daily_tokens_used gauge",
+      // 非 cache_read 口径的当日消耗（本地日界；进程重启归零）。配了日预算时
+      // 运维靠它直读余量，没配时它就是当日烧量的直接读数
+      `agent_harness_daily_tokens_used ${dailyTokens.day === localDayKey() ? dailyTokens.used : 0}`,
       "# TYPE agent_harness_history_errors_total counter",
       `agent_harness_history_errors_total ${metrics.historyErrors}`,
       "",
@@ -3085,6 +3144,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           return badRequest(res, 'Missing or invalid "text" field');
         }
         const feedback = parsed.text.trim();
+        // 追问/归档派生同属新的执行准入：日预算门先于并发门（拒因更具体）
+        const budgetRefusal = dailyBudgetRefusal();
+        if (budgetRefusal) return rejectAtDailyBudget(res, budgetRefusal);
         const releaseAdmission = acquireRunAdmission();
         if (!releaseAdmission) return rejectAtCapacity(res);
 
@@ -3445,6 +3507,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         const verify = parsed.verify === true;
         // §5.2 决定 1：默认关，逐 run 显式开
         const askUser = parsed.askUser === true;
+        const budgetRefusal = dailyBudgetRefusal();
+        if (budgetRefusal) return rejectAtDailyBudget(res, budgetRefusal);
         const releaseAdmission = acquireRunAdmission();
         if (!releaseAdmission) return rejectAtCapacity(res);
         const id = randomUUID();

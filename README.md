@@ -77,7 +77,7 @@ npm test                                                          # 单元测试
 
 ```powershell
 $env:AGENT_TOTAL_MAX_TURNS = "120"          # continuation/返工共用，不会每段重置
-$env:AGENT_TOTAL_TOKEN_BUDGET = "500000"    # 整个执行 lineage 的 token 总账
+$env:AGENT_TOTAL_TOKEN_BUDGET = "500000"    # 执行谱系（main/返工/续跑）的 token 总账
 $env:AGENT_PROGRESS_EXTENSION_TURNS = "8"   # 仍有新证据时最多一次有界续跑
 $env:AGENT_STAGNATION_WINDOW = "3"          # 连续相同调用+结果后要求换策略
 $env:AGENT_MAX_ASK_ROUNDS = "3"             # 打断次数；每次可集中问 1~4 题
@@ -85,6 +85,11 @@ $env:AGENT_MAX_ASK_ROUNDS = "3"             # 打断次数；每次可集中问 
 
 显式 token 总账按完整模型调用结算：单次在途响应可能自然越过剩余额度；并行子任务会在
 同一总账上串行取得调用资格，避免多条轨基于旧余额同时起跑、按并发数放大超支。
+**口径要点**：这份总账只约束执行谱系——verifier / planner 各自另建等额的独立预算，
+不从此账扣（隔离是有意的：核查断粮会引入新失效形态），带核查的 run 名义总消耗
+可达约 3 倍。Web 宿主另有一道宿主级日预算 `AGENT_UI_DAILY_TOKEN_BUDGET`（非
+cache_read 口径）：超限后新任务/追问/归档派生一律拒绝准入，在飞任务不受影响，
+本地日翻页自动恢复（进程态计数，重启当日归零）。
 
 `--verify` 支持独立的核查模型（核查者应 ≥ 执行者强度，见 A/B 研究结论）：
 

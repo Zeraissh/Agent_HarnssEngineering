@@ -4004,6 +4004,54 @@ describe("监控闭环：outcome 分档指标与告警文件一致性", () => {
     }
   });
 
+  it("日预算门：超限后新 run 与追问均 429（拒因可读、计数入指标），账本读数如实", async () => {
+    // 预算 100 < 单 run 非 cache_read 消耗 150（input 100 + output 50）。
+    // 首个 run 准入时账本为 0 → 放行并跑完；之后一切新准入被拒，在飞语义
+    // 由"门只在准入点"这一结构保证（run 中途永远不再过这道门）。
+    const model = new FakeModelClient([fakeMessage([textBlock("done")], "end_turn")]);
+    const dir = await mkdtemp(join(tmpdir(), "metrics-daily-budget-"));
+    const handle = createUiServer({ modelClient: model, workdir: dir, dailyTokenBudget: 100 });
+    try {
+      const port = await startServer(handle);
+      const base = baseUrl(port);
+      const create = () =>
+        fetch(`${base}/api/runs`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ task: "t" }),
+        });
+      const first = await create();
+      expect(first.status).toBe(200);
+      const { runId } = await first.json();
+      await waitForDone(base, runId);
+
+      const text1 = await (await fetch(`${base}/metrics`)).text();
+      expect(text1).toMatch(/^agent_harness_daily_tokens_used 150$/m);
+
+      // 新 run 被拒：429 + 可读拒因 + Retry-After 指向次日
+      const second = await create();
+      expect(second.status).toBe(429);
+      const body = (await second.json()) as any;
+      expect(body.error).toContain("Daily token budget");
+      expect(body.dailyTokensUsed).toBe(150);
+      expect(Number(second.headers.get("retry-after"))).toBeGreaterThan(0);
+
+      // 追问（已完成 run 的续跑）同属新的执行准入，一样被拒
+      const followUp = await fetch(`${base}/api/runs/${runId}/messages`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: "再补一步" }),
+      });
+      expect(followUp.status).toBe(429);
+
+      const text2 = await (await fetch(`${base}/metrics`)).text();
+      expect(text2).toMatch(/^agent_harness_security_rejections_total\{reason="budget"\} 2$/m);
+    } finally {
+      await handle.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("meterModelClient：视觉调用的 usage 被逐次交给回调，turn 原样透传", async () => {
     // describe_image 的调用在工具执行内部，不经 done/verification 任何记账路径
     // ——计量只能包在客户端边界（评审 real-bug：turn.usage 此前拿到就扔）

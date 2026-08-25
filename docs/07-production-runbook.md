@@ -66,6 +66,12 @@ is backed by the `AgentHarnessRunErrorRatio` alert. Token spend is queryable as
 `agent_harness_tokens_total{role=execution|verification|planner, kind=input|output|cache_read|cache_creation}`
 (accumulated as each segment completes); the `AgentHarnessTokenBurnRate` alert warns when non-cache-read
 tokens exceed 2M per hour — tune that threshold to the account's actual limits and model pricing.
+`AGENT_UI_DAILY_TOKEN_BUDGET` adds a host-level daily cap in the same non-cache-read unit: once
+exceeded, new runs, follow-ups, and archive continuations get 429 until the local calendar day rolls
+over, while running tasks are never interrupted. The day counter lives in process memory — a host
+restart resets it (same boundary as `/metrics`), so treat it as an operator guardrail, not billing.
+Budget refusals are counted as `agent_harness_security_rejections_total{reason="budget"}` and the
+current day's spend is exported as `agent_harness_daily_tokens_used`.
 
 ## Canary and smoke checks
 
