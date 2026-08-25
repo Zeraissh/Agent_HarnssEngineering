@@ -4052,6 +4052,111 @@ describe("监控闭环：outcome 分档指标与告警文件一致性", () => {
     }
   });
 
+  it("日预算 0 = 今日封盘：一切新准入立即 429（而不是炸启动或当未启用）", async () => {
+    // 评审实测：0 走 positiveInteger 会拒启——但 used >= 0 恒真本可自然表达
+    // "封盘"。现在放行 0 并钉住该语义；配置校验只拒负数与非整数
+    const dir = await mkdtemp(join(tmpdir(), "metrics-budget-zero-"));
+    const handle = createUiServer({
+      modelClient: new FakeModelClient([fakeMessage([textBlock("done")], "end_turn")]),
+      workdir: dir,
+      dailyTokenBudget: 0,
+    });
+    try {
+      const port = await startServer(handle);
+      const res = await fetch(`${baseUrl(port)}/api/runs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task: "t" }),
+      });
+      expect(res.status).toBe(429);
+      expect(((await res.json()) as any).error).toContain("Daily token budget");
+    } finally {
+      await handle.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("注入测试模型的宿主忽略日预算 env——开发机残留变量不得武装全部测试宿主", async () => {
+    // 仪器纪律同台账/历史：env 只武装 realHost。否则 export 过小额度的开发机上，
+    // 全套测试会在消耗积累后冒出无法归因的 429（评审点名的测试污染缝）
+    process.env.AGENT_UI_DAILY_TOKEN_BUDGET = "1";
+    const dir = await mkdtemp(join(tmpdir(), "metrics-budget-env-"));
+    const handle = createUiServer({
+      modelClient: new FakeModelClient([fakeMessage([textBlock("done")], "end_turn")]),
+      workdir: dir,
+    });
+    try {
+      const port = await startServer(handle);
+      const base = baseUrl(port);
+      const res = await fetch(`${base}/api/runs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task: "t" }),
+      });
+      expect(res.status).toBe(200);
+      const { runId } = await res.json();
+      await waitForDone(base, runId);
+    } finally {
+      delete process.env.AGENT_UI_DAILY_TOKEN_BUDGET;
+      await handle.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("计划签字位也过日预算门：预算在挂起期间耗尽 → approve 429 且计划保持挂起，reject 永远可行", async () => {
+    // 评审：签字位零副作用、可挂任意久，却曾是唯一不过预算门的执行入口——
+    // 预算在挂起期间被烧穿后点批准 = 全部子任务无门发射。
+    // planner 一条消息即耗 150（逐调用实时落账——这里同时锁住计量不等段收尾），
+    // 预算 100 在计划挂起时已穿。
+    const planJson = JSON.stringify({
+      subtasks: [{ id: "s1", title: "第一步", description: "做 A", acceptance: ["A 完成"], dependsOn: [] }],
+    });
+    const model = new FakeModelClient([
+      fakeMessage([textBlock(["```json", planJson, "```"].join("\n"))], "end_turn"),
+      fakeMessage([textBlock("s1 完成")], "end_turn"),
+      fakeMessage([textBlock(JSON.stringify({ passed: true, issues: [], summary: "通过" }))], "end_turn"),
+    ]);
+    const dir = await mkdtemp(join(tmpdir(), "metrics-budget-plangate-"));
+    const handle = createUiServer({ modelClient: model, workdir: dir, dailyTokenBudget: 100 });
+    try {
+      const port = await startServer(handle);
+      const base = baseUrl(port);
+      const { runId } = await (await fetch(`${base}/api/runs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task: "需要签字的任务", mode: "plan", planGate: true }),
+      })).json() as { runId: string };
+      for (let i = 0; i < 100; i++) {
+        const list = (await (await fetch(`${base}/api/runs`)).json()) as any[];
+        const r = list.find((x) => x.runId === runId);
+        if (r?.awaitingPlanApproval) break;
+        if (r?.status === "done") throw new Error("run 已收尾但从未挂起计划门");
+        await new Promise((r2) => setTimeout(r2, 20));
+      }
+      const approve = await fetch(`${base}/api/runs/${runId}/plan-approval`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ decision: "approve" }),
+      });
+      expect(approve.status).toBe(429);
+      expect(((await approve.json()) as any).error).toContain("Daily token budget");
+      // 429 不消耗签字位：计划保持挂起，run 未被作废
+      const list = (await (await fetch(`${base}/api/runs`)).json()) as any[];
+      expect(list.find((x) => x.runId === runId)?.awaitingPlanApproval).toBe(true);
+      // 拒绝不花钱，永远可拒——且正常走完否决收场
+      const reject = await fetch(`${base}/api/runs/${runId}/plan-approval`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ decision: "reject" }),
+      });
+      expect(reject.status).toBe(200);
+      await waitForDone(base, runId);
+    } finally {
+      await handle.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("meterModelClient：视觉调用的 usage 被逐次交给回调，turn 原样透传", async () => {
     // describe_image 的调用在工具执行内部，不经 done/verification 任何记账路径
     // ——计量只能包在客户端边界（评审 real-bug：turn.usage 此前拿到就扔）

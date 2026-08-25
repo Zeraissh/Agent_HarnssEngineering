@@ -67,9 +67,13 @@ is backed by the `AgentHarnessRunErrorRatio` alert. Token spend is queryable as
 (accumulated as each segment completes); the `AgentHarnessTokenBurnRate` alert warns when non-cache-read
 tokens exceed 2M per hour — tune that threshold to the account's actual limits and model pricing.
 `AGENT_UI_DAILY_TOKEN_BUDGET` adds a host-level daily cap in the same non-cache-read unit: once
-exceeded, new runs, follow-ups, and archive continuations get 429 until the local calendar day rolls
-over, while running tasks are never interrupted. The day counter lives in process memory — a host
-restart resets it (same boundary as `/metrics`), so treat it as an operator guardrail, not billing.
+exceeded, new runs, follow-ups, archive continuations, and plan-gate approvals get 429 until the
+local calendar day rolls over, while running tasks are never interrupted. The ledger is metered per
+model call, so the admission race window is one in-flight call per running lane — not a whole
+segment; the worst-case overshoot is bounded by the runs already admitted (each lineage can
+nominally spend multiples of `AGENT_TOTAL_TOKEN_BUDGET`, see the env example). The day counter
+lives in process memory — a host restart resets it (same boundary as `/metrics`), so treat it as an
+operator guardrail, not billing. `0` means closed for today.
 Budget refusals are counted as `agent_harness_security_rejections_total{reason="budget"}` and the
 current day's spend is exported as `agent_harness_daily_tokens_used`.
 

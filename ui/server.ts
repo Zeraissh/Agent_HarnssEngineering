@@ -898,9 +898,23 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   const maxActiveRuns = positiveInteger(options.maxActiveRuns, "maxActiveRuns")
     ?? positiveIntegerEnv("AGENT_UI_MAX_ACTIVE_RUNS")
     ?? (realHost ? 4 : Number.MAX_SAFE_INTEGER);
-  // 缺省不启用（undefined）：日预算是操作员显式立的防线，不做隐形缺省
-  const dailyTokenBudget = positiveInteger(options.dailyTokenBudget, "dailyTokenBudget")
-    ?? positiveIntegerEnv("AGENT_UI_DAILY_TOKEN_BUDGET");
+  // 缺省不启用（undefined）：日预算是操作员显式立的防线，不做隐形缺省。
+  // 0 = 今日封盘（恒拒新准入）——所以不能用 positiveInteger（会把 0 拒成配置
+  // 错误炸启动，评审实测确认）。env 只在 realHost 读：与台账/历史同一条仪器
+  // 纪律——开发机残留的 AGENT_UI_DAILY_TOKEN_BUDGET 不该武装注入测试模型的宿主，
+  // 否则全套测试会在消耗积累后冒出无法归因的 429（评审点名的测试污染缝）。
+  const dailyTokenBudgetInput =
+    options.dailyTokenBudget ??
+    (realHost && process.env.AGENT_UI_DAILY_TOKEN_BUDGET?.trim()
+      ? Number(process.env.AGENT_UI_DAILY_TOKEN_BUDGET)
+      : undefined);
+  if (
+    dailyTokenBudgetInput !== undefined &&
+    (!Number.isInteger(dailyTokenBudgetInput) || dailyTokenBudgetInput < 0)
+  ) {
+    throw new Error("dailyTokenBudget must be a non-negative integer (0 = closed for today)");
+  }
+  const dailyTokenBudget = dailyTokenBudgetInput;
   const mutationRateLimitPerMinute = positiveInteger(
     options.mutationRateLimitPerMinute,
     "mutationRateLimitPerMinute",
@@ -914,7 +928,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
   // F1: 缺省模型从环境变量读取，compat 取自 createModelClientFromEnv 返回值
   const resolved = createModelClientFromEnv(process.env.AGENT_MODEL ?? "claude-opus-4-8");
-  const modelClient = options.modelClient ?? resolved.client;
+  // 日账本逐调用实时计量（评审 b62f6a5：段粒度落账让预算门的 TOCTOU 窗口有
+  // 整段宽——最坏 4 条 lineage 在账本过线前全部准入；跨午夜大段还会整段挤占
+  // 新日额度）。metrics.tokens 的 role 记账仍走事件路径（每段独立 usage、归属
+  // 清晰），这层只喂日账本——两本账职责分开，互不双计。
+  const modelClient = meterModelClient(options.modelClient ?? resolved.client, (u) => bumpDaily(u));
   const taskCompletionEnabled =
     options.taskCompletion ?? (options.modelClient ? false : process.env.AGENT_REQUIRE_FINISH_TASK !== "0");
   /**
@@ -992,8 +1010,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   const visionRole = resolveRole("VISION");
   const visionTool = visionRole
     ? createDescribeImageTool({
-        // 计量包裹：视觉调用不经 done/verification 记账路径，只能在客户端边界抓
-        client: meterModelClient(visionRole.provider.client, (u) => growTokens("vision", u)),
+        // 计量包裹：视觉调用不经 done/verification 记账路径，只能在客户端边界抓。
+        // 视觉是独立 client（不在主 modelClient 的日账包裹之内），日账本也在这里喂
+        client: meterModelClient(visionRole.provider.client, (u) => {
+          growTokens("vision", u);
+          bumpDaily(u);
+        }),
         modelName: visionRole.name,
       })
     : null;
@@ -1031,6 +1053,17 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   /** 日预算账本（进程态；宿主重启当日归零，与 /metrics 同边界） */
   let dailyTokens = { day: localDayKey(), used: 0 };
 
+  /** 日账本落账（非 cache_read 口径，与成本告警一致；cache_read 量大价低，
+   * 计入会让长循环任务两小时吃光名义预算，防线沦为噪声）。由 meterModelClient
+   * 按**每次模型调用**喂入——不等段收尾。 */
+  function bumpDaily(u: { inputTokens: number; outputTokens: number; cacheCreationTokens: number }): void {
+    const n = u.inputTokens + u.outputTokens + u.cacheCreationTokens;
+    if (n <= 0) return;
+    const today = localDayKey();
+    if (dailyTokens.day !== today) dailyTokens = { day: today, used: 0 };
+    dailyTokens.used += n;
+  }
+
   /** token 计数累加（AggregateUsage → role 四档）。全部记账路径共用这一个入口 */
   function growTokens(
     role: (typeof TOKEN_ROLES)[number],
@@ -1044,14 +1077,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     grow("output", u.outputTokens);
     grow("cache_read", u.cacheReadTokens);
     grow("cache_creation", u.cacheCreationTokens);
-    // 日预算账本走非 cache_read 口径（与成本告警一致；cache_read 量大价低，
-    // 计入会让长循环任务两小时吃光名义预算，防线沦为噪声）
-    const nonCacheRead = u.inputTokens + u.outputTokens + u.cacheCreationTokens;
-    if (nonCacheRead > 0) {
-      const today = localDayKey();
-      if (dailyTokens.day !== today) dailyTokens = { day: today, used: 0 };
-      dailyTokens.used += nonCacheRead;
-    }
+    // 日账本不在这里累：它由 meterModelClient 逐调用喂入（见 bumpDaily）。
+    // 在这条事件路径上再累一遍就是双计。
   }
 
   function reportHistoryError(error: Error): void {
@@ -2616,17 +2643,20 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    * 只拦**新的执行准入**——在飞 run 永不掐：掐半截既毁产物又不省多少钱。
    * 返回 null = 未启用 / 有余量 / 账本已翻日。
    */
-  function dailyBudgetRefusal(): { used: number; budget: number } | null {
+  function dailyBudgetRefusal(): { used: number; budget: number; now: Date } | null {
     if (dailyTokenBudget === undefined) return null;
-    if (dailyTokens.day !== localDayKey()) return null;
+    // 判定与 Retry-After 计算共用同一个 now：拒绝路径若各取时刻，跨午夜的
+    // 毫秒级竞态会把 Retry-After 指到后天零点（评审点名）
+    const now = new Date();
+    if (dailyTokens.day !== localDayKey(now)) return null;
     return dailyTokens.used >= dailyTokenBudget
-      ? { used: dailyTokens.used, budget: dailyTokenBudget }
+      ? { used: dailyTokens.used, budget: dailyTokenBudget, now }
       : null;
   }
 
-  function rejectAtDailyBudget(res: ServerResponse, info: { used: number; budget: number }): void {
+  function rejectAtDailyBudget(res: ServerResponse, info: { used: number; budget: number; now: Date }): void {
     metrics.budgetRejected += 1;
-    const now = new Date();
+    const now = info.now;
     const midnight = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
     res.setHeader("Retry-After", String(Math.max(1, Math.ceil((midnight.getTime() - now.getTime()) / 1000))));
     json(res, 429, {
@@ -3602,6 +3632,14 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         }
         if (parsed.decision !== "approve" && parsed.decision !== "reject") {
           return badRequest(res, 'decision must be "approve" or "reject"');
+        }
+
+        // 日预算门（评审：签字位是零副作用停点——批准即并行发射全部子任务，
+        // 却曾是唯一不过预算门的执行入口）。只拦 approve：拒绝不花钱，永远可拒。
+        // 429 时计划保持挂起——预算说的是"今天不行"，不是"这个计划不行"。
+        if (parsed.decision === "approve") {
+          const budgetRefusal = dailyBudgetRefusal();
+          if (budgetRefusal) return rejectAtDailyBudget(res, budgetRefusal);
         }
 
         const pendingPlan = run.pendingPlan;
