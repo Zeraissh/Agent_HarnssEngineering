@@ -1934,8 +1934,13 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
     run.status = "done";
     run.finishedAt = Date.now();
-    // 独占资源随收尾释放（release 按 holder 幂等；追问续跑会重新占用）
-    if (run.heldResources?.length) hostResources.release(run.heldResources, run.id);
+    // 独占资源随收尾释放（release 按 holder 幂等；追问续跑会重新占用）。
+    // 释放后清掉字段：留着旧数组会让它的语义从"当前持有"漂成"最后一次持有"，
+    // 后续把它当持有状态读的代码会拿到假数据（评审 de6ddef）
+    if (run.heldResources?.length) {
+      hostResources.release(run.heldResources, run.id);
+      delete run.heldResources;
+    }
     if (endInfo.mainStopReason) run.mainStopReason = endInfo.mainStopReason;
     metrics.runsFinished.set(endInfo.outcome, (metrics.runsFinished.get(endInfo.outcome) ?? 0) + 1);
     if (realHost) {
@@ -2300,8 +2305,13 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
               // 的核查工作量差一个量级，共用一个数就是案例 #8 那个失效
               ...(verifyMaxTurnsOf(sp) !== undefined ? { verifyMaxTurns: verifyMaxTurnsOf(sp)! } : {}),
             },
-            // 独占资源：调度器对同标签子任务强制串行。真机域的探针是全局单件
-            ...(sub.resources ?? sp?.resources ? { resources: sub.resources ?? sp!.resources! } : {}),
+            // 独占资源：调度器对同标签子任务强制串行。真机域的探针是全局单件。
+            // 兜底链含宿主默认包（评审 de6ddef）：planner 漏写/写错 pack 的子任务
+            // 会降级到默认配置执行——工具面照样拿到探针类 MCP 工具，资源声明
+            // 却是空的，等于绕过互斥表。与 single 模式按 admissionPack 占用同口径
+            ...(sub.resources ?? sp?.resources ?? pack?.resources
+              ? { resources: (sub.resources ?? sp?.resources ?? pack?.resources)! }
+              : {}),
           };
         },
         onEvent: (source, event) => {
@@ -3273,6 +3283,13 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           return badRequest(res, 'Missing or invalid "text" field');
         }
         const feedback = parsed.text.trim();
+        // 状态门在 readBody 之前查过一次——await 期间另一条并发 followUp 可能
+        // 已把 run 置回 running。不复查的话同一 AgentLoop 会被两条 continuation
+        // 并发驱动（资源门因同 holder 幂等恰好拦不住），先收尾的一段还会把
+        // 在用探针提前释放（评审 de6ddef 双镜头各自独立抓出的 real-bug）
+        if (!run.archived && run.status === "running") {
+          return json(res, 409, { error: "运行进行中，请等它这一轮结束再追加指令" });
+        }
         // 追问/归档派生同属新的执行准入：日预算门先于并发门（拒因更具体）
         const budgetRefusal = dailyBudgetRefusal();
         if (budgetRefusal) return rejectAtDailyBudget(res, budgetRefusal);

@@ -449,6 +449,39 @@ describe("独占资源互斥（v1.1.1：领域包声明 resources，同标签强
     expect(maxActive()).toBe(1); // 资源互斥生效：无执行窗口重叠
   });
 
+  it("两个 runPlanned 注入同一张表且都缺省 resourceHolder：同名子任务不双占", async () => {
+    // 评审抓出的静默失效陷阱：子任务 id 只在单个计划内唯一（惯例 s1/s2…），
+    // holder 缺省若是常量 "plan"，两个 run 的 s1 拿到相同 holder——tryAcquire
+    // 的同 holder 幂等分支放行，互斥无声瓦解。缺省必须逐实例唯一。
+    const shared = { active: 0, max: 0 };
+    const mkClient = () =>
+      new RoutingClient(async (req) => {
+        if (isVerifierReq(req)) return passVerdict();
+        shared.active += 1;
+        shared.max = Math.max(shared.max, shared.active);
+        await delay(50);
+        shared.active -= 1;
+        return fakeMessage([textBlock("摘要")], "end_turn");
+      });
+    const coordinator = createResourceCoordinator();
+    const opts = {
+      plan: {
+        subtasks: [
+          { id: "s1", title: "S1", description: "任务", acceptance: [], dependsOn: [], resources: ["swd-probe"] },
+        ],
+      },
+      resources: coordinator,
+      // 刻意不传 resourceHolder——锁住缺省值的唯一性
+    };
+    const [a, b] = await Promise.all([
+      runPlanned(baseConfig, mkClient(), "任务A", opts),
+      runPlanned(baseConfig, mkClient(), "任务B", opts),
+    ]);
+    expect(a.completed).toBe(true);
+    expect(b.completed).toBe(true);
+    expect(shared.max).toBe(1); // 双占即红
+  });
+
   it("宿主注入的跨 run 表：资源被外部 holder 持有时等待而非 skip，释放后照常完成", async () => {
     // 审计 high ④ 的调度语义锁：修前"running 空即 break"——被外部资源挡住且
     // 本 run 无在飞任务时子任务会被判 skipped。现在等待 waitForRelease 唤醒。

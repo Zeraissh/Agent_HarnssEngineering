@@ -4262,6 +4262,125 @@ describe("监控闭环：outcome 分档指标与告警文件一致性", () => {
     }
   });
 
+  it("并发双 followUp：readBody 期间 run 被另一条置回 running → 复查 409", async () => {
+    // 评审双镜头独立抓出的 real-bug：状态门在 await readBody 之前查过一次，
+    // await 期间另一条 followUp 把 run 置回 running——不复查的话同一 AgentLoop
+    // 会被两条 continuation 并发驱动，且资源门因同 holder 幂等拦不住。
+    // 竞态窗口用 chunked POST 确定性构造：B 先送请求头（预检通过、停在
+    // readBody 等 body）→ A 完整发出且续跑挂在审批上（status=running）→
+    // 再补 B 的 body——复查点必然看到 running。
+    const model = new FakeModelClient([
+      fakeMessage([textBlock("首轮完成")], "end_turn"),
+      fakeMessage([toolUseBlock("tu_hold2", "hold_op", { op: "x" })], "tool_use"), // A 的续跑挂审批
+    ]);
+    const dir = await mkdtemp(join(tmpdir(), "followup-race-"));
+    const handle = createUiServer({ modelClient: model, tools: [askTool("hold_op")], workdir: dir });
+    try {
+      const port = await startServer(handle);
+      const base = baseUrl(port);
+      const res = await fetch(`${base}/api/runs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task: "t" }),
+      });
+      const { runId } = await res.json();
+      await waitForDone(base, runId);
+
+      // B：只送头，预检（status=done 时）通过后停在 readBody
+      const slow = httpRequest({
+        host: "127.0.0.1",
+        port,
+        path: `/api/runs/${runId}/messages`,
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Transfer-Encoding": "chunked" },
+      });
+      const slowResponse = new Promise<number>((resolveStatus, reject) => {
+        slow.on("response", (r) => {
+          r.resume();
+          resolveStatus(r.statusCode!);
+        });
+        slow.on("error", reject);
+      });
+      slow.flushHeaders();
+      await new Promise((r) => setTimeout(r, 80)); // 让 B 的处理器进入并停在 readBody
+
+      // A：完整发出，续跑同步置 running 并挂在审批上
+      const a = await fetch(`${base}/api/runs/${runId}/messages`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: "先到的一条" }),
+      });
+      expect(a.status).toBe(200);
+
+      // 补 B 的 body：readBody 返回后复查必须抓到 running
+      slow.end(JSON.stringify({ text: "后到的一条" }));
+      expect(await slowResponse).toBe(409);
+    } finally {
+      await handle.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("planner 漏写 pack 的子任务：资源兜底到宿主默认包，不得绕过互斥表", async () => {
+    // 评审抓出的覆盖缺口：无 pack/包名打错的子任务降级到默认配置执行，
+    // 工具面照样拿到探针类工具，资源声明却是空的——等于绕过互斥。
+    // 兜底链补了宿主默认包（与 single 模式按 admissionPack 占用同口径）。
+    const planJson = JSON.stringify({
+      subtasks: [
+        { id: "s1", title: "连板", description: "真机操作", acceptance: ["ok"], dependsOn: [] }, // 刻意无 pack
+      ],
+    });
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("tu_hold3", "probe_op", { op: "hold" })], "tool_use"),
+      fakeMessage([textBlock(["```json", planJson, "```"].join("\n"))], "end_turn"),
+      fakeMessage([textBlock("s1 完成")], "end_turn"),
+      fakeMessage([textBlock(JSON.stringify({ passed: true, issues: [], summary: "通过" }))], "end_turn"),
+    ]);
+    const dirA = await mkdtemp(join(tmpdir(), "plan-fallback-a-"));
+    const dirB = await mkdtemp(join(tmpdir(), "plan-fallback-b-"));
+    const handle = createUiServer({
+      modelClient: model,
+      tools: [askTool("probe_op")],
+      packName: "stm32-debug", // 宿主默认包声明 swd-probe
+      workdir: dirA,
+      workdirs: [dirA, dirB],
+    });
+    try {
+      const port = await startServer(handle);
+      const base = baseUrl(port);
+      const a = await fetch(`${base}/api/runs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task: "占着探针" }),
+      });
+      expect(a.status).toBe(200);
+      const { runId: runA } = await a.json();
+      const b = await fetch(`${base}/api/runs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task: "计划任务", mode: "plan", workdir: dirB }),
+      });
+      const { runId: runB } = await b.json();
+
+      await new Promise((r) => setTimeout(r, 150));
+      const midEvents = await readSSESnapshot(base, runB);
+      expect(
+        midEvents.some((e: any) => String(e.source).startsWith("s1/")),
+        "无 pack 子任务也必须持探针标签等待，不得硬闯",
+      ).toBe(false);
+
+      expect((await fetch(`${base}/api/runs/${runA}/stop`, { method: "POST" })).status).toBe(200);
+      await waitForDone(base, runA);
+      await waitForDone(base, runB);
+      const endEvents = await readSSESnapshot(base, runB);
+      expect(endEvents.some((e: any) => String(e.source).startsWith("s1/"))).toBe(true);
+    } finally {
+      await handle.close();
+      await rm(dirA, { recursive: true, force: true });
+      await rm(dirB, { recursive: true, force: true });
+    }
+  });
+
   it("workdir 独占开关：同 workdir 并发 → 409 附冲突 run；不同 workdir 放行", async () => {
     const model = new FakeModelClient([
       fakeMessage([toolUseBlock("tu_wd", "wd_op", { op: "x" })], "tool_use"),

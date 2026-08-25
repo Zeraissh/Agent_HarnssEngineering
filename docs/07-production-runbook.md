@@ -58,7 +58,8 @@ Exclusive hardware resources (pack-declared tags such as `swd-probe`) are now mu
 **across** runs: a single/verified run acquires its pack's tags at admission and a conflicting new
 run gets 429 naming the holder; plan-mode subtasks acquire tags per subtask through the same
 process-level table and **wait** for a busy tag instead of being skipped — a subtask can therefore
-sit idle while another run holds the probe, which is by design (stop the holding run to release).
+sit idle while another run holds the probe, which is by design (stop the holding run to release);
+after a release, acquisition order among waiters is not first-come-first-served.
 Concurrent runs sharing one workdir are warned in the operational log by default;
 `AGENT_UI_EXCLUSIVE_WORKDIR=1` upgrades that to refusal — give each concurrent run its own workdir
 via `AGENT_UI_WORKDIRS`. Refusals are counted under

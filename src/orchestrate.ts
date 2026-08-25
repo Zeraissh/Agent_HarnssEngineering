@@ -2,6 +2,7 @@
  * L4 — 编排：主 agent 执行 → verifier 核查 → 未通过则带着问题清单返工。
  * 主 loop 与 verifier 共用 systemPrompt/tools（缓存前缀一致），上下文互相隔离。
  */
+import { randomUUID } from "node:crypto";
 import { runClarificationGate, type ClarificationOutcome } from "./clarifier.js";
 import { AgentLoop, createRunBudget } from "./loop.js";
 import {
@@ -298,6 +299,13 @@ function reportFromResult(result: AgentRunResult): string {
  * 是全局单件，无锁并发 = 抢探针事故（case-01 与 windows-taskstop 僵尸风暴实录）。
  * 宿主注入进程级实例即获得跨 run 互斥；本文件的调度器对"被外部 holder 持有"
  * 的资源**等待**而不是把子任务判 skip。
+ *
+ * **死锁自由的结构不变量（演进护栏，改动下面任何一条前先重新论证）**：
+ * ① 等待实体（调度循环）从不持有 tag；② 持有实体从不等待——已发射子任务
+ * 经 finally 释放、single 模式准入是 tryAcquire-or-拒绝、绝不排队；
+ * ③ tryAcquire 整组原子，失败不半占。三条合起来让 wait-for 图中的环必经过
+ * 一个会自行终止的在飞任务，AB-BA 永久互锁不可达。若未来加"执行中途追加
+ * acquire"或"准入排队等待"，这个论证即失效。
  */
 export interface ResourceCoordinator {
   /** 全部 tag 空闲（或已由同一 holder 持有）时原子占用并返回 true；否则 false 且不占任何 tag */
@@ -585,9 +593,12 @@ export async function runPlanned(
       return [s.id, { ...resolved, cfg: { ...resolved.cfg, runBudget: planExecutionBudget } }] as const;
     }),
   );
-  // 资源互斥：宿主注入 = 跨 run；缺省本地实例 = 与旧的函数局部 Set 行为等价
+  // 资源互斥：宿主注入 = 跨 run；缺省本地实例 = 与旧的函数局部 Set 行为等价。
   const coordinator = opts.resources ?? createResourceCoordinator();
-  const holderBase = opts.resourceHolder ?? "plan";
+  // 注入共享表而缺省 holder 时必须生成唯一前缀：子任务 id 只在单个计划内唯一
+  // （planner 惯例 s1/s2…），两个 runPlanned 都缺省 "plan" 会让各自的 s1 拿到
+  // 相同 holder——tryAcquire 的同 holder 幂等分支放行，互斥静默瓦解（评审抓出）
+  const holderBase = opts.resourceHolder ?? (opts.resources ? `plan-${randomUUID()}` : "plan");
   const subHolder = (sub: SubTask): string => `${holderBase}/${sub.id}`;
 
   const forward = makeApprovalSerializer(opts.onEvent);
