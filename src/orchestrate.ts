@@ -322,6 +322,13 @@ export interface PlannedRunOptions {
      */
     resources?: string[];
   };
+  /**
+   * 每轮核查裁决出炉即回调（与 runVerified.onVerification 同义，多带子任务 id）。
+   * 动机（token 计量评审 2026-08-24）：宿主此前只能从返回值的 steps 收尾回扫
+   * 核查 usage——宿主级异常时已完成轮次整体漏记，长 run 期间成本指标到收尾
+   * 才跳变。逐轮回调让 plan 模式与单模式共用同一个记账点。
+   */
+  onVerification?: (subtaskId: string, round: number, outcome: VerifyOutcome) => void | Promise<void>;
   /** 每个子任务的最大返工轮数。默认 1 */
   maxReworks?: number;
   /** 计划就绪回调（在任何子任务执行前触发）：宿主可展示计划、做人工把关 */
@@ -524,6 +531,9 @@ export async function runPlanned(
         // 审批门只管执行/返工——verifier/planner 的 respond 由其内部自答，
         // 排队等宿主应答会死锁（内部自答在 onEvent 返回之后才发生）
         onEvent: (source, event) => forward(`${sub.id}/${source}`, event, source !== "verifier"),
+        ...(opts.onVerification
+          ? { onVerification: (round: number, vo: VerifyOutcome) => opts.onVerification!(sub.id, round, vo) }
+          : {}),
       });
       stepsById.set(sub.id, { sub, result, durationMs: Date.now() - startedAt });
       if (result.finalPassed) {

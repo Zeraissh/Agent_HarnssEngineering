@@ -101,10 +101,40 @@ export const RUN_OUTCOMES = ["completed", "partial", "blocked", "error", "closed
 /**
  * token 计数的角色与档位全集（与 RUN_OUTCOMES 同款纪律：唯一事实源 +
  * /metrics 稳定序列集）。role 按事件来源归并：verifier（含 sN/verifier）→
- * verification，planner → planner，其余（main / 子任务 / clarifier）→ execution。
+ * verification，planner → planner，describe_image 的视觉调用 → vision，
+ * 其余（main / 子任务 / clarifier）→ execution。
  */
-export const TOKEN_ROLES = ["execution", "verification", "planner"] as const;
+export const TOKEN_ROLES = ["execution", "verification", "planner", "vision"] as const;
 export const TOKEN_KINDS = ["input", "output", "cache_read", "cache_creation"] as const;
+
+/**
+ * 把 ModelClient 包成"每次调用把 usage 交给回调"的版本（评审 2026-08-24
+ * real-bug：describe_image 拿到 turn 只取文本，usage 原地丢弃——视觉调用发生
+ * 在工具执行内部，不经 done/verification 任何记账路径，带 base64 图片的
+ * input 动辄数千上万 token，恰是成本告警要抓的对象，却全程隐形）。
+ */
+export function meterModelClient(
+  client: ModelClient,
+  onUsage: (u: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheCreationTokens: number;
+  }) => void,
+): ModelClient {
+  return {
+    send: async (req) => {
+      const turn = await client.send(req);
+      onUsage({
+        inputTokens: turn.usage.input_tokens,
+        outputTokens: turn.usage.output_tokens,
+        cacheReadTokens: turn.usage.cache_read_input_tokens ?? 0,
+        cacheCreationTokens: turn.usage.cache_creation_input_tokens ?? 0,
+      });
+      return turn;
+    },
+  };
+}
 
 /** run 级终止信息，由 startPlainRun/startVerifiedRun 算出后交给 finalizeRun */
 interface RunEndInfo {
@@ -946,7 +976,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    */
   const visionRole = resolveRole("VISION");
   const visionTool = visionRole
-    ? createDescribeImageTool({ client: visionRole.provider.client, modelName: visionRole.name })
+    ? createDescribeImageTool({
+        // 计量包裹：视觉调用不经 done/verification 记账路径，只能在客户端边界抓
+        client: meterModelClient(visionRole.provider.client, (u) => growTokens("vision", u)),
+        modelName: visionRole.name,
+      })
     : null;
   const enabledBuiltinPool = bashEnabled
     ? BUILTIN_POOL
@@ -2190,18 +2224,18 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         onEvent: (source, event) => {
           pushEvent(run, source, event);
         },
+        // 核查成本逐轮记账（子任务 verifier 的 done 被 orchestrate 压掉不经
+        // pushEvent；此前从返回值 steps 收尾回扫——宿主级异常时已完成轮次
+        // 整体漏记，长 run 期间成本指标到收尾才跳变，违背入口记账原则）
+        onVerification: (_subtaskId, _round, vo) => {
+          growTokens("verification", vo.usage);
+        },
       });
 
       const finishedAt = Date.now();
       const stepSum = outcome.steps.reduce((n, st) => n + st.durationMs, 0);
       const subtaskWall = finishedAt - planReadyAt;
       mainStopReason = plannedStopReason(outcome);
-
-      // plan 模式的核查成本：子任务 verifier 的 done 同样被压掉不经 pushEvent，
-      // 从步骤结果逐轮记账（每轮 usage 独立，与单模式 onVerification 同口径）
-      for (const st of outcome.steps) {
-        for (const v of st.result.verifications) growTokens("verification", v.usage);
-      }
 
       // 并行收益的口径必须写清：子任务阶段墙钟排除 planner，"节省"是相对
       // 串行全序和而言的。不标口径的数字等于没有数字。

@@ -28,6 +28,7 @@ import {
   contentTypeOf,
   localPathTarget,
   planGateStopReason,
+  meterModelClient,
   revealCommand,
   runOutcomeForStopReason,
   type UiServerHandle,
@@ -3879,7 +3880,19 @@ describe("监控闭环：outcome 分档指标与告警文件一致性", () => {
     }
   });
 
-  it("token 计量：普通 run 计入 execution 档精确值，12 序列全集在场（含 0）", async () => {
+  /**
+   * /metrics 的 token 序列解析成 Map 后做数值等值断言——不用 toContain：
+   * '} 100' 是 '} 1000' 的前缀，裸子串对十倍类错值静默放行（评审两抓同款缝）。
+   * 字符类含数字与下划线：snake_case 新档被 matchAll 静默跳过的缝同前。
+   */
+  const tokenSeries = (text: string): Map<string, number> =>
+    new Map(
+      [...text.matchAll(/^agent_harness_tokens_total\{role="([a-z0-9_]+)",kind="([a-z0-9_]+)"\} (\d+)$/gm)].map(
+        ([, role, kind, n]) => [`${role}/${kind}`, Number(n)],
+      ),
+    );
+
+  it("token 计量：普通 run 计入 execution 档精确值，16 序列全集在场（含 0）", async () => {
     const dir = await mkdtemp(join(tmpdir(), "metrics-tokens-"));
     const handle = createUiServer({
       modelClient: new FakeModelClient([fakeMessage([textBlock("done")], "end_turn")]),
@@ -3895,15 +3908,15 @@ describe("监控闭环：outcome 分档指标与告警文件一致性", () => {
       });
       const { runId } = await res.json();
       await waitForDone(base, runId);
-      const text = await (await fetch(`${base}/metrics`)).text();
-      // 12 序列全集（3 role × 4 kind）恒在场
-      const series = [...text.matchAll(/^agent_harness_tokens_total\{role="([a-z]+)",kind="([a-z_]+)"\} (\d+)$/gm)];
-      expect(series.length).toBe(12);
-      // FakeModelClient 每轮 usage 固定 100/50——精确断言，多计或漏计都会红
-      expect(text).toContain('agent_harness_tokens_total{role="execution",kind="input"} 100');
-      expect(text).toContain('agent_harness_tokens_total{role="execution",kind="output"} 50');
-      expect(text).toContain('agent_harness_tokens_total{role="verification",kind="input"} 0');
-      expect(text).toContain('agent_harness_tokens_total{role="planner",kind="input"} 0');
+      const series = tokenSeries(await (await fetch(`${base}/metrics`)).text());
+      // 16 序列全集（4 role × 4 kind）恒在场
+      expect(series.size).toBe(16);
+      // FakeModelClient 每轮 usage 固定 100/50——数值等值断言，多计/漏计/十倍错值都红
+      expect(series.get("execution/input")).toBe(100);
+      expect(series.get("execution/output")).toBe(50);
+      expect(series.get("verification/input")).toBe(0);
+      expect(series.get("planner/input")).toBe(0);
+      expect(series.get("vision/input")).toBe(0);
     } finally {
       await handle.close();
       await rm(dir, { recursive: true, force: true });
@@ -3937,15 +3950,78 @@ describe("监控闭环：outcome 分档指标与告警文件一致性", () => {
       });
       const { runId } = await res.json();
       await waitForDone(base, runId);
-      const text = await (await fetch(`${base}/metrics`)).text();
-      expect(text).toContain('agent_harness_tokens_total{role="execution",kind="input"} 200');
-      expect(text).toContain('agent_harness_tokens_total{role="execution",kind="output"} 100');
-      expect(text).toContain('agent_harness_tokens_total{role="verification",kind="input"} 200');
-      expect(text).toContain('agent_harness_tokens_total{role="verification",kind="output"} 100');
+      const series = tokenSeries(await (await fetch(`${base}/metrics`)).text());
+      expect(series.get("execution/input")).toBe(200);
+      expect(series.get("execution/output")).toBe(100);
+      expect(series.get("verification/input")).toBe(200);
+      expect(series.get("verification/output")).toBe(100);
     } finally {
       await handle.close();
       await rm(dir, { recursive: true, force: true });
     }
+  });
+
+  it("token 计量 plan 模式三角色全链路：planner/execution/verification 各归各档", async () => {
+    // 五段脚本（同 v2-17 形状）：planner 拆两步 + s1 执行/裁决 + s2 执行/裁决。
+    // 子任务 verifier 的 done 被 orchestrate 压掉——verification 档只能靠
+    // runPlanned 的 onVerification 逐轮回调接线（评审：此前收尾回扫在宿主级
+    // 异常时整体漏记）。接线断了此锁的 verification 档即为 0。
+    const planJson = JSON.stringify({
+      subtasks: [
+        { id: "s1", title: "第一步", description: "做 A", acceptance: ["A 完成"], dependsOn: [] },
+        { id: "s2", title: "第二步", description: "做 B", acceptance: ["B 完成"], dependsOn: ["s1"] },
+      ],
+    });
+    const pass = () =>
+      fakeMessage([textBlock(JSON.stringify({ passed: true, issues: [], summary: "通过" }))], "end_turn");
+    const model = new FakeModelClient([
+      fakeMessage([textBlock(["```json", planJson, "```"].join("\n"))], "end_turn"),
+      fakeMessage([textBlock("s1 完成")], "end_turn"), pass(),
+      fakeMessage([textBlock("s2 完成")], "end_turn"), pass(),
+    ]);
+    const dir = await mkdtemp(join(tmpdir(), "metrics-tokens-plan-"));
+    const handle = createUiServer({ modelClient: model, workdir: dir });
+    try {
+      const port = await startServer(handle);
+      const base = baseUrl(port);
+      const res = await fetch(`${base}/api/runs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task: "两步任务", mode: "plan" }),
+      });
+      const { runId } = await res.json();
+      await waitForDone(base, runId);
+      const series = tokenSeries(await (await fetch(`${base}/metrics`)).text());
+      expect(series.get("planner/input")).toBe(100);
+      expect(series.get("planner/output")).toBe(50);
+      expect(series.get("execution/input")).toBe(200);
+      expect(series.get("execution/output")).toBe(100);
+      expect(series.get("verification/input")).toBe(200);
+      expect(series.get("verification/output")).toBe(100);
+    } finally {
+      await handle.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("meterModelClient：视觉调用的 usage 被逐次交给回调，turn 原样透传", async () => {
+    // describe_image 的调用在工具执行内部，不经 done/verification 任何记账路径
+    // ——计量只能包在客户端边界（评审 real-bug：turn.usage 此前拿到就扔）
+    const seen: unknown[] = [];
+    const inner = new FakeModelClient([
+      fakeMessage([textBlock("红色")], "end_turn", {
+        input_tokens: 7000,
+        output_tokens: 3,
+        cache_read_input_tokens: 5,
+        cache_creation_input_tokens: 2,
+      }),
+    ]);
+    const metered = meterModelClient(inner, (u) => seen.push(u));
+    const turn = await metered.send({ system: [], messages: [], tools: [], maxTokens: 64 } as any);
+    expect(turn.message.content[0]).toMatchObject({ type: "text", text: "红色" });
+    expect(seen).toEqual([
+      { inputTokens: 7000, outputTokens: 3, cacheReadTokens: 5, cacheCreationTokens: 2 },
+    ]);
   });
 
   it("告警文件：引用的自产指标逐一真实存在；进程死亡告警钉在 job=agent-harness", async () => {

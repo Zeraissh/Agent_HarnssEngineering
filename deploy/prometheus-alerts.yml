@@ -44,12 +44,16 @@ groups:
 
       # 成本告警（审计 2026-08-24 high：token 消耗无跨 run 聚合观测，失控只能
       # 等供应商账单事后发现）。cache_read 刻意排除：长循环每轮重读缓存前缀，
-      # 量大价低，混入会淹没真实成本信号。阈值 2M/h ≈ 默认单 run 预算 500k ×
-      # 4 并发全速烧一小时——按自己账户的限额与模型单价调整。
-      # 口径：计数在每个执行段完成时落账，小时级长段的消耗要到段尾才可见。
+      # 量大价低，混入会淹没真实成本信号；写成 !=（而非三值 allowlist）让未来
+      # 新增的 kind 自动纳入告警，而不是静默漏出。
+      # 阈值 2M/h 是起步值，不是从预算推导的（run 预算的记账口径**含** cache_read，
+      # 与本告警口径不同，不能直接换算）——上线后按 /metrics 实测的非 cache_read
+      # 时增量分布与账户限额校准。
+      # 口径：执行/planner 按段落账、核查按轮落账、视觉按次落账；小时级长段的
+      # 消耗要到段尾才可见。
       - alert: AgentHarnessTokenBurnRate
         expr: >-
-          sum(increase(agent_harness_tokens_total{job="agent-harness",kind=~"input|output|cache_creation"}[1h]))
+          sum(increase(agent_harness_tokens_total{job="agent-harness",kind!="cache_read"}[1h]))
           > 2000000
         labels:
           severity: warning
