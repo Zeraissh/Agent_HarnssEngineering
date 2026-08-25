@@ -62,7 +62,10 @@ Bearer token used by the operator; `/metrics` is authenticated whenever the host
 Name the scrape job exactly `agent-harness` — the process-death alert (`AgentHarnessDown`) matches on
 that job label and stays silent under any other name. Run outcomes are queryable as
 `agent_harness_runs_finished_total{outcome=...}`; the rollback trigger "run errors exceed baseline"
-is backed by the `AgentHarnessRunErrorRatio` alert.
+is backed by the `AgentHarnessRunErrorRatio` alert. Token spend is queryable as
+`agent_harness_tokens_total{role=execution|verification|planner, kind=input|output|cache_read|cache_creation}`
+(accumulated as each segment completes); the `AgentHarnessTokenBurnRate` alert warns when non-cache-read
+tokens exceed 2M per hour — tune that threshold to the account's actual limits and model pricing.
 
 ## Canary and smoke checks
 

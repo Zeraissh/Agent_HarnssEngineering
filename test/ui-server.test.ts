@@ -3879,6 +3879,75 @@ describe("监控闭环：outcome 分档指标与告警文件一致性", () => {
     }
   });
 
+  it("token 计量：普通 run 计入 execution 档精确值，12 序列全集在场（含 0）", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "metrics-tokens-"));
+    const handle = createUiServer({
+      modelClient: new FakeModelClient([fakeMessage([textBlock("done")], "end_turn")]),
+      workdir: dir,
+    });
+    try {
+      const port = await startServer(handle);
+      const base = baseUrl(port);
+      const res = await fetch(`${base}/api/runs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task: "t" }),
+      });
+      const { runId } = await res.json();
+      await waitForDone(base, runId);
+      const text = await (await fetch(`${base}/metrics`)).text();
+      // 12 序列全集（3 role × 4 kind）恒在场
+      const series = [...text.matchAll(/^agent_harness_tokens_total\{role="([a-z]+)",kind="([a-z_]+)"\} (\d+)$/gm)];
+      expect(series.length).toBe(12);
+      // FakeModelClient 每轮 usage 固定 100/50——精确断言，多计或漏计都会红
+      expect(text).toContain('agent_harness_tokens_total{role="execution",kind="input"} 100');
+      expect(text).toContain('agent_harness_tokens_total{role="execution",kind="output"} 50');
+      expect(text).toContain('agent_harness_tokens_total{role="verification",kind="input"} 0');
+      expect(text).toContain('agent_harness_tokens_total{role="planner",kind="input"} 0');
+    } finally {
+      await handle.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("token 计量防双计：verify+返工共 4 段，逐段求和精确等于脚本总量", async () => {
+    // main → verifier(不通过) → 返工续跑 → verifier(通过)：4 段各 100/50。
+    // done 的 usage 若是跨段累计（而非每段独立），execution 会计成 300/150——此锁即红
+    const model = new FakeModelClient([
+      fakeMessage([textBlock("首轮交付")], "end_turn"),
+      fakeMessage(
+        [textBlock(JSON.stringify({ passed: false, issues: ["缺少收尾"], summary: "未通过" }))],
+        "end_turn",
+      ),
+      fakeMessage([textBlock("返工完成")], "end_turn"),
+      fakeMessage(
+        [textBlock(JSON.stringify({ passed: true, issues: [], summary: "通过" }))],
+        "end_turn",
+      ),
+    ]);
+    const dir = await mkdtemp(join(tmpdir(), "metrics-tokens-rework-"));
+    const handle = createUiServer({ modelClient: model, workdir: dir });
+    try {
+      const port = await startServer(handle);
+      const base = baseUrl(port);
+      const res = await fetch(`${base}/api/runs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task: "t", verify: true }),
+      });
+      const { runId } = await res.json();
+      await waitForDone(base, runId);
+      const text = await (await fetch(`${base}/metrics`)).text();
+      expect(text).toContain('agent_harness_tokens_total{role="execution",kind="input"} 200');
+      expect(text).toContain('agent_harness_tokens_total{role="execution",kind="output"} 100');
+      expect(text).toContain('agent_harness_tokens_total{role="verification",kind="input"} 200');
+      expect(text).toContain('agent_harness_tokens_total{role="verification",kind="output"} 100');
+    } finally {
+      await handle.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("告警文件：引用的自产指标逐一真实存在；进程死亡告警钉在 job=agent-harness", async () => {
     const alertsYml = readFileSync(
       fileURLToPath(new URL("../deploy/prometheus-alerts.yml", import.meta.url)),

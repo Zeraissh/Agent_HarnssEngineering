@@ -98,6 +98,14 @@ interface ResolvedApproval {
  */
 export const RUN_OUTCOMES = ["completed", "partial", "blocked", "error", "closed", "rejected"] as const;
 
+/**
+ * token 计数的角色与档位全集（与 RUN_OUTCOMES 同款纪律：唯一事实源 +
+ * /metrics 稳定序列集）。role 按事件来源归并：verifier（含 sN/verifier）→
+ * verification，planner → planner，其余（main / 子任务 / clarifier）→ execution。
+ */
+export const TOKEN_ROLES = ["execution", "verification", "planner"] as const;
+export const TOKEN_KINDS = ["input", "output", "cache_read", "cache_creation"] as const;
+
 /** run 级终止信息，由 startPlainRun/startVerifiedRun 算出后交给 finalizeRun */
 interface RunEndInfo {
   /**
@@ -959,6 +967,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     // 按 outcome 分档（审计 2026-08-24 high：无成败率指标，runbook 的
     // "run errors 超基线即回滚"条款没有任何可查询的数据支撑）
     runsFinished: new Map<RunEndInfo["outcome"], number>(),
+    // token 累计，键 "role/kind"（审计 2026-08-24 high：无跨 run 成本观测）
+    tokens: new Map<string, number>(),
     originRejected: 0,
     authRejected: 0,
     hostRejected: 0,
@@ -967,6 +977,21 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     capacityRejected: 0,
     historyErrors: 0,
   };
+
+  /** token 计数累加（AggregateUsage → role 四档）。全部记账路径共用这一个入口 */
+  function growTokens(
+    role: (typeof TOKEN_ROLES)[number],
+    u: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number },
+  ): void {
+    const grow = (kind: (typeof TOKEN_KINDS)[number], n: number) => {
+      const key = `${role}/${kind}`;
+      metrics.tokens.set(key, (metrics.tokens.get(key) ?? 0) + n);
+    };
+    grow("input", u.inputTokens);
+    grow("output", u.outputTokens);
+    grow("cache_read", u.cacheReadTokens);
+    grow("cache_creation", u.cacheCreationTokens);
+  }
 
   function reportHistoryError(error: Error): void {
     historyHealthy = false;
@@ -1662,6 +1687,17 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       run.verifierHitBudget = true;
     }
 
+    // 成本观测（审计 2026-08-24 high：token 消耗无跨 run 聚合，失控只能等账单）。
+    // 挂在事件入口而非收尾回扫：与上面工具台账同一个理由——续跑让缓冲跨段，
+    // 回扫会把上一段重复计进来；且长任务的消耗按段落账，不必等 run 收尾。
+    // done 的 usage 是每段独立值（loop 每次 run/continuation 各自从零累计），
+    // 逐段求和即真实总量。**归属权分工**：verifier 来源在此显式跳过——它的
+    // done 被 orchestrate 压掉（runVerifierWithEvents），usage 由 onVerification
+    // /plan steps 记账；这里若也记，将来解除压制的那天就是双计的第一天。
+    if (event.type === "done" && event.result.usage && !isVerifierSource(source)) {
+      growTokens(source === "planner" ? "planner" : "execution", event.result.usage);
+    }
+
     // F2: verifier 的 approval_request 不进 pendingApprovals（verifier 内部已自答）
     if (event.type === "approval_request" && !isVerifierSource(source)) {
       /**
@@ -2161,6 +2197,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       const subtaskWall = finishedAt - planReadyAt;
       mainStopReason = plannedStopReason(outcome);
 
+      // plan 模式的核查成本：子任务 verifier 的 done 同样被压掉不经 pushEvent，
+      // 从步骤结果逐轮记账（每轮 usage 独立，与单模式 onVerification 同口径）
+      for (const st of outcome.steps) {
+        for (const v of st.result.verifications) growTokens("verification", v.usage);
+      }
+
       // 并行收益的口径必须写清：子任务阶段墙钟排除 planner，"节省"是相对
       // 串行全序和而言的。不标口径的数字等于没有数字。
       pushSyntheticEvent(run, "host", {
@@ -2254,6 +2296,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         // V-08：逐轮裁决实时透出。只发末轮的话，"为什么要返工"（中间轮的 issues）
         // 在界面上永远看不到
         onVerification: (round, vo) => {
+          // verifier 的 done 不经 pushEvent（被 orchestrate 压掉），核查成本在此记账
+          growTokens("verification", vo.usage);
           pushSyntheticEvent(run, "verifier", {
             type: "verification",
             round,
@@ -2570,6 +2614,13 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       // "出现过才有序列"会让告警在第一次错误前后看到不同的向量形状
       ...RUN_OUTCOMES.map(
         (o) => `agent_harness_runs_finished_total{outcome="${o}"} ${metrics.runsFinished.get(o) ?? 0}`,
+      ),
+      "# TYPE agent_harness_tokens_total counter",
+      // 12 序列全集恒在场（role × kind，含 0），与 runs_finished 六档同一个道理
+      ...TOKEN_ROLES.flatMap((role) =>
+        TOKEN_KINDS.map(
+          (kind) => `agent_harness_tokens_total{role="${role}",kind="${kind}"} ${metrics.tokens.get(`${role}/${kind}`) ?? 0}`,
+        ),
       ),
       "# TYPE agent_harness_security_rejections_total counter",
       `agent_harness_security_rejections_total{reason="origin"} ${metrics.originRejected}`,
