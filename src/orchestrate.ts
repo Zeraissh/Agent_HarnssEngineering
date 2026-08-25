@@ -293,6 +293,67 @@ function reportFromResult(result: AgentRunResult): string {
 
 // ————————————————— 三角编排：planner → executor → verifier —————————————————
 
+/**
+ * 独占资源协调器。tag 是仪器实例级标识（如 "swd-probe"）——真机域的探针/串口
+ * 是全局单件，无锁并发 = 抢探针事故（case-01 与 windows-taskstop 僵尸风暴实录）。
+ * 宿主注入进程级实例即获得跨 run 互斥；本文件的调度器对"被外部 holder 持有"
+ * 的资源**等待**而不是把子任务判 skip。
+ */
+export interface ResourceCoordinator {
+  /** 全部 tag 空闲（或已由同一 holder 持有）时原子占用并返回 true；否则 false 且不占任何 tag */
+  tryAcquire(tags: string[], holder: string): boolean;
+  /** 只释放确属该 holder 的 tag；有实际释放时唤醒 waitForRelease 的等待者 */
+  release(tags: string[], holder: string): void;
+  /** 当前持有者（用于拒绝/等待时的可读诊断） */
+  holderOf(tag: string): string | undefined;
+  /** 下一次任意资源释放时兑现；signal 中止时也兑现（调用方回到循环重新评估） */
+  waitForRelease(signal?: AbortSignal): Promise<void>;
+}
+
+export function createResourceCoordinator(): ResourceCoordinator {
+  const held = new Map<string, string>();
+  const waiters = new Set<() => void>();
+  const wake = (): void => {
+    for (const w of [...waiters]) w();
+    waiters.clear();
+  };
+  return {
+    tryAcquire(tags, holder) {
+      if (tags.some((t) => { const h = held.get(t); return h !== undefined && h !== holder; })) return false;
+      for (const t of tags) held.set(t, holder);
+      return true;
+    },
+    release(tags, holder) {
+      let any = false;
+      for (const t of tags) {
+        if (held.get(t) === holder) {
+          held.delete(t);
+          any = true;
+        }
+      }
+      if (any) wake();
+    },
+    holderOf(tag) {
+      return held.get(tag);
+    },
+    waitForRelease(signal) {
+      if (signal?.aborted) return Promise.resolve();
+      return new Promise((resolve) => {
+        const w = () => {
+          signal?.removeEventListener("abort", onAbort);
+          resolve();
+        };
+        const onAbort = () => {
+          waiters.delete(w);
+          resolve();
+        };
+        waiters.add(w);
+        signal?.addEventListener("abort", onAbort, { once: true });
+      });
+    },
+  };
+}
+
 export interface PlannedRunOptions {
   /** 中止所有尚未结束的澄清/执行子任务；已完成的副作用不回滚。 */
   signal?: AbortSignal;
@@ -369,6 +430,16 @@ export interface PlannedRunOptions {
   plannerProtocol?: "freeform" | "structured";
   /** structured 协议的拆分规则（默认 DEFAULT_SPLIT_RULE：分片≥2 即拆） */
   splitRule?: SplitRule;
+  /**
+   * 资源协调器（审计 2026-08-24 high：独占资源互斥此前只在单个 runPlanned 内
+   * 生效——heldResources 是函数局部变量，两个并发 run 同用 stm32 包会同时抢
+   * 探针）。宿主注入进程级协调器后，互斥升为跨 run；缺省用本地实例，行为与
+   * 旧的函数局部 Set 逐字等价（CLI 路径无跨 run 语义，不受影响）。
+   * 被**外部** holder 持有的资源不会让子任务被 skip——调度器等待释放唤醒。
+   */
+  resources?: ResourceCoordinator;
+  /** 跨 run 表里的 holder 前缀（宿主传 runId）；缺省 "plan" */
+  resourceHolder?: string;
   /**
    * planner 探索预算的显式覆盖（宿主从 AGENT_PLAN_MAX_TURNS 传入）。
    * 缺省时 planner 按包菜单三级解析（包声明取最大 > 默认 12）——见
@@ -514,7 +585,10 @@ export async function runPlanned(
       return [s.id, { ...resolved, cfg: { ...resolved.cfg, runBudget: planExecutionBudget } }] as const;
     }),
   );
-  const heldResources = new Set<string>();
+  // 资源互斥：宿主注入 = 跨 run；缺省本地实例 = 与旧的函数局部 Set 行为等价
+  const coordinator = opts.resources ?? createResourceCoordinator();
+  const holderBase = opts.resourceHolder ?? "plan";
+  const subHolder = (sub: SubTask): string => `${holderBase}/${sub.id}`;
 
   const forward = makeApprovalSerializer(opts.onEvent);
 
@@ -551,26 +625,37 @@ export async function runPlanned(
       })
       .finally(() => {
         running.delete(sub.id);
-        for (const r of sub.resources ?? resolvedById.get(sub.id)!.resources ?? []) heldResources.delete(r);
+        coordinator.release(sub.resources ?? resolvedById.get(sub.id)!.resources ?? [], subHolder(sub));
       });
 
   while (true) {
+    // signal 中止必须在这里显式收敛：被外部资源挡住且无在飞任务时，launch 的
+    // 失败路径没有机会置 aborted，缺这行会在 waitForRelease 上无限等
+    if (opts.signal?.aborted) aborted = true;
+    let blockedOnResources = false;
     if (!aborted) {
       const ready = queue.filter((s) => s.dependsOn.every((d) => passed.has(d)));
       for (const sub of ready) {
         if (running.size >= concurrency) break;
         // 独占资源互斥：与在飞子任务共享任一资源标签的，本轮不发射（资源释放后自然就绪）。
         // 子任务级声明覆盖包级默认（资源是仪器实例级的——双探针场景两个 debug 子任务
-        // 各绑一只探针,包级同标签会误伤真并行）
+        // 各绑一只探针,包级同标签会误伤真并行）。互斥也可能来自宿主表里**别的 run**
+        // ——那种情况没有本地唤醒点，靠 waitForRelease 醒来重试，绝不判 skip
         const resources = sub.resources ?? resolvedById.get(sub.id)!.resources ?? [];
-        if (resources.some((r) => heldResources.has(r))) continue;
-        for (const r of resources) heldResources.add(r);
+        if (resources.length > 0 && !coordinator.tryAcquire(resources, subHolder(sub))) {
+          blockedOnResources = true;
+          continue;
+        }
         queue.splice(queue.indexOf(sub), 1);
         running.set(sub.id, launch(sub));
       }
     }
-    if (running.size === 0) break; // 无在飞：全部完成，或失败/依赖不满足使调度停止
-    await Promise.race(running.values());
+    // 只有"无在飞且不在等资源"才是调度终点——外部持有的资源不构成 skip 理由
+    if (running.size === 0 && !(blockedOnResources && !aborted)) break;
+    await Promise.race([
+      ...running.values(),
+      ...(blockedOnResources ? [coordinator.waitForRelease(opts.signal)] : []),
+    ]);
   }
   if (schedulerError) throw schedulerError;
 

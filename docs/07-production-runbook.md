@@ -54,6 +54,16 @@ cache pruning and machine changes, which is what makes the rollback procedure be
 7. Open `https://<public-host>/?access_token=<token>` once. The host exchanges it for an HttpOnly,
    SameSite cookie and redirects to a clean URL.
 
+Exclusive hardware resources (pack-declared tags such as `swd-probe`) are now mutually exclusive
+**across** runs: a single/verified run acquires its pack's tags at admission and a conflicting new
+run gets 429 naming the holder; plan-mode subtasks acquire tags per subtask through the same
+process-level table and **wait** for a busy tag instead of being skipped — a subtask can therefore
+sit idle while another run holds the probe, which is by design (stop the holding run to release).
+Concurrent runs sharing one workdir are warned in the operational log by default;
+`AGENT_UI_EXCLUSIVE_WORKDIR=1` upgrades that to refusal — give each concurrent run its own workdir
+via `AGENT_UI_WORKDIRS`. Refusals are counted under
+`agent_harness_security_rejections_total{reason="resource"|"workdir"}`.
+
 Remote listeners fail to start without authentication and a declared TLS boundary. Bash is removed
 from the remote tool surface by default. Enabling it requires the separate
 `AGENT_UI_ALLOW_REMOTE_EXECUTION=1` acknowledgement and an OS/container isolation review.

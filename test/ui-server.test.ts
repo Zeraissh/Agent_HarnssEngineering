@@ -4157,6 +4157,157 @@ describe("监控闭环：outcome 分档指标与告警文件一致性", () => {
     }
   });
 
+  it("跨 run 资源互斥：stm32 包的探针被在飞 run 持有 → 429 附持有者；stop 释放后放行", async () => {
+    // 审计 high ④：互斥此前只在单个 runPlanned 内生效——两个并发 run 同用
+    // stm32 包会同时抢探针。run A 挂在工具审批上保持 running（准入时已按包
+    // 声明整体占用 swd-probe）；B 同包创建被 429；stop A 触发 finalize 释放。
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("tu_probe", "probe_op", { op: "read" })], "tool_use"),
+      fakeMessage([textBlock("done")], "end_turn"),
+    ]);
+    const dir = await mkdtemp(join(tmpdir(), "resource-mutex-"));
+    const handle = createUiServer({ modelClient: model, tools: [askTool("probe_op")], workdir: dir });
+    try {
+      const port = await startServer(handle);
+      const base = baseUrl(port);
+      const create = () =>
+        fetch(`${base}/api/runs`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ task: "t", pack: "stm32-debug" }),
+        });
+      const first = await create();
+      expect(first.status).toBe(200);
+      const { runId: runA } = await first.json();
+
+      const refused = await create();
+      expect(refused.status).toBe(429);
+      const body = (await refused.json()) as any;
+      expect(body.resource).toBe("swd-probe");
+      expect(body.heldBy).toBe(runA);
+      const metricsText = await (await fetch(`${base}/metrics`)).text();
+      expect(metricsText).toMatch(/^agent_harness_security_rejections_total\{reason="resource"\} 1$/m);
+
+      expect((await fetch(`${base}/api/runs/${runA}/stop`, { method: "POST" })).status).toBe(200);
+      await waitForDone(base, runA);
+
+      const second = await create();
+      expect(second.status).toBe(200);
+      const { runId: runB } = await second.json();
+      await waitForDone(base, runB);
+    } finally {
+      await handle.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("plan 模式子任务对别的 run 持有的探针等待而非 skip：stop 持有者后照常完成", async () => {
+    // 锁宿主接线（resources: hostResources 注入 runPlanned）：调度器的等待语义
+    // 在 orchestrate 层已有锁，这里锁"宿主真的把跨 run 表递了进去"。
+    const planJson = JSON.stringify({
+      subtasks: [
+        { id: "s1", title: "连板", description: "真机操作", acceptance: ["ok"], dependsOn: [], pack: "stm32-debug" },
+      ],
+    });
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("tu_hold", "probe_op", { op: "hold" })], "tool_use"), // run A 挂审批持探针
+      fakeMessage([textBlock(["```json", planJson, "```"].join("\n"))], "end_turn"), // run B planner
+      fakeMessage([textBlock("s1 完成")], "end_turn"), // s1 执行（A 释放后才会被消费）
+      fakeMessage([textBlock(JSON.stringify({ passed: true, issues: [], summary: "通过" }))], "end_turn"),
+    ]);
+    const dirA = await mkdtemp(join(tmpdir(), "plan-mutex-a-"));
+    const dirB = await mkdtemp(join(tmpdir(), "plan-mutex-b-"));
+    const handle = createUiServer({
+      modelClient: model,
+      tools: [askTool("probe_op")],
+      workdir: dirA,
+      workdirs: [dirA, dirB],
+    });
+    try {
+      const port = await startServer(handle);
+      const base = baseUrl(port);
+      const a = await fetch(`${base}/api/runs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task: "占着探针", pack: "stm32-debug" }),
+      });
+      const { runId: runA } = await a.json();
+      const b = await fetch(`${base}/api/runs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task: "计划任务", mode: "plan", workdir: dirB }),
+      });
+      expect(b.status).toBe(200); // plan 模式创建不整体占资源——按子任务粒度管
+      const { runId: runB } = await b.json();
+
+      // 给调度器时间走到 s1：s1 必须在等待（零 s1/ 前缀事件），而不是被 skip 或硬闯
+      await new Promise((r) => setTimeout(r, 150));
+      const midEvents = await readSSESnapshot(base, runB);
+      expect(
+        midEvents.some((e: any) => String(e.source).startsWith("s1/")),
+        "探针被 run A 持有期间 s1 不得发射",
+      ).toBe(false);
+
+      expect((await fetch(`${base}/api/runs/${runA}/stop`, { method: "POST" })).status).toBe(200);
+      await waitForDone(base, runA);
+      await waitForDone(base, runB);
+      const endEvents = await readSSESnapshot(base, runB);
+      expect(endEvents.some((e: any) => String(e.source).startsWith("s1/"))).toBe(true);
+      const result = endEvents.find((e: any) => e.event.type === "plan_result") as any;
+      expect(result.event.steps.map((st: any) => st.id)).toEqual(["s1"]); // 没有被 skip
+    } finally {
+      await handle.close();
+      await rm(dirA, { recursive: true, force: true });
+      await rm(dirB, { recursive: true, force: true });
+    }
+  });
+
+  it("workdir 独占开关：同 workdir 并发 → 409 附冲突 run；不同 workdir 放行", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("tu_wd", "wd_op", { op: "x" })], "tool_use"),
+      fakeMessage([textBlock("done")], "end_turn"),
+    ]);
+    const dirA = await mkdtemp(join(tmpdir(), "wd-excl-a-"));
+    const dirB = await mkdtemp(join(tmpdir(), "wd-excl-b-"));
+    const handle = createUiServer({
+      modelClient: model,
+      tools: [askTool("wd_op")],
+      workdir: dirA,
+      workdirs: [dirA, dirB],
+      exclusiveWorkdir: true,
+    });
+    try {
+      const port = await startServer(handle);
+      const base = baseUrl(port);
+      const create = (workdir?: string) =>
+        fetch(`${base}/api/runs`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ task: "t", ...(workdir ? { workdir } : {}) }),
+        });
+      const first = await create();
+      expect(first.status).toBe(200);
+      const { runId: runA } = await first.json();
+
+      // 同 workdir → 409 且指认冲突 run
+      const refused = await create();
+      expect(refused.status).toBe(409);
+      expect(((await refused.json()) as any).conflictRunId).toBe(runA);
+      const metricsText = await (await fetch(`${base}/metrics`)).text();
+      expect(metricsText).toMatch(/^agent_harness_security_rejections_total\{reason="workdir"\} 1$/m);
+
+      // 不同 workdir → 放行并跑完
+      const other = await create(dirB);
+      expect(other.status).toBe(200);
+      const { runId: runC } = await other.json();
+      await waitForDone(base, runC);
+    } finally {
+      await handle.close();
+      await rm(dirA, { recursive: true, force: true });
+      await rm(dirB, { recursive: true, force: true });
+    }
+  });
+
   it("meterModelClient：视觉调用的 usage 被逐次交给回调，turn 原样透传", async () => {
     // describe_image 的调用在工具执行内部，不经 done/verification 任何记账路径
     // ——计量只能包在客户端边界（评审 real-bug：turn.usage 此前拿到就扔）

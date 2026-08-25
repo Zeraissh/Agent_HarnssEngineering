@@ -15,6 +15,7 @@ import {
   runPlanned,
   plannedStopReason,
   planParallelWidth,
+  createResourceCoordinator,
   AUTO_CONCURRENCY_CAP,
   type VerifiedRunResult,
 } from "../src/orchestrate.js";
@@ -173,6 +174,12 @@ interface StoredRun {
   segmentIndex: number;
   /** 核查运行的完整结果（含 executionUsage / reworks / 全部裁决），run_end 用 */
   outcome?: VerifiedRunResult;
+  /**
+   * 本 run（single/verified 模式）在宿主级资源表里整体持有的独占标签——
+   * 准入时按包声明占用，finalize 释放。plan 模式不走这里：资源按子任务
+   * 粒度由调度器经同一张表管理。
+   */
+  heldResources?: string[];
   /** 最终交付那一段的终止原因，列表接口直接读（不必等客户端订阅） */
   mainStopReason?: string;
   /**
@@ -402,6 +409,12 @@ export interface UiServerOptions {
    * 进程态计数：宿主重启当日账本归零（与 /metrics 同边界，runbook 已写明）。
    */
   dailyTokenBudget?: number;
+  /**
+   * 同 workdir 并发 run 时拒绝新准入（缺省只在运维日志告警）。
+   * workdir 同时是写入圈禁边界，两个并发 run 互踩产物是静默数据损坏。
+   * env: AGENT_UI_EXCLUSIVE_WORKDIR=1（仅 realHost 读取）。
+   */
+  exclusiveWorkdir?: boolean;
   /** 内存中保留的运行（含事件/正文）上限；磁盘历史仍按 historyKeep 独立保留。 */
   maxStoredRuns?: number;
   /** 单一远端地址每分钟可发出的 POST 数；真实宿主默认 120。 */
@@ -915,6 +928,18 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     throw new Error("dailyTokenBudget must be a non-negative integer (0 = closed for today)");
   }
   const dailyTokenBudget = dailyTokenBudgetInput;
+  /**
+   * 跨 run 独占资源表（审计 2026-08-24 high ④：互斥此前只在单个 runPlanned 内
+   * 生效，两个并发 run 同用 stm32 包会同时抢探针——case-01 僵尸风暴的形态）。
+   * single/verified 模式按包声明在准入时整体占用；plan 模式把这张表注入调度器，
+   * 子任务粒度互斥、被外部持有时等待而非 skip。
+   */
+  const hostResources = createResourceCoordinator();
+  // 同 workdir 并发 run：workdir 同时是写入圈禁边界，互踩是静默数据损坏。
+  // 缺省告警（现状兼容），AGENT_UI_EXCLUSIVE_WORKDIR=1 升为拒绝。env 只武装
+  // realHost（仪器纪律同日预算）。
+  const exclusiveWorkdir =
+    options.exclusiveWorkdir ?? (realHost && process.env.AGENT_UI_EXCLUSIVE_WORKDIR === "1");
   const mutationRateLimitPerMinute = positiveInteger(
     options.mutationRateLimitPerMinute,
     "mutationRateLimitPerMinute",
@@ -1041,6 +1066,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     // token 累计，键 "role/kind"（审计 2026-08-24 high：无跨 run 成本观测）
     tokens: new Map<string, number>(),
     budgetRejected: 0,
+    resourceRejected: 0,
+    workdirRejected: 0,
     originRejected: 0,
     authRejected: 0,
     hostRejected: 0,
@@ -1907,6 +1934,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
     run.status = "done";
     run.finishedAt = Date.now();
+    // 独占资源随收尾释放（release 按 holder 幂等；追问续跑会重新占用）
+    if (run.heldResources?.length) hostResources.release(run.heldResources, run.id);
     if (endInfo.mainStopReason) run.mainStopReason = endInfo.mainStopReason;
     metrics.runsFinished.set(endInfo.outcome, (metrics.runsFinished.get(endInfo.outcome) ?? 0) + 1);
     if (realHost) {
@@ -2284,6 +2313,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         onVerification: (_subtaskId, _round, vo) => {
           growTokens("verification", vo.usage);
         },
+        // 跨 run 资源互斥：把宿主表注入调度器——子任务粒度互斥，被别的 run
+        // 持有时等待而非 skip；holder 前缀 = runId，冲突诊断可读
+        resources: hostResources,
+        resourceHolder: run.id,
       });
 
       const finishedAt = Date.now();
@@ -2654,6 +2687,70 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       : null;
   }
 
+  /**
+   * 独占资源准入（single/verified 模式）：包声明的资源被别的 run 持有 → 429
+   * 附持有者；全部空闲 → 以 runId 为 holder 整体占用。plan 模式不走这里。
+   * 返回 null 表示已占用成功（或无资源要占）。
+   */
+  function acquireRunResources(
+    res: ServerResponse,
+    runId: string,
+    tags: string[],
+  ): "acquired" | "refused" {
+    if (tags.length === 0 || hostResources.tryAcquire(tags, runId)) return "acquired";
+    const conflict = tags.find((t) => {
+      const h = hostResources.holderOf(t);
+      return h !== undefined && h !== runId;
+    })!;
+    metrics.resourceRejected += 1;
+    json(res, 429, {
+      error:
+        `Exclusive resource "${conflict}" is held by run ${hostResources.holderOf(conflict)}. ` +
+        "Wait for that run to finish (or stop it), then retry.",
+      resource: conflict,
+      heldBy: hostResources.holderOf(conflict),
+    });
+    return "refused";
+  }
+
+  /** 与目标 workdir 相同的在飞 run（resolve 后精确比对，口径同白名单校验） */
+  function runningWorkdirConflict(targetWorkdir: string, excludeRunId?: string): StoredRun | undefined {
+    const target = resolve(targetWorkdir);
+    for (const r of runs.values()) {
+      if (r.status !== "running" || r.id === excludeRunId) continue;
+      if (resolve(r.workdir ?? workdir) === target) return r;
+    }
+    return undefined;
+  }
+
+  /** 同 workdir 并发：exclusive 时 409 拒绝（返回 true 表示已拒），否则告警放行 */
+  function refuseOrWarnSharedWorkdir(
+    res: ServerResponse,
+    runId: string,
+    targetWorkdir: string,
+    excludeRunId?: string,
+  ): boolean {
+    const conflict = runningWorkdirConflict(targetWorkdir, excludeRunId);
+    if (!conflict) return false;
+    if (exclusiveWorkdir) {
+      metrics.workdirRejected += 1;
+      json(res, 409, {
+        error:
+          `Workdir is in use by running run ${conflict.id}. Concurrent runs sharing a workdir ` +
+          "can silently overwrite each other's artifacts; give each run its own workdir " +
+          "(AGENT_UI_WORKDIRS) or wait for the other run.",
+        conflictRunId: conflict.id,
+      });
+      return true;
+    }
+    operationalLog("warn", "workdir_shared", {
+      runId,
+      conflictRunId: conflict.id,
+      workdir: resolve(targetWorkdir),
+    });
+    return false;
+  }
+
   function rejectAtDailyBudget(res: ServerResponse, info: { used: number; budget: number; now: Date }): void {
     metrics.budgetRejected += 1;
     const now = info.now;
@@ -2748,6 +2845,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       `agent_harness_security_rejections_total{reason="rate"} ${metrics.rateRejected}`,
       `agent_harness_security_rejections_total{reason="capacity"} ${metrics.capacityRejected}`,
       `agent_harness_security_rejections_total{reason="budget"} ${metrics.budgetRejected}`,
+      `agent_harness_security_rejections_total{reason="resource"} ${metrics.resourceRejected}`,
+      `agent_harness_security_rejections_total{reason="workdir"} ${metrics.workdirRejected}`,
       "# TYPE agent_harness_daily_tokens_used gauge",
       // 非 cache_read 口径的当日消耗（本地日界；进程重启归零）。配了日预算时
       // 运维靠它直读余量，没配时它就是当日烧量的直接读数
@@ -3193,6 +3292,14 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
             const id = randomUUID();
             const rootRunId = run.rootRunId ?? run.id;
+            // 派生子 run 是新的执行：独占资源与 workdir 冲突同样过门
+            const childPack = run.packName ? getPack(run.packName) : pack;
+            const childResources = childPack?.resources ?? [];
+            if (acquireRunResources(res, id, childResources) === "refused") return;
+            if (refuseOrWarnSharedWorkdir(res, id, run.workdir ?? workdir, run.id)) {
+              hostResources.release(childResources, id);
+              return;
+            }
             const child: StoredRun = {
               id,
               // 子 run 仍是同一项任务；新增指令由 user_message 事件精确记录。
@@ -3221,6 +3328,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
               ...(run.rubric ? { rubric: run.rubric } : {}),
               ...(run.workdir ? { workdir: resolve(run.workdir) } : { workdir }),
               ...(run.askUser ? { askUser: true } : {}),
+              ...(childResources.length ? { heldResources: childResources } : {}),
             };
             if (historyRoot) {
               child.archiveWriter = createArchiveWriter(id);
@@ -3251,6 +3359,20 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           }
         }
 
+        // 追问续跑重启执行：finalize 时已释放的资源要重新占——否则另一个持有
+        // 同资源的 run 与本次续跑会同时上探针
+        const resumePack = run.packName ? getPack(run.packName) : pack;
+        const resumeResources = run.mode === "plan" ? [] : (resumePack?.resources ?? []);
+        if (acquireRunResources(res, run.id, resumeResources) === "refused") {
+          releaseAdmission();
+          return;
+        }
+        if (refuseOrWarnSharedWorkdir(res, run.id, run.workdir ?? workdir, run.id)) {
+          hostResources.release(resumeResources, run.id);
+          releaseAdmission();
+          return;
+        }
+        if (resumeResources.length) run.heldResources = resumeResources;
         // startContinuation 在第一个 await 之前就把轮数加过了，这里不能再 +1
         void startContinuation(run, feedback);
         releaseAdmission();
@@ -3539,9 +3661,21 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         const askUser = parsed.askUser === true;
         const budgetRefusal = dailyBudgetRefusal();
         if (budgetRefusal) return rejectAtDailyBudget(res, budgetRefusal);
-        const releaseAdmission = acquireRunAdmission();
-        if (!releaseAdmission) return rejectAtCapacity(res);
         const id = randomUUID();
+        // 跨 run 独占资源：single/verified 按包声明在准入时整体占用；
+        // plan 模式由调度器经同一张宿主表按子任务粒度管理，此处不占
+        const admissionPack = parsed.pack ? getPack(parsed.pack) : pack;
+        const packResources = parsed.mode === "plan" ? [] : (admissionPack?.resources ?? []);
+        if (acquireRunResources(res, id, packResources) === "refused") return;
+        if (refuseOrWarnSharedWorkdir(res, id, runWorkdir ?? workdir)) {
+          hostResources.release(packResources, id);
+          return;
+        }
+        const releaseAdmission = acquireRunAdmission();
+        if (!releaseAdmission) {
+          hostResources.release(packResources, id);
+          return rejectAtCapacity(res);
+        }
         const run: StoredRun = {
           id,
           task: parsed.task,
@@ -3568,6 +3702,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           ...(parsed.usePlannerModel === false ? { usePlannerModel: false } : {}),
           ...(parsed.planGate === true ? { planGate: true } : {}),
           ...(askUser ? { askUser: true } : {}),
+          ...(packResources.length ? { heldResources: packResources } : {}),
         };
         // B2：建档要在第一条事件之前——writer 的写入链从 mkdir 开始保序
         if (historyRoot) {

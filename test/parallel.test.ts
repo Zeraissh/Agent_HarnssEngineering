@@ -14,7 +14,7 @@ import {
   parseShardInventory,
   type ShardInventory,
 } from "../src/planner.js";
-import { planParallelWidth, runPlanned } from "../src/orchestrate.js";
+import { createResourceCoordinator, planParallelWidth, runPlanned } from "../src/orchestrate.js";
 import type { ModelClient, ModelRequest, ModelTurn, Tool } from "../src/types.js";
 import { fakeMessage, textBlock, toolUseBlock } from "./helpers.js";
 
@@ -449,6 +449,28 @@ describe("独占资源互斥（v1.1.1：领域包声明 resources，同标签强
     expect(maxActive()).toBe(1); // 资源互斥生效：无执行窗口重叠
   });
 
+  it("宿主注入的跨 run 表：资源被外部 holder 持有时等待而非 skip，释放后照常完成", async () => {
+    // 审计 high ④ 的调度语义锁：修前"running 空即 break"——被外部资源挡住且
+    // 本 run 无在飞任务时子任务会被判 skipped。现在等待 waitForRelease 唤醒。
+    const { client, opts } = makeResourceFixture({ a: ["swd-probe"], b: [] });
+    const coordinator = createResourceCoordinator();
+    expect(coordinator.tryAcquire(["swd-probe"], "other-run")).toBe(true);
+    const externalRelease = (async () => {
+      await delay(200);
+      coordinator.release(["swd-probe"], "other-run");
+    })();
+    const outcome = await runPlanned(baseConfig, client, "总任务", {
+      ...opts,
+      resources: coordinator,
+      resourceHolder: "this-run",
+    });
+    await externalRelease;
+    expect(outcome.completed).toBe(true);
+    expect(outcome.skipped).toHaveLength(0);
+    // 用完归还：宿主表上不残留本 run 的持有
+    expect(coordinator.holderOf("swd-probe")).toBeUndefined();
+  });
+
   it("异资源：并发不受影响（重叠恢复）", async () => {
     const { client, opts, maxActive } = makeResourceFixture({ a: ["probe-1"], b: ["probe-2"] });
     const outcome = await runPlanned(baseConfig, client, "总任务", opts);
@@ -504,5 +526,39 @@ describe("子任务级资源覆盖（双探针场景：同包不同仪器实例�
     expect(p).toBeDefined();
     expect(p!.subtasks[0]!.resources).toEqual(["r1"]);
     expect(p!.subtasks[1]!.resources).toBeUndefined();
+  });
+});
+
+describe("ResourceCoordinator：占用/释放/唤醒语义", () => {
+  it("tryAcquire 原子性：任一 tag 被他人持有则整体失败且不占任何 tag；同 holder 幂等", () => {
+    const c = createResourceCoordinator();
+    expect(c.tryAcquire(["a", "b"], "h1")).toBe(true);
+    expect(c.tryAcquire(["b", "c"], "h2")).toBe(false);
+    expect(c.holderOf("c")).toBeUndefined(); // 失败不得半占
+    expect(c.tryAcquire(["a", "b"], "h1")).toBe(true); // 同 holder 重入
+  });
+
+  it("release 只释放确属该 holder 的 tag；有实际释放才唤醒等待者", async () => {
+    const c = createResourceCoordinator();
+    c.tryAcquire(["a"], "h1");
+    let woke = false;
+    const wait = c.waitForRelease().then(() => { woke = true; });
+    c.release(["a"], "h2"); // 别人的 release 不生效
+    await delay(10);
+    expect(c.holderOf("a")).toBe("h1");
+    expect(woke).toBe(false);
+    c.release(["a"], "h1");
+    await wait;
+    expect(woke).toBe(true);
+    expect(c.holderOf("a")).toBeUndefined();
+  });
+
+  it("waitForRelease 在 signal 中止时也兑现（调用方回到循环重新评估，不挂死）", async () => {
+    const c = createResourceCoordinator();
+    c.tryAcquire(["a"], "h1");
+    const ac = new AbortController();
+    const wait = c.waitForRelease(ac.signal);
+    ac.abort();
+    await wait; // 不超时即通过
   });
 });
