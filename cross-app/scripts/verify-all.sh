@@ -17,9 +17,11 @@ npm run build
 echo '==> 3/7 node --check app.js'
 node --check app.js
 
-echo '==> 4/7 node --check electron/main.cjs && node --check electron/preload.cjs'
+echo '==> 4/7 node --check electron/main.cjs + preload.cjs + host-launcher.cjs'
 node --check electron/main.cjs
 node --check electron/preload.cjs
+node --check electron/host-launcher.cjs
+node --check electron/workspace-store.cjs
 
 echo '==> 5/7 npx cap sync android'
 npx cap sync android

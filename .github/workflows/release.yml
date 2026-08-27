@@ -28,6 +28,8 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci --ignore-scripts
+      - name: Verify tag and package version match
+        run: test "${GITHUB_REF_NAME}" = "v$(node -p "require('./package.json').version")"
       - run: npm audit
       - run: npm run typecheck
       - run: npm test
@@ -41,15 +43,58 @@ jobs:
         working-directory: cross-app
       - run: npm run build
         working-directory: cross-app
+      - run: npm run host:stage
+        working-directory: cross-app
       - run: node --check electron/main.cjs
         working-directory: cross-app
 
-  image:
+  desktop-windows:
     needs: gate
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+      CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            cross-app/package-lock.json
+      - run: npm ci --ignore-scripts
+      - run: npm ci --ignore-scripts
+        working-directory: cross-app
+      - name: Build signed Windows installer
+        run: npm run desktop:dist
+        working-directory: cross-app
+      - name: Verify Authenticode signature
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem -LiteralPath cross-app/dist-electron -Filter '*-setup.exe' | Select-Object -First 1
+          if (-not $installer) { throw 'Windows installer was not produced' }
+          $signature = Get-AuthenticodeSignature -LiteralPath $installer.FullName
+          if ($signature.Status -ne 'Valid') { throw "Invalid Authenticode signature: $($signature.Status)" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-harness-windows
+          path: |
+            cross-app/dist-electron/*-setup.exe
+            cross-app/dist-electron/*.blockmap
+          if-no-files-found: error
+
+  image:
+    needs: [gate, desktop-windows]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: agent-harness-windows
+          path: desktop-artifact
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
@@ -96,4 +141,4 @@ jobs:
             echo "同镜像的可读 tag：\`${IMAGE}:${IMG_TAG}\`（tag 可被覆盖，生产部署一律用上面的 digest 引用）。"
             echo "发布门禁（typecheck / 单测 / build / pack 白名单 / cross-app / audit）在本 workflow 的 gate job 全过后才构建镜像。"
           } > release-notes.md
-          gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --notes-file release-notes.md
+          gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --notes-file release-notes.md desktop-artifact/*

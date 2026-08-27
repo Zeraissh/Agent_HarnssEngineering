@@ -421,6 +421,8 @@ export interface UiServerOptions {
   mutationRateLimitPerMinute?: number;
   /** 优雅关停等待历史/MCP/连接的最长时间。 */
   shutdownTimeoutMs?: number;
+  /** SSE 注释心跳间隔；防止反向代理在长模型空窗中回收连接。 */
+  sseHeartbeatMs?: number;
   /** 是否把任意命令执行工具装进工具面；远程宿主应由 launcher 默认关闭。 */
   enableBash?: boolean;
   /** 只在宿主确实位于可信反向代理之后时读取 X-Forwarded-Proto/Host。 */
@@ -948,6 +950,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   const shutdownTimeoutMs = positiveInteger(options.shutdownTimeoutMs, "shutdownTimeoutMs")
     ?? positiveIntegerEnv("AGENT_UI_SHUTDOWN_TIMEOUT_MS")
     ?? 5_000;
+  const sseHeartbeatMs = positiveInteger(options.sseHeartbeatMs, "sseHeartbeatMs")
+    ?? positiveIntegerEnv("AGENT_UI_SSE_HEARTBEAT_MS")
+    ?? 15_000;
   const bashEnabled = options.enableBash ?? (realHost ? process.env.AGENT_UI_ENABLE_BASH !== "0" : true);
   const trustProxy = options.trustProxy ?? (realHost && process.env.AGENT_UI_TRUST_PROXY === "1");
 
@@ -2465,11 +2470,28 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   }
 
   /** SSE 事件流：先重放缓冲，再实时推送 */
+  function keepSseAlive(req: IncomingMessage, res: ServerResponse, onClose: () => void): void {
+    const timer = setInterval(() => {
+      if (!res.writableEnded && !res.destroyed) res.write(": heartbeat\n\n");
+    }, sseHeartbeatMs);
+    timer.unref?.();
+    let closed = false;
+    const cleanup = () => {
+      if (closed) return;
+      closed = true;
+      clearInterval(timer);
+      onClose();
+    };
+    req.once("close", cleanup);
+    res.once("close", cleanup);
+  }
+
   function serveSSE(req: IncomingMessage, res: ServerResponse, run: StoredRun): void {
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
       Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
     });
 
     // 断点续传：浏览器重连时自带 Last-Event-ID，只补发缺口而非整条重放。
@@ -2492,9 +2514,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     run.sseClients.add(res);
 
     // 客户端断开时清理
-    req.on("close", () => {
-      run.sseClients.delete(res);
-    });
+    keepSseAlive(req, res, () => run.sseClients.delete(res));
   }
 
   /**
@@ -3590,6 +3610,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           "Content-Type": "text/event-stream",
           "Cache-Control": "no-cache",
           Connection: "keep-alive",
+          "X-Accel-Buffering": "no",
         });
         // 先发一份当前快照，订阅者不必再额外拉一次 /api/runs
         res.write(
@@ -3599,9 +3620,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           })}\n\n`,
         );
         lifecycleClients.add(res);
-        req.on("close", () => {
-          lifecycleClients.delete(res);
-        });
+        keepSseAlive(req, res, () => lifecycleClients.delete(res));
         return;
       }
 

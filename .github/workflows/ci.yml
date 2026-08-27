@@ -46,6 +46,7 @@ jobs:
       - run: npm audit
       - run: npm test
       - run: npm run build
+      - run: npm run host:stage
       - run: node --check electron/main.cjs
 
   container:

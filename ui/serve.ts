@@ -12,6 +12,7 @@
  *   AGENT_UI_ALLOW_INSECURE_HTTP=1  显式接受远程明文风险（生产不建议）
  *   AGENT_UI_ALLOWED_ORIGINS      精确跨源白名单，逗号分隔
  *   AGENT_UI_ALLOW_REMOTE_EXECUTION=1  非 loopback 时显式装回 bash（默认移除）
+ *   AGENT_UI_SSE_HEARTBEAT_MS  SSE 心跳间隔，默认 15000ms
  *   AGENT_UI_WORKDIR       默认工作目录（工具圈禁根），默认 process.cwd()
  *   AGENT_UI_WORKDIRS      逐 run 可选的工作目录白名单（路径分隔符分隔）。
  *                          workdir 同时是工具的写入圈禁边界,所以合法集合由宿主
@@ -29,6 +30,12 @@ import { delimiter } from "node:path";
 import { createUiServer } from "./server.js";
 import { accessHintLine, resolveUiLaunchPolicy } from "./production.js";
 import { warnEnvConflicts } from "../src/env-check.js";
+
+// 桌面壳（cross-app/electron）用 ELECTRON_RUN_AS_NODE=1 拉起本进程；这个变量
+// 不该再透传给 bash 工具的子命令——否则 agent 在 bash 里启动任何 Electron 系
+// 可执行文件都会退化成纯 Node 跑其入口脚本。tsx 的自我重生发生在本文件之前，
+// 此处删除对启动路径无影响。
+delete process.env.ELECTRON_RUN_AS_NODE;
 
 // .env 被残留环境变量压掉时大声说出来——那可能意味着凭据被发往另一家端点
 warnEnvConflicts();

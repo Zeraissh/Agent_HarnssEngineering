@@ -230,7 +230,7 @@ function createModelClientFromEnv(
 
 1. **环境变量驱动的协议选择**：
    - `AGENT_PROVIDER=anthropic`（默认）→ `AnthropicModelClient`，通过 `ANTHROPIC_BASE_URL` / `ANTHROPIC_API_KEY` 连接 Anthropic 官方或任意 Anthropic 兼容端点；
-   - `AGENT_PROVIDER=openai` → `OpenAIModelClient`，通过 `OPENAI_BASE_URL`（如 `https://api.deepseek.com`）/ `OPENAI_API_KEY` 连接，API Key 缺省复用 `ANTHROPIC_API_KEY`——同一家的 key 两种协议通用。
+   - `AGENT_PROVIDER=openai` → `OpenAIModelClient`，通过 `OPENAI_BASE_URL`（如 `https://api.deepseek.com`）/ `OPENAI_API_KEY` 连接；密钥必须显式配置，不跨 provider 隐式复用。
   （来源：文件头部 JSDoc）
 
 2. **端点覆盖（ProviderOverrides）**：用于在同一进程里创建指向不同端点的第二个客户端。典型场景："执行者用本地 Ollama、verifier 用云端强模型"的跨强度核查实验。（来源：`ProviderOverrides` JSDoc）

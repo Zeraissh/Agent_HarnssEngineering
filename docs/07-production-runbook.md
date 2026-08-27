@@ -25,6 +25,7 @@ npm ci --ignore-scripts
 npm audit
 npm test
 npm run build
+npm run host:stage
 node --check electron/main.cjs
 ```
 
@@ -33,11 +34,13 @@ the npm manifest; local histories, `.env`, worktrees, demos, and customer artifa
 `desktop:dist` refuses Windows/macOS production artifacts when signing credentials are absent.
 `desktop:dist:unsigned` is local-test-only and must never be uploaded as a release.
 
-Releases are cut by pushing a `vX.Y.Z` tag. The `Release` workflow re-runs this entire gate on CI,
-builds the container image, pushes it to GHCR (`ghcr.io/<owner>/agent-harness`, version tag plus
-`sha-<commit>` tag), and records the digest-pinned reference in the GitHub Release notes. Production
-always deploys that digest reference, never a mutable tag — the recorded digest survives builder
-cache pruning and machine changes, which is what makes the rollback procedure below executable.
+Releases are cut by pushing a `vX.Y.Z` tag that exactly matches `package.json`. The `Release` workflow
+re-runs this entire gate, builds a Windows installer on `windows-latest`, and requires a valid
+Authenticode signature from repository secrets `WIN_CSC_LINK` and `WIN_CSC_KEY_PASSWORD`. Only after
+that artifact passes signature verification does it build and push the container image to GHCR
+(`ghcr.io/<owner>/agent-harness`, version tag plus `sha-<commit>` tag) and attach the installer to the
+GitHub Release. Production always deploys the digest recorded in that Release, never a mutable tag —
+the recorded digest survives builder cache pruning and machine changes, which makes rollback executable.
 
 ## Deployment
 
@@ -46,11 +49,14 @@ cache pruning and machine changes, which is what makes the rollback procedure be
 3. Terminate TLS at a trusted reverse proxy and forward `Host`, `X-Forwarded-Host`, and
    `X-Forwarded-Proto`. Keep the container port bound to loopback.
 4. Copy `.env.production.example` outside the repository, populate secrets, and set an absolute
-   `AGENT_WORKSPACE`.
+   `AGENT_WORKSPACE`. Create a separate, access-controlled `AGENT_HISTORY_BACKUP_PATH` outside the
+   workspace and history volume; the container's `node` user must be able to write it. Backups contain
+   plaintext task transcripts and therefore require the same confidentiality controls as model keys.
 5. Set `AGENT_IMAGE` to the digest-pinned reference from the target GitHub Release notes, then
    start `deploy/docker-compose.production.yml`.
 6. Confirm `/health` is HTTP 200 and `/ready` is HTTP 200. A 503 readiness response means history
    protection or shutdown state is degraded; do not send traffic.
+   Confirm the `history-backup` sidecar is healthy and its `.last-success.json` timestamp is current.
 7. Open `https://<public-host>/?access_token=<token>` once. The host exchanges it for an HttpOnly,
    SameSite cookie and redirects to a clean URL.
 
@@ -88,6 +94,14 @@ operator guardrail, not billing. `0` means closed for today.
 Budget refusals are counted as `agent_harness_security_rejections_total{reason="budget"}` and the
 current day's spend is exported as `agent_harness_daily_tokens_used`.
 
+Both run-event and lifecycle SSE responses send `: heartbeat` comments every
+`AGENT_UI_SSE_HEARTBEAT_MS` (default 15s) and set `X-Accel-Buffering: no`; the reverse proxy must pass
+streaming responses through without response buffering. Completed run archives are copied by the
+`history-backup` sidecar to `AGENT_HISTORY_BACKUP_PATH` with a per-file SHA-256 manifest. Existing
+backups are never silently overwritten: a hash mismatch makes the sidecar fail and become unhealthy.
+Provider credentials are isolated by protocol; `AGENT_PROVIDER=openai` requires an explicit
+`OPENAI_API_KEY` and never falls back to `ANTHROPIC_API_KEY`.
+
 ## Canary and smoke checks
 
 Send only an operator canary first, then verify:
@@ -100,6 +114,9 @@ Send only an operator canary first, then verify:
 - submit an evil Origin, `text/plain` create request, oversized body, and fifth concurrent run;
   expected results are 403, 415, 413, and 429 respectively;
 - hold `/api/stream`, send SIGTERM, and confirm shutdown completes within the configured timeout.
+- leave `/api/stream` idle beyond the proxy idle timeout and confirm heartbeat comments keep it open;
+- complete one run, confirm its backup manifest verifies, then restore that run directory into an
+  empty history volume and confirm it appears after host restart.
 
 ## Rollback triggers and procedure
 

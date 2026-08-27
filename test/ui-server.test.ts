@@ -71,6 +71,40 @@ function baseUrl(port: number): string {
   return `http://127.0.0.1:${port}`;
 }
 
+describe("SSE reverse-proxy keepalive", () => {
+  let handle: UiServerHandle | undefined;
+  afterEach(async () => { await handle?.close(); handle = undefined; });
+
+  it("生命周期流禁用 nginx buffering，并在空窗发送注释心跳", async () => {
+    handle = createUiServer({
+      modelClient: new FakeModelClient([]), tools: [], workdir: process.cwd(), sseHeartbeatMs: 20,
+    });
+    const base = baseUrl(await startServer(handle));
+    const controller = new AbortController();
+    const response = await fetch(`${base}/api/stream`, { signal: controller.signal });
+    expect(response.status).toBe(200);
+    expect(response.headers.get("x-accel-buffering")).toBe("no");
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+    let text = "";
+    const deadline = Date.now() + 2000;
+    while (!text.includes(": heartbeat\n\n") && Date.now() < deadline) {
+      const { value } = await reader.read();
+      if (value) text += decoder.decode(value);
+    }
+    controller.abort();
+    expect(text).toContain(": heartbeat\n\n");
+
+    const created = await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ task: "sse header" }),
+    });
+    const { runId } = await created.json() as { runId: string };
+    const events = await fetch(`${base}/api/runs/${runId}/events`);
+    expect(events.headers.get("x-accel-buffering")).toBe("no");
+    await events.body?.cancel();
+  });
+});
+
 /** 流式读取 SSE 事件（逐个 yield） */
 async function* readSSE(
   response: Response,

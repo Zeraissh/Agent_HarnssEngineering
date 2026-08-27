@@ -1,6 +1,7 @@
 node_modules/
 dist/
 dist-electron/
+.host-runtime/
 *.local
 android/app/src/main/assets/public/
 android/app/src/main/assets/capacitor.config.json

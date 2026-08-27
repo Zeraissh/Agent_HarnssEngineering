@@ -28,6 +28,21 @@ import { randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
 import type { SharedRunBudget } from "../src/types.js";
 
+async function renameWithTransientRetry(source: string, target: string): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await rename(source, target);
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (attempt >= 5 || (code !== "EPERM" && code !== "EACCES" && code !== "EBUSY")) throw error;
+      // Windows Defender/索引器会短暂占住旧 meta。保留旧文件并重试原子替换，
+      // 不能先 rm target——那会制造一个断电时 meta 完全不存在的窗口。
+      await new Promise((done) => setTimeout(done, 10 * 2 ** attempt));
+    }
+  }
+}
+
 /** 保留的 run 目录数上限（判据③）。先写死再收数据——口径同 STRUCTURED_OUTPUT_RULE */
 export const DEFAULT_HISTORY_KEEP = 50;
 
@@ -131,7 +146,7 @@ export class RunHistoryWriter {
       const temporary = join(this.dir, `.meta.${process.pid}.${randomUUID()}.tmp`);
       try {
         await writeFile(temporary, JSON.stringify(meta), "utf8");
-        await rename(temporary, target);
+        await renameWithTransientRetry(temporary, target);
       } catch (error) {
         await rm(temporary, { force: true }).catch(() => {});
         throw error;

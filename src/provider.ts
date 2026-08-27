@@ -5,7 +5,7 @@
  *     ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY（Anthropic 官方或任意 Anthropic 兼容端点）
  *   AGENT_PROVIDER=openai → OpenAIModelClient
  *     OPENAI_BASE_URL（如 https://api.deepseek.com）
- *     OPENAI_API_KEY（缺省复用 ANTHROPIC_API_KEY——同一家的 key 两种协议通用）
+ *     OPENAI_API_KEY（必须显式配置；不同 provider 之间绝不隐式复用密钥）
  *
  * 通用旋钮：AGENT_TIMEOUT_MS / AGENT_MAX_RETRIES
  */
@@ -46,7 +46,7 @@ export function createModelClientFromEnv(
       compat: true,
       client: new OpenAIModelClient(model, {
         baseURL: overrides.baseURL ?? process.env.OPENAI_BASE_URL,
-        apiKey: overrides.apiKey ?? process.env.OPENAI_API_KEY ?? process.env.ANTHROPIC_API_KEY,
+        apiKey: overrides.apiKey ?? process.env.OPENAI_API_KEY,
         timeoutMs,
         maxRetries,
       }),

@@ -1,7 +1,7 @@
 {
   "name": "agent-harness-console",
   "private": true,
-  "version": "0.1.0",
+  "version": "1.2.0",
   "description": "Sandboxed Electron and experimental Capacitor shell for Agent Harness",
   "type": "module",
   "main": "electron/main.cjs",
@@ -11,8 +11,9 @@
     "preview": "vite preview",
     "test": "vitest run",
     "desktop": "electron .",
-    "desktop:dist": "node scripts/require-signing.mjs && electron-builder --config electron-builder.yml",
-    "desktop:dist:unsigned": "electron-builder --config electron-builder.yml",
+    "host:stage": "node scripts/stage-host-runtime.mjs",
+    "desktop:dist": "node scripts/require-signing.mjs && npm run host:stage && electron-builder --config electron-builder.yml",
+    "desktop:dist:unsigned": "npm run host:stage && electron-builder --config electron-builder.yml",
     "mobile:sync": "npm run build && cap sync"
   },
   "dependencies": {},

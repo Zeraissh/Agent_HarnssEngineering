@@ -53,10 +53,10 @@ $env:AGENT_MODEL        = "qwen3.5:9b"
 $env:AGENT_MAX_TOKENS   = "4096"            # 掐断思考螺旋，快速失败
 $env:AGENT_TIMEOUT_MS   = "300000"; $env:AGENT_MAX_RETRIES = "0"
 
-# 或 OpenAI wire 协议（任何 chat-completions 端点；key 可与 Anthropic 协议复用）
+# 或 OpenAI wire 协议（任何 chat-completions 端点；key 必须显式配置）
 $env:AGENT_PROVIDER     = "openai"
 $env:OPENAI_BASE_URL    = "https://api.deepseek.com"   # 或 api.openai.com 等
-$env:OPENAI_API_KEY     = "sk-..."          # 缺省复用 ANTHROPIC_API_KEY
+$env:OPENAI_API_KEY     = "sk-..."
 $env:AGENT_MODEL        = "deepseek-chat"
 
 npm run cli -- "阅读 docs/ 下所有文档，生成 SUMMARY.md"          # 交互审批 y/n

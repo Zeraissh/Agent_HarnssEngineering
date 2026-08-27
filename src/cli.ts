@@ -18,7 +18,7 @@
  *   ANTHROPIC_API_KEY   API 密钥（Anthropic 或第三方兼容端点的 key）
  *   ANTHROPIC_BASE_URL  可选，第三方 Anthropic 兼容端点（DeepSeek/GLM/Kimi/Ollama）
  *   OPENAI_BASE_URL     provider=openai 时的端点（如 https://api.deepseek.com）
- *   OPENAI_API_KEY      provider=openai 时的 key，缺省复用 ANTHROPIC_API_KEY
+ *   OPENAI_API_KEY      provider=openai 时的 key（必须显式配置，不跨 provider 复用）
  *   AGENT_MODEL         可选，模型名，默认 claude-opus-4-8；
  *                       非 claude-* 模型自动进入 compat 模式（去掉 Claude 专属参数）
  *   AGENT_VISION_MODEL  可选，视觉模型（+ _PROVIDER / _BASE_URL / _API_KEY）：

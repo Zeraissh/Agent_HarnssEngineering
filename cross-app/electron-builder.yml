@@ -6,6 +6,19 @@ asar: true
 npmRebuild: false
 files:
   - electron
+extraResources:
+  - from: .host-runtime/app
+    to: harness
+    filter:
+      - "**/*"
+      - "!node_modules{,/**/*}"
+  # electron-builder deliberately filters nested node_modules from broad copy
+  # rules. Map production dependencies explicitly so the installed Desktop app
+  # can start its bundled host without a source checkout or a global npm cache.
+  - from: .host-runtime/app/node_modules
+    to: harness/node_modules
+    filter:
+      - "**/*"
 win:
   target: nsis
   artifactName: ${productName}-${version}-${arch}-setup.${ext}

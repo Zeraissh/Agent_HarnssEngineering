@@ -28,8 +28,11 @@ services:
       AGENT_UI_MAX_ACTIVE_RUNS: ${AGENT_UI_MAX_ACTIVE_RUNS:-4}
       AGENT_UI_MAX_STORED_RUNS: ${AGENT_UI_MAX_STORED_RUNS:-100}
       AGENT_UI_MUTATIONS_PER_MINUTE: ${AGENT_UI_MUTATIONS_PER_MINUTE:-120}
+      AGENT_UI_SSE_HEARTBEAT_MS: ${AGENT_UI_SSE_HEARTBEAT_MS:-15000}
       AGENT_TOTAL_MAX_TURNS: ${AGENT_TOTAL_MAX_TURNS:-120}
       AGENT_TOTAL_TOKEN_BUDGET: ${AGENT_TOTAL_TOKEN_BUDGET:-500000}
+      AGENT_UI_DAILY_TOKEN_BUDGET: ${AGENT_UI_DAILY_TOKEN_BUDGET:-5000000}
+      AGENT_UI_EXCLUSIVE_WORKDIR: ${AGENT_UI_EXCLUSIVE_WORKDIR:-1}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       AGENT_MODEL: ${AGENT_MODEL:-claude-opus-4-8}
@@ -48,6 +51,41 @@ services:
     pids_limit: 256
     mem_limit: 2g
     cpus: 2.0
+
+  history-backup:
+    image: ${AGENT_IMAGE:?set the digest-pinned release image from the GitHub Release notes}
+    restart: unless-stopped
+    init: true
+    read_only: true
+    command: ["node", "/app/dist/ui/history-backup.js"]
+    environment:
+      AGENT_RUN_HISTORY_DIR: /data/history
+      AGENT_RUN_HISTORY_BACKUP_DIR: /data/backups
+      AGENT_RUN_HISTORY_BACKUP_INTERVAL_MS: ${AGENT_RUN_HISTORY_BACKUP_INTERVAL_MS:-3600000}
+    volumes:
+      - harness-history:/data/history:ro
+      - type: bind
+        source: ${AGENT_HISTORY_BACKUP_PATH:?set an absolute backup path outside the workspace/history volume}
+        target: /data/backups
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: 0.25
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "const fs=require('fs');const p='/data/backups/.last-success.json';const x=JSON.parse(fs.readFileSync(p,'utf8'));const max=Math.max(Number(process.env.AGENT_RUN_HISTORY_BACKUP_INTERVAL_MS||3600000)*2,120000);if(Date.now()-Date.parse(x.at)>max)process.exit(1)"
+      interval: 5m
+      timeout: 5s
+      start_period: 2m
+      retries: 3
 
 volumes:
   harness-history:
