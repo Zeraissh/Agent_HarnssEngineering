@@ -46,6 +46,9 @@ jobs:
       - run: npm audit
       - run: npm test
       - run: npm run build
+      # host:stage 会编译仓库根宿主；job 彼此隔离，不能借用 core 的 node_modules。
+      - run: npm ci --ignore-scripts
+        working-directory: .
       - run: npm run host:stage
       - run: node --check electron/main.cjs
 
