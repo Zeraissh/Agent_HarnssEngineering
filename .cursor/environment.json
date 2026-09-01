@@ -1,6 +1,6 @@
 {
   "name": "Agent Harness",
-  "install": "npm ci && bash scripts/cloud-sync-env.sh",
+  "install": "npm ci",
   "start": "bash scripts/cloud-sync-env.sh",
   "terminals": [
     {
