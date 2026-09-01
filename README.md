@@ -104,6 +104,43 @@ $env:AGENT_VERIFIER_API_KEY  = "sk-..."                           # 可选，缺
 npm run cli -- --verify "……"
 ```
 
+## 在 Cloud Agent 里跑：凭据怎么过去
+
+Cloud Agent 跑在远端 VM，读不到你本机的 `.env`。配置分两半走：
+
+- **非敏感项**（端点、视觉模型）提交在 [`.env.cloud`](.env.cloud) 里，云端自动生效，
+  不需要人工填任何东西；
+- **密钥**只能经 Cursor 的 Environment Secrets 走，填【与本地 `.env` 同名】的变量。
+
+新 Agent 启动时由 [`.cursor/environment.json`](.cursor/environment.json) 的 `start`
+调用 [`scripts/cloud-sync-env.sh`](scripts/cloud-sync-env.sh)，把两半合成工作区
+`.env`（0600），同名 Secret 覆盖 `.env.cloud` 的默认值。当前配置下需要人工填的
+Secret 只有 `ANTHROPIC_API_KEY` 一项。
+
+本机可以先算出"还差哪几个"：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/sync-local-env-to-cloud.ps1
+# 已知环境 ID 时直接开到该环境的设置页
+powershell ... -EnvironmentId "<Agent 面板 Environment 卡片里的 ID>"
+```
+
+它会逐项比对本机 `.env` 与仓库 `.env.cloud`，把已覆盖的标成「无需填」，只把真正
+缺的列成待办；密钥类变量永远算待办（不进 `.env.cloud`）。
+
+三个会让人白等一轮的坑：
+
+- **Secrets 只对 Agent 实际启动的那个环境生效。** 环境每次跑 Setup 流程都会新建一个，
+  填到旧环境上不会注入。以 Agent 面板右侧 Environment 卡片显示的 ID 为准。
+- **注入发生在新 Agent 启动时。** 已经在跑的 Agent 不会拿到，改完必须重开一个。
+- **同步范围 = 示例文件里声明过的变量名**（`.env.example` / `.env.production.example`
+  的注释行同样算声明）+ `.env.cloud` 的键。没被收录的变量用
+  `AGENT_CLOUD_ENV_EXTRA_KEYS=A,B` 显式放行——这道白名单是有意的，否则云端一堆
+  无关环境变量都会被写进 `.env`。
+
+`start` 日志里会打印命中的变量【名】与计数（绝不打印值）；一个 Secret 都没拿到时
+会连同排查清单一起告警。落地后 `npm run doctor` 应显示 `credential_present: yes`。
+
 ## Web 控制台与跨端 App
 
 浏览器控制台在 [`ui/`](ui/)（`ui/server.ts` + `ui/public`，任务提交 / 事件流直播 /

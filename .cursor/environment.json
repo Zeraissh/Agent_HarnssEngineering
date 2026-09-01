@@ -1,0 +1,18 @@
+{
+  "name": "Agent Harness",
+  "install": "npm ci",
+  "start": "bash scripts/cloud-sync-env.sh",
+  "terminals": [
+    {
+      "name": "ui",
+      "command": "npm run ui",
+      "description": "Web 宿主（127.0.0.1:4173），需 API 凭据后可用"
+    }
+  ],
+  "ports": [
+    {
+      "name": "agent-ui",
+      "port": 4173
+    }
+  ]
+}

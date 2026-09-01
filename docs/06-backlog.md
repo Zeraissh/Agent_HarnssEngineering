@@ -37,12 +37,11 @@ B2（运行历史落盘）、B2b（backlog 补标注）、台账 `[object Object
 
 ### A. 等证据类——不是"没做"，是"证据还不够"
 
-**A1. §2.1 结构化输出：台账已就位，但样本是 0，不是 16。**
-`npm run ledger` 现在显示 16 次运行、**带核查 0 次**，所以裁决样本 = 0。
-判据要 ≥20 次裁决才下结论。
-→ **第一步**：以后跑真实任务时**勾上「开启独立核查」**（Web）或加 `--verify`（CLI）。
-不刻意造样本，但要让真实运行付得起这笔账。攒够了跑 `npm run ledger`，
-它会**直接给出 do / close / 灰带**的结论，不需要再讨论。
+**A1. §2.1 结构化输出：台账已就位，样本需继续攒。**
+`npm run ledger` 读 `.agent-runs.jsonl`（gitignore）。判据要 ≥20 次**实施后**裁决才下结论。
+→ **批量采集**：配置 API 凭据后 `npm run ledger:samples`（小任务 + `--verify`，自动补到 20）。
+→ **单次**：CLI `npm run agent -- run --yes --verify "…"` 或 Web「开启独立核查」。
+攒够了跑 `npm run ledger`，它会**直接给出效果结论**（`effective` / `insufficient` 等）。
 
 **A2. 9.9 `write_memory` 观察项：改为自动检出，等第二次出现。**
 台账按角色记工具直方图，verifier 侧的写类调用会单独列出。
