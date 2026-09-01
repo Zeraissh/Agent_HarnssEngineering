@@ -17,8 +17,8 @@
 
 ## 已验证基线
 
-- [x] **BASE-01 核心回归基线**：2026-09-01，本轮优化后 `npm test` 为 31 个文件通过、
-  1 个真实 OCI 文件跳过；1172 passed、13 skipped，`npm run typecheck` 通过。
+- [x] **BASE-01 核心回归基线**：2026-09-01，`npm test` 为 31 个文件通过、
+  1 个真实 OCI 文件跳过；1173 passed、13 skipped，`npm run typecheck` 通过。
 - [x] **BASE-02 跨端契约基线**：2026-09-01，`cross-app` 为 31 passed、1 skipped。
 - [x] **BASE-03 CI 构建基线**：当前 `main` 的 core、desktop-shell、container job 成功。
 - [ ] **BASE-04 真实运行基线**：真实模型、浏览器 E2E、已安装 Electron、Android、
@@ -56,23 +56,21 @@ npm run pack:check
 | SAFE-02 | Windows junction/POSIX symlink 语义测试覆盖圈外读写、尚不存在深层路径、合法内部链接和 readRoots；写入前二次校验；本机测试未跳过 | Node 文件 API 没有跨平台 `openat` 式原子圈禁，检查到 I/O 仍有极窄 TOCTOU；由 SAFE-05 完全封闭 |
 | SAFE-03 | 12 个网络边界测试覆盖怪异 IP 字面量、DNS 私网/混合结果、HTTP/凭据/私网重定向、重定向上限、DNS cancel、响应断流和大小限制；固定公网 IP + 域名 SNI 的真实 HTTPS canary 成功 | 本机 TUN 把普通域名映射到 198.18/15 synthetic IP，按策略 fail closed；需要后续受控 egress/proxy，不能自动放宽私网范围 |
 | SAFE-04 | 阶段 1：canonical JSON SHA-256 防止不同 command/path/device 复用。阶段 2：grant 绑定 run、工具契约元数据 fingerprint、绝对 TTL 与最大自动次数；默认 ask 工具仅单次，`bash` / `write_file` / `describe_image` / ask 型 MCP 均不能扩权，当前只有 `fetch_url` 显式开放受限 exact-input；planner/verifier 自答 deny 不进入宿主授权表；并发双 POST 原子决策、同参 pending 复用 grant、陈旧项创建前清扫；不可续跑 run 收尾即终止 active grant；完整 checkpoint 保存版本化审计快照，重启/归档 child 明确不继承；manual/auto 及触发检查后的 expired/exhausted/invalidated/not-inherited 事件与 UI 状态均可审计 | active grant 仍是进程内状态；在 RUN-01 能恢复同一 run 且 GOV-01 有稳定主体前，不允许跨重启恢复 capability。fingerprint 不含 execute/build 实现，授权主体也尚不能绑定文件内容/设备状态等可变资源身份，因此此类工具必须保持 once。当前为单操作员/单租户边界，checkpoint 审计快照未做签名防篡改；因此 SAFE-04 保持 `[~]` |
-| SAFE-05 | ADR-001 固定 `off/report/required` 与 `auto/oci/bwrap` 语义；`ExecutionBroker` 沿 `AgentConfig → AgentLoop → ToolExecutor → ToolContext` 逐 run/segment 传播，Web/CLI 均绑定 boundaryId/workdir，已完成 segment 的 broker 立即释放，follow-up 保留上下文/累计预算但换用新 broker；初始无 bash 的 plan 动态切到含 bash 子任务也不会绕过。`required` 对 `/ready`、新 run、续跑、每个 segment 和每次命令强制刷新，per-run canary 前后双闸门重验全局 cleanup，失败时 durable `run_config` 先报告 `failed`、broker/canary/模型均零启动、绝不 host fallback；required+host MCP 在任何 probe 前拒绝。内嵌 OCI 只接受 Linux 直宿主上 root 管理的绝对 Docker CLI+SHA-256 和本机 Unix socket；digest/image-ID 镜像不 pull，拒绝 VOLUME，覆盖 ENTRYPOINT/health；固定 bootstrap 将 stdin 全量写入 0600 私有 tmpfs 脚本，再以 fd0=EOF 执行，命令不进 argv/`Config.Cmd`，且 `env -i`；固定 network/IPC none、只读 root、禁递归子 mount、numeric UID/GID 无补充组、cap-drop/NNP/seccomp 与 PID/CPU/内存/swap/FD/tmpfs/wall/output 限制；functional 与实际 workdir 双层 canary 核对 UID/rootfs/安全状态/cgroup/网络和 read-write-rename-delete，并拒绝 symlink 路径、nested mount、IPC/device/hardlink。ADR-002 进一步用 daemon-resident schema-3 namespace/owner/boot/PID-namespace/PID/starttime/lease/kind/boundary/policy/lease-ms labels 固化 ownership；每次 probe 在 canary 前按 namespace 两阶段扫描，完整校验后只按 full ID 回收“已到期且 owner 明确死亡”的 worker，正常 cleanup 也先核对 lease 以阻断名称复用，且只有 daemon 明确回执不存在才算 confirmed。PID namespace 不同或 `/proc`/signal-0 无法确认时 fail closed、不删除。未确认会撤销全部 coverage 并锁住全局 readiness/admission。CLI、API、durable `run_config`、Tools 卡与 tool result 区分 `direct/report-only/partial/failed`；公共 `/ready` 不泄露绝对路径。Linux CI container job 跑 13 个真实 OCI 逃逸/并发/abort/dispose/resource/stdin/reaper canary（worker=`debian:bookworm-slim`，`agent-harness:ci` 仅 build smoke）；**2026-09-01 CI @ 33461119575 全绿** | 本机 Windows 仍 skipped；durable reaper 无独立 timer、专属 worktree/UID 未完成、MCP 尚无 managed worker、Windows/macOS/WSL 隔离未完成。因此 Linux 侧 `[~]`→待评审是否升为 `[x]`，全局仍 `partial` |
+| SAFE-05 | ADR-001 固定 `off/report/required` 与 `auto/oci/bwrap` 语义；`ExecutionBroker` 沿 `AgentConfig → AgentLoop → ToolExecutor → ToolContext` 逐 run/segment 传播，Web/CLI 均绑定 boundaryId/workdir，已完成 segment 的 broker 立即释放，follow-up 保留上下文/累计预算但换用新 broker；初始无 bash 的 plan 动态切到含 bash 子任务也不会绕过。`required` 对 `/ready`、新 run、续跑、每个 segment 和每次命令强制刷新，per-run canary 前后双闸门重验全局 cleanup，失败时 durable `run_config` 先报告 `failed`、broker/canary/模型均零启动、绝不 host fallback；required+host MCP 在任何 probe 前拒绝。内嵌 OCI 只接受 Linux 直宿主上 root 管理的绝对 Docker CLI+SHA-256 和本机 Unix socket；digest/image-ID 镜像不 pull，拒绝 VOLUME，覆盖 ENTRYPOINT/health；固定 bootstrap 将 stdin 全量写入 0600 私有 tmpfs 脚本，再以 fd0=EOF 执行，命令不进 argv/`Config.Cmd`，且 `env -i`；固定 network/IPC none、只读 root、禁递归子 mount、numeric UID/GID 无补充组、cap-drop/NNP/seccomp 与 PID/CPU/内存/swap/FD/tmpfs/wall/output 限制；functional 与实际 workdir 双层 canary 核对 UID/rootfs/安全状态/cgroup/网络和 read-write-rename-delete，并拒绝 symlink 路径、nested mount、IPC/device/hardlink。ADR-002 进一步用 daemon-resident schema-3 namespace/owner/boot/PID-namespace/PID/starttime/lease/kind/boundary/policy/lease-ms labels 固化 ownership；每次 probe 在 canary 前按 namespace 两阶段扫描，完整校验后只按 full ID 回收“已到期且 owner 明确死亡”的 worker，正常 cleanup 也先核对 lease 以阻断名称复用，且只有 daemon 明确回执不存在才算 confirmed。PID namespace 不同或 `/proc`/signal-0 无法确认时 fail closed、不删除。未确认会撤销全部 coverage 并锁住全局 readiness/admission。CLI、API、durable `run_config`、Tools 卡与 tool result 区分 `direct/report-only/partial/failed`；公共 `/ready` 不泄露绝对路径。Linux CI container job 跑 13 个真实 OCI 逃逸/并发/abort/dispose/resource/stdin/reaper canary（worker=`debian:bookworm-slim`，`agent-harness:ci` 仅 build smoke）；**2026-09-01 CI @ 33461119575 全绿** | **2026-09-01 评审：保持 `[~]`**。Linux CI 绿测满足「逃逸 canary 在 CI 通过」这一条，但完成定义还要求每 run 独立 worktree/UID、MCP managed worker、全平台隔离与 autonomous TTL reaper——均未完成；本机 Windows OCI 仍 skipped。CI 回执记入证据列，不单独把 Linux 子项升为 `[x]` |
 
 ### 本轮完整回归
 
 ```text
 npm run typecheck                       passed
-npm test                                30 files passed, 1 skipped; 1154 passed, 7 skipped
-npm run pack:check                      80 files, 1,537,655 bytes
-cross-app npm test                      31 passed, 1 skipped
-cross-app npm run build                 passed
-cross-app npm run host:stage            passed
-npm audit --audit-level=moderate        0 vulnerabilities（root + cross-app）
-git diff --check                        passed
+npm test                                31 files passed, 1 skipped; 1173 passed, 13 skipped
+npm run pack:check                      （本轮未重跑 pack:check）
+cross-app npm test                      （本轮未重跑 cross-app）
+npm audit --audit-level=moderate        0 vulnerabilities（install 后 root）
 ```
 
-未执行真实模型、Electron 安装包、Android emulator、真实 OCI 容器 canary 或 STM32 HIL；
-7 个 OCI 用例因本机 Windows 无可信 Linux fixture 明确 skipped，等待 CI Linux 回执。
+未执行真实模型、Electron 安装包、Android emulator 或 STM32 HIL；
+OCI 逃逸 canary 由 Linux CI container job 承担（run #33461119575 全绿）。
+§2.1 台账样本：`npm run ledger:samples`（需 API 凭据）向 `.agent-runs.jsonl` 攒 ≥20 次实施后裁决。
 
 ## Phase 1：把质量变成发布决策
 
@@ -135,5 +133,5 @@ git diff --check                        passed
 5. **回归证据**：针对性测试、完整测试、typecheck/build/pack，以及需要的真实 E2E/HIL。
 6. **残余风险**：未覆盖平台、TOCTOU、外部系统或人工验收项。
 
-当前执行顺序：`SAFE-05 Phase 2B（durable workspace lease + source/execution root + UID/Git/quota）→ EVAL-01 → EVAL-03 → E2E-01 → RUN-01 → SAFE-04 同 run 恢复/SAFE-06`。Phase 2A 的 daemon-label orphan reaper 与真实 `SIGKILL → sweep` E2E 已落地，但仍需 Linux CI 回执，且尚不是无宿主 reaper 的 autonomous TTL。
+当前执行顺序：`A1 攒 §2.1 样本（ledger:samples）→ SAFE-05 Phase 2B（durable workspace lease + source/execution root + UID/Git/quota）→ EVAL-01 → EVAL-03 → E2E-01 → RUN-01 → SAFE-04 同 run 恢复/SAFE-06`。Phase 2A 的 daemon-label orphan reaper 与真实 `SIGKILL → sweep` E2E 已落地；**2026-09-01 Linux CI #33461119575 全绿**，SAFE-05 评审结论为保持 `[~]`（见 Phase 0 实施记录）。
 如果目标改为公网多人服务，`GOV-01/02/03` 必须提前到 `RUN-01` 之后、任何公开上线之前。
