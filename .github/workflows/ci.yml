@@ -63,9 +63,11 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts
       - run: docker build --tag agent-harness:ci .
+      - run: docker pull debian:bookworm-slim
       - name: OCI execution boundary escape/resource/cleanup canary
         run: |
-          IMAGE_ID="$(docker image inspect --format '{{.Id}}' agent-harness:ci)"
+          # 执行 worker 用最小 shell 镜像；agent-harness:ci 是 UI 运行时，不适合当 bash 沙箱。
+          IMAGE_ID="$(docker image inspect --format '{{.Id}}' debian:bookworm-slim)"
           RUNTIME="$(readlink -f "$(command -v docker)")"
           RUNTIME_SHA256="$(sha256sum "$RUNTIME" | awk '{print $1}')"
           test -n "$IMAGE_ID"

@@ -1162,8 +1162,9 @@ async function dockerProbe(
           result.error,
           result.stderr.trim(),
           result.stdout.trim(),
+          `exit=${result.exitCode}`,
           marker ? `marker=${JSON.stringify(marker)}` : "marker missing",
-        ].filter(Boolean).join("; ") || `exit ${result.exitCode}`;
+        ].filter(Boolean).join("; ") || "probe failed";
         return {
           ready: false,
           runtimeVersion,
