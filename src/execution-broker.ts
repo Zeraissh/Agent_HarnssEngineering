@@ -652,6 +652,8 @@ export interface OciRunSpec {
   workdir: string;
   command: string;
   lease: OciLeaseSpec;
+  /** 仅管理员固定脚本可走 inline；agent 命令必须经 stdin bootstrap，避免 argv 泄露。 */
+  delivery?: "stdin" | "inline";
 }
 
 const OCI_LABEL_KEYS = Object.freeze({
@@ -794,7 +796,7 @@ export function buildOciRunArgs(spec: OciRunSpec): string[] {
     throw new Error("OCI container name must bind the boundary and full lease UUID");
   }
   const labelArgs = Object.entries(labels).flatMap(([name, value]) => ["--label", `${name}=${value}`]);
-  return [
+  const base = [
     "run",
     "--rm",
     "--pull", "never",
@@ -817,6 +819,20 @@ export function buildOciRunArgs(spec: OciRunSpec): string[] {
     "--mount", `type=bind,source=${workdir},target=${OCI_PROFILE.workspace},bind-recursive=disabled`,
     "--workdir", OCI_PROFILE.workspace,
     "--user", OCI_PROFILE.user,
+  ];
+  if (spec.delivery === "inline") {
+    if (/[\0\r]/.test(spec.command)) {
+      throw new Error("Inline OCI command cannot contain NUL or carriage return characters");
+    }
+    return [
+      ...base,
+      "--entrypoint", "/bin/sh",
+      spec.image,
+      "-c", spec.command,
+    ];
+  }
+  return [
+    ...base,
     "--interactive",
     // `env -i` removes every image ENV value as well as all host values; setting
     // `--env NAME=` would leave secret-shaped names present with empty values.
@@ -1130,23 +1146,29 @@ async function dockerProbe(
           workdir: workspace,
           command: PROBE_COMMAND,
           lease: target.lease,
+          delivery: "inline",
         }),
         {
           timeoutMs: 15_000,
           maxBufferBytes: 256 * 1024,
           windowsHide: true,
-          stdin: PROBE_COMMAND,
         },
       );
-      const marker = await readFile(path.join(workspace, "probe.out"), "utf8").catch(() => "");
+      const marker = (await readFile(path.join(workspace, "probe.out"), "utf8").catch(() => "")).trim();
       if (result.exitCode !== 0 || marker !== "passed") {
         const cleanup = await forceRemoveContainer(target);
         if (cleanup === "confirmed") active?.delete(name);
+        const detail = [
+          result.error,
+          result.stderr.trim(),
+          result.stdout.trim(),
+          marker ? `marker=${JSON.stringify(marker)}` : "marker missing",
+        ].filter(Boolean).join("; ") || `exit ${result.exitCode}`;
         return {
           ready: false,
           runtimeVersion,
           cleanupFailed: cleanup === "failed",
-          reason: `OCI functional probe failed: ${result.error ?? (result.stderr.trim() || `exit ${result.exitCode}`)}`
+          reason: `OCI functional probe failed: ${detail}`
             + (cleanup === "failed" ? "; probe worker cleanup could not be confirmed" : ""),
         };
       }
@@ -1690,11 +1712,11 @@ class DockerExecutionAdapter implements OciExecutionAdapter {
         workdir,
         command,
         lease: target.lease,
+        delivery: "inline",
       }), {
         timeoutMs: 20_000,
         maxBufferBytes: 256 * 1024,
         windowsHide: true,
-        stdin: command,
       });
       if (result.exitCode !== 0 || result.signal !== null || result.error) {
         const cleanup = await forceRemoveContainer(target);

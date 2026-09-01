@@ -83,7 +83,7 @@ console.log("");
 
 console.log("── 9.9 观察项：核查者调了写类工具吗 ──");
 if (Object.keys(s.verifierWriteCalls).length === 0) {
-  console.log("  无。（注意：这个现象只有 CLI + 领域包那条路能产生，Web 宿主没接 MemoryStore）");
+  console.log("  无。（Web 宿主已于 2026-09-01 接入 MemoryStore；CLI + 领域包仍是主要观察路径。）");
 } else {
   for (const [name, n] of Object.entries(s.verifierWriteCalls)) console.log(`  ${name}：${n} 次`);
   console.log("  只读核查出现写类调用——按 9.6/9.9 判定是否收紧白名单。");

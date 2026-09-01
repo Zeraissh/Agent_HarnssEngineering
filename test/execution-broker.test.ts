@@ -262,6 +262,23 @@ describe("OCI policy args", () => {
       lease: testLease(),
     })).toThrow(/comma or newline/);
   });
+
+  it("runs trusted admin scripts inline while agent commands stay on stdin bootstrap", () => {
+    const lease = testLease({ kind: "functional-probe" });
+    const args = buildOciRunArgs({
+      image: `sha256:${"a".repeat(64)}`,
+      name: `agent-harness-${executionBoundaryLabel("functional-probe")}-${lease.leaseId}`,
+      boundaryId: "functional-probe",
+      workdir,
+      command: "printf passed > /workspace/probe.out",
+      lease,
+      delivery: "inline",
+    });
+    expect(args).not.toContain("--interactive");
+    expect(args.at(-2)).toBe("-c");
+    expect(args.at(-1)).toBe("printf passed > /workspace/probe.out");
+    expect(args.at(-4)).toBe("/bin/sh");
+  });
 });
 
 describe("OCI durable tombstone schema", () => {
