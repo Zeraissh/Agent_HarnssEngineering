@@ -127,6 +127,15 @@ describe("cloud-sync-env.sh：Secrets → 工作区 .env", () => {
     expect(existsSync(join(root, ".env"))).toBe(false);
   });
 
+  it("名单只有一项时不拖一个空尾巴", () => {
+    const root = makeRepo({ example: "ANTHROPIC_API_KEY=", cloud: "AGENT_MODEL=deepseek-chat" });
+
+    const out = sync(root, { ANTHROPIC_API_KEY: "sk-test" });
+
+    expect(out).toMatch(/Secrets 命中 1 项：ANTHROPIC_API_KEY\n/);
+    expect(out).toMatch(/默认 1 项：AGENT_MODEL\n/);
+  });
+
   it("只打印变量名，绝不打印值", () => {
     const root = makeRepo({ example: "ANTHROPIC_API_KEY=" });
 

@@ -24,9 +24,12 @@ log() { printf '[cloud-sync-env] %s\n' "$*"; }
 join_names() {
   if [[ "$#" -eq 0 ]]; then
     printf '无'
-  else
-    printf '%s' "$1"
-    shift
+    return 0
+  fi
+  printf '%s' "$1"
+  shift
+  # 无参数时 printf 仍会把格式套一遍，只剩 1 项就会多吐一个 ", "
+  if [[ "$#" -gt 0 ]]; then
     printf ', %s' "$@"
   fi
 }
