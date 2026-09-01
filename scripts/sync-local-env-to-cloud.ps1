@@ -49,17 +49,57 @@ foreach ($line in $lines) {
   }
 }
 
+# .env.cloud 里的非敏感默认项已经提交在仓库里，云端会自动拿到。
+# 逐项比对后只报"还差哪几个"，免得把已覆盖的也当成待办重填一遍。
+$cloudDefaults = @{}
+$cloudPath = Join-Path $repoRoot ".env.cloud"
+if (Test-Path -LiteralPath $cloudPath) {
+  foreach ($line in Get-Content -LiteralPath $cloudPath -Encoding UTF8) {
+    $trim = $line.Trim()
+    if ($trim -eq "" -or $trim.StartsWith("#")) { continue }
+    $eq = $trim.IndexOf("=")
+    if ($eq -le 0) { continue }
+    $cloudDefaults[$trim.Substring(0, $eq).Trim()] = $trim.Substring($eq + 1).Trim()
+  }
+}
+
 Write-Host ""
 Write-Host "=== 本机 .env → Cloud Secrets 对照（共 $($entries.Count) 项）===" -ForegroundColor Cyan
 Write-Host "读取：$EnvPath"
+Write-Host "仓库默认：$cloudPath（$($cloudDefaults.Count) 项，已提交，云端自动生效）"
 Write-Host "环境设置：$EnvironmentUrl"
 Write-Host ""
-Write-Host "在 Secrets 里添加【同名】变量（名称必须与下面 Key 完全一致）："
-Write-Host ""
 
+$todo = @()
 foreach ($e in $entries) {
-  $masked = if ($e.Key -match 'KEY|TOKEN|SECRET|PASSWORD') { "***" } else { $e.Value }
-  Write-Host ("  {0,-28} = {1}" -f $e.Key, $masked)
+  $sensitive = $e.Key -match 'KEY|TOKEN|SECRET|PASSWORD'
+  $masked = if ($sensitive) { "***" } else { $e.Value }
+  if ($sensitive) {
+    # 敏感值永远不进 .env.cloud，只能走 Secrets
+    $state = "必须填 Secret"
+    $color = "Yellow"
+    $todo += $e.Key
+  } elseif (-not $cloudDefaults.ContainsKey($e.Key)) {
+    $state = "需填 Secret（.env.cloud 未收录）"
+    $color = "Yellow"
+    $todo += $e.Key
+  } elseif ($cloudDefaults[$e.Key] -ne $e.Value) {
+    $state = "需填 Secret（与仓库默认不同：$($cloudDefaults[$e.Key])）"
+    $color = "Yellow"
+    $todo += $e.Key
+  } else {
+    $state = "已在 .env.cloud，无需填"
+    $color = "DarkGray"
+  }
+  Write-Host ("  {0,-28} = {1,-42} {2}" -f $e.Key, $masked, $state) -ForegroundColor $color
+}
+
+Write-Host ""
+if ($todo.Count -eq 0) {
+  Write-Host "无需填任何 Secret：本机 .env 的每一项都已由 .env.cloud 覆盖。" -ForegroundColor Green
+} else {
+  Write-Host "需要在 Secrets 里添加【同名】变量，共 $($todo.Count) 项：" -ForegroundColor Cyan
+  Write-Host ("  " + ($todo -join ", "))
 }
 
 Write-Host ""
