@@ -106,19 +106,27 @@ npm run cli -- --verify "……"
 
 ## 在 Cloud Agent 里跑：凭据怎么过去
 
-Cloud Agent 跑在远端 VM，读不到你本机的 `.env`。凭据只能经 Cursor 的 Environment
-Secrets 走：填【与本地 `.env` 同名】的变量，新 Agent 启动时由
-[`.cursor/environment.json`](.cursor/environment.json) 的 `start` 调用
-[`scripts/cloud-sync-env.sh`](scripts/cloud-sync-env.sh) 落成工作区 `.env`（0600）。
-非敏感默认项（端点、模型）提交在 [`.env.cloud`](.env.cloud) 里，同名 Secret 覆盖它。
+Cloud Agent 跑在远端 VM，读不到你本机的 `.env`。配置分两半走：
 
-本机可以先生成对照表：
+- **非敏感项**（端点、视觉模型）提交在 [`.env.cloud`](.env.cloud) 里，云端自动生效，
+  不需要人工填任何东西；
+- **密钥**只能经 Cursor 的 Environment Secrets 走，填【与本地 `.env` 同名】的变量。
+
+新 Agent 启动时由 [`.cursor/environment.json`](.cursor/environment.json) 的 `start`
+调用 [`scripts/cloud-sync-env.sh`](scripts/cloud-sync-env.sh)，把两半合成工作区
+`.env`（0600），同名 Secret 覆盖 `.env.cloud` 的默认值。当前配置下需要人工填的
+Secret 只有 `ANTHROPIC_API_KEY` 一项。
+
+本机可以先算出"还差哪几个"：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/sync-local-env-to-cloud.ps1
 # 已知环境 ID 时直接开到该环境的设置页
 powershell ... -EnvironmentId "<Agent 面板 Environment 卡片里的 ID>"
 ```
+
+它会逐项比对本机 `.env` 与仓库 `.env.cloud`，把已覆盖的标成「无需填」，只把真正
+缺的列成待办；密钥类变量永远算待办（不进 `.env.cloud`）。
 
 三个会让人白等一轮的坑：
 
