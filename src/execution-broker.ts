@@ -872,6 +872,16 @@ const PROBE_COMMAND = [
   "! grep -qE '^[^[:space:]]+[[:space:]]+00000000[[:space:]]' /proc/net/route",
 ].join(" && ");
 
+/** numeric UID worker 落盘的 bind mount 文件默认不可被宿主 uid 读取；agent 命令末尾统一放宽。 */
+const OCI_AGENT_COMMAND_EPILOGUE = [
+  "find /workspace -type f -exec chmod a+r {} + 2>/dev/null || true",
+  "find /workspace -type d -exec chmod a+rx {} + 2>/dev/null || true",
+].join("; ");
+
+function wrapOciAgentCommand(command: string): string {
+  return `${command.replace(/\s+$/, "")}\n${OCI_AGENT_COMMAND_EPILOGUE}\n`;
+}
+
 interface TrustedDockerRuntime {
   file: string;
   host: string;
@@ -1847,7 +1857,7 @@ class DockerExecutionAdapter implements OciExecutionAdapter {
         maxBufferBytes: request.maxBufferBytes,
         signal: request.signal,
         windowsHide: request.windowsHide,
-        stdin: request.command,
+        stdin: wrapOciAgentCommand(request.command),
       });
       // `--rm` 是 runtime 请求，不是删除证明。无论命令成功与否都做 daemon
       // readback；只有明确 No such container/object 才释放 active 记录。
