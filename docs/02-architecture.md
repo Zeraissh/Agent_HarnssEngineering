@@ -126,11 +126,20 @@ sequenceDiagram
 | `ToolRegistry` | 注册与查找；负责把 Tool 列表**确定性序列化**为 API 的 `tools` 参数（按 name 排序——工具顺序变化即缓存全灭） |
 | `ToolExecutor` | 接收一批 tool_use 块 → 逐个评估权限（auto 直接执行；ask 发审批事件等宿主应答；deny 回拒绝 result）→ 按 parallelSafe 分组调度 → 统一收集 ToolResult |
 
-**v0.2 内置工具**（最小集）：`bash`（自定义 schema 的普通工具，宿主本地执行，超时+输出截断）、`read_file`、`write_file`。遵循 P2：其余能力先走 bash，出现 gate/校验/渲染/并行需求时再晋升。
+**v0.2 内置工具**（最小集）：`bash`、`read_file`、`write_file`。`bash` 不再自行
+调用 `child_process`：逐 run 的 `ExecutionBroker` 经
+`AgentConfig → AgentLoop → ToolExecutor → ToolContext` 传播。`off/report` 是明确标注的
+宿主兼容通道，`required` 只允许通过功能探测的 OCI profile，失败绝不回退宿主；当前
+只覆盖 bash，故状态最多为 `partial`，不能称整个 run 已 sandboxed。required 每个
+segment/命令都强制刷新；segment 收尾立即销毁 broker，follow-up 新建并重新探针。
+清理未确认会撤销 coverage，per-run canary 前后双闸门阻止全局新准入。命令经 stdin
+全量落入私有 tmpfs 后以 fd0=EOF 执行，不出现在 runtime argv。详细决策与后续
+MCP/gateway Gate 见 `docs/adr/ADR-001-execution-isolation.md`。遵循 P2：其余能力先走
+bash，出现 gate/校验/渲染/并行需求时再晋升。
 
-**MCP 接入**（v0.7，`src/mcp.ts`）：任意 MCP server 的工具经 `adaptMcpTool` 适配为标准 `Tool`（名字加 `${server}__` 前缀），由 `mcp.json` 声明（command/args/env + per-server permission/parallelSafe/includeTools）。默认 "ask" + 串行——外部进程能力面未知，宿主审批兜底（P6）；`includeTools` 白名单控制工具面大小。isError 直接映射（P5）。首个落地：stm32-gdb-mcp 驱动 STM32L151 真机调试。
+**MCP 接入**（v0.7，`src/mcp.ts`）：任意 MCP server 的工具经 `adaptMcpTool` 适配为标准 `Tool`（名字加 `${server}__` 前缀），由 `mcp.json` 声明（command/args/env + per-server permission/toolPermissions/parallelSafe/includeTools）。默认 "ask" + 串行——外部进程能力面未知，宿主审批兜底（P6）；`toolPermissions` 按原始工具名细分 auto/ask，`includeTools` 白名单控制工具面大小。DomainPack 可在 server 策略上再做同构覆盖，CLI/Web 均经 `selectPackTools` 解析最终权限。isError 直接映射（P5）。首个落地：stm32-gdb-mcp 驱动 STM32L151 真机调试。
 
-**安全基线**：`write_file` / `bash` 默认 `permission: "ask"`；路径类输入一律 resolve 到规范形式并校验在工作目录内（拒绝 `..`、符号链接逃逸）。
+**安全基线**：`write_file` / `bash` 默认 `permission: "ask"`；路径类输入先做 lexical containment，再校验真实路径或最近存在父目录（拒绝 `..`、symlink/junction/reparse point 逃逸）。`fetch_url` 只连接已解析并固定的公网 HTTPS 地址，每次重定向重新校验 URL/DNS/IP，拒绝私网与本机目标。OCI workdir 额外拒绝 symlink 路径组件、nested mount、IPC/device 和 hardlink，并做 Docker daemon 双向 canary。ADR-002 用 daemon-resident schema-3 lease、boot-id/PID-namespace/PID starttime 存活证明和 full-ID readback，在下一次成功 probe 回收已到期且 owner 已死亡的 orphan；无后续 probe 时仍不是 autonomous TTL。Node 文件 API 与内嵌 CLI adapter 尚不能消除检查到 I/O/mount 之间的极窄 TOCTOU；独立 timer/Broker、MCP gateway、逐 run worktree/UID lease 与磁盘/inode 配额仍未完成，所以 SAFE-05 保持部分完成。
 
 ---
 
@@ -160,12 +169,14 @@ sequenceDiagram
 Web 宿主把 `meta.json`、`events.jsonl`、`transcript.jsonl` 分开落盘。父归档是不可变的
 审计记录；跨重启续跑不会尝试序列化/复活 `AgentLoop` 活对象，而是从最近完整 main
 段派生子 run。检查点只包含可验证恢复所需的最小状态：transcript 段号、对话轮数、
-Context 输入水位和共享 `runBudget` 快照。
+Context 输入水位、共享 `runBudget` 快照，以及完整 main 段结束时仍有效的版本化审批
+grant **审计快照**。该快照用于回答“当时有哪些授权”，不是可执行 capability。
 
 派生边界是 fail-closed 的：只支持无独立核查的 single run；工作目录必须仍命中当前
 宿主白名单，领域包必须仍存在；旧检查点上限与当前宿主上限逐项取更严格值，已用轮次
 和 token 不清零。子 run 使用当前模型/工具/策略，审批放行、挂起交互与 `ask_user`
-已用配额全部重置，并以 durable `run_forked` 事件记录直接父级、根运行和环境边界。
+已用配额全部重置；父 grant 因 `runId` 不同绝不继承，并逐条写入 durable
+`approval_grant_not_inherited`。`run_forked` 同时记录直接父级、根运行和环境边界。
 
 ## L5 — Memory（v0.5 已实现）
 

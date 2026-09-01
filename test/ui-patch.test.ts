@@ -491,7 +491,7 @@ describe("createBatcher", () => {
 // 详情页：输入值、焦点、渲染次数
 // ================================================================
 
-function stateWithPendingApproval() {
+function stateWithPendingApproval(grantPolicy = { maxScope: "once", maxTtlMs: 60_000, maxUses: 1 }) {
   let s = createInitialState("run-x", "写文件任务", true);
   s = reduceEvents(s, [
     sse(0, "main", "turn_start", { turn: 1 }),
@@ -499,12 +499,35 @@ function stateWithPendingApproval() {
       toolUseId: "tu_w",
       name: "write_file",
       input: { path: "a.txt" },
+      grantPolicy,
     }),
   ]);
   return s;
 }
 
 describe("详情页重渲染下的状态存活 (V-10)", () => {
+  it("可复用工具明确显示短期、相同参数边界", () => {
+    const onAllowAlways = vi.fn();
+    renderRunDetail(
+      stateWithPendingApproval({ maxScope: "exact-input", maxTtlMs: 60_000, maxUses: 3 }),
+      { activeTab: "overview", onAllowAlways },
+    );
+    const button = document.querySelector("[data-action='allow-always']") as HTMLButtonElement;
+    expect(button.textContent).toBe("短期允许相同参数");
+    expect(button.hidden).toBe(false);
+    expect(button.title).toContain("最多复用 3 次");
+    expect(document.body.textContent).not.toContain("本次对话都允许");
+    button.click();
+    expect(onAllowAlways).toHaveBeenCalledWith("tu_w#1", "write_file");
+  });
+
+  it("once 工具隐藏复用按钮，客户端不能扩大宿主策略", () => {
+    renderRunDetail(stateWithPendingApproval(), { activeTab: "overview" });
+    const button = document.querySelector("[data-action='allow-always']") as HTMLButtonElement;
+    expect(button.hidden).toBe(true);
+    expect(button.title).toContain("只允许单次审批");
+  });
+
   it("拒绝理由输入的内容与光标位置在重渲染后保持", () => {
     let s = stateWithPendingApproval();
     renderRunDetail(s, { activeTab: "overview" });
@@ -1447,6 +1470,60 @@ describe("装配状态条", () => {
     expect(by.verify).toContain("15 轮");
   });
 
+  it("精确放行说明展示 hash，并明确参数变化会重新询问", () => {
+    let state = configured();
+    state = reduceEvents(state, [
+      sse(2, "host", "approval_resolved", {
+        name: "bash",
+        toolUseId: "t1",
+        requestSeq: 1,
+        decision: "allow",
+        actor: "user",
+        scope: "run",
+        inputScope: "exact-input",
+        inputHash: "sha256:0123456789abcdef",
+        grantId: "g1",
+        boundRunId: state.runId,
+        expiresAt: Date.now() + 60_000,
+        maxUses: 5,
+        usedUses: 0,
+        at: 1,
+      }),
+    ]);
+    const item = deriveAssemblyBar(state, null).find((candidate) => candidate.key === "autoAllow")!;
+    expect(item.chip).toContain("bash#01234567");
+    expect(item.chip).toContain("余5");
+    expect(item.why).toContain("完全相同的参数");
+    expect(item.why).toContain("command、path、device");
+    expect(item.why).not.toContain("只对这几个工具名");
+  });
+
+  it("归档运行即使 grant 尚未到期也只显示审计，不显示 active", () => {
+    let state = createInitialState("archived", "历史", false, { archived: true });
+    state = reduceEvents(state, [
+      sse(2, "host", "approval_resolved", {
+        name: "fetch_url",
+        toolUseId: "t1",
+        requestSeq: 1,
+        decision: "allow",
+        actor: "user",
+        scope: "run",
+        inputScope: "exact-input",
+        inputHash: "sha256:abcdef",
+        grantId: "g-archived",
+        boundRunId: "archived",
+        expiresAt: Date.now() + 60_000,
+        maxUses: 5,
+        usedUses: 0,
+        at: 1,
+      }),
+    ]);
+    const item = deriveAssemblyBar(state, null).find((candidate) => candidate.key === "autoAllow")!;
+    expect(item.chip).toContain("授权审计");
+    expect(item.chip).not.toContain("精确放行");
+    expect(item.why).toContain("绝不恢复执行权");
+  });
+
   it("装配变了条上就变——核查关掉时说的是「核查关」", () => {
     let s = createInitialState("r2", "t", false);
     const items = deriveAssemblyBar(s, null);
@@ -1928,6 +2005,7 @@ describe("空态给的是能点的例子", () => {
     expect(document.querySelectorAll("[data-example]").length).toBeGreaterThanOrEqual(3);
     expect(document.querySelector(".empty-state h2")!.textContent).toBe("开始一段新对话");
   });
+
 });
 
 

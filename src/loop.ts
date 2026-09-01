@@ -16,6 +16,7 @@ import type {
   AgentConfig,
   AgentRunResult,
   AggregateUsage,
+  ExecutionBroker,
   ModelClient,
   SharedRunBudget,
   TaskCompletion,
@@ -189,7 +190,12 @@ export class AgentLoop {
     private readonly model: ModelClient,
   ) {
     for (const tool of cfg.tools) this.registry.register(tool);
-    this.executor = new ToolExecutor(this.registry, cfg.workdir, cfg.readRoots);
+    this.executor = new ToolExecutor(
+      this.registry,
+      cfg.workdir,
+      cfg.readRoots,
+      cfg.executionBroker,
+    );
     this.context = new DefaultContextManager({
       systemPrompt: cfg.systemPrompt,
       maxTokens: cfg.maxTokens ?? DEFAULTS.maxTokens,
@@ -215,6 +221,15 @@ export class AgentLoop {
     const queue = new AsyncEventQueue<TurnEvent>();
     this.startDrive(userInput, signal ?? new AbortController().signal, queue);
     return queue;
+  }
+
+  /**
+   * Preserve this loop's conversation context and cumulative budget while
+   * replacing the execution boundary that was disposed at the end of the
+   * previous segment.
+   */
+  setExecutionBroker(executionBroker?: ExecutionBroker): void {
+    this.executor.setExecutionBroker(executionBroker);
   }
 
   /**

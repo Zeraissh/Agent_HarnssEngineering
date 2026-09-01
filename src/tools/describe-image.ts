@@ -77,6 +77,9 @@ export function createDescribeImageTool(opts: DescribeImageOptions): Tool {
     },
     permission: "ask",
     parallelSafe: true,
+    // 同一路径的文件内容可能在两次调用间变化。grant 目前只绑定 JSON 输入，尚未
+    // 绑定文件内容摘要；因此视觉上传必须逐次审批，不能用相同 path 偷换资源。
+    approvalPolicy: { maxScope: "once" },
 
     async execute(input, ctx) {
       const { path: p, question } = input as { path?: unknown; question?: unknown };

@@ -46,6 +46,30 @@ async function renameWithTransientRetry(source: string, target: string): Promise
 /** 保留的 run 目录数上限（判据③）。先写死再收数据——口径同 STRUCTURED_OUTPUT_RULE */
 export const DEFAULT_HISTORY_KEEP = 50;
 
+/**
+ * 最后一个完整 main checkpoint 中的授权快照。
+ *
+ * 这是 durable audit / 将来同-run 恢复的输入，不是可跨 run 搬运的 capability。
+ * 当前 archive continuation 会创建新 run，因此宿主只读它并记录失效，绝不激活。
+ */
+export interface ArchivedApprovalGrant {
+  version: 1;
+  canonicalizationVersion: 1;
+  policyVersion: 1;
+  grantId: string;
+  approvalId: string;
+  boundRunId: string;
+  scope: "run";
+  name: string;
+  inputScope: "exact-input";
+  inputHash: string;
+  toolFingerprint: string;
+  issuedAt: number;
+  expiresAt: number;
+  maxUses: number;
+  usedUses: number;
+}
+
 export interface ArchivedCheckpoint {
   /** transcript.jsonl 中承载这份 messages 的 main 段号 */
   segmentIndex: number;
@@ -54,6 +78,8 @@ export interface ArchivedCheckpoint {
   contextInputTokens: number;
   /** continuation / 返工谱系共用的累计预算快照 */
   runBudget: SharedRunBudget;
+  /** 仅最后完整 main 段的授权审计快照；archive child 不继承 active grant */
+  approvalGrants?: ArchivedApprovalGrant[];
 }
 
 /** meta.json 的形状。version 是将来格式演进的逃生口 */

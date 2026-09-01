@@ -31,6 +31,8 @@ import {
   meterModelClient,
   revealCommand,
   runOutcomeForStopReason,
+  canonicalizeApprovalInput,
+  approvalInputHash,
   type UiServerHandle,
 } from "../ui/server.js";
 import { resolvePlannerMaxTurns } from "../src/planner.js";
@@ -39,6 +41,7 @@ import { REQUIREMENTS_TOOL_NAME } from "../src/clarifier.js";
 import { FINISH_TASK_TOOL_NAME } from "../src/task-completion.js";
 import { VERDICT_TOOL_NAME } from "../src/verifier.js";
 import { PACKS } from "../src/presets.js";
+import { bashTool } from "../src/tools/bash.js";
 import { DEFAULT_HISTORY_KEEP, historyKeepCount, historyRootPath } from "../ui/history.js";
 import {
   FakeModelClient,
@@ -47,7 +50,15 @@ import {
   textBlock,
   toolUseBlock,
 } from "./helpers.js";
-import type { Tool, ModelClient, ModelRequest, ModelTurn, StreamDelta } from "../src/types.js";
+import type {
+  Tool,
+  ModelClient,
+  ModelRequest,
+  ModelTurn,
+  StreamDelta,
+  ExecutionBroker,
+  ExecutionBoundaryStatus,
+} from "../src/types.js";
 
 // ------------------------------------------------------
 // Helpers
@@ -1413,6 +1424,27 @@ describe("ui-server", () => {
     expect(asText).not.toContain("sk-");
   });
 
+  it("v2-8b. Web 宿主接入 memory 工具与快照", async () => {
+    handle = createUiServer({
+      modelClient: new FakeModelClient([]),
+      workdir: process.cwd(),
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+
+    const snap = await (await fetch(`${base}/api/harness`)).json() as any;
+    const memoryTools = snap.tools.filter((t: { name: string }) => t.name.startsWith("memory_"));
+    expect(memoryTools.map((t: { name: string }) => t.name).sort()).toEqual([
+      "memory_delete",
+      "memory_list",
+      "memory_read",
+      "memory_write",
+    ]);
+    expect(memoryTools.every((t: { origin: string }) => t.origin === "memory")).toBe(true);
+    expect(snap.memory.enabled).toBe(true);
+    expect(snap.memory.toolCount).toBe(4);
+  });
+
   // ---- V-07 / V-08 成本口径与逐轮裁决 ----
   it("v2-9. run_end 带 executionUsage/verifications/reworks，且逐轮 verification 实时发出", async () => {
     const model = new FakeModelClient([
@@ -1705,6 +1737,74 @@ describe("ui-server", () => {
     expect(String(result.event.plannerFailure)).toContain("零工具调用");
     // 计划作废即一个子任务都不执行
     expect(events.some((e: any) => String(e.source).includes("/"))).toBe(false);
+  });
+
+  it("planner 的自答 deny 不进入 Web 审批表，宿主不能抢答或创建 grant", async () => {
+    let executed = 0;
+    let releaseSecond!: () => void;
+    let markSecondEntered!: () => void;
+    const secondGate = new Promise<void>((resolveGate) => { releaseSecond = resolveGate; });
+    const secondEntered = new Promise<void>((resolveEntered) => { markSecondEntered = resolveEntered; });
+    const planJson = JSON.stringify({
+      subtasks: [{ id: "s1", title: "只读计划", description: "完成任务", acceptance: ["完成"], dependsOn: [] }],
+    });
+    const script = [
+      fakeMessage([toolUseBlock("planner_danger", "danger", { target: "same" })], "tool_use"),
+      fakeMessage([textBlock(planJson)], "end_turn"),
+      fakeMessage([textBlock("s1 done")], "end_turn"),
+      fakeMessage([textBlock(JSON.stringify({ passed: true, issues: [], summary: "通过" }))], "end_turn"),
+    ];
+    let call = 0;
+    const model: ModelClient = {
+      send: async () => {
+        const index = call++;
+        const message = script[index];
+        if (!message) throw new Error(`planner approval script exhausted at ${index + 1}`);
+        if (index === 1) {
+          markSecondEntered();
+          await secondGate;
+        }
+        return { message, stopReason: message.stop_reason, usage: message.usage };
+      },
+    };
+    const danger = makeTool({
+      name: "danger",
+      permission: "ask",
+      approvalPolicy: { maxScope: "exact-input", maxTtlMs: 60_000, maxUses: 5 },
+      execute: async () => { executed += 1; return { content: "must not execute" }; },
+    });
+    handle = createUiServer({ modelClient: model, tools: [danger], workdir: process.cwd() });
+    port = await startServer(handle);
+    base = baseUrl(port);
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "planner 只读审批", mode: "plan", concurrency: 1 }),
+    })).json() as { runId: string };
+
+    await secondEntered;
+    try {
+      const snapshot = await readSSESnapshot(base, runId) as any[];
+      const request = snapshot.find((item) => item.source === "planner" && item.event.type === "approval_request");
+      expect(request, "planner approval_request 应保留为只读审计事件").toBeDefined();
+      const summary = ((await (await fetch(`${base}/api/runs`)).json()) as any[])
+        .find((item) => item.runId === runId);
+      expect(summary.pendingApprovals).toBe(0);
+      const attempted = await fetch(
+        `${base}/api/runs/${runId}/approvals/${encodeURIComponent(`${request.event.toolUseId}#${request.seq}`)}`,
+        {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ decision: "allow", scope: "conversation" }),
+        },
+      );
+      expect(attempted.status).toBe(404);
+      expect(executed).toBe(0);
+    } finally {
+      releaseSecond();
+    }
+    await waitForDone(base, runId);
+    const events = await readSSESnapshot(base, runId) as any[];
+    expect(events.some((item) => item.event.grantId || item.event.actor === "auto-rule")).toBe(false);
+    expect(executed).toBe(0);
   });
 
   it("v2-19. mode / concurrency 非法值当场 400", async () => {
@@ -2138,6 +2238,693 @@ describe("ui-server", () => {
     expect(rc.event.workdir).toBe(resolve(sub));
   });
 
+  it("SAFE-05. Web 为 run 固定独立 broker，并把真实 boundary 写进 run_config", async () => {
+    const calls: { runId: string; workdir: string; command?: string }[] = [];
+    const brokers = new Map<string, ExecutionBroker>();
+    handle = createUiServer({
+      modelClient: new FakeModelClient([
+        fakeMessage([toolUseBlock("tu_exec", "bash", { command: "echo broker" })], "tool_use"),
+        fakeMessage([textBlock("done")], "end_turn"),
+      ]),
+      tools: [{ ...bashTool, permission: "auto" }],
+      workdir: process.cwd(),
+      executionBrokerFactory: (runId, runWorkdir) => {
+        calls.push({ runId, workdir: runWorkdir });
+        const boundary: ExecutionBoundaryStatus = {
+          schemaVersion: 1,
+          boundaryId: runId,
+          requestedMode: "required",
+          requestedBackend: "oci",
+          effectiveState: "partial",
+          resolvedBackend: "oci",
+          policyDigest: "d".repeat(64),
+          probe: { state: "ready", candidate: "oci", runtimeVersion: "fake" },
+          coverage: ["bash"],
+          filesystem: "ro root + rw workdir",
+          network: "none",
+          identity: "uid 65532",
+          resources: "limited",
+        };
+        const broker: ExecutionBroker = {
+          boundaryId: runId,
+          status: () => boundary,
+          probe: async () => boundary,
+          executeShell: async (request) => {
+            calls.push({ runId, workdir: request.cwd, command: request.command });
+            return {
+              stdout: "broker-ok\n", stderr: "", exitCode: 0, signal: null,
+              timedOut: false, aborted: false, outputLimitExceeded: false,
+              cleanup: "runtime-rm", status: boundary,
+            };
+          },
+        };
+        brokers.set(runId, broker);
+        return broker;
+      },
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "broker binding" }),
+    })).json() as { runId: string };
+    await waitForDone(base, runId);
+    const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+    const rc = events.find((event: any) => event.event.type === "run_config") as any;
+    expect(rc.event.executionIsolation).toMatchObject({
+      boundaryId: runId,
+      effectiveState: "partial",
+      resolvedBackend: "oci",
+      coverage: ["bash"],
+    });
+    expect(brokers.get(runId)).toBeDefined();
+    expect(calls.filter((call) => call.command)).toEqual([
+      { runId, workdir: resolve(process.cwd()), command: "echo broker" },
+    ]);
+    expect(calls.filter((call) => !call.command)).toEqual([
+      { runId: "process-capability-probe", workdir: resolve(process.cwd()) },
+      { runId, workdir: resolve(process.cwd()) },
+    ]);
+  });
+
+  it("SAFE-05. 已完成 run 的 follow-up 换用新 broker，绝不复用已释放实例", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([textBlock("first done")], "end_turn"),
+      fakeMessage([toolUseBlock("tu_followup_bash", "bash", { command: "echo follow-up" })], "tool_use"),
+      fakeMessage([textBlock("follow-up done")], "end_turn"),
+    ]);
+    const boundaryFor = (boundaryId: string): ExecutionBoundaryStatus => ({
+      schemaVersion: 1,
+      boundaryId,
+      requestedMode: "required",
+      requestedBackend: "oci",
+      effectiveState: "partial",
+      resolvedBackend: "oci",
+      policyDigest: "7".repeat(64),
+      probe: { state: "ready", candidate: "oci" },
+      coverage: ["bash"],
+      filesystem: "ro root + rw workdir",
+      network: "none",
+      identity: "uid 65532",
+      resources: "limited",
+    });
+    const processBoundary = boundaryFor("process-probe");
+    const processBroker: ExecutionBroker = {
+      boundaryId: processBoundary.boundaryId,
+      status: () => processBoundary,
+      probe: async () => processBoundary,
+      executeShell: async (request) => ({
+        stdout: "", stderr: "", exitCode: 0, signal: null,
+        timedOut: false, aborted: request.signal.aborted, outputLimitExceeded: false,
+        cleanup: "runtime-rm", status: processBoundary,
+      }),
+    };
+    const created: Array<{
+      runId: string;
+      disposed: boolean;
+      commands: string[];
+    }> = [];
+
+    handle = createUiServer({
+      modelClient: model,
+      tools: [{ ...bashTool, permission: "auto" }],
+      workdir: process.cwd(),
+      executionProbeBroker: processBroker,
+      executionBrokerFactory: (runId) => {
+        const state = { runId, disposed: false, commands: [] as string[] };
+        created.push(state);
+        const boundary = boundaryFor(runId);
+        return {
+          boundaryId: runId,
+          status: () => boundary,
+          probe: async () => boundary,
+          executeShell: async (request) => {
+            if (state.disposed) throw new Error("disposed broker was reused");
+            state.commands.push(request.command);
+            return {
+              stdout: "follow-up-ok\n", stderr: "", exitCode: 0, signal: null,
+              timedOut: false, aborted: request.signal.aborted, outputLimitExceeded: false,
+              cleanup: "runtime-rm", status: boundary,
+            };
+          },
+          dispose: async () => { state.disposed = true; },
+        };
+      },
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "first segment", verify: false }),
+    })).json() as { runId: string };
+    await waitForDone(base, runId);
+    expect(created).toHaveLength(1);
+    expect(created[0]).toMatchObject({ runId, disposed: true, commands: [] });
+
+    const follow = await fetch(`${base}/api/runs/${runId}/messages`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "run the follow-up command" }),
+    });
+    expect(follow.status).toBe(200);
+    await waitForDone(base, runId);
+
+    expect(created).toHaveLength(2);
+    expect(created[0]).toMatchObject({ runId, disposed: true, commands: [] });
+    expect(created[1]).toMatchObject({
+      runId,
+      disposed: true,
+      commands: ["echo follow-up"],
+    });
+    expect(model.requests).toHaveLength(3);
+  });
+
+  it("SAFE-05. 初始无 bash 的 pack 规划到含 bash 子任务时仍走同一 per-run broker", async () => {
+    const plan = JSON.stringify({
+      subtasks: [{
+        id: "s1", title: "Python step", pack: "python-coding",
+        description: "运行检查", acceptance: ["检查通过"], dependsOn: [],
+      }],
+    });
+    const model = new FakeModelClient([
+      fakeMessage([textBlock(plan)], "end_turn"),
+      fakeMessage([toolUseBlock("tu_planned_bash", "bash", { command: "python -m pytest -q" })], "tool_use"),
+      fakeMessage([textBlock("subtask done")], "end_turn"),
+      fakeMessage([textBlock(JSON.stringify({ passed: true, issues: [], summary: "通过" }))], "end_turn"),
+    ]);
+    const commands: Array<{ runId: string; command: string }> = [];
+    const boundaryFor = (boundaryId: string): ExecutionBoundaryStatus => ({
+      schemaVersion: 1, boundaryId, requestedMode: "required", requestedBackend: "oci",
+      effectiveState: "partial", resolvedBackend: "oci", policyDigest: "e".repeat(64),
+      probe: { state: "ready", candidate: "oci" }, coverage: ["bash"],
+      filesystem: "rw workdir", network: "none", identity: "uid 65532", resources: "limited",
+    });
+    const brokerFor = (boundaryId: string): ExecutionBroker => ({
+      boundaryId, status: () => boundaryFor(boundaryId), probe: async () => boundaryFor(boundaryId),
+      executeShell: async (request) => {
+        commands.push({ runId: boundaryId, command: request.command });
+        return {
+          stdout: "ok", stderr: "", exitCode: 0, signal: null, timedOut: false,
+          aborted: request.signal.aborted, outputLimitExceeded: false, cleanup: "runtime-rm",
+          status: boundaryFor(boundaryId),
+        };
+      },
+      dispose: async () => {},
+    });
+    const processBroker = brokerFor("process-probe");
+    const createdRunBrokers: string[] = [];
+    handle = createUiServer({
+      modelClient: model,
+      // 不注入 tools：让 stm32-debug → python-coding 的真实 pack 工具选择发生。
+      workdir: process.cwd(),
+      executionEnv: {
+        AGENT_EXECUTION_ISOLATION: "required", AGENT_EXECUTION_BACKEND: "oci",
+        AGENT_EXECUTION_OCI_IMAGE: `sha256:${"e".repeat(64)}`,
+      },
+      executionProbeBroker: processBroker,
+      executionBrokerFactory: (runId) => {
+        createdRunBrokers.push(runId);
+        return brokerFor(runId);
+      },
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "跨包计划", mode: "plan", pack: "stm32-debug", concurrency: 1 }),
+    })).json() as { runId: string };
+    const approval = await waitForEvent(
+      base,
+      runId,
+      (event: any) => event.event.type === "approval_request" && event.event.toolUseId === "tu_planned_bash",
+    ) as any;
+    expect(approval.event.name).toBe("bash");
+    expect((await fetch(`${base}/api/runs/${runId}/approvals/${approval.event.toolUseId}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: "allow" }),
+    })).status).toBe(200);
+    await waitForDone(base, runId);
+    expect(createdRunBrokers).toEqual([runId]);
+    expect(commands).toEqual([{ runId, command: "python -m pytest -q" }]);
+  });
+
+  it("SAFE-05. 初始无 bash 的 plan 若 per-run boundary 失败，planner 也保持零模型调用", async () => {
+    const model = new FakeModelClient([fakeMessage([textBlock("must not plan")], "end_turn")]);
+    const ready: ExecutionBoundaryStatus = {
+      schemaVersion: 1, boundaryId: "process-probe", requestedMode: "required", requestedBackend: "oci",
+      effectiveState: "partial", resolvedBackend: "oci", policyDigest: "1".repeat(64),
+      probe: { state: "ready", candidate: "oci" }, coverage: ["bash"], filesystem: "rw",
+      network: "none", identity: "uid 65532", resources: "limited",
+    };
+    const failed = (boundaryId: string): ExecutionBoundaryStatus => ({
+      ...ready, boundaryId, effectiveState: "failed", resolvedBackend: null,
+      probe: { state: "unavailable", candidate: "oci", reason: "run workdir canary failed" },
+      coverage: [], filesystem: "unavailable", network: "unavailable",
+      identity: "unavailable", resources: "unavailable",
+    });
+    const processBroker: ExecutionBroker = {
+      boundaryId: ready.boundaryId, status: () => ready, probe: async () => ready,
+      executeShell: async (request) => ({
+        stdout: "", stderr: "", exitCode: 0, signal: null, timedOut: false,
+        aborted: request.signal.aborted, outputLimitExceeded: false, cleanup: "runtime-rm", status: ready,
+      }), dispose: async () => {},
+    };
+    handle = createUiServer({
+      modelClient: model,
+      workdir: process.cwd(),
+      executionEnv: {
+        AGENT_EXECUTION_ISOLATION: "required", AGENT_EXECUTION_BACKEND: "oci",
+        AGENT_EXECUTION_OCI_IMAGE: `sha256:${"1".repeat(64)}`,
+      },
+      executionProbeBroker: processBroker,
+      executionBrokerFactory: (runId) => ({
+        boundaryId: runId, status: () => failed(runId), probe: async () => failed(runId),
+        executeShell: async (request) => ({
+          stdout: "", stderr: "", exitCode: null, signal: null, timedOut: false,
+          aborted: request.signal.aborted, outputLimitExceeded: false, cleanup: "not-needed",
+          status: failed(runId), error: "must not execute",
+        }), dispose: async () => {},
+      }),
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "blocked cross-pack plan", mode: "plan", pack: "stm32-debug" }),
+    })).json() as { runId: string };
+    await waitForDone(base, runId);
+    const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+    expect(events.some((event: any) => event.event.type === "execution_boundary_failed")).toBe(true);
+    expect(model.requests).toHaveLength(0);
+  });
+
+  it("SAFE-05. required 探针失败时 liveness 存活、readiness 与新 run 均 503", async () => {
+    const failed: ExecutionBoundaryStatus = {
+      schemaVersion: 1,
+      boundaryId: "process-probe",
+      requestedMode: "required",
+      requestedBackend: "oci",
+      effectiveState: "failed",
+      resolvedBackend: null,
+      policyDigest: "f".repeat(64),
+      probe: {
+        state: "unavailable",
+        candidate: "oci",
+        reason: "docker daemon unavailable at /private/runtime/docker.sock",
+      },
+      coverage: [],
+      filesystem: "unavailable",
+      network: "unavailable",
+      identity: "unavailable",
+      resources: "unavailable",
+    };
+    const failedBroker: ExecutionBroker = {
+      boundaryId: failed.boundaryId,
+      status: () => failed,
+      probe: async () => failed,
+      executeShell: async (request) => ({
+        stdout: "", stderr: "", exitCode: null, signal: null,
+        timedOut: false, aborted: request.signal.aborted, outputLimitExceeded: false,
+        cleanup: "not-needed", status: failed, error: "must not run",
+      }),
+    };
+    handle = createUiServer({
+      modelClient: new FakeModelClient([]),
+      tools: [{ ...bashTool, permission: "auto" }],
+      workdir: process.cwd(),
+      executionProbeBroker: failedBroker,
+      executionBrokerFactory: () => failedBroker,
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+    expect((await fetch(`${base}/health`)).status).toBe(200);
+    const ready = await fetch(`${base}/ready`);
+    expect(ready.status).toBe(503);
+    const readyText = await ready.text();
+    expect(readyText).not.toContain("/private/runtime/docker.sock");
+    expect((JSON.parse(readyText) as any).execution.status).toMatchObject({
+      effectiveState: "failed",
+      probe: { code: "execution_backend_unavailable" },
+    });
+    const create = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "must not reach model" }),
+    });
+    expect(create.status).toBe(503);
+    expect((await create.json() as any).error).toContain("docker daemon unavailable");
+  });
+
+  it("SAFE-05. 注入 modelClient 不能把 required 配置静默降为测试直跑，失败时模型零调用", async () => {
+    const model = new FakeModelClient([fakeMessage([textBlock("must not run")], "end_turn")]);
+    handle = createUiServer({
+      modelClient: model,
+      tools: [{ ...bashTool, permission: "auto" }],
+      workdir: process.cwd(),
+      executionEnv: {
+        AGENT_EXECUTION_ISOLATION: "required",
+        AGENT_EXECUTION_BACKEND: "oci",
+        AGENT_EXECUTION_OCI_IMAGE: `sha256:${"8".repeat(64)}`,
+      },
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+    expect((await fetch(`${base}/ready`)).status).toBe(503);
+    const create = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "model must stay untouched" }),
+    });
+    expect(create.status).toBe(503);
+    expect(model.requests).toHaveLength(0);
+  });
+
+  it("SAFE-05. ready 后 backend 失效会立即阻断 readiness 与同 run 续跑，模型零新增调用", async () => {
+    const model = new FakeModelClient([fakeMessage([textBlock("first done")], "end_turn")]);
+    let backendReady = true;
+    const makeBoundary = (boundaryId: string): ExecutionBoundaryStatus => ({
+      schemaVersion: 1,
+      boundaryId,
+      requestedMode: "required",
+      requestedBackend: "oci",
+      effectiveState: backendReady ? "partial" : "failed",
+      resolvedBackend: backendReady ? "oci" : null,
+      policyDigest: "9".repeat(64),
+      probe: backendReady
+        ? { state: "ready", candidate: "oci" }
+        : { state: "unavailable", candidate: "oci", reason: "runtime went down" },
+      coverage: backendReady ? ["bash"] : [],
+      filesystem: backendReady ? "rw workdir" : "unavailable",
+      network: backendReady ? "none" : "unavailable",
+      identity: backendReady ? "uid 65532" : "unavailable",
+      resources: backendReady ? "limited" : "unavailable",
+    });
+    const brokerFor = (boundaryId: string): ExecutionBroker => ({
+      boundaryId,
+      status: () => makeBoundary(boundaryId),
+      probe: async () => makeBoundary(boundaryId),
+      executeShell: async (request) => ({
+        stdout: "", stderr: "", exitCode: 0, signal: null,
+        timedOut: false, aborted: request.signal.aborted, outputLimitExceeded: false,
+        cleanup: "runtime-rm", status: makeBoundary(boundaryId),
+      }),
+      dispose: async () => {},
+    });
+    handle = createUiServer({
+      modelClient: model,
+      tools: [{ ...bashTool, permission: "auto" }],
+      workdir: process.cwd(),
+      executionEnv: {
+        AGENT_EXECUTION_ISOLATION: "required",
+        AGENT_EXECUTION_BACKEND: "oci",
+        AGENT_EXECUTION_OCI_IMAGE: `sha256:${"9".repeat(64)}`,
+      },
+      executionProbeBroker: brokerFor("process-probe"),
+      executionBrokerFactory: (runId) => brokerFor(runId),
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "first", verify: false }),
+    })).json() as { runId: string };
+    await waitForDone(base, runId);
+    expect(model.requests).toHaveLength(1);
+
+    backendReady = false;
+    expect((await fetch(`${base}/ready`)).status).toBe(503);
+    const follow = await fetch(`${base}/api/runs/${runId}/messages`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "continue" }),
+    });
+    expect(follow.status).toBe(503);
+    expect(model.requests).toHaveLength(1);
+  });
+
+  it("SAFE-05. run broker 清理未确认会锁住全局新准入，不能只污染旧 run", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("tu_cleanup", "bash", { command: "false" })], "tool_use"),
+      fakeMessage([textBlock("handled")], "end_turn"),
+      fakeMessage([textBlock("must not run")], "end_turn"),
+    ]);
+    const readyBoundary = (boundaryId: string): ExecutionBoundaryStatus => ({
+      schemaVersion: 1, boundaryId, requestedMode: "required", requestedBackend: "oci",
+      effectiveState: "partial", resolvedBackend: "oci", policyDigest: "a".repeat(64),
+      probe: { state: "ready", candidate: "oci" }, coverage: ["bash"],
+      filesystem: "rw workdir", network: "none", identity: "uid 65532", resources: "limited",
+    });
+    const processBroker: ExecutionBroker = {
+      boundaryId: "process-probe", status: () => readyBoundary("process-probe"),
+      probe: async () => readyBoundary("process-probe"),
+      executeShell: async (request) => ({
+        stdout: "", stderr: "", exitCode: 0, signal: null, timedOut: false,
+        aborted: request.signal.aborted, outputLimitExceeded: false, cleanup: "runtime-rm",
+        status: readyBoundary("process-probe"),
+      }),
+      dispose: async () => {},
+    };
+    let cleanupAttempts = 0;
+    const runBroker = (runId: string): ExecutionBroker => ({
+      boundaryId: runId, status: () => readyBoundary(runId), probe: async () => readyBoundary(runId),
+      executeShell: async (request) => ({
+        stdout: "", stderr: "command failed", exitCode: 1, signal: null,
+        timedOut: false, aborted: request.signal.aborted, outputLimitExceeded: false,
+        cleanup: "failed", status: readyBoundary(runId), error: "cleanup receipt missing",
+      }),
+      dispose: async () => {
+        cleanupAttempts += 1;
+        if (cleanupAttempts === 1) throw new Error("worker still present");
+      },
+    });
+    handle = createUiServer({
+      modelClient: model,
+      tools: [{ ...bashTool, permission: "auto" }],
+      workdir: process.cwd(),
+      executionEnv: {
+        AGENT_EXECUTION_ISOLATION: "required", AGENT_EXECUTION_BACKEND: "oci",
+        AGENT_EXECUTION_OCI_IMAGE: `sha256:${"a".repeat(64)}`,
+      },
+      executionProbeBroker: processBroker,
+      executionBrokerFactory: (runId) => runBroker(runId),
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "cleanup fail", verify: false }),
+    })).json() as { runId: string };
+    await waitForDone(base, runId);
+    await new Promise((resolveDone) => setTimeout(resolveDone, 0));
+    const second = await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "must be blocked", verify: false }),
+    });
+    expect(second.status).toBe(503);
+    expect(model.requests).toHaveLength(2);
+  });
+
+  it("SAFE-05. 慢 create body 通过旧检查后遇到 detached cleanup，启动重验保持零 canary/模型执行", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("tu_finish_first", "hold_op", { op: "finish" })], "tool_use"),
+      fakeMessage([textBlock("first finished")], "end_turn"),
+    ]);
+    const boundaryFor = (boundaryId: string): ExecutionBoundaryStatus => ({
+      schemaVersion: 1, boundaryId, requestedMode: "required", requestedBackend: "oci",
+      effectiveState: "partial", resolvedBackend: "oci", policyDigest: "6".repeat(64),
+      probe: { state: "ready", candidate: "oci" }, coverage: ["bash"],
+      filesystem: "rw workdir", network: "none", identity: "uid 65532", resources: "limited",
+    });
+
+    let armSlowAdmissionProbe = false;
+    let signalSlowAdmissionProbe!: () => void;
+    const slowAdmissionProbePassed = new Promise<void>((resolveProbe) => {
+      signalSlowAdmissionProbe = resolveProbe;
+    });
+    const processBroker: ExecutionBroker = {
+      boundaryId: "process-probe",
+      status: () => boundaryFor("process-probe"),
+      probe: async () => {
+        if (armSlowAdmissionProbe) {
+          armSlowAdmissionProbe = false;
+          signalSlowAdmissionProbe();
+        }
+        return boundaryFor("process-probe");
+      },
+      executeShell: async (request) => ({
+        stdout: "", stderr: "", exitCode: 0, signal: null, timedOut: false,
+        aborted: request.signal.aborted, outputLimitExceeded: false, cleanup: "runtime-rm",
+        status: boundaryFor("process-probe"),
+      }),
+      dispose: async () => {},
+    };
+
+    let releaseFirstCleanup!: () => void;
+    const firstCleanup = new Promise<void>((resolveCleanup) => {
+      releaseFirstCleanup = resolveCleanup;
+    });
+    const runBrokers: Array<{ runId: string; probes: number; executions: number }> = [];
+    handle = createUiServer({
+      modelClient: model,
+      tools: [askTool("hold_op"), { ...bashTool, permission: "auto" }],
+      workdir: process.cwd(),
+      executionEnv: {
+        AGENT_EXECUTION_ISOLATION: "required", AGENT_EXECUTION_BACKEND: "oci",
+        AGENT_EXECUTION_OCI_IMAGE: `sha256:${"6".repeat(64)}`,
+      },
+      executionProbeBroker: processBroker,
+      executionBrokerFactory: (runId) => {
+        const state = { runId, probes: 0, executions: 0 };
+        runBrokers.push(state);
+        return {
+          boundaryId: runId,
+          status: () => boundaryFor(runId),
+          probe: async () => {
+            state.probes += 1;
+            return boundaryFor(runId);
+          },
+          executeShell: async (request) => {
+            state.executions += 1;
+            return {
+              stdout: "", stderr: "", exitCode: 0, signal: null, timedOut: false,
+              aborted: request.signal.aborted, outputLimitExceeded: false, cleanup: "runtime-rm",
+              status: boundaryFor(runId),
+            };
+          },
+          // 第一个 run 的回收保持 pending；第二个（被准入门拦下）的 broker 可正常收掉。
+          dispose: async () => {
+            if (runBrokers[0] === state) await firstCleanup;
+          },
+        };
+      },
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+
+    try {
+      const first = await fetch(`${base}/api/runs`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task: "first run waits for approval", verify: false }),
+      });
+      const { runId: firstRunId } = await first.json() as { runId: string };
+      const approval = await waitForEvent(
+        base,
+        firstRunId,
+        (event: any) => event.event.type === "approval_request" && event.event.toolUseId === "tu_finish_first",
+      ) as any;
+
+      // B 只发送请求头：process admission 已通过，处理器随后确定性停在 readBody。
+      armSlowAdmissionProbe = true;
+      let slowRequest!: ReturnType<typeof httpRequest>;
+      const slowResponse = new Promise<{ status: number; body: string }>((resolveResponse, rejectResponse) => {
+        slowRequest = httpRequest({
+          host: "127.0.0.1", port, path: "/api/runs", method: "POST",
+          headers: { "Content-Type": "application/json", "Transfer-Encoding": "chunked" },
+        }, (response) => {
+          let body = "";
+          response.setEncoding("utf8");
+          response.on("data", (chunk) => { body += chunk; });
+          response.on("end", () => resolveResponse({ status: response.statusCode!, body }));
+        });
+        slowRequest.on("error", rejectResponse);
+        slowRequest.flushHeaders();
+      });
+      await slowAdmissionProbePassed;
+
+      // A 此时收尾并进入永不自行完成的 detached cleanup，制造旧检查后的状态翻转。
+      expect((await fetch(`${base}/api/runs/${firstRunId}/approvals/${approval.event.toolUseId}`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ decision: "allow" }),
+      })).status).toBe(200);
+      await waitForDone(base, firstRunId);
+
+      slowRequest.end(JSON.stringify({ task: "must stop after per-run probe", verify: false }));
+      const secondResponse = await slowResponse;
+      expect(secondResponse.status).toBe(200);
+      const { runId: secondRunId } = JSON.parse(secondResponse.body) as { runId: string };
+      await waitForDone(base, secondRunId);
+
+      const secondEvents = await readSSEAll(await fetch(`${base}/api/runs/${secondRunId}/events`));
+      const configIndex = secondEvents.findIndex((event: any) => event.event.type === "run_config");
+      const blockedIndex = secondEvents.findIndex(
+        (event: any) => event.event.type === "execution_boundary_failed",
+      );
+      expect(configIndex).toBeGreaterThanOrEqual(0);
+      expect(blockedIndex).toBeGreaterThan(configIndex);
+      expect((secondEvents[configIndex] as any).event.executionIsolation).toMatchObject({
+        boundaryId: secondRunId,
+        effectiveState: "failed",
+        resolvedBackend: null,
+        probe: {
+          state: "unavailable",
+          reason: expect.stringContaining("Cleanup is still unconfirmed"),
+        },
+        coverage: [],
+      });
+      const blocked = secondEvents.find((event: any) => event.event.type === "execution_boundary_failed") as any;
+      expect(blocked.event.reason).toContain("Cleanup is still unconfirmed");
+      // gate 早于 buildConfig；第二个 run 连 broker/canary 都不得创建。
+      expect(runBrokers).toHaveLength(1);
+      expect(runBrokers.find((broker) => broker.runId === secondRunId)?.probes ?? 0).toBe(0);
+      expect(runBrokers.reduce((total, broker) => total + broker.executions, 0)).toBe(0);
+      expect(model.requests).toHaveLength(2);
+    } finally {
+      releaseFirstCleanup();
+      await new Promise((resolveDone) => setTimeout(resolveDone, 0));
+    }
+  });
+
+  it("SAFE-05. required+host MCP 在任何 broker/probe 创建前即拒绝", () => {
+    const prior = process.env.AGENT_UI_MCP;
+    process.env.AGENT_UI_MCP = "1";
+    const factoryCalls: string[] = [];
+    try {
+      expect(() => createUiServer({
+        modelClient: new FakeModelClient([]),
+        tools: [{ ...bashTool, permission: "auto" }],
+        workdir: process.cwd(),
+        executionEnv: {
+          AGENT_EXECUTION_ISOLATION: "required", AGENT_EXECUTION_BACKEND: "oci",
+          AGENT_EXECUTION_OCI_IMAGE: `sha256:${"b".repeat(64)}`,
+        },
+        executionBrokerFactory: (runId) => {
+          factoryCalls.push(runId);
+          throw new Error("must not construct");
+        },
+      })).toThrow(/cannot enable shared host stdio MCP/);
+      expect(factoryCalls).toEqual([]);
+    } finally {
+      if (prior === undefined) delete process.env.AGENT_UI_MCP;
+      else process.env.AGENT_UI_MCP = prior;
+    }
+  });
+
+  it("SAFE-05. close 会关闭 HTTP 且把 broker 清理失败作为拒绝返回", async () => {
+    const boundary: ExecutionBoundaryStatus = {
+      schemaVersion: 1, boundaryId: "close-probe", requestedMode: "required", requestedBackend: "oci",
+      effectiveState: "partial", resolvedBackend: "oci", policyDigest: "c".repeat(64),
+      probe: { state: "ready", candidate: "oci" }, coverage: ["bash"], filesystem: "rw",
+      network: "none", identity: "uid 65532", resources: "limited",
+    };
+    const broker: ExecutionBroker = {
+      boundaryId: boundary.boundaryId, status: () => boundary, probe: async () => boundary,
+      executeShell: async (request) => ({
+        stdout: "", stderr: "", exitCode: 0, signal: null, timedOut: false,
+        aborted: request.signal.aborted, outputLimitExceeded: false, cleanup: "runtime-rm", status: boundary,
+      }),
+      dispose: async () => { throw new Error("cleanup proof unavailable"); },
+    };
+    handle = createUiServer({
+      modelClient: new FakeModelClient([]), tools: [{ ...bashTool, permission: "auto" }],
+      workdir: process.cwd(), executionProbeBroker: broker, executionBrokerFactory: () => broker,
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+    const closing = handle.close();
+    handle = undefined;
+    await expect(closing).rejects.toThrow(/cleanup proof unavailable/);
+    await expect(fetch(`${base}/health`)).rejects.toThrow();
+  });
+
   // ---- V-30 角色模型 ----
   it("v2-26. 角色模型快照只报名字与 provider，绝不下发密钥或 baseURL", async () => {
     process.env.AGENT_VERIFIER_MODEL = "strong-verifier";
@@ -2215,6 +3002,7 @@ describe("ui-server", () => {
       expect(vision.origin).toBe("builtin");
       // 把本地文件送到另一个端点，属于要审批的动作
       expect(vision.permission).toBe("ask");
+      expect(vision.approvalPolicy).toEqual({ maxScope: "once" });
 
       expect(snap.roleModels.vision).toEqual({
         model: "moonshot-v1-8k-vision-preview", provider: "openai", configured: true,
@@ -2710,7 +3498,7 @@ describe("凭据装载：npm 脚本必须自己读 .env", () => {
   });
 });
 
-describe("本次对话常驻放行：省的是点击，不是记录", () => {
+describe("本次对话精确输入放行：省的是重复点击，不是扩大权限", () => {
   let handle: Awaited<ReturnType<typeof createUiServer>>;
   let base: string;
 
@@ -2719,7 +3507,12 @@ describe("本次对话常驻放行：省的是点击，不是记录", () => {
   });
 
   /** 每次调用都要审批的工具；模型连着调它三次 */
-  const askEvery = (name: string) => makeTool({ name, permission: "ask", parallelSafe: false });
+  const askEvery = (name: string) => makeTool({
+    name,
+    permission: "ask",
+    parallelSafe: false,
+    approvalPolicy: { maxScope: "exact-input", maxTtlMs: 60_000, maxUses: 5 },
+  });
 
   async function startRunCallingThrice(): Promise<{ runId: string }> {
     const model = new FakeModelClient([
@@ -2752,7 +3545,7 @@ describe("本次对话常驻放行：省的是点击，不是记录", () => {
     throw new Error("没等到审批请求");
   };
 
-  it("建规则之后同名工具不再挂起，run 自己跑完", async () => {
+  it("建规则之后同一工具 + 相同输入不再挂起，run 自己跑完", async () => {
     const { runId } = await startRunCallingThrice();
     const ref = await firstPending(runId);
     const res = await fetch(`${base}/api/runs/${runId}/approvals/${encodeURIComponent(ref)}`, {
@@ -2761,7 +3554,19 @@ describe("本次对话常驻放行：省的是点击，不是记录", () => {
       body: JSON.stringify({ decision: "allow", scope: "conversation" }),
     });
     expect(res.status).toBe(200);
-    expect((await res.json()).autoAllow).toContain("danger");
+    const response = await res.json() as any;
+    expect(response.autoAllow).toContain("danger"); // 旧 API 形状保留
+    expect(response.autoAllowExact).toEqual([
+      expect.objectContaining({
+        name: "danger",
+        scope: "run",
+        inputScope: "exact-input",
+        boundRunId: runId,
+        expiresAt: expect.any(Number),
+        maxUses: 5,
+        inputHash: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
+      }),
+    ]);
 
     await waitForDone(base, runId);
     const list = await (await fetch(`${base}/api/runs`)).json();
@@ -2785,14 +3590,92 @@ describe("本次对话常驻放行：省的是点击，不是记录", () => {
     await waitForDone(base, runId);
 
     const evs = await readSSESnapshot(base, runId);
+    expect(evs.filter((e: any) => (e.event as any)?.type === "approval_request"))
+      .toHaveLength(3);
+    expect(evs.map((e: any) => e.seq), "durable 事件序号必须连续且保持 request 在 resolution 之前")
+      .toEqual(evs.map((_: unknown, index: number) => index));
     const resolved = evs.filter((e: any) => (e.event as any)?.type === "approval_resolved") as any[];
     expect(resolved.length, "三次调用应当有三条决策记录").toBe(3);
     expect(resolved[0].event.actor, "第一次是人点的").toBe("user");
-    expect(resolved[0].event.scope, "建规则那次要标出来").toBe("conversation");
+    expect(resolved[0].event.scope, "建规则那次要标出来").toBe("run");
+    expect(resolved[0].event.boundRunId).toBe(runId);
+    expect(resolved[0].event.expiresAt).toBeGreaterThan(resolved[0].event.issuedAt);
+    expect(resolved[0].event.inputScope).toBe("exact-input");
+    expect(resolved[0].event.inputHash).toMatch(/^sha256:[0-9a-f]{64}$/);
     for (const r of resolved.slice(1)) {
       expect(r.event.actor, "自动放行必须标 auto-rule，不能冒充人点的").toBe("auto-rule");
       expect(r.event.decision).toBe("allow");
+      expect(r.event.scope).toBe("run");
+      expect(r.event.inputScope).toBe("exact-input");
+      expect(r.event.inputHash).toBe(resolved[0].event.inputHash);
     }
+  });
+
+  it("递归 canonicalization 与 SHA-256 稳定：对象 key 顺序不同仍是同一输入", () => {
+    const left = { command: "echo ok", options: { cwd: "x", env: { B: "2", A: "1" } }, args: [1, 2] };
+    const right = { args: [1, 2], options: { env: { A: "1", B: "2" }, cwd: "x" }, command: "echo ok" };
+    expect(canonicalizeApprovalInput(left)).toBe(canonicalizeApprovalInput(right));
+    expect(approvalInputHash(left)).toBe(approvalInputHash(right));
+    expect(approvalInputHash(left)).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(approvalInputHash({ ...right, args: [2, 1] })).not.toBe(approvalInputHash(left));
+  });
+
+  it("同一工具的对象 key 顺序不同可复用规则", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("t1", "danger", { command: "echo ok", nested: { b: 2, a: 1 } })], "tool_use"),
+      fakeMessage([toolUseBlock("t2", "danger", { nested: { a: 1, b: 2 }, command: "echo ok" })], "tool_use"),
+      fakeMessage([textBlock("done")], "end_turn"),
+    ]);
+    handle = createUiServer({ modelClient: model, tools: [askEvery("danger")], workdir: process.cwd() });
+    base = baseUrl(await startServer(handle));
+    const runId = (await (await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ task: "同参数重排" }),
+    })).json()).runId;
+
+    const ref = await firstPending(runId);
+    await fetch(`${base}/api/runs/${runId}/approvals/${encodeURIComponent(ref)}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: "allow", scope: "conversation" }),
+    });
+    await waitForDone(base, runId);
+
+    const events = await readSSESnapshot(base, runId);
+    expect(events.filter((e: any) => e.event.type === "approval_request")).toHaveLength(2);
+    const auto = events.find((e: any) => e.event.type === "approval_resolved" && e.event.actor === "auto-rule") as any;
+    expect(auto?.event.toolUseId).toBe("t2");
+    expect(auto?.event.inputScope).toBe("exact-input");
+  });
+
+  it("command/path/device 任一参数变化都必须再次审批", async () => {
+    const inputs = [
+      { command: "flash", path: "fw-a.bin", device: "probe-a" },
+      { command: "verify", path: "fw-a.bin", device: "probe-a" },
+      { command: "verify", path: "fw-b.bin", device: "probe-a" },
+      { command: "verify", path: "fw-b.bin", device: "probe-b" },
+    ];
+    const model = new FakeModelClient([
+      ...inputs.map((input, i) => fakeMessage([toolUseBlock(`t${i + 1}`, "bash", input)], "tool_use")),
+      fakeMessage([textBlock("done")], "end_turn"),
+    ]);
+    handle = createUiServer({ modelClient: model, tools: [askEvery("bash")], workdir: process.cwd() });
+    base = baseUrl(await startServer(handle));
+    const runId = (await (await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ task: "参数变化" }),
+    })).json()).runId;
+
+    for (let i = 0; i < inputs.length; i++) {
+      const ref = await firstPending(runId);
+      expect(ref.startsWith(`t${i + 1}#`)).toBe(true);
+      const response = await fetch(`${base}/api/runs/${runId}/approvals/${encodeURIComponent(ref)}`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ decision: "allow", scope: "conversation" }),
+      });
+      expect(response.status).toBe(200);
+    }
+    await waitForDone(base, runId);
+    const events = await readSSESnapshot(base, runId);
+    expect(events.filter((e: any) => e.event.type === "approval_request")).toHaveLength(inputs.length);
+    expect(events.some((e: any) => e.event.actor === "auto-rule")).toBe(false);
   });
 
   /** 规则**逐工具名**——放行 read_file 不等于放行 bash */
@@ -2839,6 +3722,377 @@ describe("本次对话常驻放行：省的是点击，不是记录", () => {
     // 下一次调用仍要人点
     await firstPending(runId);
   });
+
+  it("工具策略是权限上限：once 工具拒绝客户端扩大为 conversation grant", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("t_once", "danger", {})], "tool_use"),
+      fakeMessage([textBlock("done")], "end_turn"),
+    ]);
+    handle = createUiServer({ modelClient: model, tools: [askTool("danger")], workdir: process.cwd() });
+    base = baseUrl(await startServer(handle));
+    const runId = (await (await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ task: "单次策略" }),
+    })).json()).runId;
+    const ref = await firstPending(runId);
+
+    const expanded = await fetch(`${base}/api/runs/${runId}/approvals/${encodeURIComponent(ref)}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: "allow", scope: "conversation" }),
+    });
+    expect(expanded.status).toBe(409);
+    expect((await expanded.json()).maxScope).toBe("once");
+
+    const once = await fetch(`${base}/api/runs/${runId}/approvals/${encodeURIComponent(ref)}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: "allow" }),
+    });
+    expect(once.status).toBe(200);
+    await waitForDone(base, runId);
+  });
+
+  it("畸形 exact-input 限制 fail closed 为 once，0 不能反向套用宿主默认值", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("t_invalid", "danger", {})], "tool_use"),
+      fakeMessage([textBlock("done")], "end_turn"),
+    ]);
+    const malformed = makeTool({
+      name: "danger",
+      permission: "ask",
+      approvalPolicy: { maxScope: "exact-input", maxTtlMs: 0, maxUses: 0 },
+    });
+    handle = createUiServer({ modelClient: model, tools: [malformed], workdir: process.cwd() });
+    base = baseUrl(await startServer(handle));
+    const runId = (await (await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ task: "畸形策略" }),
+    })).json()).runId;
+    const ref = await firstPending(runId);
+    const expanded = await fetch(`${base}/api/runs/${runId}/approvals/${encodeURIComponent(ref)}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: "allow", scope: "conversation" }),
+    });
+    expect(expanded.status).toBe(409);
+    expect((await expanded.json()).maxScope).toBe("once");
+    await fetch(`${base}/api/runs/${runId}/approvals/${encodeURIComponent(ref)}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: "allow" }),
+    });
+    await waitForDone(base, runId);
+  });
+
+  it("同一审批的并发双 POST 只有一个能决策，不能重复发 grant/审计事件", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("t_race", "danger", {})], "tool_use"),
+      fakeMessage([textBlock("done")], "end_turn"),
+    ]);
+    handle = createUiServer({ modelClient: model, tools: [askEvery("danger")], workdir: process.cwd() });
+    const port = await startServer(handle);
+    base = baseUrl(port);
+    const runId = (await (await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ task: "双击审批" }),
+    })).json()).runId;
+    const ref = await firstPending(runId);
+    const body = JSON.stringify({ decision: "allow", scope: "conversation" });
+    const path = `/api/runs/${runId}/approvals/${encodeURIComponent(ref)}`;
+
+    const beginSlowPost = () => {
+      let request!: ReturnType<typeof httpRequest>;
+      const result = new Promise<number>((resolveStatus, reject) => {
+        request = httpRequest({
+          host: "127.0.0.1",
+          port,
+          path,
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Transfer-Encoding": "chunked" },
+        }, (response) => {
+          response.resume();
+          response.on("end", () => resolveStatus(response.statusCode!));
+        });
+        request.on("error", reject);
+        request.write(body.slice(0, 1));
+      });
+      return { request, result };
+    };
+
+    const left = beginSlowPost();
+    const right = beginSlowPost();
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 30));
+    left.request.end(body.slice(1));
+    right.request.end(body.slice(1));
+    expect((await Promise.all([left.result, right.result])).sort()).toEqual([200, 409]);
+
+    await waitForDone(base, runId);
+    const events = await readSSESnapshot(base, runId) as any[];
+    expect(events.filter((item) => item.event.type === "approval_resolved" && item.event.actor === "user"))
+      .toHaveLength(1);
+  });
+
+  it("创建不同输入的新 grant 前会清扫已过期项，不让陈旧记录永久占槽", async () => {
+    let now = 1_000;
+    let executions = 0;
+    const tool = makeTool({
+      name: "danger",
+      permission: "ask",
+      approvalPolicy: { maxScope: "exact-input", maxTtlMs: 1_000, maxUses: 5 },
+      execute: async () => {
+        executions += 1;
+        if (executions === 1) now = 2_000;
+        return { content: "ok" };
+      },
+    });
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("t_old", "danger", { target: "old" })], "tool_use"),
+      fakeMessage([toolUseBlock("t_new", "danger", { target: "new" })], "tool_use"),
+      fakeMessage([textBlock("done")], "end_turn"),
+    ]);
+    handle = createUiServer({
+      modelClient: model,
+      tools: [tool],
+      workdir: process.cwd(),
+      approvalClock: () => now,
+    });
+    base = baseUrl(await startServer(handle));
+    const runId = (await (await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ task: "清扫过期 grant" }),
+    })).json()).runId;
+    const oldRef = await firstPending(runId);
+    await fetch(`${base}/api/runs/${runId}/approvals/${encodeURIComponent(oldRef)}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: "allow", scope: "conversation" }),
+    });
+
+    const newRef = await firstPending(runId);
+    const created = await fetch(`${base}/api/runs/${runId}/approvals/${encodeURIComponent(newRef)}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: "allow", scope: "conversation" }),
+    });
+    expect(created.status).toBe(200);
+    const body = await created.json() as any;
+    expect(body.autoAllowExact).toHaveLength(1);
+    expect(body.autoAllowExact[0].inputHash).toBe(approvalInputHash({ target: "new" }));
+    await waitForDone(base, runId);
+    const events = await readSSESnapshot(base, runId) as any[];
+    expect(events.find((item) => item.event.type === "approval_grant_expired")?.event.cause)
+      .toBe("ttl_expired");
+  });
+
+  it("同一轮相同参数的两个 pending 复用一个 grantId，不重置 TTL/次数", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([
+        toolUseBlock("t_parallel_1", "danger", { target: "same" }),
+        toolUseBlock("t_parallel_2", "danger", { target: "same" }),
+      ], "tool_use"),
+      fakeMessage([textBlock("done")], "end_turn"),
+    ]);
+    const tool = makeTool({
+      name: "danger",
+      permission: "ask",
+      parallelSafe: true,
+      approvalPolicy: { maxScope: "exact-input", maxTtlMs: 60_000, maxUses: 5 },
+    });
+    handle = createUiServer({ modelClient: model, tools: [tool], workdir: process.cwd() });
+    base = baseUrl(await startServer(handle));
+    const runId = (await (await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ task: "并发同参" }),
+    })).json()).runId;
+
+    for (let i = 0; i < 60; i++) {
+      const summary = ((await (await fetch(`${base}/api/runs`)).json()) as any[])
+        .find((item) => item.runId === runId);
+      if (summary?.pendingApprovals === 2) break;
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
+    }
+    const requests = (await readSSESnapshot(base, runId) as any[])
+      .filter((item) => item.event.type === "approval_request")
+      .sort((left, right) => left.seq - right.seq);
+    expect(requests).toHaveLength(2);
+    const approve = async (request: any) => {
+      const ref = `${request.event.toolUseId}#${request.seq}`;
+      const response = await fetch(`${base}/api/runs/${runId}/approvals/${encodeURIComponent(ref)}`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ decision: "allow", scope: "conversation" }),
+      });
+      expect(response.status).toBe(200);
+      return response.json() as Promise<any>;
+    };
+    const first = await approve(requests[0]);
+    const second = await approve(requests[1]);
+    expect(first.autoAllowExact).toHaveLength(1);
+    expect(second.autoAllowExact).toHaveLength(1);
+    expect(second.autoAllowExact[0].grantId).toBe(first.autoAllowExact[0].grantId);
+    expect(second.autoAllowExact[0].issuedAt).toBe(first.autoAllowExact[0].issuedAt);
+
+    await waitForDone(base, runId);
+    const events = await readSSESnapshot(base, runId) as any[];
+    const userGrants = events.filter(
+      (item) => item.event.type === "approval_resolved" && item.event.actor === "user" && item.event.grantId,
+    );
+    expect(userGrants.map((item) => item.event.grantAction)).toEqual(["created", "reused"]);
+    expect(new Set(userGrants.map((item) => item.event.grantId)).size).toBe(1);
+  });
+
+  it("TTL 是硬边界：now === expiresAt 时失效，自动使用不会续期", async () => {
+    let now = 1_000;
+    let executions = 0;
+    const tool = makeTool({
+      name: "danger",
+      permission: "ask",
+      parallelSafe: false,
+      approvalPolicy: { maxScope: "exact-input", maxTtlMs: 1_000, maxUses: 5 },
+      execute: async () => {
+        executions += 1;
+        if (executions === 1) now = 2_000;
+        return { content: "ok" };
+      },
+    });
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("t1", "danger", {})], "tool_use"),
+      fakeMessage([toolUseBlock("t2", "danger", {})], "tool_use"),
+      fakeMessage([textBlock("done")], "end_turn"),
+    ]);
+    handle = createUiServer({
+      modelClient: model,
+      tools: [tool],
+      workdir: process.cwd(),
+      approvalGrantTtlMs: 1_000,
+      approvalClock: () => now,
+    });
+    base = baseUrl(await startServer(handle));
+    const runId = (await (await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ task: "TTL" }),
+    })).json()).runId;
+    const first = await firstPending(runId);
+    await fetch(`${base}/api/runs/${runId}/approvals/${encodeURIComponent(first)}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: "allow", scope: "conversation" }),
+    });
+
+    const second = await firstPending(runId);
+    expect(second.startsWith("t2#")).toBe(true);
+    const events = await readSSESnapshot(base, runId) as any[];
+    const expired = events.find((item) => item.event.type === "approval_grant_expired");
+    expect(expired?.event.cause).toBe("ttl_expired");
+    expect(expired?.event.at).toBe(2_000);
+    expect(events.filter((item) => item.event.actor === "auto-rule")).toHaveLength(0);
+
+    await fetch(`${base}/api/runs/${runId}/approvals/${encodeURIComponent(second)}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: "allow" }),
+    });
+    await waitForDone(base, runId);
+  });
+
+  it("工具定义变化会使旧 fingerprint grant 失效，相同输入也必须重新审批", async () => {
+    let executions = 0;
+    let tool!: Tool;
+    tool = makeTool({
+      name: "danger",
+      description: "definition-v1",
+      permission: "ask",
+      approvalPolicy: { maxScope: "exact-input", maxTtlMs: 60_000, maxUses: 5 },
+      execute: async () => {
+        executions += 1;
+        if (executions === 1) tool.description = "definition-v2";
+        return { content: "ok" };
+      },
+    });
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("t1", "danger", { target: "same" })], "tool_use"),
+      fakeMessage([toolUseBlock("t2", "danger", { target: "same" })], "tool_use"),
+      fakeMessage([textBlock("done")], "end_turn"),
+    ]);
+    handle = createUiServer({ modelClient: model, tools: [tool], workdir: process.cwd() });
+    base = baseUrl(await startServer(handle));
+    const runId = (await (await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ task: "工具定义变化" }),
+    })).json()).runId;
+    const first = await firstPending(runId);
+    await fetch(`${base}/api/runs/${runId}/approvals/${encodeURIComponent(first)}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: "allow", scope: "conversation" }),
+    });
+
+    const second = await firstPending(runId);
+    expect(second.startsWith("t2#")).toBe(true);
+    const events = await readSSESnapshot(base, runId) as any[];
+    expect(events.find((item) => item.event.type === "approval_grant_invalidated")?.event.cause)
+      .toBe("tool_changed");
+    expect(events.some((item) => item.event.actor === "auto-rule")).toBe(false);
+
+    await fetch(`${base}/api/runs/${runId}/approvals/${encodeURIComponent(second)}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: "allow" }),
+    });
+    await waitForDone(base, runId);
+  });
+
+  it("最大使用次数耗尽后重新审批，并留下 exhausted 事件", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("t1", "danger", {})], "tool_use"),
+      fakeMessage([toolUseBlock("t2", "danger", {})], "tool_use"),
+      fakeMessage([toolUseBlock("t3", "danger", {})], "tool_use"),
+      fakeMessage([toolUseBlock("t4", "danger", {})], "tool_use"),
+      fakeMessage([textBlock("done")], "end_turn"),
+    ]);
+    const tool = makeTool({
+      name: "danger",
+      permission: "ask",
+      parallelSafe: false,
+      approvalPolicy: { maxScope: "exact-input", maxTtlMs: 60_000, maxUses: 2 },
+    });
+    handle = createUiServer({ modelClient: model, tools: [tool], workdir: process.cwd() });
+    base = baseUrl(await startServer(handle));
+    const runId = (await (await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ task: "次数" }),
+    })).json()).runId;
+    const first = await firstPending(runId);
+    await fetch(`${base}/api/runs/${runId}/approvals/${encodeURIComponent(first)}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: "allow", scope: "conversation" }),
+    });
+
+    const fourth = await firstPending(runId);
+    expect(fourth.startsWith("t4#")).toBe(true);
+    const events = await readSSESnapshot(base, runId) as any[];
+    expect(events.filter((item) => item.event.actor === "auto-rule")).toHaveLength(2);
+    expect(events.some((item) => item.event.type === "approval_grant_exhausted")).toBe(true);
+
+    await fetch(`${base}/api/runs/${runId}/approvals/${encodeURIComponent(fourth)}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: "allow" }),
+    });
+    await waitForDone(base, runId);
+  });
+
+  it("不可续跑的核查 run 收尾时终止 active grant，UI 摘要不能继续报活跃", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("t_verified", "danger", {})], "tool_use"),
+      fakeMessage([textBlock("main done")], "end_turn"),
+      fakeMessage([textBlock(JSON.stringify({ passed: true, issues: [], summary: "通过" }))], "end_turn"),
+    ]);
+    handle = createUiServer({ modelClient: model, tools: [askEvery("danger")], workdir: process.cwd() });
+    base = baseUrl(await startServer(handle));
+    const runId = (await (await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "核查后不可续跑", verify: true }),
+    })).json()).runId;
+    const ref = await firstPending(runId);
+    await fetch(`${base}/api/runs/${runId}/approvals/${encodeURIComponent(ref)}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: "allow", scope: "conversation" }),
+    });
+    await waitForDone(base, runId);
+
+    const summary = ((await (await fetch(`${base}/api/runs`)).json()) as any[])
+      .find((item) => item.runId === runId);
+    expect(summary.canContinue).toBe(false);
+    expect(summary.approvalGrants.active).toBe(0);
+    const events = await readSSESnapshot(base, runId) as any[];
+    const invalidated = events.find(
+      (item) => item.event.type === "approval_grant_invalidated" && item.event.cause === "run_not_continuable",
+    );
+    expect(invalidated).toBeDefined();
+    expect(events.at(-1)?.event.type).toBe("run_end");
+  });
 });
 
 // ================================================================
@@ -2874,6 +4128,146 @@ describe("B2 · 运行历史落盘", () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
+
+  it("grant 进入完整 checkpoint 仅作审计；重启派生 child 必须重新审批", async () => {
+    dir = await mkdtemp(join(tmpdir(), "history-grant-"));
+    const reusable = () => makeTool({
+      name: "danger",
+      permission: "ask",
+      parallelSafe: false,
+      approvalPolicy: { maxScope: "exact-input", maxTtlMs: 60_000, maxUses: 3 },
+    });
+    await boot({
+      modelClient: new FakeModelClient([
+        fakeMessage([toolUseBlock("parent_tool", "danger", { target: "same" })], "tool_use"),
+        fakeMessage([textBlock("parent done")], "end_turn"),
+      ]),
+      tools: [reusable()],
+      workdir: process.cwd(),
+      history: dir,
+    });
+    const { runId } = (await (await post("/api/runs", { task: "授权审计", verify: false })).json()) as { runId: string };
+    const parentRequest = await waitForEvent(
+      base,
+      runId,
+      (item: any) => item.event.type === "approval_request",
+    ) as any;
+    const parentRef = `${parentRequest.event.toolUseId}#${parentRequest.seq}`;
+    const granted = await post(`/api/runs/${runId}/approvals/${encodeURIComponent(parentRef)}`, {
+      decision: "allow",
+      scope: "conversation",
+    });
+    expect(granted.status).toBe(200);
+    await waitForDone(base, runId);
+    const parentEventsBefore = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+    await handle!.close();
+    handle = undefined;
+
+    const meta = JSON.parse(await readFile(join(dir, runId, "meta.json"), "utf8"));
+    expect(meta.checkpoint.approvalGrants).toEqual([
+      expect.objectContaining({
+        version: 1,
+        boundRunId: runId,
+        scope: "run",
+        name: "danger",
+        inputScope: "exact-input",
+        usedUses: 0,
+      }),
+    ]);
+
+    await boot({
+      modelClient: new FakeModelClient([
+        fakeMessage([toolUseBlock("child_tool", "danger", { target: "same" })], "tool_use"),
+        fakeMessage([textBlock("child done")], "end_turn"),
+      ]),
+      tools: [reusable()],
+      workdir: process.cwd(),
+      history: dir,
+    });
+    const restored = ((await (await fetch(`${base}/api/runs`)).json()) as any[])
+      .find((item) => item.runId === runId);
+    expect(restored.approvalGrants).toMatchObject({ active: 0, archivedAudit: 1, restorable: false });
+
+    const follow = await post(`/api/runs/${runId}/messages`, { text: "继续相同操作" });
+    expect(follow.status).toBe(200);
+    const childId = ((await follow.json()) as any).runId as string;
+    const childRequest = await waitForEvent(
+      base,
+      childId,
+      (item: any) => item.event.type === "approval_request" && item.event.toolUseId === "child_tool",
+    ) as any;
+    expect(childRequest, "child 不得被父 grant 自动放行").toBeDefined();
+    const childEvents = await readSSESnapshot(base, childId) as any[];
+    expect(childEvents[0]?.event.type, "派生运行第一条 durable 事件必须先建立谱系")
+      .toBe("run_forked");
+    const reset = childEvents.find((item) => item.event.type === "approval_grant_not_inherited");
+    expect(reset?.event).toMatchObject({
+      boundRunId: runId,
+      childRunId: childId,
+      reason: "run_id_mismatch",
+    });
+    expect(childEvents.some((item) => item.event.actor === "auto-rule")).toBe(false);
+
+    const childRef = `${childRequest.event.toolUseId}#${childRequest.seq}`;
+    await post(`/api/runs/${childId}/approvals/${encodeURIComponent(childRef)}`, { decision: "allow" });
+    await waitForDone(base, childId);
+    expect(await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`))).toEqual(parentEventsBefore);
+  });
+
+  it("复制其它 run 的 grant 快照会被丢弃，普通 checkpoint 仍可读取", async () => {
+    dir = await mkdtemp(join(tmpdir(), "history-grant-tamper-"));
+    const runDir = join(dir, "target-run");
+    await mkdir(runDir, { recursive: true });
+    const hash = `sha256:${"a".repeat(64)}`;
+    await writeFile(join(runDir, "meta.json"), JSON.stringify({
+      version: 1,
+      runId: "target-run",
+      task: "tampered grant",
+      status: "done",
+      verify: false,
+      createdAt: 1_000,
+      finishedAt: 2_000,
+      packName: null,
+      mode: "single",
+      effort: null,
+      rubric: null,
+      workdir: process.cwd(),
+      conversationTurn: 1,
+      planGate: false,
+      planDecision: null,
+      mainStopReason: "completed",
+      outcome: null,
+      checkpoint: {
+        segmentIndex: 0,
+        conversationTurn: 1,
+        contextInputTokens: 10,
+        runBudget: { usedTurns: 1, usedTokens: 10 },
+        approvalGrants: [{
+          version: 1,
+          canonicalizationVersion: 1,
+          policyVersion: 1,
+          grantId: "copied-grant",
+          approvalId: "tool#1",
+          boundRunId: "another-run",
+          scope: "run",
+          name: "danger",
+          inputScope: "exact-input",
+          inputHash: hash,
+          toolFingerprint: hash,
+          issuedAt: 1_100,
+          expiresAt: 9_999_999_999_999,
+          maxUses: 3,
+          usedUses: 0,
+        }],
+      },
+    }), "utf8");
+
+    await boot({ modelClient: new FakeModelClient([]), tools: [], workdir: process.cwd(), history: dir });
+    const restored = ((await (await fetch(`${base}/api/runs`)).json()) as any[])
+      .find((item) => item.runId === "target-run");
+    expect(restored).toBeDefined();
+    expect(restored.approvalGrants).toMatchObject({ active: 0, archivedAudit: 0, restorable: false });
+  });
 
   it("重启后从检查点派生新 run：父档案不变、正史与共享预算继续", async () => {
     dir = await mkdtemp(join(tmpdir(), "history-"));

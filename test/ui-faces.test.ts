@@ -28,6 +28,11 @@ const HARNESS = {
   effort: "high",
   effortApplies: true,
   shell: "Git Bash",
+  executionIsolation: {
+    effectiveState: "partial", resolvedBackend: "oci", requestedMode: "required",
+    probe: { state: "ready" }, filesystem: "ro root", network: "none",
+    identity: "uid 65532", resources: "limited",
+  },
   workdir: "D:\\repo",
   readRoots: ["D:\\refs"],
   guardrails: { maxTurns: 40, maxTokens: 64000, contextTokenLimit: 1000 },
@@ -241,12 +246,35 @@ describe("deriveToolsFace", () => {
     expect(deriveToolsFace(st, HARNESS).reroutes[0].switched).toBe(false);
   });
 
-  it("透出边界：只读根 / 白名单 / shell / 护栏", () => {
+  it("透出边界：只读根 / 白名单 / shell / 执行隔离 / 护栏", () => {
     const f = deriveToolsFace(s(), HARNESS);
     expect(f.readRoots).toEqual(["D:\\refs"]);
     expect(f.pack.verify.readOnlyCommands).toEqual(["python -m pytest"]);
     expect(f.shell).toBe("Git Bash");
+    expect(f.executionIsolation).toMatchObject({ effectiveState: "partial", resolvedBackend: "oci" });
     expect(f.guardrails.maxTurns).toBe(40);
+  });
+
+  it("run_config 的执行边界覆盖进程快照，report-only 必须成为 Tools 异常", () => {
+    const state = feed([ev("host", {
+      type: "run_config",
+      executionIsolation: {
+        effectiveState: "report-only", resolvedBackend: "host", requestedMode: "report",
+        probe: { state: "unavailable" }, filesystem: "host", network: "host",
+        identity: "host", resources: "none",
+      },
+    })]);
+    const tools = deriveToolsFace(state, HARNESS);
+    expect(tools.executionIsolation.effectiveState).toBe("report-only");
+    const card = buildFactorCards({
+      loop: deriveLoopFace(state, HARNESS),
+      context: deriveContextFace(state, HARNESS),
+      tools,
+      verification: deriveVerificationFace(state, HARNESS),
+      action: deriveActionState(state),
+    }).find((candidate) => candidate.id === "tools");
+    expect(card.abnormal).toBe(true);
+    expect(card.lines.some((line: string) => line.includes("宿主直跑"))).toBe(true);
   });
 
   it("宿主快照缺席时照实降级，不编造工具面", () => {

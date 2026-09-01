@@ -52,8 +52,26 @@ npm run dev
 npm run desktop
 ```
 
-一条命令：没有宿主就自动拉起（见上节顺序），有就直连。渲染器启用
-context isolation 与 sandbox，不暴露 preload/Node 桥。
+一条命令：没有宿主就自动拉起（见上节顺序），有就直连。远程 Harness 渲染器启用
+context isolation 与 sandbox，不暴露 preload/Node 桥；只有本地打包的设置窗口拥有
+经过 sender 校验的窄 IPC。
+
+#### 模型与运行设置
+
+从应用菜单选择 **设置 → 模型与运行设置…**（快捷键 `Ctrl/Cmd+,`），可配置：
+
+- Anthropic Messages / OpenAI Chat Completions 协议、模型、Base URL、API key；
+- effort、单次输出与上下文上限、请求超时、重试次数；
+- 本地宿主最大并发任务数与每日 token 预算。
+
+API key 只从本地设置页送到 Electron main，由 `safeStorage` 使用 Windows DPAPI、
+macOS Keychain 或受支持的 Linux secret store 加密；安全存储不可用时拒绝保存，不会
+退回明文。读取设置只返回“凭据已配置/来源”状态，不返回 key。非敏感配置与密文保存在
+Electron 用户数据目录的 `model-settings.json`，不进入项目目录、网页 `localStorage`、
+运行历史或命令行 argv。保存会重启本地宿主，正在运行的任务会中断。
+
+Desktop 设置对自管宿主优先于启动环境和仓库 `.env`。连接 `AGENT_UI_URL` 或复用已运行
+宿主的 attach 模式为只读，避免把本地凭据能力交给外部页面。
 
 #### 切换工作目录
 
@@ -71,6 +89,10 @@ context isolation 与 sandbox，不暴露 preload/Node 桥。
 
 ```bash
 npm run desktop:dist
+# 原生安全存储 + 本地设置窗口/IPC/冷启动刷新冒烟
+npm run desktop:settings-smoke
+# 打包后真实拉起 win-unpacked、检查 /health 与脱敏快照，再确认进程树收净
+npm run desktop:smoke
 ```
 
 产物输出在 `dist-electron/`。Windows/macOS 的 `desktop:dist` 有签名门禁；

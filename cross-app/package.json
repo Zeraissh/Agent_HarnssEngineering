@@ -14,6 +14,8 @@
     "host:stage": "node scripts/stage-host-runtime.mjs",
     "desktop:dist": "node scripts/require-signing.mjs && npm run host:stage && electron-builder --config electron-builder.yml",
     "desktop:dist:unsigned": "npm run host:stage && electron-builder --config electron-builder.yml",
+    "desktop:settings-smoke": "electron test/fixtures/safe-storage-smoke.cjs && electron test/fixtures/settings-window-smoke.cjs",
+    "desktop:smoke": "node scripts/smoke-packaged-desktop.mjs",
     "mobile:sync": "npm run build && cap sync"
   },
   "dependencies": {},

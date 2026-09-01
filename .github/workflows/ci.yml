@@ -57,4 +57,20 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts
       - run: docker build --tag agent-harness:ci .
+      - name: OCI execution boundary escape/resource/cleanup canary
+        run: |
+          IMAGE_ID="$(docker image inspect --format '{{.Id}}' agent-harness:ci)"
+          RUNTIME="$(readlink -f "$(command -v docker)")"
+          RUNTIME_SHA256="$(sha256sum "$RUNTIME" | awk '{print $1}')"
+          test -n "$IMAGE_ID"
+          test -x "$RUNTIME"
+          AGENT_TEST_OCI_IMAGE="$IMAGE_ID" \
+          AGENT_TEST_OCI_RUNTIME="$RUNTIME" \
+          AGENT_TEST_OCI_RUNTIME_SHA256="$RUNTIME_SHA256" \
+            npx vitest run test/execution-broker-oci.test.ts

@@ -17,6 +17,11 @@ describe("domain packs", () => {
     expect(p!.verify.instructions).toContain("不要相信报告");
     expect(typeof p!.mcp).toBe("object");
     expect((p!.mcp as { includeTools: string[] }).includeTools).toContain("flash_firmware");
+    expect(p!.mcp && typeof p!.mcp === "object" && p!.mcp.permission).toBe("auto");
+    if (!p!.mcp || typeof p!.mcp !== "object") throw new Error("stm32-debug mcp policy missing");
+    for (const destructive of ["flash_firmware", "flash_and_run", "reset_target", "write_memory"]) {
+      expect(p!.mcp.toolPermissions?.[destructive]).toBe("ask");
+    }
     // v1.0 演示教训：给 bash 会被用来绕开 MCP 自建调试栈、taskkill 扫死共享 server
     expect(p!.builtinTools).not.toContain("bash");
     expect(p!.systemPrompt).toContain("不要自建 OpenOCD/GDB");

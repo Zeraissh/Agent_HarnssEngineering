@@ -6,7 +6,8 @@
  *   不再需要手写 TS 工具，L0/L1/L3 依旧零改动（P1）；
  * - 工具名加 `${server}__` 前缀，避免与内置工具及多 server 之间撞名；
  * - 权限默认 "ask"（外部进程的能力面未知，宿主审批兜底，P6）；
- *   信任的 server 可在 mcp.json 里按 server 配 "auto" / parallelSafe；
+ *   信任的 server 可在 mcp.json 里按 server 配默认值，再用
+ *   toolPermissions 对单个原始工具名收紧/放开；
  * - MCP 的 isError 直接映射为 ToolResult.isError（错误进上下文，P5）。
  *
  * 配置文件（默认 ./mcp.json，AGENT_MCP_CONFIG 覆盖）：
@@ -16,7 +17,9 @@
  *       "command": "python", "args": ["-m", "mcp_server.server"],
  *       "cwd": "D:/Work/MCP_Servers/stm32-gdb-mcp",
  *       "env": { "PYTHONPATH": "D:/Work/MCP_Servers/stm32-gdb-mcp/src" },
- *       "permission": "auto", "includeTools": ["start_debug_session", "..."]
+ *       "permission": "auto",
+ *       "toolPermissions": { "flash_firmware": "ask", "read_memory": "auto" },
+ *       "includeTools": ["start_debug_session", "..."]
  *     }
  *   }
  * }
@@ -40,6 +43,8 @@ export interface McpServerConfig {
   cwd?: string;
   /** 默认 "ask"——外部进程能力面未知，审批兜底 */
   permission?: "auto" | "ask";
+  /** 按 MCP server 声明的原始工具名覆盖 permission */
+  toolPermissions?: Record<string, "auto" | "ask">;
   /** 默认 false——MCP server 内部多为有状态会话，保守串行 */
   parallelSafe?: boolean;
   /** 只暴露这些工具（可选，控制工具面大小） */
@@ -48,6 +53,81 @@ export interface McpServerConfig {
 
 export interface McpConfig {
   servers: Record<string, McpServerConfig>;
+}
+
+/** server / DomainPack 共用的权限策略形状。 */
+export interface McpPermissionPolicy {
+  /** 该层级的默认权限 */
+  permission?: "auto" | "ask";
+  /** 按 MCP 原始工具名的细粒度覆盖 */
+  toolPermissions?: Record<string, "auto" | "ask">;
+}
+
+interface AdaptedMcpPermissionMetadata {
+  rawToolName: string;
+  serverPolicy: McpPermissionPolicy;
+}
+
+/** Tool 契约保持领域无关；MCP 原始策略作为进程内 side metadata 随实例保存。 */
+const adaptedMcpPermissionMetadata = new WeakMap<Tool, AdaptedMcpPermissionMetadata>();
+
+/** 读取适配时保存的原始 MCP 工具名，避免靠 `${server}__${raw}` 字符串反推。 */
+export function originalMcpToolName(tool: Tool): string | undefined {
+  return adaptedMcpPermissionMetadata.get(tool)?.rawToolName;
+}
+
+function isToolPermission(value: unknown): value is "auto" | "ask" {
+  return value === "auto" || value === "ask";
+}
+
+/**
+ * 合并 server 与 DomainPack 权限。优先级从低到高固定为：
+ * server 默认 → pack 默认 → server 单工具 → pack 单工具。
+ *
+ * 关键不变量：pack 的泛化默认不能放宽 server 对某个具体工具的显式 ask；
+ * 若确实要覆盖，必须在 pack.toolPermissions 中同样点名该工具。
+ */
+export function resolveMcpToolPermission(
+  rawToolName: string,
+  serverPolicy?: McpPermissionPolicy,
+  packPolicy?: McpPermissionPolicy,
+): "auto" | "ask" {
+  let resolved: "auto" | "ask" = "ask";
+  if (isToolPermission(serverPolicy?.permission)) resolved = serverPolicy.permission;
+  if (isToolPermission(packPolicy?.permission)) resolved = packPolicy.permission;
+  const serverTool = serverPolicy?.toolPermissions?.[rawToolName];
+  if (isToolPermission(serverTool)) resolved = serverTool;
+  const packTool = packPolicy?.toolPermissions?.[rawToolName];
+  if (isToolPermission(packTool)) resolved = packTool;
+  return resolved;
+}
+
+/**
+ * 对已适配 MCP Tool 应用 DomainPack 策略，并保留 server 原始细粒度策略。
+ * 非 adaptMcpTool 产生的池元素按其当前 permission 视为显式 server 工具策略，
+ * 因而同样不会被 pack 的泛化默认静默放宽。
+ */
+export function applyMcpPackPermission(
+  tool: Tool,
+  rawToolName: string,
+  packPolicy?: McpPermissionPolicy,
+): Tool {
+  const metadata = adaptedMcpPermissionMetadata.get(tool);
+  const effectiveRawToolName = metadata?.rawToolName ?? rawToolName;
+  const serverPolicy = metadata?.serverPolicy ?? {
+    toolPermissions: { [effectiveRawToolName]: tool.permission },
+  };
+  const permission = resolveMcpToolPermission(effectiveRawToolName, serverPolicy, packPolicy);
+  if (permission === tool.permission) return tool;
+  const resolved = {
+    ...tool,
+    permission,
+    ...(permission === "ask" && !tool.approvalPolicy
+      ? { approvalPolicy: { maxScope: "once" as const } }
+      : {}),
+  };
+  if (metadata) adaptedMcpPermissionMetadata.set(resolved, metadata);
+  return resolved;
 }
 
 // ---------------------------------------------------------------- 纯适配层（可测）
@@ -67,14 +147,17 @@ export function adaptMcpTool(
   serverName: string,
   info: McpToolInfo,
   call: McpCaller,
-  cfg: Pick<McpServerConfig, "permission" | "parallelSafe">,
+  cfg: Pick<McpServerConfig, "permission" | "toolPermissions" | "parallelSafe">,
 ): Tool {
-  return {
+  const permission = resolveMcpToolPermission(info.name, cfg);
+  const tool: Tool = {
     name: `${serverName}__${info.name}`,
     description: info.description?.trim() || `Tool "${info.name}" provided by MCP server "${serverName}".`,
     inputSchema: (info.inputSchema ?? { type: "object", properties: {} }) as JSONSchema,
-    permission: cfg.permission ?? "ask",
+    permission,
     parallelSafe: cfg.parallelSafe ?? false,
+    // MCP 可能控制进程、云资源或真实硬件；没有更细策略前一律只准单次审批。
+    ...(permission === "ask" ? { approvalPolicy: { maxScope: "once" as const } } : {}),
     async execute(input) {
       const args = (input ?? {}) as Record<string, unknown>;
       const result = await call(info.name, args);
@@ -84,6 +167,14 @@ export function adaptMcpTool(
       };
     },
   };
+  adaptedMcpPermissionMetadata.set(tool, {
+    rawToolName: info.name,
+    serverPolicy: {
+      ...(cfg.permission ? { permission: cfg.permission } : {}),
+      ...(cfg.toolPermissions ? { toolPermissions: cfg.toolPermissions } : {}),
+    },
+  });
+  return tool;
 }
 
 /** 传输层死亡判定：SDK 在 stdio 断开后抛 "Not connected" / "Connection closed" */
@@ -245,6 +336,31 @@ export async function loadMcpConfig(configPath: string): Promise<McpConfig | und
   const parsed = JSON.parse(raw) as McpConfig;
   if (!parsed.servers || typeof parsed.servers !== "object") {
     throw new Error(`Invalid MCP config ${configPath}: missing "servers" object`);
+  }
+  for (const [serverName, cfg] of Object.entries(parsed.servers)) {
+    if (!cfg || typeof cfg !== "object" || Array.isArray(cfg)) {
+      throw new Error(`Invalid MCP config ${configPath}: server "${serverName}" must be an object`);
+    }
+    if (cfg.permission !== undefined && !isToolPermission(cfg.permission)) {
+      throw new Error(
+        `Invalid MCP config ${configPath}: server "${serverName}" permission must be "auto" or "ask"`,
+      );
+    }
+    if (
+      cfg.toolPermissions !== undefined &&
+      (!cfg.toolPermissions || typeof cfg.toolPermissions !== "object" || Array.isArray(cfg.toolPermissions))
+    ) {
+      throw new Error(
+        `Invalid MCP config ${configPath}: server "${serverName}" toolPermissions must be an object`,
+      );
+    }
+    for (const [toolName, permission] of Object.entries(cfg.toolPermissions ?? {})) {
+      if (!isToolPermission(permission)) {
+        throw new Error(
+          `Invalid MCP config ${configPath}: server "${serverName}" tool "${toolName}" permission must be "auto" or "ask"`,
+        );
+      }
+    }
   }
   return parsed;
 }

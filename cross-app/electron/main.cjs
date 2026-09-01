@@ -1,6 +1,9 @@
-const { app, BrowserWindow, Menu, dialog, session, shell } = require('electron');
+const { app, BrowserWindow, Menu, dialog, safeStorage, session, shell } = require('electron');
 const path = require('node:path');
 const launcher = require('./host-launcher.cjs');
+const modelSettingsStore = require('./model-settings-store.cjs');
+const { isLoopbackHostname } = require('./network-policy.cjs');
+const { createSettingsController } = require('./settings-window.cjs');
 const workspaceStore = require('./workspace-store.cjs');
 
 // 打包态的编译宿主与 production dependencies 位于 resources/harness；开发态
@@ -21,6 +24,15 @@ let currentPage = null;
 let hostMode = null;
 let workspaceFile = null;
 let workspaceState = null;
+let modelSettingsFile = null;
+let modelSettingsRecord = null;
+let modelSettingsWarning = null;
+let settingsController = null;
+let settingsSaveInFlight = false;
+/** 工作目录与模型设置共用同一串行重启队列，避免 stop/spawn 交错留下未跟踪宿主。 */
+let restartQueue = Promise.resolve();
+/** 本地设置窗不能被 setPage/loadInto 误导航到远程 Harness。 */
+const harnessWindows = new Set();
 
 function seedConfiguredWorkspaces(state) {
   const originallySelected = state.selected;
@@ -37,17 +49,12 @@ function seedConfiguredWorkspaces(state) {
   return workspaceStore.selectWorkspace(next, originallySelected);
 }
 
-function isLoopback(hostname) {
-  const host = hostname.toLowerCase().replace(/^\[|\]$/g, '');
-  return host === 'localhost' || host === '::1' || host.startsWith('127.');
-}
-
 function resolveAttachUrl(raw) {
   const target = new URL(raw);
   if (target.username || target.password) {
     throw new Error('AGENT_UI_URL must not contain URL userinfo');
   }
-  if (target.protocol !== 'https:' && !(target.protocol === 'http:' && isLoopback(target.hostname))) {
+  if (target.protocol !== 'https:' && !(target.protocol === 'http:' && isLoopbackHostname(target.hostname))) {
     throw new Error('AGENT_UI_URL must use HTTPS unless it points to loopback');
   }
   return target;
@@ -56,7 +63,7 @@ function resolveAttachUrl(raw) {
 function canOpenExternally(raw) {
   try {
     const target = new URL(raw);
-    return target.protocol === 'https:' || (target.protocol === 'http:' && isLoopback(target.hostname));
+    return target.protocol === 'https:' || (target.protocol === 'http:' && isLoopbackHostname(target.hostname));
   } catch {
     return false;
   }
@@ -79,7 +86,71 @@ function loadInto(win, href) {
 
 function setPage(href) {
   currentPage = href;
-  for (const win of BrowserWindow.getAllWindows()) loadInto(win, href);
+  for (const win of harnessWindows) {
+    if (!win.isDestroyed()) loadInto(win, href);
+  }
+}
+
+function loadInheritedHostEnvironment() {
+  let dotEnv = {};
+  try {
+    dotEnv = launcher.loadDotEnv(REPO_ROOT);
+  } catch (error) {
+    console.warn(`.env 读取失败，按无 .env 继续：${error.message}`);
+  }
+  return launcher.mergeEnv(process.env, dotEnv);
+}
+
+function canManageLocalHost() {
+  return !process.env.AGENT_UI_URL && (hostMode === 'spawned' || hostMode === 'managed-error');
+}
+
+async function applyModelSettings(environment) {
+  if (!modelSettingsRecord) return environment;
+  const resolved = await modelSettingsStore.modelEnvironment(modelSettingsRecord, safeStorage);
+  const configured = { ...environment };
+  for (const name of resolved.unset) delete configured[name];
+  Object.assign(configured, resolved.set);
+  if (resolved.rotatedRecord && resolved.rotatedRecord !== modelSettingsRecord) {
+    modelSettingsRecord = resolved.rotatedRecord;
+    modelSettingsStore.writeRecord(modelSettingsFile, modelSettingsRecord);
+  }
+  return configured;
+}
+
+async function getPublicModelSettings() {
+  const inherited = loadInheritedHostEnvironment();
+  const fallback = modelSettingsStore.settingsFromEnvironment(inherited);
+  const provider = modelSettingsRecord?.settings.provider ?? fallback.provider;
+  const keyName = provider === 'openai' ? 'OPENAI_API_KEY' : 'ANTHROPIC_API_KEY';
+  return modelSettingsStore.publicSettings(modelSettingsRecord, fallback, {
+    editable: canManageLocalHost(),
+    mode: hostMode ?? (process.env.AGENT_UI_URL ? 'attach-pending' : 'local-pending'),
+    environmentCredentialPresent: Boolean(inherited[keyName]),
+    warning: modelSettingsWarning,
+  });
+}
+
+async function saveAndApplyModelSettings(payload) {
+  if (!canManageLocalHost()) throw new Error('当前连接外部宿主，本地模型设置为只读');
+  if (settingsSaveInFlight) throw new Error('已有设置保存/宿主重启正在进行');
+  settingsSaveInFlight = true;
+  try {
+    modelSettingsRecord = await modelSettingsStore.saveModelSettings(
+      modelSettingsFile,
+      payload,
+      modelSettingsRecord,
+      safeStorage,
+    );
+    modelSettingsWarning = null;
+    const restart = await restartOwnedHost('正在应用模型与运行设置…');
+    if (!restart.ok) {
+      throw new Error(`设置已安全保存，但宿主重启失败：${restart.error}`);
+    }
+    return getPublicModelSettings();
+  } finally {
+    settingsSaveInFlight = false;
+  }
 }
 
 /**
@@ -111,12 +182,8 @@ async function resolveHarness({ forceSpawn = false } = {}) {
     );
   }
   const port = preferredPort ? Number(preferredPort) : await launcher.pickFreePort();
-  let dotEnv = {};
-  try {
-    dotEnv = launcher.loadDotEnv(REPO_ROOT);
-  } catch (error) {
-    console.warn(`.env 读取失败，按无 .env 继续：${error.message}`);
-  }
+  const inheritedEnv = loadInheritedHostEnvironment();
+  const configuredEnv = await applyModelSettings(inheritedEnv);
 
   // 与 will-quit 的竞态防线：quitting 置位后绝不再拉宿主（此检查与 spawn、
   // hostChild 赋值同处一个同步块，中间无 await，不存在交错窗口）。
@@ -131,7 +198,9 @@ async function resolveHarness({ forceSpawn = false } = {}) {
     execPath: process.execPath,
     nodeArgs: entry.nodeArgs,
     repoRoot: REPO_ROOT,
-    env: { ...launcher.mergeEnv(process.env, dotEnv), ...desktopEnv },
+    // Desktop 保存的 profile 是本地用户刚刚明确选择的配置，因此优先于启动
+    // 终端与仓库 .env；attach 模式不会走到这里，也不会把凭据发给远端。
+    env: { ...configuredEnv, ...desktopEnv },
     port,
   });
   hostChild = child;
@@ -167,7 +236,7 @@ function selectWorkspaceInWindows(directory) {
   const script = `(() => { const el = document.getElementById('workdir-select'); if (!el) return false; ` +
     `el.value = ${serialized}; el.title = el.value; el.dispatchEvent(new Event('change', { bubbles: true })); ` +
     `return el.value === ${serialized}; })()`;
-  for (const win of BrowserWindow.getAllWindows()) {
+  for (const win of harnessWindows) {
     if (!win.isDestroyed()) void win.webContents.executeJavaScript(script).catch(() => {});
   }
 }
@@ -199,6 +268,16 @@ function installApplicationMenu() {
         ...workspaceItems,
       ],
     },
+    {
+      label: '设置',
+      submenu: [
+        {
+          label: '模型与运行设置…',
+          accelerator: 'CmdOrCtrl+,',
+          click: () => settingsController?.open(BrowserWindow.getFocusedWindow() ?? undefined),
+        },
+      ],
+    },
     { role: 'viewMenu' },
     { role: 'windowMenu' },
   ];
@@ -206,7 +285,7 @@ function installApplicationMenu() {
 }
 
 async function chooseAndAddWorkspace() {
-  if (hostMode !== 'spawned') {
+  if (!canManageLocalHost()) {
     await dialog.showMessageBox({
       type: 'info',
       message: '当前连接的是外部宿主',
@@ -237,27 +316,39 @@ async function chooseAndAddWorkspace() {
   await restartOwnedHost();
 }
 
-async function restartOwnedHost() {
-  if (!hostChild || hostMode !== 'spawned') return;
+function restartOwnedHost(statusMessage = '正在切换工作目录…') {
+  const operation = restartQueue.then(() => performOwnedHostRestart(statusMessage));
+  // 队列自身吞掉失败以保持后续重启可执行；每个调用者仍拿到原 operation 的结果。
+  restartQueue = operation.catch(() => ({ ok: false, error: '上一轮宿主重启异常' }));
+  return operation;
+}
+
+async function performOwnedHostRestart(statusMessage) {
+  if (!canManageLocalHost()) return { ok: false, error: '当前连接外部宿主' };
   restarting = true;
-  setPage(textPage(`正在切换工作目录…\n${workspaceState.selected}`));
-  const child = hostChild;
-  const clean = await launcher.stopHostTree(child);
-  restarting = false;
-  if (!clean) {
-    // stop 超时表示它可能仍活着；保留句柄，App 最终退出时还能再走一次收树。
-    hostChild = child;
-    setPage(textPage('旧宿主进程树未能完全退出；为避免两个宿主同时写文件，已取消切换。'));
-    return;
-  }
   try {
+    setPage(textPage(`${statusMessage}\n${workspaceState.selected}`));
+    const child = hostChild;
+    const clean = child ? await launcher.stopHostTree(child) : true;
+    if (!clean) {
+      // stop 超时表示它可能仍活着；保留句柄，App 最终退出时还能再走一次收树。
+      hostChild = child;
+      setPage(textPage('旧宿主进程树未能完全退出；为避免两个宿主同时写文件，已取消切换。'));
+      return { ok: false, error: '旧宿主进程树未能完全退出' };
+    }
     const resolved = await resolveHarness({ forceSpawn: true });
     hostMode = resolved.mode;
     harnessHref = resolved.href;
     harnessOrigin = new URL(resolved.href).origin;
     setPage(harnessHref);
+    return { ok: true };
   } catch (error) {
-    setPage(textPage(`切换工作目录失败：${error.message}`));
+    hostMode = 'managed-error';
+    setPage(textPage(`宿主重启失败：${error.message}`));
+    return { ok: false, error: error.message };
+  } finally {
+    restarting = false;
+    installApplicationMenu();
   }
 }
 
@@ -275,6 +366,8 @@ function createWindow() {
       webSecurity: true,
     },
   });
+  harnessWindows.add(win);
+  win.on('closed', () => harnessWindows.delete(win));
   win.once('ready-to-show', () => win.show());
 
   win.webContents.setWindowOpenHandler(({ url }) => {
@@ -315,14 +408,22 @@ app.whenReady().then(async () => {
   session.defaultSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
   session.defaultSession.setPermissionCheckHandler(() => false);
   workspaceFile = path.join(app.getPath('userData'), 'workspaces.json');
+  modelSettingsFile = path.join(app.getPath('userData'), 'model-settings.json');
   const fallbackWorkdir = workspaceStore.normalizeDirectory(process.env.AGENT_UI_WORKDIR) ?? REPO_ROOT;
   workspaceState = seedConfiguredWorkspaces(workspaceStore.loadWorkspaceState(workspaceFile, fallbackWorkdir));
+  const loadedModelSettings = modelSettingsStore.loadModelSettings(modelSettingsFile, loadInheritedHostEnvironment());
+  modelSettingsRecord = loadedModelSettings.record;
+  modelSettingsWarning = loadedModelSettings.warning;
+  settingsController = createSettingsController({
+    getState: getPublicModelSettings,
+    saveState: saveAndApplyModelSettings,
+  });
   installApplicationMenu();
   createWindow();
 
   app.on('activate', () => {
     // macOS：点击 Dock 图标且无窗口时重新创建窗口
-    if (BrowserWindow.getAllWindows().length === 0) {
+    if (harnessWindows.size === 0) {
       createWindow();
     }
   });
@@ -334,6 +435,8 @@ app.whenReady().then(async () => {
     harnessOrigin = new URL(resolved.href).origin;
     setPage(harnessHref);
   } catch (error) {
+    hostMode = process.env.AGENT_UI_URL ? 'attach' : 'managed-error';
+    installApplicationMenu();
     setPage(textPage(`无法启动/连接 Harness 宿主：${error.message}`));
   }
 });

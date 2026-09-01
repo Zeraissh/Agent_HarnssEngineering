@@ -12,6 +12,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { AnthropicModelClient } from "./model-client.js";
 import { OpenAIModelClient } from "./model-client-openai.js";
+import { assertSafeProviderEndpoint } from "./provider-config.js";
 import type { ModelClient } from "./types.js";
 
 export interface ResolvedProvider {
@@ -35,17 +36,26 @@ export function createModelClientFromEnv(
   model: string,
   overrides: ProviderOverrides = {},
 ): ResolvedProvider {
-  const provider =
-    overrides.provider ?? ((process.env.AGENT_PROVIDER ?? "anthropic") as "anthropic" | "openai");
+  if (!model || model.length > 200 || model !== model.trim() || /[\u0000-\u001f\u007f]/.test(model)) {
+    throw new Error("AGENT_MODEL/角色模型名无效：不能为空、不能带首尾空白或控制字符，且最长 200 字符");
+  }
+  const rawProvider = overrides.provider ?? process.env.AGENT_PROVIDER ?? "anthropic";
+  if (rawProvider !== "anthropic" && rawProvider !== "openai") {
+    throw new Error('AGENT_PROVIDER 无效：只能是 "anthropic" 或 "openai"');
+  }
+  const provider = rawProvider;
   const timeoutMs = process.env.AGENT_TIMEOUT_MS ? Number(process.env.AGENT_TIMEOUT_MS) : undefined;
   const maxRetries = process.env.AGENT_MAX_RETRIES ? Number(process.env.AGENT_MAX_RETRIES) : undefined;
 
   if (provider === "openai") {
+    const configuredBaseURL = overrides.baseURL ?? process.env.OPENAI_BASE_URL;
+    const baseURL = configuredBaseURL?.trim() || undefined;
+    assertSafeProviderEndpoint(baseURL, "OPENAI_BASE_URL");
     return {
       provider,
       compat: true,
       client: new OpenAIModelClient(model, {
-        baseURL: overrides.baseURL ?? process.env.OPENAI_BASE_URL,
+        baseURL,
         apiKey: overrides.apiKey ?? process.env.OPENAI_API_KEY,
         timeoutMs,
         maxRetries,
@@ -53,16 +63,20 @@ export function createModelClientFromEnv(
     };
   }
 
+  const configuredAnthropicBaseURL = overrides.baseURL ?? process.env.ANTHROPIC_BASE_URL;
+  const anthropicBaseURL = configuredAnthropicBaseURL?.trim() || undefined;
+  assertSafeProviderEndpoint(anthropicBaseURL, "ANTHROPIC_BASE_URL");
+
   const needsCustomSdk =
     timeoutMs !== undefined ||
     maxRetries !== undefined ||
-    overrides.baseURL !== undefined ||
+    anthropicBaseURL !== undefined ||
     overrides.apiKey !== undefined;
   const sdkClient = needsCustomSdk
     ? new Anthropic({
         ...(timeoutMs !== undefined ? { timeout: timeoutMs } : {}),
         ...(maxRetries !== undefined ? { maxRetries } : {}),
-        ...(overrides.baseURL !== undefined ? { baseURL: overrides.baseURL } : {}),
+        ...(anthropicBaseURL !== undefined ? { baseURL: anthropicBaseURL } : {}),
         ...(overrides.apiKey !== undefined ? { apiKey: overrides.apiKey } : {}),
       })
     : undefined;

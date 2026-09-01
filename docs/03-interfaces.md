@@ -23,6 +23,18 @@ interface ToolContext {
   toolUseId: string;
   /** 取消信号：护栏触发或用户中断时，长时间运行的工具应尽快退出 */
   signal: AbortSignal;
+  /** 本 run 固定的任意命令边界；bash 不得绕过它 */
+  executionBroker?: ExecutionBroker;
+}
+
+interface ExecutionBroker {
+  readonly boundaryId: string;
+  /** requested/probe/effective/coverage 分开报告，禁止单一 sandboxed 布尔值 */
+  status(): ExecutionBoundaryStatus;
+  /** 功能探测，不以 which/version 冒充可用；admission/execute 用 force=true */
+  probe(force?: boolean): Promise<ExecutionBoundaryStatus>;
+  executeShell(request: ShellExecutionRequest): Promise<ShellExecutionResult>;
+  dispose?(): Promise<void>;
 }
 
 interface ToolResult {
@@ -30,6 +42,15 @@ interface ToolResult {
   content: string;
   /** true = 以 is_error: true 回传，模型据此调整策略；不会中断循环 */
   isError?: boolean;
+}
+
+interface ToolApprovalPolicy {
+  /** once = 仅当前调用；exact-input = 可在 TTL/次数内复用完全相同的输入 */
+  maxScope: "once" | "exact-input";
+  /** 工具上限；宿主还会与自己的全局上限取更严格值 */
+  maxTtlMs?: number;
+  /** 自动复用次数，不含最初由人批准的那次 */
+  maxUses?: number;
 }
 
 interface Tool {
@@ -41,6 +62,8 @@ interface Tool {
   permission: "auto" | "ask";
   /** true = 可与其他 parallelSafe 工具并发执行（典型：只读工具） */
   parallelSafe: boolean;
+  /** 缺省 once；高副作用工具不应开放 exact-input 复用 */
+  approvalPolicy?: ToolApprovalPolicy;
   /** input 为 JSON.parse 后的对象；实现内部自行做 schema 校验与收窄 */
   execute(input: unknown, ctx: ToolContext): Promise<ToolResult>;
 }
@@ -135,6 +158,7 @@ interface AgentConfig {
   model: string;                          // 默认 "claude-opus-4-8"
   systemPrompt: string;                   // 冻结；禁止含时间戳等易变内容
   tools: Tool[];
+  executionBroker?: ExecutionBroker;      // 逐 run 固定，经 Loop/Executor 传播
   effort?: "low" | "medium" | "high" | "xhigh";   // 默认 "high"
   maxTokens?: number;                     // 默认 64000（流式）
   maxTurns?: number;                      // 默认 50，单执行段护栏

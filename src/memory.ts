@@ -10,7 +10,14 @@
  */
 import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { Tool } from "./types.js";
+import type { Tool, ToolContext } from "./types.js";
+
+export const MEMORY_TOOL_NAMES = new Set([
+  "memory_list",
+  "memory_read",
+  "memory_write",
+  "memory_delete",
+]);
 
 /** 单条记忆上限：记忆是"值得复用的事实/教训"，不是数据仓库 */
 const MAX_MEMORY_BYTES = 64 * 1024;
@@ -94,8 +101,9 @@ function firstLineSummary(text: string): string {
   return clean.length > 80 ? `${clean.slice(0, 80)}…` : clean;
 }
 
-/** 由一个 MemoryStore 派生出四个记忆工具（工厂：一个 agent 一套，互不串味） */
-export function createMemoryTools(store: MemoryStore): Tool[] {
+type MemoryStoreResolver = (workdir: string) => MemoryStore;
+
+function buildMemoryTools(resolveStore: MemoryStoreResolver): Tool[] {
   const memoryList: Tool = {
     name: "memory_list",
     description:
@@ -103,8 +111,8 @@ export function createMemoryTools(store: MemoryStore): Tool[] {
     inputSchema: { type: "object", properties: {} },
     permission: "auto",
     parallelSafe: true,
-    async execute() {
-      return { content: await store.indexBlock() };
+    async execute(_input, ctx: ToolContext) {
+      return { content: await resolveStore(ctx.workdir).indexBlock() };
     },
   };
 
@@ -119,9 +127,9 @@ export function createMemoryTools(store: MemoryStore): Tool[] {
     },
     permission: "auto",
     parallelSafe: true,
-    async execute(input) {
+    async execute(input, ctx: ToolContext) {
       const { name } = input as { name: string };
-      return { content: await store.read(name) };
+      return { content: await resolveStore(ctx.workdir).read(name) };
     },
   };
 
@@ -140,9 +148,9 @@ export function createMemoryTools(store: MemoryStore): Tool[] {
     // 写盘却 auto：因为被圈禁在 memoryDir 内 —— 这正是"晋升为专用工具"的收益（P2）
     permission: "auto",
     parallelSafe: false,
-    async execute(input) {
+    async execute(input, ctx: ToolContext) {
       const { name, content } = input as { name: string; content: string };
-      await store.write(name, content);
+      await resolveStore(ctx.workdir).write(name, content);
       return { content: `Memory saved: ${name}` };
     },
   };
@@ -158,12 +166,37 @@ export function createMemoryTools(store: MemoryStore): Tool[] {
     },
     permission: "auto",
     parallelSafe: false,
-    async execute(input) {
+    async execute(input, ctx: ToolContext) {
       const { name } = input as { name: string };
-      await store.delete(name);
+      await resolveStore(ctx.workdir).delete(name);
       return { content: `Memory deleted: ${name}` };
     },
   };
 
   return [memoryList, memoryRead, memoryWrite, memoryDelete];
+}
+
+/** 由一个 MemoryStore 派生出四个记忆工具（工厂：一个 agent 一套，互不串味） */
+export function createMemoryTools(store: MemoryStore): Tool[] {
+  return buildMemoryTools(() => store);
+}
+
+/** Web 宿主等多 workdir 场景：按 ctx.workdir 解析独立 MemoryStore。 */
+export function createWorkdirScopedMemoryTools(
+  memoryDirForWorkdir: (workdir: string) => string,
+): { tools: Tool[]; indexBlock: (workdir: string) => Promise<string> } {
+  const cache = new Map<string, MemoryStore>();
+  const storeFor = (workdir: string): MemoryStore => {
+    const dir = memoryDirForWorkdir(workdir);
+    let store = cache.get(dir);
+    if (!store) {
+      store = new MemoryStore(dir);
+      cache.set(dir, store);
+    }
+    return store;
+  };
+  return {
+    tools: buildMemoryTools(storeFor),
+    indexBlock: (workdir) => storeFor(workdir).indexBlock(),
+  };
 }

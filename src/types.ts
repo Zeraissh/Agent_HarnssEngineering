@@ -9,6 +9,74 @@ import type Anthropic from "@anthropic-ai/sdk";
 /** JSON Schema 对象（工具输入约束），直接使用 SDK 的 InputSchema 形状 */
 export type JSONSchema = Anthropic.Tool.InputSchema;
 
+/** SAFE-05：执行策略与具体隔离后端正交，避免 `auto` 被误解成宿主降级。 */
+export type ExecutionIsolationMode = "off" | "report" | "required";
+export type ExecutionBackendPreference = "auto" | "oci" | "bwrap";
+export type ExecutionEffectiveState = "direct" | "report-only" | "partial" | "failed";
+
+/**
+ * 一份可以直接进入 API/事件/审计记录的执行边界证明。
+ *
+ * 刻意没有 `sandboxed: boolean`：候选 runtime 可用、bash 已进容器、整个 run
+ * 全面隔离是三个不同事实，压成一个布尔值一定会产生虚假安全声明。
+ */
+export interface ExecutionBoundaryStatus {
+  schemaVersion: 1;
+  boundaryId: string;
+  requestedMode: ExecutionIsolationMode;
+  requestedBackend: ExecutionBackendPreference;
+  effectiveState: ExecutionEffectiveState;
+  resolvedBackend: "host" | "oci" | null;
+  policyDigest: string;
+  probe: {
+    state: "not-run" | "ready" | "unavailable" | "not-required";
+    candidate: "oci" | "bwrap" | null;
+    reason?: string;
+    runtimeVersion?: string;
+  };
+  /** 当前真正由这条边界覆盖的能力；首个纵切只有 bash。 */
+  coverage: string[];
+  filesystem: string;
+  network: string;
+  identity: string;
+  resources: string;
+}
+
+export interface ShellExecutionRequest {
+  command: string;
+  shell?: string;
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  timeoutMs: number;
+  maxBufferBytes: number;
+  signal: AbortSignal;
+  windowsHide: boolean;
+  toolUseId: string;
+}
+
+export interface ShellExecutionResult {
+  stdout: string;
+  stderr: string;
+  exitCode: number | null;
+  signal: NodeJS.Signals | null;
+  timedOut: boolean;
+  aborted: boolean;
+  outputLimitExceeded: boolean;
+  cleanup: "not-needed" | "best-effort" | "runtime-rm" | "confirmed" | "failed";
+  status: ExecutionBoundaryStatus;
+  error?: string;
+}
+
+/** 逐 run 固定的命令执行边界；实现不得在 required 下回退到宿主。 */
+export interface ExecutionBroker {
+  readonly boundaryId: string;
+  status(): ExecutionBoundaryStatus;
+  /** force=true 用于 readiness/admission，绕过短 TTL 重新取得运行时回执。 */
+  probe(force?: boolean): Promise<ExecutionBoundaryStatus>;
+  executeShell(request: ShellExecutionRequest): Promise<ShellExecutionResult>;
+  dispose?(): Promise<void>;
+}
+
 export interface ToolContext {
   /** 工作目录（路径校验的根，所有文件类工具不得逃逸） */
   workdir: string;
@@ -21,6 +89,8 @@ export interface ToolContext {
   toolUseId: string;
   /** 取消信号：护栏触发或用户中断时，长时间运行的工具应尽快退出 */
   signal: AbortSignal;
+  /** SAFE-05：本 run 的命令执行边界；未注入时仅允许显式的 legacy local broker。 */
+  executionBroker?: ExecutionBroker;
 }
 
 export interface ToolResult {
@@ -28,6 +98,21 @@ export interface ToolResult {
   content: string;
   /** true = 以 is_error: true 回传，模型据此调整策略；不会中断循环 */
   isError?: boolean;
+}
+
+/**
+ * 宿主对“相同参数再次执行”授权的最高边界。
+ *
+ * 客户端只能在这条策略以内选择，不能通过 approval body 把单次审批扩大成
+ * conversation grant。未声明策略的 ask 工具按最严格的 `once` 处理。
+ */
+export interface ToolApprovalPolicy {
+  /** once = 只允许当前调用；exact-input = 可在 TTL/次数内复用完全相同的输入 */
+  maxScope: "once" | "exact-input";
+  /** 工具级 TTL 上限；宿主还会再与全局上限取更严格值 */
+  maxTtlMs?: number;
+  /** 自动复用次数上限；不含最初由人批准的那一次 */
+  maxUses?: number;
 }
 
 export interface Tool {
@@ -39,6 +124,8 @@ export interface Tool {
   permission: "auto" | "ask";
   /** true = 可与其他 parallelSafe 工具并发执行（典型：只读工具） */
   parallelSafe: boolean;
+  /** 缺省为 once；高副作用工具不应开放 exact-input 复用 */
+  approvalPolicy?: ToolApprovalPolicy;
   execute(input: unknown, ctx: ToolContext): Promise<ToolResult>;
 }
 
@@ -181,6 +268,8 @@ export interface AgentConfig {
   /** 高阶装配口：多个 AgentLoop 共享同一个实例；通常由 orchestrate 自动创建 */
   runBudget?: SharedRunBudget;
   workdir: string;
+  /** 逐 run 固定；所有任意命令工具必须经它执行。 */
+  executionBroker?: ExecutionBroker;
   /** 额外只读根（见 ToolContext.readRoots）。CLI 经 AGENT_READ_ROOTS 注入 */
   readRoots?: string[];
   /**

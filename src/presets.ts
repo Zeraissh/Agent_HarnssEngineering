@@ -1,4 +1,14 @@
 import type { Tool } from "./types.js";
+import {
+  applyMcpPackPermission,
+  originalMcpToolName,
+  type McpPermissionPolicy,
+} from "./mcp.js";
+
+export interface DomainMcpPolicy extends McpPermissionPolicy {
+  /** 只暴露这些 MCP 原始工具名；缺省全部暴露 */
+  includeTools?: string[];
+}
 
 /**
  * DomainPack（领域包）：把一个领域的 harness 内容打包成可切换单元。
@@ -27,7 +37,7 @@ export interface DomainPack {
    * 对象 = 在 mcp.json 基础上覆盖各 server 的工具白名单/审批策略
    * （如调试包收窄到只读集 + 烧录动作走审批）。
    */
-  mcp?: boolean | { includeTools?: string[]; permission?: "auto" | "ask" };
+  mcp?: boolean | DomainMcpPolicy;
   /** 核查配置 */
   verify: {
     /** 是否自动经 verifier 子代理独立核查 */
@@ -363,6 +373,14 @@ export const PACKS: Record<string, DomainPack> = {
     // 报告用 write_file,读产物用 read_file,足够。
     builtinTools: ["read_file", "write_file"],
     mcp: {
+      // 读取/诊断默认直接执行；会持久改动 Flash/RAM 或丢失现场的动作必须审批。
+      permission: "auto",
+      toolPermissions: {
+        flash_firmware: "ask",
+        flash_and_run: "ask",
+        reset_target: "ask",
+        write_memory: "ask",
+      },
       includeTools: [
         "suggest_server_args",
         "start_debug_session",
@@ -562,6 +580,8 @@ export function selectPackTools(
   builtinPool: Tool[],
   mcpPool: Tool[],
 ): Tool[] {
+  const rawMcpName = (tool: Tool): string =>
+    originalMcpToolName(tool) ?? tool.name.split("__").slice(1).join("__");
   const builtinNames = pack?.builtinTools ?? builtinPool.map((t) => t.name);
   const builtins = builtinPool.filter((t) => builtinNames.includes(t.name));
 
@@ -570,11 +590,16 @@ export function selectPackTools(
     mcp = [];
   } else if (pack && typeof pack.mcp === "object" && pack.mcp.includeTools) {
     const allow = new Set(pack.mcp.includeTools);
-    mcp = mcpPool.filter((t) => allow.has(t.name.split("__").slice(1).join("__")));
+    mcp = mcpPool.filter((t) => allow.has(rawMcpName(t)));
   } else {
     mcp = mcpPool;
   }
-  return [...builtins, ...mcp];
+  const packPolicy = pack && typeof pack.mcp === "object" ? pack.mcp : undefined;
+  const resolvedMcp = mcp.map((tool) => {
+    const rawName = rawMcpName(tool);
+    return applyMcpPackPermission(tool, rawName, packPolicy);
+  });
+  return [...builtins, ...resolvedMcp];
 }
 
 // ————— 兼容别名（v0.8 及之前的 Preset 命名）—————

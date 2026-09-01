@@ -410,6 +410,7 @@ export interface DomainPack {
   mcp?: boolean | {
     includeTools?: string[];
     permission?: "auto" | "ask";
+    toolPermissions?: Record<string, "auto" | "ask">;
   };
   verify: {
     enabled: boolean;
@@ -456,8 +457,8 @@ export const getPreset = getPack;
 1. **领域包 = 数据/配置，非核心代码**  
    包是五件套：工具（内置名单 + MCP 接入面）、system prompt（领域工作循环 + 黄金规则）、核查（形态 + 领域核查方法）、护栏参数、eval 套件（放 `eval/`，按包命名约定关联）。机制层（loop/context/verifier 纪律/编排）保持领域无关（P1）。
 
-2. **`selectPackTools` 按包纯内存过滤**  
-   内置池按 `builtinTools` 名单过滤（缺省全带）；MCP 池按包的 `mcp` 接入面过滤——`false` 全不带，`includeTools` 按原始名匹配（MCP 工具名形如 `${server}__${raw}`）。好处：MCP 只需按 `mcp.json` 连接一次，三角编排的子任务切包不用重连 server。
+2. **`selectPackTools` 按包纯内存过滤并解析最终权限**
+   内置池按 `builtinTools` 名单过滤（缺省全带）；MCP 池按包的 `mcp` 接入面过滤——`false` 全不带，`includeTools` 按原始名匹配（MCP 工具名形如 `${server}__${raw}`），再按 `pack 单工具 > server 单工具 > pack 默认 > server 默认 > ask` 解析最终权限。pack 的泛化默认不能静默放宽 server 点名的危险工具。CLI/Web/计划子任务均经过该函数，避免同一包在不同宿主下审批语义分叉。MCP 只需按 `mcp.json` 连接一次，三角编排的子任务切包不用重连 server。
 
 3. **成文口径优先纪律（rule-precedence）**  
    `RULE_PRECEDENCE_DISCIPLINE` 经 A/B 实证后采纳为全局默认（`eval/ab-report-rulefirst.md`：baseline 7/10 → 加此条款 10/10，副作用检查 8/8 干净）。针对的失败模式：任务给了明确口径（正则/行前缀/映射规则）时，模型的语义直觉会"补全"字面规则漏掉的情况，遵从稳定性仅 ~50%。

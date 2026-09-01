@@ -91,6 +91,11 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts
       - uses: actions/download-artifact@v4
         with:
           name: agent-harness-windows
@@ -109,6 +114,15 @@ jobs:
           TAG="${GITHUB_REF_NAME}"
           SHA_TAG="sha-${GITHUB_SHA::12}"
           docker build --tag "$IMAGE:$TAG" --tag "$IMAGE:$SHA_TAG" .
+          IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$IMAGE:$TAG")"
+          RUNTIME="$(readlink -f "$(command -v docker)")"
+          RUNTIME_SHA256="$(sha256sum "$RUNTIME" | awk '{print $1}')"
+          test -n "$IMAGE_ID"
+          test -x "$RUNTIME"
+          AGENT_TEST_OCI_IMAGE="$IMAGE_ID" \
+          AGENT_TEST_OCI_RUNTIME="$RUNTIME" \
+          AGENT_TEST_OCI_RUNTIME_SHA256="$RUNTIME_SHA256" \
+            npx vitest run test/execution-broker-oci.test.ts
           docker push "$IMAGE:$TAG"
           docker push "$IMAGE:$SHA_TAG"
           DIGEST="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$TAG")"

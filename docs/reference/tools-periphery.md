@@ -4,17 +4,71 @@
 
 ---
 
+## execution-broker.ts
+
+### 职责
+
+SAFE-05 的任意命令边界：解析 `off|report|required` 与 `auto|oci|bwrap`，为每个 run
+固定 boundary，执行 OCI 功能探测，并保证 `required` 不可用时绝不回退宿主。状态用
+`direct|report-only|partial|failed` 与 coverage 表达；本版 OCI 只覆盖 bash，所以不会
+报告整个 run 已隔离。
+
+### 主要导出
+
+```typescript
+export function parseExecutionPolicy(env?: NodeJS.ProcessEnv): ExecutionPolicyConfig;
+export function configuredExecutionStatus(env?: NodeJS.ProcessEnv, boundaryId?: string): ExecutionBoundaryStatus;
+export function createExecutionBroker(options: ExecutionBrokerOptions): ExecutionBroker;
+export function buildOciRunArgs(spec: OciRunSpec): string[];
+export function executionBoundaryLabel(boundaryId: string): string;
+export function executionNamespaceLabel(namespace: string): string;
+```
+
+OCI 参数由宿主固定：不可变镜像引用、`--pull never`、network none、只读 root、唯一
+RW workdir（递归子 mount 禁用）、numeric non-root、无 supplementary group、cap-drop、
+NNP、builtin seccomp、PID/CPU/内存/FD/tmpfs/输出/wall-time 上限。agent command 通过
+stdin 先全量写入私有 tmpfs 脚本，再由固定 `/bin/sh` bootstrap 以 fd0=EOF 执行，
+不出现在 Docker CLI argv/`Config.Cmd`；`env -i` 清空镜像与宿主环境。runtime 必须是
+Linux 上 root 管理的绝对真实路径并逐次核对 SHA-256，daemon
+只接受 root 管理的本机 Unix socket；socket 与设备均不进入 worker。
+
+探测会真实启动 canary 检查 UID/GID/groups、rootfs mount、NNP、CapEff、seccomp、网络
+路由、cgroup/FD 限制与 workdir 写入。实际 workdir 还会做 daemon 双向 read/write/
+rename/delete canary，并拒绝嵌套 mount、socket/FIFO/device、hardlink 与 symlink 路径组件。
+required 每次执行和每个 segment 准入都强制刷新；segment 收尾立即 dispose，follow-up
+更换 broker。清理无法取得“容器不存在”的 daemon 回执时全局 readiness/准入降级，
+per-run canary 前后双重重验。不能用“docker 命令存在”冒充
+安全后端。
+
+required+OCI 还要求稳定的 deployment namespace。每个容器原子写入 schema-3
+namespace/owner/boot/PID-namespace/PID/starttime/lease/kind/boundary/policy/lease-ms labels；probe 在 canary 前完整校验当前
+namespace，只按 full ID 回收“已到期且 owner 死亡证据完整”的 lease。未到期或 owner 仍活的并发 worker 不动，owner 存活性未知与畸形 tombstone 均 fail closed，
+正常 cleanup 也先核对 lease 以避免迟到 cleanup 删除名称复用对象。该 reaper 只保证下一次成功
+probe 后收敛，不是没有宿主进程时仍会触发的 daemon TTL。
+
+`report` 探测后仍走明确标注的 host lane；`required` 只有探测通过才走 OCI。
+`bwrap` 目前只保留配置值并报告 unavailable，未叠 cgroup 前不能满足 SAFE-05。
+
+---
+
 ## bash.ts
 
 ### 职责
 
-提供 shell 命令执行工具（`bash`），是 Agent 在本地工作目录执行任意命令的入口。自动探测 Windows 下的 Git Bash 路径以保持工具名与实际运行时一致。
+提供 shell 命令工具（`bash`），是 Agent 提交任意命令的入口。它只负责输入/输出适配、
+环境去密和 shell 语义；实际执行必须走 `ToolContext.executionBroker`。自动探测 Windows
+下的 Git Bash 路径以保持工具名与迁移期 host runtime 一致；required OCI 恒用 `/bin/sh`。
 
 ### 导出签名
 
 ```typescript
 // 实际使用的 shell 描述字符串（供宿主注入 dynamicContext）
 export const SHELL_DESC: string;
+export function shellDescription(env?: NodeJS.ProcessEnv): string;
+export function createBashTool(options?: {
+  legacyBrokerFactory?: (boundaryId: string, workdir: string) => ExecutionBroker;
+}): Tool;
+export function sanitizeChildEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv;
 
 // bash 工具定义（Tool 接口实例）
 export const bashTool: Tool;
@@ -31,11 +85,14 @@ function detectWindowsBash(): string | undefined;
 - **工具名与运行时一致性（2026-07-25 A/B 诊断教训）**：工具名叫 `bash` 而运行时是 `cmd.exe` 时，模型按名字写 bash 管道 → cmd 引号转义全崩 → 模型每次烧 5-10 轮做环境考古。工具名与运行时必须一致；名字的暗示力大于描述里的免责声明。
 - **避开 WSL 的 `System32\bash.exe`**：路径语义与 Git Bash 不同，比 cmd 更糟，探测时跳过。
 - **探测优先级**：`ProgramW6432` → `ProgramFiles` → `C:\Program Files`，依次查找 `Git\usr\bin\bash.exe` 和 `Git\bin\bash.exe`。
-- **权限门**：任意命令执行 = 最大能力面，默认 `permission: "ask"`（走审批门）。
+- **权限门**：任意命令执行 = 最大能力面，默认 `permission: "ask"`（走审批门），
+  `approvalPolicy.maxScope = "once"`，客户端不能扩大成同参数自动放行。
 - **并发安全**：`parallelSafe: false`。
-- **超时与缓冲**：单命令 120s 超时（`TIMEOUT_MS = 120_000`），缓冲区上限 10 MiB（`MAX_BUFFER = 10 * 1024 * 1024`）。
+- **逐 run Broker**：Web 用 `executionBrokerFactory(runId, workdir)` 固定实例；CLI 同样创建独立 boundary。旧式直接 `Tool.execute` 也只会进入明确标注的 `legacy-unbound` broker，并在调用后自行 dispose。
+- **超时与缓冲**：单命令 120s 超时（`TIMEOUT_MS = 120_000`），每路缓冲区上限 10 MiB（`MAX_BUFFER = 10 * 1024 * 1024`）。
 - **输出合并**：stdout 与 stderr 合并为一个字符串，以 `\n--- stderr ---\n` 分隔；空结果返回 `"(no output)"`。
-- **错误收敛**：超时/被 kill 或非零退出码均包装为 `isError: true` 的 ToolResult，错误消息经 `truncate` 截断。
+- **边界真相**：每条结果首行带 boundary/effective backend/mode/probe；`report-only` 与 `direct` 明确写未隔离。
+- **错误收敛**：timeout、abort、输出超限、清理未确认或非零退出码均包装为 `isError: true`，错误消息经 `truncate` 截断。
 
 ---
 
@@ -48,7 +105,11 @@ function detectWindowsBash(): string | undefined;
 ### 导出签名
 
 ```typescript
+export function createFetchUrlTool(overrides?: Partial<FetchUrlDependencies>): Tool;
+
 export const fetchUrlTool: Tool;
+
+export function isPublicIpAddress(address: string): boolean;
 ```
 
 内部函数（未导出）：
@@ -60,15 +121,26 @@ function stripHtml(html: string): string;
 ### 设计决策
 
 - **试点验证目标（v0.4）**：新增领域能力只需实现 Tool 接口 —— L0/L1/L3 零改动。
-- **安全考量**：GET 请求也有外泄面（模型可把数据拼进查询串发给任意主机），默认 `permission: "ask"`，由宿主审批放行。
-- **协议限制**：仅接受 `https://` 开头的 URL，其他返回错误。
-- **超时**：单次请求 20s（`TIMEOUT_MS = 20_000`），通过 `AbortSignal.timeout` + `ctx.signal` 竞速实现。
-- **重定向**：`redirect: "follow"` 跟随重定向。
-- **User-Agent**：`agent-harness/0.4 (+https://github.com/Zeraissh/Agent_HarnssEngineering)`。
+- **安全考量**：GET 请求也有外泄面（模型可把数据拼进查询串发给任意主机），默认
+  `permission: "ask"`，只允许同 run、同工具定义、同规范化 URL 输入在 10 分钟内
+  自动复用最多 5 次；宿主可进一步收紧。
+- **协议与目标限制**：用 WHATWG `URL` 解析，仅接受 HTTPS、拒绝 URL 内嵌凭据；
+  hostname 每次都解析为 IP 并拒绝 loopback、private、link-local、CGNAT、benchmark、
+  documentation、multicast/reserved IPv4 及非 global-unicast/特殊隧道 IPv6。
+- **超时/取消**：整个操作共用 20s `AbortSignal.timeout` + `ctx.signal`；DNS lookup 即使底层 resolver 不支持取消，也经 abort-aware Promise 闸门及时返回。
+- **DNS pinning**：DNS 校验后，`https.request` 的 TCP 连接直接使用该 IP，TLS SNI、
+  证书校验和 HTTP Host 仍使用原域名，关闭“校验时公网、连接时私网”的 rebinding 窗口。
+- **重定向**：手动处理 301/302/303/307/308；每一跳重新执行 URL、DNS 与 IP 校验，最多 5 跳。
+- **响应上限**：网络层最多读取 1,000,000 bytes，再把返回模型的文本截断到 20,000 字符。
+- **断流收口**：响应监听 `end/aborted/error/close`；headers 后中途断流会明确报错，不会留下永久 pending Promise。
+- **User-Agent**：`agent-harness/1.2 (+https://github.com/Zeraissh/Agent_HarnssEngineering)`。
 - **HTML 朴素去标签**：`stripHtml` 移除 `<script>`、`<style>` 块及所有 HTML 标签，实体解码（`&nbsp;` `&amp;` `&lt;` `&gt;`），压缩空白。对 v0.4 试点足够；正经抽取（readability 等）是后续工具的事。
 - **输出截断**：结果经 `truncate` 截断到 20 000 字符（`truncate(text, 20_000)`）；空响应返回 `"(empty response)"`。
 - **内容类型判断**：响应 `Content-Type` 含 `html` 时走去标签流程，否则原始文本直通。
 - **并发安全**：`parallelSafe: true`。
+- **受控网络边界**：使用 198.18.0.0/15 等 synthetic/fake-IP DNS 的本地 TUN 环境会
+  fail closed；在专用受控 egress/proxy 能把验证地址与真实连接绑定之前，不应为兼容而
+  自动放开这类非公网地址。
 
 ---
 
@@ -82,10 +154,16 @@ function stripHtml(html: string): string;
 
 ```typescript
 /**
- * 将相对/绝对路径 resolve 到规范形式并确认仍在 workdir 内。
- * 模型给出的路径是不可信输入 —— 拒绝 .. 逃逸与工作区外的绝对路径。
+ * 先做 lexical containment，再校验目标或最近存在父目录的真实路径仍在 workdir 内。
  */
 export function resolveInWorkdir(workdir: string, p: string): string;
+
+/** 只读路径可额外落在 readRoots 内，仍执行同一真实路径边界校验。 */
+export function resolveReadable(
+  workdir: string,
+  readRoots: string[] | undefined,
+  p: string,
+): string;
 
 /**
  * 输出截断：超长内容回填给模型只会烧 token，不会更有用。
@@ -96,7 +174,12 @@ export function truncate(text: string, limit = 30_000): string;
 
 ### 设计决策
 
-- **路径不可信原则**：模型给出的路径是不可信输入，`resolveInWorkdir` resolve 后检查相对路径是否以 `..` 开头或为绝对路径（即逃逸），命中则抛出 `Path escapes the working directory` 错误。
+- **路径不可信原则**：先用 `path.resolve/path.relative` 拒绝 lexical 逃逸，再用
+  `realpathSync.native` 校验目标或最近存在父目录，拒绝经 POSIX symlink、Windows
+  junction/reparse point 越界；workdir 本身不存在时 fail closed。
+- **写入二次校验**：`write_file` 在创建父目录之后、最终写入之前再次解析真实边界，
+  防止新建目录阶段引入链接。Node 跨平台 API 没有 `openat` 式逐分量原子圈禁，检查与
+  最终 I/O 之间仍有极窄 TOCTOU；彻底封闭依赖后续逐 run OS sandbox。
 - **截断语义**：超长内容回填给模型只会烧 token，不会更有用 —— 超限时截取前 `limit` 字符并附加 `...[truncated N of total chars]` 标记。
 - **默认截断上限**：`truncate` 默认 30 000 字符；各工具可按需传入更小限制（如 `fetch-url` 传 20 000）。
 
@@ -199,7 +282,7 @@ export const writeFileTool: Tool;
 
 ### 设计决策
 
-- **权限**：写盘是可回滚性最差的内置动作，默认 `permission: "ask"`。
+- **权限**：写盘是可回滚性最差的内置动作，默认 `permission: "ask"` 且只允许单次审批。
 - **并发安全**：`parallelSafe: false`。
 - **覆写语义**：直接覆写已有文件内容 —— 需保留部分内容时应先 `read_file` 再 `write_file`。
 - **自动建目录**：`mkdir(path.dirname(resolved), { recursive: true })` 确保父目录存在。
@@ -226,6 +309,8 @@ export interface McpServerConfig {
   cwd?: string;
   /** 默认 "ask"——外部进程能力面未知，审批兜底 */
   permission?: "auto" | "ask";
+  /** 按 MCP 原始工具名覆盖 server 默认权限 */
+  toolPermissions?: Record<string, "auto" | "ask">;
   /** 默认 false——MCP server 内部多为有状态会话，保守串行 */
   parallelSafe?: boolean;
   /** 只暴露这些工具（可选，控制工具面大小） */
@@ -235,6 +320,12 @@ export interface McpServerConfig {
 /** MCP 配置文件顶层结构 */
 export interface McpConfig {
   servers: Record<string, McpServerConfig>;
+}
+
+/** server / DomainPack 共用的权限策略 */
+export interface McpPermissionPolicy {
+  permission?: "auto" | "ask";
+  toolPermissions?: Record<string, "auto" | "ask">;
 }
 
 /** MCP server 返回的原始工具信息 */
@@ -255,8 +346,15 @@ export function adaptMcpTool(
   serverName: string,
   info: McpToolInfo,
   call: McpCaller,
-  cfg: Pick<McpServerConfig, "permission" | "parallelSafe">,
+  cfg: Pick<McpServerConfig, "permission" | "toolPermissions" | "parallelSafe">,
 ): Tool;
+
+/** server default → pack default → server tool → pack tool 合并 */
+export function resolveMcpToolPermission(
+  rawToolName: string,
+  serverPolicy?: McpPermissionPolicy,
+  packPolicy?: McpPermissionPolicy,
+): "auto" | "ask";
 
 /** 传输层死亡判定：SDK 在 stdio 断开后抛 "Not connected" / "Connection closed" */
 export function isTransportDead(err: unknown): boolean;
@@ -302,7 +400,7 @@ export async function loadMcpConfig(configPath: string): Promise<McpConfig | und
 
 - **一次适配，整个 MCP 生态可用（P1）**：领域能力（硬件调试、数据库、浏览器等）不再需要手写 TS 工具，L0/L1/L3 依旧零改动。
 - **命名空间隔离**：工具名统一加 `${serverName}__` 前缀，避免与内置工具及多 server 之间撞名。
-- **权限默认 "ask"（P6）**：外部进程的能力面未知，宿主审批兜底；信任的 server 可在 `mcp.json` 中按 server 配置 `"auto"` 和 `parallelSafe`。
+- **权限默认 "ask"（P6）**：外部进程的能力面未知，宿主审批兜底；信任的 server 可在 `mcp.json` 中按 server 配置 `"auto"` ，再用 `toolPermissions` 将烧录/复位/写内存等单工具收紧为 `"ask"`。最终优先级为 `pack 单工具 > server 单工具 > pack 默认 > server 默认 > ask`：pack 的泛化 `auto` 不能盖掉 server 对具体危险工具的 `ask`；要覆盖必须在 pack 中同样逐工具点名。所有最终为 ask 的 MCP 工具缺省 `approvalPolicy.maxScope = "once"`，不能仅凭相同参数自动复用破坏性外部调用。
 - **isError 直通（P5）**：MCP 的 `isError` 直接映射为 `ToolResult.isError`，错误进入上下文供模型阅读。
 - **传输层死亡自愈**：server 进程被杀或 stdio 断开 → 自动重启 server 进程并重连（一次）。教训（v1.0 三角编排演示）：执行者用 bash 清理进程时可能扫死共享的 MCP server，多轮编排的寿命比连接长，必须能自愈。
 - **重连代价标注**：重连后 server 端会话状态清零（如调试会话），调用方需自行重建会话。

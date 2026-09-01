@@ -54,8 +54,10 @@ the recorded digest survives builder cache pruning and machine changes, which ma
    plaintext task transcripts and therefore require the same confidentiality controls as model keys.
 5. Set `AGENT_IMAGE` to the digest-pinned reference from the target GitHub Release notes, then
    start `deploy/docker-compose.production.yml`.
-6. Confirm `/health` is HTTP 200 and `/ready` is HTTP 200. A 503 readiness response means history
-   protection or shutdown state is degraded; do not send traffic.
+6. Confirm `/health` is HTTP 200 and `/ready` is HTTP 200. A 503 readiness response means history,
+   execution cleanup/backend, or shutdown state is degraded; do not send traffic. The public
+   readiness body intentionally returns only stable execution state/codes, not runtime/socket/workdir
+   paths; use authenticated `/api/harness` and operational logs for detail.
    Confirm the `history-backup` sidecar is healthy and its `.last-success.json` timestamp is current.
 7. Open `https://<public-host>/?access_token=<token>` once. The host exchanges it for an HttpOnly,
    SameSite cookie and redirects to a clean URL.
@@ -73,7 +75,20 @@ via `AGENT_UI_WORKDIRS`. Refusals are counted under
 
 Remote listeners fail to start without authentication and a declared TLS boundary. Bash is removed
 from the remote tool surface by default. Enabling it requires the separate
-`AGENT_UI_ALLOW_REMOTE_EXECUTION=1` acknowledgement and an OS/container isolation review.
+`AGENT_UI_ALLOW_REMOTE_EXECUTION=1` acknowledgement **and**
+`AGENT_EXECUTION_ISOLATION=required`. The launcher rejects `off/report` remote bash; the host runs a
+functional OCI canary (not just `docker version`) and returns `/ready` 503 plus 503 for new runs when
+the digest-pinned image/runtime/profile is unavailable. `required` never falls back to host exec.
+The supplied production Compose deliberately keeps bash disabled and does not mount a Docker socket;
+do not weaken that boundary by mounting the runtime socket into a worker. The embedded OCI adapter is
+a Linux-direct-host, single-operator migration slice, not a public multi-tenant Broker service. A
+reviewed direct-host deployment must set an administrator-pinned absolute canonical Docker CLI path,
+its SHA-256, and a root-managed local Unix socket. PATH lookup, Docker contexts, and TCP/SSH daemons
+are refused. It must also set a stable, deployment-unique `AGENT_EXECUTION_OCI_NAMESPACE`; changing it
+requires stopping old instances and manually inspecting/cleaning the old namespace first. Docker package
+upgrades change the CLI digest and require an intentional config update.
+See
+`docs/adr/ADR-001-execution-isolation.md` and `docs/adr/ADR-002-durable-oci-worker-leases.md`.
 Load `deploy/prometheus-alerts.yml` into the monitoring stack and configure the scraper with the same
 Bearer token used by the operator; `/metrics` is authenticated whenever the host token is enabled.
 Name the scrape job exactly `agent-harness` — the process-death alert (`AgentHarnessDown`) matches on
@@ -113,16 +128,29 @@ Send only an operator canary first, then verify:
 - restart the host and derive a continuation child from a completed checkpoint;
 - submit an evil Origin, `text/plain` create request, oversized body, and fifth concurrent run;
   expected results are 403, 415, 413, and 429 respectively;
-- hold `/api/stream`, send SIGTERM, and confirm shutdown completes within the configured timeout.
+- hold `/api/stream`, send SIGTERM, and confirm shutdown completes within the configured timeout
+  (default 15s); cleanup rejection must produce a non-zero launcher exit, not a false success.
+  Keep the orchestrator grace period above this window (the supplied Compose uses 20s).
 - leave `/api/stream` idle beyond the proxy idle timeout and confirm heartbeat comments keep it open;
 - complete one run, confirm its backup manifest verifies, then restore that run directory into an
   empty history volume and confirm it appears after host restart.
+- in a staging host with bash enabled, inspect `/api/harness` and the run's `run_config`: candidate
+  probe readiness is not enough; effective state must be `partial/oci`, coverage must say `bash`, and
+  the UI must not claim the whole run is isolated. Stop the runtime and confirm `/ready` and new-run
+  admission become 503 without executing the canary command on the host;
+- run the OCI negative suite used by CI: host-parent/symlink/hardlink/Unix-socket/provider-env/
+  network/rootfs reads fail; UID/GID/groups, CapEff/NNP/seccomp and cgroup limits match the profile;
+  concurrent workers do not kill each other; command literals are absent from `Config.Cmd`; abort and
+  broker dispose leave no labelled worker container; an expired schema-3 tombstone is removed by full ID,
+  expired current-process and foreign-process owners survive, a SIGKILLed owning Node is reaped after expiry,
+  and a malformed current-namespace tombstone blocks readiness without being deleted. This proves cleanup on
+  the next successful sweep, not autonomous daemon TTL.
 
 ## Rollback triggers and procedure
 
 Rollback immediately when any of these occur: two consecutive readiness failures, authentication or
 Origin bypass, history write degradation, inability to answer `ask_user`, graceful shutdown beyond
-10 seconds, or a canary run losing its terminal event. Also rollback when 5xx responses exceed 1%
+the configured 15-second default, or a canary run losing its terminal event. Also rollback when 5xx responses exceed 1%
 for five minutes or run errors materially exceed the previous release baseline.
 
 Stop new traffic, preserve the failed release logs/history volume, set `AGENT_IMAGE` back to the

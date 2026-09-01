@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'none'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>模型与运行设置</title>
+    <link rel="stylesheet" href="./settings.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <p class="eyebrow">Agent Harness · Desktop</p>
+        <h1>模型与运行设置</h1>
+        <p class="lede">这些设置只用于桌面端自管的本地宿主。API key 不会返回给网页，也不会写入项目目录。</p>
+      </header>
+
+      <div id="mode-banner" class="banner" role="status" aria-live="polite"></div>
+      <div id="message" class="message" role="alert" aria-live="assertive" hidden></div>
+
+      <form id="settings-form">
+        <section aria-labelledby="model-heading">
+          <h2 id="model-heading">执行模型</h2>
+          <div class="grid two">
+            <label>
+              <span>API 协议</span>
+              <select id="provider" name="provider">
+                <option value="anthropic">Anthropic Messages</option>
+                <option value="openai">OpenAI Chat Completions</option>
+              </select>
+            </label>
+            <label>
+              <span>模型名</span>
+              <input id="model" name="model" autocomplete="off" maxlength="200" required />
+            </label>
+          </div>
+          <label>
+            <span>API Base URL <small>官方端点可留空；远程地址必须 HTTPS</small></span>
+            <input id="baseUrl" name="baseUrl" type="url" autocomplete="off" placeholder="https://api.example.com" />
+          </label>
+          <label>
+            <span>API key <small id="credential-status"></small></span>
+            <input id="apiKey" name="apiKey" type="password" autocomplete="new-password" placeholder="留空则保留当前凭据来源" />
+          </label>
+          <label class="check-row">
+            <input id="clearApiKey" name="clearApiKey" type="checkbox" />
+            <span>清除已保存的 API key（不会修改 PowerShell 或 .env）</span>
+          </label>
+        </section>
+
+        <section aria-labelledby="guardrail-heading">
+          <h2 id="guardrail-heading">运行护栏</h2>
+          <div class="grid two">
+            <label>
+              <span>思考档位</span>
+              <select id="effort" name="effort">
+                <option value="low">low</option>
+                <option value="medium">medium</option>
+                <option value="high">high</option>
+                <option value="xhigh">xhigh</option>
+                <option value="max">max</option>
+              </select>
+            </label>
+            <label>
+              <span>单次输出 token 上限</span>
+              <input id="maxTokens" name="maxTokens" type="number" min="1" max="1000000" placeholder="默认" />
+            </label>
+            <label>
+              <span>上下文 token 上限</span>
+              <input id="contextLimit" name="contextLimit" type="number" min="1" max="2000000" placeholder="默认" />
+            </label>
+            <label>
+              <span>请求超时（毫秒）</span>
+              <input id="timeoutMs" name="timeoutMs" type="number" min="1000" max="3600000" placeholder="默认" />
+            </label>
+            <label>
+              <span>模型请求重试次数</span>
+              <input id="maxRetries" name="maxRetries" type="number" min="0" max="10" placeholder="默认" />
+            </label>
+            <label>
+              <span>最大并发任务数</span>
+              <input id="maxActiveRuns" name="maxActiveRuns" type="number" min="1" max="64" placeholder="默认" />
+            </label>
+          </div>
+          <label>
+            <span>宿主每日 token 预算 <small>0 表示封盘；留空表示不启用</small></span>
+            <input id="dailyTokenBudget" name="dailyTokenBudget" type="number" min="0" max="1000000000000" placeholder="默认" />
+          </label>
+        </section>
+
+        <p class="restart-note">保存会重启本地宿主，正在运行的任务会中断；历史记录不会删除。</p>
+        <footer>
+          <button id="cancel" class="secondary" type="button">取消</button>
+          <button id="save" type="submit">保存并重启宿主</button>
+        </footer>
+      </form>
+    </main>
+    <script src="./settings.js"></script>
+  </body>
+</html>

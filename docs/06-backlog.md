@@ -159,7 +159,9 @@ blockedReason 都说"执行上下文没有跨重启保存"，不再落到"可能
 共享总预算写进 meta；重启后不是“复活”父 run，而是派生带 `continuedFrom /
 rootRunId` 的新 run，首条 durable 事件为 `run_forked`。父档案事件逐条不变；子 run
 读取父正史并延续 usedTurns/usedTokens，恢复首请求按旧水位先 compact。模型、工具与
-策略使用当前宿主，审批放行和 ask_user 配额重置；工作目录白名单、领域包存在性、
+策略使用当前宿主。完整 checkpoint 可保存仍有效 grant 的版本化**审计快照**，但它
+不是 capability：派生 child 因 `runId` 不同不继承授权，并逐条写入
+`approval_grant_not_inherited`；挂起审批和 ask_user 配额同样重置。工作目录白名单、领域包存在性、
 核查/编排边界与预算剩余量全部 fail-closed。旧检查点上限与当前上限取更严格者，
 所以重启不能扩权或洗掉总账。Web composer 明示「从归档继续」并自动切换到子 run。
 故障注入覆盖父档案不可变、正史/预算延续、当前预算收紧与工作目录越权零模型调用。
@@ -218,7 +220,7 @@ planner/verifier 的契约输出是**裸 JSON**，渲染器对它无事可做。
 哨兵吃掉下一次真实用户滚动）——瞬时落点下哨兵本就多余。
 
 **D3. 候选：交互模式收敛为 manual / plan / auto。**
-原语已经全齐——manual=审批门逐次问+常驻放行；plan=mode=plan+计划确认门；
+原语已经全齐——manual=审批门逐次问+同工具同参数的 run 内放行；plan=mode=plan+计划确认门；
 auto=--yes/审批 auto。缺的只是**命名的装配预设**（一个三态选择器捆定这几个
 开关），不是新机制。硬约束：装配条必须继续显示展开后的真实开关值，模式名
 不得替代它——否则又是"界面说谎"那族（V-04）。→ 第一步：写清三档各捆哪些

@@ -12,6 +12,12 @@
         "STM32_GDB_MCP_COMPACT": "1"
       },
       "permission": "auto",
+      "toolPermissions": {
+        "flash_firmware": "ask",
+        "flash_and_run": "ask",
+        "reset_target": "ask",
+        "write_memory": "ask"
+      },
       "parallelSafe": false,
       "includeTools": [
         "suggest_server_args",

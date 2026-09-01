@@ -28,6 +28,7 @@
 | [docs/02-architecture.md](docs/02-architecture.md) | 五层架构、模块职责、一轮 turn 的完整数据流、关键 API 事实 |
 | [docs/03-interfaces.md](docs/03-interfaces.md) | 核心 TypeScript 接口定义（实现蓝本） |
 | [docs/04-roadmap.md](docs/04-roadmap.md) | 演进路线（v0.1 → v1.1）与每阶段验证 checklist |
+| [docs/08-maturity-optimization-checklist.md](docs/08-maturity-optimization-checklist.md) | 对标成熟 Agent 的分阶段优化清单、优先级与验收证据 |
 | [docs/reference/README.md](docs/reference/README.md) | `src/` 全部 21 个模块的参考文档（签名与源码逐一核对；由 v1.1 并行编排自举生成，见案例 #2） |
 | [docs/cases/](docs/cases) | 真实任务案例：#1 遥测固件真机闭环、#2 并行编排交付参考文档（墙钟 −43%） |
 
@@ -36,35 +37,37 @@
 ```powershell
 npm install
 
-# Anthropic 官方（默认 claude-opus-4-8）
-$env:ANTHROPIC_API_KEY = "sk-ant-..."
+# 推荐：复制模板后在编辑器中填写 .env
+Copy-Item .env.example .env
+```
 
-# 或任意 Anthropic 兼容端点（DeepSeek / 智谱 GLM / Moonshot Kimi）
-$env:ANTHROPIC_BASE_URL = "https://api.deepseek.com/anthropic"
-$env:ANTHROPIC_API_KEY  = "sk-..."
-$env:AGENT_MODEL        = "deepseek-chat"   # 非 claude-* 自动进入 compat 模式
+CLI 没有 `--api-key` 参数；不要把真实密钥写进 argv 或 PowerShell 赋值命令。请在
+`.env` 中选择一种端点配置（完整字段与 OCI 配置见 [`.env.example`](.env.example)）：
 
-# 或本地 Ollama（v0.14+ 原生 Anthropic 兼容；本地慢速模型务必配超时与输出上限）
-# 定位（2026-08 起）：本地端点仅作离线/隐私路径验证（npm run smoke:local），
-# 研究实验一律用云端——弱执行者请用云端小模型（SiliconFlow/DashScope 的 qwen 阶梯）
-$env:ANTHROPIC_BASE_URL = "http://localhost:11434"
-$env:ANTHROPIC_API_KEY  = "ollama"          # 任意值即可
-$env:AGENT_MODEL        = "qwen3.5:9b"
-$env:AGENT_MAX_TOKENS   = "4096"            # 掐断思考螺旋，快速失败
-$env:AGENT_TIMEOUT_MS   = "300000"; $env:AGENT_MAX_RETRIES = "0"
+```dotenv
+# Anthropic 官方（默认模型 claude-opus-4-8）
+ANTHROPIC_API_KEY=sk-ant-...
 
-# 或 OpenAI wire 协议（任何 chat-completions 端点；key 必须显式配置）
-$env:AGENT_PROVIDER     = "openai"
-$env:OPENAI_BASE_URL    = "https://api.deepseek.com"   # 或 api.openai.com 等
-$env:OPENAI_API_KEY     = "sk-..."
-$env:AGENT_MODEL        = "deepseek-chat"
+# 若改用 OpenAI wire 协议，则设置：
+# AGENT_PROVIDER=openai
+# OPENAI_BASE_URL=https://api.example.com
+# OPENAI_API_KEY=sk-...
+# AGENT_MODEL=example-model
+```
 
-npm run cli -- "阅读 docs/ 下所有文档，生成 SUMMARY.md"          # 交互审批 y/n
-npm run cli -- --yes "……"                                        # 自动批准（CI）
-npm run cli -- --verify "……"                                     # 完成后 verifier 独立核查，未通过自动返工
-npm run cli -- --ask "……"                                        # 允许执行前集中提出 1~4 个选择题（可自由输入）
-npm run cli -- --plan "……"                                       # 三角编排：planner 拆解→执行→核查→交接；
-                                                                  #   互不依赖的子任务默认并行（auto=min(3,层宽)），--parallel=N 覆盖
+```powershell
+# 静态自检：只读本地配置，不创建模型客户端、不联网、不启动执行 worker
+npm run doctor
+npm run agent -- run "阅读 docs/ 下所有文档，生成 SUMMARY.md"    # 新入口；交互审批 y/n
+npm run agent -- run --yes "……"                                  # 自动批准（CI）
+npm run agent -- run --verify "……"                               # 完成后 verifier 独立核查，未通过自动返工
+npm run agent -- run --ask "……"                                  # 允许执行前集中提出 1~4 个选择题（可自由输入）
+npm run agent -- run --plan --parallel 3 "……"                    # 分离式并行度不会混入任务正文
+npm run agent -- --help                                           # 严格参数说明
+npm run agent -- --version
+
+# 兼容入口保留；已有脚本无需立即迁移
+npm run cli -- --verify "……"
 npm run eval                                                      # 全量用例回归基线（31 用例，纯产物评分）
 npm run lab                                                       # A/B 实验向导：选端点/臂/用例，免拼环境变量
 npm run lab -- --last                                             # 重放上一次实验配置
@@ -117,10 +120,30 @@ npm run desktop:dist                    # 生产打包；Windows/macOS 缺签名
 npm run desktop:dist:unsigned           # 只供本机安装测试，不得发布
 ```
 
+Desktop 自管本地宿主时，可从应用菜单打开 **设置 → 模型与运行设置…**（`Ctrl/Cmd+,`），
+配置 API 协议、模型、Base URL、API key 以及 token/超时/重试/并发护栏。API key 由
+Electron `safeStorage` 交给操作系统凭据系统加密，配置文件不会保存明文，远程 Harness
+网页也拿不到密钥；保存后桌面壳会重启本地宿主。若通过 `AGENT_UI_URL` 或已有服务进入
+attach 模式，该窗口只读，模型配置应在外部宿主完成。
+
 真实编译产物用 `npm run build && npm start` 启动；`npm run pack:check` 会审计发布包
 allowlist。非 loopback 监听现在是 fail-closed：必须提供至少 32 字符的
 `AGENT_UI_ACCESS_TOKEN`，并声明可信 TLS 反代或显式接受明文风险；远程模式默认从工具面
-移除 `bash`。完整 Docker、探针、canary 和回滚步骤见
+移除 `bash`。即使显式开启远程执行，也必须同时使用
+`AGENT_EXECUTION_ISOLATION=required`；OCI 功能探测、固定安全 profile 或镜像任一不可用时，
+`/ready`、新任务和续跑准入均 fail closed，绝不回退宿主。内嵌 OCI adapter 只支持 Linux
+直宿主：Docker CLI 必须使用管理员固定的绝对真实路径并同时固定 SHA-256，daemon 只接受
+root 管理的本机 Unix socket，并配置稳定且部署唯一的 `AGENT_EXECUTION_OCI_NAMESPACE`；Windows/macOS 需要后续独立 Broker 服务。CLI/loopback 的缺省 `report` 只是迁移
+模式：命令仍在宿主执行，CLI、Tools 面和 tool result 都会明确标记“未隔离”。当前 OCI 纵切
+只覆盖 `bash`，命令正文经 stdin 先全量落到 worker 私有 tmpfs，再以 fd0=EOF 执行，
+不进入 Docker argv/`Config.Cmd`；每次执行重跑 runtime/profile 与实际 workdir canary，
+每个对话 segment 收尾立即销毁 broker，follow-up 必须新建并重探针。ADR-002 的 daemon-resident
+schema-3 lease/reaper 会在每次 probe 前校验 namespace/ownership/租期，只按 full container ID
+回收“已到期且 boot-id/PID-namespace/PID starttime 证明 owner 已死亡”的 orphan；名称复用、owner 存活性未知、畸形 tombstone 或清理无法确认时，per-run canary 前后双闸门都会
+停止新准入。没有后续 probe 时它不是 autonomous TTL。状态仍最多是 `partial`；独立 timer/Broker、MCP gateway 与逐 run worktree/UID lease 完成前
+SAFE-05 不会标记完成。架构取舍见
+[`ADR-001`](docs/adr/ADR-001-execution-isolation.md) 与
+[`ADR-002`](docs/adr/ADR-002-durable-oci-worker-leases.md)。完整 Docker、探针、canary 和回滚步骤见
 [`docs/07-production-runbook.md`](docs/07-production-runbook.md)。
 
 PowerShell 中临时清除继承的端点变量要用：
@@ -136,7 +159,8 @@ Web 宿主默认把运行历史写到 `<cwd>/.agent-run-history`（可用
 `AGENT_RUN_HISTORY_DIR` 改位置，`AGENT_RUN_HISTORY_KEEP` 改保留数）。完整结束的
 单执行者运行会同时保存事件、会话正史、Context 水位与累计总预算。宿主重启后点
 「从归档继续」会从检查点**派生一个新运行**：父档案保持只读，正史与总预算延续；
-模型、工具、策略与审批规则以当前宿主为准，旧上限与当前上限取更严格者。旧格式档案、
+模型、工具与策略以当前宿主为准，旧上限与当前上限取更严格者。检查点中的短期审批
+grant 仅作审计，不是可恢复的执行权限；新运行会记录未继承原因并重新询问。旧格式档案、
 核查/编排运行、预算已耗尽或工作目录不在当前白名单时只允许回看。
 
 `/health` 提供 liveness，`/ready` 在历史写入失败或关停时返回 503，`/metrics`

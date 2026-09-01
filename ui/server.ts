@@ -8,8 +8,13 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join, extname, dirname, delimiter, resolve, basename, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { AgentLoop } from "../src/loop.js";
+import {
+  configuredExecutionStatus,
+  createExecutionBroker,
+  parseExecutionPolicy,
+} from "../src/execution-broker.js";
 import {
   runVerified,
   runPlanned,
@@ -20,8 +25,9 @@ import {
   type VerifiedRunResult,
 } from "../src/orchestrate.js";
 import { createModelClientFromEnv, type ResolvedProvider } from "../src/provider.js";
-import { getPack, selectPackTools, PACKS, type DomainPack } from "../src/presets.js";
+import { getPack, selectPackTools, PACKS, RULE_PRECEDENCE_DISCIPLINE, type DomainPack } from "../src/presets.js";
 import { connectMcpServers, loadMcpConfig, type McpRuntime } from "../src/mcp.js";
+import { createWorkdirScopedMemoryTools, MEMORY_TOOL_NAMES } from "../src/memory.js";
 import { DEFAULT_VERIFIER_MAX_TURNS } from "../src/verifier.js";
 import { resolvePlannerMaxTurns } from "../src/planner.js";
 import type { Plan, SubTask } from "../src/planner.js";
@@ -46,6 +52,7 @@ import {
   pruneHistory,
   readArchivedEvents,
   readArchivedTranscript,
+  type ArchivedApprovalGrant,
   type ArchivedCheckpoint,
   type ArchivedMeta,
 } from "./history.js";
@@ -57,6 +64,8 @@ import type {
   Tool,
   Effort,
   SharedRunBudget,
+  ExecutionBroker,
+  ExecutionBoundaryStatus,
 } from "../src/types.js";
 import type { Verdict } from "../src/verifier.js";
 
@@ -80,6 +89,12 @@ interface PendingApproval {
   toolUseId: string;
   name: string;
   input: unknown;
+  /** 规范化 JSON 的 SHA-256；常驻规则只能复用完全相同的输入 */
+  inputHash: string;
+  /** 当前宿主工具定义的授权上限；客户端不能扩大 */
+  grantPolicy: ResolvedApprovalGrantPolicy;
+  /** 工具 schema/权限/描述摘要；工具定义变化即失效 */
+  toolFingerprint?: string;
   /** 发出该请求的事件 seq —— 审批的唯一键，见 approvalId() */
   requestSeq: number;
   at: number;
@@ -91,6 +106,22 @@ interface ResolvedApproval {
   reason?: string;
   at: number;
 }
+
+type ExactInputApprovalRule = ArchivedApprovalGrant;
+
+interface ResolvedApprovalGrantPolicy {
+  maxScope: "once" | "exact-input";
+  maxTtlMs: number;
+  maxUses: number;
+}
+
+export const APPROVAL_CANONICALIZATION_VERSION = 1 as const;
+export const APPROVAL_GRANT_POLICY_VERSION = 1 as const;
+export const DEFAULT_APPROVAL_GRANT_TTL_MS = 15 * 60_000;
+export const MAX_APPROVAL_GRANT_TTL_MS = 60 * 60_000;
+export const DEFAULT_APPROVAL_GRANT_MAX_USES = 5;
+export const MAX_APPROVAL_GRANT_MAX_USES = 100;
+export const MAX_APPROVAL_GRANTS_PER_RUN = 100;
 
 /**
  * outcome 值域的唯一事实源（B1 的教训：同一枚举写两处必漂移）。
@@ -203,16 +234,21 @@ interface StoredRun {
    * 所以"停止"的准确语义是**不再往下走**，不是"当场消失"。
    */
   abort?: AbortController;
+  /** SAFE-05：逐 run 固定，绝不把全局 bashTool 变成共享可变执行域。 */
+  executionBroker?: ExecutionBroker;
+  /** 最近一次功能探测/执行边界状态，进入 run_config 与持久事件。 */
+  executionBoundaryStatus?: ExecutionBoundaryStatus;
   /**
-   * 本次对话内**常驻放行**的工具名（委托方："每次都要人手点击很麻烦"）。
+   * 当前活 run 内的精确输入放行 grant。
    *
-   * 三条边界，缺一条这个功能就从"省事"变成"把审批门拆了"：
-   *   ① **逐 run**，不跨 run、不落盘——下一次对话从零开始问；
-   *   ② **逐工具名**，不是"全部放行"——你放行的是 read_file，不等于放行 bash；
-   *   ③ 自动放行**照样进事件流**（actor: "auto-rule"），审计记录里看得出
-   *      这一次没有人真的点过。第 ③ 条最重要：省掉的是点击，不是记录。
+   * 四条边界，缺一条这个功能就从"省事"变成"把审批门拆了"：
+   *   ① **逐 run**，archive fork/new run 绝不继承 active grant；
+   *   ② 键绑定 **工具名 + 规范化输入 SHA-256**。同名 bash 换 command、写文件换
+   *      path、硬件工具换 device 都必须重新审批；仅对象 key 顺序不同可以复用；
+   *   ③ 固定 TTL + 最大使用次数，工具定义 fingerprint 改变立即失效；
+   *   ④ 自动放行**照样进事件流**（actor: "auto-rule"），且留下 grantId/hash。
    */
-  autoAllow?: Set<string>;
+  autoAllow?: Map<string, ExactInputApprovalRule>;
   /** 本次运行的装配（V-24：可逐 run 覆盖，不再是进程级常量） */
   packName?: string;
   effort?: Effort;
@@ -278,6 +314,8 @@ interface StoredRun {
   archivedOutcome?: { finalPassed: boolean | null; reworks: number | null; verdict: Verdict | null };
   /** 最近一个完整 main 段的可恢复检查点；归档本身保持只读，续跑会派生新 run。 */
   checkpoint?: ArchivedCheckpoint;
+  /** 从 checkpoint 恢复的只读授权审计；永不装进 autoAllow。 */
+  archivedApprovalGrantAudit?: ArchivedApprovalGrant[];
   /** 派生谱系。continuedFrom 是直接父级，rootRunId 是最初祖先。 */
   continuedFrom?: string;
   rootRunId?: string;
@@ -341,12 +379,70 @@ function approvalId(toolUseId: string, requestSeq: number): string {
 }
 
 /**
+ * 递归规范化 JSON：对象键逐层排序，数组顺序保持不变。
+ *
+ * 先走一次原生 JSON 序列化/解析，是为了继承 JSON 对 undefined、稀疏数组、
+ * -0 等边界的既有语义；循环引用、BigInt 等非 JSON 输入继续抛错并 fail closed。
+ * 工具输入来自模型 JSON 协议，正常路径不会包含这些非 JSON 值。
+ */
+export function canonicalizeApprovalInput(input: unknown): string {
+  const json = JSON.stringify(input);
+  if (json === undefined) throw new TypeError("Approval input must be JSON-serializable");
+  const normalized = JSON.parse(json) as unknown;
+
+  const encode = (value: unknown): string => {
+    if (value === null || typeof value !== "object") {
+      const primitive = JSON.stringify(value);
+      if (primitive === undefined) throw new TypeError("Approval input must contain JSON values only");
+      return primitive;
+    }
+    if (Array.isArray(value)) return `[${value.map(encode).join(",")}]`;
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${encode(record[key])}`)
+      .join(",")}}`;
+  };
+
+  return encode(normalized);
+}
+
+/** 审计字段只哈希输入；运行期规则键另行绑定工具名，避免同参数跨工具串权。 */
+export function approvalInputHash(input: unknown): string {
+  return `sha256:${createHash("sha256").update(canonicalizeApprovalInput(input)).digest("hex")}`;
+}
+
+/** 长度前缀避免工具名与 hash 的字符串拼接出现边界歧义。 */
+export function exactInputApprovalKey(name: string, inputHash: string): string {
+  return `${name.length}:${name}:${inputHash}`;
+}
+
+/** 工具定义变化后旧 grant 必须失效；摘要不包含 execute 函数或任何 secret。 */
+export function approvalToolFingerprint(tool: Tool): string {
+  const definition = canonicalizeApprovalInput({
+    policyVersion: APPROVAL_GRANT_POLICY_VERSION,
+    name: tool.name,
+    description: tool.description,
+    inputSchema: tool.inputSchema,
+    permission: tool.permission,
+    parallelSafe: tool.parallelSafe,
+    approvalPolicy: tool.approvalPolicy ?? { maxScope: "once" },
+  });
+  return `sha256:${createHash("sha256").update(definition).digest("hex")}`;
+}
+
+/**
  * verifier 来源判定。写成前缀/后缀两用是为并行编排预留——那里的来源形如
  * "s1/verifier"，若只比对字面量 "verifier"，子任务的 verifier 审批会被
  * 错误地挂进待办表，而它内部已自答 → 双响。
  */
 function isVerifierSource(source: string): boolean {
   return source === "verifier" || source.endsWith("/verifier");
+}
+
+/** planner/verifier 都在各自 drain 循环里自答 deny；宿主不得抢答或为其建 grant。 */
+function isInternallyResolvedApprovalSource(source: string): boolean {
+  return isVerifierSource(source) || source === "planner" || source.endsWith("/planner");
 }
 
 /** decodeURIComponent 对畸形百分号编码会抛错——路径参数是外部输入，不能让它炸掉请求 */
@@ -387,6 +483,12 @@ export interface UiServerOptions {
   history?: false | string;
   /** 历史保留数（判据③），缺省 env AGENT_RUN_HISTORY_KEEP > DEFAULT_HISTORY_KEEP */
   historyKeep?: number;
+  /** exact-input grant 的宿主级硬 TTL；工具还可声明更短上限。 */
+  approvalGrantTtlMs?: number;
+  /** exact-input grant 可自动复用的宿主级次数上限。 */
+  approvalGrantMaxUses?: number;
+  /** 仅供确定性测试；授权安全判断不得复用客户端时间。 */
+  approvalClock?: () => number;
   /**
    * 主执行者是否必须调用 finish_task。真实宿主默认开；注入 fake model 的测试默认关，
    * 需要验证该能力的测试显式传 true，避免改写数百条旧脚本的 wire 预期。
@@ -425,6 +527,15 @@ export interface UiServerOptions {
   sseHeartbeatMs?: number;
   /** 是否把任意命令执行工具装进工具面；远程宿主应由 launcher 默认关闭。 */
   enableBash?: boolean;
+  /** SAFE-05 测试/宿主注入：每个 run 必须得到独立、绑定 runId/workdir 的 broker。 */
+  executionBrokerFactory?: (runId: string, workdir: string) => ExecutionBroker;
+  /** 启动/readiness 功能探针注入；缺省由同一 factory 创建。 */
+  executionProbeBroker?: ExecutionBroker;
+  /**
+   * 独立于 modelClient 的执行策略注入口。安全语义绝不能用“是否注入模型”推断；
+   * 测试若要隔离宿主环境，应显式传 `{ AGENT_EXECUTION_ISOLATION: "off" }`。
+   */
+  executionEnv?: NodeJS.ProcessEnv;
   /** 只在宿主确实位于可信反向代理之后时读取 X-Forwarded-Proto/Host。 */
   trustProxy?: boolean;
 }
@@ -672,6 +783,51 @@ function nonNegativeInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= 0;
 }
 
+const SHA256_FIELD = /^sha256:[0-9a-f]{64}$/;
+
+/** meta/checkpoint 是外部输入；坏 grant 逐条丢弃，绝不影响普通会话恢复。 */
+function archivedApprovalGrantFromUnknown(value: unknown): ArchivedApprovalGrant | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  if (
+    raw.version !== 1 ||
+    raw.canonicalizationVersion !== APPROVAL_CANONICALIZATION_VERSION ||
+    raw.policyVersion !== APPROVAL_GRANT_POLICY_VERSION ||
+    typeof raw.grantId !== "string" || raw.grantId.length < 1 || raw.grantId.length > 128 ||
+    typeof raw.approvalId !== "string" || raw.approvalId.length < 1 || raw.approvalId.length > 512 ||
+    typeof raw.boundRunId !== "string" || raw.boundRunId.length < 1 || raw.boundRunId.length > 128 ||
+    raw.scope !== "run" ||
+    typeof raw.name !== "string" || raw.name.length < 1 || raw.name.length > 512 ||
+    raw.inputScope !== "exact-input" ||
+    typeof raw.inputHash !== "string" || !SHA256_FIELD.test(raw.inputHash) ||
+    typeof raw.toolFingerprint !== "string" || !SHA256_FIELD.test(raw.toolFingerprint) ||
+    !nonNegativeInteger(raw.issuedAt) ||
+    !nonNegativeInteger(raw.expiresAt) ||
+    raw.expiresAt <= raw.issuedAt ||
+    !nonNegativeInteger(raw.maxUses) || raw.maxUses < 1 || raw.maxUses > MAX_APPROVAL_GRANT_MAX_USES ||
+    !nonNegativeInteger(raw.usedUses) || raw.usedUses > raw.maxUses
+  ) {
+    return undefined;
+  }
+  return {
+    version: 1,
+    canonicalizationVersion: APPROVAL_CANONICALIZATION_VERSION,
+    policyVersion: APPROVAL_GRANT_POLICY_VERSION,
+    grantId: raw.grantId,
+    approvalId: raw.approvalId,
+    boundRunId: raw.boundRunId,
+    scope: "run",
+    name: raw.name,
+    inputScope: "exact-input",
+    inputHash: raw.inputHash,
+    toolFingerprint: raw.toolFingerprint,
+    issuedAt: raw.issuedAt,
+    expiresAt: raw.expiresAt,
+    maxUses: raw.maxUses,
+    usedUses: raw.usedUses,
+  };
+}
+
 /** meta.json 是可被手工修改的外部输入；恢复前不能只信 TypeScript cast。 */
 function checkpointFromUnknown(value: unknown): ArchivedCheckpoint | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
@@ -691,6 +847,12 @@ function checkpointFromUnknown(value: unknown): ArchivedCheckpoint | undefined {
   ) {
     return undefined;
   }
+  const approvalGrants = Array.isArray(raw.approvalGrants)
+    ? raw.approvalGrants
+        .slice(0, MAX_APPROVAL_GRANTS_PER_RUN)
+        .map(archivedApprovalGrantFromUnknown)
+        .filter((grant): grant is ArchivedApprovalGrant => Boolean(grant))
+    : [];
   return {
     segmentIndex: raw.segmentIndex,
     conversationTurn: raw.conversationTurn,
@@ -701,6 +863,7 @@ function checkpointFromUnknown(value: unknown): ArchivedCheckpoint | undefined {
       usedTurns: b.usedTurns,
       usedTokens: b.usedTokens,
     },
+    ...(approvalGrants.length ? { approvalGrants } : {}),
   };
 }
 
@@ -864,7 +1027,9 @@ const UPLOAD_SUBDIR = "uploads";
 const UPLOAD_MAX_BYTES = 20_000_000;
 const DEFAULT_SYSTEM_PROMPT = `You are a capable autonomous agent operating in a local working directory.
 Complete the user's task end to end using the available tools.
-Ground every claim of progress in an actual tool result.`;
+Ground every claim of progress in an actual tool result.
+
+You have a persistent memory that survives across sessions. The current memory index is provided in the <context> block of the first message. Consult relevant memories (memory_read) before starting work. When you learn a durable fact, user preference, or lesson worth reusing — a correction you received, a project constant, an approach that worked — save it with memory_write (one fact per file, first line = summary). Update or delete memories that turn out to be wrong. Do not store transient task state or things already recorded in the repository.` + RULE_PRECEDENCE_DISCIPLINE;
 
 // ------------------------------------------------------
 // Server factory
@@ -910,6 +1075,19 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   const requestBodyMaxBytes = positiveInteger(options.requestBodyMaxBytes, "requestBodyMaxBytes")
     ?? positiveIntegerEnv("AGENT_UI_REQUEST_BODY_MAX_BYTES")
     ?? 32 * 1024 * 1024;
+  const approvalGrantTtlMs = positiveInteger(options.approvalGrantTtlMs, "approvalGrantTtlMs")
+    ?? (realHost ? positiveIntegerEnv("AGENT_APPROVAL_GRANT_TTL_MS") : undefined)
+    ?? DEFAULT_APPROVAL_GRANT_TTL_MS;
+  if (approvalGrantTtlMs > MAX_APPROVAL_GRANT_TTL_MS) {
+    throw new Error(`approvalGrantTtlMs must be <= ${MAX_APPROVAL_GRANT_TTL_MS}`);
+  }
+  const approvalGrantMaxUses = positiveInteger(options.approvalGrantMaxUses, "approvalGrantMaxUses")
+    ?? (realHost ? positiveIntegerEnv("AGENT_APPROVAL_GRANT_MAX_USES") : undefined)
+    ?? DEFAULT_APPROVAL_GRANT_MAX_USES;
+  if (approvalGrantMaxUses > MAX_APPROVAL_GRANT_MAX_USES) {
+    throw new Error(`approvalGrantMaxUses must be <= ${MAX_APPROVAL_GRANT_MAX_USES}`);
+  }
+  const approvalClock = options.approvalClock ?? Date.now;
   const maxActiveRuns = positiveInteger(options.maxActiveRuns, "maxActiveRuns")
     ?? positiveIntegerEnv("AGENT_UI_MAX_ACTIVE_RUNS")
     ?? (realHost ? 4 : Number.MAX_SAFE_INTEGER);
@@ -949,7 +1127,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     ?? (realHost ? 120 : Number.MAX_SAFE_INTEGER);
   const shutdownTimeoutMs = positiveInteger(options.shutdownTimeoutMs, "shutdownTimeoutMs")
     ?? positiveIntegerEnv("AGENT_UI_SHUTDOWN_TIMEOUT_MS")
-    ?? 5_000;
+    ?? 15_000;
   const sseHeartbeatMs = positiveInteger(options.sseHeartbeatMs, "sseHeartbeatMs")
     ?? positiveIntegerEnv("AGENT_UI_SSE_HEARTBEAT_MS")
     ?? 15_000;
@@ -1002,6 +1180,110 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   // 但字符串不等——不在源头 resolve 的话，默认路径会过不了自己的白名单
   const workdir = resolve(options.workdir ?? process.cwd());
   const allowedWorkdirs = [...new Set([workdir, ...(options.workdirs ?? [])].map((d) => resolve(d)))];
+  const memoryHost = createWorkdirScopedMemoryTools(
+    (runWorkdir) => process.env.AGENT_MEMORY_DIR ?? join(runWorkdir, ".agent-memory"),
+  );
+  const memoryTools = memoryHost.tools;
+  const defaultMemoryDir = process.env.AGENT_MEMORY_DIR ?? join(workdir, ".agent-memory");
+  // modelClient 是 provider 注入口，不是“测试模式”安全开关；用它推断 off 会让
+  // 嵌入式真实 client 在 required 配置下静默退回宿主。测试隔离必须显式传 env。
+  const executionEnv: NodeJS.ProcessEnv = options.executionEnv ?? process.env;
+  const executionPolicy = parseExecutionPolicy(executionEnv);
+  const mcpEnabled = process.env.AGENT_UI_MCP === "1";
+  // 先过跨能力边界，再创建/启动任何 OCI probe。否则构造函数随后 throw 时调用方
+  // 拿不到 handle，也就没有机会 dispose 已启动的 canary。
+  if (executionPolicy.mode === "required" && mcpEnabled) {
+    throw new Error(
+      "AGENT_EXECUTION_ISOLATION=required cannot enable shared host stdio MCP; " +
+      "disable AGENT_UI_MCP or use a managed gateway",
+    );
+  }
+  const executionBrokerFactory = options.executionBrokerFactory ??
+    ((runId: string, runWorkdir: string) => createExecutionBroker({
+      boundaryId: runId,
+      workdir: runWorkdir,
+      env: executionEnv,
+    }));
+  const processProbeBroker = bashEnabled
+    ? (options.executionProbeBroker
+        ?? executionBrokerFactory("process-capability-probe", workdir))
+    : undefined;
+  let processExecutionStatus = processProbeBroker?.status()
+    ?? configuredExecutionStatus(executionEnv, "process");
+  let executionHealthy = !bashEnabled || processExecutionStatus.requestedMode !== "required";
+  // 已从 runs 表淘汰、但仍在清理的 broker 必须保留强引用；否则 cleanup
+  // 失败后既不能重试，也会让下一次 admission 错误地恢复为 healthy。
+  const detachedExecutionBrokers = new Set<ExecutionBroker>();
+  const detachedExecutionTasks = new Set<Promise<void>>();
+  function markProcessExecutionFailed(reason: string): void {
+    processExecutionStatus = {
+      ...processExecutionStatus,
+      effectiveState: "failed",
+      resolvedBackend: null,
+      probe: {
+        state: "unavailable",
+        candidate: processExecutionStatus.probe.candidate,
+        reason,
+      },
+      coverage: [],
+      filesystem: "unavailable: execution boundary is not ready",
+      network: "unavailable",
+      identity: "unavailable",
+      resources: "unavailable",
+    };
+    executionHealthy = processExecutionStatus.requestedMode !== "required";
+  }
+  function detachAndDisposeExecutionBroker(run: StoredRun): void {
+    const broker = run.executionBroker;
+    if (!broker) return;
+    // continuation 必须重新建 broker 并重新 admission；不能复用已进入 dispose 的实例。
+    delete run.executionBroker;
+    if (!broker.dispose) return;
+    detachedExecutionBrokers.add(broker);
+    const cleanup = broker.dispose().then(
+      () => { detachedExecutionBrokers.delete(broker); },
+      (err: unknown) => {
+        const detail = err instanceof Error ? err.message : String(err);
+        markProcessExecutionFailed(`Detached execution cleanup failed: ${detail}`);
+        operationalLog("error", "detached_execution_cleanup_failed", {
+          runId: run.id,
+          error: detail,
+        });
+      },
+    );
+    detachedExecutionTasks.add(cleanup);
+    void cleanup.finally(() => detachedExecutionTasks.delete(cleanup)).catch(() => {});
+  }
+  async function refreshExecutionHealth(force = false): Promise<void> {
+    if (!processProbeBroker) return;
+    try {
+      const status = await processProbeBroker.probe(force);
+        processExecutionStatus = status;
+        executionHealthy = status.requestedMode !== "required"
+          || (status.effectiveState === "partial" && status.resolvedBackend === "oci");
+        if (detachedExecutionBrokers.size > 0) {
+          markProcessExecutionFailed(
+            `Cleanup is still unconfirmed for ${detachedExecutionBrokers.size} detached execution broker(s)`,
+          );
+        }
+    } catch (err: unknown) {
+        markProcessExecutionFailed(err instanceof Error ? err.message : String(err));
+    }
+  }
+  function executionAdmissionBlockReason(): string | null {
+    // 路由入口的 process probe 与真正启动之间可能隔着慢请求体、MCP 装配等 await。
+    // 这期间别的 run 一旦进入 detached cleanup，旧的 healthy 快照就已失效。
+    // 必须在每个 per-run probe 之后，以当前集合重验；成功清理会先从集合删除，
+    // pending/failed 则都保持占位，因此这里不靠异步状态传播，也没有漏放窗口。
+    if (detachedExecutionBrokers.size > 0) {
+      return `Cleanup is still unconfirmed for ${detachedExecutionBrokers.size} detached execution broker(s)`;
+    }
+    if (!executionHealthy) {
+      return processExecutionStatus.probe.reason ?? "required isolation backend unavailable";
+    }
+    return null;
+  }
+  const executionReady: Promise<void> = refreshExecutionHealth(true);
   const pack = options.packName ? getPack(options.packName) : undefined;
   const injectedTools = options.tools;
 
@@ -1174,7 +1456,19 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       for (const a of await loadArchivedMetas(historyRoot)) {
         if (runs.has(a.meta.runId)) continue;
         const crashed = a.meta.status === "running";
-        const checkpoint = checkpointFromUnknown(a.meta.checkpoint);
+        const parsedCheckpoint = checkpointFromUnknown(a.meta.checkpoint);
+        // checkpoint 中夹入其它 run 的 grant 只能作为篡改/复制痕迹丢弃；预算与正史仍可恢复。
+        const archivedApprovalGrantAudit = parsedCheckpoint?.approvalGrants
+          ?.filter((grant) => grant.boundRunId === a.meta.runId)
+          .map((grant) => ({ ...grant })) ?? [];
+        const checkpoint = parsedCheckpoint
+          ? {
+              ...parsedCheckpoint,
+              ...(archivedApprovalGrantAudit.length
+                ? { approvalGrants: archivedApprovalGrantAudit }
+                : { approvalGrants: undefined }),
+            }
+          : undefined;
         runs.set(a.meta.runId, {
           id: a.meta.runId,
           task: a.meta.task,
@@ -1211,6 +1505,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           ...(a.meta.planDecision ? { planDecision: a.meta.planDecision } : {}),
           ...(a.meta.askUser ? { askUser: true } : {}),
           ...(checkpoint ? { checkpoint } : {}),
+          ...(archivedApprovalGrantAudit.length ? { archivedApprovalGrantAudit } : {}),
           ...(typeof a.meta.continuedFrom === "string" && a.meta.continuedFrom
             ? { continuedFrom: a.meta.continuedFrom }
             : {}),
@@ -1345,6 +1640,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     const liveCanContinue = liveStructurallyContinuable && liveBudgetBlockReason === null;
     const archiveBlockReason = r.archived ? archivedForkBlockReason(r) : null;
     const archiveCanFork = Boolean(r.archived && archiveBlockReason === null);
+    const grantCanStillBeCalled = !r.archived && (r.status === "running" || liveCanContinue);
+    const activeApprovalGrants = grantCanStillBeCalled
+      ? approvalGrantCheckpointSnapshot(r, approvalClock()).length
+      : 0;
     return {
       runId: r.id,
       task: r.task,
@@ -1358,6 +1657,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       finalPassed: r.outcome?.finalPassed ?? r.archivedOutcome?.finalPassed ?? null,
       reworks: r.outcome?.reworks ?? r.archivedOutcome?.reworks ?? null,
       pendingApprovals: r.pendingApprovals.size,
+      approvalGrants: {
+        active: activeApprovalGrants,
+        archivedAudit: r.archivedApprovalGrantAudit?.length ?? 0,
+        restorable: false,
+        ...(r.archivedApprovalGrantAudit?.length ? { inactiveReason: "archived_run" } : {}),
+      },
       // V-14 口径：需要人介入的事项由服务端持有，不取决于该 run 有没有被订阅过。
       // 计划门挂起时侧栏就该显示"需你决定"，而不是点进去才发现
       planGate: Boolean(r.planGate),
@@ -1423,6 +1728,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         detachedArchiveFlushes.add(flush);
         void flush.finally(() => detachedArchiveFlushes.delete(flush));
       }
+      detachAndDisposeExecutionBroker(oldest);
       broadcastLifecycleRemoval(oldest.id);
     }
   }
@@ -1479,7 +1785,6 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    * 常驻进程——默认连接就等于一个长期攥着调试探针的会话，正是案例 #3 里
    * 害得整块板子连不上的那种形态。要用就显式开，用完关掉宿主。
    */
-  const mcpEnabled = process.env.AGENT_UI_MCP === "1";
   const mcpConfigPath = process.env.AGENT_MCP_CONFIG ?? join(workdir, "mcp.json");
 
   /**
@@ -1546,7 +1851,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    * 里跑不同领域的任务是常态，此前只能靠重启换 AGENT_PACK。
    * 未指定时回落到进程级默认（env 装配的那套），行为与改动前一致。
    */
-  function buildConfig(run?: StoredRun): AgentConfig {
+  function buildConfig(
+    run?: StoredRun,
+    options: { bindExecutionBroker?: boolean } = {},
+  ): AgentConfig {
     const runPack = run?.packName ? getPack(run.packName) : pack;
     const runEffort = run?.effort ?? effort;
     const runWorkdir = run?.workdir ?? workdir;
@@ -1563,12 +1871,23 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
      * 宿主这边不必也不该重复实现那道闸。
      */
     const tools = run?.askUser
-      ? [...baseTools, (run.askUserTool ??= makeAskUserTool(run))]
-      : baseTools;
+      ? [...appendMemoryTools(baseTools), (run.askUserTool ??= makeAskUserTool(run))]
+      : appendMemoryTools(baseTools);
+    // plan 可在 planner 产出后换包。即使初始包（如 stm32-debug）没有 bash，
+    // 子任务仍可能选择 python/ts/stm32-coding 并引入 bash；broker 必须在首次
+    // planner 模型调用前就按 runId/workdir 固定，不能到子任务里落 legacy lane。
+    const planMayIntroduceBash = run?.mode === "plan"
+      && (injectedTools ?? enabledBuiltinPool).some((tool) => tool.name === "bash");
+    const executionBroker = options.bindExecutionBroker !== false && run && (
+      tools.some((tool) => tool.name === "bash") || planMayIntroduceBash
+    )
+      ? (run.executionBroker ??= executionBrokerFactory(run.id, runWorkdir))
+      : undefined;
     const cfg: AgentConfig = {
       systemPrompt,
       tools,
       workdir: runWorkdir,
+      ...(executionBroker ? { executionBroker } : {}),
       compat: envCompat,
       // 此前这里只设四个字段，pack 的护栏、只读根、effort 全部丢失
       ...(runEffort ? { effort: runEffort } : {}),
@@ -1591,6 +1910,149 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           ...(stagnationWindow !== undefined ? { stagnationWindow } : {}),
         })
       : cfg;
+  }
+
+  function appendMemoryTools(tools: Tool[]): Tool[] {
+    const names = new Set(tools.map((tool) => tool.name));
+    return [...tools, ...memoryTools.filter((tool) => !names.has(tool.name))];
+  }
+
+  async function buildRunConfig(
+    run?: StoredRun,
+    options: { bindExecutionBroker?: boolean } = {},
+  ): Promise<AgentConfig> {
+    const cfg = buildConfig(run, options);
+    const runWorkdir = run?.workdir ?? workdir;
+    return {
+      ...cfg,
+      dynamicContext: {
+        date: new Date().toISOString().slice(0, 10),
+        platform: process.platform,
+        shell: bashEnabled ? SHELL_DESC : "bash disabled",
+        workdir: runWorkdir,
+        ...(processExecutionStatus
+          ? {
+              execution_isolation:
+                `${processExecutionStatus.effectiveState}/${processExecutionStatus.resolvedBackend ?? "none"}/${processExecutionStatus.policyDigest}`,
+            }
+          : {}),
+        ...(readRoots.length ? { read_only_roots: readRoots.join("; ") } : {}),
+        memory_index: await memoryHost.indexBlock(runWorkdir),
+      },
+    };
+  }
+
+  function toolOrigin(name: string): "builtin" | "memory" | "mcp" {
+    if (MEMORY_TOOL_NAMES.has(name)) return "memory";
+    if (toolPool.some((builtin) => builtin.name === name)) return "builtin";
+    return "mcp";
+  }
+
+  function approvalGrantPolicyFor(
+    run: StoredRun,
+    name: string,
+    knownTool?: Tool,
+  ): { policy: ResolvedApprovalGrantPolicy; toolFingerprint?: string } {
+    const tool = knownTool ?? buildConfig(run).tools.find((candidate) => candidate.name === name);
+    const declared = tool?.approvalPolicy;
+    const declaredTtl = declared?.maxTtlMs;
+    const declaredUses = declared?.maxUses;
+    const invalidDeclaredTtl = declaredTtl !== undefined &&
+      (!Number.isInteger(declaredTtl) || declaredTtl < 1);
+    const invalidDeclaredUses = declaredUses !== undefined &&
+      (!Number.isInteger(declaredUses) || declaredUses < 1);
+    // 插件/自定义工具是运行时输入；exact-input 的任一限制值畸形时必须退回 once，
+    // 不能把 0/NaN 当成“未声明”后反而套用更宽的宿主默认值。
+    const maxScope = declared?.maxScope === "exact-input" &&
+      !invalidDeclaredTtl && !invalidDeclaredUses
+      ? "exact-input"
+      : "once";
+    const maxTtlMs = Math.min(
+      approvalGrantTtlMs,
+      Number.isInteger(declaredTtl) && (declaredTtl as number) >= 1
+        ? (declaredTtl as number)
+        : approvalGrantTtlMs,
+    );
+    const maxUses = Math.min(
+      approvalGrantMaxUses,
+      Number.isInteger(declaredUses) && (declaredUses as number) >= 1
+        ? (declaredUses as number)
+        : approvalGrantMaxUses,
+    );
+    return {
+      policy: { maxScope, maxTtlMs, maxUses },
+      ...(tool ? { toolFingerprint: approvalToolFingerprint(tool) } : {}),
+    };
+  }
+
+  function approvalGrantFailure(
+    run: StoredRun,
+    grant: ExactInputApprovalRule,
+    name: string,
+    inputHash: string,
+    toolFingerprint: string | undefined,
+    at: number,
+  ): "run_id_mismatch" | "input_mismatch" | "tool_changed" | "clock_rollback" | "ttl_expired" | "uses_exhausted" | null {
+    if (grant.boundRunId !== run.id) return "run_id_mismatch";
+    if (grant.name !== name || grant.inputHash !== inputHash) return "input_mismatch";
+    if (!toolFingerprint || grant.toolFingerprint !== toolFingerprint) return "tool_changed";
+    if (at < grant.issuedAt) return "clock_rollback";
+    if (at >= grant.expiresAt) return "ttl_expired";
+    if (grant.usedUses >= grant.maxUses) return "uses_exhausted";
+    return null;
+  }
+
+  function approvalGrantFailureEvent(
+    grant: ExactInputApprovalRule,
+    failure: Exclude<ReturnType<typeof approvalGrantFailure>, null>,
+    at: number,
+  ): Record<string, unknown> {
+    return {
+      type: failure === "ttl_expired" || failure === "clock_rollback"
+        ? "approval_grant_expired"
+        : "approval_grant_invalidated",
+      grantId: grant.grantId,
+      boundRunId: grant.boundRunId,
+      name: grant.name,
+      inputScope: grant.inputScope,
+      inputHash: grant.inputHash,
+      expiresAt: grant.expiresAt,
+      cause: failure,
+      actor: "system",
+      at,
+    };
+  }
+
+  /** 新建 grant 前清扫所有陈旧项，避免不同 input 的过期记录永久占满 run 上限。 */
+  function sweepInvalidApprovalGrants(run: StoredRun, at: number): void {
+    if (!run.autoAllow) return;
+    for (const [key, grant] of run.autoAllow) {
+      const current = approvalGrantPolicyFor(run, grant.name);
+      const failure = approvalGrantFailure(
+        run,
+        grant,
+        grant.name,
+        grant.inputHash,
+        current.toolFingerprint,
+        at,
+      );
+      if (!failure) continue;
+      run.autoAllow.delete(key);
+      pushSyntheticEvent(run, "host", approvalGrantFailureEvent(grant, failure, at));
+    }
+  }
+
+  /** 只把完整 main 段结束时仍有效、仍匹配当前工具定义的 grant 放进审计快照。 */
+  function approvalGrantCheckpointSnapshot(run: StoredRun, at: number): ArchivedApprovalGrant[] {
+    if (!run.autoAllow) return [];
+    const grants: ArchivedApprovalGrant[] = [];
+    for (const grant of run.autoAllow.values()) {
+      const current = approvalGrantPolicyFor(run, grant.name);
+      if (approvalGrantFailure(run, grant, grant.name, grant.inputHash, current.toolFingerprint, at)) continue;
+      grants.push({ ...grant });
+      if (grants.length >= MAX_APPROVAL_GRANTS_PER_RUN) break;
+    }
+    return grants;
   }
 
   /**
@@ -1797,6 +2259,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       event: serializeEvent(source, event, run.segmentIndex),
     };
     run.events.push(sseEvent);
+    // approval_request 可能同步生成 resolved/expired 等宿主事件；先暂存，确保原始
+    // request 自己先进入 durable stream，避免归档出现 seq 倒序或缺口。
+    const deferredHostEvents: Record<string, unknown>[] = [];
 
     // L6 运行台账：按角色累加工具调用。放在这里而不是收尾时回扫 run.events，
     // 是因为续跑会让事件缓冲跨越多段，回扫容易把上一段的数重复计进来。
@@ -1818,38 +2283,90 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       growTokens(source === "planner" ? "planner" : "execution", event.result.usage);
     }
 
-    // F2: verifier 的 approval_request 不进 pendingApprovals（verifier 内部已自答）
-    if (event.type === "approval_request" && !isVerifierSource(source)) {
+    // planner/verifier 的 approval_request 不进 pendingApprovals：二者在内部只读
+    // drain 中自答 deny。宿主若先答 allow 或留下 reusable grant，会打穿只读边界。
+    if (event.type === "approval_request" && !isInternallyResolvedApprovalSource(source)) {
+      const inputHash = approvalInputHash(event.input);
+      const ruleKey = exactInputApprovalKey(event.name, inputHash);
+      const current = approvalGrantPolicyFor(run, event.name);
+      Object.assign(sseEvent.event, {
+        inputHash,
+        grantPolicy: current.policy,
+      });
       /**
-       * 常驻放行：本次对话里已经对这个工具说过"以后都行"，就直接放。
-       *
-       * **仍然写一条 approval_resolved 进事件流**（actor: "auto-rule"）——
-       * 省掉的是点击，不是记录。事后回看必须看得出"这一步没有人真的点过"，
-       * 否则审计里的"已允许"就分不清是人还是规则，那比多点几下危险得多。
+       * 精确输入 grant：除 name/hash 外还绑定 runId、工具 fingerprint、绝对 TTL
+       * 与最大使用次数。任何一项失配都删除 active grant 并重新挂起。
        */
-      if (run.autoAllow?.has(event.name)) {
-        event.respond("allow");
-        pushSyntheticEvent(run, "host", {
-          type: "approval_resolved",
-          requestSeq: seq,
+      let autoApproved = false;
+      const grant = run.autoAllow?.get(ruleKey);
+      if (grant) {
+        const at = approvalClock();
+        const failure = approvalGrantFailure(
+          run,
+          grant,
+          event.name,
+          inputHash,
+          current.toolFingerprint,
+          at,
+        );
+        if (failure) {
+          run.autoAllow!.delete(ruleKey);
+          deferredHostEvents.push(approvalGrantFailureEvent(grant, failure, at));
+        } else {
+          grant.usedUses += 1;
+          const remainingUses = grant.maxUses - grant.usedUses;
+          if (remainingUses === 0) run.autoAllow!.delete(ruleKey);
+          event.respond("allow");
+          autoApproved = true;
+          deferredHostEvents.push({
+            type: "approval_resolved",
+            requestSeq: seq,
+            toolUseId: event.toolUseId,
+            name: event.name,
+            decision: "allow",
+            actor: "auto-rule",
+            scope: "run",
+            inputScope: "exact-input",
+            inputHash,
+            grantId: grant.grantId,
+            boundRunId: grant.boundRunId,
+            issuedAt: grant.issuedAt,
+            expiresAt: grant.expiresAt,
+            maxUses: grant.maxUses,
+            usedUses: grant.usedUses,
+            remainingUses,
+            at,
+          });
+          if (remainingUses === 0) {
+            deferredHostEvents.push({
+              type: "approval_grant_exhausted",
+              grantId: grant.grantId,
+              boundRunId: grant.boundRunId,
+              name: grant.name,
+              inputScope: grant.inputScope,
+              inputHash: grant.inputHash,
+              maxUses: grant.maxUses,
+              actor: "system",
+              at,
+            });
+          }
+        }
+      }
+      if (!autoApproved) {
+        run.pendingApprovals.set(approvalId(event.toolUseId, seq), {
           toolUseId: event.toolUseId,
           name: event.name,
-          decision: "allow",
-          actor: "auto-rule",
-          at: Date.now(),
+          input: event.input,
+          inputHash,
+          grantPolicy: current.policy,
+          ...(current.toolFingerprint ? { toolFingerprint: current.toolFingerprint } : {}),
+          requestSeq: seq,
+          at: sseEvent.ts,
+          respond: event.respond,
         });
-        return seq;
+        // 侧栏的"待审批"计数靠这条推送保鲜，不必再轮询
+        broadcastLifecycle("run_updated", run);
       }
-      run.pendingApprovals.set(approvalId(event.toolUseId, seq), {
-        toolUseId: event.toolUseId,
-        name: event.name,
-        input: event.input,
-        requestSeq: seq,
-        at: sseEvent.ts,
-        respond: event.respond,
-      });
-      // 侧栏的"待审批"计数靠这条推送保鲜，不必再轮询
-      broadcastLifecycle("run_updated", run);
     }
 
     // 段计数在 done 之后递增：done 自身属于刚结束的那一段
@@ -1879,6 +2396,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             contextInputTokens:
               event.result.contextInputTokens ?? fallbackContextTokens,
             runBudget: { ...event.result.runBudget },
+            ...(() => {
+              const approvalGrants = approvalGrantCheckpointSnapshot(run, approvalClock());
+              return approvalGrants.length ? { approvalGrants } : {};
+            })(),
           };
         }
       }
@@ -1888,6 +2409,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     run.archiveWriter?.appendEvent(sseEvent);
     // 推送给在线 SSE 客户端
     broadcastSSE(run, frameFor(sseEvent));
+    for (const deferred of deferredHostEvents) pushSyntheticEvent(run, "host", deferred);
     return seq;
   }
 
@@ -1939,6 +2461,29 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
     run.status = "done";
     run.finishedAt = Date.now();
+    const liveGrantCanContinue =
+      !run.verify &&
+      run.mode !== "plan" &&
+      Boolean(run.loop && run.history?.length) &&
+      !(run.checkpoint && exhaustedBudgetReason(run.checkpoint.runBudget));
+    if (!liveGrantCanContinue && run.autoAllow?.size) {
+      const at = approvalClock();
+      for (const grant of run.autoAllow.values()) {
+        pushSyntheticEvent(run, "host", {
+          type: "approval_grant_invalidated",
+          grantId: grant.grantId,
+          boundRunId: grant.boundRunId,
+          name: grant.name,
+          inputScope: grant.inputScope,
+          inputHash: grant.inputHash,
+          expiresAt: grant.expiresAt,
+          cause: "run_not_continuable",
+          actor: "system",
+          at,
+        });
+      }
+      run.autoAllow.clear();
+    }
     // 独占资源随收尾释放（release 按 holder 幂等；追问续跑会重新占用）。
     // 释放后清掉字段：留着旧数组会让它的语义从"当前持有"漂成"最后一次持有"，
     // 后续把它当持有状态读的代码会拿到假数据（评审 de6ddef）
@@ -1947,6 +2492,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       delete run.heldResources;
     }
     if (endInfo.mainStopReason) run.mainStopReason = endInfo.mainStopReason;
+    // run_end 之前即启动 worker 回收。清理失败会被全局准入门锁存；继续对话时
+    // 也只能在回收完成后创建一个全新的 per-run broker。
+    detachAndDisposeExecutionBroker(run);
     metrics.runsFinished.set(endInfo.outcome, (metrics.runsFinished.get(endInfo.outcome) ?? 0) + 1);
     if (realHost) {
       operationalLog("info", "run_finished", {
@@ -2054,8 +2602,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   /** 启动一次不带核查的运行 */
   async function startPlainRun(run: StoredRun): Promise<void> {
     await ensureMcp(); // 必须在 buildConfig 之前：工具面要么齐要么别开跑
-    pushRunConfig(run);
-    const cfg = buildConfig(run);
+    if (!(await pushRunConfig(run))) {
+      finalizeRun(run, { outcome: "error", mainStopReason: "execution_unavailable" });
+      return;
+    }
+    const cfg = await buildRunConfig(run);
     // V-28：实例留给后续对话轮复用——重建的话 ContextManager 的 lastInputTokens
     // 归零，续跑第一轮的压缩判据会失准
     const loop = new AgentLoop(cfg, modelClient);
@@ -2116,6 +2667,16 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     });
     broadcastLifecycle("run_updated", run);
 
+    // finalizeRun 已把上一段的 broker 从 run 上摘除并启动回收。续跑保留同一个
+    // AgentLoop（从而保留 ContextManager 与累计预算），但执行器必须在模型可能
+    // 发出下一条 bash tool_use 之前换成一个经过强制探针的新 broker。否则它会
+    // 继续持有已 dispose 的旧实例，既错误失败，也绕过本段的 workdir canary。
+    if (!(await pushRunConfig(run))) {
+      finalizeRun(run, { outcome: "error", mainStopReason: "execution_unavailable" });
+      return;
+    }
+    loop.setExecutionBroker(run.executionBroker);
+
     let mainStopReason: string | undefined;
     try {
       for await (const event of loop.runContinuation(history, feedback, run.abort?.signal)) {
@@ -2147,7 +2708,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    * 接收事件。新 run 只继承可序列化的会话正史、上下文水位、累计预算与任务
    * 装配选择；模型/工具/策略取当前宿主，审批放行与 ask_user 已用配额全部重置。
    */
-  async function startForkedContinuation(run: StoredRun, feedback: string): Promise<void> {
+  async function startForkedContinuation(
+    run: StoredRun,
+    feedback: string,
+    parentApprovalGrants: readonly ArchivedApprovalGrant[] = [],
+  ): Promise<void> {
     const history = run.history;
     const inheritedBudget = run.resumeBudget;
     if (!history?.length || !inheritedBudget || !run.continuedFrom) {
@@ -2175,6 +2740,23 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       reset: ["审批放行规则", "挂起交互", "ask_user 已用配额"],
       at: Date.now(),
     });
+    // run_forked 必须保持第一条 durable 事件；随后逐条说明父 grant 为什么没有
+    // 变成 child capability，最后才记录本轮 user_message。
+    for (const grant of parentApprovalGrants) {
+      pushSyntheticEvent(run, "host", {
+        type: "approval_grant_not_inherited",
+        grantId: grant.grantId,
+        boundRunId: grant.boundRunId,
+        childRunId: run.id,
+        name: grant.name,
+        inputScope: grant.inputScope,
+        inputHash: grant.inputHash,
+        expiresAt: grant.expiresAt,
+        reason: "run_id_mismatch",
+        actor: "system",
+        at: approvalClock(),
+      });
+    }
     pushSyntheticEvent(run, "host", {
       type: "user_message",
       turn: run.conversationTurn,
@@ -2184,8 +2766,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     broadcastLifecycle("run_updated", run);
 
     await ensureMcp();
-    pushRunConfig(run);
-    const loop = new AgentLoop(buildConfig(run), modelClient);
+    if (!(await pushRunConfig(run))) {
+      finalizeRun(run, { outcome: "error", mainStopReason: "execution_unavailable" });
+      return;
+    }
+    const cfg = await buildRunConfig(run);
+    const loop = new AgentLoop(cfg, modelClient);
     run.loop = loop;
 
     let mainStopReason: string | undefined;
@@ -2229,8 +2815,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    */
   async function startPlannedRun(run: StoredRun): Promise<void> {
     await ensureMcp();
-    pushRunConfig(run);
-    const baseCfg = buildConfig(run);
+    if (!(await pushRunConfig(run))) {
+      finalizeRun(run, { outcome: "error", mainStopReason: "execution_unavailable" });
+      return;
+    }
+    const baseCfg = await buildRunConfig(run);
     const startedAt = Date.now();
     let planReadyAt = startedAt;
     const concurrency = run.concurrency ?? "auto";
@@ -2285,7 +2874,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           const runRubric = run.rubric || rubric || sp?.verify.rubric;
           // 领域包只收窄业务工具；交互/完成控制面必须随执行者进入每个子任务。
           const controlTools = baseCfg.tools.filter(
-            (tool) => tool.name === ASK_USER_TOOL_NAME || tool.name === FINISH_TASK_TOOL_NAME,
+            (tool) =>
+              tool.name === ASK_USER_TOOL_NAME
+              || tool.name === FINISH_TASK_TOOL_NAME
+              || MEMORY_TOOL_NAMES.has(tool.name),
           );
           const domainTools = injectedTools ?? selectPackTools(sp, enabledBuiltinPool, mcpTools);
           return {
@@ -2416,8 +3008,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   /** 启动一次带核查的运行 */
   async function startVerifiedRun(run: StoredRun): Promise<void> {
     await ensureMcp();
-    pushRunConfig(run);
-    const cfg = buildConfig(run);
+    if (!(await pushRunConfig(run))) {
+      finalizeRun(run, { outcome: "error", mainStopReason: "execution_unavailable" });
+      return;
+    }
+    const cfg = await buildRunConfig(run);
     let mainStopReason: string | undefined;
     try {
       const outcome = await runVerified(cfg, modelClient, run.task, {
@@ -2553,9 +3148,35 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    * 若 Tools 面继续读进程默认，用户选了 python-coding 却会看到默认包的工具面与
    * 白名单——界面说谎，正是本项目最忌讳的那类错误。
    */
-  function pushRunConfig(run: StoredRun): void {
-    const runPack = run.packName ? getPack(run.packName) : pack;
-    const cfg = buildConfig(run);
+  function failedRunExecutionBoundary(
+    runId: string,
+    reason: string,
+    base: ExecutionBoundaryStatus = processExecutionStatus,
+  ): ExecutionBoundaryStatus {
+    return {
+      ...base,
+      boundaryId: runId,
+      effectiveState: "failed",
+      resolvedBackend: null,
+      probe: {
+        state: "unavailable",
+        candidate: base.probe.candidate,
+        reason,
+      },
+      coverage: [],
+      filesystem: "unavailable: execution admission failed",
+      network: "unavailable",
+      identity: "unavailable",
+      resources: "unavailable",
+    };
+  }
+
+  function pushRunConfigSnapshot(
+    run: StoredRun,
+    runPack: ReturnType<typeof getPack>,
+    cfg: AgentConfig,
+    executionBoundary: ExecutionBoundaryStatus | null,
+  ): void {
     pushSyntheticEvent(run, "host", {
       type: "run_config",
       pack: packView(runPack),
@@ -2574,6 +3195,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       plannerBudgetTurns: plannerBudgetTurns(),
       plannerBudgetSource: plannerBudgetSource(),
       workdir: cfg.workdir,
+      executionIsolation: executionBoundary,
       roleModels: {
         executor: process.env.AGENT_MODEL ?? "claude-opus-4-8",
         // 报的是本 run 实际用了什么，而不是配了什么——两者可以不同
@@ -2588,13 +3210,64 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         maxTotalTurns: cfg.maxTotalTurns ?? null,
         maxTokensBudget: cfg.maxTokensBudget ?? null,
       },
-      tools: cfg.tools.map((t) => ({
-        name: t.name,
-        permission: t.permission,
-        parallelSafe: t.parallelSafe,
-        origin: toolPool.some((b) => b.name === t.name) ? "builtin" : "mcp",
+      tools: cfg.tools.map((tool) => ({
+        name: tool.name,
+        permission: tool.permission,
+        parallelSafe: tool.parallelSafe,
+        // 已有 tool 实例时不要再 buildConfig；早拒路径必须保持 broker factory=0。
+        approvalPolicy: approvalGrantPolicyFor(run, tool.name, tool).policy,
+        origin: toolOrigin(tool.name),
       })),
     });
+  }
+
+  async function pushRunConfig(run: StoredRun): Promise<boolean> {
+    const runPack = run.packName ? getPack(run.packName) : pack;
+    // 若 cleanup 在路由预检之后、进入本启动函数之前已经挂起，连 per-run
+    // canary worker 都不应创建。这里必须早于 buildConfig：后者会按需构造 broker。
+    const preProbeBlockReason = executionAdmissionBlockReason();
+    if (preProbeBlockReason) {
+      // 早拒也必须先落 durable run_config。用不绑定 broker 的纯配置投影，避免
+      // 为了 UI/审计真值反过来创建本应被准入门挡住的 worker capability。
+      const cfg = buildConfig(run, { bindExecutionBroker: false });
+      const failedBoundary = failedRunExecutionBoundary(run.id, preProbeBlockReason);
+      run.executionBoundaryStatus = failedBoundary;
+      pushRunConfigSnapshot(run, runPack, cfg, failedBoundary);
+      pushSyntheticEvent(run, "host", {
+        type: "execution_boundary_failed",
+        boundaryId: run.id,
+        policyDigest: failedBoundary.policyDigest,
+        reason: preProbeBlockReason,
+      });
+      return false;
+    }
+    const cfg = buildConfig(run);
+    const executionBoundary = cfg.executionBroker
+      ? await cfg.executionBroker.probe(true)
+      : null;
+    if (executionBoundary) run.executionBoundaryStatus = executionBoundary;
+    // 所有会触发模型的入口（plain / verified / plan / continuation / archive fork）
+    // 都汇聚于此。canary 自己也会 await，所以完成后还要再读一次宿主 cleanup
+    // gate，封住“pre-check 通过 → probe 期间另一 run 开始清理”的第二个窗口。
+    const admissionBlockReason = executionAdmissionBlockReason();
+    const failureReason = executionBoundary?.effectiveState === "failed"
+      ? executionBoundary.probe.reason ?? "required isolation backend unavailable"
+      : admissionBlockReason;
+    const reportedBoundary = failureReason
+      ? failedRunExecutionBoundary(run.id, failureReason, executionBoundary ?? processExecutionStatus)
+      : executionBoundary;
+    if (reportedBoundary) run.executionBoundaryStatus = reportedBoundary;
+    pushRunConfigSnapshot(run, runPack, cfg, reportedBoundary);
+    if (failureReason) {
+      pushSyntheticEvent(run, "host", {
+        type: "execution_boundary_failed",
+        boundaryId: reportedBoundary?.boundaryId ?? run.id,
+        policyDigest: reportedBoundary?.policyDigest ?? processExecutionStatus.policyDigest,
+        reason: failureReason,
+      });
+      return false;
+    }
+    return true;
   }
 
   function harnessSnapshot(): Record<string, unknown> {
@@ -2608,8 +3281,14 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       effort: effort ?? null,
       effortApplies: Boolean(effort) && !envCompat,
       shell: bashEnabled ? SHELL_DESC : null,
+      executionIsolation: bashEnabled ? processExecutionStatus : null,
       workdir,
       readRoots,
+      memory: {
+        enabled: true,
+        dir: defaultMemoryDir,
+        toolCount: memoryTools.length,
+      },
       guardrails: {
         maxTurns: maxTurns ?? null,
         maxTokens: maxTokens ?? null,
@@ -2623,6 +3302,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         maxStoredRuns,
         mutationRateLimitPerMinute,
         bashEnabled,
+        approvalGrantTtlMs,
+        approvalGrantMaxUses,
       },
       compactWatermark: 0.8,
       uploadSubdir: UPLOAD_SUBDIR,
@@ -2668,7 +3349,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         name: t.name,
         permission: t.permission,
         parallelSafe: t.parallelSafe,
-        origin: toolPool.some((b) => b.name === t.name) ? "builtin" : "mcp",
+        approvalPolicy: t.approvalPolicy ?? { maxScope: "once" },
+        origin: toolOrigin(t.name),
       })),
       mcp: mcpSnapshot(),
     };
@@ -2830,6 +3512,23 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         // 公共探针不回显可能带绝对路径的底层错误。
         error: historyHealthy ? null : "history_write_failed",
       },
+      execution: {
+        enabled: bashEnabled,
+        healthy: executionHealthy,
+        // /ready 默认未认证；只报稳定枚举，不回显 runtime/socket/workdir 绝对路径。
+        status: {
+          requestedMode: processExecutionStatus.requestedMode,
+          requestedBackend: processExecutionStatus.requestedBackend,
+          effectiveState: processExecutionStatus.effectiveState,
+          resolvedBackend: processExecutionStatus.resolvedBackend,
+          probe: {
+            state: processExecutionStatus.probe.state,
+            candidate: processExecutionStatus.probe.candidate,
+            code: executionHealthy ? null : "execution_backend_unavailable",
+          },
+          coverage: [...processExecutionStatus.coverage],
+        },
+      },
     };
   }
 
@@ -2851,7 +3550,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       "# TYPE agent_harness_active_runs gauge",
       `agent_harness_active_runs ${activeRunCount()}`,
       "# TYPE agent_harness_ready gauge",
-      `agent_harness_ready ${historyHealthy && !shuttingDown ? 1 : 0}`,
+      `agent_harness_ready ${historyHealthy && executionHealthy && !shuttingDown ? 1 : 0}`,
       "# TYPE agent_harness_runs_started_total counter",
       `agent_harness_runs_started_total ${metrics.runsStarted}`,
       "# TYPE agent_harness_runs_finished_total counter",
@@ -3148,7 +3847,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     // B2：档案恢复完成前不应答 API——启动后的第一个 GET /api/runs 就要看得到
     // 历史，否则界面会先画一份空列表再闪一次（静态资源不用等）
     if (route.type !== "static" && route.type !== "health" && route.type !== "metrics") {
-      await historyReady;
+      await Promise.all([historyReady, executionReady]);
     }
 
     switch (route.type) {
@@ -3159,7 +3858,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         return json(res, 200, { status: "ok", uptimeMs: Date.now() - startedAt });
 
       case "ready": {
-        const ready = historyHealthy && !shuttingDown;
+        // readiness 是运行时事实，但端点本身未认证：走 broker 的短 TTL + 并发
+        // 去重，避免公网探针把 dockerd 放大成每请求一个 canary container。
+        if (!shuttingDown) await refreshExecutionHealth(false);
+        const ready = historyHealthy && executionHealthy && !shuttingDown;
         return json(res, ready ? 200 : 503, healthBody(ready));
       }
 
@@ -3310,6 +4012,15 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         if (!run.archived && run.status === "running") {
           return json(res, 409, { error: "运行进行中，请等它这一轮结束再追加指令" });
         }
+        // 续跑也是新的执行 segment：绕过 createRun 路由不等于绕过隔离准入。
+        await refreshExecutionHealth(true);
+        if (!executionHealthy) {
+          return json(res, 503, {
+            error:
+              `Required command isolation is unavailable: ${processExecutionStatus.probe.reason ?? "backend probe failed"}`,
+            executionIsolation: processExecutionStatus,
+          });
+        }
         // 追问/归档派生同属新的执行准入：日预算门先于并发门（拒因更具体）
         const budgetRefusal = dailyBudgetRefusal();
         if (budgetRefusal) return rejectAtDailyBudget(res, budgetRefusal);
@@ -3382,7 +4093,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
               });
             }
             broadcastLifecycle("run_created", child);
-            void startForkedContinuation(child, feedback);
+            void startForkedContinuation(child, feedback, run.archivedApprovalGrantAudit ?? []);
             return json(res, 200, {
               runId: id,
               conversationTurn: child.conversationTurn,
@@ -3625,6 +4336,15 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       }
 
       case "createRun": {
+        // 先在 admission 重新探测，daemon/image/profile 启动后失效时模型调用必须为 0。
+        await refreshExecutionHealth(true);
+        if (!executionHealthy) {
+          return json(res, 503, {
+            error:
+              `Required command isolation is unavailable: ${processExecutionStatus.probe.reason ?? "backend probe failed"}`,
+            executionIsolation: processExecutionStatus,
+          });
+        }
         let body: string;
         try {
           body = await readBody(req, requestBodyMaxBytes);
@@ -3931,17 +4651,74 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         if (parsed.decision !== "allow" && parsed.decision !== "deny") {
           return badRequest(res, 'decision must be "allow" or "deny"');
         }
+        if (parsed.scope !== undefined && parsed.scope !== "conversation") {
+          return badRequest(res, 'scope must be omitted or "conversation"');
+        }
+        // resolveApprovalRef 发生在 await readBody 之前。两个并发 POST 都可能先拿到
+        // 同一 pending 引用；在任何授权/应答副作用前原子复查，只有先恢复执行的
+        // 那一个能赢，另一个稳定返回 409。
+        if (!key || run.pendingApprovals.get(key) !== pending) {
+          return json(res, 409, { error: "Approval already decided" });
+        }
 
         /**
-         * `scope: "conversation"` = 本次对话内此后同名工具自动放行。
-         * 只对 allow 有意义——"以后都拒绝"没有用例：模型拿到 deny 会换做法，
-         * 常驻拒绝等于让它反复撞同一堵墙。
+         * API 保留 `scope: "conversation"` 兼容名称；内部授权事实明确绑定当前
+         * runId。archive continuation 是新 run，绝不继承。工具策略是最高权限，
+         * 客户端 body 不能把 once 扩大成 exact-input。
          */
-        if (parsed.decision === "allow" && parsed.scope === "conversation") {
-          (run.autoAllow ??= new Set()).add(pending.name);
+        const createsExactRule = parsed.decision === "allow" && parsed.scope === "conversation";
+        if (createsExactRule && pending.grantPolicy.maxScope !== "exact-input") {
+          return json(res, 409, {
+            error: `Tool policy for "${pending.name}" permits one-time approval only`,
+            maxScope: "once",
+          });
+        }
+        if (createsExactRule && !pending.toolFingerprint) {
+          return json(res, 409, {
+            error: `Cannot create reusable approval for unknown tool definition: ${pending.name}`,
+          });
+        }
+        const exactKey = exactInputApprovalKey(pending.name, pending.inputHash);
+        const at = approvalClock();
+        if (createsExactRule) sweepInvalidApprovalGrants(run, at);
+        const existingGrant = createsExactRule ? run.autoAllow?.get(exactKey) : undefined;
+        if (
+          createsExactRule &&
+          !existingGrant &&
+          (run.autoAllow?.size ?? 0) >= MAX_APPROVAL_GRANTS_PER_RUN
+        ) {
+          return json(res, 409, { error: "Active approval grant limit reached" });
+        }
+
+        let resolvedGrant: ExactInputApprovalRule | undefined;
+        let grantAction: "created" | "reused" | undefined;
+        if (createsExactRule) {
+          if (existingGrant) {
+            resolvedGrant = existingGrant;
+            grantAction = "reused";
+          } else {
+            resolvedGrant = {
+              version: 1,
+              canonicalizationVersion: APPROVAL_CANONICALIZATION_VERSION,
+              policyVersion: APPROVAL_GRANT_POLICY_VERSION,
+              grantId: randomUUID(),
+              approvalId: approvalId(pending.toolUseId, pending.requestSeq),
+              boundRunId: run.id,
+              scope: "run",
+              name: pending.name,
+              inputScope: "exact-input",
+              inputHash: pending.inputHash,
+              toolFingerprint: pending.toolFingerprint!,
+              issuedAt: at,
+              expiresAt: at + pending.grantPolicy.maxTtlMs,
+              maxUses: pending.grantPolicy.maxUses,
+              usedUses: 0,
+            };
+            grantAction = "created";
+            (run.autoAllow ??= new Map()).set(exactKey, resolvedGrant);
+          }
         }
         pending.respond(parsed.decision, parsed.reason);
-        const at = Date.now();
         run.respondedApprovals.set(key!, {
           decision: parsed.decision,
           ...(parsed.reason ? { reason: parsed.reason } : {}),
@@ -3961,13 +4738,39 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           decision: parsed.decision,
           ...(parsed.reason ? { reason: parsed.reason } : {}),
           actor: "user",
-          ...(parsed.scope === "conversation" ? { scope: "conversation" } : {}),
+          ...(resolvedGrant
+            ? {
+                scope: resolvedGrant.scope,
+                inputScope: resolvedGrant.inputScope,
+                inputHash: resolvedGrant.inputHash,
+                grantId: resolvedGrant.grantId,
+                boundRunId: resolvedGrant.boundRunId,
+                canonicalizationVersion: resolvedGrant.canonicalizationVersion,
+                policyVersion: resolvedGrant.policyVersion,
+                toolFingerprint: resolvedGrant.toolFingerprint,
+                issuedAt: resolvedGrant.issuedAt,
+                expiresAt: resolvedGrant.expiresAt,
+                maxUses: resolvedGrant.maxUses,
+                usedUses: resolvedGrant.usedUses,
+                remainingUses: resolvedGrant.maxUses - resolvedGrant.usedUses,
+                grantAction,
+              }
+            : {}),
           at,
         });
 
+        const exactRules = run.autoAllow ? [...run.autoAllow.values()] : [];
         return json(res, 200, {
           acknowledged: true,
-          ...(run.autoAllow?.size ? { autoAllow: [...run.autoAllow] } : {}),
+          // 旧客户端仍可读工具名数组；新客户端用 autoAllowExact 看真实匹配边界。
+          ...(exactRules.length
+            ? {
+                autoAllow: [...new Set(exactRules.map((rule) => rule.name))],
+                autoAllowExact: exactRules.map((rule) => ({
+                  ...rule,
+                })),
+              }
+            : {}),
         });
       }
 
@@ -4029,38 +4832,72 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         const flushes = [...runs.values()]
           .map((r) => r.archiveWriter?.flush())
           .filter((p): p is Promise<unknown> => Boolean(p));
+        const executionBrokers = new Set<ExecutionBroker>([
+          ...[...runs.values()].flatMap((r) => r.executionBroker ? [r.executionBroker] : []),
+          ...(processProbeBroker ? [processProbeBroker] : []),
+          ...detachedExecutionBrokers,
+        ]);
+        const executionCleanup = [...executionBrokers]
+          .map((broker) => broker.dispose?.()?.then(() => {
+            detachedExecutionBrokers.delete(broker);
+          }))
+          .filter((p): p is Promise<void> => Boolean(p));
         // MCP 子进程必须显式断开：留着就是常驻的僵尸 server，stm32 那种还攥着
         // 探针（案例 #3 的事故原型）。给落盘与断开一个有界窗口，超时后仍释放 HTTP。
         const cleanup = Promise.allSettled([
           ...flushes,
           ...detachedArchiveFlushes,
+          ...detachedExecutionTasks,
+          ...executionCleanup,
           ...(mcpRuntime ? [mcpRuntime.close()] : []),
         ]);
         let cleanupTimer: ReturnType<typeof setTimeout> | undefined;
-        await Promise.race([
-          cleanup,
-          new Promise<void>((resolveTimeout) => {
-            cleanupTimer = setTimeout(resolveTimeout, shutdownTimeoutMs);
+        const cleanupOutcome = await Promise.race([
+          cleanup.then((results) => ({ kind: "settled" as const, results })),
+          new Promise<{ kind: "timeout" }>((resolveTimeout) => {
+            cleanupTimer = setTimeout(() => resolveTimeout({ kind: "timeout" }), shutdownTimeoutMs);
           }),
         ]);
         if (cleanupTimer) clearTimeout(cleanupTimer);
+        let cleanupFailure: Error | undefined;
+        if (cleanupOutcome.kind === "timeout") {
+          cleanupFailure = new Error(`Host shutdown cleanup exceeded ${shutdownTimeoutMs}ms`);
+        } else {
+          const rejected = cleanupOutcome.results.filter(
+            (result): result is PromiseRejectedResult => result.status === "rejected",
+          );
+          if (rejected.length > 0) {
+            cleanupFailure = new Error(
+              `Host shutdown cleanup failed (${rejected.length}): ${rejected
+                .map((result) => result.reason instanceof Error ? result.reason.message : String(result.reason))
+                .join("; ")}`,
+            );
+          }
+        }
         runs.clear();
         mutationWindows.clear();
 
-        if (!server.listening) return;
-        await new Promise<void>((resolveClose, rejectClose) => {
-          const forceTimer = setTimeout(() => {
-            server.closeAllConnections();
-          }, shutdownTimeoutMs);
-          server.close((error) => {
-            clearTimeout(forceTimer);
-            if (error && (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING") {
-              rejectClose(error);
-            } else {
-              resolveClose();
-            }
+        if (server.listening) {
+          await new Promise<void>((resolveClose, rejectClose) => {
+            const forceTimer = setTimeout(() => {
+              server.closeAllConnections();
+            }, shutdownTimeoutMs);
+            server.close((error) => {
+              clearTimeout(forceTimer);
+              if (error && (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING") {
+                rejectClose(error);
+              } else {
+                resolveClose();
+              }
+            });
           });
-        });
+        }
+        if (cleanupFailure) {
+          if (realHost) operationalLog("error", "host_shutdown_cleanup_failed", {
+            error: cleanupFailure.message,
+          });
+          throw cleanupFailure;
+        }
         if (realHost) operationalLog("info", "host_shutdown_completed");
       })();
       return closePromise;

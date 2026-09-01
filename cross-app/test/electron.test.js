@@ -21,6 +21,24 @@ describe('production desktop shell', () => {
     expect(main).not.toMatch(/preload:/);
   });
 
+  it('模型设置只在独立本地窗口开放窄 IPC，远程 Harness 窗口拿不到凭据能力', () => {
+    const main = readFileSync(join(root, 'electron', 'main.cjs'), 'utf8');
+    const settingsWindow = readFileSync(join(root, 'electron', 'settings-window.cjs'), 'utf8');
+    const preload = readFileSync(join(root, 'electron', 'settings-preload.cjs'), 'utf8');
+    const page = readFileSync(join(root, 'electron', 'settings.html'), 'utf8');
+    expect(main).toContain("require('./settings-window.cjs')");
+    expect(main).toContain('const harnessWindows = new Set()');
+    expect(settingsWindow).toContain("preload: path.join(__dirname, 'settings-preload.cjs')");
+    expect(settingsWindow).toMatch(/event\.sender !== settingsWindow\.webContents/);
+    expect(settingsWindow).toMatch(/contextIsolation:\s*true/);
+    expect(settingsWindow).toMatch(/nodeIntegration:\s*false/);
+    expect(settingsWindow).toMatch(/sandbox:\s*true/);
+    expect(preload).toContain("contextBridge.exposeInMainWorld('agentSettings'");
+    expect(preload).not.toMatch(/sendSync|on\(|removeListener|ipcRenderer:\s*ipcRenderer/);
+    expect(page).toMatch(/Content-Security-Policy/);
+    expect(page).toContain("connect-src 'none'");
+  });
+
   it('一键启动接线：先探已有宿主再自拉起，退出必收进程树，attach 模式不杀别人的宿主', () => {
     const main = readFileSync(join(root, 'electron', 'main.cjs'), 'utf8');
     expect(main).toContain("require('./host-launcher.cjs')");
@@ -61,6 +79,15 @@ describe('production desktop shell', () => {
     expect(main).toContain('workspaceStore.saveWorkspaceState');
     expect(main).not.toMatch(/ipcMain|ipcRenderer/);
     expect(main).toMatch(/if \(!clean\) \{[\s\S]{0,200}?hostChild = child;/);
+    expect(main).toContain('restartQueue.then(() => performOwnedHostRestart(statusMessage))');
+  });
+
+  it('attach/外链的 loopback 判定复用严格 IP 策略，不接受 127. 前缀域名', () => {
+    const main = readFileSync(join(root, 'electron', 'main.cjs'), 'utf8');
+    const networkPolicy = readFileSync(join(root, 'electron', 'network-policy.cjs'), 'utf8');
+    expect(main).toContain("require('./network-policy.cjs')");
+    expect(main).not.toContain("host.startsWith('127.')");
+    expect(networkPolicy).toContain("isIP(host) === 4 && host.split('.')[0] === '127'");
   });
 
   it('发布脚本先做签名门禁，builder 携带自包含的生产宿主', () => {

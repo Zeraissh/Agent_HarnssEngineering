@@ -58,6 +58,11 @@ function recorder(text = "一张 1×1 的透明图。") {
 const ctx = () => ({ workdir: dir, toolUseId: "t1", signal: new AbortController().signal });
 
 describe("describe_image", () => {
+  it("审批只能单次：相同路径不能替被换过内容的新文件继续授权", () => {
+    const tool = createDescribeImageTool({ client: recorder("unused").client, modelName: "vision" });
+    expect(tool.approvalPolicy).toEqual({ maxScope: "once" });
+  });
+
   it("把图片读成 base64 图像块发给视觉模型，并把提问一并带上", async () => {
     const rec = recorder("屏幕上写着 Connection refused。");
     const tool = createDescribeImageTool({ client: rec.client, modelName: "kimi-vision" });

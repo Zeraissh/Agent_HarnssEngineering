@@ -32,7 +32,7 @@ describe("production UI launcher policy", () => {
     })).toThrow(/ALLOWED_ORIGINS/);
   });
 
-  it("远程宿主默认移除 bash；只有显式承认远程执行面才装回", () => {
+  it("远程宿主默认移除 bash；显式承认后还必须 required，report/off 不得装回", () => {
     const base = {
       AGENT_UI_HOST: "0.0.0.0",
       AGENT_UI_ACCESS_TOKEN: "x".repeat(32),
@@ -44,9 +44,14 @@ describe("production UI launcher policy", () => {
       trustProxy: true,
       enableBash: false,
     });
+    expect(() => resolveUiLaunchPolicy({
+      ...base,
+      AGENT_UI_ALLOW_REMOTE_EXECUTION: "1",
+    })).toThrow(/ISOLATION=required/);
     expect(resolveUiLaunchPolicy({
       ...base,
       AGENT_UI_ALLOW_REMOTE_EXECUTION: "1",
+      AGENT_EXECUTION_ISOLATION: "required",
     }).enableBash).toBe(true);
   });
 });

@@ -52,9 +52,26 @@
  *                       （如 4096）以掐断思考螺旋——快速失败优于无限等待
  *   AGENT_TIMEOUT_MS    可选，单请求超时毫秒数，默认 SDK 的 10 分钟
  *   AGENT_MAX_RETRIES   可选，超时/5xx 重试次数，默认 SDK 的 2
+ *   AGENT_EXECUTION_ISOLATION off|report|required；缺省 report（宿主直跑且明确未隔离）
+ *   AGENT_EXECUTION_BACKEND auto|oci|bwrap；required 当前只实现 OCI
+ *   AGENT_EXECUTION_OCI_IMAGE required+OCI 必填，必须是 digest/image-ID 固定引用
+ *   AGENT_EXECUTION_OCI_RUNTIME Linux 下管理员固定的 Docker CLI 绝对真实路径
+ *   AGENT_EXECUTION_OCI_RUNTIME_SHA256 与 runtime 成对的 64 位 SHA-256
+ *   AGENT_EXECUTION_OCI_HOST 仅允许本机绝对 unix:// socket；缺省 /var/run/docker.sock
+ *   AGENT_EXECUTION_OCI_NAMESPACE required+OCI 必填的稳定部署分区，用于 durable lease/reaper
  */
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import readline from "node:readline/promises";
+import { createExecutionBroker, parseExecutionPolicy } from "./execution-broker.js";
+import {
+  buildStaticDoctorReport,
+  CLI_VERSION,
+  CliArgumentError,
+  cliHelpText,
+  formatStaticDoctor,
+  parseCliArgs,
+} from "./cli-args.js";
 import { AgentLoop } from "./loop.js";
 import { connectMcpServers, loadMcpConfig } from "./mcp.js";
 import { createMemoryTools, MemoryStore } from "./memory.js";
@@ -76,7 +93,9 @@ import { writeFileTool } from "./tools/write-file.js";
 import { appendRunLedger, buildLedgerEntry, tallyToolCall, type ToolTally } from "./ledger.js";
 import { warnEnvConflicts } from "./env-check.js";
 import { EFFORT_LEVELS } from "./types.js";
-import type { AgentConfig, Effort, TurnEvent } from "./types.js";
+import type { AgentConfig, Effort, ExecutionBroker, TurnEvent } from "./types.js";
+
+let activeCliExecutionBroker: ExecutionBroker | undefined;
 
 const c = {
   dim: (s: string) => `\x1b[2m${s}\x1b[0m`,
@@ -95,28 +114,36 @@ Keep file outputs clean and well-structured. Respond in the language the user us
 You have a persistent memory that survives across sessions. The current memory index is provided in the <context> block of the first message. Consult relevant memories (memory_read) before starting work. When you learn a durable fact, user preference, or lesson worth reusing — a correction you received, a project constant, an approach that worked — save it with memory_write (one fact per file, first line = summary). Update or delete memories that turn out to be wrong. Do not store transient task state or things already recorded in the repository.` + RULE_PRECEDENCE_DISCIPLINE;
 
 async function main(): Promise<void> {
+  // 参数与静态 doctor 必须先于 provider/MCP/execution broker。doctor 的契约是
+  // 零网络、零模型 client、零 worker；连帮助命令也不应被 .env 冲突告警淹没。
+  const parsedArgs = parseCliArgs(process.argv.slice(2));
+  if (parsedArgs.command === "help") {
+    console.log(cliHelpText());
+    return;
+  }
+  if (parsedArgs.command === "version") {
+    console.log(CLI_VERSION);
+    return;
+  }
+  if (parsedArgs.command === "doctor") {
+    const report = buildStaticDoctorReport();
+    console.log(formatStaticDoctor(report));
+    if (!report.ok) process.exitCode = 1;
+    return;
+  }
+
   // .env 被残留环境变量压掉时大声说出来（可能意味着凭据发往另一家端点）
   warnEnvConflicts();
 
-  const args = process.argv.slice(2);
-  const autoYes = args.includes("--yes");
-  const withPlan = args.includes("--plan");
-  const withAuto = args.includes("--auto");
-  // --parallel=N：--plan 的显式并行度。缺省 "auto" = min(3, 计划层宽)——
-  // A/B 采纳（ab-report-parallel.md）：拆分率 ~50/50 下串行默认让一半 run 白付
-  // 拆分成本；线性链 auto 自动退化为串行。--parallel=1 显式退回全串行。
-  const parallelArg = args.find((a) => a === "--parallel" || a.startsWith("--parallel="));
-  const concurrency: number | "auto" =
-    parallelArg && parallelArg.includes("=")
-      ? Math.max(1, Math.floor(Number(parallelArg.split("=")[1]) || 1))
-      : "auto";
-  const task = args.filter((a) => !a.startsWith("--")).join(" ").trim();
+  const autoYes = parsedArgs.autoYes;
+  const withPlan = parsedArgs.plan;
+  const withAuto = parsedArgs.auto;
+  // 缺省 auto = min(3, 计划层宽)。解析器同时支持 --parallel=N 与
+  // --parallel N，且会消费分离值，避免把数字误拼进 task。
+  const concurrency = parsedArgs.concurrency;
+  const task = parsedArgs.task;
   if (!task) {
-    console.error('Usage: npx tsx src/cli.ts "task description" [--yes] [--verify] [--plan [--parallel=N]] [--auto]');
-    process.exit(1);
-  }
-  if (parallelArg && !withPlan) {
-    console.error("--parallel 只对 --plan 生效（并行度是子任务调度的属性）");
+    console.error('Usage: npm run agent -- run [options] "task description"（旧入口 npm run cli -- 仍兼容）');
     process.exit(1);
   }
 
@@ -152,7 +179,7 @@ async function main(): Promise<void> {
     console.log(c.dim(`pack: ${pack.name} (verify=${pack.verify.enabled}/${pack.verify.mode}) — ${pack.description}`));
   }
   // --verify 手动开启，或领域包自动开启
-  const withVerify = args.includes("--verify") || pack?.verify.enabled === true;
+  const withVerify = parsedArgs.verify || pack?.verify.enabled === true;
 
   // --verify 时可选的独立 verifier 模型（核查者应 ≥ 执行者强度）
   const verifierModelName = process.env.AGENT_VERIFIER_MODEL;
@@ -249,16 +276,20 @@ async function main(): Promise<void> {
   );
 
   // MCP 工具（可选）：./mcp.json 存在即连接，AGENT_MCP_CONFIG 覆盖路径；
-  // 领域包可整体关闭（mcp: false）或覆盖各 server 的工具白名单/审批策略
+  // 领域包可整体关闭（mcp: false）；白名单/审批策略在最终工具面
+  // 由 selectPackTools 统一解析，不再先改 server 配置。这样 CLI/Web/计划子任务同口径。
   const mcpConfig =
     pack?.mcp === false
       ? undefined
       : await loadMcpConfig(process.env.AGENT_MCP_CONFIG ?? path.join(process.cwd(), "mcp.json"));
-  if (mcpConfig && pack && typeof pack.mcp === "object") {
-    for (const server of Object.values(mcpConfig.servers)) {
-      if (pack.mcp.includeTools) server.includeTools = pack.mcp.includeTools;
-      if (pack.mcp.permission) server.permission = pack.mcp.permission;
-    }
+  const executionPolicy = parseExecutionPolicy();
+  // required 的语义是“所有任意执行面都不得落宿主”。stdio MCP 当前是宿主长驻
+  // 进程且跨 run 共享；在 managed-spawn/gateway 完成前必须先拒绝，不能连上后再说。
+  if (executionPolicy.mode === "required" && mcpConfig && Object.keys(mcpConfig.servers).length > 0) {
+    throw new Error(
+      "AGENT_EXECUTION_ISOLATION=required cannot start stdio MCP in this release; " +
+      "disable MCP or use a separately managed hardware/service gateway",
+    );
   }
   const mcp = mcpConfig ? await connectMcpServers(mcpConfig, (m) => console.warn(c.yellow(m))) : undefined;
   if (mcp) {
@@ -311,6 +342,32 @@ async function main(): Promise<void> {
     }
     throw new Error(`Pack "${pack?.name}" 声明了未知内置工具: ${n}`);
   });
+
+  // --plan 的子任务可换到任意候选 pack；即使未来 planner 基础工具面被收窄，
+  // broker 也必须在第一次 planner 调用前固定并完成 required preflight。
+  const executionBroker = (withPlan || builtins.some((tool) => tool.name === "bash"))
+    ? createExecutionBroker({
+        boundaryId: `cli-${randomUUID()}`,
+        workdir: path.resolve(process.cwd()),
+      })
+    : undefined;
+  activeCliExecutionBroker = executionBroker;
+  const executionStatus = executionBroker ? await executionBroker.probe() : undefined;
+  if (executionStatus?.effectiveState === "failed") {
+    throw new Error(
+      `Command execution unavailable under required isolation: ${executionStatus.probe.reason ?? "probe failed"}`,
+    );
+  }
+  if (executionStatus) {
+    const line =
+      `execution: ${executionStatus.effectiveState} / ${executionStatus.resolvedBackend ?? "none"} ` +
+      `(mode=${executionStatus.requestedMode}, probe=${executionStatus.probe.state})`;
+    console.log(
+      executionStatus.effectiveState === "partial"
+        ? c.cyan(line)
+        : c.yellow(`${line} — shell commands are not run-isolated`),
+    );
+  }
 
   // 思考预算档：外部输入,非法值当场报错而不是静默退回默认——
   // 静默降级会让"我明明设了 max"与实际行为长期不一致,查起来很贵
@@ -372,10 +429,7 @@ async function main(): Promise<void> {
    * `--yes`（无人值守）下即使显式开也不装：那条路径根本没有 readline，
    * 装了等于每个问题都立刻走"未应答"，白烧一轮往返。
    */
-  const askEnabled = args.includes("--ask") && !autoYes;
-  if (args.includes("--ask") && autoYes) {
-    console.log(c.yellow("提示：--ask 与 --yes 同时给出，本次不装 ask_user（无人值守没人可问）"));
-  }
+  const askEnabled = parsedArgs.ask;
   const rl = autoYes ? null : readline.createInterface({ input: process.stdin, output: process.stdout });
   // 计划并发下多个执行者可能同时触发同一个 ask_user。readline 不能并排挂多个
   // question；这里把“向人提问”串行化，执行工具本身仍可并发。
@@ -420,8 +474,13 @@ async function main(): Promise<void> {
 
   const baseConfig: AgentConfig = {
     systemPrompt: pack?.systemPrompt ?? SYSTEM_PROMPT,
-    tools: [...builtins, ...memTools, ...askUserTools, ...(mcp?.tools ?? [])],
+    tools: [
+      ...selectPackTools(pack, builtins, mcp?.tools ?? []),
+      ...memTools,
+      ...askUserTools,
+    ],
     workdir: process.cwd(),
+    ...(executionBroker ? { executionBroker } : {}),
     ...(readRoots.length ? { readRoots } : {}),
     compat,
     ...(effort ? { effort } : {}),
@@ -436,6 +495,12 @@ async function main(): Promise<void> {
       platform: process.platform,
       shell: SHELL_DESC,
       workdir: process.cwd(),
+      ...(executionStatus
+        ? {
+            execution_isolation:
+              `${executionStatus.effectiveState}/${executionStatus.resolvedBackend ?? "none"}/${executionStatus.policyDigest}`,
+          }
+        : {}),
       ...(readRoots.length ? { read_only_roots: readRoots.join("; ") } : {}),
       memory_index: await memory.indexBlock(),
     },
@@ -830,6 +895,8 @@ async function main(): Promise<void> {
   );
 
   rl?.close();
+  await executionBroker?.dispose?.();
+  activeCliExecutionBroker = undefined;
   await mcp?.close();
 
   async function renderEvent(event: TurnEvent): Promise<void> {
@@ -948,7 +1015,30 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((err) => {
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  process.once(signal, () => {
+    const cleanup = activeCliExecutionBroker?.dispose?.();
+    if (!cleanup) {
+      process.exit(signal === "SIGINT" ? 130 : 143);
+      return;
+    }
+    void cleanup.then(
+      () => process.exit(signal === "SIGINT" ? 130 : 143),
+      (err: unknown) => {
+        console.error(c.red(`Execution cleanup failed during ${signal}: ${err instanceof Error ? err.message : String(err)}`));
+        process.exit(1);
+      },
+    );
+  });
+}
+
+main().catch(async (err) => {
+  await activeCliExecutionBroker?.dispose?.().catch(() => {});
+  if (err instanceof CliArgumentError) {
+    console.error(c.red(err.message));
+    console.error(c.dim("使用 --help 查看用法。"));
+    process.exit(err.exitCode);
+  }
   console.error(c.red(err instanceof Error ? err.stack ?? err.message : String(err)));
   process.exit(1);
 });

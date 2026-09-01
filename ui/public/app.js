@@ -37,9 +37,11 @@ export { createBatcher, diffKeyed, signature, patchList, appendOnly, setText, se
  *   runId: string,
  *   task: string,
  *   status: "running"|"done",
+ *   archived: boolean,
  *   verify: boolean,
  *   timeline: TimelineEntry[],
  *   verifierTimeline: TimelineEntry[],
+ *   autoAllow: {name:string,inputHash:string|null,inputScope:"exact-input"|"legacy-tool",grantId?:string,boundRunId?:string,expiresAt?:number,maxUses?:number,usedUses?:number,status:"active"|"expired"|"invalidated"|"exhausted"|"not-inherited"|"legacy"}[],
  *   pendingApprovals: PendingApproval[],
  *   verdict: VerdictModel|null,
  *   usage: UsageModel|null,
@@ -82,7 +84,8 @@ export { createBatcher, diffKeyed, signature, patchList, appendOnly, setText, se
  *   reason?: string,
  *   decidedAt?: number,
  *   requestSeq?: number,
- *   approvalId?: string
+ *   approvalId?: string,
+ *   grantPolicy?: {maxScope:"once"|"exact-input",maxTtlMs:number,maxUses:number}
  * }} PendingApproval
  *
  * @typedef {{
@@ -123,15 +126,16 @@ export { createBatcher, diffKeyed, signature, patchList, appendOnly, setText, se
 // ---------------------------------------------------------------
 
 /** @returns {RunState} */
-export function createInitialState(runId, task, verify) {
+export function createInitialState(runId, task, verify, metadata = {}) {
   return {
     runId,
     task,
     status: "running",
     verify,
+    archived: Boolean(metadata.archived),
     timeline: [],
     verifierTimeline: [],
-    /** 本次对话内常驻放行的工具名（见 deriveAssemblyBar 的 autoAllow 那一格） */
+    /** 本次对话内精确输入放行规则（见 deriveAssemblyBar 的 autoAllow 那一格） */
     autoAllow: [],
     pendingApprovals: [],
     verdict: null,
@@ -305,15 +309,76 @@ export function reduceEvent(state, sseEvent) {
   if (type === "approval_resolved") {
     const next = applyApprovalResolved(state, event);
     /**
-     * 常驻放行规则也从这条事件里长出来（服务端在建规则那次带上 `scope`）。
-     * **不能另开一个 `if (type === "approval_resolved" && …)`**——
-     * 上面那个分支会先命中，后写的那条永远到不了。
-     * （我第一版就是这么写的，加完发现规则永远是空的。）
+     * 放行规则也从权威事件里长出来。当前事件必须带 exact-input/hash；旧档案
+     * 可能只有 scope，保留成 legacy 审计标记，但不会把它说成当前精确规则。
      */
-    if (event.scope !== "conversation") return next;
+    if (event.scope !== "run" && event.scope !== "conversation") return next;
     const name = String(event.name ?? "");
-    if (!name || next.autoAllow.includes(name)) return next;
-    return { ...next, autoAllow: [...next.autoAllow, name] };
+    if (!name) return next;
+    const exact =
+      event.scope === "run" &&
+      event.inputScope === "exact-input" &&
+      typeof event.inputHash === "string" &&
+      typeof event.grantId === "string" &&
+      event.boundRunId === state.runId &&
+      Number.isFinite(Number(event.expiresAt));
+    const rule = {
+      name,
+      inputHash: exact ? String(event.inputHash) : null,
+      inputScope: exact ? "exact-input" : "legacy-tool",
+      status: exact ? "active" : "legacy",
+      ...(exact
+        ? {
+            grantId: String(event.grantId),
+            boundRunId: String(event.boundRunId),
+            expiresAt: Number(event.expiresAt),
+            maxUses: Number(event.maxUses ?? 0),
+            usedUses: Number(event.usedUses ?? 0),
+          }
+        : {}),
+    };
+    const index = next.autoAllow.findIndex(
+      (item) =>
+        (rule.grantId && item.grantId === rule.grantId) ||
+        (!rule.grantId && item.name === rule.name && item.inputHash === rule.inputHash && item.inputScope === rule.inputScope),
+    );
+    if (index < 0) return { ...next, autoAllow: [...next.autoAllow, rule] };
+    const autoAllow = [...next.autoAllow];
+    autoAllow[index] = { ...autoAllow[index], ...rule };
+    return { ...next, autoAllow };
+  }
+  if (
+    type === "approval_grant_expired" ||
+    type === "approval_grant_invalidated" ||
+    type === "approval_grant_exhausted" ||
+    type === "approval_grant_not_inherited"
+  ) {
+    const status = type === "approval_grant_expired"
+      ? "expired"
+      : type === "approval_grant_exhausted"
+        ? "exhausted"
+        : type === "approval_grant_not_inherited"
+          ? "not-inherited"
+          : "invalidated";
+    const grantId = String(event.grantId ?? "");
+    const index = state.autoAllow.findIndex((item) => grantId && item.grantId === grantId);
+    const record = {
+      name: String(event.name ?? "unknown"),
+      inputHash: typeof event.inputHash === "string" ? String(event.inputHash) : null,
+      inputScope: event.inputScope === "exact-input" ? "exact-input" : "legacy-tool",
+      grantId: grantId || undefined,
+      boundRunId: typeof event.boundRunId === "string" ? String(event.boundRunId) : undefined,
+      expiresAt: Number.isFinite(Number(event.expiresAt)) ? Number(event.expiresAt) : undefined,
+      status,
+    };
+    const autoAllow = [...state.autoAllow];
+    if (index >= 0) autoAllow[index] = { ...autoAllow[index], ...record };
+    else autoAllow.push(record);
+    return {
+      ...state,
+      autoAllow,
+      timeline: [...state.timeline, buildTimelineEntry(seq, source, type, event)],
+    };
   }
   if (type === "approval_expired") {
     return applyApprovalExpired(state, event);
@@ -459,6 +524,7 @@ export function reduceEvent(state, sseEvent) {
       runConfig: {
         pack: event.pack ?? null,
         workdir: event.workdir ?? null,
+        executionIsolation: event.executionIsolation ?? null,
         roleModels: event.roleModels ?? null,
         effort: event.effort ?? null,
         effortApplies: Boolean(event.effortApplies),
@@ -732,6 +798,9 @@ function applyApproval(state, seq, source, event) {
         status: "pending",
         requestSeq: seq,
         approvalId: `${toolUseId}#${seq}`,
+        ...(event.grantPolicy && typeof event.grantPolicy === "object"
+          ? { grantPolicy: event.grantPolicy }
+          : {}),
       },
     ],
   };
@@ -1194,6 +1263,7 @@ export function deriveToolsFace(state, harness) {
   return {
     pack: rc?.pack ?? harness?.pack ?? null,
     shell: harness?.shell ?? null,
+    executionIsolation: rc?.executionIsolation ?? harness?.executionIsolation ?? null,
     // 逐 run 可换工作目录，Tools 面必须报本 run 真正用的那个
     workdir: rc?.workdir ?? harness?.workdir ?? null,
     roleModels: rc?.roleModels ?? null,
@@ -2681,18 +2751,32 @@ export function deriveAssemblyBar(state, harness) {
         "工具面必须与真实能力一致，这是工具运行时地板那条纪律。",
   );
 
-  /**
-   * 本次对话内的常驻放行规则。**有规则就必须显示**——
-   * 一个悄悄不再问你的审批门，和没有审批门是一回事。
-   */
+  /** 精确输入 grant 必须可见：active 与历史审计不能混成一个状态。 */
   const rules = state.autoAllow ?? [];
   if (rules.length > 0) {
+    const now = Date.now();
+    const activeRules = rules.filter(
+      (rule) =>
+        !state.archived &&
+        rule?.status === "active" &&
+        rule.inputScope === "exact-input" &&
+        rule.inputHash &&
+        Number(rule.expiresAt) > now &&
+        Number(rule.usedUses ?? 0) < Number(rule.maxUses ?? 0),
+    );
+    const historicalRules = rules.filter((rule) => !activeRules.includes(rule));
+    const labels = activeRules.map((rule) => {
+      const shortHash = String(rule.inputHash).replace(/^sha256:/, "").slice(0, 8);
+      const remaining = Math.max(0, Number(rule.maxUses ?? 0) - Number(rule.usedUses ?? 0));
+      return `${rule.name}#${shortHash}·余${remaining}`;
+    });
+    if (historicalRules.length) labels.push(`历史记录 ${historicalRules.length}`);
     push(
       "autoAllow",
-      `常驻放行 ${rules.join("·")}`,
-      "你在这次对话里对这些工具说过「以后都允许」。规则**只在本次对话内、只对这几个工具名**生效，" +
-        "不跨对话也不落盘。自动放行照样进事件流（标记为 auto-rule），" +
-        "所以事后回看分得清哪一步是人点的、哪一步是规则放的——省掉的是点击，不是记录。",
+      activeRules.length ? `精确放行 ${labels.join("·")}` : `授权审计 ${labels.join("·")}`,
+      "active grant 只在**同一 runId、同一工具定义、完全相同的参数**下生效，并受固定 TTL 与次数限制；" +
+        "command、path、device 任一参数变化都会重新询问。完整 main checkpoint 会保存审计快照，但 archive continuation " +
+        "会创建新 run，因此只显示 not-inherited，绝不恢复执行权。旧版或过期记录仅作历史审计。",
     );
   }
 
@@ -3038,8 +3122,8 @@ function patchApprovalRail(parts, state, isRunning, callbacks) {
         '<pre class="approval-input"></pre>' +
         '<div class="approval-actions" hidden>' +
         '<button class="btn btn--allow" data-action="allow">允许本次</button>' +
-        // 常驻放行只对**这个工具**、**这次对话**生效——不是"全部放行"开关
-        '<button class="btn btn--allow-always" data-action="allow-always">本次对话都允许</button>' +
+        // 规则只复用同一工具 + 完全相同参数，并受 TTL/次数/工具策略限制
+        '<button class="btn btn--allow-always" data-action="allow-always">短期允许相同参数</button>' +
         '<button class="btn btn--deny" data-action="deny">拒绝并说明</button>' +
         '<input class="deny-reason" placeholder="拒绝理由（可选）" />' +
         "</div>" +
@@ -3143,6 +3227,18 @@ function updateApprovalCard(card, a, isRunning) {
 
   // 只切显隐，不重建——输入框节点必须原地存活
   setAttr(card.querySelector(".approval-actions"), "hidden", operable ? null : "");
+  const reusable = a.grantPolicy?.maxScope === "exact-input";
+  const reusableButton = card.querySelector("[data-action='allow-always']");
+  setAttr(reusableButton, "hidden", operable && reusable ? null : "");
+  if (reusable) {
+    setAttr(
+      reusableButton,
+      "title",
+      `最多复用 ${Number(a.grantPolicy.maxUses ?? 0)} 次，最长 ${Math.round(Number(a.grantPolicy.maxTtlMs ?? 0) / 60000)} 分钟`,
+    );
+  } else {
+    setAttr(reusableButton, "title", "该工具策略只允许单次审批");
+  }
 
   const metaEl = card.querySelector(".approval-meta");
   setAttr(metaEl, "hidden", resolved && a.decidedAt ? null : "");
@@ -3689,6 +3785,18 @@ export function buildFactorCards(faces) {
   if (tools.totalErrors > 0) toolLines.push(`✗ 失败 ${tools.totalErrors} 次`);
   if (tools.denials.length > 0) toolLines.push(`⊘ 被拒 ${tools.denials.length} 次`);
   if (tools.readRoots.length > 0) toolLines.push(`只读根 ${tools.readRoots.length} 个`);
+  if (tools.executionIsolation) {
+    const state = tools.executionIsolation.effectiveState;
+    toolLines.push(
+      state === "partial"
+        ? "隔离：部分（仅 bash）"
+        : state === "report-only"
+          ? "⚠ 隔离：仅报告，宿主直跑"
+          : state === "direct"
+            ? "⚠ 隔离：关闭，宿主直跑"
+            : "✗ 隔离：required 不可用",
+    );
+  }
 
   const vLines = [verdictBadgeLabel(v.badge)];
   if (v.verdict) {
@@ -3712,7 +3820,9 @@ export function buildFactorCards(faces) {
     },
     {
       id: "tools", title: "Tools 工具", lines: toolLines,
-      abnormal: tools.totalErrors > 0 || tools.denials.length > 0,
+      abnormal:
+        tools.totalErrors > 0 || tools.denials.length > 0 ||
+        ["direct", "report-only", "failed"].includes(tools.executionIsolation?.effectiveState),
     },
     {
       id: "verify", title: "Verification 核查", lines: vLines,
@@ -3925,6 +4035,21 @@ function renderToolsTab(tools) {
     if (tools.pack.resources?.length) html += row("独占资源", tools.pack.resources.join("、"));
   }
   if (tools.shell) html += row("bash 运行时", tools.shell);
+  if (tools.executionIsolation) {
+    const e = tools.executionIsolation;
+    const label = e.effectiveState === "partial"
+      ? "部分隔离（当前只覆盖 bash，SAFE-05 尚未完成）"
+      : e.effectiveState === "report-only"
+        ? "仅能力报告；命令仍以宿主身份执行，未隔离"
+        : e.effectiveState === "direct"
+          ? "隔离关闭；命令以宿主身份执行"
+          : "required 后端不可用；命令拒绝执行";
+    html += row(
+      "Agent 命令隔离",
+      `${label} · backend ${e.resolvedBackend ?? "none"} · probe ${e.probe?.state ?? "unknown"}`,
+    );
+    html += row("隔离策略摘要", `fs: ${e.filesystem} · net: ${e.network} · identity: ${e.identity} · resources: ${e.resources}`);
+  }
   if (tools.workdir) html += row("工作目录", tools.workdir);
   if (tools.roleModels) {
     // 报的是本 run 实际用了什么模型跑哪个角色——配了但这次没启用要看得出来

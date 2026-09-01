@@ -1,3 +1,5 @@
+import { parseExecutionPolicy } from "../src/execution-broker.js";
+
 export interface UiLaunchPolicy {
   host: string;
   accessToken: string | null;
@@ -65,6 +67,20 @@ export function resolveUiLaunchPolicy(env: NodeJS.ProcessEnv = process.env): UiL
   const enableBash = remote
     ? requestedBash && env.AGENT_UI_ALLOW_REMOTE_EXECUTION === "1"
     : requestedBash;
+
+  if (remote && enableBash) {
+    const execution = parseExecutionPolicy(env);
+    if (execution.mode !== "required") {
+      throw new Error(
+        "Remote bash requires AGENT_EXECUTION_ISOLATION=required; off/report host execution is forbidden",
+      );
+    }
+    if (env.AGENT_UI_MCP === "1") {
+      throw new Error(
+        "Remote required isolation cannot enable host stdio MCP in this release; use a managed gateway",
+      );
+    }
+  }
 
   return {
     host,

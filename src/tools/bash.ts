@@ -1,7 +1,12 @@
-import { exec } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
-import type { Tool } from "../types.js";
+import {
+  configuredExecutionStatus,
+  createExecutionBroker,
+  parseExecutionPolicy,
+  sanitizeChildEnv,
+} from "../execution-broker.js";
+import type { ExecutionBroker, ShellExecutionResult, Tool } from "../types.js";
 import { truncate } from "./fs-util.js";
 
 const TIMEOUT_MS = 120_000;
@@ -63,23 +68,7 @@ const BASH_PATH_MISSING = bashPathMissing();
  * 确需透传的变量走 AGENT_BASH_KEEP_ENV（逗号分隔，名字精确匹配）：放行成为
  * 一个留在部署清单里的显式配置动作，而不是默认全给。
  */
-const SENSITIVE_ENV_NAME =
-  /SECRET|(?:^|_)(?:API_?KEY|TOKEN|PASSWORD|PASSWD|CREDENTIALS?|PRIVATE_KEY|ACCESS_KEY(?:_ID)?)$/i;
-
-export function sanitizeChildEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const keep = new Set(
-    (env["AGENT_BASH_KEEP_ENV"] ?? "")
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean),
-  );
-  const out: NodeJS.ProcessEnv = {};
-  for (const [k, v] of Object.entries(env)) {
-    if (!keep.has(k) && SENSITIVE_ENV_NAME.test(k)) continue;
-    out[k] = v;
-  }
-  return out;
-}
+export { sanitizeChildEnv } from "../execution-broker.js";
 
 /**
  * 每次执行时从**活的** process.env 合成（而非模块加载快照——快照会漏掉
@@ -94,16 +83,38 @@ function childEnv(): NodeJS.ProcessEnv {
 }
 
 /** 实际使用的 shell 描述（宿主注入 dynamicContext 用，保持与工具行为一致） */
-export const SHELL_DESC =
+const HOST_SHELL_DESC =
   process.platform !== "win32"
     ? "/bin/sh"
     : WINDOWS_BASH
       ? "bash (Git Bash)"
       : "cmd.exe — bash syntax will NOT work";
 
-export const bashTool: Tool = {
+/** required 的实际 worker 恒为 /bin/sh；report/off 才按宿主 shell 写提示。 */
+export function shellDescription(env: NodeJS.ProcessEnv = process.env): string {
+  try {
+    const policy = parseExecutionPolicy(env);
+    return policy.mode === "required"
+      ? "/bin/sh in required OCI boundary (unavailable fails closed)"
+      : `${HOST_SHELL_DESC} — host execution is ${policy.mode === "report" ? "REPORT-ONLY / UNISOLATED" : "UNISOLATED"}`;
+  } catch {
+    return "execution disabled: invalid isolation configuration";
+  }
+}
+
+export const SHELL_DESC = shellDescription();
+
+function executionHeader(status: ReturnType<typeof configuredExecutionStatus>): string {
+  return `[execution boundary=${status.boundaryId} state=${status.effectiveState} backend=${status.resolvedBackend ?? "none"} mode=${status.requestedMode} probe=${status.probe.state}]`;
+}
+
+export function createBashTool(options: {
+  /** 只供嵌入/测试覆盖 legacy 边界；Web/CLI 正常路径始终从 ToolContext 注入。 */
+  legacyBrokerFactory?: (boundaryId: string, workdir: string) => ExecutionBroker;
+} = {}): Tool {
+  return {
   name: "bash",
-  description: `Execute a shell command in the working directory (shell: ${SHELL_DESC}). Call this for anything not covered by a dedicated tool: listing/globbing files, git, running programs, etc. Commands time out after 120s; stdout and stderr are both returned.`,
+  description: `Execute a shell command in the working directory (shell: ${SHELL_DESC}). Call this for anything not covered by a dedicated tool: listing/globbing files, git, running programs, etc. Commands time out after 120s; stdout and stderr are both returned together with the effective execution-boundary state.`,
   inputSchema: {
     type: "object",
     properties: {
@@ -114,42 +125,81 @@ export const bashTool: Tool = {
   // 任意命令执行 = 最大的能力面，默认走审批门
   permission: "ask",
   parallelSafe: false,
-  execute(input, ctx) {
+  // 任意命令即使文本完全相同，也可能因外部状态变化产生不同副作用。
+  approvalPolicy: { maxScope: "once" },
+  async execute(input, ctx) {
     const { command } = input as { command: string };
     if (typeof command !== "string" || command.length === 0) {
-      return Promise.resolve({
+      return {
         content: 'Invalid input: expected {"command": string}.',
         isError: true,
-      });
+      };
     }
-    return new Promise((resolve) => {
-      exec(
+    // Web/CLI 正常路径逐 run 注入；公开 Tool.execute 的旧调用仍走一个明确标为
+    // legacy-unbound 的 broker，而不是绕过 SAFE-05 重新直调 child_process。
+    const ownsBroker = !ctx.executionBroker;
+    const legacyBoundaryId = `legacy-unbound-${process.pid}`;
+    const legacyWorkdir = path.resolve(ctx.workdir);
+    const broker = ctx.executionBroker
+      ?? options.legacyBrokerFactory?.(legacyBoundaryId, legacyWorkdir)
+      ?? createExecutionBroker({ boundaryId: legacyBoundaryId, workdir: legacyWorkdir });
+    let result: ShellExecutionResult | undefined;
+    let executionFailure: unknown;
+    try {
+      result = await broker.executeShell({
         command,
-        {
-          cwd: ctx.workdir,
-          timeout: TIMEOUT_MS,
-          maxBuffer: MAX_BUFFER,
-          signal: ctx.signal,
-          windowsHide: true,
-          ...(WINDOWS_BASH ? { shell: WINDOWS_BASH } : {}),
-          // 必须显式给 env：不传时 exec 隐式继承完整 process.env，剥密钥即失效
-          env: childEnv(),
-        },
-        (err, stdout, stderr) => {
-          const combined = [stdout, stderr].filter(Boolean).join("\n--- stderr ---\n");
-          if (err) {
-            const why = err.killed
-              ? `Command timed out after ${TIMEOUT_MS / 1000}s or was aborted.`
-              : `Command exited with ${err.code ?? "unknown code"}.`;
-            resolve({
-              content: truncate(`${why}\n${combined}` || why),
-              isError: true,
-            });
-          } else {
-            resolve({ content: truncate(combined) || "(no output)" });
-          }
-        },
-      );
-    });
+        ...(WINDOWS_BASH ? { shell: WINDOWS_BASH } : {}),
+        cwd: path.resolve(ctx.workdir),
+        // 必须显式给 env：不传时 direct exec 会隐式继承完整 process.env，剥密钥即失效。
+        // OCI backend 无条件忽略这份 env，只注入固定 HOME/PATH。
+        env: childEnv(),
+        timeoutMs: TIMEOUT_MS,
+        maxBufferBytes: MAX_BUFFER,
+        signal: ctx.signal,
+        windowsHide: true,
+        toolUseId: ctx.toolUseId,
+      });
+    } catch (err) {
+      executionFailure = err;
+    }
+    if (ownsBroker) {
+      try {
+        await broker.dispose?.();
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        return {
+          content: `Legacy execution boundary cleanup failed and could not be confirmed: ${detail}`,
+          isError: true,
+        };
+      }
+    }
+    if (!result) throw executionFailure;
+    const combined = [result.stdout, result.stderr].filter(Boolean).join("\n--- stderr ---\n");
+    const header = executionHeader(result.status);
+    const failed = Boolean(result.error)
+      || result.exitCode !== 0
+      || result.timedOut
+      || result.aborted
+      || result.outputLimitExceeded;
+    if (failed) {
+      const why = result.timedOut
+        ? `Command timed out after ${TIMEOUT_MS / 1000}s.`
+        : result.aborted
+          ? "Command was aborted by the host."
+          : result.outputLimitExceeded
+            ? `Command exceeded the ${MAX_BUFFER} byte output limit.`
+            : result.exitCode !== null
+              ? `Command exited with ${result.exitCode}.`
+              : `Command could not execute: ${result.error ?? "unknown error"}.`;
+      const cleanup = result.cleanup === "failed" ? "\nWARNING: execution cleanup could not be confirmed." : "";
+      return {
+        content: truncate(`${header}\n${why}${cleanup}${combined ? `\n${combined}` : ""}`),
+        isError: true,
+      };
+    }
+    return { content: truncate(`${header}\n${combined || "(no output)"}`) };
   },
-};
+  };
+}
+
+export const bashTool: Tool = createBashTool();

@@ -565,6 +565,56 @@ describe("v2 R1 · 段终止 ≠ run 终止 (V-01)", () => {
 });
 
 describe("v2 R1 · 审批审计 (V-02/V-03)", () => {
+  it("exact-input 规则按 name + hash 去重，同名不同 hash 分开显示", () => {
+    let state = createInitialState("a0", "exact rules", false);
+    const expiresAt = Date.now() + 60_000;
+    state = reduceEvents(state, [
+      seqSse(1, "host", "approval_resolved", {
+        name: "bash", toolUseId: "t1", requestSeq: 0, decision: "allow", actor: "user",
+        scope: "run", inputScope: "exact-input", inputHash: "sha256:aaa", grantId: "g1",
+        boundRunId: "a0", expiresAt, maxUses: 5, usedUses: 0, at: 1,
+      }),
+      seqSse(2, "host", "approval_resolved", {
+        name: "bash", toolUseId: "t2", requestSeq: 0, decision: "allow", actor: "auto-rule",
+        scope: "run", inputScope: "exact-input", inputHash: "sha256:aaa", grantId: "g1",
+        boundRunId: "a0", expiresAt, maxUses: 5, usedUses: 1, at: 2,
+      }),
+      seqSse(3, "host", "approval_resolved", {
+        name: "bash", toolUseId: "t3", requestSeq: 0, decision: "allow", actor: "user",
+        scope: "run", inputScope: "exact-input", inputHash: "sha256:bbb", grantId: "g2",
+        boundRunId: "a0", expiresAt, maxUses: 5, usedUses: 0, at: 3,
+      }),
+    ]);
+    expect(state.autoAllow).toHaveLength(2);
+    expect(state.autoAllow).toEqual(expect.arrayContaining([
+      expect.objectContaining({ grantId: "g1", inputHash: "sha256:aaa", status: "active", usedUses: 1 }),
+      expect.objectContaining({ grantId: "g2", inputHash: "sha256:bbb", status: "active", usedUses: 0 }),
+    ]));
+  });
+
+  it("grant lifecycle 重放区分 expired / not-inherited，不把历史记录当 active", () => {
+    let state = createInitialState("child", "grant lifecycle", false);
+    state = reduceEvents(state, [
+      seqSse(1, "host", "approval_resolved", {
+        name: "fetch_url", toolUseId: "t1", requestSeq: 0, decision: "allow", actor: "user",
+        scope: "run", inputScope: "exact-input", inputHash: "sha256:a", grantId: "g-active",
+        boundRunId: "child", expiresAt: Date.now() + 60_000, maxUses: 2, usedUses: 0, at: 1,
+      }),
+      seqSse(2, "host", "approval_grant_expired", {
+        grantId: "g-active", boundRunId: "child", name: "fetch_url",
+        inputScope: "exact-input", inputHash: "sha256:a", cause: "ttl_expired", at: 2,
+      }),
+      seqSse(3, "host", "approval_grant_not_inherited", {
+        grantId: "g-parent", boundRunId: "parent", childRunId: "child", name: "fetch_url",
+        inputScope: "exact-input", inputHash: "sha256:b", reason: "run_id_mismatch", at: 3,
+      }),
+    ]);
+    expect(state.autoAllow).toEqual(expect.arrayContaining([
+      expect.objectContaining({ grantId: "g-active", status: "expired" }),
+      expect.objectContaining({ grantId: "g-parent", status: "not-inherited" }),
+    ]));
+  });
+
   it("approval_resolved 按 requestSeq 落卡，含决策/理由/主体/时间", () => {
     let state = createInitialState("a1", "audit", false);
     state = reduceEvents(state, [

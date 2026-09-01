@@ -2,7 +2,7 @@
  * L2 — ToolRegistry + ToolExecutor：工具注册、确定性序列化、权限评估与并行调度。
  */
 import type Anthropic from "@anthropic-ai/sdk";
-import type { Tool, ToolResult } from "../types.js";
+import type { ExecutionBroker, Tool, ToolResult } from "../types.js";
 import { validateToolInput } from "./validate-input.js";
 
 export class ToolRegistry {
@@ -48,7 +48,18 @@ export class ToolExecutor {
     private readonly registry: ToolRegistry,
     private readonly workdir: string,
     private readonly readRoots?: string[],
+    private executionBroker?: ExecutionBroker,
   ) {}
+
+  /**
+   * A completed Web conversation segment disposes its execution boundary.  The
+   * same AgentLoop may still be reused for a follow-up so that context and the
+   * shared run budget survive; swap only the segment-scoped broker before that
+   * continuation starts.
+   */
+  setExecutionBroker(executionBroker?: ExecutionBroker): void {
+    this.executionBroker = executionBroker;
+  }
 
   /**
    * 执行一轮内的全部 tool_use 块：
@@ -150,6 +161,7 @@ export class ToolExecutor {
         ...(this.readRoots?.length ? { readRoots: this.readRoots } : {}),
         toolUseId: block.id,
         signal,
+        ...(this.executionBroker ? { executionBroker: this.executionBroker } : {}),
       });
     } catch (err) {
       // 错误进上下文，写给模型看（P5）

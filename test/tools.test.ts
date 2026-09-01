@@ -1,9 +1,9 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { ToolRegistry } from "../src/tools/registry.js";
-import { credentialLikeName, resolveInWorkdir, truncate } from "../src/tools/fs-util.js";
+import { credentialLikeName, resolveInWorkdir, resolveReadable, truncate } from "../src/tools/fs-util.js";
 import { readFileTool } from "../src/tools/read-file.js";
 import { writeFileTool } from "../src/tools/write-file.js";
 import { SHELL_DESC, bashTool, sanitizeChildEnv } from "../src/tools/bash.js";
@@ -15,6 +15,18 @@ const ctx = (toolUseId = "tu_test") => ({
   toolUseId,
   signal: new AbortController().signal,
 });
+
+async function tryDirectoryLink(target: string, link: string): Promise<boolean> {
+  try {
+    // Windows junction 不要求 Developer Mode；POSIX 的 dir symlink 走同一测试语义。
+    await symlink(target, link, process.platform === "win32" ? "junction" : "dir");
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (["EPERM", "EACCES", "ENOSYS", "ENOTSUP"].includes(code ?? "")) return false;
+    throw error;
+  }
+}
 
 beforeAll(async () => {
   workdir = await mkdtemp(path.join(tmpdir(), "harness-test-"));
@@ -43,6 +55,60 @@ describe("resolveInWorkdir", () => {
 
   it("接受工作区内的相对与嵌套路径", () => {
     expect(resolveInWorkdir(workdir, "a/b/c.txt")).toBe(path.resolve(workdir, "a/b/c.txt"));
+    expect(resolveInWorkdir(workdir, "..safe.txt")).toBe(path.resolve(workdir, "..safe.txt"));
+  });
+
+  it("不存在的合法写目标按最近存在父目录校验并放行", () => {
+    expect(resolveInWorkdir(workdir, "brand-new/deep/file.txt")).toBe(
+      path.resolve(workdir, "brand-new/deep/file.txt"),
+    );
+  });
+
+  it("拒绝经 symlink/junction 越界，包含尚不存在的深层写目标", async (testContext) => {
+    const outside = await mkdtemp(path.join(tmpdir(), "harness-outside-"));
+    const link = path.join(workdir, "escape-link");
+    await writeFile(path.join(outside, "secret.txt"), "outside", "utf8");
+    if (!(await tryDirectoryLink(outside, link))) {
+      await rm(outside, { recursive: true, force: true });
+      testContext.skip("This host cannot create a directory symlink or junction");
+      return;
+    }
+
+    try {
+      expect(() => resolveInWorkdir(workdir, "escape-link/secret.txt")).toThrow(/escapes/);
+      expect(() => resolveInWorkdir(workdir, "escape-link/missing/deep/pwned.txt")).toThrow(/escapes/);
+      expect(() => resolveReadable(workdir, undefined, "escape-link/secret.txt")).toThrow(/escapes/);
+      await expect(readFileTool.execute({ path: "escape-link/secret.txt" }, ctx())).rejects.toThrow(/escapes/);
+      await expect(
+        writeFileTool.execute({ path: "escape-link/missing/deep/pwned.txt", content: "pwned" }, ctx()),
+      ).rejects.toThrow(/escapes/);
+      await expect(readFile(path.join(outside, "missing/deep/pwned.txt"), "utf8")).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    } finally {
+      await rm(link, { force: true });
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("允许 symlink/junction 指向同一工作区内的目录", async (testContext) => {
+    const realDir = path.join(workdir, "inside-real");
+    const link = path.join(workdir, "inside-link");
+    await mkdir(realDir, { recursive: true });
+    if (!(await tryDirectoryLink(realDir, link))) {
+      testContext.skip("This host cannot create a directory symlink or junction");
+      return;
+    }
+
+    try {
+      const w = await writeFileTool.execute({ path: "inside-link/ok.txt", content: "ok" }, ctx());
+      expect(w.isError).toBeUndefined();
+      expect(await readFile(path.join(realDir, "ok.txt"), "utf8")).toBe("ok");
+      const r = await readFileTool.execute({ path: "inside-link/ok.txt" }, ctx());
+      expect(r.content).toBe("ok");
+    } finally {
+      await rm(link, { force: true });
+    }
   });
 });
 
@@ -128,6 +194,28 @@ describe("额外只读根（readRoots，案例 #5 催生）", () => {
         { ...ctx(), readRoots: [readRoot] },
       ),
     ).rejects.toThrow(/escapes/);
+  });
+
+  it("额外只读根也拒绝经 symlink/junction 读取圈外文件", async (testContext) => {
+    const outside = await mkdtemp(path.join(tmpdir(), "harness-readroot-outside-"));
+    const link = path.join(readRoot, "escape-link");
+    await writeFile(path.join(outside, "secret.txt"), "outside", "utf8");
+    if (!(await tryDirectoryLink(outside, link))) {
+      await rm(outside, { recursive: true, force: true });
+      testContext.skip("This host cannot create a directory symlink or junction");
+      return;
+    }
+
+    try {
+      const escaped = path.join(link, "secret.txt");
+      expect(() => resolveReadable(workdir, [readRoot], escaped)).toThrow(/escapes/);
+      await expect(
+        readFileTool.execute({ path: escaped }, { ...ctx(), readRoots: [readRoot] }),
+      ).rejects.toThrow(/escapes/);
+    } finally {
+      await rm(link, { force: true });
+      await rm(outside, { recursive: true, force: true });
+    }
   });
 });
 
