@@ -13,9 +13,10 @@
 - **EVAL-01[~]** — `eval/cases-heldout.ts` 24×`ho-*`；`AB_SUITE=heldout`；nightly/release 六件套已切 held-out。
   research `eval/cases.ts` **不是** held-out；本会话未为追分改 prompt。
 - **OBS-01[~]** — `src/trace.ts` + `trace.jsonl`；`GET /api/runs/:id/trace` 脱敏导出。
+- **RUN-01[~]** — ADR-003 + `src/run-state.ts` Phase 1 内核（未落盘/未接线）。
 
-**下一刀**：RUN-01 — 先写 `docs/adr/ADR-003-durable-run-state.md`，再做 phase-1 可恢复状态。
-MODEL-01b / MEM-01 本会话搁置（优先 OBS/RUN）。
+**下一刀**：把 `transitionRunState` 接到 Web `pushEvent`/plan/finalize，写 `state.json`（ADR Phase 1 清单 2–3）。
+MEM-01 / MODEL-01b 本会话搁置。
 
 以下为历史交接页（2026-08-08 收工），仍有参考价值；新开工优先看 `docs/08`。
 
