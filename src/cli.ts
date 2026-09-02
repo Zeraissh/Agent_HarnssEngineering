@@ -90,7 +90,7 @@ import { createDescribeImageTool } from "./tools/describe-image.js";
 import { fetchUrlTool } from "./tools/fetch-url.js";
 import { readFileTool } from "./tools/read-file.js";
 import { writeFileTool } from "./tools/write-file.js";
-import { appendRunLedger, buildLedgerEntry, tallyToolCall, type ToolTally } from "./ledger.js";
+import { appendRunLedger, buildLedgerEntry, ledgerErrorClass, tallyToolCall, type ToolTally } from "./ledger.js";
 import { warnEnvConflicts } from "./env-check.js";
 import { EFFORT_LEVELS } from "./types.js";
 import type { AgentConfig, Effort, ExecutionBroker, TurnEvent } from "./types.js";
@@ -583,6 +583,7 @@ async function main(): Promise<void> {
   /** 三条路径各自把收尾事实归一到这里，最后统一写一行 */
   let ledgerFacts: {
     stopReason: string | null;
+    error: string | null;
     turns: number | null;
     reworks: number | null;
     finalPassed: boolean | null;
@@ -784,6 +785,13 @@ async function main(): Promise<void> {
     // steps 为空时各聚合项自然得 0/[]，不必按分支各写一份。
     ledgerFacts = {
       stopReason: plannedStopReason(outcome),
+      error: (() => {
+        const reason = plannedStopReason(outcome);
+        if (reason !== "error") return null;
+        const failed = outcome.steps.find((st) => st.result.main.stopReason === "error");
+        if (failed?.result.main.error) return ledgerErrorClass(failed.result.main.error);
+        return ledgerErrorClass(outcome.planOutcome.failureSummary ?? "plan_failed");
+      })(),
       // 编排下 turns 取各子任务执行轮次之和：单看某一步没有意义
       turns: outcome.steps.reduce((n, st) => n + st.result.executionUsage.turns, 0),
       reworks: outcome.steps.reduce((n, st) => n + st.result.reworks, 0),
@@ -842,6 +850,12 @@ async function main(): Promise<void> {
     });
     ledgerFacts = {
       stopReason: outcome.main.stopReason,
+      error:
+        outcome.main.stopReason === "error" && outcome.main.error
+          ? ledgerErrorClass(outcome.main.error)
+          : outcome.main.stopReason === "error"
+            ? ledgerErrorClass("error")
+            : null,
       turns: outcome.executionUsage.turns,
       reworks: outcome.reworks,
       finalPassed: outcome.finalPassed,
@@ -857,6 +871,12 @@ async function main(): Promise<void> {
       if (event.type === "done") {
         ledgerFacts = {
           stopReason: event.result.stopReason,
+          error:
+            event.result.stopReason === "error" && event.result.error
+              ? ledgerErrorClass(event.result.error)
+              : event.result.stopReason === "error"
+                ? ledgerErrorClass("error")
+                : null,
           turns: event.result.usage.turns,
           reworks: null,
           finalPassed: null,
@@ -883,6 +903,7 @@ async function main(): Promise<void> {
       verify: withVerify || withPlan,
       rubric: envRubric ?? pack?.verify.rubric ?? null,
       stopReason: ledgerFacts?.stopReason ?? null,
+      error: ledgerFacts?.error ?? null,
       turns: ledgerFacts?.turns ?? null,
       reworks: ledgerFacts?.reworks ?? null,
       finalPassed: ledgerFacts?.finalPassed ?? null,

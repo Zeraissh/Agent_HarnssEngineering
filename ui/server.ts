@@ -43,7 +43,7 @@ import { fetchUrlTool } from "../src/tools/fetch-url.js";
 import { readFileTool } from "../src/tools/read-file.js";
 import { writeFileTool } from "../src/tools/write-file.js";
 import { resolveInWorkdir } from "../src/tools/fs-util.js";
-import { appendRunLedger, buildLedgerEntry, ledgerPath, tallyToolCall, type ToolTally } from "../src/ledger.js";
+import { appendRunLedger, buildLedgerEntry, ledgerErrorClass, ledgerPath, tallyToolCall, type ToolTally } from "../src/ledger.js";
 import {
   RunHistoryWriter,
   historyKeepCount,
@@ -182,6 +182,11 @@ interface RunEndInfo {
    */
   outcome: (typeof RUN_OUTCOMES)[number];
   mainStopReason?: string;
+  /**
+   * 经 ledgerErrorClass（= classifyApiError 首行）后的错误类。
+   * stopReason=error / execution_unavailable 时必填——台账靠它做失败 taxonomy。
+   */
+  error?: string | null;
 }
 
 interface StoredRun {
@@ -2572,7 +2577,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         verify: run.verify,
         rubric: run.rubric ?? null,
         stopReason: endInfo.mainStopReason ?? null,
-        error: null,
+        error:
+          endInfo.error ??
+          (endInfo.mainStopReason === "error" || endInfo.mainStopReason === "execution_unavailable"
+            ? ledgerErrorClass(endInfo.mainStopReason)
+            : null),
         turns: o?.executionUsage?.turns ?? null,
         reworks: o?.reworks ?? null,
         finalPassed: o?.finalPassed ?? null,
@@ -2603,7 +2612,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   async function startPlainRun(run: StoredRun): Promise<void> {
     await ensureMcp(); // 必须在 buildConfig 之前：工具面要么齐要么别开跑
     if (!(await pushRunConfig(run))) {
-      finalizeRun(run, { outcome: "error", mainStopReason: "execution_unavailable" });
+      finalizeRun(run, {
+        outcome: "error",
+        mainStopReason: "execution_unavailable",
+        error: ledgerErrorClass("execution_unavailable"),
+      });
       return;
     }
     const cfg = await buildRunConfig(run);
@@ -2612,9 +2625,15 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     const loop = new AgentLoop(cfg, modelClient);
     run.loop = loop;
     let mainStopReason: string | undefined;
+    let mainError: string | null = null;
     try {
       for await (const event of loop.run(run.task, run.abort?.signal)) {
-        if (event.type === "done") mainStopReason = event.result.stopReason;
+        if (event.type === "done") {
+          mainStopReason = event.result.stopReason;
+          if (event.result.stopReason === "error" && event.result.error) {
+            mainError = ledgerErrorClass(event.result.error);
+          }
+        }
         pushEvent(run, "main", event);
       }
     } catch (err) {
@@ -2629,11 +2648,13 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         },
       };
       mainStopReason = "error";
+      mainError = ledgerErrorClass(err);
       pushEvent(run, "main", errorEvent);
     } finally {
       finalizeRun(run, {
         outcome: runOutcomeForStopReason(mainStopReason),
         ...(mainStopReason ? { mainStopReason } : {}),
+        ...(mainError || mainStopReason === "error" ? { error: mainError ?? ledgerErrorClass("error") } : {}),
       });
     }
   }
@@ -2672,20 +2693,31 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     // 发出下一条 bash tool_use 之前换成一个经过强制探针的新 broker。否则它会
     // 继续持有已 dispose 的旧实例，既错误失败，也绕过本段的 workdir canary。
     if (!(await pushRunConfig(run))) {
-      finalizeRun(run, { outcome: "error", mainStopReason: "execution_unavailable" });
+      finalizeRun(run, {
+        outcome: "error",
+        mainStopReason: "execution_unavailable",
+        error: ledgerErrorClass("execution_unavailable"),
+      });
       return;
     }
     loop.setExecutionBroker(run.executionBroker);
 
     let mainStopReason: string | undefined;
+    let mainError: string | null = null;
     try {
       for await (const event of loop.runContinuation(history, feedback, run.abort?.signal)) {
-        if (event.type === "done") mainStopReason = event.result.stopReason;
+        if (event.type === "done") {
+          mainStopReason = event.result.stopReason;
+          if (event.result.stopReason === "error" && event.result.error) {
+            mainError = ledgerErrorClass(event.result.error);
+          }
+        }
         pushEvent(run, "main", event);
       }
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
       mainStopReason = "error";
+      mainError = ledgerErrorClass(err);
       pushSyntheticEvent(run, "main", {
         type: "done",
         stopReason: "error",
@@ -2697,6 +2729,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       finalizeRun(run, {
         outcome: runOutcomeForStopReason(mainStopReason),
         ...(mainStopReason ? { mainStopReason } : {}),
+        ...(mainError || mainStopReason === "error" ? { error: mainError ?? ledgerErrorClass("error") } : {}),
       });
     }
   }
@@ -2721,7 +2754,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         reason: "派生 run 缺少正史、预算或父级标识",
         at: Date.now(),
       });
-      finalizeRun(run, { outcome: "error", mainStopReason: "error" });
+      finalizeRun(run, {
+        outcome: "error",
+        mainStopReason: "error",
+        error: ledgerErrorClass("派生 run 缺少正史、预算或父级标识"),
+      });
       return;
     }
 
@@ -2767,7 +2804,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
     await ensureMcp();
     if (!(await pushRunConfig(run))) {
-      finalizeRun(run, { outcome: "error", mainStopReason: "execution_unavailable" });
+      finalizeRun(run, {
+        outcome: "error",
+        mainStopReason: "execution_unavailable",
+        error: ledgerErrorClass("execution_unavailable"),
+      });
       return;
     }
     const cfg = await buildRunConfig(run);
@@ -2775,14 +2816,21 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     run.loop = loop;
 
     let mainStopReason: string | undefined;
+    let mainError: string | null = null;
     try {
       for await (const event of loop.runContinuation(history, feedback, run.abort?.signal)) {
-        if (event.type === "done") mainStopReason = event.result.stopReason;
+        if (event.type === "done") {
+          mainStopReason = event.result.stopReason;
+          if (event.result.stopReason === "error" && event.result.error) {
+            mainError = ledgerErrorClass(event.result.error);
+          }
+        }
         pushEvent(run, "main", event);
       }
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
       mainStopReason = "error";
+      mainError = ledgerErrorClass(err);
       pushSyntheticEvent(run, "main", {
         type: "done",
         stopReason: "error",
@@ -2796,6 +2844,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       finalizeRun(run, {
         outcome: runOutcomeForStopReason(mainStopReason),
         ...(mainStopReason ? { mainStopReason } : {}),
+        ...(mainError || mainStopReason === "error" ? { error: mainError ?? ledgerErrorClass("error") } : {}),
       });
     }
   }
@@ -2816,7 +2865,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   async function startPlannedRun(run: StoredRun): Promise<void> {
     await ensureMcp();
     if (!(await pushRunConfig(run))) {
-      finalizeRun(run, { outcome: "error", mainStopReason: "execution_unavailable" });
+      finalizeRun(run, {
+        outcome: "error",
+        mainStopReason: "execution_unavailable",
+        error: ledgerErrorClass("execution_unavailable"),
+      });
       return;
     }
     const baseCfg = await buildRunConfig(run);
@@ -2825,6 +2878,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     const concurrency = run.concurrency ?? "auto";
     let effectiveConcurrency = typeof concurrency === "number" ? concurrency : 1;
     let mainStopReason: string | undefined;
+    let mainError: string | null = null;
 
     try {
       const usePlanner = run.usePlannerModel ?? true;
@@ -2930,6 +2984,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       const stepSum = outcome.steps.reduce((n, st) => n + st.durationMs, 0);
       const subtaskWall = finishedAt - planReadyAt;
       mainStopReason = plannedStopReason(outcome);
+      if (mainStopReason === "error") {
+        const failed = outcome.steps.find((st) => st.result.main.stopReason === "error");
+        mainError = failed?.result.main.error
+          ? ledgerErrorClass(failed.result.main.error)
+          : ledgerErrorClass(outcome.planOutcome.failureSummary ?? "plan_failed");
+      }
 
       // 并行收益的口径必须写清：子任务阶段墙钟排除 planner，"节省"是相对
       // 串行全序和而言的。不标口径的数字等于没有数字。
@@ -2986,6 +3046,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       // plan_gate_expired 分档从未触发过；分流的理由见 planGateStopReason。
       mainStopReason =
         err instanceof PlanRejectedError ? planGateStopReason(err.cause_) : "error";
+      if (mainStopReason === "error") mainError = ledgerErrorClass(err);
       pushSyntheticEvent(run, "main", {
         type: "done",
         stopReason: mainStopReason,
@@ -3001,6 +3062,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         // 门未应答归 closed、明确否决归 rejected；与其它 stopReason 共用唯一映射。
         outcome: runOutcomeForStopReason(mainStopReason),
         ...(mainStopReason ? { mainStopReason } : {}),
+        ...(mainError || mainStopReason === "error" ? { error: mainError ?? ledgerErrorClass("error") } : {}),
       });
     }
   }
@@ -3009,11 +3071,16 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   async function startVerifiedRun(run: StoredRun): Promise<void> {
     await ensureMcp();
     if (!(await pushRunConfig(run))) {
-      finalizeRun(run, { outcome: "error", mainStopReason: "execution_unavailable" });
+      finalizeRun(run, {
+        outcome: "error",
+        mainStopReason: "execution_unavailable",
+        error: ledgerErrorClass("execution_unavailable"),
+      });
       return;
     }
     const cfg = await buildRunConfig(run);
     let mainStopReason: string | undefined;
+    let mainError: string | null = null;
     try {
       const outcome = await runVerified(cfg, modelClient, run.task, {
         ...buildVerifyOptions(run),
@@ -3021,7 +3088,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         onEvent: (source, event) => {
           // 只记主/返工段的终止原因：verifier 的 done 已被 orchestrate 压掉，
           // 这里取到的最后一个就是最终交付那一段的
-          if (event.type === "done") mainStopReason = event.result.stopReason;
+          if (event.type === "done") {
+            mainStopReason = event.result.stopReason;
+            if (event.result.stopReason === "error" && event.result.error) {
+              mainError = ledgerErrorClass(event.result.error);
+            }
+          }
           pushEvent(run, source, event);
         },
         // V-08：逐轮裁决实时透出。只发末轮的话，"为什么要返工"（中间轮的 issues）
@@ -3046,9 +3118,14 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       if (lastVerdict) {
         pushSyntheticEvent(run, "verifier", { type: "verdict", verdict: lastVerdict });
       }
+      if (!mainStopReason) mainStopReason = outcome.main.stopReason;
+      if (mainStopReason === "error" && !mainError && outcome.main.error) {
+        mainError = ledgerErrorClass(outcome.main.error);
+      }
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
       mainStopReason = "error";
+      mainError = ledgerErrorClass(err);
       pushSyntheticEvent(run, "main", {
         type: "done",
         stopReason: "error",
@@ -3060,6 +3137,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       finalizeRun(run, {
         outcome: runOutcomeForStopReason(mainStopReason),
         ...(mainStopReason ? { mainStopReason } : {}),
+        ...(mainError || mainStopReason === "error" ? { error: mainError ?? ledgerErrorClass("error") } : {}),
       });
     }
   }

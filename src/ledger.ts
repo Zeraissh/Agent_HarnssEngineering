@@ -26,9 +26,22 @@
  */
 import { appendFile } from "node:fs/promises";
 import path from "node:path";
+import { classifyApiError } from "./model-client.js";
 
 /** 裁决是怎么拿到的（与 verifier.ts 的 VerdictRecovery 同源） */
 export type LedgerRecovery = "tool" | "direct" | "reformat" | "wrapup" | "failed";
+
+/**
+ * 台账用的错误类：经 classifyApiError 后取首行并截断。
+ * stopReason=error 时宿主必须把这个字段写进台账——否则失败 taxonomy 算不出来
+ * （2026-09-02 台账里 12 次 error 全是 null，正是 ui/server 硬编码造成的）。
+ */
+export function ledgerErrorClass(err: unknown): string {
+  return classifyApiError(err).slice(0, 200).split("\n")[0]!;
+}
+
+/** error 终止却没带分类时的哨兵——buildLedgerEntry fail-closed，避免再写回 null */
+export const LEDGER_UNCLASSIFIED_ERROR = "unclassified_error";
 
 export interface LedgerVerification {
   round: number;
@@ -130,7 +143,12 @@ export function buildLedgerEntry(input: LedgerInput): RunLedgerEntry {
     // rubric 只记"有没有"：内容可能很长，且它是不是空串才是判据
     rubric: Boolean(input.rubric && String(input.rubric).trim()),
     stopReason: input.stopReason ?? null,
-    error: input.error ? String(input.error).slice(0, 200).split("\n")[0]! : null,
+    error: (() => {
+      const line = input.error ? String(input.error).slice(0, 200).split("\n")[0]! : null;
+      // error 终止必须带分类：宿主漏传时写哨兵，不许再落 null（taxonomy 前置）
+      if (!line && input.stopReason === "error") return LEDGER_UNCLASSIFIED_ERROR;
+      return line;
+    })(),
     turns: input.turns ?? null,
     reworks: input.reworks ?? null,
     finalPassed: input.finalPassed ?? null,

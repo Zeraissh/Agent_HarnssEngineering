@@ -7,9 +7,9 @@
 单操作员形态；GOV-* 与 SAFE-05 Phase 2B **本波不做**。
 每项独立 commit + push，等 CI 绿再开下一项。
 
-**已落地**：TEST-01a — `npm run test:coverage`（棘轮 lines/statements≥75、
-branches≥78、functions≥88）+ `npm run test:mutation-smoke`（8 个关键变异必须变红）；
-CI `core` 已接并上传 coverage artifact。
+**已落地**：
+- TEST-01a — `npm run test:coverage` + `npm run test:mutation-smoke`（8/8 killed）；CI artifact。
+- EVAL-02 前置 — 台账 `error` 不再硬编码 null（`ledgerErrorClass` + 哨兵锁）。
 
 以下为历史交接页（2026-08-08 收工），仍有参考价值；新开工优先看 `docs/08`。
 

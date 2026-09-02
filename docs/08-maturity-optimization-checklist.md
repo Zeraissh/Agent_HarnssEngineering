@@ -77,7 +77,7 @@ OCI 逃逸 canary 由 Linux CI container job 承担（run #33461119575 全绿）
 | 状态 | ID | 优化项 | I/R/E | 优先分 | 完成定义 |
 |---|---|---|---:|---:|---|
 | [ ] | EVAL-01 | Held-out 真实任务集 | 5/5/4 | 20 | 建立 20–50 个不参与提示/实现调优的任务，覆盖编辑、调试、澄清、权限、恢复、MCP、多文件与失败场景 |
-| [ ] | EVAL-02 | 统计与失败分类 | 5/4/3 | 27 | 每模型/配置至少重复 3–5 次；输出 pass@1、首轮成功率、修复率、置信区间、token、成本、延迟和稳定失败 taxonomy |
+| [~] | EVAL-02 | 统计与失败分类 | 5/4/3 | 27 | 每模型/配置至少重复 3–5 次；输出 pass@1、首轮成功率、修复率、置信区间、token、成本、延迟和稳定失败 taxonomy |
 | [ ] | EVAL-03 | CI/nightly/release 门 | 5/5/4 | 20 | PR 跑确定性小集；nightly 跑真实 provider 矩阵；release 对质量/成本/延迟设置退化阈值并保存报告 |
 | [~] | TEST-01 | Coverage 与 mutation | 4/4/3 | 24 | changed-line coverage、关键状态机 branch 阈值及 mutation score 纳入 CI；证明关键验收测试会在实现被破坏时变红 |
 | [ ] | E2E-01 | Web/桌面/容器真实 E2E | 5/5/4 | 20 | Playwright Web、已打包 Electron 启动/升级/卸载、容器 health+canary 自动化；覆盖流式断线、审批和崩溃恢复 |
@@ -88,6 +88,7 @@ OCI 逃逸 canary 由 Linux CI container job 承担（run #33461119575 全绿）
 | ID | 已取得证据 | 残余边界 |
 |---|---|---|
 | TEST-01a | 装 `@vitest/coverage-v8`；`vitest.config.ts` include `src/**`+`ui/*.ts`，reporters text-summary/lcov/json-summary。2026-09-02 本机基线 statements/lines **77.68%**、branches **81.2%**、functions **91.54%**；棘轮阈值 lines/statements **75**、branches **78**、functions **88**（实测下方约 2–3pt）。`scripts/mutation-smoke.mjs` 固定 8 个关键变异（瞬时判定恒假/恒真、审批门绕过、tool_choice none 映射丢、verdict fail-open、verifier 只读放行、台账空成功、credentialLike 恒假），每个必须把对应测试文件打红。CI `core` 改跑 `test:coverage` + `test:mutation-smoke` 并上传 `coverage/` artifact | 尚非 changed-line coverage、无 Stryker 全量 mutation score；OCI 用例在 Windows 本机 skipped，Linux CI 才计入分支覆盖。第二波再扩变异清单与差分覆盖 |
+| EVAL-02 前置 | 修台账 `error` 硬编码 null：`ledgerErrorClass`（classifyApiError 首行）+ Web/CLI 全路径写入；`buildLedgerEntry` 对 `stopReason=error` 漏传 fail-closed 为 `unclassified_error`。锁：源码不再 `error: null`、哨兵变异验证 | 统计引擎（Wilson/pass@k/taxonomy）尚未落地；历史台账里已写入的 null 不回改 |
 
 ## Phase 2：可恢复、可重放、可运营
 
