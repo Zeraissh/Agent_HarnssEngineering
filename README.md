@@ -92,6 +92,11 @@ npm run eval:compare-baseline                                     # nightly 基�
 Nightly（`.github/workflows/nightly.yml`）跑真实 provider 小子集（6 用例 × baseline × 1），
 凭据来自 `ANTHROPIC_API_KEY` secret 与 `ANTHROPIC_BASE_URL`/`AGENT_MODEL` variables；
 `AB_TOKEN_CAP` 触顶即停（exit 2），再与 `eval/baselines/nightly.json` 比对通过率/成本/延迟。
+阈值经首夜 6/6 证据收紧（`minPassRate=1`、`maxTotalTokens=150k`、`maxTotalWallMs=300s`）。
+
+Release tag 门（`.github/workflows/release.yml` `gate`）在确定性场景门之后，**在打标签的提交上重跑**
+同一真实子集，对照 `eval/baselines/release.json`（不得比 nightly 更松），报告落 artifact
+`release-quality-eval`。缺少 secret/vars 时 fail-closed，不静默跳过。
 
 真实 CLI/Web 宿主默认要求 `finish_task` 结构化收尾，`end_turn` 不再直接等于完成。
 长任务可用以下总账与恢复参数（PowerShell）：

@@ -122,3 +122,71 @@ describe("cellsFromAbLog + summarizeCells", () => {
     expect(s.completedCells).toBe(2);
   });
 });
+
+describe("checked-in baselines (EVAL-03c)", () => {
+  it("nightly and release share the same case×arm matrix", async () => {
+    const { readFile } = await import("node:fs/promises");
+    const { resolve } = await import("node:path");
+    const nightly = JSON.parse(
+      await readFile(resolve("eval/baselines/nightly.json"), "utf8"),
+    ) as NightlyBaseline;
+    const release = JSON.parse(
+      await readFile(resolve("eval/baselines/release.json"), "utf8"),
+    ) as NightlyBaseline;
+    expect(nightly.version).toBe(1);
+    expect(release.version).toBe(1);
+    expect(release.cases).toEqual(nightly.cases);
+    expect(release.arms).toEqual(nightly.arms);
+    // Release must not be looser than nightly on quality/cost/latency.
+    expect(release.minPassRate).toBeGreaterThanOrEqual(nightly.minPassRate);
+    expect(release.maxTotalTokens ?? Infinity).toBeLessThanOrEqual(
+      nightly.maxTotalTokens ?? Infinity,
+    );
+    expect(release.maxTotalWallMs ?? Infinity).toBeLessThanOrEqual(
+      nightly.maxTotalWallMs ?? Infinity,
+    );
+    // Evidence-backed floors after nightly #33646201722 (6/6 @ 52k / 28s).
+    expect(nightly.minPassRate).toBe(1);
+    expect(nightly.maxTotalTokens).toBe(150_000);
+    expect(nightly.maxTotalWallMs).toBe(300_000);
+    for (const id of nightly.cases) {
+      expect(nightly.caseMinPassRate?.[id]).toBe(1);
+      expect(release.caseMinPassRate?.[id]).toBe(1);
+    }
+  });
+
+  it("post-evidence floors reject the pre-tighten ceilings", () => {
+    const floors: NightlyBaseline = {
+      version: 1,
+      cases: ["write-basic", "sum-numbers", "read-extract", "bash-count", "json-field", "filter-lines"],
+      arms: ["baseline"],
+      minPassRate: 1,
+      maxTotalTokens: 150_000,
+      maxTotalWallMs: 300_000,
+    };
+    // Old loose ceilings (0.8 / 400k / 30min) would have passed a 5/6 + 200k run;
+    // new floors must fail both miss and token blow-up.
+    const almost = [
+      cell("write-basic", "baseline", 1, 1, 20_000, 5_000),
+      cell("sum-numbers", "baseline", 1, 1, 20_000, 5_000),
+      cell("read-extract", "baseline", 1, 1, 20_000, 5_000),
+      cell("bash-count", "baseline", 1, 1, 20_000, 5_000),
+      cell("json-field", "baseline", 1, 1, 20_000, 5_000),
+      cell("filter-lines", "baseline", 0, 1, 20_000, 5_000),
+    ];
+    expect(compareNightly(almost, floors).ok).toBe(false);
+    const bloated = almost.map((c) =>
+      c.caseId === "filter-lines"
+        ? { ...c, pass: 1, tokens: 100_000 }
+        : { ...c, tokens: 20_000 },
+    );
+    // 200k tokens > 150k ceiling
+    expect(compareNightly(bloated, floors).ok).toBe(false);
+    expect(
+      compareNightly(
+        bloated.map((c) => ({ ...c, tokens: 8_000, wallMs: 4_000, pass: 1 })),
+        floors,
+      ).ok,
+    ).toBe(true);
+  });
+});

@@ -1,20 +1,20 @@
 # 待办清单（v2 UI 之后）
 
-# 交接：从这里接着做（2026-09-02 成熟度第一波）
+# 交接：从这里接着做（2026-09-02 成熟度第二波）
 
-**进行中**：按 `docs/08-maturity-optimization-checklist.md` Phase 1 第一波推进
-（覆盖率门 → 台账/统计 → mock 确定性评测 → provider 降级 → nightly）。
-单操作员形态；GOV-* 与 SAFE-05 Phase 2B **本波不做**。
+**进行中**：按 `docs/08-maturity-optimization-checklist.md` Wave 2：
+`EVAL-03c → EVAL-01 held-out → OBS-01 → RUN-01（先 ADR-003）→ MEM-01`。
+单操作员形态；GOV-* 与 SAFE-05 Phase 2B **本波不做**（除非已解锁且很小）。
 每项独立 commit + push，等 CI 绿再开下一项。
 
-**已落地**：
-- TEST-01a — `npm run test:coverage` + `npm run test:mutation-smoke`（8/8 killed）；CI artifact。
-- EVAL-02 — 台账 `error` 分类 + `npm run eval:stats`（Wilson/pass@k/taxonomy）。
-- EVAL-03a — `npm run eval:deterministic`（12 场景跑 `dist/` + mock；CI `deterministic-eval`）。
-- MODEL-01a — `FallbackModelClient` + 熔断；`model_fallback` 事件已接 CLI/Web（链只覆盖主执行者）。
-- EVAL-03b — nightly.yml + Secrets/vars + `AB_TOKEN_CAP` + `eval/baselines/nightly.json` 比对。
+**已落地（含第一波）**：
+- TEST-01a / EVAL-02 / EVAL-03a / MODEL-01a / EVAL-03b — 见 docs/08。
+- **EVAL-03c** — release 质量/成本/延迟门 + 地板收紧（证据 nightly #33646201722 6/6）。
+  `eval/baselines/{nightly,release}.json`；`release.yml` 在 tag 候选上重跑真实子集。
 
-**第一波五项已收口。** 下一波候选见 `docs/08` Phase 2（EVAL-01 → OBS-01 → RUN-01 → MEM-01；SAFE-05 2B / GOV-* 仍按单操作员形态搁置）。
+**下一刀**：EVAL-01 held-out 任务集（与 in-tree 研究用例分立；本会话创建集时不跟分调 prompt）。
+
+以下为历史交接页（2026-08-08 收工），仍有参考价值；新开工优先看 `docs/08`。
 
 以下为历史交接页（2026-08-08 收工），仍有参考价值；新开工优先看 `docs/08`。
 

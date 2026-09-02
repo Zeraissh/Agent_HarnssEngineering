@@ -20,5 +20,5 @@
   },
   "maxTotalTokens": 150000,
   "maxTotalWallMs": 300000,
-  "notes": "Floors raised 2026-09-02 from successful nightly #33646201722 (6/6, 52k tok, 28s wall on deepseek-v4-flash). Token ceiling ~3× observed; wall ~10× for provider variance. REPS=1 ⇒ any miss fails fail-closed."
+  "notes": "EVAL-03c release quality/cost/latency gate. Same floors as nightly after #33646201722 evidence. Release re-runs this subset on the tagged commit (not reuse prior nightly artifact) so the candidate itself is measured. Must not be looser than nightly.json."
 }

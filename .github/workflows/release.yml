@@ -20,7 +20,11 @@ concurrency:
 jobs:
   gate:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 45
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      ANTHROPIC_BASE_URL: ${{ vars.ANTHROPIC_BASE_URL }}
+      AGENT_MODEL: ${{ vars.AGENT_MODEL }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -45,6 +49,40 @@ jobs:
             eval/deterministic-report.json
             eval/deterministic-report.md
           if-no-files-found: error
+          retention-days: 90
+      # EVAL-03c：质量/成本/延迟退化门——在**打标签的那次提交**上重跑真实
+      # provider 小子集，对照 eval/baselines/release.json（与 nightly 同口径、
+      # 不得更松）。不复用昨夜 artifact：要测的是候选本身。
+      - name: Require provider credentials for release quality gate
+        run: |
+          test -n "$ANTHROPIC_API_KEY" || { echo "missing secret ANTHROPIC_API_KEY"; exit 1; }
+          test -n "$ANTHROPIC_BASE_URL" || { echo "missing var ANTHROPIC_BASE_URL"; exit 1; }
+          test -n "$AGENT_MODEL" || { echo "missing var AGENT_MODEL"; exit 1; }
+          echo "model=$AGENT_MODEL base=$ANTHROPIC_BASE_URL"
+      - name: Clear prior ab-log
+        run: rm -f eval/ab-log.jsonl
+      - name: Release quality subset (real provider)
+        env:
+          AB_ARMS: baseline
+          AB_CASES: write-basic,sum-numbers,read-extract,bash-count,json-field,filter-lines
+          AB_REPS: "1"
+          AB_TOKEN_CAP: "150000"
+          AB_REPORT: eval/ab-report-release.md
+        run: npm run ab
+      - name: Compare release baseline
+        env:
+          COMPARE_OUT: eval/release-compare.json
+        run: npm run eval:compare-baseline -- eval/ab-log.jsonl eval/baselines/release.json
+      - name: Upload release quality artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-quality-eval
+          path: |
+            eval/ab-report-release.md
+            eval/ab-log.jsonl
+            eval/release-compare.json
+          if-no-files-found: warn
           retention-days: 90
       - run: npm run pack:check
       - run: npm ci --ignore-scripts
@@ -165,6 +203,6 @@ jobs:
             echo '```'
             echo
             echo "同镜像的可读 tag：\`${IMAGE}:${IMG_TAG}\`（tag 可被覆盖，生产部署一律用上面的 digest 引用）。"
-            echo "发布门禁（typecheck / 单测 / build / 确定性场景门 / pack 白名单 / cross-app / audit）在本 workflow 的 gate job 全过后才构建镜像。"
+            echo "发布门禁（typecheck / 单测 / build / 确定性场景门 / 真实 provider 质量·成本·延迟门 / pack 白名单 / cross-app / audit）在本 workflow 的 gate job 全过后才构建镜像。"
           } > release-notes.md
           gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --notes-file release-notes.md desktop-artifact/*

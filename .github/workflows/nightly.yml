@@ -28,7 +28,7 @@ jobs:
       AB_ARMS: baseline
       AB_CASES: write-basic,sum-numbers,read-extract,bash-count,json-field,filter-lines
       AB_REPS: "1"
-      AB_TOKEN_CAP: "400000"
+      AB_TOKEN_CAP: "150000"
       AB_REPORT: eval/ab-report-nightly.md
       COMPARE_OUT: eval/nightly-compare.json
     steps:

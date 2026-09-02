@@ -29,6 +29,8 @@ export interface NightlyBaseline {
   maxTotalTokens?: number;
   /** 矩阵合计墙钟上界（ms） */
   maxTotalWallMs?: number;
+  /** 可选：人类可读的阈值来源说明（不参与比对） */
+  notes?: string;
 }
 
 export interface CompareResult {
