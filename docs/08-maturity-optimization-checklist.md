@@ -79,9 +79,15 @@ OCI 逃逸 canary 由 Linux CI container job 承担（run #33461119575 全绿）
 | [ ] | EVAL-01 | Held-out 真实任务集 | 5/5/4 | 20 | 建立 20–50 个不参与提示/实现调优的任务，覆盖编辑、调试、澄清、权限、恢复、MCP、多文件与失败场景 |
 | [ ] | EVAL-02 | 统计与失败分类 | 5/4/3 | 27 | 每模型/配置至少重复 3–5 次；输出 pass@1、首轮成功率、修复率、置信区间、token、成本、延迟和稳定失败 taxonomy |
 | [ ] | EVAL-03 | CI/nightly/release 门 | 5/5/4 | 20 | PR 跑确定性小集；nightly 跑真实 provider 矩阵；release 对质量/成本/延迟设置退化阈值并保存报告 |
-| [ ] | TEST-01 | Coverage 与 mutation | 4/4/3 | 24 | changed-line coverage、关键状态机 branch 阈值及 mutation score 纳入 CI；证明关键验收测试会在实现被破坏时变红 |
+| [~] | TEST-01 | Coverage 与 mutation | 4/4/3 | 24 | changed-line coverage、关键状态机 branch 阈值及 mutation score 纳入 CI；证明关键验收测试会在实现被破坏时变红 |
 | [ ] | E2E-01 | Web/桌面/容器真实 E2E | 5/5/4 | 20 | Playwright Web、已打包 Electron 启动/升级/卸载、容器 health+canary 自动化；覆盖流式断线、审批和崩溃恢复 |
 | [ ] | E2E-02 | Android 与 provider canary | 4/4/4 | 16 | 修正 Android instrumentation 身份并在 emulator 运行；每次 release 用少量真实 provider 请求验证协议与凭据边界 |
+
+### Phase 1 实施记录（进行中）
+
+| ID | 已取得证据 | 残余边界 |
+|---|---|---|
+| TEST-01a | 装 `@vitest/coverage-v8`；`vitest.config.ts` include `src/**`+`ui/*.ts`，reporters text-summary/lcov/json-summary。2026-09-02 本机基线 statements/lines **77.68%**、branches **81.2%**、functions **91.54%**；棘轮阈值 lines/statements **75**、branches **78**、functions **88**（实测下方约 2–3pt）。`scripts/mutation-smoke.mjs` 固定 8 个关键变异（瞬时判定恒假/恒真、审批门绕过、tool_choice none 映射丢、verdict fail-open、verifier 只读放行、台账空成功、credentialLike 恒假），每个必须把对应测试文件打红。CI `core` 改跑 `test:coverage` + `test:mutation-smoke` 并上传 `coverage/` artifact | 尚非 changed-line coverage、无 Stryker 全量 mutation score；OCI 用例在 Windows 本机 skipped，Linux CI 才计入分支覆盖。第二波再扩变异清单与差分覆盖 |
 
 ## Phase 2：可恢复、可重放、可运营
 
@@ -133,5 +139,11 @@ OCI 逃逸 canary 由 Linux CI container job 承担（run #33461119575 全绿）
 5. **回归证据**：针对性测试、完整测试、typecheck/build/pack，以及需要的真实 E2E/HIL。
 6. **残余风险**：未覆盖平台、TOCTOU、外部系统或人工验收项。
 
-当前执行顺序：`A1 攒 §2.1 样本（ledger:samples）→ SAFE-05 Phase 2B（durable workspace lease + source/execution root + UID/Git/quota）→ EVAL-01 → EVAL-03 → E2E-01 → RUN-01 → SAFE-04 同 run 恢复/SAFE-06`。Phase 2A 的 daemon-label orphan reaper 与真实 `SIGKILL → sweep` E2E 已落地；**2026-09-01 Linux CI #33461119575 全绿**，SAFE-05 评审结论为保持 `[~]`（见 Phase 0 实施记录）。
-如果目标改为公网多人服务，`GOV-01/02/03` 必须提前到 `RUN-01` 之后、任何公开上线之前。
+当前执行顺序（2026-09-02 成熟度第一波，单操作员形态）：
+`TEST-01a → EVAL-02（先修台账 error）→ EVAL-03a mock 确定性门 → MODEL-01a 降级/熔断 → EVAL-03b nightly`。
+本波**不提前** GOV-*；SAFE-05 Phase 2B / SAFE-06 保持 partial，排第二波。
+并行可继续：`A1 攒 §2.1 样本（ledger:samples）`（与质量门不冲突）。
+第二波顺序：`SAFE-05 Phase 2B → EVAL-01 held-out → OBS-01 → RUN-01 → MEM-01 → E2E-01`；
+若目标改公网多人，`GOV-01/02/03` 必须提前到 `RUN-01` 之后、任何公开上线之前。
+Phase 2A 的 daemon-label orphan reaper 与真实 `SIGKILL → sweep` E2E 已落地；
+**2026-09-01 Linux CI #33461119575 全绿**，SAFE-05 评审结论为保持 `[~]`（见 Phase 0 实施记录）。

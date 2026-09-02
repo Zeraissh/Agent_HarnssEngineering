@@ -25,7 +25,16 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm audit
       - run: npm run typecheck
-      - run: npm test
+      - run: npm run test:coverage
+      - run: npm run test:mutation-smoke
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage/
+          if-no-files-found: warn
+          retention-days: 14
       - run: npm run build
       - run: npm run pack:check
 

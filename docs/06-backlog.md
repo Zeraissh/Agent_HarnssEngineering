@@ -1,5 +1,20 @@
 # 待办清单（v2 UI 之后）
 
+# 交接：从这里接着做（2026-09-02 成熟度第一波）
+
+**进行中**：按 `docs/08-maturity-optimization-checklist.md` Phase 1 第一波推进
+（覆盖率门 → 台账/统计 → mock 确定性评测 → provider 降级 → nightly）。
+单操作员形态；GOV-* 与 SAFE-05 Phase 2B **本波不做**。
+每项独立 commit + push，等 CI 绿再开下一项。
+
+**已落地**：TEST-01a — `npm run test:coverage`（棘轮 lines/statements≥75、
+branches≥78、functions≥88）+ `npm run test:mutation-smoke`（8 个关键变异必须变红）；
+CI `core` 已接并上传 coverage artifact。
+
+以下为历史交接页（2026-08-08 收工），仍有参考价值；新开工优先看 `docs/08`。
+
+---
+
 # 交接：从这里接着做（2026-08-08 收工）
 
 **至 `ddcc18a`（2026-08-09 晨）**：**784 单测 / 22 文件 + `tsc` 全绿**｜工作树干净。

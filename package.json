@@ -21,6 +21,8 @@
     "lab": "tsx --env-file-if-exists=.env eval/lab.ts",
     "smoke:local": "tsx --env-file-if-exists=.env eval/smoke-local.ts",
     "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "test:mutation-smoke": "node scripts/mutation-smoke.mjs",
     "typecheck": "tsc --noEmit",
     "ledger": "tsx --env-file-if-exists=.env eval/ledger-report.ts",
     "ledger:samples": "tsx --env-file-if-exists=.env eval/ledger-samples.ts",
@@ -37,6 +39,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "@vitest/coverage-v8": "^3.2.7",
     "axe-core": "^4.13.0",
     "jsdom": "^30.0.1",
     "tsx": "^4.19.0",
