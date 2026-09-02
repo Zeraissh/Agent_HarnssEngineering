@@ -101,7 +101,7 @@ export function passAtK(passes: number, n: number, k: number): { k: number; esti
   if (fails < kk) return { k: kk, estimate: 1 };
   const denom = comb(n, kk);
   if (denom === 0) return { k: kk, estimate: 0 };
-  return { k: kk, estimate: 0 }; // MUTATION
+  return { k: kk, estimate: 1 - comb(fails, kk) / denom };
 }
 
 export function percentile(sorted: number[], p: number): number | null {
