@@ -9,7 +9,7 @@
 
 **已落地**：
 - TEST-01a — `npm run test:coverage` + `npm run test:mutation-smoke`（8/8 killed）；CI artifact。
-- EVAL-02 前置 — 台账 `error` 不再硬编码 null（`ledgerErrorClass` + 哨兵锁）。
+- EVAL-02 — 台账 `error` 分类 + `npm run eval:stats`（Wilson/pass@k/taxonomy）。
 
 以下为历史交接页（2026-08-08 收工），仍有参考价值；新开工优先看 `docs/08`。
 

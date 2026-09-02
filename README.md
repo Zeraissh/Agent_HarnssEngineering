@@ -75,6 +75,7 @@ npm run smoke:local                                               # 离线端点
 npm test                                                          # 单元测试
 npm run test:coverage                                             # 覆盖率 + 棘轮阈值（TEST-01a）
 npm run test:mutation-smoke                                       # 8 个关键变异必须变红（TEST-01a）
+npm run eval:stats                                                # A/B + 台账统计报告（EVAL-02）
 ```
 
 真实 CLI/Web 宿主默认要求 `finish_task` 结构化收尾，`end_turn` 不再直接等于完成。

@@ -5,6 +5,9 @@ dist/
 eval-out/
 eval/lab-profiles.json
 eval/ab-log.jsonl
+# EVAL-02 统计报告：本地/CI 生成物，用 npm run eval:stats 重产
+eval/stats-report.md
+eval/stats-report.json
 .agent-memory/
 eval/transcripts/
 logs/

@@ -26,6 +26,7 @@
     "typecheck": "tsc --noEmit",
     "ledger": "tsx --env-file-if-exists=.env eval/ledger-report.ts",
     "ledger:samples": "tsx --env-file-if-exists=.env eval/ledger-samples.ts",
+    "eval:stats": "tsx --env-file-if-exists=.env eval/stats.ts",
     "build": "node scripts/clean-dist.mjs && tsc -p tsconfig.build.json && node scripts/copy-ui-assets.mjs",
     "start": "node --env-file-if-exists=.env dist/ui/serve.js",
     "pack:check": "npm run build && node scripts/check-pack.mjs",
