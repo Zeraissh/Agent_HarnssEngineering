@@ -9,6 +9,7 @@ import { existsSync } from "node:fs";
 import { join, extname, dirname, delimiter, resolve, basename, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { AgentLoop } from "../src/loop.js";
 import {
   configuredExecutionStatus,
@@ -25,6 +26,11 @@ import {
   type VerifiedRunResult,
 } from "../src/orchestrate.js";
 import { createModelClientFromEnv, type ResolvedProvider } from "../src/provider.js";
+import {
+  createFallbackClientIfConfigured,
+  FallbackModelClient,
+  type FallbackInfo,
+} from "../src/model-fallback.js";
 import { getPack, selectPackTools, PACKS, RULE_PRECEDENCE_DISCIPLINE, type DomainPack } from "../src/presets.js";
 import { connectMcpServers, loadMcpConfig, type McpRuntime } from "../src/mcp.js";
 import { createWorkdirScopedMemoryTools, MEMORY_TOOL_NAMES } from "../src/memory.js";
@@ -160,8 +166,12 @@ export function meterModelClient(
   }) => void,
 ): ModelClient {
   return {
-    send: async (req) => {
-      const turn = await client.send(req);
+    // 三个参数必须原样透传。此前这里只接 `req`：`onDelta` 被吞掉等于 Web 上
+    // 没有流式（直播条与对话末尾的实时段全空），`signal` 被吞掉等于停止按钮
+    // 掐不掉在飞的那个请求——ModelClient 的签名注释里写得很清楚"没有它，
+    // 停止就只是句空话"。装饰器最容易犯的错就是收窄被装饰者的契约。
+    send: async (req, onDelta, signal) => {
+      const turn = await client.send(req, onDelta, signal);
       onUsage({
         inputTokens: turn.usage.input_tokens,
         outputTokens: turn.usage.output_tokens,
@@ -232,6 +242,8 @@ interface StoredRun {
   toolTally: ToolTally;
   /** 核查是否撞过轮次上限（"预算不够"这个嫌疑要有据可查，见案例 #8 的三层归因） */
   verifierHitBudget?: boolean;
+  /** 本 run 主执行者换端点的次数（MODEL-01a）。未配降级链时恒 0 */
+  fallbacks?: number;
   /**
    * 中止闸。**逐 run 一个**——停止的是这一次运行，不是整个宿主。
    * 人按下停止即 abort()，编排层把它传给 AgentLoop，循环在下一次模型调用
@@ -541,6 +553,13 @@ export interface UiServerOptions {
    * 测试若要隔离宿主环境，应显式传 `{ AGENT_EXECUTION_ISOLATION: "off" }`。
    */
   executionEnv?: NodeJS.ProcessEnv;
+  /**
+   * 端点降级链（MODEL-01a）的配置源。与 `executionEnv` 同一条仪器纪律：
+   * **不用"是否注入了 modelClient"去推断该不该武装这条防线**。
+   * 测试要么显式传一份自己的 env，要么就得接受宿主 `.env` 里那条真实链——
+   * 后者意味着一次瞬时错误会把假模型的请求转发到真端点上去。
+   */
+  fallbackEnv?: NodeJS.ProcessEnv;
   /** 只在宿主确实位于可信反向代理之后时读取 X-Forwarded-Proto/Host。 */
   trustProxy?: boolean;
 }
@@ -1141,11 +1160,29 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
   // F1: 缺省模型从环境变量读取，compat 取自 createModelClientFromEnv 返回值
   const resolved = createModelClientFromEnv(process.env.AGENT_MODEL ?? "claude-opus-4-8");
+  /**
+   * 端点降级链（MODEL-01a）。**只包主执行者**——verifier / planner / vision
+   * 三个角色模型不进链：它们是被显式指定的端点，"核查者应 ≥ 执行者"是一条
+   * 设计约束，静默把核查换到另一家会让那条约束在无人知晓时失效。
+   *
+   * 归属靠 AsyncLocalStorage 而不是一个可变的"当前 run"引用：换端点发生在
+   * `FallbackModelClient.send` 内部，而这台宿主允许多个 run 并发在飞
+   * （maxActiveRuns），单个可变引用会在两次 send 交错时把降级记到别人账上。
+   * ALS 的存储沿 await 链传播，谁发起的 send 就记到谁头上。
+   */
+  const fallbackSink = new AsyncLocalStorage<(info: FallbackInfo) => void>();
+  const fallbackClient = createFallbackClientIfConfigured(
+    { name: process.env.AGENT_MODEL ?? "claude-opus-4-8", client: options.modelClient ?? resolved.client },
+    options.fallbackEnv ?? process.env,
+    (info) => fallbackSink.getStore()?.(info),
+  );
+  const fallbackChain = fallbackClient instanceof FallbackModelClient ? fallbackClient.chain() : null;
   // 日账本逐调用实时计量（评审 b62f6a5：段粒度落账让预算门的 TOCTOU 窗口有
   // 整段宽——最坏 4 条 lineage 在账本过线前全部准入；跨午夜大段还会整段挤占
   // 新日额度）。metrics.tokens 的 role 记账仍走事件路径（每段独立 usage、归属
   // 清晰），这层只喂日账本——两本账职责分开，互不双计。
-  const modelClient = meterModelClient(options.modelClient ?? resolved.client, (u) => bumpDaily(u));
+  // 计量包在降级之**外**：哪个端点应答的都要计进日额度，账本关心的是花了多少钱。
+  const modelClient = meterModelClient(fallbackClient, (u) => bumpDaily(u));
   const taskCompletionEnabled =
     options.taskCompletion ?? (options.modelClient ? false : process.env.AGENT_REQUIRE_FINISH_TASK !== "0");
   /**
@@ -2418,6 +2455,29 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     return seq;
   }
 
+  /**
+   * 在本 run 的归属域里跑一段执行（MODEL-01a）。
+   *
+   * 降级发生在 L0 的 `FallbackModelClient.send` 内部，宿主看不到轮内的事；
+   * 唯一能把"这次换端点属于哪个 run"接起来的地方就是发起执行的这一层。
+   * 未配降级链时不建域——不为一条没启用的防线给每个 run 加一层 ALS 上下文。
+   */
+  function withFallbackAttribution<T>(run: StoredRun, body: () => Promise<T>): Promise<T> {
+    if (!fallbackChain) return body();
+    return fallbackSink.run((info) => {
+      run.fallbacks = (run.fallbacks ?? 0) + 1;
+      // 来源记 "model"：它既不是模型说的话（main），也不是宿主的决定（host），
+      // 而是 L0 这一层的事实。混进 host 会让"谁做的决定"这件事失真。
+      pushSyntheticEvent(run, "model", {
+        type: "model_fallback",
+        from: info.from,
+        to: info.to,
+        reason: info.reason,
+        turn: info.turn,
+      });
+    }, body);
+  }
+
   /** 推送合成事件（如 verdict / approval_resolved / run_end）到缓冲与在线客户端 */
   function pushSyntheticEvent(run: StoredRun, source: string, event: Record<string, unknown>): number {
     const seq = run.events.length;
@@ -2588,6 +2648,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         verifications: o?.verifications ?? [],
         verifierBudgetTurns: verifyMaxTurnsOf(run.packName ? getPack(run.packName) : pack) ?? null,
         verifierHitBudget: run.verifierHitBudget ?? false,
+          fallbackChain,
+          fallbacks: run.fallbacks ?? 0,
           tools: run.toolTally,
           durationMs: (run.finishedAt ?? Date.now()) - run.createdAt,
         }),
@@ -3281,6 +3343,14 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         planner: plannerRole && (run.usePlannerModel ?? true) ? plannerRole.name : null,
         vision: visionRole?.name ?? null,
       },
+      /**
+       * 端点降级链（MODEL-01a）。未配置时 **null 而不是空数组**：
+       * "没有这条防线"与"链上零个备用端点"在界面上必须能分开。
+       * 只报名字——链上第二家的 baseURL / key 与角色模型同规格，绝不下发。
+       */
+      fallbackChain,
+      // 三个角色模型不在链上（见装配处的理由）；界面照实说，别让人以为核查也保了底
+      fallbackScope: fallbackChain ? "executor" : null,
       guardrails: {
         maxTurns: cfg.maxTurns ?? null,
         maxTokens: cfg.maxTokens ?? null,
@@ -3412,6 +3482,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           ? { model: visionRole.name, provider: visionRole.provider.provider, configured: true }
           : { configured: false },
       },
+      // MODEL-01a：进程级降级链快照（逐 run 的同名字段走 run_config）。
+      // null = 未配置这条防线，与"链上只有主端点"不是一回事
+      fallbackChain,
+      fallbackScope: fallbackChain ? "executor" : null,
       // 核查预算与执行者解耦，但**不是常数**（9.1）：领域包可用 verify.maxTurns
       // 覆盖。这里报进程级默认包的值；逐 run 的真实值走 run_config
       verifierBudgetTurns: verifyMaxTurnsOf(pack) ?? DEFAULT_VERIFIER_MAX_TURNS,
@@ -4171,7 +4245,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
               });
             }
             broadcastLifecycle("run_created", child);
-            void startForkedContinuation(child, feedback, run.archivedApprovalGrantAudit ?? []);
+            void withFallbackAttribution(child, () =>
+              startForkedContinuation(child, feedback, run.archivedApprovalGrantAudit ?? []),
+            );
             return json(res, 200, {
               runId: id,
               conversationTurn: child.conversationTurn,
@@ -4200,7 +4276,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         }
         if (resumeResources.length) run.heldResources = resumeResources;
         // startContinuation 在第一个 await 之前就把轮数加过了，这里不能再 +1
-        void startContinuation(run, feedback);
+        void withFallbackAttribution(run, () => startContinuation(run, feedback));
         releaseAdmission();
         return json(res, 200, {
           runId: run.id,
@@ -4557,11 +4633,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         broadcastLifecycle("run_created", run);
 
         if (run.mode === "plan") {
-          void startPlannedRun(run);
+          void withFallbackAttribution(run, () => startPlannedRun(run));
         } else if (verify) {
-          void startVerifiedRun(run);
+          void withFallbackAttribution(run, () => startVerifiedRun(run));
         } else {
-          void startPlainRun(run);
+          void withFallbackAttribution(run, () => startPlainRun(run));
         }
 
         return json(res, 200, { runId: id });

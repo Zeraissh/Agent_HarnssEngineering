@@ -426,6 +426,20 @@ export type TurnEvent =
   | { type: "thinking_delta"; text: string }
   /** backoffMs = 本次实际等待毫秒（含抖动）——不带它宿主就看不出重试到底等了多久 */
   | { type: "api_retry"; turn: number; attempt: number; reason: string; backoffMs: number }
+  /**
+   * 端点降级（MODEL-01a）。**唯一一条不由 AgentLoop 发射的 TurnEvent**：
+   * 换端点发生在 L0（FallbackModelClient.send 内部），循环那一层只认识
+   * ModelClient 接口，按设计不知道这次调用换了一家服务商。宿主在装配模型
+   * 客户端时挂 onFallback，收到就合成这条事件推进自己的事件流。
+   *
+   * 放进 TurnEvent 而不是各宿主各定义一个形状：CLI 与 Web 必须渲染同一件事，
+   * 两边各写一遍字段名就是下一次"界面少显示一行且不报错"的温床。
+   *
+   * reason 是**离开上一个端点的原因**（HTTP 状态+消息，或 `circuit_open`
+   * 表示它还在熔断隔离期被跳过）；turn 是该客户端的第几次 send，
+   * 与 loop 的轮次不是同一个计数器（一轮可能重发多次）。
+   */
+  | { type: "model_fallback"; from: string; to: string; reason: string; turn: number }
   | {
       /** 目标级恢复决策：不是模型散文，而是 harness 的确定性分支 */
       type: "recovery_decision";

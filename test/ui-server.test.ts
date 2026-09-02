@@ -43,6 +43,7 @@ import { VERDICT_TOOL_NAME } from "../src/verifier.js";
 import { PACKS } from "../src/presets.js";
 import { bashTool } from "../src/tools/bash.js";
 import { DEFAULT_HISTORY_KEEP, historyKeepCount, historyRootPath } from "../ui/history.js";
+import { startMockProvider } from "../eval/mock-provider.js";
 import {
   FakeModelClient,
   fakeMessage,
@@ -5875,6 +5876,39 @@ describe("监控闭环：outcome 分档指标与告警文件一致性", () => {
     ]);
   });
 
+  /**
+   * 装饰器不得收窄被装饰者的契约。
+   *
+   * 计量层此前只接 `req` 一个参数：`onDelta` 被吞掉 = Web 上根本没有流式
+   * （直播条与对话末尾的实时段全空），`signal` 被吞掉 = 停止按钮掐不掉在飞的
+   * 那个请求——而 `ModelClient.send` 的注释写得很清楚："没有它，停止就只是句
+   * 空话"。两条都是**静默**失效：没有报错，只是那个能力不见了。
+   */
+  it("meterModelClient：onDelta 与 signal 必须原样透传（吞掉它们=流式与停止双双静默失效）", async () => {
+    const controller = new AbortController();
+    let sawDelta: unknown;
+    let sawSignal: AbortSignal | undefined;
+    const inner: ModelClient = {
+      send: async (_req, onDelta, signal) => {
+        sawSignal = signal;
+        onDelta?.({ kind: "text", text: "半句" });
+        return {
+          message: fakeMessage([textBlock("整句")], "end_turn"),
+          stopReason: "end_turn",
+          usage: { input_tokens: 1, output_tokens: 1 } as any,
+        };
+      },
+    };
+    const metered = meterModelClient(inner, () => {});
+    await metered.send(
+      { system: [], messages: [], tools: [], maxTokens: 8 } as any,
+      (d) => { sawDelta = d; },
+      controller.signal,
+    );
+    expect(sawDelta).toEqual({ kind: "text", text: "半句" });
+    expect(sawSignal).toBe(controller.signal);
+  });
+
   it("告警文件：引用的自产指标逐一真实存在；进程死亡告警钉在 job=agent-harness", async () => {
     const alertsYml = readFileSync(
       fileURLToPath(new URL("../deploy/prometheus-alerts.yml", import.meta.url)),
@@ -5912,6 +5946,192 @@ describe("监控闭环：outcome 分档指标与告警文件一致性", () => {
     } finally {
       await handle.close();
       await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ------------------------------------------------------
+// MODEL-01a · 端点降级链接进 Web 宿主
+// ------------------------------------------------------
+
+describe("MODEL-01a 端点降级：宿主接线", () => {
+  /**
+   * 换端点发生在 L0 的 `FallbackModelClient.send` 内部，宿主看不到轮内的事。
+   * 这一组用**真的 HTTP**（本地 mock provider）走完整条路：主端点报 503 →
+   * 换到备用端点 → 备用端点真的应答 → run 跑完。只 stub 到 FallbackModelClient
+   * 为止的话，验的就只是"我调用了我自己写的那个函数"。
+   *
+   * 降级链的配置源走 `fallbackEnv` 注入而不是 `process.env`：仪器纪律与
+   * `executionEnv` 同款——宿主 `.env` 里真有一条链时，测试里的一次瞬时错误
+   * 会把假模型的请求转发到真端点上去。
+   */
+  let handle: UiServerHandle | undefined;
+  let mock: Awaited<ReturnType<typeof startMockProvider>> | undefined;
+  let dir: string | undefined;
+
+  afterEach(async () => {
+    await handle?.close();
+    handle = undefined;
+    await mock?.close();
+    mock = undefined;
+    if (dir) await rm(dir, { recursive: true, force: true });
+    dir = undefined;
+  });
+
+  /** 恒报 503 的主端点：瞬时错误才允许换端点，这是链会动的前提 */
+  const alwaysTransient = (): ModelClient => ({
+    send: async () => {
+      throw Object.assign(new Error("upstream temporarily unavailable"), { status: 503 });
+    },
+  });
+
+  function fallbackEnvFor(base: string): NodeJS.ProcessEnv {
+    return {
+      AGENT_FALLBACK_MODEL: "mock-backup",
+      AGENT_FALLBACK_PROVIDER: "anthropic",
+      AGENT_FALLBACK_BASE_URL: base,
+      AGENT_FALLBACK_API_KEY: "test-key",
+    };
+  }
+
+  it("主端点瞬时失败 → 事件流里有 model_fallback，且备用端点真的把这次 run 跑完", async () => {
+    mock = await startMockProvider({
+      scripts: [{ content: [{ type: "text", text: "备用端点接手并完成" }], stopReason: "end_turn" }],
+    });
+    dir = await mkdtemp(join(tmpdir(), "fallback-e2e-"));
+    handle = createUiServer({
+      modelClient: alwaysTransient(),
+      tools: [],
+      workdir: dir,
+      fallbackEnv: fallbackEnvFor(mock.anthropicBaseUrl),
+    });
+    const base = baseUrl(await startServer(handle));
+
+    const created = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "降级 e2e" }),
+    });
+    const { runId } = (await created.json()) as { runId: string };
+    await waitForDone(base, runId);
+
+    const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+    const fell = events.find((e) => (e as any).event.type === "model_fallback") as any;
+    expect(fell, "主端点 503 之后必须有一条 model_fallback 进事件流").toBeDefined();
+    expect(fell.event.to).toBe("mock-backup");
+    expect(fell.event.reason).toContain("503");
+    expect(fell.event.turn).toBe(1);
+    // 来源不是 host：那是宿主的决定；换端点是 L0 的事实
+    expect(fell.source).toBe("model");
+
+    // 备用端点确实收到了请求，并且 run 是靠它跑完的
+    expect(mock.requestLog.map((r) => r.wire)).toContain("anthropic");
+    const done = events.find((e) => (e as any).event.type === "done") as any;
+    expect(done.event.stopReason).toBe("completed");
+    const texts = events
+      .filter((e) => (e as any).event.type === "assistant_text")
+      .map((e) => (e as any).event.text);
+    expect(texts.join("")).toContain("备用端点接手并完成");
+  });
+
+  it("run_config 与 /api/harness 都报出这条链，并写明只覆盖执行者", async () => {
+    mock = await startMockProvider({ scripts: [{ content: [{ type: "text", text: "ok" }] }] });
+    dir = await mkdtemp(join(tmpdir(), "fallback-cfg-"));
+    handle = createUiServer({
+      modelClient: new FakeModelClient([fakeMessage([textBlock("ok")], "end_turn")]),
+      tools: [],
+      workdir: dir,
+      fallbackEnv: fallbackEnvFor(mock.anthropicBaseUrl),
+    });
+    const base = baseUrl(await startServer(handle));
+
+    const snapshot = (await (await fetch(`${base}/api/harness`)).json()) as any;
+    expect(snapshot.fallbackChain).toHaveLength(2);
+    expect(snapshot.fallbackChain[1]).toBe("mock-backup");
+    expect(snapshot.fallbackScope).toBe("executor");
+    // 链上第二家的 baseURL / key 与角色模型同规格：绝不下发给浏览器
+    const asText = JSON.stringify(snapshot);
+    expect(asText).not.toContain("test-key");
+    expect(asText).not.toContain(mock.anthropicBaseUrl);
+
+    const created = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "看配置" }),
+    });
+    const { runId } = (await created.json()) as { runId: string };
+    await waitForDone(base, runId);
+    const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+    const cfg = events.find((e) => (e as any).event.type === "run_config") as any;
+    expect(cfg.event.fallbackChain[1]).toBe("mock-backup");
+    expect(cfg.event.fallbackScope).toBe("executor");
+  });
+
+  /**
+   * `null` 与 `[]` 必须分得开：前者是"这台机器上根本没有这条防线"，
+   * 后者会被读成"配了链但没有备用端点"。压成同一个读数之后，
+   * "本次零降级"是防线没触发还是防线不存在就再也答不出来。
+   */
+  it("没配降级链时报 null 而不是空数组，且 run 照常跑完", async () => {
+    dir = await mkdtemp(join(tmpdir(), "fallback-off-"));
+    handle = createUiServer({
+      modelClient: new FakeModelClient([fakeMessage([textBlock("ok")], "end_turn")]),
+      tools: [],
+      workdir: dir,
+      fallbackEnv: {},
+    });
+    const base = baseUrl(await startServer(handle));
+    const snapshot = (await (await fetch(`${base}/api/harness`)).json()) as any;
+    expect(snapshot.fallbackChain).toBeNull();
+    expect(snapshot.fallbackScope).toBeNull();
+
+    const created = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "无降级" }),
+    });
+    const { runId } = (await created.json()) as { runId: string };
+    await waitForDone(base, runId);
+    const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+    expect(events.some((e) => (e as any).event.type === "model_fallback")).toBe(false);
+  });
+
+  /**
+   * 归属靠 AsyncLocalStorage 而不是一个可变的"当前 run"引用。这台宿主允许多个
+   * run 并发在飞，而换端点发生在 send 内部——单个可变引用会在两次 send 交错时
+   * 把降级记到别人账上，而那种错误在界面上完全看不出来（另一个 run 多了一行）。
+   */
+  it("两个 run 并发降级时各记各的，不会串台", async () => {
+    mock = await startMockProvider({
+      scripts: [
+        { content: [{ type: "text", text: "A 完成" }] },
+        { content: [{ type: "text", text: "B 完成" }] },
+      ],
+    });
+    dir = await mkdtemp(join(tmpdir(), "fallback-par-"));
+    handle = createUiServer({
+      modelClient: alwaysTransient(),
+      tools: [],
+      workdir: dir,
+      fallbackEnv: fallbackEnvFor(mock.anthropicBaseUrl),
+    });
+    const base = baseUrl(await startServer(handle));
+
+    const start = async (task: string): Promise<string> => {
+      const res = await fetch(`${base}/api/runs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task }),
+      });
+      return ((await res.json()) as { runId: string }).runId;
+    };
+    const [a, b] = await Promise.all([start("并发 A"), start("并发 B")]);
+    await Promise.all([waitForDone(base, a), waitForDone(base, b)]);
+
+    for (const runId of [a, b]) {
+      const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+      const fallbacks = events.filter((e) => (e as any).event.type === "model_fallback");
+      expect(fallbacks, `run ${runId} 应当恰好记到自己那一次降级`).toHaveLength(1);
     }
   });
 });

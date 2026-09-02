@@ -537,6 +537,9 @@ export function reduceEvent(state, sseEvent) {
         verifierBudgetSource: event.verifierBudgetSource ?? null,
         plannerBudgetTurns: event.plannerBudgetTurns ?? null,
         plannerBudgetSource: event.plannerBudgetSource ?? null,
+        // MODEL-01a：null = 没配这条防线，[] 与它不是一回事，别用 ?? [] 抹平
+        fallbackChain: Array.isArray(event.fallbackChain) ? event.fallbackChain.map(String) : null,
+        fallbackScope: event.fallbackScope ? String(event.fallbackScope) : null,
         guardrails: event.guardrails ?? null,
         tools: Array.isArray(event.tools) ? event.tools : [],
       },
@@ -740,6 +743,16 @@ function buildTimelineEntry(seq, source, type, event) {
         // 抖动上线后同一 attempt 的等待不再是定值；旧 run 没有这个字段，
         // 只在存在时带上（渲染层据此决定显不显示，不能显示 undefined）
         ...(typeof event.backoffMs === "number" ? { backoffMs: event.backoffMs } : {}),
+      };
+    // MODEL-01a 端点降级。逐字段白名单投影：不在这里列出的字段静默消失，
+    // 而"少显示一行"在界面上看不出来（host-lags 那条纪律的第 N 次现身）
+    case "model_fallback":
+      return {
+        ...base,
+        from: String(event.from ?? ""),
+        to: String(event.to ?? ""),
+        reason: String(event.reason ?? ""),
+        turn: Number(event.turn ?? 0),
       };
     case "recovery_decision":
       return {
@@ -1175,6 +1188,9 @@ export function deriveLoopFace(state, harness) {
     chain,
     reworks: state.runEnd?.reworks ?? segments.filter((s) => s.role === "rework").length,
     retries: state.timeline.filter((e) => e.type === "api_retry"),
+    // 端点降级与同轮重试分开计：一个是"同一家再试一次"，一个是"换了一家"，
+    // 混成一个数字就再也答不出"这次运行到底是谁应答的"
+    fallbacks: state.timeline.filter((e) => e.type === "model_fallback"),
     effort: rc?.effort ?? harness?.effort ?? null,
     effortApplies: Boolean(rc ? rc.effortApplies : harness?.effortApplies),
   };
@@ -1803,6 +1819,8 @@ function defaultCollapsed(entry) {
   if (entry.type === "approval_request") return false;
   // API 重试 → 展开
   if (entry.type === "api_retry") return false;
+  // 换端点 → 展开：这一行解释了后面所有轮次是谁应答的，折起来等于藏了变量
+  if (entry.type === "model_fallback") return false;
   if (entry.type === "segment_resume") return false;
   if (entry.type === "recovery_decision") return false;
   if (entry.type === "run_forked") return false;
@@ -2750,6 +2768,27 @@ export function deriveAssemblyBar(state, harness) {
         "而不是摆一个一调用就报错的工具。给模型一个用不了的工具，它会反复尝试并把失败归咎于自己；" +
         "工具面必须与真实能力一致，这是工具运行时地板那条纪律。",
   );
+
+  /**
+   * 端点降级链（MODEL-01a）。**只在配了的时候上条**——与识图那一格相反：
+   * 识图未配时要明说，因为"模型说它看不到图"这个现象需要解释；降级未配是
+   * 绝大多数机器的常态，摆一格"未配"只是噪声。
+   *
+   * 配了就必须写清**覆盖范围**：链只包主执行者。若把它读成"整台宿主都保了底"，
+   * 核查者所在端点挂掉时会得到一个完全意料之外的失败。
+   */
+  const chainCfg = cfg.fallbackChain ?? harness?.fallbackChain ?? null;
+  if (Array.isArray(chainCfg) && chainCfg.length > 1) {
+    const fellBack = (state.timeline ?? []).some((e) => e.type === "model_fallback");
+    push(
+      "fallback",
+      `降级链 ${chainCfg.join(" → ")}${fellBack ? "·已降级" : ""}`,
+      "主执行者的端点降级链：瞬时错误（网络/超时/429/5xx）耗尽后换下一家再试，各端点各带一个熔断器。" +
+        "**只覆盖执行者**——核查者/planner/视觉模型仍走各自显式配置的端点，因为「核查者应 ≥ 执行者」是一条设计约束，" +
+        "静默把核查换到另一家会让那条约束在无人知晓时失效。认证失败、400 这类非瞬时错误一律原样上抛：" +
+        "换端点救不了配置错误，只会把同一个 401 打到第二家去，并掩盖真正的原因。",
+    );
+  }
 
   /** 精确输入 grant 必须可见：active 与历史审计不能混成一个状态。 */
   const rules = state.autoAllow ?? [];
@@ -4976,6 +5015,7 @@ function renderLogEntry(e) {
   if (e.type === "tool_result" && e.resultIsError) cls += " log-entry--error";
   if (e.type === "approval_request") cls += " log-entry--approval";
   if (e.type === "api_retry") cls += " log-entry--warning";
+  if (e.type === "model_fallback") cls += " log-entry--warning";
   if (e.type === "recovery_decision") cls += " log-entry--warning";
   if (e.type === "run_forked") cls += " log-entry--warning";
   if (e.type === "compaction") cls += " log-entry--warning";
@@ -5036,6 +5076,14 @@ function renderLogEntryBody(e) {
       return `<div class="log-entry-body">原因：${esc(e.reason ?? "")}${
         typeof e.backoffMs === "number" ? `<br>退避等待：${esc(formatDuration(e.backoffMs))}（含抖动）` : ""
       }</div>`;
+    case "model_fallback":
+      // 三件事都要写出来：换到了哪家、为什么离开上一家、这之后的输出归谁。
+      // 只写"已降级"会让后面所有轮次的行为差异变成无从解释的怪事
+      return `<div class="log-entry-body">主执行者端点从 <code>${esc(e.from ?? "")}</code> 换到 <code>${esc(
+        e.to ?? "",
+      )}</code>（第 ${esc(String(e.turn ?? "?"))} 次模型调用）。<br>离开原因：${esc(
+        fallbackReasonText(e.reason),
+      )}<br>此后的输出由新端点产生——核查者/planner/视觉模型不在降级链上，仍走各自配置的端点。</div>`;
     case "recovery_decision":
       return `<div class="log-entry-body">${esc(e.detail ?? "")}${
         typeof e.extraTurns === "number" ? `<br>追加额度：${esc(String(e.extraTurns))} 轮` : ""
@@ -5076,6 +5124,7 @@ function entryIcon(type, isError) {
     case "approval_request": return "⚠"; // cli.ts:539
     case "api_retry": return "⟳";        // cli.ts:563
     case "segment_resume": return "⟲";   // 与 ⟳(同轮重试) 区分：这是整段续跑
+    case "model_fallback": return "⇄";   // 前两个换的是时机，这个换的是端点（cli.ts 同款）
     case "recovery_decision": return "⤷";
     case "run_forked": return "↗";
     // CLI 对压缩也用 ⚠，这里刻意分开：V-19 要求不可逆自成语域，
@@ -5100,6 +5149,7 @@ function entryActionLabel(e) {
     case "approval_request": return `审批请求：${e.name ?? ""}`;
     case "api_retry": return `API 重试（第${e.attempt ?? "?"}次）`;
     case "segment_resume": return `瞬时失败后带正史续跑（已完成 ${e.priorTurns ?? "?"} 轮）`;
+    case "model_fallback": return `端点降级：${e.from ?? "?"} → ${e.to ?? "?"}`;
     case "recovery_decision": {
       const labels = {
         request_completion: "要求业务收口",
@@ -5117,6 +5167,17 @@ function entryActionLabel(e) {
   }
 }
 
+/**
+ * 降级原因的人话。`circuit_open` 是 L0 的内部标记，不是端点回的错误码——
+ * 原样显示会让人以为上游返回了一个叫 circuit_open 的东西，从而去查错方向。
+ * 摘要行与展开体共用这一处，两处各写一遍就是"同一件事两种说法"的开始。
+ * @returns {string}
+ */
+function fallbackReasonText(reason) {
+  if (reason === "circuit_open") return "上一个端点仍在熔断隔离期，本次直接跳过";
+  return reason ?? "";
+}
+
 /** @returns {string} */
 function entryDetail(e) {
   switch (e.type) {
@@ -5130,6 +5191,8 @@ function entryDetail(e) {
       return truncate(formatInput(e.input), 60);
     case "api_retry":
       return e.reason ?? "";
+    case "model_fallback":
+      return fallbackReasonText(e.reason);
     case "recovery_decision":
       return e.detail ?? e.reason ?? "";
     case "run_forked":

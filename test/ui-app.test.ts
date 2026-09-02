@@ -37,6 +37,7 @@ import {
   filterRunsByStatus,
   mergeForkedFollowUp,
   buildNewRunRequest,
+  deriveLoopFace,
 } from "../ui/public/app.js";
 import { plannedStopReason } from "../src/orchestrate.js";
 import { STOP_REASONS } from "../src/types.js";
@@ -2161,5 +2162,77 @@ describe("直播条：arrived 必须取自累计计数，不是缓冲长度", ()
     // 停表与续表也都要按 runId
     expect(htmlSrc).toContain("revealTickers.delete(runId)");
     expect(htmlSrc).toContain("revealTickers.set(runId,");
+  });
+});
+
+// ================================================================
+// MODEL-01a · 端点降级事件的投影与派生
+// ================================================================
+
+describe("MODEL-01a 端点降级", () => {
+  /**
+   * `buildTimelineEntry` 是**逐字段白名单**：没有专门的 case，事件只会留下
+   * `{seq,source,type}` 三个字段进时间线，from/to/reason/turn 全部静默消失，
+   * 而且不报任何错。这条锁盯的就是那四个字段真的活下来了。
+   */
+  it("四个字段全部进时间线——少一个界面就再也答不出「谁换到了谁」", () => {
+    let state = createInitialState("rfb", "降级任务", false);
+    state = reduceEvent(state, sse("model", "model_fallback", {
+      from: "deepseek-v4-pro",
+      to: "kimi-k3",
+      reason: "503: upstream unavailable",
+      turn: 4,
+    }));
+
+    expect(state.timeline).toHaveLength(1);
+    expect(state.timeline[0]).toMatchObject({
+      type: "model_fallback",
+      source: "model",
+      from: "deepseek-v4-pro",
+      to: "kimi-k3",
+      reason: "503: upstream unavailable",
+      turn: 4,
+    });
+  });
+
+  it("默认展开：这一行是后面所有轮次的前提，折起来等于藏了变量", () => {
+    const state = makeState({
+      timeline: [{ seq: 0, source: "model", type: "model_fallback", from: "a", to: "b", reason: "503", turn: 1 }],
+    });
+    expect(deriveLogEntries(state)[0].collapsed).toBe(false);
+    expect(isEntryCollapsedByDefault({ seq: 0, source: "model", type: "model_fallback", from: "a", to: "b" })).toBe(false);
+  });
+
+  /**
+   * 降级不是重试。两者都表示"这一轮不顺利"，但一个是同一家再来一次、
+   * 另一个是换了一家——混进同一个计数，事后就答不出"这次运行到底是谁应答的"。
+   */
+  it("Loop 面把降级与同轮重试分开计数", () => {
+    let state = createInitialState("rfb2", "t", false);
+    state = reduceEvent(state, sse("main", "api_retry", { turn: 1, attempt: 1, reason: "timeout", backoffMs: 1000 }));
+    state = reduceEvent(state, sse("model", "model_fallback", { from: "a", to: "b", reason: "503", turn: 2 }));
+
+    const face = deriveLoopFace(state, null);
+    expect(face.retries).toHaveLength(1);
+    expect(face.fallbacks).toHaveLength(1);
+    expect(face.fallbacks[0].to).toBe("b");
+  });
+
+  /**
+   * `null`（这台机器没有这条防线）与 `[]`（配了链但空）必须能分开：
+   * 用 `?? []` 抹平之后，"零次降级"是防线没触发还是防线不存在就再也分不出来。
+   */
+  it("run_config 的降级链：未配是 null，不是空数组", () => {
+    let state = createInitialState("rfb3", "t", false);
+    state = reduceEvent(state, sse("host", "run_config", { pack: null }));
+    expect(state.runConfig.fallbackChain).toBeNull();
+    expect(state.runConfig.fallbackScope).toBeNull();
+
+    state = reduceEvent(state, sse("host", "run_config", {
+      fallbackChain: ["deepseek-v4-pro", "kimi-k3"],
+      fallbackScope: "executor",
+    }));
+    expect(state.runConfig.fallbackChain).toEqual(["deepseek-v4-pro", "kimi-k3"]);
+    expect(state.runConfig.fallbackScope).toBe("executor");
   });
 });

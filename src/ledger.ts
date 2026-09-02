@@ -78,6 +78,15 @@ export interface RunLedgerEntry {
   verifierBudgetTurns: number | null;
   /** 核查是否撞了轮次上限（撞了才有"预算不够"这个嫌疑） */
   verifierHitBudget: boolean;
+  /**
+   * 主执行者的端点降级链（MODEL-01a），未配置降级时为 **null**。
+   * null 与 `[主端点]` 必须分开：前者是"这台机器上根本没有这条防线"，
+   * 后者是"配了链但只有一环"——把两者压成同一个读数，事后就无从判断
+   * "零次降级"是防线没触发还是防线不存在。
+   */
+  fallbackChain: string[] | null;
+  /** 本次运行实际换端点的次数（含被熔断跳过导致的换）。未配置时恒 0 */
+  fallbacks: number;
   tools: ToolTally;
   durationMs: number | null;
   /**
@@ -122,6 +131,8 @@ export interface LedgerInput {
   }[];
   verifierBudgetTurns?: number | null;
   verifierHitBudget?: boolean;
+  fallbackChain?: string[] | null;
+  fallbacks?: number | null;
   tools?: ToolTally;
   durationMs?: number | null;
 }
@@ -164,6 +175,11 @@ export function buildLedgerEntry(input: LedgerInput): RunLedgerEntry {
     })),
     verifierBudgetTurns: input.verifierBudgetTurns ?? null,
     verifierHitBudget: Boolean(input.verifierHitBudget),
+    fallbackChain:
+      Array.isArray(input.fallbackChain) && input.fallbackChain.length > 0
+        ? input.fallbackChain.map(String)
+        : null,
+    fallbacks: Number.isFinite(Number(input.fallbacks)) ? Math.max(0, Number(input.fallbacks)) : 0,
     tools: input.tools ?? {},
     durationMs: input.durationMs ?? null,
     // 构建标记，不是配置：这个构建的 verifier/planner 一律带终结工具

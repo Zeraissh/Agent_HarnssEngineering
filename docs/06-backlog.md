@@ -10,6 +10,7 @@
 **已落地**：
 - TEST-01a — `npm run test:coverage` + `npm run test:mutation-smoke`（8/8 killed）；CI artifact。
 - EVAL-02 — 台账 `error` 分类 + `npm run eval:stats`（Wilson/pass@k/taxonomy）。
+- EVAL-03a — `npm run eval:deterministic`（12 场景跑 `dist/` + mock；CI `deterministic-eval`）。
 
 以下为历史交接页（2026-08-08 收工），仍有参考价值；新开工优先看 `docs/08`。
 

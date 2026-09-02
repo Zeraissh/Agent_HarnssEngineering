@@ -1935,6 +1935,85 @@ describe("装配条的识图那一格", () => {
   });
 });
 
+// ================================================================
+// MODEL-01a 端点降级：换端点这件事必须在界面上留痕
+// ================================================================
+
+describe("端点降级在界面上看得见", () => {
+  /**
+   * 换端点是**本次运行最强的解释变量**：之后每一轮的措辞、工具偏好、失败形态
+   * 都可能因此改变。这条事件若被静默丢弃（`app.js` 的逐字段白名单投影天生就是
+   * 这个语义），界面只是少一行，肉眼看不出——正是这个项目踩过七次的那条缝。
+   */
+  function stateWithFallback(extra: Record<string, unknown> = {}) {
+    let s = createInitialState("run-fb", "降级任务", false);
+    s = reduceEvents(s, [
+      sse(0, "main", "turn_start", { turn: 1 }),
+      sse(1, "model", "model_fallback", {
+        from: "deepseek-v4-pro",
+        to: "kimi-k3",
+        reason: "503: upstream unavailable",
+        turn: 2,
+        ...extra,
+      }),
+    ]);
+    return s;
+  }
+
+  it("日志里渲染出「从谁换到谁 + 为什么离开」，且默认展开", () => {
+    renderRunDetail(stateWithFallback(), { activeTab: "loop" });
+    const entry = document.querySelector(".log-entries .log-entry") as HTMLElement | null;
+    const body = document.querySelector(".log-entries")?.textContent ?? "";
+    expect(body).toContain("deepseek-v4-pro");
+    expect(body).toContain("kimi-k3");
+    expect(body).toContain("503: upstream unavailable");
+    // 折叠会把这行藏起来；这条事件恰恰是后面所有轮次的前提，不能默认折叠
+    expect([...document.querySelectorAll(".log-entries .log-entry")].some(
+      (e) => e.textContent?.includes("deepseek-v4-pro") && !e.className.includes("log-entry--collapsed"),
+    )).toBe(true);
+    expect(entry).not.toBeNull();
+  });
+
+  it("熔断跳过要说成「隔离期跳过」，不能显示成一个假的错误码", () => {
+    renderRunDetail(stateWithFallback({ reason: "circuit_open" }), { activeTab: "loop" });
+    const body = document.querySelector(".log-entries")?.textContent ?? "";
+    expect(body).toContain("熔断隔离期");
+    expect(body).not.toContain("circuit_open");
+  });
+
+  it("界面要说清降级只覆盖执行者——否则核查端点挂掉时会是个意料之外的失败", () => {
+    renderRunDetail(stateWithFallback(), { activeTab: "loop" });
+    const body = document.querySelector(".log-entries")?.textContent ?? "";
+    expect(body).toContain("核查者");
+    expect(body).toContain("不在降级链上");
+  });
+
+  it("装配条：配了链才上条，且写出完整链路", () => {
+    const configured = reduceEvents(createInitialState("rc", "t", false), [
+      sse(0, "host", "run_config", { fallbackChain: ["deepseek-v4-pro", "kimi-k3"] }),
+    ]);
+    const chip = deriveAssemblyBar(configured, null).find((i) => i.key === "fallback");
+    expect(chip?.chip).toContain("deepseek-v4-pro → kimi-k3");
+    expect(chip?.why).toContain("只覆盖执行者");
+  });
+
+  it("没配降级链时这一格根本不出现（未配是常态，摆一格「未配」只是噪声）", () => {
+    expect(
+      deriveAssemblyBar(createInitialState("rc2", "t", false), null).find((i) => i.key === "fallback"),
+    ).toBeUndefined();
+  });
+
+  it("已经降过级的运行，装配条上要看得出来（配置 ≠ 发生过）", () => {
+    let s = createInitialState("rc3", "t", false);
+    s = reduceEvents(s, [
+      sse(0, "host", "run_config", { fallbackChain: ["a", "b"] }),
+    ]);
+    expect(deriveAssemblyBar(s, null).find((i) => i.key === "fallback")!.chip).not.toContain("已降级");
+    s = reduceEvents(s, [sse(1, "model", "model_fallback", { from: "a", to: "b", reason: "503", turn: 1 })]);
+    expect(deriveAssemblyBar(s, null).find((i) => i.key === "fallback")!.chip).toContain("已降级");
+  });
+});
+
 describe("会话标题：算出来的短句，不是任务原文", () => {
   /**
    * 侧栏此前直接铺任务原文——一条几百字的描述占三四行还看不出是什么。

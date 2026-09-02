@@ -80,6 +80,7 @@ import type { VerifyOutcome } from "./verifier.js";
 import { getPack, PACKS, RULE_PRECEDENCE_DISCIPLINE, selectPackTools } from "./presets.js";
 import { routeToPack } from "./router.js";
 import { createModelClientFromEnv } from "./provider.js";
+import { createFallbackClientIfConfigured, FallbackModelClient } from "./model-fallback.js";
 import { ASK_USER_TOOL_NAME, createAskUserTool } from "./tools/ask-user.js";
 import {
   FINISH_TASK_TOOL_NAME,
@@ -513,8 +514,6 @@ async function main(): Promise<void> {
           ...(progressExtensionTurns !== undefined ? { progressExtensionTurns } : {}),
           ...(stagnationWindow !== undefined ? { stagnationWindow } : {}),
         });
-  const modelClient = resolvedClient;
-
   let streamingText = false;
   const endStreamLine = () => {
     if (streamingText) {
@@ -522,6 +521,34 @@ async function main(): Promise<void> {
       streamingText = false;
     }
   };
+
+  /**
+   * 端点降级链（MODEL-01a）。**只包主执行者的客户端**：verifier / planner /
+   * vision 三个角色模型不进链，因为它们是**被显式指定的**——"核查者应 ≥ 执行者"
+   * 是一条设计约束，静默把核查换到另一家端点会让那条约束在无人知晓时失效。
+   * 主执行者不同：它是任务本身要跑完的那一条路，换端点跑完 > 整段作废。
+   *
+   * 降级事件走 renderEvent 而不是就地 console.log：CLI 只应有一个渲染器，
+   * 两处各写一遍就是"同一件事两种说法"的开始。
+   */
+  let fallbackCount = 0;
+  const modelClient = createFallbackClientIfConfigured(
+    { name: model, client: resolvedClient },
+    process.env,
+    (info) => {
+      fallbackCount += 1;
+      void renderEvent({
+        type: "model_fallback",
+        from: info.from,
+        to: info.to,
+        reason: info.reason,
+        turn: info.turn,
+      });
+    },
+  );
+  if (modelClient instanceof FallbackModelClient) {
+    console.log(c.dim(`fallback chain: ${modelClient.chain().join(" → ")}`));
+  }
 
   // 裁决信号浮出（案例 #1 改进项）：boot_count 规格 bug 曾藏在 passed=true 的
   // 裁决 summary 里——宿主只看布尔就会漏。最终结果块无论通过与否都展示
@@ -910,6 +937,8 @@ async function main(): Promise<void> {
       verifications: ledgerFacts?.verifications ?? [],
       verifierBudgetTurns: verifyMaxTurnsOf(pack) ?? null,
       verifierHitBudget: ledgerHitBudget,
+      fallbackChain: modelClient instanceof FallbackModelClient ? modelClient.chain() : null,
+      fallbacks: fallbackCount,
       tools: ledgerTally,
       durationMs: Date.now() - ledgerStartedAt,
     }),
@@ -973,6 +1002,15 @@ async function main(): Promise<void> {
         endStreamLine();
         console.log(
           c.yellow(`⟳ API 瞬时错误，同轮重试 #${event.attempt}（等待 ${event.backoffMs}ms）：${event.reason}`),
+        );
+        break;
+      case "model_fallback":
+        // ⇄ 与 ⟳(同轮重试) / ⟲(整段续跑) 分开：那两个换的是时机，这个换的是端点
+        endStreamLine();
+        console.log(
+          c.yellow(
+            `⇄ 端点降级：${event.from} → ${event.to}（第 ${event.turn} 次调用）：${event.reason}`,
+          ),
         );
         break;
       case "assistant_thinking":
