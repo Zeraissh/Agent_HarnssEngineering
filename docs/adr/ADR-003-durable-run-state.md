@@ -1,6 +1,6 @@
 # ADR-003: Durable RunState（分阶段）
 
-**Status:** Proposed（Phase 1 范围锁定；实现未开始前不得标 Accepted）  
+**Status:** Proposed（Phase 1 内核 + Web state.json 接线已落地；Phase 2 热恢复未开，不得标 Accepted）  
 **Date:** 2026-09-02  
 **Deciders:** Agent_Design 维护者  
 **Related:** RUN-01 / RUN-02；B2 `ui/history.ts`；SAFE-04 grant 边界；OBS-01 `trace.jsonl`
@@ -106,7 +106,9 @@ Phase 1 **明确不做**：同 runId 热恢复、跨重启复用 active grant、
 
 ## Implementation notes（Phase 1 开工清单）
 
-1. `src/run-state.ts`：类型 + `transition(phase, event) → next` 纯函数 + 单测。
-2. `ui/history.ts`：`writeState` / `readState`（坏文件跳过，同 meta）。
-3. `ui/server.ts`：在 plan/execute/verify/approval/finalize 点调用 transition；崩溃 hydrate 读 phase。
+1. ~~`src/run-state.ts`：类型 + `transition(phase, event) → next` 纯函数 + 单测。~~
+2. ~~`ui/history.ts`：`writeState` / `readState`（坏文件跳过，同 meta）。~~
+3. ~~`ui/server.ts`：在 plan/execute/verify/approval/finalize 点调用 transition；崩溃 hydrate 读 phase。~~
 4. docs/08 RUN-01 → `[~]` 并记残余；不得在 Phase 2 未做时标 `[x]`。
+
+**Phase 1 已接线残余**：CLI 对等 durable state；同 run 热恢复（Phase 2）；toolTx（SAFE-06）；预算快照进 state；grant 审计数组进 state（当前只 pendingIds）。

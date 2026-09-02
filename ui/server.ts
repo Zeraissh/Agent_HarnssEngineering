@@ -57,12 +57,21 @@ import {
   loadArchivedMetas,
   pruneHistory,
   readArchivedEvents,
+  readArchivedState,
   readArchivedTranscript,
   readArchivedTrace,
   type ArchivedApprovalGrant,
   type ArchivedCheckpoint,
   type ArchivedMeta,
 } from "./history.js";
+import {
+  initialRunState,
+  recoveryActionForPhase,
+  transitionRunState,
+  type DurablePlanSnapshot,
+  type DurableRunState,
+  type RunStateEvent,
+} from "../src/run-state.js";
 import {
   endSpan,
   exportRedactedTrace,
@@ -351,6 +360,12 @@ interface StoredRun {
   /** 仅供刚派生的新 run 装配首轮；完成后 checkpoint 会从真实 done 事件重建。 */
   resumeBudget?: SharedRunBudget;
   initialContextInputTokens?: number;
+  /**
+   * RUN-01 / ADR-003：进程内 Durable RunState 游标；与 `state.json` 同步。
+   * 归档恢复只读；崩溃相按 recoveryActionForPhase 收成 closed/interrupted，
+   * **从不**把 archived 冒充成可同 run 热续跑。
+   */
+  durableState?: DurableRunState;
   // ---- OBS-01 trace ----
   /** 本 run 根 span id；子 span 挂在其下 */
   traceRunSpanId?: string;
@@ -601,6 +616,48 @@ export function runOutcomeForStopReason(reason?: string): RunEndInfo["outcome"] 
     default:
       return "error";
   }
+}
+
+/** Plan → DurablePlanSnapshot（DAG 边 = dependsOn）。 */
+export function durablePlanFromPlan(
+  plan: Plan,
+  protocol: DurablePlanSnapshot["protocol"] = "freeform",
+): DurablePlanSnapshot {
+  const edges: Record<string, string[]> = {};
+  for (const t of plan.subtasks) {
+    edges[t.id] = [...(t.dependsOn ?? [])];
+  }
+  return {
+    protocol,
+    taskIds: plan.subtasks.map((t) => t.id),
+    edges,
+    approvedAt: null,
+    rejectedAt: null,
+  };
+}
+
+/**
+ * 崩溃档案按 ADR-003 表收成终态：不恢复 grant、不热续跑。
+ * 返回应用后的 state（调用方落盘）；只读相原样返回。
+ */
+export function recoverDurableStateOnCrash(
+  state: DurableRunState,
+  at = Date.now(),
+): DurableRunState {
+  const action = recoveryActionForPhase(state.phase);
+  if (action === "readonly") return state;
+  if (action === "close_archive") {
+    return transitionRunState(state, { type: "close" }, at) ?? { ...state, phase: "closed", updatedAt: at };
+  }
+  return (
+    transitionRunState(state, { type: "interrupt" }, at) ?? {
+      ...state,
+      phase: "interrupted",
+      updatedAt: at,
+      pendingApprovalIds: [],
+      pendingQuestionIds: [],
+    }
+  );
 }
 
 export interface UiServerHandle {
@@ -1514,6 +1571,66 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     run.archiveWriter.writeMeta(meta);
   }
 
+  /** RUN-01：初始化 durable 游标并落盘（建 run / 派生 fork 时）。 */
+  function seedDurableState(run: StoredRun): void {
+    const state = initialRunState(run.id, run.createdAt);
+    state.rootRunId = run.rootRunId ?? null;
+    state.continuedFrom = run.continuedFrom ?? null;
+    run.durableState = state;
+    run.archiveWriter?.writeState(state);
+  }
+
+  /**
+   * RUN-01：应用迁移并写 state.json。非法迁移 fail-closed 记日志，不打断 run。
+   * 调用方保证先落相关事件（appendEvent）再调本函数——writer 同链保序。
+   */
+  function applyDurableTransition(run: StoredRun, event: RunStateEvent, at = Date.now()): void {
+    if (!run.durableState) seedDurableState(run);
+    const current = run.durableState!;
+    const next = transitionRunState(current, event, at);
+    if (!next) {
+      if (realHost) {
+        operationalLog("warn", "run_state_transition_rejected", {
+          runId: run.id,
+          phase: current.phase,
+          event: event.type,
+        });
+      }
+      return;
+    }
+    run.durableState = next;
+    run.archiveWriter?.writeState(next);
+  }
+
+  /** 收尾时把游标收到终态（已终态则幂等跳过）。 */
+  function finalizeDurableState(run: StoredRun, endInfo: RunEndInfo): void {
+    const phase = run.durableState?.phase;
+    if (phase && ["completed", "failed", "closed", "interrupted"].includes(phase)) return;
+    const reason = endInfo.mainStopReason;
+    if (reason === "plan_rejected" || endInfo.outcome === "rejected") {
+      applyDurableTransition(run, { type: "close" });
+      return;
+    }
+    if (reason === "plan_gate_expired" || endInfo.outcome === "closed" || reason === "aborted") {
+      // 宿主关停 / 门过期 / 委托方停止：中断，不是"跑完了"
+      applyDurableTransition(run, { type: "interrupt" });
+      return;
+    }
+    if (endInfo.outcome === "error" || reason === "error" || reason === "execution_unavailable") {
+      applyDurableTransition(run, { type: "fail" });
+      return;
+    }
+    // 同进程还可追问的 completed：保持 executing，不标 completed——
+    // 否则 startContinuation 的 segment_begin 会被非法迁移挡住。
+    const structurallyContinuable =
+      !run.verify && run.mode !== "plan" && Boolean(run.loop && run.history?.length);
+    if (structurallyContinuable && endInfo.outcome === "completed") {
+      if (run.durableState) run.archiveWriter?.writeState(run.durableState);
+      return;
+    }
+    applyDurableTransition(run, { type: "complete" });
+  }
+
   /**
    * 启动时恢复档案（判据①②）。先修剪再恢复；坏档案已在 loadArchivedMetas
    * 里被跳过。恢复出来的 run 一律 status=done + archived——**没有任何一个
@@ -1540,6 +1657,26 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
                 : { approvalGrants: undefined }),
             }
           : undefined;
+        // RUN-01：读 state.json；崩溃相按 ADR 表收成 closed/interrupted 并回写。
+        let durableState = await readArchivedState(a.dir);
+        if (durableState && crashed) {
+          const recovered = recoverDurableStateOnCrash(durableState);
+          if (recovered !== durableState && recovered.phase !== durableState.phase) {
+            durableState = recovered;
+            try {
+              const writer = new RunHistoryWriter(a.dir, reportHistoryError);
+              writer.writeState(recovered);
+              await writer.flush();
+            } catch {
+              // 回写失败不阻断启动；内存仍持恢复后的 phase 供 API 诚实展示
+            }
+          } else {
+            durableState = recovered;
+          }
+        } else if (!durableState && crashed) {
+          // 旧档案无 state.json：合成 interrupted，仍不冒充在跑
+          durableState = recoverDurableStateOnCrash(initialRunState(a.meta.runId, a.meta.createdAt));
+        }
         runs.set(a.meta.runId, {
           id: a.meta.runId,
           task: a.meta.task,
@@ -1583,6 +1720,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           ...(typeof a.meta.rootRunId === "string" && a.meta.rootRunId
             ? { rootRunId: a.meta.rootRunId }
             : {}),
+          ...(durableState ? { durableState } : {}),
           // 崩溃档案（meta 还停在 running）：没人正常收过尾，按宿主级异常归档
           ...(crashed
             ? { mainStopReason: "error" }
@@ -1752,6 +1890,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       conversationTurn: r.conversationTurn,
       continuedFrom: r.continuedFrom ?? null,
       rootRunId: r.rootRunId ?? null,
+      // RUN-01：编排游标诚实展示。有 state 就报 phase + 崩溃恢复策略；
+      // 明确 sameRunResume=false——Phase 1 只 fork/checkpoint，不热续跑。
+      durablePhase: r.durableState?.phase ?? null,
+      durableRecovery: r.durableState ? recoveryActionForPhase(r.durableState.phase) : null,
+      sameRunResume: false,
       // V-32：侧栏按工作目录分组。workdir 是工具的写入圈禁边界，
       // 也就是"这段工作触碰的范围"——它是这个 harness 自己长出来的分组键，
       // 不是从别家侧栏照搬来的层级
@@ -2236,6 +2379,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       questions: queued.questions,
       at: Date.now(),
     });
+    applyDurableTransition(run, { type: "question_wait", questionId: id });
     run.pendingQuestion = {
       id,
       requestSeq,
@@ -2243,6 +2387,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       questions: queued.questions,
       settle: (answers) => {
         if (run.pendingQuestion?.id === id) delete run.pendingQuestion;
+        applyDurableTransition(run, { type: "question_resolved", questionId: id });
         queued.resolve(answers);
         // 计划模式可有多个执行者同时提问；一次只向界面挂一组，答完再开下一组。
         pumpQuestionQueue(run);
@@ -2280,6 +2425,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       id: pending.id,
       cause,
     });
+    // settle 内会 question_resolved + 清 pending；过期事件已先落盘
     pending.settle(null);
   }
 
@@ -2493,6 +2639,29 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
     // B2：durable 事件逐条落盘（delta 在上面早已 return——本来就不进缓冲）
     run.archiveWriter?.appendEvent(sseEvent);
+    // RUN-01：事件落盘后再迁游标（ADR 写序）。段起点 / 审批挂起。
+    if (
+      run.durableState &&
+      (run.durableState.segmentSource !== source || run.durableState.segmentIndex !== run.segmentIndex) &&
+      ["executing", "reworking", "verifying"].includes(run.durableState.phase)
+    ) {
+      applyDurableTransition(
+        run,
+        { type: "segment_begin", index: run.segmentIndex, source },
+        sseEvent.ts,
+      );
+    }
+    if (
+      event.type === "approval_request" &&
+      !isInternallyResolvedApprovalSource(source) &&
+      run.pendingApprovals.has(approvalId(event.toolUseId, seq))
+    ) {
+      applyDurableTransition(
+        run,
+        { type: "approval_wait", approvalId: approvalId(event.toolUseId, seq) },
+        sseEvent.ts,
+      );
+    }
     // 推送给在线 SSE 客户端
     broadcastSSE(run, frameFor(sseEvent));
     for (const deferred of deferredHostEvents) pushSyntheticEvent(run, "host", deferred);
@@ -2729,6 +2898,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     // B2：收尾状态整写进档案，然后修剪（判据③）。在跑的 run 受保护不删。
     // 修剪排在本 run 的写入链上：直接 fire-and-forget 会与自己的 meta 写赛跑，
     // 读盘时档案未成形、计数不足就漏剪
+    finalizeDurableState(run, endInfo);
     persistMeta(run);
     if (historyRoot && run.archiveWriter) {
       const running = new Set(
@@ -2750,6 +2920,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       });
       return;
     }
+    applyDurableTransition(run, { type: "start" });
     const cfg = await buildRunConfig(run);
     // V-28：实例留给后续对话轮复用——重建的话 ContextManager 的 lastInputTokens
     // 归零，续跑第一轮的压缩判据会失准
@@ -2893,6 +3064,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       return;
     }
 
+    applyDurableTransition(run, { type: "start" });
+
     // 第一条 durable 事件就是环境边界；即使 MCP 连接很慢，人也能立刻看懂
     // 这是从哪里来的、继承了什么、哪些权限状态已清零。
     pushSyntheticEvent(run, "host", {
@@ -3003,6 +3176,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       });
       return;
     }
+    applyDurableTransition(run, { type: "plan_begin" });
     const baseCfg = await buildRunConfig(run);
     const startedAt = Date.now();
     let planReadyAt = startedAt;
@@ -3026,6 +3200,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           if (concurrency === "auto") {
             effectiveConcurrency = Math.min(AUTO_CONCURRENCY_CAP, planParallelWidth(plan.subtasks));
           }
+          const protocol =
+            process.env.AGENT_PLAN_PROTOCOL === "structured" ? "structured" : "freeform";
           pushSyntheticEvent(run, "host", {
             type: "plan",
             concurrency: effectiveConcurrency,
@@ -3043,6 +3219,15 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             /** 门开着时前端要知道"这份计划还在等签字"，而不是以为已经在跑了 */
             gated: Boolean(run.planGate),
           });
+          applyDurableTransition(
+            run,
+            {
+              type: "plan_ready",
+              plan: durablePlanFromPlan(plan, protocol),
+              gated: Boolean(run.planGate),
+            },
+            planReadyAt,
+          );
           // 签字位：计划已发出、一个子任务都还没发射，此时停下是零副作用的
           if (run.planGate) await waitForPlanDecision(run);
         },
@@ -3209,6 +3394,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       });
       return;
     }
+    applyDurableTransition(run, { type: "start" });
     const cfg = await buildRunConfig(run);
     let mainStopReason: string | undefined;
     let mainError: string | null = null;
@@ -4307,6 +4493,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             if (historyRoot) {
               child.archiveWriter = createArchiveWriter(id);
               persistMeta(child);
+              seedDurableState(child);
+            } else {
+              seedDurableState(child);
             }
             runs.set(id, child);
             metrics.runsStarted += 1;
@@ -4718,6 +4907,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         if (historyRoot) {
           run.archiveWriter = createArchiveWriter(id);
           persistMeta(run);
+          seedDurableState(run);
           // OBS-01：run 根 span + 版本指纹（commit/model/pack/tool schema）
           try {
             const toolsForHash = [
@@ -4746,6 +4936,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           } catch {
             // ignore
           }
+        } else {
+          seedDurableState(run);
         }
         runs.set(id, run);
         releaseAdmission();
@@ -4826,6 +5018,13 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           actor: "user",
           at,
         });
+        applyDurableTransition(
+          run,
+          parsed.decision === "approve"
+            ? { type: "plan_approved", at }
+            : { type: "plan_rejected", at },
+          at,
+        );
         pendingPlan.settle(parsed.decision);
         broadcastLifecycle("run_updated", run);
         return json(res, 200, { acknowledged: true });
@@ -5040,6 +5239,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             : {}),
           at,
         });
+        applyDurableTransition(run, {
+          type: "approval_resolved",
+          approvalId: key!,
+        }, at);
 
         const exactRules = run.autoAllow ? [...run.autoAllow.values()] : [];
         return json(res, 200, {

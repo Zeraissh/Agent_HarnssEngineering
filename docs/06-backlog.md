@@ -3,7 +3,7 @@
 # 交接：从这里接着做（2026-09-02 成熟度第二波）
 
 **进行中**：按 `docs/08-maturity-optimization-checklist.md` Wave 2：
-`EVAL-03c → EVAL-01 → OBS-01 → RUN-01（先 ADR-003）→ MEM-01`。
+`EVAL-03c → EVAL-01 → OBS-01 → RUN-01（state.json 接线）→ MEM-01`。
 单操作员形态；GOV-* 与 SAFE-05 Phase 2B **本波不做**（除非已解锁且很小）。
 每项独立 commit + push，等 CI 绿再开下一项。
 
@@ -13,10 +13,10 @@
 - **EVAL-01[~]** — `eval/cases-heldout.ts` 24×`ho-*`；`AB_SUITE=heldout`；nightly/release 六件套已切 held-out。
   research `eval/cases.ts` **不是** held-out；本会话未为追分改 prompt。
 - **OBS-01[~]** — `src/trace.ts` + `trace.jsonl`；`GET /api/runs/:id/trace` 脱敏导出。
-- **RUN-01[~]** — ADR-003 + `src/run-state.ts` Phase 1 内核（未落盘/未接线）。
+- **RUN-01[~]** — ADR-003 + 内核 + **Web `state.json` 接线**（plan/execute/approval/finalize；崩溃收口；`sameRunResume:false`）。
 
-**下一刀**：把 `transitionRunState` 接到 Web `pushEvent`/plan/finalize，写 `state.json`（ADR Phase 1 清单 2–3）。
-MEM-01 / MODEL-01b 本会话搁置。
+**下一刀**：CI 绿后若有余量再开 MEM-01；否则停。MODEL-01b 仍搁置。
+RUN-01 残余：同 run 热恢复 / toolTx / CLI 对等 / 预算与 grant 审计进 state。
 
 以下为历史交接页（2026-08-08 收工），仍有参考价值；新开工优先看 `docs/08`。
 

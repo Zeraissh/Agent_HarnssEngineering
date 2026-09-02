@@ -4584,6 +4584,88 @@ describe("B2 · 运行历史落盘", () => {
     expect(historyKeepCount({ AGENT_RUN_HISTORY_KEEP: "abc" })).toBe(DEFAULT_HISTORY_KEEP);
     expect(historyKeepCount({ AGENT_RUN_HISTORY_KEEP: "0" })).toBe(DEFAULT_HISTORY_KEEP);
   });
+
+  it("RUN-01：活 run 写 state.json；列表暴露 durablePhase 且 sameRunResume=false", async () => {
+    dir = await mkdtemp(join(tmpdir(), "history-state-"));
+    await boot({
+      modelClient: new FakeModelClient([fakeMessage([textBlock("done")], "end_turn")]),
+      tools: [autoTool("noop")],
+      workdir: process.cwd(),
+      history: dir,
+    });
+    const { runId } = (await (await post("/api/runs", { task: "state me", verify: false })).json()) as {
+      runId: string;
+    };
+    await waitForDone(base, runId);
+    const list = (await (await fetch(`${base}/api/runs`)).json()) as any[];
+    const row = list.find((r) => r.runId === runId);
+    expect(row.sameRunResume).toBe(false);
+    expect(row.durablePhase).toBe("executing"); // 可追问的 completed 保持 executing
+    expect(row.durableRecovery).toBe("fork_from_checkpoint");
+    const statePath = join(dir, runId, "state.json");
+    const state = JSON.parse(await readFile(statePath, "utf8"));
+    expect(state.phase).toBe("executing");
+    expect(state.runId).toBe(runId);
+    expect(state.segmentSource).toBe("main");
+  });
+
+  it("RUN-01：崩溃档案(meta=running)恢复后 phase=interrupted，不冒充可同 run 续跑", async () => {
+    dir = await mkdtemp(join(tmpdir(), "history-crash-"));
+    const runDir = join(dir, "crash-1");
+    await mkdir(runDir, { recursive: true });
+    await writeFile(
+      join(runDir, "meta.json"),
+      JSON.stringify({
+        version: 1,
+        runId: "crash-1",
+        task: "崩了",
+        status: "running",
+        verify: false,
+        createdAt: 1000,
+        finishedAt: null,
+        packName: null,
+        mode: "single",
+        effort: null,
+        rubric: null,
+        workdir: null,
+        conversationTurn: 1,
+        planGate: false,
+        planDecision: null,
+        mainStopReason: null,
+        outcome: null,
+      }),
+      "utf8",
+    );
+    await writeFile(
+      join(runDir, "state.json"),
+      JSON.stringify({
+        version: 1,
+        runId: "crash-1",
+        phase: "executing",
+        updatedAt: 1001,
+        plan: null,
+        segmentIndex: 0,
+        segmentSource: "main",
+        verificationRound: 0,
+        pendingApprovalIds: [],
+        pendingQuestionIds: [],
+        rootRunId: null,
+        continuedFrom: null,
+      }),
+      "utf8",
+    );
+    await writeFile(join(runDir, "events.jsonl"), "", "utf8");
+    await boot({ modelClient: new FakeModelClient([]), tools: [], workdir: process.cwd(), history: dir });
+    const list = (await (await fetch(`${base}/api/runs`)).json()) as any[];
+    const row = list.find((r) => r.runId === "crash-1");
+    expect(row.archived).toBe(true);
+    expect(row.status).toBe("done");
+    expect(row.durablePhase).toBe("interrupted");
+    expect(row.sameRunResume).toBe(false);
+    expect(row.continuationMode).not.toBe("same");
+    const recovered = JSON.parse(await readFile(join(runDir, "state.json"), "utf8"));
+    expect(recovered.phase).toBe("interrupted");
+  });
 });
 
 

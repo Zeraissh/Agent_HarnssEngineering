@@ -4,12 +4,15 @@
  *
  * 四个判据（动手前定死，与 docs/06-backlog.md B2 条目一致）：
  *
- * ① **存什么**：三个文件——`meta.json`（列表所需元数据快照，整写）、
+ * ① **存什么**：四个文件——`meta.json`（列表所需元数据快照，整写）、
  *    `events.jsonl`（可重放事件流，逐条追加；界面的全部状态都由重放长出来，
  *    这正是 V-05 重放幂等锁存在的原因）、`transcript.jsonl`（逐段会话正文，
  *    可达数 MB/段，与事件流分开、按需读——当初把 transcript 从 SSE 摘出去
- *    的理由在磁盘上同样成立）。活对象一概不存：loop/abort/SSE 客户端存不了，
- *    挂起审批的 respond 回调也存不了——收尾时它们已被宣告过期并落进事件流。
+ *    的理由在磁盘上同样成立）、`state.json`（RUN-01 / ADR-003 编排游标：
+ *    phase / plan DAG / segment / 挂起审批 id——**不是**第二套事件流；
+ *    Phase 1 不恢复 active grant、不冒充同 run 热续跑）。活对象一概不存：
+ *    loop/abort/SSE 客户端存不了，挂起审批的 respond 回调也存不了——收尾时
+ *    它们已被宣告过期并落进事件流。
  * ② **存哪**：`<root>/<runId>/` 每 run 一个目录。删一条 = 删一个目录，
  *    root 缺省 `<cwd>/.agent-run-history`，`AGENT_RUN_HISTORY_DIR` 可覆盖。
  * ③ **存多久**：只保留最近 DEFAULT_HISTORY_KEEP 个 run（启动与每次收尾后
@@ -17,15 +20,22 @@
  * ④ **怎样恢复续跑**：归档本身保持只读；每个已完成 main 段把 transcript 段号、
  *    ContextManager 水位和共享预算快照写进 meta。重启后从该检查点**派生新 run**，
  *    新 run 使用当前宿主的模型/工具/策略并显式记录 lineage，不冒充原进程无缝继续。
- *    没有检查点的旧档案仍只能回看。
+ *    没有检查点的旧档案仍只能回看。`state.json` 只回答"崩在哪一相"，续跑仍走 fork。
  *
  * 写失败不打断正在跑的 run，但必须通过健康状态显式上报；生产宿主不能把
- * “任务完成但历史全丢了”伪装成健康。meta 采用同目录临时文件 + rename，避免
+ * “任务完成但历史全丢了”伪装成健康。meta/state 采用同目录临时文件 + rename，避免
  * 进程中断留下半截 JSON。
  */
 import { appendFile, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
-import { join, resolve } from "node:path";
+import { join, resolve, dirname } from "node:path";
+import {
+  RUN_PHASES,
+  RUN_STATE_VERSION,
+  type DurablePlanSnapshot,
+  type DurableRunState,
+  type RunPhase,
+} from "../src/run-state.js";
 import type { SharedRunBudget } from "../src/types.js";
 
 async function renameWithTransientRetry(source: string, target: string): Promise<void> {
@@ -40,6 +50,18 @@ async function renameWithTransientRetry(source: string, target: string): Promise
       // 不能先 rm target——那会制造一个断电时 meta 完全不存在的窗口。
       await new Promise((done) => setTimeout(done, 10 * 2 ** attempt));
     }
+  }
+}
+
+/** meta/state 共用的整写 + rename；prefix 只进临时文件名，避免互相踩。 */
+async function writeJsonAtomic(target: string, value: unknown, prefix: string): Promise<void> {
+  const temporary = join(dirname(target), `.${prefix}.${process.pid}.${randomUUID()}.tmp`);
+  try {
+    await writeFile(temporary, JSON.stringify(value), "utf8");
+    await renameWithTransientRetry(temporary, target);
+  } catch (error) {
+    await rm(temporary, { force: true }).catch(() => {});
+    throw error;
   }
 }
 
@@ -168,15 +190,17 @@ export class RunHistoryWriter {
   /** 整写 meta.json；rename 的源/目标同目录，因此不会跨卷退化成复制。 */
   writeMeta(meta: ArchivedMeta): void {
     this.enqueue(async () => {
-      const target = join(this.dir, "meta.json");
-      const temporary = join(this.dir, `.meta.${process.pid}.${randomUUID()}.tmp`);
-      try {
-        await writeFile(temporary, JSON.stringify(meta), "utf8");
-        await renameWithTransientRetry(temporary, target);
-      } catch (error) {
-        await rm(temporary, { force: true }).catch(() => {});
-        throw error;
-      }
+      await writeJsonAtomic(join(this.dir, "meta.json"), meta, "meta");
+    });
+  }
+
+  /**
+   * RUN-01：整写 state.json（编排游标）。与 meta 同链保序——调用方须先
+   * appendEvent 再 writeState（ADR-003 写序），本 writer 的 enqueue 保证落盘顺序。
+   */
+  writeState(state: DurableRunState): void {
+    this.enqueue(async () => {
+      await writeJsonAtomic(join(this.dir, "state.json"), state, "state");
     });
   }
 
@@ -256,6 +280,81 @@ export async function readArchivedTranscript(dir: string): Promise<unknown[]> {
 /** OBS-01：读 trace.jsonl（缺文件 = 空，旧档案无 trace） */
 export async function readArchivedTrace(dir: string): Promise<unknown[]> {
   return readJsonLines(join(dir, "trace.jsonl"));
+}
+
+/**
+ * RUN-01：读 state.json。坏文件/缺文件/版本不认 → null（同 meta 跳过纪律）。
+ * 变异锁：丢掉 `phase` 必须返回 null，不能静默当成可恢复游标。
+ */
+export async function readArchivedState(dir: string): Promise<DurableRunState | null> {
+  try {
+    const raw = JSON.parse(await readFile(join(dir, "state.json"), "utf8")) as unknown;
+    return parseDurableRunState(raw);
+  } catch {
+    return null;
+  }
+}
+
+/** 校验 DurableRunState 形状；任何必填字段缺失即 null。 */
+export function parseDurableRunState(raw: unknown): DurableRunState | null {
+  if (!raw || typeof raw !== "object") return null;
+  const o = raw as Record<string, unknown>;
+  if (o.version !== RUN_STATE_VERSION) return null;
+  if (typeof o.runId !== "string" || o.runId === "") return null;
+  if (typeof o.phase !== "string" || !(RUN_PHASES as readonly string[]).includes(o.phase)) return null;
+  if (typeof o.updatedAt !== "number" || !Number.isFinite(o.updatedAt)) return null;
+  if (typeof o.segmentIndex !== "number" || !Number.isInteger(o.segmentIndex) || o.segmentIndex < 0) {
+    return null;
+  }
+  if (o.segmentSource !== null && typeof o.segmentSource !== "string") return null;
+  if (typeof o.verificationRound !== "number" || !Number.isInteger(o.verificationRound)) return null;
+  if (!Array.isArray(o.pendingApprovalIds) || !o.pendingApprovalIds.every((x) => typeof x === "string")) {
+    return null;
+  }
+  if (!Array.isArray(o.pendingQuestionIds) || !o.pendingQuestionIds.every((x) => typeof x === "string")) {
+    return null;
+  }
+  if (o.rootRunId !== null && typeof o.rootRunId !== "string") return null;
+  if (o.continuedFrom !== null && typeof o.continuedFrom !== "string") return null;
+  const plan = parseDurablePlanSnapshot(o.plan);
+  if (o.plan !== null && plan === null) return null;
+  return {
+    version: RUN_STATE_VERSION,
+    runId: o.runId,
+    phase: o.phase as RunPhase,
+    updatedAt: o.updatedAt,
+    plan,
+    segmentIndex: o.segmentIndex,
+    segmentSource: o.segmentSource as string | null,
+    verificationRound: o.verificationRound,
+    pendingApprovalIds: [...o.pendingApprovalIds],
+    pendingQuestionIds: [...o.pendingQuestionIds],
+    rootRunId: (o.rootRunId as string | null) ?? null,
+    continuedFrom: (o.continuedFrom as string | null) ?? null,
+  };
+}
+
+function parseDurablePlanSnapshot(raw: unknown): DurablePlanSnapshot | null {
+  if (raw === null || raw === undefined) return null;
+  if (!raw || typeof raw !== "object") return null;
+  const o = raw as Record<string, unknown>;
+  if (o.protocol !== "freeform" && o.protocol !== "structured" && o.protocol !== "fixed") return null;
+  if (!Array.isArray(o.taskIds) || !o.taskIds.every((x) => typeof x === "string")) return null;
+  if (!o.edges || typeof o.edges !== "object") return null;
+  const edges: Record<string, string[]> = {};
+  for (const [from, tos] of Object.entries(o.edges as Record<string, unknown>)) {
+    if (!Array.isArray(tos) || !tos.every((x) => typeof x === "string")) return null;
+    edges[from] = [...tos];
+  }
+  if (o.approvedAt !== null && typeof o.approvedAt !== "number") return null;
+  if (o.rejectedAt !== null && typeof o.rejectedAt !== "number") return null;
+  return {
+    protocol: o.protocol,
+    taskIds: [...o.taskIds],
+    edges,
+    approvedAt: o.approvedAt as number | null,
+    rejectedAt: o.rejectedAt as number | null,
+  };
 }
 
 async function readJsonLines(file: string): Promise<unknown[]> {

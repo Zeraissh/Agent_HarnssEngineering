@@ -1,7 +1,8 @@
 /**
  * RUN-01 Phase 1 — Durable RunState 纯函数内核（见 docs/adr/ADR-003）。
  *
- * 本文件只锁定 phase 迁移与快照形状；Web/CLI 接线与 state.json 落盘是后续提交。
+ * 本文件锁定 phase 迁移与快照形状；Web 宿主经 `ui/history.ts`（state.json）
+ * + `ui/server.ts`（plan/execute/approval/finalize 接线）落盘。CLI 对等与
  * 热恢复 / toolTx / 跨重启 grant **不在** Phase 1。
  */
 export const RUN_STATE_VERSION = 1 as const;
