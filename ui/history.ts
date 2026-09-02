@@ -188,6 +188,11 @@ export class RunHistoryWriter {
     this.enqueue(() => appendFile(join(this.dir, "transcript.jsonl"), `${JSON.stringify(segment)}\n`, "utf8"));
   }
 
+  /** OBS-01：追加一条 trace span（与 events 同链保序）。 */
+  appendTraceSpan(span: unknown): void {
+    this.enqueue(() => appendFile(join(this.dir, "trace.jsonl"), `${JSON.stringify(span)}\n`, "utf8"));
+  }
+
   /**
    * 在写入链上排一个自定义步骤：保证它在此前全部写落盘之后才执行。
    * 收尾后的修剪必须走这里——fire-and-forget 的修剪会与本 run 的 meta 写
@@ -246,6 +251,11 @@ export async function readArchivedEvents(dir: string): Promise<unknown[]> {
 /** 读一个档案的会话正文（逐段） */
 export async function readArchivedTranscript(dir: string): Promise<unknown[]> {
   return readJsonLines(join(dir, "transcript.jsonl"));
+}
+
+/** OBS-01：读 trace.jsonl（缺文件 = 空，旧档案无 trace） */
+export async function readArchivedTrace(dir: string): Promise<unknown[]> {
+  return readJsonLines(join(dir, "trace.jsonl"));
 }
 
 async function readJsonLines(file: string): Promise<unknown[]> {

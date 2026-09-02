@@ -58,10 +58,22 @@ import {
   pruneHistory,
   readArchivedEvents,
   readArchivedTranscript,
+  readArchivedTrace,
   type ArchivedApprovalGrant,
   type ArchivedCheckpoint,
   type ArchivedMeta,
 } from "./history.js";
+import {
+  endSpan,
+  exportRedactedTrace,
+  hashToolSchemas,
+  playbackSummary,
+  projectTurnEventToSpans,
+  resolveGitCommit,
+  startSpan,
+  type TraceSpan,
+} from "../src/trace.js";
+import { readFileSync } from "node:fs";
 import { EFFORT_LEVELS } from "../src/types.js";
 import type {
   ModelClient,
@@ -339,6 +351,11 @@ interface StoredRun {
   /** 仅供刚派生的新 run 装配首轮；完成后 checkpoint 会从真实 done 事件重建。 */
   resumeBudget?: SharedRunBudget;
   initialContextInputTokens?: number;
+  // ---- OBS-01 trace ----
+  /** 本 run 根 span id；子 span 挂在其下 */
+  traceRunSpanId?: string;
+  /** tool_call → tool_result 开闭配对 */
+  openToolSpans?: Map<string, TraceSpan>;
 }
 
 interface PendingPlan {
@@ -702,6 +719,18 @@ const MIME: Record<string, string> = {
   ".woff": "font/woff",
   ".ttf": "font/ttf",
 };
+
+function readHarnessVersion(): string {
+  try {
+    const pkgPath = join(dirname(fileURLToPath(import.meta.url)), "..", "package.json");
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as { version?: string };
+    return typeof pkg.version === "string" ? pkg.version : "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+}
+
+const HARNESS_VERSION = readHarnessVersion();
 
 class RequestBodyTooLargeError extends Error {}
 
@@ -2308,6 +2337,21 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     // L6 运行台账：按角色累加工具调用。放在这里而不是收尾时回扫 run.events，
     // 是因为续跑会让事件缓冲跨越多段，回扫容易把上一段的数重复计进来。
     if (event.type === "tool_call") tallyToolCall(run.toolTally, source, event.name);
+    // OBS-01：事件旁路投影 span（失败不打断 run）
+    try {
+      if (!run.openToolSpans) run.openToolSpans = new Map();
+      const spans = projectTurnEventToSpans({
+        runId: run.id,
+        source,
+        event,
+        parentSpanId: run.traceRunSpanId ?? null,
+        openTools: run.openToolSpans,
+        ts: sseEvent.ts,
+      });
+      for (const span of spans) run.archiveWriter?.appendTraceSpan(span);
+    } catch {
+      // 仪器纪律：trace 投影失败不得影响执行
+    }
     // 核查撞轮次上限要留痕：案例 #8 的三层归因里，"预算不够"是第二嫌疑，
     // 而此前它只在日志里一闪而过，事后无从统计
     if (event.type === "done" && isVerifierSource(source) && event.result.stopReason === "max_turns") {
@@ -2568,6 +2612,31 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         stopReason: endInfo.mainStopReason ?? null,
         durationMs: run.finishedAt - run.createdAt,
       });
+    }
+
+    // OBS-01：关闭 run 根 span
+    if (run.traceRunSpanId && run.archiveWriter) {
+      try {
+        const closed = endSpan(
+          startSpan({
+            kind: "run",
+            name: "run",
+            runId: run.id,
+            spanId: run.traceRunSpanId,
+            ts: run.createdAt,
+            attrs: {},
+          }),
+          endInfo.outcome === "error" ? "error" : "ok",
+          {
+            outcome: endInfo.outcome,
+            stopReason: endInfo.mainStopReason ?? null,
+          },
+          run.finishedAt,
+        );
+        run.archiveWriter.appendTraceSpan(closed);
+      } catch {
+        // ignore
+      }
     }
 
     // V-07：成本必须用 executionUsage（全部执行轮合计，含被否掉的中间轮）。
@@ -3775,6 +3844,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     | { type: "runsList" }
     | { type: "lifecycleStream" }
     | { type: "transcript"; runId: string }
+    | { type: "trace"; runId: string }
     | { type: "inspectPaths"; runId: string }
     | { type: "artifact"; runId: string; path: string; download: boolean }
     | { type: "reveal"; runId: string }
@@ -3814,6 +3884,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     const transcriptMatch = method === "GET" && url.match(/^\/api\/runs\/([^/]+)\/transcript$/);
     if (transcriptMatch) {
       return { type: "transcript", runId: transcriptMatch[1]! };
+    }
+    const traceMatch = method === "GET" && url.match(/^\/api\/runs\/([^/]+)\/trace$/);
+    if (traceMatch) {
+      return { type: "trace", runId: traceMatch[1]! };
     }
 
     const inspectPathsMatch =
@@ -4299,6 +4373,32 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         });
       }
 
+      case "trace": {
+        const run = runs.get(route.runId);
+        if (!run) return notFound(res, `Run not found: ${route.runId}`);
+        await hydrateArchive(run);
+        const dir = run.archiveDir ?? (historyRoot ? join(historyRoot, run.id) : null);
+        let spans: TraceSpan[] = [];
+        if (dir) {
+          // flush in-flight writer so just-finished runs expose their last spans
+          if (run.archiveWriter) await run.archiveWriter.flush();
+          const rows = await readArchivedTrace(dir);
+          spans = rows.filter(
+            (r): r is TraceSpan =>
+              !!r &&
+              typeof r === "object" &&
+              (r as TraceSpan).version === 1 &&
+              typeof (r as TraceSpan).spanId === "string",
+          ) as TraceSpan[];
+        }
+        const exported = exportRedactedTrace(spans);
+        return json(res, 200, {
+          runId: run.id,
+          ...exported,
+          playback: playbackSummary(spans),
+        });
+      }
+
       /**
        * 把模型正文里的“疑似路径”升级成链接之前，先做一次只读确认。
        *
@@ -4618,6 +4718,34 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         if (historyRoot) {
           run.archiveWriter = createArchiveWriter(id);
           persistMeta(run);
+          // OBS-01：run 根 span + 版本指纹（commit/model/pack/tool schema）
+          try {
+            const toolsForHash = [
+              { name: bashTool.name, inputSchema: bashTool.inputSchema },
+              { name: readFileTool.name, inputSchema: readFileTool.inputSchema },
+              { name: writeFileTool.name, inputSchema: writeFileTool.inputSchema },
+            ];
+            const root = startSpan({
+              kind: "run",
+              name: "run",
+              runId: id,
+              ts: run.createdAt,
+              attrs: {
+                harnessVersion: HARNESS_VERSION,
+                gitCommit: resolveGitCommit(),
+                packName: run.packName ?? pack?.name ?? null,
+                model: process.env.AGENT_MODEL ?? null,
+                toolSchemaHash: hashToolSchemas(toolsForHash),
+                mode: run.mode ?? "single",
+                verify,
+              },
+            });
+            run.traceRunSpanId = root.spanId;
+            run.openToolSpans = new Map();
+            run.archiveWriter?.appendTraceSpan(root);
+          } catch {
+            // ignore
+          }
         }
         runs.set(id, run);
         releaseAdmission();

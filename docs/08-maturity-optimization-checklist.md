@@ -102,9 +102,15 @@ OCI 逃逸 canary 由 Linux CI container job 承担（run #33461119575 全绿）
 |---|---|---|---:|---:|---|
 | [ ] | RUN-01 | Durable RunState | 5/5/5 | 10 Gate | 持久化 plan DAG、segment、审批/提问、verifier/rework、预算与 tool transaction；进程重启从明确状态恢复 |
 | [ ] | RUN-02 | 恢复与故障注入 | 5/5/4 | 20 | 在 model call、tool prepared/committed、审批等待和历史写入各点注入崩溃；不丢状态、不重复副作用、可安全 fork |
-| [ ] | OBS-01 | 端到端 trace | 5/4/4 | 18 | run→segment→model/tool spans；记录 commit、模型、工具/schema/pack 版本与输入输出哈希；支持脱敏导出和离线 playback |
+| [~] | OBS-01 | 端到端 trace | 5/4/4 | 18 | run→segment→model/tool spans；记录 commit、模型、工具/schema/pack 版本与输入输出哈希；支持脱敏导出和离线 playback。**已落地（2026-09-02）**：`src/trace.ts` + `trace.jsonl` 旁路（扩展 history，无 OTel）；Web `GET /api/runs/:id/trace` 脱敏导出 + playback 摘要；事件投影 tool/model/segment。**仍开**：CLI 同等接线、完整 model span 起止（非 done 摘要）、跨进程统一 collector |
 | [ ] | OBS-02 | 成本、延迟与 SLO | 4/4/3 | 24 | TTFT、模型/工具延迟、排队/审批等待、重试/错误、USD 成本和 provider/model/pack 归因；持久预算账与 p50/p95/p99 仪表盘 |
 | [ ] | OPS-01 | 备份、恢复与升级演练 | 5/4/4 | 18 | 定义并验证 RPO/RTO；完成异地加密备份恢复、版本迁移、回滚及在途任务升级演练 |
+
+### Phase 2 实施记录（进行中）
+
+| ID | 已取得证据 | 残余边界 |
+|---|---|---|
+| OBS-01 | `src/trace.ts`：span 模型 + redact/hash + TurnEvent 投影 + JSONL playback；`RunHistoryWriter.appendTraceSpan` → `trace.jsonl`；Web 建 run 写根 span（harness/git/model/pack/toolSchemaHash），`pushEvent` 投影 tool/model/segment，收尾关根 span；`GET /api/runs/:id/trace` 返回脱敏导出 + playback 摘要。`test/trace.test.ts` 7 测。未引入 OTel | CLI 未接线；model span 仍是 done/api_retry/fallback 摘要而非逐 send 起止；无跨进程 collector；UI 未渲染 trace 面 |
 
 ## Phase 3：动态协作与扩展平台
 
@@ -172,8 +178,8 @@ npx tsc --noEmit                            passed
 6. **残余风险**：未覆盖平台、TOCTOU、外部系统或人工验收项。
 
 当前执行顺序（2026-09-02 成熟度第二波，单操作员形态）：
-`EVAL-03c → EVAL-01 held-out（仪器）→ OBS-01 → RUN-01（先 ADR-003）→ MEM-01`。
-EVAL-03c 与 EVAL-01 仪器已落地（EVAL-01 保持 `[~]`：缺全量真实矩阵/活 MCP）。
+`EVAL-03c → EVAL-01 held-out（仪器）→ OBS-01[~] → RUN-01（先 ADR-003）→ MEM-01`。
+EVAL-03c / EVAL-01 仪器 / OBS-01 旁路已落地；OBS-01 保持 `[~]`（缺 CLI/完整 model span）。
 本波**不提前** GOV-*；SAFE-05 Phase 2B / SAFE-06 保持 partial，除非发现已解锁且很小。
 并行可继续：`A1 攒 §2.1 样本（ledger:samples）`（与质量门不冲突）。
 若目标改公网多人，`GOV-01/02/03` 必须提前到 `RUN-01` 之后、任何公开上线之前。

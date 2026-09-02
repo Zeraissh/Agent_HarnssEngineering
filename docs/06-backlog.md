@@ -12,9 +12,10 @@
 - **EVAL-03c** — release 质量/成本/延迟门 + 地板收紧（证据 nightly #33646201722 6/6）。
 - **EVAL-01[~]** — `eval/cases-heldout.ts` 24×`ho-*`；`AB_SUITE=heldout`；nightly/release 六件套已切 held-out。
   research `eval/cases.ts` **不是** held-out；本会话未为追分改 prompt。
+- **OBS-01[~]** — `src/trace.ts` + `trace.jsonl`；`GET /api/runs/:id/trace` 脱敏导出。
 
-**下一刀**：OBS-01 端到端 trace（run→segment→model/tool spans + 脱敏导出）。
-MODEL-01b / MEM-01 仅在更前项绿且有余力时做。
+**下一刀**：RUN-01 — 先写 `docs/adr/ADR-003-durable-run-state.md`，再做 phase-1 可恢复状态。
+MODEL-01b / MEM-01 本会话搁置（优先 OBS/RUN）。
 
 以下为历史交接页（2026-08-08 收工），仍有参考价值；新开工优先看 `docs/08`。
 
