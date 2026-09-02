@@ -77,6 +77,7 @@ npm run test:coverage                                             # 覆盖率 + 
 npm run test:mutation-smoke                                       # 8 个关键变异必须变红（TEST-01a）
 npm run eval:stats                                                # A/B + 台账统计报告（EVAL-02）
 npm run build && npm run eval:deterministic                        # 确定性场景门（EVAL-03a）
+npm run eval:compare-baseline                                     # nightly 基线比对（EVAL-03b）
 ```
 
 `npm run eval:deterministic` 是 PR 级质量门：12 个场景跑在**编译产物** `dist/src/cli.js` 上，
@@ -87,6 +88,10 @@ npm run build && npm run eval:deterministic                        # 确定性�
 事实（产物字节、台账字段、模型请求条数），报告落 `eval/deterministic-report.{json,md}`。
 `--filter <子串>` 只跑部分场景，`--keep` 保留临时工作目录便于排障。因为它测 dist，
 **必须先 `npm run build`**。
+
+Nightly（`.github/workflows/nightly.yml`）跑真实 provider 小子集（6 用例 × baseline × 1），
+凭据来自 `ANTHROPIC_API_KEY` secret 与 `ANTHROPIC_BASE_URL`/`AGENT_MODEL` variables；
+`AB_TOKEN_CAP` 触顶即停（exit 2），再与 `eval/baselines/nightly.json` 比对通过率/成本/延迟。
 
 真实 CLI/Web 宿主默认要求 `finish_task` 结构化收尾，`end_turn` 不再直接等于完成。
 长任务可用以下总账与恢复参数（PowerShell）：

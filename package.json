@@ -28,6 +28,7 @@
     "ledger:samples": "tsx --env-file-if-exists=.env eval/ledger-samples.ts",
     "eval:stats": "tsx --env-file-if-exists=.env eval/stats.ts",
     "eval:deterministic": "tsx eval/deterministic.ts",
+    "eval:compare-baseline": "tsx eval/compare-baseline-cli.ts",
     "build": "node scripts/clean-dist.mjs && tsc -p tsconfig.build.json && node scripts/copy-ui-assets.mjs",
     "start": "node --env-file-if-exists=.env dist/ui/serve.js",
     "pack:check": "npm run build && node scripts/check-pack.mjs",

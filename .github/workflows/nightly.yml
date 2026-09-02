@@ -1,0 +1,68 @@
+# EVAL-03b — nightly 真实 provider 质量门。
+# 凭据：ANTHROPIC_API_KEY（secret）；端点与模型：vars。
+# 成本防线：AB_TOKEN_CAP 触顶 → ab exit 2；基线比对失败 → exit 1。
+
+name: Nightly eval
+
+on:
+  schedule:
+    # UTC 16:00 ≈ 北京时间次日 00:00
+    - cron: "0 16 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-eval
+  cancel-in-progress: false
+
+jobs:
+  nightly-eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      ANTHROPIC_BASE_URL: ${{ vars.ANTHROPIC_BASE_URL }}
+      AGENT_MODEL: ${{ vars.AGENT_MODEL }}
+      AB_ARMS: baseline
+      AB_CASES: write-basic,sum-numbers,read-extract,bash-count,json-field,filter-lines
+      AB_REPS: "1"
+      AB_TOKEN_CAP: "400000"
+      AB_REPORT: eval/ab-report-nightly.md
+      COMPARE_OUT: eval/nightly-compare.json
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Require credentials
+        run: |
+          test -n "$ANTHROPIC_API_KEY" || { echo "missing secret ANTHROPIC_API_KEY"; exit 1; }
+          test -n "$ANTHROPIC_BASE_URL" || { echo "missing var ANTHROPIC_BASE_URL"; exit 1; }
+          test -n "$AGENT_MODEL" || { echo "missing var AGENT_MODEL"; exit 1; }
+          echo "model=$AGENT_MODEL base=$ANTHROPIC_BASE_URL"
+      - name: Clear prior ab-log
+        run: rm -f eval/ab-log.jsonl
+      - name: Run A/B subset
+        run: npm run ab
+      - name: Stats report
+        if: always()
+        run: npm run eval:stats
+      - name: Compare nightly baseline
+        run: npm run eval:compare-baseline
+      - name: Upload nightly artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nightly-eval
+          path: |
+            eval/ab-report-nightly.md
+            eval/ab-log.jsonl
+            eval/stats-report.md
+            eval/stats-report.json
+            eval/nightly-compare.json
+          if-no-files-found: warn
+          retention-days: 30

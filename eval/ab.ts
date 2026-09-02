@@ -5,6 +5,7 @@
  *   AB_CASES=write-basic,sum-numbers   只跑指定用例（默认全部）
  *   AB_REPS=1                    每个(用例,臂)重复次数（默认 1；>1 用于看方差）
  *   AB_REPORT=eval/ab-report.md  报告输出路径（默认覆盖 eval/ab-report.md）
+ *   AB_TOKEN_CAP=N               累计 token 上限；触顶即停并 exit 2（EVAL-03b 成本防线）
  *   AB_VERIFIER_MODEL=…          verified-strong 臂的核查模型；配套可选：
  *   AB_VERIFIER_PROVIDER / AB_VERIFIER_BASE_URL / AB_VERIFIER_API_KEY
  *     （缺省沿用执行者的端点配置；未设 AB_VERIFIER_MODEL 时自动跳过 strong 臂）
@@ -24,6 +25,7 @@ import type { Verdict } from "../src/verifier.js";
 import type { AgentConfig, AgentRunResult, ModelClient } from "../src/types.js";
 import { getArms, type Arm } from "./arms.js";
 import { cases, type EvalCase } from "./cases.js";
+import { parseTokenCap, wouldExceedOrMeetCap } from "./token-cap.js";
 
 // 2026-07-31 起（rule-precedence 采纳,见 ab-report-rulefirst.md）baseline 含成文口径纪律——
 // 与更早报告横向比较时注意这是新的 baseline 时代
@@ -64,6 +66,7 @@ async function main(): Promise<void> {
   const workdir = process.cwd();
   const model = process.env.AGENT_MODEL ?? "claude-opus-4-8";
   const reps = process.env.AB_REPS ? Number(process.env.AB_REPS) : 1;
+  const tokenCap = parseTokenCap(process.env.AB_TOKEN_CAP);
   const caseFilter = process.env.AB_CASES?.split(",").map((s) => s.trim());
   const suite = caseFilter ? cases.filter((c) => caseFilter.includes(c.id)) : cases;
 
@@ -118,10 +121,13 @@ async function main(): Promise<void> {
   for (const c of suite) grid[c.id] = {};
 
   console.log(
-    `A/B: ${suite.length} 用例 × ${arms.length} 臂 × ${reps} 次 = ${suite.length * arms.length * reps} runs (model=${model})\n`,
+    `A/B: ${suite.length} 用例 × ${arms.length} 臂 × ${reps} 次 = ${suite.length * arms.length * reps} runs (model=${model}${tokenCap != null ? `, AB_TOKEN_CAP=${tokenCap}` : ""})\n`,
   );
 
-  for (const evalCase of suite) {
+  let tokensSpent = 0;
+  let hitTokenCap = false;
+
+  outer: for (const evalCase of suite) {
     for (const arm of arms) {
       // fixed-* 臂需要用例自带参考拆解；没带就在该用例上跳过（cell.reps=0 → 报告渲染 "—"）
       if (arm.planned?.useFixedPlan && !evalCase.plan) {
@@ -129,8 +135,14 @@ async function main(): Promise<void> {
         console.log(`[skip] ${evalCase.id} / ${arm.name}: 用例未提供参考拆解（EvalCase.plan）`);
         continue;
       }
-      const cell: Cell = { pass: 0, reps, turns: 0, tokens: 0, wallMs: 0 };
+      const cell: Cell = { pass: 0, reps: 0, turns: 0, tokens: 0, wallMs: 0 };
       for (let r = 0; r < reps; r++) {
+        if (wouldExceedOrMeetCap(tokensSpent, 0, tokenCap) && tokensSpent > 0) {
+          // 上一 run 已触顶：不再开新 run
+          hitTokenCap = true;
+          grid[evalCase.id]![arm.name] = cell;
+          break outer;
+        }
         // 每个 run 前清空产出目录——保证判定只看本次 run 的产物
         await rm(path.join(workdir, "eval-out"), { recursive: true, force: true });
         await mkdir(path.join(workdir, "eval-out"), { recursive: true });
@@ -145,6 +157,8 @@ async function main(): Promise<void> {
           arm.planned?.useFixedPlan ? evalCase.plan : undefined,
           arm.planned?.strongPlanner ? plannerProvider : undefined,
         );
+        tokensSpent += tokens;
+        cell.reps += 1;
         cell.turns += turns;
         cell.tokens += tokens;
         cell.wallMs += wallMs;
@@ -197,12 +211,28 @@ async function main(): Promise<void> {
           }) + "\n",
           "utf8",
         );
+        if (wouldExceedOrMeetCap(tokensSpent, 0, tokenCap)) {
+          hitTokenCap = true;
+          console.log(`[cap] AB_TOKEN_CAP=${tokenCap} reached (spent=${tokensSpent}); stopping`);
+          grid[evalCase.id]![arm.name] = cell;
+          break outer;
+        }
       }
       grid[evalCase.id]![arm.name] = cell;
       const c = grid[evalCase.id]![arm.name]!;
+      const denom = Math.max(1, c.reps);
       console.log(
-        `[${evalCase.id} / ${arm.name}] ${c.pass}/${c.reps} pass, ${(c.turns / c.reps).toFixed(1)} turns, ${Math.round(c.tokens / c.reps)} tok`,
+        `[${evalCase.id} / ${arm.name}] ${c.pass}/${c.reps} pass, ${(c.turns / denom).toFixed(1)} turns, ${Math.round(c.tokens / denom)} tok`,
       );
+    }
+  }
+
+  // 未跑到的格子补空 cell，避免 renderReport 读 undefined
+  for (const c of suite) {
+    for (const a of arms) {
+      if (!grid[c.id]![a.name]) {
+        grid[c.id]![a.name] = { pass: 0, reps: 0, turns: 0, tokens: 0, wallMs: 0 };
+      }
     }
   }
 
@@ -210,6 +240,10 @@ async function main(): Promise<void> {
   const report = renderReport(model, reps, suite, arms, grid, verifierModelName, plannerModelName);
   await writeFile(path.join(workdir, reportPath), report, "utf8");
   console.log(`\n报告已写入 ${reportPath}`);
+  if (hitTokenCap) {
+    console.error(`AB_TOKEN_CAP hit (spent=${tokensSpent}, cap=${tokenCap}); matrix incomplete`);
+    process.exit(2);
+  }
 }
 
 async function runArm(

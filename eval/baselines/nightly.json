@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "cases": [
+    "write-basic",
+    "sum-numbers",
+    "read-extract",
+    "bash-count",
+    "json-field",
+    "filter-lines"
+  ],
+  "arms": ["baseline"],
+  "minPassRate": 0.8,
+  "caseMinPassRate": {
+    "write-basic": 1,
+    "sum-numbers": 1
+  },
+  "maxTotalTokens": 400000,
+  "maxTotalWallMs": 1800000
+}

@@ -11,6 +11,10 @@
 - TEST-01a — `npm run test:coverage` + `npm run test:mutation-smoke`（8/8 killed）；CI artifact。
 - EVAL-02 — 台账 `error` 分类 + `npm run eval:stats`（Wilson/pass@k/taxonomy）。
 - EVAL-03a — `npm run eval:deterministic`（12 场景跑 `dist/` + mock；CI `deterministic-eval`）。
+- MODEL-01a — `FallbackModelClient` + 熔断；`model_fallback` 事件已接 CLI/Web（链只覆盖主执行者）。
+- EVAL-03b — nightly.yml + Secrets/vars + `AB_TOKEN_CAP` + `eval/baselines/nightly.json` 比对。
+
+**第一波五项已收口。** 下一波候选见 `docs/08` Phase 2（EVAL-01 → OBS-01 → RUN-01 → MEM-01；SAFE-05 2B / GOV-* 仍按单操作员形态搁置）。
 
 以下为历史交接页（2026-08-08 收工），仍有参考价值；新开工优先看 `docs/08`。
 
