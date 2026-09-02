@@ -4602,6 +4602,9 @@ describe("B2 · 运行历史落盘", () => {
     expect(row.sameRunResume).toBe(false);
     expect(row.durablePhase).toBe("executing"); // 可追问的 completed 保持 executing
     expect(row.durableRecovery).toBe("fork_from_checkpoint");
+    // writer 链是异步的：关宿主 flush 后再读盘，避免 waitForDone 与 rename 赛跑
+    await handle!.close();
+    handle = undefined;
     const statePath = join(dir, runId, "state.json");
     const state = JSON.parse(await readFile(statePath, "utf8"));
     expect(state.phase).toBe("executing");
