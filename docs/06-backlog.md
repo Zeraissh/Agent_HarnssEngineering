@@ -3,18 +3,18 @@
 # 交接：从这里接着做（2026-09-02 成熟度第二波）
 
 **进行中**：按 `docs/08-maturity-optimization-checklist.md` Wave 2：
-`EVAL-03c → EVAL-01 held-out → OBS-01 → RUN-01（先 ADR-003）→ MEM-01`。
+`EVAL-03c → EVAL-01 → OBS-01 → RUN-01（先 ADR-003）→ MEM-01`。
 单操作员形态；GOV-* 与 SAFE-05 Phase 2B **本波不做**（除非已解锁且很小）。
 每项独立 commit + push，等 CI 绿再开下一项。
 
 **已落地（含第一波）**：
 - TEST-01a / EVAL-02 / EVAL-03a / MODEL-01a / EVAL-03b — 见 docs/08。
 - **EVAL-03c** — release 质量/成本/延迟门 + 地板收紧（证据 nightly #33646201722 6/6）。
-  `eval/baselines/{nightly,release}.json`；`release.yml` 在 tag 候选上重跑真实子集。
+- **EVAL-01[~]** — `eval/cases-heldout.ts` 24×`ho-*`；`AB_SUITE=heldout`；nightly/release 六件套已切 held-out。
+  research `eval/cases.ts` **不是** held-out；本会话未为追分改 prompt。
 
-**下一刀**：EVAL-01 held-out 任务集（与 in-tree 研究用例分立；本会话创建集时不跟分调 prompt）。
-
-以下为历史交接页（2026-08-08 收工），仍有参考价值；新开工优先看 `docs/08`。
+**下一刀**：OBS-01 端到端 trace（run→segment→model/tool spans + 脱敏导出）。
+MODEL-01b / MEM-01 仅在更前项绿且有余力时做。
 
 以下为历史交接页（2026-08-08 收工），仍有参考价值；新开工优先看 `docs/08`。
 

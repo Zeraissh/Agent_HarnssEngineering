@@ -1,24 +1,24 @@
 {
   "version": 1,
   "cases": [
-    "write-basic",
-    "sum-numbers",
-    "read-extract",
-    "bash-count",
-    "json-field",
-    "filter-lines"
+    "ho-write-marker",
+    "ho-arith-product",
+    "ho-pkg-name",
+    "ho-count-md",
+    "ho-pkg-license",
+    "ho-filter-h2"
   ],
   "arms": ["baseline"],
   "minPassRate": 1,
   "caseMinPassRate": {
-    "write-basic": 1,
-    "sum-numbers": 1,
-    "read-extract": 1,
-    "bash-count": 1,
-    "json-field": 1,
-    "filter-lines": 1
+    "ho-write-marker": 1,
+    "ho-arith-product": 1,
+    "ho-pkg-name": 1,
+    "ho-count-md": 1,
+    "ho-pkg-license": 1,
+    "ho-filter-h2": 1
   },
   "maxTotalTokens": 150000,
   "maxTotalWallMs": 300000,
-  "notes": "EVAL-03c release quality/cost/latency gate. Same floors as nightly after #33646201722 evidence. Release re-runs this subset on the tagged commit (not reuse prior nightly artifact) so the candidate itself is measured. Must not be looser than nightly.json."
+  "notes": "EVAL-01 + EVAL-03c: release quality gate on held-out nightly subset. Must not be looser than nightly.json. Tag candidate re-runs AB_SUITE=heldout."
 }

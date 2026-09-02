@@ -63,8 +63,9 @@ jobs:
         run: rm -f eval/ab-log.jsonl
       - name: Release quality subset (real provider)
         env:
+          AB_SUITE: heldout
           AB_ARMS: baseline
-          AB_CASES: write-basic,sum-numbers,read-extract,bash-count,json-field,filter-lines
+          AB_CASES: ho-write-marker,ho-arith-product,ho-pkg-name,ho-count-md,ho-pkg-license,ho-filter-h2
           AB_REPS: "1"
           AB_TOKEN_CAP: "150000"
           AB_REPORT: eval/ab-report-release.md

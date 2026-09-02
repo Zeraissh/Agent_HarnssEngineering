@@ -3,6 +3,8 @@
  * 用法：npm run ab   （env 同 CLI：AGENT_MODEL / ANTHROPIC_BASE_URL / AGENT_PROVIDER…）
  *   AB_ARMS=baseline,verified   只跑指定臂（默认全部，见 arms.ts）
  *   AB_CASES=write-basic,sum-numbers   只跑指定用例（默认全部）
+ *   AB_SUITE=research|heldout|all      用例集：research=eval/cases.ts（默认可调优面）；
+ *                                      heldout=EVAL-01 冻结面；all=两者并集（id 冲突时 heldout 优先）
  *   AB_REPS=1                    每个(用例,臂)重复次数（默认 1；>1 用于看方差）
  *   AB_REPORT=eval/ab-report.md  报告输出路径（默认覆盖 eval/ab-report.md）
  *   AB_TOKEN_CAP=N               累计 token 上限；触顶即停并 exit 2（EVAL-03b 成本防线）
@@ -25,6 +27,8 @@ import type { Verdict } from "../src/verifier.js";
 import type { AgentConfig, AgentRunResult, ModelClient } from "../src/types.js";
 import { getArms, type Arm } from "./arms.js";
 import { cases, type EvalCase } from "./cases.js";
+import { heldoutCases } from "./cases-heldout.js";
+import { resolveAbSuite } from "./suite.js";
 import { parseTokenCap, wouldExceedOrMeetCap } from "./token-cap.js";
 
 // 2026-07-31 起（rule-precedence 采纳,见 ab-report-rulefirst.md）baseline 含成文口径纪律——
@@ -67,8 +71,13 @@ async function main(): Promise<void> {
   const model = process.env.AGENT_MODEL ?? "claude-opus-4-8";
   const reps = process.env.AB_REPS ? Number(process.env.AB_REPS) : 1;
   const tokenCap = parseTokenCap(process.env.AB_TOKEN_CAP);
-  const caseFilter = process.env.AB_CASES?.split(",").map((s) => s.trim());
-  const suite = caseFilter ? cases.filter((c) => caseFilter.includes(c.id)) : cases;
+  const caseFilter = process.env.AB_CASES?.split(",").map((s) => s.trim()).filter(Boolean);
+  const suiteAll = resolveAbSuite(process.env.AB_SUITE, cases, heldoutCases);
+  const suite = caseFilter ? suiteAll.filter((c) => caseFilter.includes(c.id)) : suiteAll;
+  if (caseFilter && suite.length !== caseFilter.length) {
+    const missing = caseFilter.filter((id) => !suiteAll.some((c) => c.id === id));
+    throw new Error(`AB_CASES unknown id(s) for AB_SUITE=${process.env.AB_SUITE ?? "research"}: ${missing.join(", ")}`);
+  }
 
   // verified-strong 臂的独立核查模型（可指向不同端点）；未配置则跳过该臂
   const verifierModelName = process.env.AB_VERIFIER_MODEL;

@@ -158,7 +158,14 @@ describe("checked-in baselines (EVAL-03c)", () => {
   it("post-evidence floors reject the pre-tighten ceilings", () => {
     const floors: NightlyBaseline = {
       version: 1,
-      cases: ["write-basic", "sum-numbers", "read-extract", "bash-count", "json-field", "filter-lines"],
+      cases: [
+        "ho-write-marker",
+        "ho-arith-product",
+        "ho-pkg-name",
+        "ho-count-md",
+        "ho-pkg-license",
+        "ho-filter-h2",
+      ],
       arms: ["baseline"],
       minPassRate: 1,
       maxTotalTokens: 150_000,
@@ -167,16 +174,16 @@ describe("checked-in baselines (EVAL-03c)", () => {
     // Old loose ceilings (0.8 / 400k / 30min) would have passed a 5/6 + 200k run;
     // new floors must fail both miss and token blow-up.
     const almost = [
-      cell("write-basic", "baseline", 1, 1, 20_000, 5_000),
-      cell("sum-numbers", "baseline", 1, 1, 20_000, 5_000),
-      cell("read-extract", "baseline", 1, 1, 20_000, 5_000),
-      cell("bash-count", "baseline", 1, 1, 20_000, 5_000),
-      cell("json-field", "baseline", 1, 1, 20_000, 5_000),
-      cell("filter-lines", "baseline", 0, 1, 20_000, 5_000),
+      cell("ho-write-marker", "baseline", 1, 1, 20_000, 5_000),
+      cell("ho-arith-product", "baseline", 1, 1, 20_000, 5_000),
+      cell("ho-pkg-name", "baseline", 1, 1, 20_000, 5_000),
+      cell("ho-count-md", "baseline", 1, 1, 20_000, 5_000),
+      cell("ho-pkg-license", "baseline", 1, 1, 20_000, 5_000),
+      cell("ho-filter-h2", "baseline", 0, 1, 20_000, 5_000),
     ];
     expect(compareNightly(almost, floors).ok).toBe(false);
     const bloated = almost.map((c) =>
-      c.caseId === "filter-lines"
+      c.caseId === "ho-filter-h2"
         ? { ...c, pass: 1, tokens: 100_000 }
         : { ...c, tokens: 20_000 },
     );

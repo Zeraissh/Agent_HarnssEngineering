@@ -1,24 +1,24 @@
 {
   "version": 1,
   "cases": [
-    "write-basic",
-    "sum-numbers",
-    "read-extract",
-    "bash-count",
-    "json-field",
-    "filter-lines"
+    "ho-write-marker",
+    "ho-arith-product",
+    "ho-pkg-name",
+    "ho-count-md",
+    "ho-pkg-license",
+    "ho-filter-h2"
   ],
   "arms": ["baseline"],
   "minPassRate": 1,
   "caseMinPassRate": {
-    "write-basic": 1,
-    "sum-numbers": 1,
-    "read-extract": 1,
-    "bash-count": 1,
-    "json-field": 1,
-    "filter-lines": 1
+    "ho-write-marker": 1,
+    "ho-arith-product": 1,
+    "ho-pkg-name": 1,
+    "ho-count-md": 1,
+    "ho-pkg-license": 1,
+    "ho-filter-h2": 1
   },
   "maxTotalTokens": 150000,
   "maxTotalWallMs": 300000,
-  "notes": "Floors raised 2026-09-02 from successful nightly #33646201722 (6/6, 52k tok, 28s wall on deepseek-v4-flash). Token ceiling ~3× observed; wall ~10× for provider variance. REPS=1 ⇒ any miss fails fail-closed."
+  "notes": "EVAL-01: nightly prefers held-out subset (AB_SUITE=heldout). Cost/latency ceilings retained from research 6/6 evidence (#33646201722). First held-out green night may re-tune case floors; do not retune prompts to chase scores."
 }

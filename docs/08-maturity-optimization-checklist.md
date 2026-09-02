@@ -76,9 +76,9 @@ OCI 逃逸 canary 由 Linux CI container job 承担（run #33461119575 全绿）
 
 | 状态 | ID | 优化项 | I/R/E | 优先分 | 完成定义 |
 |---|---|---|---:|---:|---|
-| [ ] | EVAL-01 | Held-out 真实任务集 | 5/5/4 | 20 | 建立 20–50 个不参与提示/实现调优的任务，覆盖编辑、调试、澄清、权限、恢复、MCP、多文件与失败场景 |
+| [~] | EVAL-01 | Held-out 真实任务集 | 5/5/4 | 20 | 建立 20–50 个不参与提示/实现调优的任务，覆盖编辑、调试、澄清、权限、恢复、MCP、多文件与失败场景。**仪器已落地（2026-09-02）**：`eval/cases-heldout.ts` 24 条 `ho-*`；`AB_SUITE=heldout|research|all`；nightly/release 六件套切到 held-out；与 research `cases.ts` id 互斥。**仍开**：全量 24 条真实 provider 基线矩阵、活 MCP HIL 面、调试类真机任务 |
 | [x] | EVAL-02 | 统计与失败分类 | 5/4/3 | 27 | 每模型/配置至少重复 3–5 次；输出 pass@1、首轮成功率、修复率、置信区间、token、成本、延迟和稳定失败 taxonomy |
-| [x] | EVAL-03 | CI/nightly/release 门 | 5/5/4 | 20 | PR 跑确定性小集；nightly 跑真实 provider 矩阵；release 对质量/成本/延迟设置退化阈值并保存报告。**PR 侧**：确定性小集 12 场景（`deterministic-eval` + release `gate`）。**Nightly 侧（EVAL-03b）**：`.github/workflows/nightly.yml` + `eval/baselines/nightly.json`。**Release 侧（EVAL-03c，2026-09-02）**：tag 门在候选提交上重跑同子集，对照 `eval/baselines/release.json`，上传 `release-quality-eval`。阈值经 nightly #33646201722（6/6、52k tok、28s）收紧为 `minPassRate=1` / `maxTotalTokens=150k` / `maxTotalWallMs=300s`。**仍开**：held-out 换子集（EVAL-01） |
+| [x] | EVAL-03 | CI/nightly/release 门 | 5/5/4 | 20 | PR 跑确定性小集；nightly 跑真实 provider 矩阵；release 对质量/成本/延迟设置退化阈值并保存报告。**PR 侧**：确定性小集 12 场景（`deterministic-eval` + release `gate`）。**Nightly 侧（EVAL-03b）**：`.github/workflows/nightly.yml` + `eval/baselines/nightly.json`。**Release 侧（EVAL-03c，2026-09-02）**：tag 门在候选提交上重跑同子集，对照 `eval/baselines/release.json`，上传 `release-quality-eval`。阈值经 nightly #33646201722（6/6、52k tok、28s）收紧为 `minPassRate=1` / `maxTotalTokens=150k` / `maxTotalWallMs=300s`。**子集已切 held-out（EVAL-01）** |
 | [~] | TEST-01 | Coverage 与 mutation | 4/4/3 | 24 | changed-line coverage、关键状态机 branch 阈值及 mutation score 纳入 CI；证明关键验收测试会在实现被破坏时变红 |
 | [ ] | E2E-01 | Web/桌面/容器真实 E2E | 5/5/4 | 20 | Playwright Web、已打包 Electron 启动/升级/卸载、容器 health+canary 自动化；覆盖流式断线、审批和崩溃恢复 |
 | [ ] | E2E-02 | Android 与 provider canary | 4/4/4 | 16 | 修正 Android instrumentation 身份并在 emulator 运行；每次 release 用少量真实 provider 请求验证协议与凭据边界 |
@@ -92,8 +92,9 @@ OCI 逃逸 canary 由 Linux CI container job 承担（run #33461119575 全绿）
 | EVAL-02 | `eval/stats.ts` + `npm run eval:stats`：读 ab-log + 台账；Wilson 95% / 无偏 pass@k / 首轮与修复率 / p50·p95 / 先写死的 11 值 taxonomy。22 单测钉已知值与映射；本机对 175+ 条 ab-log 跑通产出 `eval/stats-report.{md,json}`（gitignore） | 重复次数是实验纪律不是代码门；held-out 集（EVAL-01）与 nightly 门尚未接此报告 |
 | EVAL-03a 仪器 | `eval/mock-provider.ts`：loopback HTTP 双 wire 流式（Anthropic Messages SSE + OpenAI chat.completions SSE）+ 脚本队列 + 故障注入（429/500/cut_stream/timeout/bad_json）。25 单测；变异验证故障注入与 alwaysFault | 已被 `eval/deterministic.ts` 接走；OpenAI wire 侧目前只有单测覆盖，场景门全部走 Anthropic wire |
 | EVAL-03a 场景门 | `eval/deterministic.ts` + `npm run eval:deterministic`：**12 个场景全绿**（约 11s，零真实 provider、零凭据）。被测对象是**编译产物** `dist/src/cli.js`（不是 tsx src——CI/容器跑的是 dist，build 配置一漂单测照绿而发布件起不来），端点是 mock。场景覆盖成功闭环 / 工具失败与工作目录圈禁 / finish_task 语义违规纠正 / 完成门强制 incomplete / 核查拒签→返工→通过 / verifier 只读 deny / 核查预算收口续跑（recovery=wrapup）/ 429 同轮重试 / 500×2 段级续跑 / 断流×2 段级续跑 / freeform 两子任务串行编排 / ask_user 一轮（stdin 作答）。断言只用**可数事实**：产物字节、退出码、台账 `stopReason`·`reworks`·`finalPassed`·`verifications[].recovery`、**模型请求条数**（脚本队列一次请求消费一条，多一轮少一轮当场变红）。子进程环境**先剥掉继承来的 `AGENT_*`/`ANTHROPIC_*`/`OPENAI_*`** 再装配（仪器纪律：残留变量三次把测试指向真端点）。变异验证 3 处逐一打红：`isTransientApiError` 恒假 → 三个瞬时场景全红；completed+blockers 校验去掉 → 纠正场景红；verifier 只读 deny 改 allow → 只读场景红 | 并行编排（fan-out）**没做**：单条脚本队列在并发下消费顺序不确定，会让仪器自己变成噪声源；计划场景一律 `--parallel=1`。要覆盖 fan-out 得先给 mock 加"按请求内容选脚本"的寻址能力（backlog 候选）。审批 **deny** 路径只经 verifier 只读门覆盖；CLI 的人工 deny 无法在 `--yes` 下构造。Web 宿主（`dist/ui/serve.js`）与 OpenAI wire 未进场景门 |
-| EVAL-03b nightly | `.github/workflows/nightly.yml`：cron + `workflow_dispatch`；6 用例 × `baseline` × 1；`AB_TOKEN_CAP`；`npm run eval:compare-baseline` 对照 `eval/baselines/nightly.json`。凭据：`ANTHROPIC_API_KEY` + vars。单测 `test/eval-nightly.test.ts`。**首夜 #33646201722 全绿（6/6，52k tok，28s，deepseek-v4-flash）**后阈值收紧：`minPassRate=1`、六用例 `caseMinPassRate=1`、`maxTotalTokens=150000`（~3×）、`maxTotalWallMs=300000`（~10×）、`AB_TOKEN_CAP=150000` | REPS=1 下任一 flaky 即红（诚实 fail-closed）；统计稳健性靠后续加 REPS，不靠松地板。held-out（EVAL-01）未换子集 |
+| EVAL-03b nightly | `.github/workflows/nightly.yml`：cron + `workflow_dispatch`；**held-out** 6 用例 × `baseline` × 1（`AB_SUITE=heldout`）；`AB_TOKEN_CAP`；`npm run eval:compare-baseline` 对照 `eval/baselines/nightly.json`。凭据：`ANTHROPIC_API_KEY` + vars。单测 `test/eval-nightly.test.ts`。阈值经 research 首夜 #33646201722 收紧后沿用到 held-out ids | REPS=1 下任一 flaky 即红；held-out 首夜通过率仍待证据 |
 | EVAL-03c release | `eval/baselines/release.json`（与 nightly 同矩阵；单测锁「不得更松」）；`release.yml` `gate` 在确定性门之后要求凭据 → 重跑真实子集 → `compare-baseline` → artifact `release-quality-eval`（含 `release-compare.json`）。缺 secret/vars fail-closed | 未在本机重跑真实 provider（依赖 CI/tag）；未做多夜分布再收紧 |
+| EVAL-01 held-out | `eval/cases-heldout.ts`：**24** 条 `ho-*`（编辑/多文件/恢复/圈禁逃逸/成文口径/缺 MCP 旁路/条件分支/结构化抽取）；`eval/suite.ts` `resolveAbSuite`；`AB_SUITE` + nightly/release `AB_CASES` 切到 `HELDOUT_NIGHTLY_IDS` 六件套；`test/eval-heldout.test.ts` 锁规模/id 互斥/表面覆盖。纪律：本会话**未**为追分改 prompt/包。research `eval/cases.ts` **不是** held-out | 全量 24 条尚未跑真实 provider 矩阵；无活 MCP/HIL 调试任务；首夜 held-out 通过率仍待证据（成本/延迟天花板沿用 research 6/6） |
 
 ## Phase 2：可恢复、可重放、可运营
 
@@ -171,8 +172,8 @@ npx tsc --noEmit                            passed
 6. **残余风险**：未覆盖平台、TOCTOU、外部系统或人工验收项。
 
 当前执行顺序（2026-09-02 成熟度第二波，单操作员形态）：
-`EVAL-03c（release 质量门+收紧地板）→ EVAL-01 held-out → OBS-01 → RUN-01（先 ADR-003）→ MEM-01`。
-第一波五项已收口；EVAL-03c 闭合 release 退化阈值残余（held-out 仍归 EVAL-01）。
+`EVAL-03c → EVAL-01 held-out（仪器）→ OBS-01 → RUN-01（先 ADR-003）→ MEM-01`。
+EVAL-03c 与 EVAL-01 仪器已落地（EVAL-01 保持 `[~]`：缺全量真实矩阵/活 MCP）。
 本波**不提前** GOV-*；SAFE-05 Phase 2B / SAFE-06 保持 partial，除非发现已解锁且很小。
 并行可继续：`A1 攒 §2.1 样本（ledger:samples）`（与质量门不冲突）。
 若目标改公网多人，`GOV-01/02/03` 必须提前到 `RUN-01` 之后、任何公开上线之前。

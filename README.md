@@ -89,13 +89,15 @@ npm run eval:compare-baseline                                     # nightly 基�
 `--filter <子串>` 只跑部分场景，`--keep` 保留临时工作目录便于排障。因为它测 dist，
 **必须先 `npm run build`**。
 
-Nightly（`.github/workflows/nightly.yml`）跑真实 provider 小子集（6 用例 × baseline × 1），
-凭据来自 `ANTHROPIC_API_KEY` secret 与 `ANTHROPIC_BASE_URL`/`AGENT_MODEL` variables；
-`AB_TOKEN_CAP` 触顶即停（exit 2），再与 `eval/baselines/nightly.json` 比对通过率/成本/延迟。
-阈值经首夜 6/6 证据收紧（`minPassRate=1`、`maxTotalTokens=150k`、`maxTotalWallMs=300s`）。
+Nightly（`.github/workflows/nightly.yml`）跑 **held-out** 真实 provider 小子集
+（`AB_SUITE=heldout`，6×`ho-*` × baseline × 1），凭据来自 `ANTHROPIC_API_KEY` secret 与
+`ANTHROPIC_BASE_URL`/`AGENT_MODEL` variables；`AB_TOKEN_CAP` 触顶即停（exit 2），再与
+`eval/baselines/nightly.json` 比对通过率/成本/延迟。阈值经首夜 research 6/6 证据收紧后沿用
+到 held-out（`minPassRate=1`、`maxTotalTokens=150k`、`maxTotalWallMs=300s`）。
+研究臂默认 `AB_SUITE=research`（`eval/cases.ts`）——**不是** held-out，禁止拿它当冻结评测面。
 
 Release tag 门（`.github/workflows/release.yml` `gate`）在确定性场景门之后，**在打标签的提交上重跑**
-同一真实子集，对照 `eval/baselines/release.json`（不得比 nightly 更松），报告落 artifact
+同一 held-out 子集，对照 `eval/baselines/release.json`（不得比 nightly 更松），报告落 artifact
 `release-quality-eval`。缺少 secret/vars 时 fail-closed，不静默跳过。
 
 真实 CLI/Web 宿主默认要求 `finish_task` 结构化收尾，`end_turn` 不再直接等于完成。
