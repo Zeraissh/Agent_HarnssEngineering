@@ -78,7 +78,7 @@ OCI 逃逸 canary 由 Linux CI container job 承担（run #33461119575 全绿）
 |---|---|---|---:|---:|---|
 | [ ] | EVAL-01 | Held-out 真实任务集 | 5/5/4 | 20 | 建立 20–50 个不参与提示/实现调优的任务，覆盖编辑、调试、澄清、权限、恢复、MCP、多文件与失败场景 |
 | [x] | EVAL-02 | 统计与失败分类 | 5/4/3 | 27 | 每模型/配置至少重复 3–5 次；输出 pass@1、首轮成功率、修复率、置信区间、token、成本、延迟和稳定失败 taxonomy |
-| [~] | EVAL-03 | CI/nightly/release 门 | 5/5/4 | 20 | PR 跑确定性小集；nightly 跑真实 provider 矩阵；release 对质量/成本/延迟设置退化阈值并保存报告 |
+| [~] | EVAL-03 | CI/nightly/release 门 | 5/5/4 | 20 | PR 跑确定性小集；nightly 跑真实 provider 矩阵；release 对质量/成本/延迟设置退化阈值并保存报告。**PR 侧已闭环**（确定性小集 12 场景全绿，CI `deterministic-eval` job 与 release `gate` 均跑 `npm run eval:deterministic` 并上传报告 artifact）；**仍开** nightly 真实 provider 矩阵（EVAL-03b）与 release 的质量/成本/延迟退化阈值——确定性门是"行为没变"的判据，不是"质量没退化"的判据（假端点上 token/延迟不承载信息） |
 | [~] | TEST-01 | Coverage 与 mutation | 4/4/3 | 24 | changed-line coverage、关键状态机 branch 阈值及 mutation score 纳入 CI；证明关键验收测试会在实现被破坏时变红 |
 | [ ] | E2E-01 | Web/桌面/容器真实 E2E | 5/5/4 | 20 | Playwright Web、已打包 Electron 启动/升级/卸载、容器 health+canary 自动化；覆盖流式断线、审批和崩溃恢复 |
 | [ ] | E2E-02 | Android 与 provider canary | 4/4/4 | 16 | 修正 Android instrumentation 身份并在 emulator 运行；每次 release 用少量真实 provider 请求验证协议与凭据边界 |
@@ -90,7 +90,8 @@ OCI 逃逸 canary 由 Linux CI container job 承担（run #33461119575 全绿）
 | TEST-01a | 装 `@vitest/coverage-v8`；`vitest.config.ts` include `src/**`+`ui/*.ts`，reporters text-summary/lcov/json-summary。2026-09-02 本机基线 statements/lines **77.68%**、branches **81.2%**、functions **91.54%**；棘轮阈值 lines/statements **75**、branches **78**、functions **88**（实测下方约 2–3pt）。`scripts/mutation-smoke.mjs` 固定 8 个关键变异（瞬时判定恒假/恒真、审批门绕过、tool_choice none 映射丢、verdict fail-open、verifier 只读放行、台账空成功、credentialLike 恒假），每个必须把对应测试文件打红。CI `core` 改跑 `test:coverage` + `test:mutation-smoke` 并上传 `coverage/` artifact | 尚非 changed-line coverage、无 Stryker 全量 mutation score；OCI 用例在 Windows 本机 skipped，Linux CI 才计入分支覆盖。第二波再扩变异清单与差分覆盖 |
 | EVAL-02 前置 | 修台账 `error` 硬编码 null：`ledgerErrorClass`（classifyApiError 首行）+ Web/CLI 全路径写入；`buildLedgerEntry` 对 `stopReason=error` 漏传 fail-closed 为 `unclassified_error`。锁：源码不再 `error: null`、哨兵变异验证 | 历史台账里已写入的 null 不回改 |
 | EVAL-02 | `eval/stats.ts` + `npm run eval:stats`：读 ab-log + 台账；Wilson 95% / 无偏 pass@k / 首轮与修复率 / p50·p95 / 先写死的 11 值 taxonomy。22 单测钉已知值与映射；本机对 175+ 条 ab-log 跑通产出 `eval/stats-report.{md,json}`（gitignore） | 重复次数是实验纪律不是代码门；held-out 集（EVAL-01）与 nightly 门尚未接此报告 |
-| EVAL-03a 仪器 | `eval/mock-provider.ts`：loopback HTTP 双 wire 流式（Anthropic Messages SSE + OpenAI chat.completions SSE）+ 脚本队列 + 故障注入（429/500/cut_stream/timeout/bad_json）。25 单测；变异验证故障注入与 alwaysFault | 确定性场景 runner / CI job / release gate 尚未接 |
+| EVAL-03a 仪器 | `eval/mock-provider.ts`：loopback HTTP 双 wire 流式（Anthropic Messages SSE + OpenAI chat.completions SSE）+ 脚本队列 + 故障注入（429/500/cut_stream/timeout/bad_json）。25 单测；变异验证故障注入与 alwaysFault | 已被 `eval/deterministic.ts` 接走；OpenAI wire 侧目前只有单测覆盖，场景门全部走 Anthropic wire |
+| EVAL-03a 场景门 | `eval/deterministic.ts` + `npm run eval:deterministic`：**12 个场景全绿**（约 11s，零真实 provider、零凭据）。被测对象是**编译产物** `dist/src/cli.js`（不是 tsx src——CI/容器跑的是 dist，build 配置一漂单测照绿而发布件起不来），端点是 mock。场景覆盖成功闭环 / 工具失败与工作目录圈禁 / finish_task 语义违规纠正 / 完成门强制 incomplete / 核查拒签→返工→通过 / verifier 只读 deny / 核查预算收口续跑（recovery=wrapup）/ 429 同轮重试 / 500×2 段级续跑 / 断流×2 段级续跑 / freeform 两子任务串行编排 / ask_user 一轮（stdin 作答）。断言只用**可数事实**：产物字节、退出码、台账 `stopReason`·`reworks`·`finalPassed`·`verifications[].recovery`、**模型请求条数**（脚本队列一次请求消费一条，多一轮少一轮当场变红）。子进程环境**先剥掉继承来的 `AGENT_*`/`ANTHROPIC_*`/`OPENAI_*`** 再装配（仪器纪律：残留变量三次把测试指向真端点）。变异验证 3 处逐一打红：`isTransientApiError` 恒假 → 三个瞬时场景全红；completed+blockers 校验去掉 → 纠正场景红；verifier 只读 deny 改 allow → 只读场景红 | 并行编排（fan-out）**没做**：单条脚本队列在并发下消费顺序不确定，会让仪器自己变成噪声源；计划场景一律 `--parallel=1`。要覆盖 fan-out 得先给 mock 加"按请求内容选脚本"的寻址能力（backlog 候选）。审批 **deny** 路径只经 verifier 只读门覆盖；CLI 的人工 deny 无法在 `--yes` 下构造。Web 宿主（`dist/ui/serve.js`）与 OpenAI wire 未进场景门 |
 
 ## Phase 2：可恢复、可重放、可运营
 
@@ -109,9 +110,34 @@ OCI 逃逸 canary 由 Linux CI container job 承担（run #33461119575 全绿）
 | [ ] | AGENT-01 | 一等 `PlanState` 与重规划 | 4/3/4 | 14 | 节点有目标、证据、验收、状态和失败策略；仅在新证据/依赖变化时可审计地更新计划 |
 | [ ] | AGENT-02 | 动态多 Agent | 5/4/5 | 9 | supervisor/mailbox 支持 spawn、follow-up、cancel、重新分派和分支失败策略；handoff 使用结构化证据引用 |
 | [ ] | AGENT-03 | 每 Agent 隔离与路由 | 5/4/5 | 9 | 每 agent 独立 worktree/sandbox、工具、模型和预算；并发写不会污染共享 checkout |
-| [ ] | MODEL-01 | Provider 能力注册与降级 | 4/4/4 | 16 | 以 endpoint+model capability probe 代替名称猜测；支持健康检查、熔断、fallback、成本/延迟路由与每角色绑定 |
+| [~] | MODEL-01 | Provider 能力注册与降级 | 4/4/4 | 16 | 以 endpoint+model capability probe 代替名称猜测；支持健康检查、熔断、fallback、成本/延迟路由与每角色绑定。**MODEL-01a（降级+熔断）已落地并接进两个宿主**（见 Phase 3 实施记录）；**仍开**：capability probe（compat 仍靠 `claude-*` 名称猜测）、成本/延迟路由、每角色绑定（链只覆盖主执行者） |
 | [ ] | EXT-01 | 插件/Pack manifest 与 SDK | 4/3/4 | 14 | 版本化 manifest、权限声明、依赖、签名/来源、启停与兼容检查；DomainPack 不再只能硬编码发布 |
 | [ ] | EXT-02 | 完整 MCP 与公开协议 | 4/3/4 | 14 | 远程 transport、OAuth、resources/prompts/elicitation、lazy tool discovery；公开版本化 schema/SDK/webhook |
+
+### Phase 3 实施记录（2026-09-02，MODEL-01a）
+
+| ID | 已取得证据 | 残余边界 |
+|---|---|---|
+| MODEL-01a 内核 | `src/model-fallback.ts`：`FallbackModelClient`（L0 装饰器，上面几层只见 `ModelClient` 接口）+ 逐端点 `CircuitBreaker`（连败开路、冷却后半开、一次成功即闭合）+ `readFallbackEnv`/`createFallbackClientIfConfigured`（未配 `AGENT_FALLBACK_MODELS` 时**原样返回主客户端**，不加一层空壳）。**负向路径才是主场**：认证失败/400 一律原样上抛不降级（换端点救不了配置错误，只会把同一个 401 打到第二家去并掩盖真因）；跨端点重发**剥掉 thinking 块**（签名属于上一家）；全链熔断时报错而不是静默返回空。`test/model-fallback.test.ts` **22 测试** | 只按"瞬时错误"降级，**没有** capability probe、成本/延迟路由；链上端点的能力差异（工具调用格式、图像支持）不做校验——换过去的那家不支持识图就会当场失败 |
+| MODEL-01a 事件契约 | `src/types.ts` 新增 TurnEvent `model_fallback {from,to,reason,turn}`。它是**唯一一条不由 `AgentLoop` 发射的 TurnEvent**——换端点发生在 L0 内部，循环按设计不知道。放进 `TurnEvent` 而不是让两个宿主各定义一个形状，是为了 CLI 与 Web 渲染同一件事。`reason` 是**离开上一个端点的原因**（HTTP 状态+消息，或 `circuit_open` 表示它仍在隔离期被跳过）；`turn` 是该客户端的第几次 `send`，与 loop 轮次不是同一个计数器 | 不是 stopReason，`STOP_REASONS` 未动 |
+| MODEL-01a 宿主接线 | **两个宿主同一处改**（host-lags 纪律）。CLI：装配处 `createFallbackClientIfConfigured` + `onFallback` 走**同一个** `renderEvent`（⇄，与 ⟳ 同轮重试 / ⟲ 段级续跑区分开——那两个换的是时机，这个换的是端点），启动横幅打链。Web：`ui/server.ts` 用 **`AsyncLocalStorage`** 把 `onFallback` 定位到发起 `send` 的那个 run——宿主允许多 run 并发在飞，单个可变"当前 run"引用会在两次 send 交错时把降级记到别人账上（**变异验证**：换成可变全局后并发用例当场变红）。链只包**主执行者**，verifier/planner/vision 三个角色模型不进链（"核查者应 ≥ 执行者"是设计约束，静默换端点会让它在无人知晓时失效）；`run_config` 与 `/api/harness` 同时报 `fallbackChain` 与 `fallbackScope="executor"`，只报名字不下发 baseURL/key。测试用**真的本地 HTTP**（mock provider）走完整条路：主端点 503 → 备用端点真的应答 → SSE 里出现 `model_fallback` | 归属域只包住"宿主发起的那段执行"；若将来有绕过这一层直接调 `modelClient` 的路径，降级会落在无域状态被丢弃 |
+| MODEL-01a 界面 | `ui/public/app.js` 三处一起改（投影分支 / 派生 / 渲染，逐字段白名单投影天生会静默吞掉没列出的字段）：时间线条目默认**不折叠**并按 warn 着色；`deriveLoopFace` 把 `fallbacks` 与 `retries` **分开计数**（压成一个数就再也答不出"是同一家重试还是换了一家"）；装配条只在配了链时上一格，写明覆盖范围只到执行者。`circuit_open` 经 `fallbackReasonText` 译成人话（原样显示会让人以为上游返回了一个叫 `circuit_open` 的错误码，从而查错方向）。**渲染锁** `test/ui-patch.test.ts` + **投影/派生锁** `test/ui-app.test.ts` | 未做链的"当前健康状态"实时面（熔断器状态只在降级发生时以 reason 间接可见） |
+| MODEL-01a 台账 | `src/ledger.ts` 新增 `fallbackChain: string[] \| null` 与 `fallbacks: number`。**null 与 `[主端点]` 必须分开**：前者是"这台机器上没有这条防线"，后者是"配了链但只有一环"——压成同一个读数，事后就无从判断"零次降级"是防线没触发还是防线不存在。空数组按未配处理、脏输入不留 `NaN`（台账每行形状必须一致） | 没做 `modelsUsed`（"这一轮实际是谁应答的"要逐 send 归属，属 OBS-01 的 span 范畴，不塞进 run 级台账） |
+| 顺带修出的真缺陷 | `ui/server.ts` 的 `meterModelClient` 装饰器**吞掉了 `onDelta` 与 `signal`**：Web 上等于没有流式（直播条与对话末尾实时段全空），且停止按钮掐不掉在飞的请求。装饰器最常见的错就是收窄被装饰者的契约。已修并加锁 | — |
+
+### Phase 3 回归证据（2026-09-02）
+
+```text
+npx vitest run test/model-fallback.test.ts test/ledger.test.ts \
+                test/ui-app.test.ts test/ui-patch.test.ts     444 passed
+npx vitest run（全量）                     1262 passed, 13 skipped, 12 failed
+npx tsc --noEmit                            passed
+```
+
+全量里的 12 条失败全部落在 `test/cloud-sync-env.test.ts`，本机 Windows 下
+`execFileSync("bash", ...)` 把 Windows 路径的反斜杠吃掉（`C:Usersrk302...`），
+与本次改动无关且在改动前即如此；Linux CI 不复现。未跑真实 provider、
+`npm run build`、`pack:check` 与 `cross-app`。
 
 ## Phase 4：团队与商业化（按部署目标启用）
 
@@ -144,6 +170,7 @@ OCI 逃逸 canary 由 Linux CI container job 承担（run #33461119575 全绿）
 
 当前执行顺序（2026-09-02 成熟度第一波，单操作员形态）：
 `TEST-01a → EVAL-02（先修台账 error）→ EVAL-03a mock 确定性门 → MODEL-01a 降级/熔断 → EVAL-03b nightly`。
+其中 `TEST-01a`、`EVAL-02`、`EVAL-03a`、**`MODEL-01a` 已落地**（各见对应实施记录），下一项是 `EVAL-03b nightly`。
 本波**不提前** GOV-*；SAFE-05 Phase 2B / SAFE-06 保持 partial，排第二波。
 并行可继续：`A1 攒 §2.1 样本（ledger:samples）`（与质量门不冲突）。
 第二波顺序：`SAFE-05 Phase 2B → EVAL-01 held-out → OBS-01 → RUN-01 → MEM-01 → E2E-01`；

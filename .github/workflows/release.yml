@@ -34,6 +34,18 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+      # EVAL-03a：确定性场景门跑在**编译产物**上，所以必须排在 build 之后。
+      - run: npm run eval:deterministic
+      - name: Upload deterministic eval report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: deterministic-report-release
+          path: |
+            eval/deterministic-report.json
+            eval/deterministic-report.md
+          if-no-files-found: error
+          retention-days: 90
       - run: npm run pack:check
       - run: npm ci --ignore-scripts
         working-directory: cross-app
@@ -153,6 +165,6 @@ jobs:
             echo '```'
             echo
             echo "同镜像的可读 tag：\`${IMAGE}:${IMG_TAG}\`（tag 可被覆盖，生产部署一律用上面的 digest 引用）。"
-            echo "发布门禁（typecheck / 单测 / build / pack 白名单 / cross-app / audit）在本 workflow 的 gate job 全过后才构建镜像。"
+            echo "发布门禁（typecheck / 单测 / build / 确定性场景门 / pack 白名单 / cross-app / audit）在本 workflow 的 gate job 全过后才构建镜像。"
           } > release-notes.md
           gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --notes-file release-notes.md desktop-artifact/*

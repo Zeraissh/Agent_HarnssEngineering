@@ -8,6 +8,9 @@ eval/ab-log.jsonl
 # EVAL-02 统计报告：本地/CI 生成物，用 npm run eval:stats 重产
 eval/stats-report.md
 eval/stats-report.json
+# EVAL-03a 确定性场景门报告：每次 npm run eval:deterministic 重产，CI 作为 artifact 上传
+eval/deterministic-report.md
+eval/deterministic-report.json
 .agent-memory/
 eval/transcripts/
 logs/

@@ -76,7 +76,17 @@ npm test                                                          # 单元测试
 npm run test:coverage                                             # 覆盖率 + 棘轮阈值（TEST-01a）
 npm run test:mutation-smoke                                       # 8 个关键变异必须变红（TEST-01a）
 npm run eval:stats                                                # A/B + 台账统计报告（EVAL-02）
+npm run build && npm run eval:deterministic                        # 确定性场景门（EVAL-03a）
 ```
+
+`npm run eval:deterministic` 是 PR 级质量门：12 个场景跑在**编译产物** `dist/src/cli.js` 上，
+端点是 `eval/mock-provider.ts` 起的 loopback 假端点（脚本队列 + 故障注入），因此**不需要
+任何真实 provider 或凭据**，约 11 秒跑完。它守的是单测按设计覆不到的那条缝——进程边界、
+退出码、工作目录圈禁、台账落盘，以及 loop ↔ orchestrate 组合起来的失败与恢复路径
+（同轮重试 / 段级续跑 / 核查预算收口 / 拒签返工 / 完成门强制 incomplete）。断言只用可数
+事实（产物字节、台账字段、模型请求条数），报告落 `eval/deterministic-report.{json,md}`。
+`--filter <子串>` 只跑部分场景，`--keep` 保留临时工作目录便于排障。因为它测 dist，
+**必须先 `npm run build`**。
 
 真实 CLI/Web 宿主默认要求 `finish_task` 结构化收尾，`end_turn` 不再直接等于完成。
 长任务可用以下总账与恢复参数（PowerShell）：
@@ -106,6 +116,37 @@ $env:AGENT_VERIFIER_BASE_URL = "https://api.deepseek.com/anthropic"  # 可选，
 $env:AGENT_VERIFIER_API_KEY  = "sk-..."                           # 可选，缺省沿用执行者
 npm run cli -- --verify "……"
 ```
+
+### 端点降级与熔断（可选）
+
+配一个备用端点，主端点在瞬时错误（网络/超时/429/5xx）上耗尽重试后自动换过去再试，
+每个端点各带一个熔断器（连败 N 次开路、冷却期内直接跳过、冷却后放一次试探、
+成功即闭合）。**不配 `AGENT_FALLBACK_MODEL` 就完全不生效**，也不会多包一层装饰器。
+
+```powershell
+$env:AGENT_FALLBACK_MODEL    = "kimi-k3"                      # 配了才启用整条防线
+$env:AGENT_FALLBACK_PROVIDER = "anthropic"                    # 可选，anthropic | openai
+$env:AGENT_FALLBACK_BASE_URL = "https://api.moonshot.cn/anthropic"  # 可选
+$env:AGENT_FALLBACK_API_KEY  = "sk-..."                       # 可选，缺省沿用执行者
+$env:AGENT_CIRCUIT_FAILURE_THRESHOLD = "3"                    # 连败几次开路，默认 3
+$env:AGENT_CIRCUIT_COOLDOWN_MS       = "30000"                # 隔离多久，默认 30s
+```
+
+三条边界写在这里，因为踩上去都不便宜：
+
+- **只覆盖主执行者。** verifier / planner / 视觉模型仍走各自显式配置的端点——
+  "核查者应 ≥ 执行者"是一条设计约束（见 A/B 研究结论），静默把核查换到另一家
+  会让那条约束在无人知晓时失效。
+- **认证失败、400 这类非瞬时错误一律原样上抛。** 换端点救不了配置错误，
+  只会把同一个 401 打到第二家去，并掩盖真正的原因。
+- **跨端点重发会剥掉 thinking 块**（签名属于上一家），链上端点若能力不同
+  （例如备用端点不支持识图）不做校验，请自行确认两家能跑同一类任务。
+
+换端点这件事在两个宿主上都留痕：CLI 打一行 `⇄ 端点降级：A → B`，Web 上是时间线里
+一条默认展开的条目 + 装配条上的降级链，台账另记 `fallbackChain` 与 `fallbacks` 次数
+（未配置时 `fallbackChain` 是 `null`，与"配了链但零次降级"分得开）。
+熔断相关的数值配错会**直接抛错而不是静默取默认**——以为把冷却调成了 5 分钟、
+实际仍是 30 秒，这种防线口径与认知不一致就等于没有。
 
 ## 在 Cloud Agent 里跑：凭据怎么过去
 

@@ -38,6 +38,33 @@ jobs:
       - run: npm run build
       - run: npm run pack:check
 
+  # EVAL-03a：确定性质量门。被测对象是编译产物（dist/src/cli.js），端点是
+  # eval/mock-provider.ts 起的 loopback 假端点——零真实 provider、零凭据、零限流，
+  # 所以可以在每个 PR 上跑。它守的是单测按设计覆不到的那条缝：进程边界、退出码、
+  # 台账落盘、以及 loop ↔ orchestrate 组合起来的失败/恢复路径。
+  deterministic-eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - run: npm run eval:deterministic
+      - name: Upload deterministic eval report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: deterministic-report
+          path: |
+            eval/deterministic-report.json
+            eval/deterministic-report.md
+          if-no-files-found: error
+          retention-days: 14
+
   desktop-shell:
     runs-on: ubuntu-latest
     timeout-minutes: 10
