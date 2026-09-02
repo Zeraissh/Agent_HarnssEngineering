@@ -127,6 +127,15 @@ const MUTANTS = [
     testFiles: ["test/tools.test.ts"],
     why: "read_file 对 .env/密钥形状必须 fail-closed；恒假会泄露密钥进正史",
   },
+  {
+    id: "compact-ledger-skipped",
+    file: "src/context.ts",
+    find: "    const ledger = mergeCompactLedgers(priorLedger, scanned);\n    const withLedger = upsertCompactLedger(out, ledger);\n    return {\n      messages: withLedger,\n      droppedBlocks: dropped,\n      ledgerEntries: ledgerEntryCount(ledger),\n      ledger,\n    };",
+    replace:
+      "    // MUTATION: skip semantic ledger — regress to placeholder-only compaction\n    return {\n      messages: out,\n      droppedBlocks: dropped,\n      ledgerEntries: 0,\n      ledger: emptyCompactLedger(),\n    };",
+    testFiles: ["test/compact.test.ts"],
+    why: "MEM-01 压缩必须写入 compact_ledger；退回纯占位等于语义残留丢失",
+  },
 ];
 
 function runVitest(testFiles) {

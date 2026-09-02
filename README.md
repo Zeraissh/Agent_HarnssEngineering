@@ -264,7 +264,7 @@ HTTP，但在平台凭据存储、签名流水线和 HTTPS 真机验收完成前
 
 - **v0.1 ✅** — 设计文档：分层架构 + 接口契约定稿
 - **v0.2 ✅** — 最小可跑闭环：ModelClient + AgentLoop + 3 个内置工具 + compat 模式（第三方兼容端点）
-- **v0.3 ✅** — 上下文管理完整化：compact、缓存诊断、动态上下文注入
+- **v0.3 ✅** — 上下文管理完整化：compact、缓存诊断、动态上下文注入（后演进 MEM-01 语义账本，见 docs/08）
 - **v0.4 ✅** — verifier 子代理 + `runVerified` 编排 + `fetch_url` 领域工具试点 + 评估基线
 - **v0.5 ✅** — L5 跨会话记忆：`.agent-memory/` + 四个记忆工具 + 开局索引注入
 - **v0.6 ✅** — OpenAI wire 协议：`AGENT_PROVIDER=openai` 接入一切 chat-completions 端点，核心层零改动

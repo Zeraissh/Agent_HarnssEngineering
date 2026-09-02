@@ -1,9 +1,9 @@
 # 待办清单（v2 UI 之后）
 
-# 交接：从这里接着做（2026-09-02 成熟度第二波）
+# 交接：从这里接着做（2026-09-03 成熟度第二波）
 
 **进行中**：按 `docs/08-maturity-optimization-checklist.md` Wave 2：
-`EVAL-03c → EVAL-01 → OBS-01 → RUN-01（state.json 接线）→ MEM-01`。
+`EVAL-03c → EVAL-01 → OBS-01 → RUN-01（state.json）→ MEM-01[~]`。
 单操作员形态；GOV-* 与 SAFE-05 Phase 2B **本波不做**（除非已解锁且很小）。
 每项独立 commit + push，等 CI 绿再开下一项。
 
@@ -14,9 +14,11 @@
   research `eval/cases.ts` **不是** held-out；本会话未为追分改 prompt。
 - **OBS-01[~]** — `src/trace.ts` + `trace.jsonl`；`GET /api/runs/:id/trace` 脱敏导出。
 - **RUN-01[~]** — ADR-003 + 内核 + **Web `state.json` 接线**（plan/execute/approval/finalize；崩溃收口；`sameRunResume:false`）。
+- **MEM-01[~ Phase A]** — 语义压缩：`[compact_ledger]` + 语义占位；非 LLM；mutation `compact-ledger-skipped`。
 
-**下一刀**：CI 绿后若有余量再开 MEM-01；否则停。MODEL-01b 仍搁置。
+**下一刀**：CI 绿后开 `MODEL-01b`（capability probe / 每角色 fallback），或 MEM-01 Phase B / RUN-01 Phase 2（按需求）。
 RUN-01 残余：同 run 热恢复 / toolTx / CLI 对等 / 预算与 grant 审计进 state。
+MEM-01 残余：启发式漏检、无 LLM 摘要、MCP 写工具靠名字启发。
 
 以下为历史交接页（2026-08-08 收工），仍有参考价值；新开工优先看 `docs/08`。
 

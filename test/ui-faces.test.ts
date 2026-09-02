@@ -193,12 +193,13 @@ describe("deriveContextFace", () => {
 
   it("压缩事件汇总为不可逆语域的数据", () => {
     const s = feed([
-      ev("main", { type: "compaction", droppedBlocks: 4 }),
-      ev("main", { type: "compaction", droppedBlocks: 3 }),
+      ev("main", { type: "compaction", droppedBlocks: 4, ledgerEntries: 5 }),
+      ev("main", { type: "compaction", droppedBlocks: 3, ledgerEntries: 2 }),
     ]);
     const f = deriveContextFace(s, HARNESS);
     expect(f.compactions).toHaveLength(2);
     expect(f.droppedBlocks).toBe(7);
+    expect(f.ledgerEntries).toBe(7);
   });
 
   it("无上限配置时不编造水位", () => {
@@ -393,11 +394,11 @@ describe("buildFactorCards", () => {
     expect(cards[0].lines[0]).toContain("通过（有备注）");
   });
 
-  it("压缩发生过 → Context 卡异常且写明不可恢复", () => {
-    const s = feed([ev("main", { type: "compaction", droppedBlocks: 5 })]);
+  it("压缩发生过 → Context 卡异常且写明置换与账本", () => {
+    const s = feed([ev("main", { type: "compaction", droppedBlocks: 5, ledgerEntries: 3 })]);
     const ctx = buildFactorCards(facesFor(s)).find((c) => c.id === "context");
     expect(ctx.abnormal).toBe(true);
-    expect(ctx.lines.some((l: string) => l.includes("不可恢复"))).toBe(true);
+    expect(ctx.lines.some((l: string) => l.includes("置换") && l.includes("账本"))).toBe(true);
   });
 });
 

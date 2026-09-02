@@ -114,6 +114,10 @@ interface CompactResult {
   messages: Anthropic.MessageParam[];
   /** 本次被置换为占位文本的 tool_result 块数；0 = 未压缩 */
   droppedBlocks: number;
+  /** MEM-01：结构化账本事实条数（约束/决策/失败/证据/副作用） */
+  ledgerEntries: number;
+  /** MEM-01：写入正史的 durable ledger；未压缩时为空 */
+  ledger: CompactLedger;
 }
 
 interface ContextManager {
@@ -133,11 +137,11 @@ interface ContextManager {
   checkpointInputTokens(): number;
 
   /**
-   * v0.3 实现：上一轮输入超过 contextTokenLimit 的 80% 时，把保护窗口
-   * （protectRecent，默认 6 条）之外的大体积 tool_result 内容置换为占位文本。
-   * 结构不变（tool_use_id 配对保持），幂等（已压缩块不重复计数）。
-   * loop 用返回值替换正史（一次性、确定性），保证后续请求前缀稳定不抖缓存。
-   * 后续版本可切换 server-side compaction。
+   * v0.3 + MEM-01：上一轮输入超过 contextTokenLimit 的 80% 时，把保护窗口
+   * （protectRecent，默认 6 条）之外的大体积 tool_result 置换为语义占位，
+   * 并 upsert `[compact_ledger]`（约束/决策/失败/证据/副作用）。结构不变
+   * （tool_use_id 配对保持），幂等（已压缩块不重复计数）。loop 用返回值替换
+   * 正史（一次性、确定性），保证后续请求前缀稳定不抖缓存。启发式非 LLM 摘要。
    */
   compact(messages: Anthropic.MessageParam[]): CompactResult;
 }
@@ -183,7 +187,7 @@ type TurnEvent =
       /** 宿主必须调用 respond 才能让 loop 继续；deny 时可附给模型的理由 */
       respond: (decision: "allow" | "deny", reason?: string) => void }
   | { type: "usage"; turn: number; usage: Anthropic.Usage }
-  | { type: "compaction"; droppedBlocks: number }
+  | { type: "compaction"; droppedBlocks: number; ledgerEntries?: number }
   | { type: "recovery_decision";
       reason: "end_turn_without_completion" | "max_tokens_without_completion" | "max_turns" | "stagnation";
       action: "request_completion" | "continue_with_context" | "change_strategy" | "force_completion";

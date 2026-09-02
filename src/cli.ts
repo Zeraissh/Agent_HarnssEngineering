@@ -673,7 +673,12 @@ async function main(): Promise<void> {
           break;
         }
         case "compaction":
-          console.log(c.yellow(`${tag} ⚠ context compacted: dropped ${event.droppedBlocks} blocks`));
+          console.log(
+            c.yellow(
+              `${tag} ⚠ context compacted: dropped ${event.droppedBlocks} blocks` +
+                (event.ledgerEntries != null ? `, ledger ${event.ledgerEntries} facts` : ""),
+            ),
+          );
           break;
         case "api_retry":
           console.log(
@@ -1036,7 +1041,12 @@ async function main(): Promise<void> {
         console.log(c.yellow(`⤷ 恢复决策：${event.detail}`));
         break;
       case "compaction":
-        console.log(c.yellow(`⚠ context compacted: dropped ${event.droppedBlocks} blocks`));
+        console.log(
+          c.yellow(
+            `⚠ context compacted: dropped ${event.droppedBlocks} blocks` +
+              (event.ledgerEntries != null ? `, ledger ${event.ledgerEntries} facts` : ""),
+          ),
+        );
         break;
       case "done": {
         endStreamLine();

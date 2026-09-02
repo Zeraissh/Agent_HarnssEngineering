@@ -1,10 +1,25 @@
 /**
  * L3 — ContextManager：模型每次看到什么。
  * 决策（docs/02）：system 冻结；两个缓存断点（system 尾块 + 最近一条消息尾块）；
- * v0.2 的 compact() 为空实现（策略接口位）。
+ * v0.3 起 compact() 为真实实现；MEM-01 起 elision 附带结构化 semantic ledger。
  */
 import type Anthropic from "@anthropic-ai/sdk";
 import type { Effort, ModelRequest } from "./types.js";
+import {
+  COMPACT_LEDGER_MARKER,
+  type CompactLedger,
+  type ToolUseRef,
+  emptyCompactLedger,
+  extractConstraintsFromText,
+  extractDecisionsFromText,
+  extractEvidenceFromText,
+  extractFromToolExchange,
+  formatCompactLedger,
+  formatSemanticPlaceholder,
+  ledgerEntryCount,
+  mergeCompactLedgers,
+  parseCompactLedgerText,
+} from "./compact-ledger.js";
 
 /** 可携带 cache_control 的 content 块类型（thinking 块不可缓存标记） */
 const CACHEABLE_TYPES = new Set(["text", "image", "tool_use", "tool_result", "document"]);
@@ -27,6 +42,10 @@ export interface CompactResult {
   messages: Anthropic.MessageParam[];
   /** 本次被置换为占位文本的 tool_result 块数量；0 = 未压缩 */
   droppedBlocks: number;
+  /** MEM-01：压缩后账本中的事实条数（含既有 + 新提取） */
+  ledgerEntries: number;
+  /** MEM-01：本次写入正史的结构化账本；未压缩时为空账本 */
+  ledger: CompactLedger;
 }
 
 /** 触发压缩的水位：上一轮实际输入超过上限的 80% */
@@ -97,20 +116,28 @@ export class DefaultContextManager {
   }
 
   /**
-   * v0.3 压缩策略：上一轮输入超过水位线时，把"保护窗口之外"的大体积
-   * tool_result 内容替换为占位文本。结构保持不变（每个 tool_use_id 仍有
-   * 对应 tool_result），只有内容被置换 —— 不会破坏 API 约束。
+   * 压缩策略（v0.3 + MEM-01）：
+   * 上一轮输入超过水位线时，把"保护窗口之外"的大体积 tool_result 置换为
+   * **语义占位**（保留该次交换抽取出的失败/证据/副作用摘要），并 upsert 一条
+   * `[compact_ledger]` 文本块，承载用户约束、决策、失败尝试、证据引用与
+   * side-effect 账本。结构保持不变（每个 tool_use_id 仍有对应 tool_result），
+   * 只有正文被置换 —— 不会破坏 API 约束。
    *
    * 注意：loop 会用返回值**替换**正史（而非仅用于本次渲染）——压缩只发生一次、
    * 结果确定，后续请求前缀保持稳定，避免每轮重压缩导致的缓存抖动。
    */
   compact(messages: Anthropic.MessageParam[]): CompactResult {
+    const empty = emptyCompactLedger();
     if (this.lastInputTokens < this.contextTokenLimit * COMPACT_WATERMARK) {
-      return { messages: [...messages], droppedBlocks: 0 };
+      return { messages: [...messages], droppedBlocks: 0, ledgerEntries: 0, ledger: empty };
     }
 
-    let dropped = 0;
     const cutoff = Math.max(0, messages.length - this.protectRecent);
+    const toolUses = indexToolUses(messages);
+    const priorLedger = findExistingLedger(messages);
+    const scanned = scanConversationLedger(messages, cutoff, toolUses);
+
+    let dropped = 0;
     const out = messages.map((m, i) => {
       if (i >= cutoff || typeof m.content === "string") return m;
       let touched = false;
@@ -123,9 +150,15 @@ export class DefaultContextManager {
         ) {
           touched = true;
           dropped += 1;
+          const tool = toolUses.get(b.tool_use_id);
+          const local = extractFromToolExchange(tool, b.content, b.is_error === true);
           return {
             ...b,
-            content: `[compacted] tool result elided to save context (${b.content.length} chars). Re-run the tool if you need this data again.`,
+            content: formatSemanticPlaceholder({
+              originalChars: b.content.length,
+              toolName: tool?.name,
+              local,
+            }),
           };
         }
         return b;
@@ -133,7 +166,18 @@ export class DefaultContextManager {
       return touched ? { ...m, content: blocks } : m;
     });
 
-    return { messages: out, droppedBlocks: dropped };
+    if (dropped === 0) {
+      return { messages: out, droppedBlocks: 0, ledgerEntries: 0, ledger: empty };
+    }
+
+    const ledger = mergeCompactLedgers(priorLedger, scanned);
+    const withLedger = upsertCompactLedger(out, ledger);
+    return {
+      messages: withLedger,
+      droppedBlocks: dropped,
+      ledgerEntries: ledgerEntryCount(ledger),
+      ledger,
+    };
   }
 }
 
@@ -175,4 +219,118 @@ function withTrailingCacheMark(m: Anthropic.MessageParam): Anthropic.MessagePara
     }
   }
   return { ...m, content: blocks };
+}
+
+function indexToolUses(messages: Anthropic.MessageParam[]): Map<string, ToolUseRef> {
+  const map = new Map<string, ToolUseRef>();
+  for (const m of messages) {
+    if (m.role !== "assistant" || typeof m.content === "string") continue;
+    for (const b of m.content) {
+      if (b.type === "tool_use") {
+        map.set(b.id, { name: b.name, input: b.input });
+      }
+    }
+  }
+  return map;
+}
+
+function findExistingLedger(messages: Anthropic.MessageParam[]): CompactLedger {
+  let found = emptyCompactLedger();
+  for (const m of messages) {
+    for (const text of messageTexts(m)) {
+      if (text.includes(COMPACT_LEDGER_MARKER)) {
+        found = mergeCompactLedgers(found, parseCompactLedgerText(text));
+      }
+    }
+  }
+  return found;
+}
+
+/**
+ * Scan the unprotected prefix for durable facts. Skip already-compacted
+ * placeholders and existing ledger blocks (those are merged via findExistingLedger).
+ */
+function scanConversationLedger(
+  messages: Anthropic.MessageParam[],
+  cutoff: number,
+  toolUses: Map<string, ToolUseRef>,
+): CompactLedger {
+  const parts: CompactLedger[] = [];
+  for (let i = 0; i < cutoff; i++) {
+    const m = messages[i]!;
+    if (m.role === "user") {
+      for (const text of messageTexts(m)) {
+        if (text.includes(COMPACT_LEDGER_MARKER) || text.startsWith("[compacted]")) continue;
+        const constraints = extractConstraintsFromText(text);
+        const evidence = extractEvidenceFromText(text);
+        if (constraints.length || evidence.length) {
+          parts.push({
+            ...emptyCompactLedger(),
+            constraints,
+            evidence,
+          });
+        }
+      }
+      if (typeof m.content !== "string") {
+        for (const b of m.content) {
+          if (b.type !== "tool_result" || typeof b.content !== "string") continue;
+          if (b.content.startsWith("[compacted]")) continue;
+          // Only harvest large results we are about to elide — small ones stay verbatim.
+          if (b.content.length <= MIN_COMPACTABLE_CHARS) continue;
+          parts.push(extractFromToolExchange(toolUses.get(b.tool_use_id), b.content, b.is_error === true));
+        }
+      }
+    } else if (m.role === "assistant") {
+      for (const text of messageTexts(m)) {
+        const decisions = extractDecisionsFromText(text);
+        if (decisions.length) {
+          parts.push({ ...emptyCompactLedger(), decisions });
+        }
+      }
+    }
+  }
+  return mergeCompactLedgers(...parts);
+}
+
+function messageTexts(m: Anthropic.MessageParam): string[] {
+  if (typeof m.content === "string") return [m.content];
+  const out: string[] = [];
+  for (const b of m.content) {
+    if (b.type === "text" && typeof b.text === "string") out.push(b.text);
+  }
+  return out;
+}
+
+/**
+ * Upsert a single durable ledger text block. Prefer rewriting an existing
+ * marker in place (prefix shape stable across re-compacts); otherwise insert
+ * a dedicated user message at the front (protectRecent is end-relative).
+ */
+function upsertCompactLedger(
+  messages: Anthropic.MessageParam[],
+  ledger: CompactLedger,
+): Anthropic.MessageParam[] {
+  const text = formatCompactLedger(ledger);
+  const out = messages.map((m) => {
+    if (typeof m.content === "string") {
+      if (!m.content.includes(COMPACT_LEDGER_MARKER)) return m;
+      return { ...m, content: text };
+    }
+    let touched = false;
+    const blocks = m.content.map((b) => {
+      if (b.type === "text" && typeof b.text === "string" && b.text.includes(COMPACT_LEDGER_MARKER)) {
+        touched = true;
+        return { ...b, text };
+      }
+      return b;
+    });
+    return touched ? { ...m, content: blocks } : m;
+  });
+
+  const already = out.some((m) =>
+    messageTexts(m).some((t) => t.includes(COMPACT_LEDGER_MARKER)),
+  );
+  if (already) return out;
+
+  return [{ role: "user", content: [{ type: "text", text }] }, ...out];
 }

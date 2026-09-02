@@ -163,9 +163,15 @@ npx tsc --noEmit                            passed
 
 | 状态 | ID | 优化项 | I/R/E | 优先分 | 完成定义 |
 |---|---|---|---:|---:|---|
-| [ ] | MEM-01 | 语义化上下文压缩 | 5/4/4 | 18 | 保留用户约束、决策、失败尝试、证据引用和 side-effect ledger，不再只用占位符替换旧工具输出 |
+| [~] | MEM-01 | 语义化上下文压缩 | 5/4/4 | 18 | 保留用户约束、决策、失败尝试、证据引用和 side-effect ledger，不再只用占位符替换旧工具输出。**Phase A 已落地（2026-09-03）**：非 LLM 结构化 `[compact_ledger]` + 语义占位；见 Phase 5 实施记录 |
 | [ ] | MEM-02 | 分层、可治理记忆 | 4/4/5 | 8 | 原始事件→滚动摘要→artifact/reference store；按用户/项目/任务检索；记录来源、时间、置信度、冲突和删除范围 |
 | [ ] | MEM-03 | 跨宿主一致性 | 4/3/4 | 14 | CLI/Web/Electron 使用同一 memory contract；同步、权限、加密、删除和数据归属有端到端测试 |
+
+### Phase 5 实施记录（2026-09-03，MEM-01 Phase A）
+
+| ID | 已取得证据 | 残余边界 |
+|---|---|---|
+| MEM-01 | `src/compact-ledger.ts` 启发式抽取五桶（constraints/decisions/failures/evidence/sideEffects）；`DefaultContextManager.compact` 在 elision 前扫描保护窗外消息，写入/原地更新 `[compact_ledger]`，tool_result 改为语义占位（仍以 `[compacted]` 开头保幂等）；`compaction` 事件带 `ledgerEntries`；CLI + Web reducer/面文案同提交接线；`test/compact*.ts` + UI 锁；mutation-smoke `compact-ledger-skipped` | **非** LLM 摘要（Phase B 未做）；启发式会漏非模板表述的约束/决策；只压缩大 tool_result，不压缩 assistant 长推理；side-effect 桶覆盖内置写类 + 变异 bash 模式，MCP 写工具靠名字启发；原文仍不可恢复 |
 
 ## 每项实施模板
 
@@ -178,9 +184,9 @@ npx tsc --noEmit                            passed
 5. **回归证据**：针对性测试、完整测试、typecheck/build/pack，以及需要的真实 E2E/HIL。
 6. **残余风险**：未覆盖平台、TOCTOU、外部系统或人工验收项。
 
-当前执行顺序（2026-09-02 成熟度第二波，单操作员形态）：
-`EVAL-03c → EVAL-01 held-out（仪器）→ OBS-01[~] → RUN-01[~ state.json 已接] → MEM-01`。
-MEM-01 本波未开：依赖更前项绿且会话余量；语义压缩单独成项。
+当前执行顺序（2026-09-03 成熟度第二波，单操作员形态）：
+`EVAL-03c → EVAL-01 held-out → OBS-01[~] → RUN-01[~] → MEM-01[~ Phase A]`。
+下一刀候选：`MODEL-01b`（capability probe / 每角色 fallback）或 `MEM-01 Phase B`（可选 LLM 摘要，仅当启发式不够）或 `RUN-01 Phase 2`。
 本波**不提前** GOV-*；SAFE-05 Phase 2B / SAFE-06 保持 partial，除非发现已解锁且很小。
 并行可继续：`A1 攒 §2.1 样本（ledger:samples）`（与质量门不冲突）。
 若目标改公网多人，`GOV-01/02/03` 必须提前到 `RUN-01` 之后、任何公开上线之前。

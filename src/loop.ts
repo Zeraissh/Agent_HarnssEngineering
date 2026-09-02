@@ -448,7 +448,11 @@ export class AgentLoop {
         const compacted = this.context.compact(messages);
         if (compacted.droppedBlocks > 0) {
           messages = compacted.messages;
-          q.push({ type: "compaction", droppedBlocks: compacted.droppedBlocks });
+          q.push({
+            type: "compaction",
+            droppedBlocks: compacted.droppedBlocks,
+            ledgerEntries: compacted.ledgerEntries,
+          });
         }
 
         const request = this.context.render(messages, this.registry.toApiTools());

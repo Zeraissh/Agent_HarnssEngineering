@@ -70,6 +70,8 @@ interface ContextConfig {
 interface CompactResult {
   messages: Anthropic.MessageParam[];
   droppedBlocks: number;
+  ledgerEntries: number;
+  ledger: CompactLedger;
 }
 
 class DefaultContextManager {
@@ -93,7 +95,7 @@ function userMessageWithContext(
 
 3. **上下文规模信号**：`lastInputTokens`（上一轮的实际输入规模 = `input_tokens + cache_creation_input_tokens + cache_read_input_tokens`）是"上下文有多大"的唯一可靠信号，也是 `compact()` 的触发依据。（来源：`lastInputTokens` 字段 JSDoc 及 `noteUsage()` 内计算逻辑注释）
 
-4. **v0.3 压缩策略**：上一轮输入超过水位线（`contextTokenLimit * 0.8`）时，把"保护窗口之外"的大体积 `tool_result` 内容替换为占位文本。结构保持不变（每个 `tool_use_id` 仍有对应 `tool_result`），只有内容被置换——不会破坏 API 约束。小于 500 字符的 `tool_result` 不值得压缩。loop 会用返回值**替换**正史（而非仅用于本次渲染）——压缩只发生一次、结果确定，后续请求前缀保持稳定，避免每轮重压缩导致的缓存抖动。（来源：`compact()` JSDoc 及内部常量 `COMPACT_WATERMARK`、`MIN_COMPACTABLE_CHARS` 的行内注释）
+4. **v0.3 + MEM-01 压缩策略**：上一轮输入超过水位线（`contextTokenLimit * 0.8`）时，把"保护窗口之外"的大体积 `tool_result` 置换为语义占位，并 upsert `[compact_ledger]`（约束/决策/失败/证据/副作用）。结构保持不变。小于 500 字符的 `tool_result` 不压缩。loop **替换正史**保前缀稳定。（来源：`compact()` / `src/compact-ledger.ts`）
 
 5. **动态上下文注入规范（P3）**：易变信息（时间、环境）以独立 text 块进 messages，绝不写进 system prompt——system 变一个字节，其后缓存全灭。注入点在首条 user 消息，run 期间保持不变，因此 messages 前缀依然稳定。（来源：`userMessageWithContext()` JSDoc）
 
@@ -338,7 +340,7 @@ type TurnEvent =
       respond: (decision: "allow" | "deny", reason?: string) => void;
     }
   | { type: "usage"; turn: number; usage: Anthropic.Usage }
-  | { type: "compaction"; droppedBlocks: number }
+  | { type: "compaction"; droppedBlocks: number; ledgerEntries?: number }
   | { type: "api_retry"; turn: number; attempt: number; reason: string }
   | { type: "done"; result: AgentRunResult };
 ```

@@ -72,6 +72,7 @@ export { createBatcher, diffKeyed, signature, patchList, appendOnly, setText, se
  *   detail?: string,
  *   extraTurns?: number,
  *   droppedBlocks?: number
+ *   ledgerEntries?: number
  * }} TimelineEntry
  *
  * @typedef {TimelineEntry & {collapsed: boolean}} LogEntry
@@ -774,7 +775,12 @@ function buildTimelineEntry(seq, source, type, event) {
         reset: Array.isArray(event.reset) ? event.reset.map(String) : [],
       };
     case "compaction":
-      return { ...base, droppedBlocks: /** @type {number} */ (event.droppedBlocks) };
+      return {
+        ...base,
+        droppedBlocks: /** @type {number} */ (event.droppedBlocks),
+        ledgerEntries:
+          typeof event.ledgerEntries === "number" ? /** @type {number} */ (event.ledgerEntries) : undefined,
+      };
     default:
       return base;
   }
@@ -1211,7 +1217,12 @@ export function deriveContextFace(state, harness) {
   const compactions = [...state.timeline, ...state.verifierTimeline]
     .filter((e) => e.type === "compaction")
     .sort((a, b) => a.seq - b.seq)
-    .map((e) => ({ seq: e.seq, source: e.source, droppedBlocks: e.droppedBlocks ?? 0 }));
+    .map((e) => ({
+      seq: e.seq,
+      source: e.source,
+      droppedBlocks: e.droppedBlocks ?? 0,
+      ledgerEntries: e.ledgerEntries ?? 0,
+    }));
 
   return {
     ...usage,
@@ -1219,6 +1230,7 @@ export function deriveContextFace(state, harness) {
     nearWatermark: usage.ratio !== null && usage.ratio >= (harness?.compactWatermark ?? 0.8),
     compactions,
     droppedBlocks: compactions.reduce((n, c) => n + c.droppedBlocks, 0),
+    ledgerEntries: compactions.reduce((n, c) => n + (c.ledgerEntries ?? 0), 0),
     perTurn: state.usageByTurn,
   };
 }
@@ -2882,7 +2894,7 @@ function patchContextGauge(parts, ctx) {
       ? `上下文最近一轮输入 ${formatTokens(ctx.lastInputTokens)}（未配置上限）`
       : `上下文水位 ${pct}%，最近一轮输入 ${formatTokens(ctx.lastInputTokens)} / 上限 ${formatTokens(ctx.limit)}`,
     ctx.compactions.length > 0
-      ? `已压缩 ${ctx.compactions.length} 次，置换 ${ctx.droppedBlocks} 个 tool_result 原文，不可恢复`
+      ? `已压缩 ${ctx.compactions.length} 次，置换 ${ctx.droppedBlocks} 个 tool_result 原文；结构化账本保留 ${ctx.ledgerEntries ?? 0} 条事实`
       : null,
     "查看上下文详情",
   ].filter(Boolean);
@@ -3815,7 +3827,10 @@ export function buildFactorCards(faces) {
   }
   ctxLines.push(`缓存命中 ${(context.cacheHitRatio * 100).toFixed(0)}%`);
   if (context.compactions.length > 0) {
-    ctxLines.push(`⚠ 压缩 ${context.compactions.length} 次 · 置换 ${context.droppedBlocks} 块不可恢复`);
+    ctxLines.push(
+      `⚠ 压缩 ${context.compactions.length} 次 · 置换 ${context.droppedBlocks} 块原文` +
+        ` · 账本 ${context.ledgerEntries ?? 0} 条`,
+    );
   }
 
   const toolLines = [];
@@ -3922,7 +3937,8 @@ function patchTabContent(parts, state, activeTab, overview, logEntries, callback
     activeTab === "context"
       ? signature([
           faces.context.lastInputTokens, faces.context.limit,
-          faces.context.compactions.length, faces.context.perTurn.length,
+          faces.context.compactions.length, faces.context.droppedBlocks,
+          faces.context.ledgerEntries ?? 0, faces.context.perTurn.length,
         ])
       : activeTab === "tools"
         ? signature([
@@ -4031,7 +4047,9 @@ function renderContextTab(ctx) {
     // 这不是"又一条黄色警告"，混在一起会让人对它脱敏。
     html += '<div class="callout callout--irreversible">';
     html += `<strong>⚠ 上下文压缩 ${ctx.compactions.length} 次，置换 ${ctx.droppedBlocks} 个 tool_result 原文</strong>`;
-    html += "<p>本地截断是不可逆的信息丢失：被置换的原文永不可恢复，模型只能重新调用工具取回。</p>";
+    html +=
+      "<p>tool_result 原文不可恢复，模型如需全文须重跑工具。" +
+      `结构化账本已保留 ${ctx.ledgerEntries ?? 0} 条约束/决策/失败/证据/副作用摘要。</p>`;
     html += "</div>";
   }
 
@@ -5100,7 +5118,9 @@ function renderLogEntryBody(e) {
         `${Array.isArray(e.reset) && e.reset.length ? `<br>已重置：${esc(e.reset.join("、"))}` : ""}</div>`;
     }
     case "compaction":
-      return `<div class="log-entry-body">丢弃 ${e.droppedBlocks ?? "?"} 个块</div>`;
+      return `<div class="log-entry-body">丢弃 ${e.droppedBlocks ?? "?"} 个块` +
+        (typeof e.ledgerEntries === "number" ? ` · 账本 ${e.ledgerEntries} 条` : "") +
+        `</div>`;
     default:
       return "";
   }

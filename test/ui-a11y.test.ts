@@ -1124,16 +1124,18 @@ describe("常驻上下文水位", () => {
   });
 
   /**
-   * 已压缩与"快满了"不是一个语域：前者是**已经不可逆地丢过东西**，
-   * 后者只是预警。共用一个颜色会让人对前者脱敏。
+   * 已压缩与"快满了"不是一个语域：前者是**已经不可逆地丢过 tool_result 原文**
+   * （MEM-01 账本可保留摘要），后者只是预警。共用一个颜色会让人对前者脱敏。
    */
-  it("已发生压缩时走不可逆语域，并在名称里说明不可恢复", () => {
+  it("已发生压缩时走不可逆语域，并在名称里说明账本保留", () => {
     renderRunDetail(stateWithUsage(300, 2), { activeTab: "loop", harness: H });
     openDrawer();
     const g = document.querySelector(".ctx-gauge")!;
     expect(g.classList.contains("ctx-gauge--irreversible")).toBe(true);
     expect(g.textContent).toContain("压缩 2");
-    expect(g.getAttribute("aria-label")).toContain("不可恢复");
+    const label = g.getAttribute("aria-label") ?? "";
+    expect(label).toContain("置换");
+    expect(label).toContain("结构化账本");
   });
 
   it("点击跳到 Context 面——图标是入口不是死数字", () => {

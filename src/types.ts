@@ -417,7 +417,12 @@ export type TurnEvent =
       respond: (decision: "allow" | "deny", reason?: string) => void;
     }
   | { type: "usage"; turn: number; usage: Anthropic.Usage }
-  | { type: "compaction"; droppedBlocks: number }
+  /**
+   * 上下文压缩。droppedBlocks = 被置换的 tool_result 数；
+   * ledgerEntries = MEM-01 结构化账本中的事实条数（约束/决策/失败/证据/副作用）。
+   * 原文仍不可恢复，但账本随正史保留。
+   */
+  | { type: "compaction"; droppedBlocks: number; ledgerEntries?: number }
   /**
    * 思考增量（逐字）。与 `assistant_thinking`（turn 级整块）互补：
    * 这条用于"运行中看它在想什么"，那条用于事后回看。
