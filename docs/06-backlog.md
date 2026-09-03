@@ -70,6 +70,12 @@ MODEL-01 残余：Web 同步探针回写 compat、成本/延迟真路由、识�
 声明整占，不再按子任务粒度；③ `cross-app/app.js` 是早已漂移的静态副本，仍写着旧
 blockedReason 文案——同步它是另一件事（备忘录有记）；④ 视觉调用仍不进 runBudget。
 
+**真机冒烟后的两条补丁（2026-09-03）**：归档派生此前只传原话、不附上一轮裁决摘要（重启前后
+两套话）——现与同进程追加共用 `composeTurnFeedback`，裁决统一由 `verdictJudging` 取（活 run 读
+outcome，归档读 meta 的 outcome+judgedTurn）；注入 `modelClient` 的宿主此前仍读 shell 里的
+`AGENT_<ROLE>_MODEL` / `AGENT_FALLBACK_*` / `AGENT_RUN_HISTORY_KEEP`（残留一个 verifier 变量就红
+10 条测试）——现缺省读空 env，测试要武装就显式传 `roleEnv` / `fallbackEnv`（锁 v2-30b）。
+
 以下为历史交接页（2026-08-08 收工），仍有参考价值；新开工优先看 `docs/08`。
 
 ---
@@ -1320,6 +1326,12 @@ fail-closed。round 0 这次 19 轮就自行收口、未触发续跑，**因此�
   22 次裁决全是 `direct`**——FakeModelClient 的裁决永远可解析，那个 100% 正好
   会把判据推向"关掉"。**用假模型的数去判模型行为，是最坏的一种假证据。**
   现在注入了 `modelClient` 就默认不记账，并有回归锁。
+  同一条纪律的另一面（2026-09-03 补齐）：注入宿主也**不得被残留 env 武装**——角色模型
+  （`AGENT_<ROLE>_MODEL` 及同组后缀）、降级链（`AGENT_FALLBACK_*`）、`AGENT_RUN_HISTORY_KEEP`
+  在注入 `modelClient` 时缺省读空 env（`roleEnv` / `fallbackEnv` 显式传才武装）；此前开发机
+  残留一个 `AGENT_VERIFIER_MODEL`，假模型驱动的核查轮就真去连端点，10 条测试红且无法归因。
+  `AGENT_UI_DAILY_TOKEN_BUDGET` / 台账 / 历史根早已如此，`executionEnv` 是刻意的例外（安全语义
+  不按注入推断）。锁：`test/ui-server.test.ts` v2-30b（污染 env 下快照 + 行为双面）。
 - ~~**思考流式**（`thinking_delta`）~~ **已接通（2026-08-08 确认全链路在场）**：
   两个客户端都发 `kind:"thinking"` 增量（`model-client.ts:47` / `model-client-openai.ts:78`）
   → `loop.ts:212` 转成 `thinking_delta` → `ui/server.ts:629` 走 `event: delta` 命名通道带

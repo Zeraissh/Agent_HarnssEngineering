@@ -1392,6 +1392,8 @@ export function deriveToolsFace(state, harness) {
     workdir: rc?.workdir ?? harness?.workdir ?? null,
     roleModels: rc?.roleModels ?? null,
     readRoots: harness?.readRoots ?? [],
+    // 运行历史的真实落点是进程级装配（不逐 run 变），只来自宿主快照
+    history: harness?.history ?? null,
     mcp: harness?.mcp ?? null,
     guardrails: rc?.guardrails ?? harness?.guardrails ?? null,
     tools,
@@ -4325,6 +4327,13 @@ function renderToolsTab(tools) {
     html += row("视觉模型", rm.vision ?? "（未配置：本次运行看不了图）");
   }
   html += row("额外只读根", tools.readRoots.length ? tools.readRoots.join("；") : "（无）");
+  if (tools.history) {
+    // 报实际落点：重启后能不能接着这场对话，取决于档案存在哪、留几个
+    html += row(
+      "运行历史",
+      tools.history.enabled ? `${tools.history.dir}（保留最近 ${tools.history.keep} 个）` : "（未落盘：重启后无法回看或派生）",
+    );
+  }
   if (tools.guardrails) {
     const g = tools.guardrails;
     html += row("护栏", `maxTurns ${g.maxTurns ?? "—"} · maxTokens ${g.maxTokens ?? "—"} · 上下文上限 ${g.contextTokenLimit ?? "—"}`);

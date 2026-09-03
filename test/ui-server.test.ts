@@ -20,6 +20,7 @@ import { join, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { mkdtemp, rm, readFile, readdir, writeFile, mkdir } from "node:fs/promises";
 import { readFileSync, existsSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { request as httpRequest } from "node:http";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -3243,54 +3244,50 @@ describe("ui-server", () => {
   });
 
   // ---- V-30 角色模型 ----
+  // 角色模型的 env 由 roleEnv 显式注入：注入了 modelClient 的宿主缺省不读 process.env
+  // （仪器纪律，见 v2-30b），所以这几条不再往 process.env 里写、也不必 finally 清
   it("v2-26. 角色模型快照只报名字与 provider，绝不下发密钥或 baseURL", async () => {
-    process.env.AGENT_VERIFIER_MODEL = "strong-verifier";
-    process.env.AGENT_VERIFIER_API_KEY = "sk-must-not-leak";
-    process.env.AGENT_VERIFIER_BASE_URL = "https://secret.internal/v1";
-    try {
-      handle = createUiServer({ modelClient: new FakeModelClient([]), tools: [], workdir: process.cwd() });
-      port = await startServer(handle);
-      const raw = await (await fetch(`${baseUrl(port)}/api/harness`)).text();
+    handle = createUiServer({
+      modelClient: new FakeModelClient([]), tools: [], workdir: process.cwd(),
+      roleEnv: {
+        AGENT_VERIFIER_MODEL: "strong-verifier",
+        AGENT_VERIFIER_API_KEY: "sk-must-not-leak",
+        AGENT_VERIFIER_BASE_URL: "https://secret.internal/v1",
+      },
+    });
+    port = await startServer(handle);
+    const raw = await (await fetch(`${baseUrl(port)}/api/harness`)).text();
 
-      const snap = JSON.parse(raw);
-      expect(snap.roleModels.verifier).toEqual({
-        model: "strong-verifier", provider: "anthropic", configured: true,
-      });
-      expect(snap.roleModels.planner.configured).toBe(false);
-      // 整份快照的字节里都不能出现密钥或内网端点
-      expect(raw).not.toContain("sk-must-not-leak");
-      expect(raw).not.toContain("secret.internal");
-    } finally {
-      delete process.env.AGENT_VERIFIER_MODEL;
-      delete process.env.AGENT_VERIFIER_API_KEY;
-      delete process.env.AGENT_VERIFIER_BASE_URL;
-    }
+    const snap = JSON.parse(raw);
+    expect(snap.roleModels.verifier).toEqual({
+      model: "strong-verifier", provider: "anthropic", configured: true,
+    });
+    expect(snap.roleModels.planner.configured).toBe(false);
+    // 整份快照的字节里都不能出现密钥或内网端点
+    expect(raw).not.toContain("sk-must-not-leak");
+    expect(raw).not.toContain("secret.internal");
   });
 
   it("v2-27. run_config 报的是本 run 实际用的角色模型——关掉后应为 null", async () => {
-    process.env.AGENT_VERIFIER_MODEL = "strong-verifier";
-    try {
-      handle = createUiServer({
-        modelClient: new FakeModelClient([fakeMessage([textBlock("ok")], "end_turn")]),
-        tools: [autoTool("noop")], workdir: process.cwd(),
-      });
-      port = await startServer(handle);
-      base = baseUrl(port);
-      const start = async (body: unknown) => {
-        const { runId } = await (await fetch(`${base}/api/runs`, {
-          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
-        })).json() as { runId: string };
-        await waitForDone(base, runId);
-        const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
-        return (events.find((e: any) => e.event.type === "run_config") as any).event.roleModels;
-      };
+    handle = createUiServer({
+      modelClient: new FakeModelClient([fakeMessage([textBlock("ok")], "end_turn")]),
+      tools: [autoTool("noop")], workdir: process.cwd(),
+      roleEnv: { AGENT_VERIFIER_MODEL: "strong-verifier" },
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+    const start = async (body: unknown) => {
+      const { runId } = await (await fetch(`${base}/api/runs`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+      })).json() as { runId: string };
+      await waitForDone(base, runId);
+      const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+      return (events.find((e: any) => e.event.type === "run_config") as any).event.roleModels;
+    };
 
-      expect((await start({ task: "默认启用" })).verifier).toBe("strong-verifier");
-      // A/B 对照臂：显式关掉就该报"与执行者同一个"，配了什么不等于用了什么
-      expect((await start({ task: "显式关掉", useVerifierModel: false })).verifier).toBeNull();
-    } finally {
-      delete process.env.AGENT_VERIFIER_MODEL;
-    }
+    expect((await start({ task: "默认启用" })).verifier).toBe("strong-verifier");
+    // A/B 对照臂：显式关掉就该报"与执行者同一个"，配了什么不等于用了什么
+    expect((await start({ task: "显式关掉", useVerifierModel: false })).verifier).toBeNull();
   });
 
   // ---- V-31 视觉模型（第四个角色） ----
@@ -3304,33 +3301,103 @@ describe("ui-server", () => {
     await handle.close();
 
     // 配上（Kimi 形态：OpenAI 兼容端点）
-    process.env.AGENT_VISION_MODEL = "moonshot-v1-8k-vision-preview";
-    process.env.AGENT_VISION_PROVIDER = "openai";
-    process.env.AGENT_VISION_BASE_URL = "https://api.moonshot.cn/v1";
-    process.env.AGENT_VISION_API_KEY = "sk-vision-must-not-leak";
+    handle = createUiServer({
+      modelClient: new FakeModelClient([]), workdir: process.cwd(),
+      roleEnv: {
+        AGENT_VISION_MODEL: "moonshot-v1-8k-vision-preview",
+        AGENT_VISION_PROVIDER: "openai",
+        AGENT_VISION_BASE_URL: "https://api.moonshot.cn/v1",
+        AGENT_VISION_API_KEY: "sk-vision-must-not-leak",
+      },
+    });
+    port = await startServer(handle);
+    const raw = await (await fetch(`${baseUrl(port)}/api/harness`)).text();
+    snap = JSON.parse(raw);
+
+    const vision = snap.tools.find((t: any) => t.name === "describe_image");
+    expect(vision, "配了视觉模型却没注册工具").toBeDefined();
+    expect(vision.origin).toBe("builtin");
+    // 把本地文件送到另一个端点，属于要审批的动作
+    expect(vision.permission).toBe("ask");
+    expect(vision.approvalPolicy).toEqual({ maxScope: "once" });
+
+    expect(snap.roleModels.vision).toEqual({
+      model: "moonshot-v1-8k-vision-preview", provider: "openai", configured: true,
+    });
+    // 密钥与端点一律不下发
+    expect(raw).not.toContain("sk-vision-must-not-leak");
+    expect(raw).not.toContain("api.moonshot.cn");
+  });
+
+  /**
+   * 仪器纪律（与台账 / 历史落盘 / 日预算门同一条）：注入了 modelClient 的宿主跑的是
+   * 假模型，不该被 shell 里残留的 env 武装。真实事故（2026-09-03）：开发机残留
+   * AGENT_VERIFIER_MODEL，假模型驱动的核查轮真的去连端点 → 10 条 ui-server 测试红，
+   * 失败信息（"verifier 输出无法解析为 JSON 裁决" / 超时）完全无法归因到那个变量。
+   */
+  it("v2-30b. 注入模型的宿主不被残留 env 武装：角色模型 / 降级链 / 历史落点与保留数只认显式选项", async () => {
+    const polluted: Record<string, string> = {
+      AGENT_VERIFIER_MODEL: "residual-verifier",
+      AGENT_PLANNER_MODEL: "residual-planner",
+      AGENT_VISION_MODEL: "residual-vision",
+      AGENT_FALLBACK_MODEL: "residual-backup",
+      AGENT_FALLBACK_PROVIDER: "anthropic",
+      // 非法值：真实宿主会在启动时炸——注入宿主根本不该读到它
+      AGENT_FALLBACK_ROUTING: "cheapest",
+      AGENT_MODEL_PROBE: "1",
+      AGENT_RUN_HISTORY_DIR: join(tmpdir(), `residual-history-${randomUUID()}`),
+      AGENT_RUN_HISTORY_KEEP: "1",
+    };
+    const saved = Object.fromEntries(Object.keys(polluted).map((k) => [k, process.env[k]]));
+    Object.assign(process.env, polluted);
+    const historyDir = await mkdtemp(join(tmpdir(), "instrument-"));
     try {
-      handle = createUiServer({ modelClient: new FakeModelClient([]), workdir: process.cwd() });
+      const model = new FakeModelClient([
+        fakeMessage([textBlock("第一个 run 交付")], "end_turn"),
+        fakeMessage([textBlock(JSON.stringify({ passed: true, issues: [], summary: "假模型出的裁决" }))], "end_turn"),
+        fakeMessage([textBlock("第二个 run 交付")], "end_turn"),
+      ]);
+      // 只传 history：其余全部依赖缺省——这正是绝大多数测试宿主的形态
+      handle = createUiServer({ modelClient: model, tools: [autoTool("noop")], workdir: process.cwd(), history: historyDir });
       port = await startServer(handle);
-      const raw = await (await fetch(`${baseUrl(port)}/api/harness`)).text();
-      snap = JSON.parse(raw);
+      base = baseUrl(port);
+      const snap = await (await fetch(`${base}/api/harness`)).json() as any;
+      expect(snap.roleModels.verifier).toEqual({ configured: false });
+      expect(snap.roleModels.planner).toEqual({ configured: false });
+      expect(snap.roleModels.vision).toEqual({ configured: false });
+      expect(snap.tools.map((t: any) => t.name)).not.toContain("describe_image");
+      expect(snap.fallbackChain).toBeNull();
+      expect(snap.fallbackScope).toBeNull();
+      // 落点是选项给的那个目录，不是 env 里的；保留数是缺省 50，不是 env 里的 1
+      expect(snap.history).toEqual({ enabled: true, dir: resolve(historyDir), keep: DEFAULT_HISTORY_KEEP });
 
-      const vision = snap.tools.find((t: any) => t.name === "describe_image");
-      expect(vision, "配了视觉模型却没注册工具").toBeDefined();
-      expect(vision.origin).toBe("builtin");
-      // 把本地文件送到另一个端点，属于要审批的动作
-      expect(vision.permission).toBe("ask");
-      expect(vision.approvalPolicy).toEqual({ maxScope: "once" });
+      // 行为面：核查轮由同一个假模型应答（两次请求都落在它身上），裁决是它出的
+      const { runId: first } = await (await fetch(`${base}/api/runs`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task: "带核查", verify: true }),
+      })).json() as { runId: string };
+      await waitForDone(base, first);
+      expect(model.requests).toHaveLength(2);
+      const verdict = (await readSSEAll(await fetch(`${base}/api/runs/${first}/events`)) as any[])
+        .find((e) => e.event.type === "verdict")?.event.verdict;
+      expect(verdict?.summary).toBe("假模型出的裁决");
 
-      expect(snap.roleModels.vision).toEqual({
-        model: "moonshot-v1-8k-vision-preview", provider: "openai", configured: true,
-      });
-      // 密钥与端点一律不下发
-      expect(raw).not.toContain("sk-vision-must-not-leak");
-      expect(raw).not.toContain("api.moonshot.cn");
+      const { runId: second } = await (await fetch(`${base}/api/runs`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task: "第二个", verify: false }),
+      })).json() as { runId: string };
+      await waitForDone(base, second);
+      await handle.close();
+      handle = undefined;
+      // 两个档案都在选项目录里（KEEP=1 若生效，第一个已被剪掉）；env 指的目录从未被创建
+      expect((await readdir(historyDir)).sort()).toEqual([first, second].sort());
+      expect(existsSync(polluted.AGENT_RUN_HISTORY_DIR!)).toBe(false);
     } finally {
-      for (const k of ["MODEL", "PROVIDER", "BASE_URL", "API_KEY"]) {
-        delete process.env[`AGENT_VISION_${k}`];
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
       }
+      await rm(historyDir, { recursive: true, force: true }).catch(() => {});
     }
   });
 

@@ -60,6 +60,7 @@ import { writeFileTool } from "../src/tools/write-file.js";
 import { resolveInWorkdir } from "../src/tools/fs-util.js";
 import { appendRunLedger, buildLedgerEntry, ledgerErrorClass, ledgerPath, tallyToolCall, type ToolTally } from "../src/ledger.js";
 import {
+  DEFAULT_HISTORY_KEEP,
   RunHistoryWriter,
   historyKeepCount,
   historyRootPath,
@@ -579,7 +580,7 @@ export interface UiServerOptions {
    * `false` = 显式关闭；字符串 = 指定根目录。
    */
   history?: false | string;
-  /** 历史保留数（判据③），缺省 env AGENT_RUN_HISTORY_KEEP > DEFAULT_HISTORY_KEEP */
+  /** 历史保留数（判据③），缺省 env AGENT_RUN_HISTORY_KEEP（仅真实宿主读）> DEFAULT_HISTORY_KEEP */
   historyKeep?: number;
   /** exact-input grant 的宿主级硬 TTL；工具还可声明更短上限。 */
   approvalGrantTtlMs?: number;
@@ -635,12 +636,24 @@ export interface UiServerOptions {
    */
   executionEnv?: NodeJS.ProcessEnv;
   /**
-   * 端点降级链（MODEL-01a）的配置源。与 `executionEnv` 同一条仪器纪律：
-   * **不用"是否注入了 modelClient"去推断该不该武装这条防线**。
-   * 测试要么显式传一份自己的 env，要么就得接受宿主 `.env` 里那条真实链——
-   * 后者意味着一次瞬时错误会把假模型的请求转发到真端点上去。
+   * 端点降级链（MODEL-01a）的配置源。缺省：真实宿主读 `process.env`；**注入了
+   * modelClient 的宿主读一份空 env**（同 `roleEnv`，见那条的仪器纪律）——
+   * 假模型的请求绝不该因为开发机残留的 AGENT_FALLBACK_* 被转发到真端点上去。
+   * 要武装就显式传（测试传自己的一份，嵌入式真实 client 传 `process.env`）。
+   * 注意与 `executionEnv` 的区别：隔离策略是安全语义，不按注入推断；降级链与
+   * 角色模型是可选装备，缺省不装才是对假模型诚实。
    */
   fallbackEnv?: NodeJS.ProcessEnv;
+  /**
+   * 角色模型（verifier / planner / vision 的 AGENT_<ROLE>_MODEL 及同组后缀）的配置源。
+   *
+   * 仪器纪律（与台账 / 历史落盘同一条）：`options.modelClient` 是测试与脚本的注入口，
+   * 注入宿主跑的是假模型，**不该被 shell 里残留的 env 武装**——曾有一次
+   * AGENT_VERIFIER_MODEL 残留让假模型驱动的核查轮真的去连端点，10 条 ui-server
+   * 测试当场红、而且无法从失败信息归因。缺省：真实宿主读 `process.env`，注入宿主读空 env；
+   * 要在测试里验证角色模型装配，显式传一份自己的 env。
+   */
+  roleEnv?: NodeJS.ProcessEnv;
   /** 只在宿主确实位于可信反向代理之后时读取 X-Forwarded-Proto/Host。 */
   trustProxy?: boolean;
   /**
@@ -1382,7 +1395,14 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   // MODEL-01b：Web 启动保持同步装配（createUiServer 契约）；compat 仍可名称猜测，
   // 粘性探针在下方异步填充供 prefer_healthy。CLI 走 createModelClientWithProbe。
   const resolved = createModelClientFromEnv(process.env.AGENT_MODEL ?? "claude-opus-4-8");
-  const fallbackEnv = options.fallbackEnv ?? process.env;
+  /**
+   * 可选装备（角色模型 / 降级链 / 能力探针）的 env 来源。真实宿主读 process.env；
+   * 注入了 modelClient 的宿主缺省读空 env——见 UiServerOptions.roleEnv 的仪器纪律。
+   * 台账、历史落盘、日预算门都按同一条纪律缺省关闭，这里补齐的是模型装配这一面。
+   */
+  const armamentEnv: NodeJS.ProcessEnv = realHost ? process.env : {};
+  const fallbackEnv = options.fallbackEnv ?? armamentEnv;
+  const roleEnv = options.roleEnv ?? armamentEnv;
   const routingPolicy: FallbackRouting = readFallbackEnv(fallbackEnv).routing;
   let executorCapabilities: EndpointCapabilities | null = null;
   /**
@@ -1453,7 +1473,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         : options.modelClient
           ? null
           : historyRootPath();
-  const historyKeep = options.historyKeep ?? historyKeepCount();
+  // 保留数同一条纪律：注入宿主不读 AGENT_RUN_HISTORY_KEEP（残留的 "1" 会让测试里第二个
+  // 档案刚落盘就被剪掉）；历史根本就只在真实宿主读 AGENT_RUN_HISTORY_DIR（上一行）
+  const historyKeep = options.historyKeep ?? (realHost ? historyKeepCount() : DEFAULT_HISTORY_KEEP);
   const maxStoredRuns = positiveInteger(options.maxStoredRuns, "maxStoredRuns")
     ?? positiveIntegerEnv("AGENT_UI_MAX_STORED_RUNS")
     ?? (realHost ? Math.max(100, historyKeep) : Number.MAX_SAFE_INTEGER);
@@ -1581,11 +1603,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    * 所以 planner 这一路留给实验，界面不该暗示它更好。
    */
   function resolveRole(prefix: string): { name: string; provider: ResolvedProvider } | null {
-    const name = process.env[`AGENT_${prefix}_MODEL`];
+    const name = roleEnv[`AGENT_${prefix}_MODEL`];
     if (!name) return null;
-    const pv = process.env[`AGENT_${prefix}_PROVIDER`];
-    const baseURL = process.env[`AGENT_${prefix}_BASE_URL`];
-    const apiKey = process.env[`AGENT_${prefix}_API_KEY`];
+    const pv = roleEnv[`AGENT_${prefix}_PROVIDER`];
+    const baseURL = roleEnv[`AGENT_${prefix}_BASE_URL`];
+    const apiKey = roleEnv[`AGENT_${prefix}_API_KEY`];
     return {
       name,
       provider: createModelClientFromEnv(name, {
@@ -1628,13 +1650,13 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   }
 
   const verifierClient = verifierRole
-    ? wrapRoleClient("verifier", verifierRole, process.env.AGENT_VERIFIER_BASE_URL)
+    ? wrapRoleClient("verifier", verifierRole, roleEnv.AGENT_VERIFIER_BASE_URL)
     : null;
   const plannerClient = plannerRole
-    ? wrapRoleClient("planner", plannerRole, process.env.AGENT_PLANNER_BASE_URL)
+    ? wrapRoleClient("planner", plannerRole, roleEnv.AGENT_PLANNER_BASE_URL)
     : null;
   const visionClient = visionRole
-    ? wrapRoleClient("vision", visionRole, process.env.AGENT_VISION_BASE_URL)
+    ? wrapRoleClient("vision", visionRole, roleEnv.AGENT_VISION_BASE_URL)
     : null;
 
   const roleFallbackChains = {
@@ -4311,6 +4333,13 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         enabled: true,
         dir: defaultMemoryDir,
         toolCount: memoryTools.length,
+      },
+      // B2 运行历史的真实落点（/health 只报 enabled 不报路径——那条端点未认证）。
+      // 装配状态条报的是"这台宿主实际存到哪、留几个"，不是 env 里配了什么
+      history: {
+        enabled: Boolean(historyRoot),
+        dir: historyRoot,
+        keep: historyKeep,
       },
       guardrails: {
         maxTurns: maxTurns ?? null,

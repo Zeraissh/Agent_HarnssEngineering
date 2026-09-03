@@ -35,6 +35,7 @@ const HARNESS = {
   },
   workdir: "D:\\repo",
   readRoots: ["D:\\refs"],
+  history: { enabled: true, dir: "D:\\repo\\.agent-run-history", keep: 50 },
   guardrails: { maxTurns: 40, maxTokens: 64000, contextTokenLimit: 1000 },
   compactWatermark: 0.8,
   verifierBudgetTurns: 15,
@@ -248,13 +249,16 @@ describe("deriveToolsFace", () => {
     expect(deriveToolsFace(st, HARNESS).reroutes[0].switched).toBe(false);
   });
 
-  it("透出边界：只读根 / 白名单 / shell / 执行隔离 / 护栏", () => {
+  it("透出边界：只读根 / 白名单 / shell / 执行隔离 / 护栏 / 运行历史落点", () => {
     const f = deriveToolsFace(s(), HARNESS);
     expect(f.readRoots).toEqual(["D:\\refs"]);
     expect(f.pack.verify.readOnlyCommands).toEqual(["python -m pytest"]);
     expect(f.shell).toBe("Git Bash");
     expect(f.executionIsolation).toMatchObject({ effectiveState: "partial", resolvedBackend: "oci" });
     expect(f.guardrails.maxTurns).toBe(40);
+    // 宿主快照新字段要真的到达派生层（host-lags 纪律：加字段同提交接宿主）
+    expect(f.history).toEqual({ enabled: true, dir: "D:\\repo\\.agent-run-history", keep: 50 });
+    expect(deriveToolsFace(s(), { ...HARNESS, history: undefined }).history).toBeNull();
   });
 
   it("run_config 的执行边界覆盖进程快照，report-only 必须成为 Tools 异常", () => {

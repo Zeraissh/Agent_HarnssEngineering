@@ -62,6 +62,7 @@ const FAKE_HARNESS = {
   shell: "Git Bash (C:\\Program Files\\Git\\bin\\bash.exe)",
   workdir: "D:\\repo",
   readRoots: ["D:\\refs"],
+  history: { enabled: true, dir: "D:\\repo\\.agent-run-history", keep: 50 },
   guardrails: { maxTurns: 40, maxTokens: 64000, contextTokenLimit: 150000 },
   compactWatermark: 0.8,
   verifierBudgetTurns: 15,
@@ -205,6 +206,24 @@ describe("axe 自动扫描：空态 / 列表 / 详情三种画面零 violations"
     openDrawer();
     const violations = await runAxe();
     expect(violations, JSON.stringify(violations, null, 2)).toEqual([]);
+  });
+
+  it("Tools 面的运行边界报运行历史的真实落点（宿主快照新字段到达 DOM，未落盘时明说后果）", () => {
+    const rowOf = (label: string): string | null => {
+      const dt = [...document.querySelectorAll(".boundary-list dt")].find((el) => el.textContent === label);
+      return dt?.nextElementSibling?.textContent ?? null;
+    };
+    renderRunDetail(buildRichState(), { activeTab: "tools", harness: FAKE_HARNESS });
+    openDrawer();
+    expect(rowOf("运行历史")).toBe("D:\\repo\\.agent-run-history（保留最近 50 个）");
+
+    document.body.innerHTML = loadSkeleton();
+    renderRunDetail(buildRichState(), {
+      activeTab: "tools",
+      harness: { ...FAKE_HARNESS, history: { enabled: false, dir: null, keep: 50 } },
+    });
+    openDrawer();
+    expect(rowOf("运行历史")).toContain("未落盘");
   });
 
   it("运行详情·Verification 面（三值裁决 + 饥饿告警 + 边界）", async () => {
