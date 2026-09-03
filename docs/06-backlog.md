@@ -22,6 +22,8 @@
   基线数字是修复前的 v1.3.0。**接手提醒**：`ho-workdir-escape-denied` 通过靠模型自律（report 模式 bash 无圈禁），
   不是圈禁证据；下一步候选——PATH 修复后对 ho-line-count-env-example / ho-only-digits 复测轮数回落，以及
   nightly 跨夜 ab-log 聚合进 EVAL-02 stats（n=3 单用例 Wilson 下界只有 43.8%）。
+  **PATH 复测已做（2026-09-03，bdc3cd9 worktree，同 nightly 口径 ×3 rep）**：三用例 9/9；turns 51→38、tokens 136.6k→79.7k、
+  `command not found` 8/9 run → 0；ho-line-count 9/9/9 → 5/6/6 轮。数字表见 `eval/heldout-report-v1.3.0.md` §7，基线 JSON 不动。
 - **OBS-01[~]** — `src/trace.ts` + `trace.jsonl`；`GET /api/runs/:id/trace` 脱敏导出。
 - **RUN-01[~ Phase 1+2]** — ADR-003；`state.json`；崩溃→interrupted；**同 run 热恢复**（checkpoint 边界，`sameRunResume`/`run_resumed`）；预算+grantAudit 进 state。
 - **MEM-01[~ Phase A+B+C]** — 语义压缩：`[compact_ledger]` + 语义占位（A）；可选 LLM 摘要进账本（B）；
