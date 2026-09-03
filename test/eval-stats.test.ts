@@ -168,6 +168,26 @@ describe("summarizeGroup / parseAbLogLine", () => {
     expect(r?.verifierPassed).toEqual([false, true]);
   });
 
+  it("parseAbLogLine 认 ab.ts 落档的 wallMs（也兼容 durationMs；两者皆无 → null）", () => {
+    // 正向：ab.ts 写的是 wallMs —— 此前只读 durationMs，wall 分位数恒为 "—"
+    const fromAb = parseAbLogLine(
+      JSON.stringify({ case: "c", arm: "baseline", model: "m", pass: true, wallMs: 4321 }),
+    );
+    expect(fromAb?.durationMs).toBe(4321);
+    // 兼容：旧口径 durationMs 仍认
+    const legacy = parseAbLogLine(
+      JSON.stringify({ case: "c", arm: "baseline", model: "m", pass: true, durationMs: 99 }),
+    );
+    expect(legacy?.durationMs).toBe(99);
+    // 反向：两者皆无 → null，不得编造 0
+    const none = parseAbLogLine(JSON.stringify({ case: "c", arm: "baseline", model: "m", pass: true }));
+    expect(none?.durationMs).toBeNull();
+    // 端到端：ab-log 行进 summarizeGroup 后 wall 分位数必须有数
+    const g = summarizeGroup([fromAb!, parseAbLogLine(JSON.stringify({ case: "c", arm: "baseline", model: "m", pass: false, stopReason: "completed", note: "期望 1 实际 2", wallMs: 1000 }))!]);
+    expect(g.wallMs.p50).toBeCloseTo((4321 + 1000) / 2);
+    expect(g.wallMs.p95).not.toBeNull();
+  });
+
   it("summarizeAll 按 case×arm×model 分桶", () => {
     const groups = summarizeAll([
       row({ pass: true, caseId: "a", arm: "b", model: "m1" }),

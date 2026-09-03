@@ -269,7 +269,15 @@ export function parseAbLogLine(line: string): StatsRunRow | null {
     note: obj.note != null ? String(obj.note) : null,
     turns: typeof obj.turns === "number" ? obj.turns : null,
     tokens: typeof obj.tokens === "number" ? obj.tokens : null,
-    durationMs: typeof obj.durationMs === "number" ? obj.durationMs : null,
+    // ab.ts 逐 run 落档的字段名是 wallMs（见 ab.ts appendFile）；durationMs 是台账/其它
+    // 来源的口径。两个都认——此前只认 durationMs，使全部 A/B 行的 wall p50/p95 恒为 "—"
+    // （EVAL-01 v1.3.0 基线矩阵跑 stats 时发现）。
+    durationMs:
+      typeof obj.wallMs === "number"
+        ? obj.wallMs
+        : typeof obj.durationMs === "number"
+          ? obj.durationMs
+          : null,
     verifierPassed: verdicts,
     error: obj.error != null ? String(obj.error) : null,
     finalPassed: typeof obj.finalPassed === "boolean" ? obj.finalPassed : pass,
