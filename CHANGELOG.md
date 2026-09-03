@@ -24,7 +24,9 @@
   旧轮折叠成一个 `[compacted_turns]` 摘要块（配对不拆、幂等、只合并不二折）；③ 端点 context-too-long 400
   （Anthropic「prompt is too long」/ OpenAI `context_length_exceeded`）不再直接报错：忽略水位硬压缩后重发同一轮，
   仍超长才以 `context_overflow` 分类收尾。  `compaction` 事件新增 `collapsedTurns` / `reactive`，CLI 与 Web 同步显示；
-  mock provider 新增 `context_overflow` 故障与确定性场景。
+  mock provider 新增 `context_overflow` 故障与确定性场景。真端点复核（deepseek-v4-flash，窗口实测 1,048,576）：
+  兼容路由回 OpenAI 信封且 `code` 只是 `invalid_request_error`，识别靠 message；该真实形状已逐字加锁；
+  CLI 真跑一次 987k+64k 撞 400 → 反应式压缩 → 重发 107k → 完成。
 
 ### 核查（Verification）
 

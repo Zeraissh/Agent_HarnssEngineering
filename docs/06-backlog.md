@@ -183,6 +183,16 @@ tier 2 跳过 / 反应式跳过 / 截断绕过 / 配对规则删除 / 超长判�
 自身不缩（20 条/桶上限）；折叠块按行摘要、轮数多时自身会长；tier 2 触发是字符/4 粗估不读真 token；反应式只重发一次
 （第二次超长即 error，不再砍保护窗）；未开 Phase B 时长 assistant 推理里的非模板事实随折叠丢失。
 
+**真端点复核（2026-09-03，deepseek-v4-flash）**：窗口实测 **1,048,576 tokens**（不是 128k——16×30k 字符共 178k tokens
+一请求被正常接受；按 messages + max_tokens 之和计超长）。兼容路由的 400 是 **OpenAI 信封 + `code:"invalid_request_error"`**
+（SDK → `BadRequestError`，message「400 {…}」，content-type octet-stream），mock 的两条 wire 形状都覆盖不到，靠 message 里
+「maximum context length」识别；已按真机报文逐字加锁（变异：删该正则分支只有它红）。CLI 真跑（112 文件 / 14 页清单，
+`AGENT_CONTEXT_LIMIT=1e7` 令水位路径永不触发）：第 12 轮 ≈ 987k + 64k 撞 400 → `compaction{reactive}` dropped 72 / collapsed 10 /
+ledger 22 → 重发 107k 成功 → `completed` 28 轮，in 1.38M / cacheR 10.6M / out 21.7k / 352 s，summary 112/112 逐字正确，水位路径 0 次。
+**折叠质量缺口（新残余）**：tier 1 置换过的结果在折叠块 results 行只剩「(elided)」，首行事实一并丢失；模型靠占位符提示
+自行 `read_file limit=1` 补读 72 次（8 轮）才凑齐。下一层候选：占位符 / results 行带原结果首行（≤100 字符）。
+台账行不记 compaction 次数（reactive 只在事件流里可见）。产物在 `D:\Work\scratch\reactive-smoke-20260903\`（run1 / run2，未入仓）。
+
 ### ④ 无包运行的核查者通用只读缺省（委托方批准的例外）—— ✅ 已实施
 
 **缺口**：白名单只来自 `DomainPack.verify.readOnlyCommands`；无包 = 无白名单 = 每条 bash 都 deny → 核查饥饿落

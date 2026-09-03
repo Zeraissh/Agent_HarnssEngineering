@@ -9,7 +9,7 @@
  * `[compact_ledger]` 只有一份且不丢；折叠确定性 + 幂等；反应式不消耗瞬时重试额度。
  */
 import { describe, expect, it } from "vitest";
-import type Anthropic from "@anthropic-ai/sdk";
+import Anthropic from "@anthropic-ai/sdk";
 import { COMPACT_LEDGER_MARKER, parseCompactLedgerText } from "../src/compact-ledger.js";
 import { COMPACTED_TURNS_MARKER, DefaultContextManager, REACTIVE_PROTECT_RECENT } from "../src/context.js";
 import { AgentLoop } from "../src/loop.js";
@@ -272,6 +272,43 @@ describe("isContextOverflowError / classifyApiError：两条 wire 的超长形�
     expect(isTransientApiError(openaiShape)).toBe(false);
     expect(classifyApiError(anthropicShape).startsWith(CONTEXT_OVERFLOW_ERROR_PREFIX)).toBe(true);
     expect(classifyApiError(openaiShape)).toContain("maximum context length is 128000");
+  });
+
+  /**
+   * 真端点实测形状（2026-09-03，deepseek-v4-flash @ api.deepseek.com/anthropic，窗口 1,048,576 tokens）：
+   * Anthropic 兼容路由回的是 **OpenAI 信封**（没有 Anthropic 的 `type:"error"` 外层），而且 `code` 不是
+   * OpenAI 自家的 context_length_exceeded，是笼统的 invalid_request_error——上面两个 mock 形状都覆盖不到：
+   * Anthropic 形状靠「prompt is too long」，OpenAI 形状靠 code。真实信号只剩 message 里那句
+   * 「maximum context length」。报文逐字照抄真机（数字含 64000 的 completion 份额：端点按
+   * messages + max_tokens 之和计超长）；经真实 SDK 的错误工厂包装——message 变成「400 {…json…}」、
+   * body 挂 `.error`、content-type 是 application/octet-stream——与 probe 观测逐字一致。
+   * 变异验证：删掉 isContextOverflowError 里的 /maximum context length/ 分支，只有这条红。
+   */
+  it("DeepSeek Anthropic 兼容路由的真实形状：OpenAI 信封 + code=invalid_request_error，只有 message 可认", () => {
+    const body = {
+      error: {
+        message:
+          "This model's maximum context length is 1048576 tokens. However, you requested 1220725 tokens " +
+          "(1156725 in the messages, 64000 in the completion). Please reduce the length of the messages or completion.",
+        type: "invalid_request_error",
+        param: null,
+        code: "invalid_request_error",
+      },
+    };
+    const err = Anthropic.APIError.generate(
+      400,
+      body,
+      undefined,
+      new Headers({ "content-type": "application/octet-stream" }),
+    );
+    expect(err).toBeInstanceOf(Anthropic.BadRequestError);
+    expect(err.status).toBe(400);
+    expect(err.message.startsWith('400 {"error":{"message":"This model\'s maximum context length is 1048576 tokens.')).toBe(true);
+    expect((err.error as { error: { code: string } }).error.code).toBe("invalid_request_error");
+    expect(isContextOverflowError(err)).toBe(true);
+    expect(isTransientApiError(err)).toBe(false);
+    expect(classifyApiError(err).startsWith(CONTEXT_OVERFLOW_ERROR_PREFIX)).toBe(true);
+    expect(classifyApiError(err)).toContain("maximum context length is 1048576");
   });
 });
 
