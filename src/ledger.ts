@@ -56,6 +56,56 @@ export interface LedgerVerification {
 /** 按角色分的工具调用直方图：`{ main: { bash: 3 }, verifier: { read_file: 8 } }` */
 export type ToolTally = Record<string, Record<string, number>>;
 
+/**
+ * 执行者谱系（main / rework，含编排下的 `s1/main`）的恢复决策计数。
+ *
+ * 为什么要它：领域包能声明恢复策略之后（`DomainPack.recovery`），"该给 kicad 几轮
+ * 续跑"这个数只能从台账里读出来——而此前台账只记 stopReason=max_turns，分不清
+ * "续跑过 8 轮仍撞上限" 与 "根本没触发续跑就停了"，也分不清停滞检测有没有开过火。
+ * planner / verifier 的决策不计：它们各有独立预算，混进来就答不出"执行者的续跑够不够"。
+ */
+export interface LedgerRecoveryTally {
+  /** action=continue_with_context 的次数（进展续跑真的发生了几次） */
+  extensions: number;
+  /** reason=stagnation 的决策次数（停滞检测开火几次，含换策略与强制收口） */
+  stagnations: number;
+  /** action=force_completion 的次数（被宿主强制结构化收口） */
+  forced: number;
+}
+
+export function emptyRecoveryTally(): LedgerRecoveryTally {
+  return { extensions: 0, stagnations: 0, forced: 0 };
+}
+
+/** 来源是不是执行者谱系：`main` / `rework` / `s1/main` / `s1/rework`；verifier / planner / clarifier 不是 */
+export function isExecutorSource(source: string): boolean {
+  const tail = source.split("/").at(-1) ?? source;
+  return tail === "main" || tail === "rework";
+}
+
+/**
+ * 累加一次恢复决策（原地改，两个宿主都在事件回调里逐条喂，与 tallyToolCall 同款）。
+ * 非执行者来源、非 recovery_decision 事件一律忽略。
+ */
+export function tallyRecoveryDecision(
+  tally: LedgerRecoveryTally,
+  source: string,
+  event: { type: string; reason?: string; action?: string },
+): LedgerRecoveryTally {
+  if (event.type !== "recovery_decision" || !isExecutorSource(source)) return tally;
+  if (event.action === "continue_with_context") tally.extensions += 1;
+  if (event.reason === "stagnation") tally.stagnations += 1;
+  if (event.action === "force_completion") tally.forced += 1;
+  return tally;
+}
+
+/** 台账里记的恢复策略快照（完成门关着时为 null——那时 loop 到 maxTurns 即停） */
+export interface LedgerRecoveryPolicy {
+  progressExtensionTurns: number;
+  stagnationWindow: number;
+  maxStagnationRecoveries: number;
+}
+
 export interface RunLedgerEntry {
   /** 传入而不是内部取，纯函数才可测 */
   at: number;
@@ -89,6 +139,18 @@ export interface RunLedgerEntry {
   fallbacks: number;
   tools: ToolTally;
   durationMs: number | null;
+  /**
+   * 执行者**单段**轮次护栏（包 guardrails.maxTurns，未声明则 DEFAULT_MAX_TURNS）。
+   * `turns / maxTurns` 是"撞上限时到底用了多少"的分母——没有它，事后只能拿
+   * 当前 presets 里的数去推算，而包护栏是会改的（kicad 40 → 70）。
+   * **plan 模式为 null**：turns 是各子任务之和，对不上任何单个护栏。
+   * 老行没有这个字段（undefined）= 未知，读数器按"推算"标注。
+   */
+  maxTurns?: number | null;
+  /** 本 run 生效的恢复策略；null = 完成门关着（loop 到 maxTurns 即停，策略无效） */
+  recoveryPolicy?: LedgerRecoveryPolicy | null;
+  /** 执行者谱系的恢复决策计数。老行没有这个字段（undefined）= 早于恢复机制，读数器按"未知"标注 */
+  recovery?: LedgerRecoveryTally;
   /**
    * 仪器纪律：**这一行是不是由带终结工具（§2.1）的构建写下的**。
    *
@@ -135,9 +197,17 @@ export interface LedgerInput {
   fallbacks?: number | null;
   tools?: ToolTally;
   durationMs?: number | null;
+  maxTurns?: number | null;
+  recoveryPolicy?: LedgerRecoveryPolicy | null;
+  recovery?: Partial<LedgerRecoveryTally> | null;
 }
 
 const RECOVERIES: LedgerRecovery[] = ["tool", "direct", "reformat", "wrapup", "failed"];
+
+function nonNegativeInt(v: unknown): number {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+}
 
 /** 纯函数：把两个宿主各自的收尾信息归一成一条台账。所有取值都做防御。 */
 export function buildLedgerEntry(input: LedgerInput): RunLedgerEntry {
@@ -182,6 +252,24 @@ export function buildLedgerEntry(input: LedgerInput): RunLedgerEntry {
     fallbacks: Number.isFinite(Number(input.fallbacks)) ? Math.max(0, Number(input.fallbacks)) : 0,
     tools: input.tools ?? {},
     durationMs: input.durationMs ?? null,
+    // 分母要保真：非正数/非数字一律 null（"护栏为 0"是一个没设过的值被画成最严格的值）
+    maxTurns:
+      typeof input.maxTurns === "number" && Number.isFinite(input.maxTurns) && input.maxTurns > 0
+        ? Math.floor(input.maxTurns)
+        : null,
+    recoveryPolicy: input.recoveryPolicy
+      ? {
+          progressExtensionTurns: nonNegativeInt(input.recoveryPolicy.progressExtensionTurns),
+          stagnationWindow: nonNegativeInt(input.recoveryPolicy.stagnationWindow),
+          maxStagnationRecoveries: nonNegativeInt(input.recoveryPolicy.maxStagnationRecoveries),
+        }
+      : null,
+    // 新行恒有这个对象（宿主没数到就是 0 次）；老行的 undefined 才表示"未知"
+    recovery: {
+      extensions: nonNegativeInt(input.recovery?.extensions),
+      stagnations: nonNegativeInt(input.recovery?.stagnations),
+      forced: nonNegativeInt(input.recovery?.forced),
+    },
     // 构建标记，不是配置：这个构建的 verifier/planner 一律带终结工具
     structuredDelivery: true,
   };
@@ -461,4 +549,134 @@ export function decideStructuredOutput(s: LedgerSummary): {
     decision: "insufficient",
     why: `非 direct ${(s.nonDirectRatio * 100).toFixed(1)}%、reformat+wrapup ${(s.reformatWrapupRatio * 100).toFixed(1)}%——落在两条阈值之间的灰带（${s.verdicts} 次裁决）。再攒一倍样本，或按当时的实际形态另行判断。`,
   };
+}
+
+// ================================================================
+// 终止原因 × 包（领域包恢复策略该填几，只能从这里读出来）
+// ================================================================
+
+/** 台账里 pack=null 的行在表上的名字（ASCII，等宽终端里列对得齐） */
+export const LEDGER_NO_PACK = "(none)";
+
+export interface TerminationPackRow {
+  pack: string;
+  total: number;
+  /** stopReason → 次数；stopReason=null 的行记在 "unknown" */
+  counts: Record<string, number>;
+}
+
+export interface MaxTurnsRunRow {
+  at: number;
+  host: string;
+  pack: string;
+  mode: "single" | "plan";
+  turns: number | null;
+  reworks: number | null;
+  /** 分母：台账记的单段护栏；老行没记就按当前包声明推算（标 inferred）；plan 模式无 */
+  maxTurns: number | null;
+  maxTurnsSource: "ledger" | "inferred" | null;
+  /** 段数 = 1 + 返工轮数：max_turns 的 turns 是各段之和，比值要按段归一 */
+  segments: number;
+  /** turns / (maxTurns × segments)；算不出来（缺 turns / 缺分母 / plan）为 null */
+  ratio: number | null;
+  /** undefined = 老行（早于恢复机制字段），不是"零次" */
+  recovery: LedgerRecoveryTally | undefined;
+  recoveryPolicy: LedgerRecoveryPolicy | null | undefined;
+}
+
+export interface TerminationSummary {
+  /** 出现过的 stopReason，按总次数降序（unknown 排最后） */
+  stopReasons: string[];
+  byPack: TerminationPackRow[];
+  maxTurnsRuns: MaxTurnsRunRow[];
+  /**
+   * 恢复机制字段落地后的行（有 recovery 字段）单独一套账：
+   * 只有这些行能回答"续跑/停滞开过火没有"。老行是基线，混进来会把"零次"和"未知"抹成一个数。
+   */
+  postRecovery: {
+    runs: number;
+    maxTurns: number;
+    extensions: number;
+    stagnations: number;
+    forced: number;
+  };
+}
+
+/**
+ * 把台账折成「终止原因 × 包」与 max_turns 明细。纯函数；`guardrailOf` 由调用方注入
+ * （通常是 `getPack(name)?.guardrails?.maxTurns ?? DEFAULT_MAX_TURNS`）——台账层不 import
+ * presets：仪器不该依赖被测对象的配置，只在老行缺分母时借它推算并明确标注。
+ */
+export function summarizeTermination(
+  entries: RunLedgerEntry[],
+  guardrailOf: (pack: string | null) => number | undefined = () => undefined,
+): TerminationSummary {
+  const perPack = new Map<string, Record<string, number>>();
+  const reasonTotals = new Map<string, number>();
+  const maxTurnsRuns: MaxTurnsRunRow[] = [];
+  const post = { runs: 0, maxTurns: 0, extensions: 0, stagnations: 0, forced: 0 };
+
+  for (const e of entries) {
+    const pack = e.pack ?? LEDGER_NO_PACK;
+    const reason = e.stopReason ?? "unknown";
+    const counts = perPack.get(pack) ?? {};
+    counts[reason] = (counts[reason] ?? 0) + 1;
+    perPack.set(pack, counts);
+    reasonTotals.set(reason, (reasonTotals.get(reason) ?? 0) + 1);
+
+    if (e.recovery !== undefined) {
+      post.runs += 1;
+      post.extensions += e.recovery.extensions;
+      post.stagnations += e.recovery.stagnations;
+      post.forced += e.recovery.forced;
+      if (e.stopReason === "max_turns") post.maxTurns += 1;
+    }
+
+    if (e.stopReason !== "max_turns") continue;
+    const mode: "single" | "plan" = e.mode === "plan" ? "plan" : "single";
+    let maxTurns: number | null = null;
+    let maxTurnsSource: MaxTurnsRunRow["maxTurnsSource"] = null;
+    if (mode === "single") {
+      if (typeof e.maxTurns === "number" && e.maxTurns > 0) {
+        maxTurns = e.maxTurns;
+        maxTurnsSource = "ledger";
+      } else if (e.maxTurns === undefined) {
+        const inferred = guardrailOf(e.pack);
+        if (inferred !== undefined && inferred > 0) {
+          maxTurns = inferred;
+          maxTurnsSource = "inferred";
+        }
+      }
+    }
+    const segments = 1 + Math.max(0, e.reworks ?? 0);
+    const ratio =
+      typeof e.turns === "number" && maxTurns !== null ? e.turns / (maxTurns * segments) : null;
+    maxTurnsRuns.push({
+      at: e.at,
+      host: e.host,
+      pack,
+      mode,
+      turns: e.turns ?? null,
+      reworks: e.reworks ?? null,
+      maxTurns,
+      maxTurnsSource,
+      segments,
+      ratio,
+      recovery: e.recovery,
+      recoveryPolicy: e.recoveryPolicy,
+    });
+  }
+
+  const stopReasons = [...reasonTotals.entries()]
+    .sort((a, b) => (a[0] === "unknown" ? 1 : b[0] === "unknown" ? -1 : b[1] - a[1] || a[0].localeCompare(b[0])))
+    .map(([k]) => k);
+  const byPack: TerminationPackRow[] = [...perPack.entries()]
+    .map(([pack, counts]) => ({
+      pack,
+      counts,
+      total: Object.values(counts).reduce((n, v) => n + v, 0),
+    }))
+    .sort((a, b) => b.total - a.total || a.pack.localeCompare(b.pack));
+
+  return { stopReasons, byPack, maxTurnsRuns, postRecovery: post };
 }

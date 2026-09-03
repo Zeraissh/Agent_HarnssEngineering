@@ -1528,6 +1528,51 @@ describe("ui-server", () => {
     }
   });
 
+  /**
+   * 台账新字段的 Web 写入口（终止原因 × 包 的原料）：裸跑也要有 turns（此前恒 null，
+   * 而 max_turns 的 Web 行全是裸跑）、单段护栏分母、恢复决策计数、策略快照（完成门关 = null）。
+   */
+  it("v2-8e. 台账行带 turns / maxTurns / recovery / recoveryPolicy——裸跑的 turns 不再是 null", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ui-ledger-"));
+    const file = join(dir, "runs.jsonl");
+    handle = createUiServer({
+      modelClient: new FakeModelClient([
+        fakeMessage([toolUseBlock("t1", "noop", {})], "tool_use"),
+        fakeMessage([toolUseBlock("t2", "noop", { x: 1 })], "tool_use"),
+        fakeMessage([textBlock("ok")], "end_turn"),
+      ]),
+      tools: [autoTool("noop")],
+      workdir: process.cwd(),
+      ledger: file,
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "ledger fields" }),
+    })).json() as { runId: string };
+    await waitForDone(base, runId);
+
+    // 台账是 fire-and-forget，等文件出现
+    const deadline = Date.now() + 3000;
+    let rows: any[] = [];
+    while (Date.now() < deadline) {
+      if (existsSync(file)) {
+        rows = (await readFile(file, "utf8")).trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
+        if (rows.length > 0) break;
+      }
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    expect(rows).toHaveLength(1);
+    const row = rows[0];
+    expect(row.stopReason).toBe("completed");
+    expect(row.turns).toBe(3); // 三次模型往返；此前裸跑这里恒 null
+    expect(row.maxTurns).toBe(50); // 无包 → DEFAULT_MAX_TURNS
+    expect(row.recovery).toEqual({ extensions: 0, stagnations: 0, forced: 0 });
+    expect(row.recoveryPolicy).toBeNull(); // 注入宿主缺省完成门关 → 策略无效，照实记 null
+    await rm(dir, { recursive: true, force: true });
+  });
+
   it("v2-8b. Web 宿主接入 memory 工具与快照", async () => {
     handle = createUiServer({
       modelClient: new FakeModelClient([]),

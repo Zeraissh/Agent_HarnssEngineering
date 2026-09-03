@@ -16,6 +16,9 @@
   新增 `AGENT_MAX_STAGNATION_RECOVERIES`；CLI 启动行、Web `run_config` / `/api/harness` 报生效值 +
   逐字段来源 + `armed`（完成门关着时明说 loop 不读）。暂未给任何包填数——台账里的 max_turns 全部
   发生在恢复机制落地之前，数字等实测。
+- **台账「终止原因 × 包」**：`npm run ledger` 新增终止原因 × 包表、max_turns 明细（用了多少轮 vs 单段护栏，
+  比值按段归一）与恢复触发计数；台账行新增 `maxTurns` / `recoveryPolicy` / `recovery`，老行仍可读并按
+  「推算 / 未知」标注；Web 裸跑的 `turns` 不再恒 null。
 
 ### 工具（Tools）
 

@@ -78,7 +78,7 @@ import {
   formatStaticDoctor,
   parseCliArgs,
 } from "./cli-args.js";
-import { AgentLoop } from "./loop.js";
+import { AgentLoop, DEFAULT_MAX_TURNS } from "./loop.js";
 import { connectMcpServers, loadMcpConfig } from "./mcp.js";
 import { createMemoryTools, MemoryStore } from "./memory.js";
 import { AUTO_CONCURRENCY_CAP, plannedStopReason, planParallelWidth, runPlanned, runVerified } from "./orchestrate.js";
@@ -98,7 +98,15 @@ import { createDescribeImageTool } from "./tools/describe-image.js";
 import { fetchUrlTool } from "./tools/fetch-url.js";
 import { readFileTool } from "./tools/read-file.js";
 import { writeFileTool } from "./tools/write-file.js";
-import { appendRunLedger, buildLedgerEntry, ledgerErrorClass, tallyToolCall, type ToolTally } from "./ledger.js";
+import {
+  appendRunLedger,
+  buildLedgerEntry,
+  emptyRecoveryTally,
+  ledgerErrorClass,
+  tallyRecoveryDecision,
+  tallyToolCall,
+  type ToolTally,
+} from "./ledger.js";
 import { warnEnvConflicts } from "./env-check.js";
 import { EFFORT_LEVELS } from "./types.js";
 import type { AgentConfig, Effort, ExecutionBroker, RecoveryPolicy, TurnEvent } from "./types.js";
@@ -750,6 +758,8 @@ async function main(): Promise<void> {
    * 只记 Web 侧，等于把唯一能出证据的那条路排除在外。
    */
   const ledgerTally: ToolTally = {};
+  // 执行者谱系的恢复决策计数（续跑/停滞/强制收口）——领域包该填几轮续跑，只能从它读出来
+  const ledgerRecovery = emptyRecoveryTally();
   let ledgerHitBudget = false;
   /** 三条路径各自把收尾事实归一到这里，最后统一写一行 */
   let ledgerFacts: {
@@ -763,6 +773,7 @@ async function main(): Promise<void> {
   const ledgerStartedAt = Date.now();
   const noteForLedger = (source: string, event: TurnEvent): void => {
     if (event.type === "tool_call") tallyToolCall(ledgerTally, source, event.name);
+    tallyRecoveryDecision(ledgerRecovery, source, event);
     if (
       event.type === "done" &&
       source.includes("verifier") &&
@@ -1094,6 +1105,10 @@ async function main(): Promise<void> {
       fallbacks: fallbackCount,
       tools: ledgerTally,
       durationMs: Date.now() - ledgerStartedAt,
+      // 分母与策略快照：plan 模式 turns 是各子任务之和，对不上单个护栏，记 null
+      maxTurns: withPlan ? null : (config.maxTurns ?? DEFAULT_MAX_TURNS),
+      recoveryPolicy: taskCompletionEnabled ? recoveryFor(pack).policy : null,
+      recovery: ledgerRecovery,
     }),
   );
 

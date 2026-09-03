@@ -16,10 +16,13 @@ import {
   decideStructuredOutputEffect,
   ledgerPath,
   summarizeLedger,
+  summarizeTermination,
   STRUCTURED_OUTPUT_BASELINE,
   STRUCTURED_OUTPUT_EFFECT_RULE,
   type RunLedgerEntry,
 } from "../src/ledger.js";
+import { DEFAULT_MAX_TURNS } from "../src/loop.js";
+import { getPack } from "../src/presets.js";
 
 const file = process.argv[2] ?? ledgerPath();
 
@@ -94,4 +97,61 @@ console.log("── 工具调用直方图（按角色）──");
 for (const [source, counts] of Object.entries(s.tools)) {
   const top = Object.entries(counts).sort((a, b) => b[1] - a[1]);
   console.log(`  ${source}: ${top.map(([n, c]) => `${n}×${c}`).join(" ")}`);
+}
+console.log("");
+
+/**
+ * 终止原因 × 包 —— 领域包的恢复策略（`DomainPack.recovery`）该填几，只能从这里读。
+ * 老行没有 maxTurns 字段时按**当前** presets 推算分母并标 `~`：包护栏是会改的
+ * （kicad 40 → 70），推算值只能当参考。plan 模式 turns 是各子任务之和，不算比值。
+ */
+const t = summarizeTermination(entries, (pack) =>
+  pack === null ? DEFAULT_MAX_TURNS : (getPack(pack)?.guardrails?.maxTurns ?? DEFAULT_MAX_TURNS),
+);
+const w = 12;
+console.log("── 终止原因 × 包 ──");
+console.log(`  ${"pack".padEnd(14)}${t.stopReasons.map((r) => r.padStart(w)).join("")}${"total".padStart(w)}`);
+for (const row of t.byPack) {
+  console.log(
+    `  ${row.pack.padEnd(14)}` +
+      t.stopReasons.map((r) => String(row.counts[r] ?? 0).padStart(w)).join("") +
+      String(row.total).padStart(w),
+  );
+}
+console.log("");
+
+console.log("── max_turns 明细：用了多少轮 vs 单段护栏（比值按段归一 = turns / (护栏 × (1+返工))）──");
+if (t.maxTurnsRuns.length === 0) {
+  console.log("  无 max_turns 运行。");
+} else {
+  console.log(
+    `  ${"日期".padEnd(12)}${"host".padEnd(5)}${"pack".padEnd(14)}${"mode".padEnd(7)}${"turns".padStart(6)}${"护栏".padStart(6)}${"段".padStart(3)}${"比值".padStart(8)}  续跑/停滞/强制  策略(续/窗/换)`,
+  );
+  for (const r of t.maxTurnsRuns) {
+    const date = new Date(r.at).toISOString().slice(0, 10);
+    const guard = r.maxTurns === null ? "—" : `${r.maxTurnsSource === "inferred" ? "~" : ""}${r.maxTurns}`;
+    const ratio = r.ratio === null ? "—" : `${(r.ratio * 100).toFixed(0)}%`;
+    const rec = r.recovery ? `${r.recovery.extensions}/${r.recovery.stagnations}/${r.recovery.forced}` : "未知(老行)";
+    const pol =
+      r.recoveryPolicy === undefined
+        ? "未知(老行)"
+        : r.recoveryPolicy === null
+          ? "关"
+          : `${r.recoveryPolicy.progressExtensionTurns}/${r.recoveryPolicy.stagnationWindow}/${r.recoveryPolicy.maxStagnationRecoveries}`;
+    console.log(
+      `  ${date.padEnd(12)}${r.host.padEnd(5)}${r.pack.padEnd(14)}${r.mode.padEnd(7)}` +
+        `${String(r.turns ?? "—").padStart(6)}${guard.padStart(6)}${String(r.segments).padStart(3)}${ratio.padStart(8)}  ${rec.padEnd(14)}  ${pol}`,
+    );
+  }
+  console.log("  （~ = 老行无分母，按当前 presets 推算；未知(老行) = 早于恢复机制字段，不是零次）");
+}
+console.log("");
+const p = t.postRecovery;
+console.log("── 恢复机制落地后的行（有 recovery 字段）──");
+if (p.runs === 0) {
+  console.log("  0 行。领域包的 recovery 数字要等这里攒够——现在填数就是拍脑袋。");
+} else {
+  console.log(
+    `  运行 ${p.runs} 次，其中 max_turns ${p.maxTurns} 次；进展续跑触发 ${p.extensions} 次、停滞检测 ${p.stagnations} 次、强制收口 ${p.forced} 次`,
+  );
 }

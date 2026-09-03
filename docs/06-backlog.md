@@ -111,6 +111,39 @@ maxTurns / maxTokens / contextTokenLimit——与 9.1（核查预算）、B0（p
 `v2-8d`（停滞行为锁：窗 2 / 换策略 0 → 首次停滞即 force_completion，证明解析结果真进了 loop）；
 ui-faces 5 条。变异 4 处逐一打红：解析器忽略包 / reducer 丢字段 / Web 装配忽略解析结果 / armed 恒 true。
 
+### ② 台账「终止原因 × 包」+ max_turns 用量比值 + 恢复触发计数 —— ✅ 已实施
+
+**缺口**：台账只记 stopReason，分不清"续跑过 8 轮仍撞上限"与"根本没触发续跑"；也没有分母
+（包护栏会改，kicad 40 → 70，事后只能推算）；Web 裸跑的 `turns` 恒 null——而 max_turns 的 Web 行全是裸跑。
+
+**落地**：`RunLedgerEntry` 新增 `maxTurns`（执行者单段护栏；plan 模式 null——turns 是各子任务之和）、
+`recoveryPolicy`（null = 完成门关）、`recovery: { extensions, stagnations, forced }`（执行者谱系
+`recovery_decision` 计数，`tallyRecoveryDecision` / `isExecutorSource`；planner / verifier 不计）；
+两宿主写入口同提交；Web 台账 `turns` 裸跑改读事件旁路累加的执行段轮次（`turnExecutorTurns`，按对话轮归零）。
+`summarizeTermination(entries, guardrailOf)`：终止原因 × 包表、max_turns 明细（比值**按段归一**
+= turns / (护栏 × (1+返工))；老行无分母按当前 presets 推算标 `~`；恢复计数缺字段标「未知(老行)」不冒充零次）、
+恢复机制落地后的行单独一套账。`npm run ledger` 末尾三段新表。
+
+**当前读数（2026-09-03，98 行）**：
+
+```
+pack        completed  max_turns  error  aborted  blocked  partial  total
+(none)             50          4     12        7        1        1     75
+kicad               8         12      0        0        0        0     20
+ts-coding           3          0      0        0        0        0      3
+```
+
+max_turns 16 次全部是老行（早于恢复机制落地 2026-08-24）：kicad 10 次 CLI 带核查 turns=140 = 70×2 段 →
+**比值 100%**（主轮与返工各跑满，一轮续跑都没有——因为那时机制不存在）；kicad 2 次 Web 裸跑与 (none) 4 次
+Web 裸跑 turns=null（老写入口的缺口，本提交已补）。**恢复机制落地后的行 0 条** → 领域包的 recovery
+数字现在填就是拍脑袋；判据先写在这里：**同一包 ≥5 次带 `recovery` 字段的 max_turns 行，看 extensions
+是否 >0 且比值是否仍 100%**——续跑触发却仍撞满说明 8 轮不够（该加），从未触发说明卡在 hasProgress
+判定不在额度（加轮数无用，回头看停滞/进展判据）。
+
+**锁**：ledger 5 条（含真实老行 JSONL 形状）；Web `v2-8e`（台账行 turns / maxTurns / recovery / recoveryPolicy，
+裸跑 turns=3 不再 null）。变异 4 处逐一打红：比值漏乘段数 / 老行不推算分母 / 裸跑 turns 回退删除 /
+计数不按来源过滤。
+
 以下为历史交接页（2026-08-08 收工），仍有参考价值；新开工优先看 `docs/08`。
 
 ---

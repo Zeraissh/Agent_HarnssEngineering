@@ -25,11 +25,17 @@ import type {
   TurnEvent,
 } from "./types.js";
 
+/**
+ * 执行者单段轮次护栏的缺省值。导出给宿主写台账用：`turns / maxTurns` 这个比值
+ * 要能算，台账里就得有分母——包没声明 guardrails.maxTurns 时分母就是它。
+ */
+export const DEFAULT_MAX_TURNS = 50;
+
 const DEFAULTS = {
   model: "claude-opus-4-8",
   effort: "high",
   maxTokens: 64_000,
-  maxTurns: 50,
+  maxTurns: DEFAULT_MAX_TURNS,
 } as const;
 
 /** 终结工具（§2.1）的回执：交付被接收 */

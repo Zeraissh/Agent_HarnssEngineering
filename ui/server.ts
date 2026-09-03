@@ -10,7 +10,7 @@ import { join, extname, dirname, delimiter, resolve, basename, relative, sep } f
 import { fileURLToPath } from "node:url";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { AgentLoop } from "../src/loop.js";
+import { AgentLoop, DEFAULT_MAX_TURNS } from "../src/loop.js";
 import {
   configuredExecutionStatus,
   createExecutionBroker,
@@ -59,7 +59,18 @@ import { fetchUrlTool } from "../src/tools/fetch-url.js";
 import { readFileTool } from "../src/tools/read-file.js";
 import { writeFileTool } from "../src/tools/write-file.js";
 import { resolveInWorkdir } from "../src/tools/fs-util.js";
-import { appendRunLedger, buildLedgerEntry, ledgerErrorClass, ledgerPath, tallyToolCall, type ToolTally } from "../src/ledger.js";
+import {
+  appendRunLedger,
+  buildLedgerEntry,
+  emptyRecoveryTally,
+  isExecutorSource,
+  ledgerErrorClass,
+  ledgerPath,
+  tallyRecoveryDecision,
+  tallyToolCall,
+  type LedgerRecoveryTally,
+  type ToolTally,
+} from "../src/ledger.js";
 import {
   DEFAULT_HISTORY_KEEP,
   RunHistoryWriter,
@@ -288,6 +299,15 @@ interface StoredRun {
    * 事件缓冲跨越多段，回扫容易把上一段的数重复计进来。
    */
   toolTally: ToolTally;
+  /** 执行者谱系的恢复决策计数（续跑/停滞/强制收口），与 toolTally 同在事件旁路累加 */
+  recoveryTally?: LedgerRecoveryTally;
+  /**
+   * 本对话轮执行者谱系（main / rework / 子任务 main）各段 done.usage.turns 之和。
+   * 台账 `turns` 此前只在带核查时有值（读 outcome.executionUsage），裸跑一律 null——
+   * 而 max_turns 的 Web 行恰好全是裸跑，"用了多少轮 vs 护栏"就永远算不出来。
+   * 每个对话轮起点归零，口径与 executionUsage.turns（本轮各执行段之和）一致。
+   */
+  turnExecutorTurns?: number;
   /** 核查是否撞过轮次上限（"预算不够"这个嫌疑要有据可查，见案例 #8 的三层归因） */
   verifierHitBudget?: boolean;
   /** 本 run 主执行者换端点的次数（MODEL-01a）。未配降级链时恒 0 */
@@ -2874,6 +2894,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     // L6 运行台账：按角色累加工具调用。放在这里而不是收尾时回扫 run.events，
     // 是因为续跑会让事件缓冲跨越多段，回扫容易把上一段的数重复计进来。
     if (event.type === "tool_call") tallyToolCall(run.toolTally, source, event.name);
+    // 恢复决策同款：领域包该声明几轮续跑，只能从"续跑真的发生过几次"读出来
+    if (event.type === "recovery_decision") {
+      tallyRecoveryDecision((run.recoveryTally ??= emptyRecoveryTally()), source, event);
+    }
     // OBS-01：事件旁路投影 span（失败不打断 run）
     try {
       if (!run.openToolSpans) run.openToolSpans = new Map();
@@ -2904,6 +2928,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     // /plan steps 记账；这里若也记，将来解除压制的那天就是双计的第一天。
     if (event.type === "done" && event.result.usage && !isVerifierSource(source)) {
       growTokens(source === "planner" ? "planner" : "execution", event.result.usage);
+    }
+    // 台账 turns 的裸跑口径：执行者谱系各段轮次之和（planner / verifier 各有独立预算，不混）
+    if (event.type === "done" && isExecutorSource(source)) {
+      run.turnExecutorTurns = (run.turnExecutorTurns ?? 0) + (event.result.usage?.turns ?? 0);
     }
 
     // planner/verifier 的 approval_request 不进 pendingApprovals：二者在内部只读
@@ -3305,7 +3333,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           (endInfo.mainStopReason === "error" || endInfo.mainStopReason === "execution_unavailable"
             ? ledgerErrorClass(endInfo.mainStopReason)
             : null),
-        turns: o?.executionUsage?.turns ?? null,
+        // 带核查读 outcome（含被否掉的中间轮）；裸跑读事件旁路累加的执行段轮次——
+        // 此前裸跑恒 null，max_turns 的 Web 行全是裸跑，比值永远算不出
+        turns: o?.executionUsage?.turns ?? run.turnExecutorTurns ?? null,
         reworks: o?.reworks ?? null,
         finalPassed: o?.finalPassed ?? null,
         verifications: o?.verifications ?? [],
@@ -3315,6 +3345,14 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           fallbacks: run.fallbacks ?? 0,
           tools: run.toolTally,
           durationMs: (run.finishedAt ?? Date.now()) - run.createdAt,
+          // 分母与策略快照（口径同 CLI）：plan 模式 turns 是各子任务之和，记 null
+          maxTurns: run.mode === "plan"
+            ? null
+            : ((run.packName ? getPack(run.packName)?.guardrails?.maxTurns : maxTurns) ?? DEFAULT_MAX_TURNS),
+          recoveryPolicy: taskCompletionEnabled
+            ? recoveryFor(run.packName ? getPack(run.packName) : pack).policy
+            : null,
+          recovery: run.recoveryTally ?? emptyRecoveryTally(),
         }),
         ledgerFile,
       );
@@ -3454,6 +3492,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     run.status = "running";
     delete run.finishedAt;
     run.conversationTurn += 1;
+    run.turnExecutorTurns = 0; // 台账 turns 按对话轮计，新一轮从零累计
     run.verify = turn.verify;
     // 上一轮按了停止的话 abort 位还立着；新一轮是新的决定，要新的闸
     const abort = new AbortController();
