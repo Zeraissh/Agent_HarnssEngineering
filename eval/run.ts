@@ -18,6 +18,8 @@ import { AgentLoop } from "../src/loop.js";
 import { RULE_PRECEDENCE_DISCIPLINE } from "../src/presets.js";
 import { createModelClientFromEnv } from "../src/provider.js";
 import { bashTool, SHELL_DESC } from "../src/tools/bash.js";
+import { globTool } from "../src/tools/glob.js";
+import { grepTool } from "../src/tools/grep.js";
 import { readFileTool } from "../src/tools/read-file.js";
 import { writeFileTool } from "../src/tools/write-file.js";
 import type { AgentConfig, AgentRunResult, ModelClient } from "../src/types.js";
@@ -47,7 +49,9 @@ async function main(): Promise<void> {
   const { client, compat } = createModelClientFromEnv(model);
   const config: AgentConfig = {
     systemPrompt: SYSTEM_PROMPT,
-    tools: [bashTool, readFileTool, writeFileTool],
+    // 与 eval/ab.ts 的工具面保持逐字一致——两台仪器的被测面分叉过一次
+    // （eval/run.ts 从 v0.6 起失修成化石，见 23055ed），不再重犯。
+    tools: [bashTool, readFileTool, writeFileTool, globTool, grepTool],
     workdir,
     compat,
     maxTurns: 15,

@@ -79,6 +79,8 @@ import {
 } from "../src/task-completion.js";
 import { createDescribeImageTool } from "../src/tools/describe-image.js";
 import { fetchUrlTool } from "../src/tools/fetch-url.js";
+import { globTool } from "../src/tools/glob.js";
+import { grepTool } from "../src/tools/grep.js";
 import { readFileTool } from "../src/tools/read-file.js";
 import { writeFileTool } from "../src/tools/write-file.js";
 import { resolveInWorkdir } from "../src/tools/fs-util.js";
@@ -1339,7 +1341,7 @@ export function localPathTarget(value: string): string {
   return String(value ?? "").trim().replace(/:\d+(?::\d+)?$/, "");
 }
 
-const BUILTIN_POOL: Tool[] = [bashTool, fetchUrlTool, readFileTool, writeFileTool];
+const BUILTIN_POOL: Tool[] = [bashTool, fetchUrlTool, readFileTool, writeFileTool, globTool, grepTool];
 
 /** 上传落点：工作目录下的固定子目录，便于人和 agent 都一眼知道东西在哪 */
 const UPLOAD_SUBDIR = "uploads";

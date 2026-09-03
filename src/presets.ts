@@ -28,7 +28,9 @@ export interface DomainPack {
   /** 覆盖默认 system prompt（冻结，P3） */
   systemPrompt: string;
   /**
-   * 内置工具名单（按工具名）。缺省 = ["bash", "fetch_url", "read_file", "write_file"]。
+   * 内置工具名单（按工具名）。缺省 = 宿主装配的全部内置工具
+   * （bash / fetch_url / read_file / write_file / edit_file / glob / grep，
+   * 外加配置齐全时才在场的条件性工具如 describe_image）。
    * 领域包应只带用得上的工具——多余的工具是触发面噪声。
    */
   builtinTools?: string[];
@@ -388,6 +390,12 @@ export const PACKS: Record<string, DomainPack> = {
     // 不给 bash：v1.0 演示实证——给了 bash，执行者会绕开 MCP 自建 openocd/gdb
     // 调试栈,还会 taskkill "清理"时扫死共享的 MCP server。调试动作全走 MCP,
     // 报告用 write_file,读产物用 read_file,足够。
+    //
+    // A1 决定：**也不给 glob / grep / edit_file**（唯一保持三件套原样的包）。
+    // 本包没有源码编辑面——它唯一的写是新起一份报告,write_file 已经够;
+    // 而给它一套代码检索面等于向执行者暗示"可以去翻源码、改源码",
+    // 而不是驱动探针取真机证据。工具的名字暗示力 > 描述里的免责声明,
+    // 这条在本包上是刻意留白,不是遗漏。
     builtinTools: ["read_file", "write_file"],
     mcp: {
       // 读取/诊断默认直接执行；会持久改动 Flash/RAM 或丢失现场的动作必须审批。
@@ -442,7 +450,7 @@ export const PACKS: Record<string, DomainPack> = {
     name: "stm32-coding",
     description: "STM32 固件编程：读写 C 源码、CMake 交叉编译、产出可烧录 ELF（交接给 stm32-debug）",
     systemPrompt: STM32_CODING_SYSTEM + RULE_PRECEDENCE_DISCIPLINE,
-    builtinTools: ["bash", "read_file", "write_file"],
+    builtinTools: ["bash", "read_file", "write_file", "glob", "grep"],
     mcp: false, // 编程阶段不碰硬件——需要真机时切 stm32-debug 包
     verify: {
       enabled: true,
@@ -468,7 +476,7 @@ export const PACKS: Record<string, DomainPack> = {
     name: "python-coding",
     description: "Python 工程：读写源码、pytest/ruff/mypy 质量门禁、交付带测试的变更（不接硬件/MCP）",
     systemPrompt: PYTHON_CODING_SYSTEM + RULE_PRECEDENCE_DISCIPLINE,
-    builtinTools: ["bash", "read_file", "write_file"],
+    builtinTools: ["bash", "read_file", "write_file", "glob", "grep"],
     mcp: false, // 纯代码域——需要真机时切 stm32-debug 包
     verify: {
       enabled: true,
@@ -509,7 +517,7 @@ export const PACKS: Record<string, DomainPack> = {
 7. 禁止 git 写命令(add/commit/push)——提交由委托方决定。
 
 把结论落到用户要求的产出,并用一两句话总结。用用户使用的语言回答。` + RULE_PRECEDENCE_DISCIPLINE,
-    builtinTools: ["bash", "read_file", "write_file"],
+    builtinTools: ["bash", "read_file", "write_file", "glob", "grep"],
     mcp: false,
     verify: {
       enabled: true,
@@ -546,7 +554,7 @@ export const PACKS: Record<string, DomainPack> = {
     // describe_image：配置了 AGENT_VISION_MODEL 时才真实在场（宿主按池过滤，
     // 没配就干净缺席）。给执行者与核查者同一双眼睛——文本盲是本包全部三条
     // 几何缝（布网/布线/排版，案例 #9）的共同根因
-    builtinTools: ["bash", "read_file", "write_file", "describe_image"],
+    builtinTools: ["bash", "read_file", "write_file", "glob", "grep", "describe_image"],
     mcp: false, // MCP 创作面已实测判死(见包头注释);文件路线全程不需要
     verify: {
       enabled: true,

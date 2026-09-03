@@ -21,6 +21,8 @@ import { runPlanned, runVerified } from "../src/orchestrate.js";
 import { RULE_PRECEDENCE_DISCIPLINE } from "../src/presets.js";
 import { createModelClientFromEnv, type ResolvedProvider } from "../src/provider.js";
 import { bashTool } from "../src/tools/bash.js";
+import { globTool } from "../src/tools/glob.js";
+import { grepTool } from "../src/tools/grep.js";
 import { readFileTool } from "../src/tools/read-file.js";
 import { writeFileTool } from "../src/tools/write-file.js";
 import type { Verdict } from "../src/verifier.js";
@@ -118,7 +120,9 @@ async function main(): Promise<void> {
   const { client, compat } = createModelClientFromEnv(model);
   const baseConfig: AgentConfig = {
     systemPrompt: SYSTEM_PROMPT,
-    tools: [bashTool, readFileTool, writeFileTool],
+    // A1（2026-09-03）：工具面从 3 件扩到 6 件。这是**被测变量本身**——
+    // 与 eval/baselines/heldout-v1.3.0.json 对照时，唯一变化的就是这一行。
+    tools: [bashTool, readFileTool, writeFileTool, globTool, grepTool],
     workdir,
     compat,
     maxTurns: 15,

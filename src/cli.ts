@@ -120,6 +120,8 @@ import {
 import { bashTool, SHELL_DESC } from "./tools/bash.js";
 import { createDescribeImageTool } from "./tools/describe-image.js";
 import { fetchUrlTool } from "./tools/fetch-url.js";
+import { globTool } from "./tools/glob.js";
+import { grepTool } from "./tools/grep.js";
 import { readFileTool } from "./tools/read-file.js";
 import { writeFileTool } from "./tools/write-file.js";
 import {
@@ -567,9 +569,15 @@ async function main(): Promise<void> {
 
   // 内置工具按包名单装配（缺省全带）——领域包只带用得上的，减少触发面噪声
   const builtinByName = new Map(
-    [bashTool, fetchUrlTool, readFileTool, writeFileTool, ...(visionTool ? [visionTool] : [])].map(
-      (t) => [t.name, t],
-    ),
+    [
+      bashTool,
+      fetchUrlTool,
+      readFileTool,
+      writeFileTool,
+      globTool,
+      grepTool,
+      ...(visionTool ? [visionTool] : []),
+    ].map((t) => [t.name, t]),
   );
   const builtinNames = pack?.builtinTools ?? [...builtinByName.keys()];
   /**
@@ -890,7 +898,15 @@ async function main(): Promise<void> {
 
   if (withPlan) {
     // 三角编排：planner 拆解 → 逐子任务(执行→核查→返工) → 交接下游
-    const builtinPool = [bashTool, fetchUrlTool, readFileTool, writeFileTool, ...(visionTool ? [visionTool] : [])];
+    const builtinPool = [
+      bashTool,
+      fetchUrlTool,
+      readFileTool,
+      writeFileTool,
+      globTool,
+      grepTool,
+      ...(visionTool ? [visionTool] : []),
+    ];
     const mcpPool = mcp?.tools ?? [];
     let currentStep = "";
     let planRef: Awaited<ReturnType<typeof runPlanned>>["plan"];
