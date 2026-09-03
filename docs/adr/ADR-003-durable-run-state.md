@@ -1,7 +1,7 @@
 # ADR-003: Durable RunState（分阶段）
 
-**Status:** Accepted（Phase 1 + Phase 2 已落地；SAFE-06 toolTx / CLI 对等仍为残余，不得标 Phase 3）  
-**Date:** 2026-09-02（Phase 2：2026-09-03）  
+**Status:** Accepted（Phase 1–2 已落地；Phase 3 / RUN-02 崩溃注入套件已落地；SAFE-06 toolTx / CLI 对等仍为残余）  
+**Date:** 2026-09-02（Phase 2+3：2026-09-03）  
 **Deciders:** Agent_Design 维护者  
 **Related:** RUN-01 / RUN-02；B2 `ui/history.ts`；SAFE-04 grant 边界；OBS-01 `trace.jsonl`
 
@@ -81,7 +81,7 @@ Idempotency 边界（无 SAFE-06 toolTx）：**checkpoint 段号**——只从�
 |---|---|---|
 | **1（已落地）** | 写 `state.json` 与 phase 迁移；崩溃档案带 phase；计划 DAG 快照进 state；与 meta/checkpoint 一致；单测 + 变异（丢 phase 变红） | docs/08 RUN-01 → `[~]` |
 | **2（已落地）** | 同 run 热恢复执行游标（idempotency = checkpoint）；预算/grantAudit 进 state；UI/API `sameRunResume` 诚实；变异 `same-run-resume-allows-executing` | docs/08 RUN-01 仍 `[~]`（toolTx/CLI 残余） |
-| **3** | 崩溃注入套件（RUN-02） | model/tool/approval/history 各点 |
+| **3（已落地）** | 崩溃注入套件（RUN-02）：`test/run-crash-inject.test.ts` 覆盖 model / approval wait / history write / same-run / fork；**不**伪造 tool prepared/committed | docs/08 RUN-02 → `[~]`；SAFE-06 仍开 |
 
 ### 与现有件的关系
 
@@ -123,3 +123,4 @@ Idempotency 边界（无 SAFE-06 toolTx）：**checkpoint 段号**——只从�
 3. ~~`ui/server.ts`：迁移接线、崩溃收口、same-run followUp、预算/grant 快照~~
 4. ~~UI：`continuationMode:"same-run"` + `run_resumed` reducer/装配条~~
 5. docs/08 RUN-01 保持 `[~]`；残余写清 toolTx / CLI。
+6. ~~RUN-02 崩溃注入套件~~（`test/run-crash-inject.test.ts`）；docs/08 RUN-02 → `[~]`，SAFE-06 残余照实写。

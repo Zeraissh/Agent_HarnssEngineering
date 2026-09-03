@@ -101,7 +101,7 @@ OCI 逃逸 canary 由 Linux CI container job 承担（run #33461119575 全绿）
 | 状态 | ID | 优化项 | I/R/E | 优先分 | 完成定义 |
 |---|---|---|---:|---:|---|
 | [~] | RUN-01 | Durable RunState | 5/5/5 | 10 Gate | 持久化 plan DAG、segment、审批/提问、verifier/rework、预算与 tool transaction；进程重启从明确状态恢复。**Phase 1+2 已落地（2026-09-03）**：`state.json` + Web 迁移；崩溃→interrupted；**同 run 热恢复**（`sameRunResume` / `run_resumed`，idempotency=checkpoint 段边界）；预算与 grantAudit 进 state；UI 文案同提交。**仍开**：SAFE-06 toolTx、CLI 对等 durable、mid-tool 恢复 |
-| [ ] | RUN-02 | 恢复与故障注入 | 5/5/4 | 20 | 在 model call、tool prepared/committed、审批等待和历史写入各点注入崩溃；不丢状态、不重复副作用、可安全 fork |
+| [~] | RUN-02 | 恢复与故障注入 | 5/5/4 | 20 | 在 model call、tool prepared/committed、审批等待和历史写入各点注入崩溃；不丢状态、不重复副作用、可安全 fork。**已落地（2026-09-03）**：`test/run-crash-inject.test.ts` 覆盖飞行中硬崩溃（无 checkpoint）、mid-model Fake 抛错、mock-provider `alwaysFault` 500、审批等待硬崩溃、history/state 原子写与半截 tmp、checkpoint→same-run（工具不重跑）、完成态 fork 诚实；**明确不做假** tool prepared/committed（见残余） |
 | [~] | OBS-01 | 端到端 trace | 5/4/4 | 18 | run→segment→model/tool spans；记录 commit、模型、工具/schema/pack 版本与输入输出哈希；支持脱敏导出和离线 playback。**已落地（2026-09-02）**：`src/trace.ts` + `trace.jsonl` 旁路（扩展 history，无 OTel）；Web `GET /api/runs/:id/trace` 脱敏导出 + playback 摘要；事件投影 tool/model/segment。**仍开**：CLI 同等接线、完整 model span 起止（非 done 摘要）、跨进程统一 collector |
 | [ ] | OBS-02 | 成本、延迟与 SLO | 4/4/3 | 24 | TTFT、模型/工具延迟、排队/审批等待、重试/错误、USD 成本和 provider/model/pack 归因；持久预算账与 p50/p95/p99 仪表盘 |
 | [ ] | OPS-01 | 备份、恢复与升级演练 | 5/4/4 | 18 | 定义并验证 RPO/RTO；完成异地加密备份恢复、版本迁移、回滚及在途任务升级演练 |
@@ -113,6 +113,7 @@ OCI 逃逸 canary 由 Linux CI container job 承担（run #33461119575 全绿）
 | OBS-01 | `src/trace.ts`：span 模型 + redact/hash + TurnEvent 投影 + JSONL playback；`RunHistoryWriter.appendTraceSpan` → `trace.jsonl`；Web 建 run 写根 span（harness/git/model/pack/toolSchemaHash），`pushEvent` 投影 tool/model/segment，收尾关根 span；`GET /api/runs/:id/trace` 返回脱敏导出 + playback 摘要。`test/trace.test.ts` 7 测。未引入 OTel | CLI 未接线；model span 仍是 done/api_retry/fallback 摘要而非逐 send 起止；无跨进程 collector；UI 未渲染 trace 面 |
 | RUN-01 Phase 1 | ADR-003 + `src/run-state.ts`；`ui/history.ts` `writeState`/`readArchivedState`；`ui/server.ts` 迁移接线与崩溃收口；`test/run-state*.ts` + ui-server 两条；API 诚实字段 | 见 Phase 2 |
 | RUN-01 Phase 2 | `canSameRunResume` + `resume` 迁移；崩溃+checkpoint → `sameRunResume:true` / `continuationMode:same-run`；`startSameRunResume` 同 runId；预算/grantAudit 进 state；`run_resumed` 事件 + UI 三处；mutation `same-run-resume-allows-executing` | **未** SAFE-06 toolTx（mid-tool）；**未** CLI 对等；完成态归档仍走 fork |
+| RUN-02 | `test/run-crash-inject.test.ts`：飞行中硬崩溃（无 done/checkpoint→不可 same-run）、mid-model Fake 抛错（status:400 防瞬时重试糊掉注入点）、mock-provider `alwaysFault` 500、`awaiting_approval` 硬崩溃→`interrupted`+pending 清空、`RunHistoryWriter` 原子写/半截 tmp fail-closed、checkpoint 段边界 same-run 且计数工具不重跑、完成态 fork 不冒充 same-run、事件流无 `tool_prepared/committed` 契约锁 | **SAFE-06**：无 toolTx → 不能在 mid-tool prepared/committed 注入并证明不重复副作用；idempotency 仍=checkpoint 段号。CLI 无对等 durable。进程内「关停再改盘」/预制档案模拟硬崩溃，非真实 SIGKILL 子进程 |
 
 ## Phase 3：动态协作与扩展平台
 
@@ -194,10 +195,9 @@ npx tsc --noEmit                            passed
 6. **残余风险**：未覆盖平台、TOCTOU、外部系统或人工验收项。
 
 当前执行顺序（2026-09-03 成熟度第二波，单操作员形态）：
-`EVAL-03c → EVAL-01 held-out → OBS-01[~] → RUN-01[~ Phase 2] → MEM-01[~ Phase A] → MODEL-01b[~]`。
-下一刀候选：`MEM-01 Phase B`（可选 LLM 摘要）或 RUN-02 崩溃注入，
-或 MODEL-01 残余（真成本路由 / Web 同步探针回写）。
-本波**不提前** GOV-*；SAFE-05 Phase 2B / SAFE-06 保持 partial，除非发现已解锁且很小。
+`EVAL-03c → EVAL-01 held-out → OBS-01[~] → RUN-01[~ Phase 2] → MEM-01[~ Phase A] → MODEL-01b[~] → RUN-02[~]`。
+下一刀候选：`MEM-01 Phase B`（可选 LLM 摘要）、MODEL-01 残余（真成本路由 / Web 同步探针回写）、
+或 SAFE-06（解锁 mid-tool 崩溃证明）——本波默认不提前 GOV-* / SAFE-05 2B。
 并行可继续：`A1 攒 §2.1 样本（ledger:samples）`（与质量门不冲突）。
 若目标改公网多人，`GOV-01/02/03` 必须提前到 `RUN-01` 之后、任何公开上线之前。
 Phase 2A 的 daemon-label orphan reaper 与真实 `SIGKILL → sweep` E2E 已落地；

@@ -38,13 +38,23 @@ export class FakeModelClient implements ModelClient {
   requests: ModelRequest[] = [];
   private index = 0;
 
+  /**
+   * RUN-02：从第 N 次 send（1-based）起每次都抛错，模拟 mid-model 崩溃。
+   * 抛错带 status:400——plain Error 会被 isTransientApiError 当成瞬时并重试，
+   * 那会把「注入点」糊成「重试后成功」，仪器说谎。
+   */
+  crashAtCall: number | null = null;
+
   constructor(private readonly script: Anthropic.Message[]) {}
 
   send(req: ModelRequest): Promise<ModelTurn> {
     this.requests.push(structuredClone(req));
-    const message = this.script[this.index];
-    if (!message) throw new Error(`FakeModelClient script exhausted at call ${this.index + 1}`);
     this.index += 1;
+    if (this.crashAtCall !== null && this.index >= this.crashAtCall) {
+      throw Object.assign(new Error(`injected model crash at call ${this.index}`), { status: 400 });
+    }
+    const message = this.script[this.index - 1];
+    if (!message) throw new Error(`FakeModelClient script exhausted at call ${this.index}`);
     return Promise.resolve({ message, stopReason: message.stop_reason, usage: message.usage });
   }
 }
