@@ -15,6 +15,7 @@ import { AgentLoop, createRunBudget } from "./loop.js";
 import { sumUsage } from "./verifier.js";
 import { withoutTaskCompletion } from "./task-completion.js";
 import { withoutAskUser } from "./tools/ask-user.js";
+import { withoutEditFile } from "./tools/edit-file.js";
 import type { DomainPack } from "./presets.js";
 import type { AgentConfig, AggregateUsage, ModelClient, Tool, TurnEvent } from "./types.js";
 
@@ -330,7 +331,8 @@ export async function runStructuredPlanner(
   const plannerCfg: AgentConfig = {
     ...roleBase,
     // 同 verifier：§5.2 决定 3，拆解者也不许把"该问谁"变成"问委托方"
-    tools: [...withoutAskUser(roleBase.tools), createShardsTool()],
+    // planner 只读拆解：与核查者同一条不变量，edit_file 不进它的工具面
+    tools: [...withoutEditFile(withoutAskUser(roleBase.tools)), createShardsTool()],
     terminalTool: SHARDS_TOOL_NAME,
     runBudget: createRunBudget({
       ...(cfg.maxTotalTurns !== undefined ? { maxTurns: cfg.maxTotalTurns } : {}),
@@ -638,7 +640,7 @@ export async function runPlanner(
   const plannerCfg: AgentConfig = {
     ...roleBase,
     // 同 verifier：§5.2 决定 3，拆解者也不许把"该问谁"变成"问委托方"
-    tools: [...withoutAskUser(roleBase.tools), createPlanTool()],
+    tools: [...withoutEditFile(withoutAskUser(roleBase.tools)), createPlanTool()],
     terminalTool: PLAN_TOOL_NAME,
     runBudget: createRunBudget({
       ...(cfg.maxTotalTurns !== undefined ? { maxTurns: cfg.maxTotalTurns } : {}),

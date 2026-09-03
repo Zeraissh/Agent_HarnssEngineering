@@ -21,6 +21,7 @@ import { runPlanned, runVerified } from "../src/orchestrate.js";
 import { RULE_PRECEDENCE_DISCIPLINE } from "../src/presets.js";
 import { createModelClientFromEnv, type ResolvedProvider } from "../src/provider.js";
 import { bashTool } from "../src/tools/bash.js";
+import { editFileTool } from '../src/tools/edit-file.js';
 import { globTool } from "../src/tools/glob.js";
 import { grepTool } from "../src/tools/grep.js";
 import { readFileTool } from "../src/tools/read-file.js";
@@ -122,7 +123,7 @@ async function main(): Promise<void> {
     systemPrompt: SYSTEM_PROMPT,
     // A1（2026-09-03）：工具面从 3 件扩到 6 件。这是**被测变量本身**——
     // 与 eval/baselines/heldout-v1.3.0.json 对照时，唯一变化的就是这一行。
-    tools: [bashTool, readFileTool, writeFileTool, globTool, grepTool],
+    tools: [bashTool, readFileTool, writeFileTool, editFileTool, globTool, grepTool],
     workdir,
     compat,
     maxTurns: 15,

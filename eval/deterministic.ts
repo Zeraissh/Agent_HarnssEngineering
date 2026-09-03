@@ -591,6 +591,82 @@ const scenarios: Scenario[] = [
   },
 
   {
+    id: "edit-file-targeted",
+    title: "edit_file 唯一命中 → 局部改盘 → completed",
+    guards:
+      "A1：str_replace 局部编辑必须落到工作目录、唯一性由宿主执行；" +
+      "审批自动放行后字节级替换成功，finish_task 收 completed",
+    args: ["--yes"],
+    task: "change the greeting in hello.txt from hello to hi",
+    seed: { "hello.txt": "hello world\n" },
+    scripts: [
+      turn(
+        say("I will edit hello.txt in place."),
+        tu("edit_file", {
+          path: "hello.txt",
+          old_string: "hello world",
+          new_string: "hi world",
+        }),
+      ),
+      turn(
+        finishTask("completed", "greeting updated", {
+          artifacts: ["hello.txt"],
+          verification: ["edit_file returned success"],
+        }),
+      ),
+    ],
+    expect: {
+      exitCode: 0,
+      includes: ["completed", "auto-approved: edit_file"],
+      files: { "hello.txt": "hi world\n" },
+      ledger: { stopReason: "completed", mode: "single", verify: false },
+      requestCount: 2,
+    },
+  },
+
+  {
+    id: "edit-file-widen-context",
+    title: "edit_file 多命中报错 → 扩上下文重抄 → completed",
+    guards:
+      "A1：多命中且未给 replace_all 必须是 is_error 并带命中次数；" +
+      "模型扩上下文后第二次编辑成功",
+    args: ["--yes"],
+    task: "change only the second TODO line in notes.txt",
+    seed: { "notes.txt": "TODO: alpha\nTODO: beta\nTODO: gamma\n" },
+    scripts: [
+      turn(
+        tu("edit_file", {
+          path: "notes.txt",
+          old_string: "TODO:",
+          new_string: "DONE:",
+        }),
+      ),
+      turn(
+        say("The first attempt was not unique; I will include surrounding lines."),
+        tu("edit_file", {
+          path: "notes.txt",
+          old_string: "TODO: beta",
+          new_string: "DONE: beta",
+        }),
+      ),
+      turn(
+        finishTask("completed", "second TODO updated", {
+          artifacts: ["notes.txt"],
+          verification: ["only the middle line changed"],
+        }),
+      ),
+    ],
+    expect: {
+      exitCode: 0,
+      includes: ["completed", "not unique", "auto-approved: edit_file"],
+      files: { "notes.txt": "TODO: alpha\nDONE: beta\nTODO: gamma\n" },
+      ledger: { stopReason: "completed", mode: "single", verify: false },
+      requestCount: 3,
+      occurrences: [{ needle: "✗", atLeast: 1 }],
+    },
+  },
+
+  {
     id: "ask-user-one-round",
     title: "ask_user 提问一轮 → 委托方从 stdin 选项作答 → completed",
     guards:

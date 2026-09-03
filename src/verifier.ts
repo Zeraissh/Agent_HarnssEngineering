@@ -13,6 +13,7 @@ import type Anthropic from "@anthropic-ai/sdk";
 import { AgentLoop, createRunBudget } from "./loop.js";
 import { withoutTaskCompletion } from "./task-completion.js";
 import { withoutAskUser } from "./tools/ask-user.js";
+import { withoutEditFile } from "./tools/edit-file.js";
 import type { AgentConfig, AggregateUsage, ModelClient, Tool, TurnEvent } from "./types.js";
 
 export interface Verdict {
@@ -293,7 +294,9 @@ export async function runVerifier(
     // withoutAskUser 是 §5.2 决定 3 的硬执行点：核查者不许问委托方要答案，
     // 它的公信力来自自己动手查。宿主一旦给执行者装了 ask_user，
     // 这份工具面会被 {...cfg} 原样继承过来——所以在这里剔，不在装配处指望人记得
-    tools: [...withoutAskUser(roleBase.tools), createVerdictTool()],
+    // withoutEditFile 与 withoutAskUser 同性质：只读角色的不变量由 harness 执行，
+    // 不指望每个宿主装配时都记得（P6）。edit_file 在核查者面前根本不该在场。
+    tools: [...withoutEditFile(withoutAskUser(roleBase.tools)), createVerdictTool()],
     terminalTool: VERDICT_TOOL_NAME,
     runBudget: verifierBudget,
   };
@@ -379,7 +382,7 @@ export async function runVerifier(
       new AgentLoop(
         {
           ...roleBase,
-          tools: withoutAskUser(roleBase.tools),
+          tools: withoutEditFile(withoutAskUser(roleBase.tools)),
           maxTurns: 3,
           runBudget: verifierBudget,
         },

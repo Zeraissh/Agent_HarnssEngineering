@@ -120,6 +120,7 @@ import {
 import { bashTool, SHELL_DESC } from "./tools/bash.js";
 import { createDescribeImageTool } from "./tools/describe-image.js";
 import { fetchUrlTool } from "./tools/fetch-url.js";
+import { editFileTool } from "./tools/edit-file.js";
 import { globTool } from "./tools/glob.js";
 import { grepTool } from "./tools/grep.js";
 import { readFileTool } from "./tools/read-file.js";
@@ -574,6 +575,7 @@ async function main(): Promise<void> {
       fetchUrlTool,
       readFileTool,
       writeFileTool,
+      editFileTool,
       globTool,
       grepTool,
       ...(visionTool ? [visionTool] : []),
@@ -903,6 +905,7 @@ async function main(): Promise<void> {
       fetchUrlTool,
       readFileTool,
       writeFileTool,
+      editFileTool,
       globTool,
       grepTool,
       ...(visionTool ? [visionTool] : []),

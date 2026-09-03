@@ -18,6 +18,7 @@ import { AgentLoop } from "../src/loop.js";
 import { RULE_PRECEDENCE_DISCIPLINE } from "../src/presets.js";
 import { createModelClientFromEnv } from "../src/provider.js";
 import { bashTool, SHELL_DESC } from "../src/tools/bash.js";
+import { editFileTool } from '../src/tools/edit-file.js';
 import { globTool } from "../src/tools/glob.js";
 import { grepTool } from "../src/tools/grep.js";
 import { readFileTool } from "../src/tools/read-file.js";
@@ -51,7 +52,7 @@ async function main(): Promise<void> {
     systemPrompt: SYSTEM_PROMPT,
     // 与 eval/ab.ts 的工具面保持逐字一致——两台仪器的被测面分叉过一次
     // （eval/run.ts 从 v0.6 起失修成化石，见 23055ed），不再重犯。
-    tools: [bashTool, readFileTool, writeFileTool, globTool, grepTool],
+    tools: [bashTool, readFileTool, writeFileTool, editFileTool, globTool, grepTool],
     workdir,
     compat,
     maxTurns: 15,
