@@ -39,6 +39,7 @@ import {
 import { resolvePlannerMaxTurns } from "../src/planner.js";
 import { DEFAULT_MAX_TOKENS } from "../src/loop.js";
 import { clearCapabilityCache } from "../src/model-capability.js";
+import { resetObservabilityMetrics } from "../src/metrics.js";
 import {
   DEFAULT_CONTEXT_TOKEN_LIMIT,
   MIN_CONTEXT_TOKEN_LIMIT,
@@ -7077,6 +7078,59 @@ describe("监控闭环：outcome 分档指标与告警文件一致性", () => {
     );
     expect(sawDelta).toEqual({ kind: "text", text: "半句" });
     expect(sawSignal).toBe(controller.signal);
+  });
+
+  /**
+   * OBS-02 延迟面。两条判据：
+   * ① 开机即有序列（首抓盲区）——直方图不预注册的话，`histogram_quantile` 在
+   *    第一次模型调用之前匹配不到向量，而第一次观测又以非零值出生。
+   * ② TTFT 与调用时长真的被这台宿主的执行者客户端量到了——装配漏一层包裹时，
+   *    指标名还在、`_count` 永远是 0，是最难看出来的一种静默失效。
+   */
+  it("/metrics：OBS-02 延迟直方图开机预注册，跑完一个 run 后 TTFT 与调用时长有读数", async () => {
+    resetObservabilityMetrics();
+    const dir = await mkdtemp(join(tmpdir(), "metrics-obs02-"));
+    // 会流式吐字的假模型：TTFT 只在真的收到 delta 时才落桶
+    const streaming: ModelClient = {
+      send: async (_req, onDelta) => {
+        onDelta?.({ kind: "text", text: "干" });
+        onDelta?.({ kind: "text", text: "完了" });
+        const message = fakeMessage([textBlock("干完了")], "end_turn");
+        return { message, stopReason: message.stop_reason, usage: message.usage };
+      },
+    };
+    const handle = createUiServer({ modelClient: streaming, workdir: dir });
+    try {
+      const port = await startServer(handle);
+      const base = baseUrl(port);
+      const before = await (await fetch(`${base}/metrics`)).text();
+      // ① 一次调用都还没有：序列在，计数为 0
+      expect(before).toMatch(/^agent_harness_model_ttft_seconds_count\{role="execution",model=".+"\} 0$/m);
+      expect(before).toMatch(/^agent_harness_model_call_seconds_bucket\{role="execution",model=".+",le="1"\} 0$/m);
+      for (const kind of ["approval", "question", "plan_gate", "resource"]) {
+        expect(before).toContain(`agent_harness_wait_seconds_count{kind="${kind}"} 0`);
+      }
+      // 挂起等待的实时读数：没人在等就是 0，不是缺失序列
+      expect(before).toContain('agent_harness_pending_wait_seconds{kind="approval"} 0');
+
+      const created = await fetch(`${base}/api/runs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task: "量一次延迟" }),
+      });
+      const { runId } = await created.json();
+      await waitForDone(base, runId);
+
+      // ② 真的量到了
+      const after = await (await fetch(`${base}/metrics`)).text();
+      const ttft = after.match(/^agent_harness_model_ttft_seconds_count\{role="execution",model=".+"\} (\d+)$/m);
+      const call = after.match(/^agent_harness_model_call_seconds_count\{role="execution",model=".+"\} (\d+)$/m);
+      expect(Number(ttft?.[1] ?? 0)).toBeGreaterThan(0);
+      expect(Number(call?.[1] ?? 0)).toBeGreaterThan(0);
+    } finally {
+      await handle.close();
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   it("告警文件：引用的自产指标逐一真实存在；进程死亡告警钉在 job=agent-harness", async () => {

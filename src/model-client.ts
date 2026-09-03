@@ -205,6 +205,56 @@ function readErrorCode(err: object): string | undefined {
 /** classifyApiError 对上下文超长的固定前缀——台账 taxonomy 与宿主文案都靠它识别 */
 export const CONTEXT_OVERFLOW_ERROR_PREFIX = "context_overflow";
 
+/**
+ * 指标标签用的错误类（OBS-02）。
+ *
+ * 与 `classifyApiError` 分工明确：那个返回**给人看的中文句子**（还带端点原文），
+ * 直接当 Prometheus 标签用会把基数炸到每条错误消息一个序列。这里返回固定枚举，
+ * 值域先写死——新增一档要改这里，指标不会静默多长出一根曲线。
+ */
+export const API_ERROR_CLASSES = [
+  "context_overflow",
+  "auth",
+  "permission",
+  "rate_limit",
+  "not_found",
+  "bad_request",
+  "timeout",
+  "network",
+  "server",
+  "aborted",
+  "unknown",
+] as const;
+export type ApiErrorClass = (typeof API_ERROR_CLASSES)[number];
+
+export function apiErrorClass(err: unknown): ApiErrorClass {
+  if (isContextOverflowError(err)) return "context_overflow";
+  if (err instanceof Anthropic.APIUserAbortError) return "aborted";
+  if (err instanceof Anthropic.AuthenticationError) return "auth";
+  if (err instanceof Anthropic.PermissionDeniedError) return "permission";
+  if (err instanceof Anthropic.RateLimitError) return "rate_limit";
+  if (err instanceof Anthropic.NotFoundError) return "not_found";
+  if (err instanceof Anthropic.APIConnectionTimeoutError) return "timeout";
+  if (err instanceof Anthropic.APIConnectionError) return "network";
+  if (err instanceof Anthropic.BadRequestError || err instanceof Anthropic.UnprocessableEntityError) {
+    return "bad_request";
+  }
+  const status = (err as { status?: unknown })?.status;
+  if (typeof status === "number") {
+    if (status === 401) return "auth";
+    if (status === 403) return "permission";
+    if (status === 404) return "not_found";
+    if (status === 408) return "timeout";
+    if (status === 429) return "rate_limit";
+    if (status >= 500) return "server";
+    if (status >= 400) return "bad_request";
+  }
+  const name = (err as { name?: unknown })?.name;
+  if (name === "AbortError") return "aborted";
+  if (name === "TimeoutError") return "timeout";
+  return "unknown";
+}
+
 /** 宿主级错误分类：loop 用它决定报错信息，不用字符串匹配 */
 export function classifyApiError(err: unknown): string {
   if (isContextOverflowError(err)) {

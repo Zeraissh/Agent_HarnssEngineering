@@ -30,6 +30,14 @@ import {
 } from "../src/orchestrate.js";
 import { createModelClientFromEnv, type ResolvedProvider } from "../src/provider.js";
 import {
+  instrumentModelClient,
+  obsRegistry,
+  observeWaitSeconds,
+  preregisterObservability,
+  WAIT_KINDS,
+  type MetricRole,
+} from "../src/metrics.js";
+import {
   createFallbackClientIfConfigured,
   createRoleFallbackClient,
   executorBackupEndpoints,
@@ -1503,7 +1511,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   // 新日额度）。metrics.tokens 的 role 记账仍走事件路径（每段独立 usage、归属
   // 清晰），这层只喂日账本——两本账职责分开，互不双计。
   // 计量包在降级之**外**：哪个端点应答的都要计进日额度，账本关心的是花了多少钱。
-  const modelClient = meterModelClient(fallbackClient, (u) => bumpDaily(u));
+  // OBS-02 的延迟仪表再包一层，位置同理：TTFT 要量的是**委托方等了多久**，
+  // 中途换了端点也照样算在这一次调用头上。
+  const modelClient = instrumentModelClient(
+    meterModelClient(fallbackClient, (u) => bumpDaily(u)),
+    { role: "execution", model: executorModelName },
+  );
   const taskCompletionEnabled =
     options.taskCompletion ?? (options.modelClient ? false : process.env.AGENT_REQUIRE_FINISH_TASK !== "0");
   /**
@@ -1700,27 +1713,37 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    */
   const visionRole = resolveRole("VISION");
 
+  /** 降级链的角色名 → 指标口径的角色名（verifier 与 verification 是同一个东西） */
+  const METRIC_ROLE_OF: Record<"verifier" | "planner" | "vision", MetricRole> = {
+    verifier: "verification",
+    planner: "planner",
+    vision: "vision",
+  };
+
   function wrapRoleClient(
     role: "verifier" | "planner" | "vision",
     resolvedRole: { name: string; provider: ResolvedProvider },
     baseURL: string | undefined,
   ): ModelClient {
-    return createRoleFallbackClient({
-      role,
-      primary: {
-        name: resolvedRole.name,
-        client: resolvedRole.provider.client,
-        identity: {
-          provider: resolvedRole.provider.provider,
-          model: resolvedRole.name,
-          ...(baseURL ? { baseURL } : {}),
+    return instrumentModelClient(
+      createRoleFallbackClient({
+        role,
+        primary: {
+          name: resolvedRole.name,
+          client: resolvedRole.provider.client,
+          identity: {
+            provider: resolvedRole.provider.provider,
+            model: resolvedRole.name,
+            ...(baseURL ? { baseURL } : {}),
+          },
         },
-      },
-      env: fallbackEnv,
-      executorFallbacks: executorBackups,
-      onFallback,
-      breakerRegistry: sharedBreakerRegistry,
-    });
+        env: fallbackEnv,
+        executorFallbacks: executorBackups,
+        onFallback,
+        breakerRegistry: sharedBreakerRegistry,
+      }),
+      { role: METRIC_ROLE_OF[role], model: resolvedRole.name },
+    );
   }
 
   const verifierClient = verifierRole
@@ -1732,6 +1755,19 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   const visionClient = visionRole
     ? wrapRoleClient("vision", visionRole, roleEnv.AGENT_VISION_BASE_URL)
     : null;
+
+  /**
+   * OBS-02 首抓盲区：被告警引用的直方图必须在开机时就有 0 值序列，否则
+   * `histogram_quantile(rate(...))` 在第一次观测之前匹配不到任何向量，
+   * 而第一次观测又以非零值出生——那一段增量永远看不见（5xx 序列同一条结论）。
+   * 只铺**这台宿主真的装配了**的角色，不铺笛卡尔积。
+   */
+  preregisterObservability([
+    { role: "execution" as const, model: executorModelName },
+    ...(verifierRole ? [{ role: "verification" as const, model: verifierRole.name }] : []),
+    ...(plannerRole ? [{ role: "planner" as const, model: plannerRole.name }] : []),
+    ...(visionRole ? [{ role: "vision" as const, model: visionRole.name }] : []),
+  ]);
 
   const roleFallbackChains = {
     executor: fallbackChain,
@@ -4863,8 +4899,36 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       `agent_harness_daily_tokens_used ${dailyTokens.day === localDayKey() ? dailyTokens.used : 0}`,
       "# TYPE agent_harness_history_errors_total counter",
       `agent_harness_history_errors_total ${metrics.historyErrors}`,
+      // OBS-02：**当前**挂着的最久的一次人工等待（秒）。直方图只在应答那一刻
+      // 落桶，所以"现在有人已经等了 40 分钟"在直方图上完全看不见——而那正是
+      // 唯一值得半夜叫醒运维的形态。没有挂起项时是 0，不是缺失序列。
+      "# TYPE agent_harness_pending_wait_seconds gauge",
+      ...WAIT_KINDS.filter((k) => k !== "resource").map(
+        (kind) => `agent_harness_pending_wait_seconds{kind="${kind}"} ${oldestPendingWaitSeconds(kind)}`,
+      ),
+      ...obsRegistry.renderLines(),
       "",
     ].join("\n");
+  }
+
+  /**
+   * 最久的一个挂起等待，秒。三种挂起态各自的挂起时刻都记在 `at` 上
+   * （PendingApproval / PendingPlan / PendingQuestion 同款字段）。
+   */
+  function oldestPendingWaitSeconds(kind: (typeof WAIT_KINDS)[number]): number {
+    const now = Date.now();
+    let oldest = now;
+    for (const run of runs.values()) {
+      if (run.status !== "running") continue;
+      if (kind === "approval") {
+        for (const p of run.pendingApprovals.values()) oldest = Math.min(oldest, p.at);
+      } else if (kind === "plan_gate") {
+        if (run.pendingPlan) oldest = Math.min(oldest, run.pendingPlan.at);
+      } else if (kind === "question") {
+        if (run.pendingQuestion) oldest = Math.min(oldest, run.pendingQuestion.at);
+      }
+    }
+    return Math.max(0, Math.round((now - oldest) / 1000));
   }
 
   /**
@@ -6008,6 +6072,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             : { type: "plan_rejected", at },
           at,
         );
+        // OBS-02：计划确认门把整场 run 挂在这儿等一个人（同 approval 的口径）
+        observeWaitSeconds("plan_gate", Date.now() - pendingPlan.at);
         pendingPlan.settle(parsed.decision);
         broadcastLifecycle("run_updated", run);
         return json(res, 200, { acknowledged: true });
@@ -6070,6 +6136,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           actor: "user",
           at: Date.now(),
         });
+        observeWaitSeconds("question", Date.now() - pendingQuestion.at);
         pendingQuestion.settle(answers);
         broadcastLifecycle("run_updated", run);
         return json(res, 200, { acknowledged: true });
@@ -6182,6 +6249,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             (run.autoAllow ??= new Map()).set(exactKey, resolvedGrant);
           }
         }
+        // OBS-02：人做决定花了多久。只量真的做了决定的那些——run 结束时被判
+        // expired 的挂起项没有终点，补一个"到关机为止"就是把宿主的作息编进曲线
+        observeWaitSeconds("approval", Date.now() - pending.at);
         pending.respond(parsed.decision, parsed.reason);
         run.respondedApprovals.set(key!, {
           decision: parsed.decision,

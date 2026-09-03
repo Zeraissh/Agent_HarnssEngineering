@@ -9,8 +9,9 @@ import type Anthropic from "@anthropic-ai/sdk";
 import { DefaultContextManager, REACTIVE_PROTECT_RECENT, userMessageWithContext } from "./context.js";
 import { createHash } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
+import { countModelError, countModelRetry, observeToolSeconds } from "./metrics.js";
 import { parseContextWindowFromOverflowError } from "./model-capability.js";
-import { classifyApiError, isContextOverflowError, isTransientApiError } from "./model-client.js";
+import { apiErrorClass, classifyApiError, isContextOverflowError, isTransientApiError } from "./model-client.js";
 import { decideRecovery } from "./recovery.js";
 import { type DurableToolTx, type ToolTxController } from "./tool-tx.js";
 import { ToolExecutor, ToolRegistry } from "./tools/registry.js";
@@ -677,9 +678,13 @@ export class AgentLoop {
               // isTransientApiError(原始错误) 决定"这段能不能带着正史续跑"（9.8）。
               // 此前这里只留下一句字符串，上游再想分类只能字符串匹配——那正是
               // 本项目一贯反对的做法。
+              // OBS-02：终局错误按类计数（标签用固定枚举，不用给人看的那句话）
+              countModelError(apiErrorClass(err));
               return finish("error", new Error(classifyApiError(err), { cause: err }));
             }
             const backoffMs = backoffWithJitter(this.errorRetryBackoffMs, attempt);
+            // OBS-02：轮内自愈的次数——端点抖动在它上面先亮，而 run 仍然会成功
+            countModelRetry(apiErrorClass(err));
             q.push({
               type: "api_retry",
               turn,
@@ -938,13 +943,18 @@ export class AgentLoop {
                   respond: (decision, reason) => resolve({ decision, reason }),
                 });
               }),
-            (executed) =>
+            (executed) => {
+              // OBS-02：工具延迟。名字只从**本轮的 blocks** 取——`ExecutedTool`
+              // 不带名字（V-12 同一个缺口），拿 toolUseId 当标签会让基数爆炸
+              const name = blocks.find((b) => b.id === executed.toolUseId)?.name;
+              if (name) observeToolSeconds(name, executed.durationMs);
               q.push({
                 type: "tool_result",
                 toolUseId: executed.toolUseId,
                 result: executed.result,
                 durationMs: executed.durationMs,
-              }),
+              });
+            },
           );
 
           // 目标级进展判定：相同调用与相同观察才算重复；tool_use_id 不参与签名。

@@ -16,6 +16,7 @@ import {
   type SubTask,
 } from "./planner.js";
 import { runVerifier, sumUsage, type Verdict, type VerifyOutcome } from "./verifier.js";
+import { observeWaitSeconds } from "./metrics.js";
 import { isTransientApiError } from "./model-client.js";
 import type { DomainPack } from "./presets.js";
 import type { AgentConfig, AgentRunResult, AggregateUsage, ModelClient, TurnEvent } from "./types.js";
@@ -715,6 +716,13 @@ export async function runPlanned(
         coordinator.release(sub.resources ?? resolvedById.get(sub.id)!.resources ?? [], subHolder(sub));
       });
 
+  /**
+   * OBS-02：子任务第一次被独占资源挡住的时刻。排队等待是**真实的墙钟成本**
+   * （双探针场景里它就是并行收益的上限），此前只在调度器脑子里，谁也看不见。
+   * 只记"被挡住又终于拿到"的那一段——被挡到 run 结束的算不出终点，不编数。
+   */
+  const blockedSince = new Map<string, number>();
+
   while (true) {
     // signal 中止必须在这里显式收敛：被外部资源挡住且无在飞任务时，launch 的
     // 失败路径没有机会置 aborted，缺这行会在 waitForRelease 上无限等
@@ -731,7 +739,13 @@ export async function runPlanned(
         const resources = sub.resources ?? resolvedById.get(sub.id)!.resources ?? [];
         if (resources.length > 0 && !coordinator.tryAcquire(resources, subHolder(sub))) {
           blockedOnResources = true;
+          if (!blockedSince.has(sub.id)) blockedSince.set(sub.id, Date.now());
           continue;
+        }
+        const waitedFrom = blockedSince.get(sub.id);
+        if (waitedFrom !== undefined) {
+          blockedSince.delete(sub.id);
+          observeWaitSeconds("resource", Date.now() - waitedFrom);
         }
         queue.splice(queue.indexOf(sub), 1);
         running.set(sub.id, launch(sub));
