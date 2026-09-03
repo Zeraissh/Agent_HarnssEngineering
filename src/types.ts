@@ -441,10 +441,11 @@ export type TurnEvent =
    * 两边各写一遍字段名就是下一次"界面少显示一行且不报错"的温床。
    *
    * reason 是**离开上一个端点的原因**（HTTP 状态+消息，或 `circuit_open`
-   * 表示它还在熔断隔离期被跳过）；turn 是该客户端的第几次 send，
-   * 与 loop 的轮次不是同一个计数器（一轮可能重发多次）。
+   * 表示它还在熔断隔离期被跳过，或 `probe_unhealthy` 表示粘性探针标过不健康）；
+   * turn 是该客户端的第几次 send，与 loop 的轮次不是同一个计数器。
+   * role / routing 为 MODEL-01b 可选字段（缺省 = 执行者 / sequential）。
    */
-  | { type: "model_fallback"; from: string; to: string; reason: string; turn: number }
+  | { type: "model_fallback"; from: string; to: string; reason: string; turn: number; role?: string; routing?: string }
   | {
       /** 目标级恢复决策：不是模型散文，而是 harness 的确定性分支 */
       type: "recovery_decision";

@@ -2236,4 +2236,19 @@ describe("MODEL-01a 端点降级", () => {
     expect(state.runConfig.fallbackChain).toEqual(["deepseek-v4-pro", "kimi-k3"]);
     expect(state.runConfig.fallbackScope).toBe("executor");
   });
+
+  it("run_config 投影 fallbackChains / routing / compatSource（MODEL-01b）", () => {
+    let state = createInitialState("r1", "t", false);
+    state = reduceEvent(state, sse("host", "run_config", {
+      fallbackChain: ["a", "b"],
+      fallbackChains: { executor: ["a", "b"], verifier: ["v1", "v2"], planner: null, vision: null },
+      fallbackScope: "roles",
+      fallbackRouting: "prefer_healthy",
+      compatSource: "probe",
+    }));
+    expect(state.runConfig.fallbackChains.verifier).toEqual(["v1", "v2"]);
+    expect(state.runConfig.fallbackScope).toBe("roles");
+    expect(state.runConfig.fallbackRouting).toBe("prefer_healthy");
+    expect(state.runConfig.compatSource).toBe("probe");
+  });
 });

@@ -129,36 +129,40 @@ $env:AGENT_VERIFIER_API_KEY  = "sk-..."                           # 可选，缺
 npm run cli -- --verify "……"
 ```
 
-### 端点降级与熔断（可选）
+### 端点降级、熔断与能力探针（可选）
 
-配一个备用端点，主端点在瞬时错误（网络/超时/429/5xx）上耗尽重试后自动换过去再试，
-每个端点各带一个熔断器（连败 N 次开路、冷却期内直接跳过、冷却后放一次试探、
-成功即闭合）。**不配 `AGENT_FALLBACK_MODEL` 就完全不生效**，也不会多包一层装饰器。
+配一个备用端点，主端点在瞬时错误（网络/超时/429/5xx）上耗尽重试后自动换过去再试。
+熔断器按**端点身份**（provider|model|baseURL）登记：同一物理端点在角色之间诚实共享
+健康状态，不同身份互不误伤。**不配 `AGENT_FALLBACK_MODEL` 就完全不生效**。
 
 ```powershell
-$env:AGENT_FALLBACK_MODEL    = "kimi-k3"                      # 配了才启用整条防线
+$env:AGENT_FALLBACK_MODEL    = "kimi-k3"                      # 配了才启用执行者链
 $env:AGENT_FALLBACK_PROVIDER = "anthropic"                    # 可选，anthropic | openai
 $env:AGENT_FALLBACK_BASE_URL = "https://api.moonshot.cn/anthropic"  # 可选
 $env:AGENT_FALLBACK_API_KEY  = "sk-..."                       # 可选，缺省沿用执行者
 $env:AGENT_CIRCUIT_FAILURE_THRESHOLD = "3"                    # 连败几次开路，默认 3
 $env:AGENT_CIRCUIT_COOLDOWN_MS       = "30000"                # 隔离多久，默认 30s
+$env:AGENT_FALLBACK_ROUTING          = "prefer_healthy"       # 可选；缺省 sequential
+# 角色自有链或继承执行者备用端点（不会静默共用执行者的装饰器实例）：
+# $env:AGENT_VERIFIER_FALLBACK_MODEL = "…"
+# $env:AGENT_VERIFIER_FALLBACK = "inherit"   # 或 planner / vision
+# 能力探针（compat 不再只靠 claude-* 名称）：loopback 默认开；远程需显式打开
+# $env:AGENT_MODEL_PROBE = "1"
+# $env:AGENT_MODEL_PROBE_TTL_MS = "300000"
 ```
 
-三条边界写在这里，因为踩上去都不便宜：
+边界：
 
-- **只覆盖主执行者。** verifier / planner / 视觉模型仍走各自显式配置的端点——
-  "核查者应 ≥ 执行者"是一条设计约束（见 A/B 研究结论），静默把核查换到另一家
-  会让那条约束在无人知晓时失效。
-- **认证失败、400 这类非瞬时错误一律原样上抛。** 换端点救不了配置错误，
-  只会把同一个 401 打到第二家去，并掩盖真正的原因。
-- **跨端点重发会剥掉 thinking 块**（签名属于上一家），链上端点若能力不同
-  （例如备用端点不支持识图）不做校验，请自行确认两家能跑同一类任务。
+- **角色默认不进执行者链。** 要给核查者/planner/视觉保底，须显式
+  `AGENT_<ROLE>_FALLBACK_MODEL` 或 `=inherit`——静默继承会让「核查者应 ≥ 执行者」
+  在无人知晓时失效（A/B 研究结论）。
+- **认证失败、400 一律原样上抛。** 换端点救不了配置错误。
+- **跨端点重发会剥掉 thinking 块。** 能力探针可区分 compat/native，但成本/延迟
+  路由仍是 stub（`prefer_healthy` 只按粘性健康位跳过，不是计价器）。
+- **探针 fail-open：** 失败或未触发 → 退回名称猜测；全链不健康仍允许尝试。
 
-换端点这件事在两个宿主上都留痕：CLI 打一行 `⇄ 端点降级：A → B`，Web 上是时间线里
-一条默认展开的条目 + 装配条上的降级链，台账另记 `fallbackChain` 与 `fallbacks` 次数
-（未配置时 `fallbackChain` 是 `null`，与"配了链但零次降级"分得开）。
-熔断相关的数值配错会**直接抛错而不是静默取默认**——以为把冷却调成了 5 分钟、
-实际仍是 30 秒，这种防线口径与认知不一致就等于没有。
+换端点在两个宿主上都留痕：CLI `⇄ 端点降级`，Web 时间线 + 装配条；台账记
+`fallbackChain` / `fallbacks`（未配置时 `fallbackChain` 为 `null`）。
 
 ## 在 Cloud Agent 里跑：凭据怎么过去
 

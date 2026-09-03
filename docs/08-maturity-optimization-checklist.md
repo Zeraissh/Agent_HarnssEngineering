@@ -120,7 +120,7 @@ OCI 逃逸 canary 由 Linux CI container job 承担（run #33461119575 全绿）
 | [ ] | AGENT-01 | 一等 `PlanState` 与重规划 | 4/3/4 | 14 | 节点有目标、证据、验收、状态和失败策略；仅在新证据/依赖变化时可审计地更新计划 |
 | [ ] | AGENT-02 | 动态多 Agent | 5/4/5 | 9 | supervisor/mailbox 支持 spawn、follow-up、cancel、重新分派和分支失败策略；handoff 使用结构化证据引用 |
 | [ ] | AGENT-03 | 每 Agent 隔离与路由 | 5/4/5 | 9 | 每 agent 独立 worktree/sandbox、工具、模型和预算；并发写不会污染共享 checkout |
-| [~] | MODEL-01 | Provider 能力注册与降级 | 4/4/4 | 16 | 以 endpoint+model capability probe 代替名称猜测；支持健康检查、熔断、fallback、成本/延迟路由与每角色绑定。**MODEL-01a（降级+熔断）已落地并接进两个宿主**（见 Phase 3 实施记录）；**仍开**：capability probe（compat 仍靠 `claude-*` 名称猜测）、成本/延迟路由、每角色绑定（链只覆盖主执行者） |
+| [~] | MODEL-01 | Provider 能力注册与降级 | 4/4/4 | 16 | 以 endpoint+model capability probe 代替名称猜测；支持健康检查、熔断、fallback、成本/延迟路由与每角色绑定。**MODEL-01a（降级+熔断）+ MODEL-01b（探针+每角色+prefer_healthy stub）已落地**（见 Phase 3 实施记录）；**仍开**：真实成本/延迟路由、Web 启动同步探针回写 compat、链健康实时面、识图能力探针 |
 | [ ] | EXT-01 | 插件/Pack manifest 与 SDK | 4/3/4 | 14 | 版本化 manifest、权限声明、依赖、签名/来源、启停与兼容检查；DomainPack 不再只能硬编码发布 |
 | [ ] | EXT-02 | 完整 MCP 与公开协议 | 4/3/4 | 14 | 远程 transport、OAuth、resources/prompts/elicitation、lazy tool discovery；公开版本化 schema/SDK/webhook |
 
@@ -134,6 +134,14 @@ OCI 逃逸 canary 由 Linux CI container job 承担（run #33461119575 全绿）
 | MODEL-01a 界面 | `ui/public/app.js` 三处一起改（投影分支 / 派生 / 渲染，逐字段白名单投影天生会静默吞掉没列出的字段）：时间线条目默认**不折叠**并按 warn 着色；`deriveLoopFace` 把 `fallbacks` 与 `retries` **分开计数**（压成一个数就再也答不出"是同一家重试还是换了一家"）；装配条只在配了链时上一格，写明覆盖范围只到执行者。`circuit_open` 经 `fallbackReasonText` 译成人话（原样显示会让人以为上游返回了一个叫 `circuit_open` 的错误码，从而查错方向）。**渲染锁** `test/ui-patch.test.ts` + **投影/派生锁** `test/ui-app.test.ts` | 未做链的"当前健康状态"实时面（熔断器状态只在降级发生时以 reason 间接可见） |
 | MODEL-01a 台账 | `src/ledger.ts` 新增 `fallbackChain: string[] \| null` 与 `fallbacks: number`。**null 与 `[主端点]` 必须分开**：前者是"这台机器上没有这条防线"，后者是"配了链但只有一环"——压成同一个读数，事后就无从判断"零次降级"是防线没触发还是防线不存在。空数组按未配处理、脏输入不留 `NaN`（台账每行形状必须一致） | 没做 `modelsUsed`（"这一轮实际是谁应答的"要逐 send 归属，属 OBS-01 的 span 范畴，不塞进 run 级台账） |
 | 顺带修出的真缺陷 | `ui/server.ts` 的 `meterModelClient` 装饰器**吞掉了 `onDelta` 与 `signal`**：Web 上等于没有流式（直播条与对话末尾实时段全空），且停止按钮掐不掉在飞的请求。装饰器最常见的错就是收窄被装饰者的契约。已修并加锁 | — |
+
+### Phase 3 实施记录（2026-09-03，MODEL-01b）
+
+| ID | 已取得证据 | 残余边界 |
+|---|---|---|
+| MODEL-01b 能力探针 | `src/model-capability.ts`：端点身份键 + 粘性 TTL 缓存；Anthropic 路径带 `thinking/adaptive` 轻量 POST——原生 200→compat=false，compat 400→compat=true；OpenAI 路径只做健康检查。**fail-open**：探针失败/未触发 → 名称猜测（错判 compat=true 可恢复，错判 false 会永久 400）。触发：`AGENT_MODEL_PROBE=1` 或 baseURL loopback（`=0` 强制关）。`createModelClientWithProbe` 写入 client 的 compat。mock provider 增 `rejectClaudeExtensions`。`test/model-capability.test.ts` **8 测试** | Web `createUiServer` 仍**同步**名称猜 compat（契约不改 async）；仅异步填充粘性供路由。未做 tools/vision 能力位、未做远程默认探针 |
+| MODEL-01b 每角色 fallback | `readRoleFallbackMode` / `createRoleFallbackClient`：`AGENT_<ROLE>_FALLBACK_MODEL`（own）或 `AGENT_<ROLE>_FALLBACK=inherit`。`CircuitBreakerRegistry` 按身份共享；装饰器实例按角色隔离。CLI + Web 同提交接线；`model_fallback` 事件带可选 `role`/`routing`；`run_config.fallbackChains` + `fallbackScope=roles\|executor\|null` | 台账仍只记执行者 `fallbackChain`（角色次数未分列）；inherit 只继承执行者**备用**端点，不把执行者 primary 塞进角色链 |
+| MODEL-01b 路由 stub | `AGENT_FALLBACK_ROUTING=prefer_healthy`：保持配置链原序，有健康候选时跳过粘性 `healthy=false`（reason=`probe_unhealthy`）；全不健康仍尝试。装配条/CLI 可见。mutation `prefer-healthy-never-skips` | **不是**成本/延迟路由——无 token 单价、无 p50 延迟模型、无多目标优化。下一步若做真路由，应另开 ID，勿在 stub 上堆 |
 
 ### Phase 3 回归证据（2026-09-02）
 
@@ -185,8 +193,9 @@ npx tsc --noEmit                            passed
 6. **残余风险**：未覆盖平台、TOCTOU、外部系统或人工验收项。
 
 当前执行顺序（2026-09-03 成熟度第二波，单操作员形态）：
-`EVAL-03c → EVAL-01 held-out → OBS-01[~] → RUN-01[~] → MEM-01[~ Phase A]`。
-下一刀候选：`MODEL-01b`（capability probe / 每角色 fallback）或 `MEM-01 Phase B`（可选 LLM 摘要，仅当启发式不够）或 `RUN-01 Phase 2`。
+`EVAL-03c → EVAL-01 held-out → OBS-01[~] → RUN-01[~] → MEM-01[~ Phase A] → MODEL-01b[~]`。
+下一刀候选：`MEM-01 Phase B`（可选 LLM 摘要，仅当启发式不够）或 `RUN-01 Phase 2`，
+或 MODEL-01 残余（真成本路由 / Web 同步探针回写）。
 本波**不提前** GOV-*；SAFE-05 Phase 2B / SAFE-06 保持 partial，除非发现已解锁且很小。
 并行可继续：`A1 攒 §2.1 样本（ledger:samples）`（与质量门不冲突）。
 若目标改公网多人，`GOV-01/02/03` 必须提前到 `RUN-01` 之后、任何公开上线之前。

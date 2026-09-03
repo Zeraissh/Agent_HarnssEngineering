@@ -28,9 +28,15 @@ import {
 import { createModelClientFromEnv, type ResolvedProvider } from "../src/provider.js";
 import {
   createFallbackClientIfConfigured,
+  createRoleFallbackClient,
+  executorBackupEndpoints,
   FallbackModelClient,
+  readFallbackEnv,
+  sharedBreakerRegistry,
   type FallbackInfo,
+  type FallbackRouting,
 } from "../src/model-fallback.js";
+import { probeEndpointCapabilities, type EndpointCapabilities } from "../src/model-capability.js";
 import { getPack, selectPackTools, PACKS, RULE_PRECEDENCE_DISCIPLINE, type DomainPack } from "../src/presets.js";
 import { connectMcpServers, loadMcpConfig, type McpRuntime } from "../src/mcp.js";
 import { createWorkdirScopedMemoryTools, MEMORY_TOOL_NAMES } from "../src/memory.js";
@@ -1245,24 +1251,45 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   const trustProxy = options.trustProxy ?? (realHost && process.env.AGENT_UI_TRUST_PROXY === "1");
 
   // F1: 缺省模型从环境变量读取，compat 取自 createModelClientFromEnv 返回值
+  // MODEL-01b：Web 启动保持同步装配（createUiServer 契约）；compat 仍可名称猜测，
+  // 粘性探针在下方异步填充供 prefer_healthy。CLI 走 createModelClientWithProbe。
   const resolved = createModelClientFromEnv(process.env.AGENT_MODEL ?? "claude-opus-4-8");
+  const fallbackEnv = options.fallbackEnv ?? process.env;
+  const routingPolicy: FallbackRouting = readFallbackEnv(fallbackEnv).routing;
+  let executorCapabilities: EndpointCapabilities | null = null;
   /**
-   * 端点降级链（MODEL-01a）。**只包主执行者**——verifier / planner / vision
-   * 三个角色模型不进链：它们是被显式指定的端点，"核查者应 ≥ 执行者"是一条
-   * 设计约束，静默把核查换到另一家会让那条约束在无人知晓时失效。
+   * 端点降级链（MODEL-01a/b）。执行者 AGENT_FALLBACK_*；角色可 own / inherit。
+   * 熔断按端点身份经 sharedBreakerRegistry 共享；装饰器实例按角色隔离。
    *
-   * 归属靠 AsyncLocalStorage 而不是一个可变的"当前 run"引用：换端点发生在
-   * `FallbackModelClient.send` 内部，而这台宿主允许多个 run 并发在飞
-   * （maxActiveRuns），单个可变引用会在两次 send 交错时把降级记到别人账上。
-   * ALS 的存储沿 await 链传播，谁发起的 send 就记到谁头上。
+   * 归属靠 AsyncLocalStorage：换端点发生在 FallbackModelClient.send 内部，
+   * 宿主允许多 run 并发，单个可变"当前 run"引用会记错账。
    */
   const fallbackSink = new AsyncLocalStorage<(info: FallbackInfo) => void>();
+  const onFallback = (info: FallbackInfo) => fallbackSink.getStore()?.(info);
+  const executorModelName = process.env.AGENT_MODEL ?? "claude-opus-4-8";
   const fallbackClient = createFallbackClientIfConfigured(
-    { name: process.env.AGENT_MODEL ?? "claude-opus-4-8", client: options.modelClient ?? resolved.client },
-    options.fallbackEnv ?? process.env,
-    (info) => fallbackSink.getStore()?.(info),
+    {
+      name: executorModelName,
+      client: options.modelClient ?? resolved.client,
+      identity: {
+        provider: resolved.provider,
+        model: executorModelName,
+        ...(process.env.ANTHROPIC_BASE_URL || process.env.OPENAI_BASE_URL
+          ? {
+              baseURL:
+                resolved.provider === "openai"
+                  ? process.env.OPENAI_BASE_URL
+                  : process.env.ANTHROPIC_BASE_URL,
+            }
+          : {}),
+      },
+    },
+    fallbackEnv,
+    onFallback,
+    { role: "executor", breakerRegistry: sharedBreakerRegistry },
   );
   const fallbackChain = fallbackClient instanceof FallbackModelClient ? fallbackClient.chain() : null;
+  const executorBackups = executorBackupEndpoints(fallbackClient);
   // 日账本逐调用实时计量（评审 b62f6a5：段粒度落账让预算门的 TOCTOU 窗口有
   // 整段宽——最坏 4 条 lineage 在账本过线前全部准入；跨午夜大段还会整段挤占
   // 新日额度）。metrics.tokens 的 role 记账仍走事件路径（每段独立 usage、归属
@@ -1448,11 +1475,93 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    * 没配就不该在工具面上摆一个一调用就报错的工具，那是在骗模型。
    */
   const visionRole = resolveRole("VISION");
-  const visionTool = visionRole
+
+  function wrapRoleClient(
+    role: "verifier" | "planner" | "vision",
+    resolvedRole: { name: string; provider: ResolvedProvider },
+    baseURL: string | undefined,
+  ): ModelClient {
+    return createRoleFallbackClient({
+      role,
+      primary: {
+        name: resolvedRole.name,
+        client: resolvedRole.provider.client,
+        identity: {
+          provider: resolvedRole.provider.provider,
+          model: resolvedRole.name,
+          ...(baseURL ? { baseURL } : {}),
+        },
+      },
+      env: fallbackEnv,
+      executorFallbacks: executorBackups,
+      onFallback,
+      breakerRegistry: sharedBreakerRegistry,
+    });
+  }
+
+  const verifierClient = verifierRole
+    ? wrapRoleClient("verifier", verifierRole, process.env.AGENT_VERIFIER_BASE_URL)
+    : null;
+  const plannerClient = plannerRole
+    ? wrapRoleClient("planner", plannerRole, process.env.AGENT_PLANNER_BASE_URL)
+    : null;
+  const visionClient = visionRole
+    ? wrapRoleClient("vision", visionRole, process.env.AGENT_VISION_BASE_URL)
+    : null;
+
+  const roleFallbackChains = {
+    executor: fallbackChain,
+    verifier: verifierClient instanceof FallbackModelClient ? verifierClient.chain() : null,
+    planner: plannerClient instanceof FallbackModelClient ? plannerClient.chain() : null,
+    vision: visionClient instanceof FallbackModelClient ? visionClient.chain() : null,
+  };
+  const anyRoleFallback = Boolean(
+    roleFallbackChains.verifier || roleFallbackChains.planner || roleFallbackChains.vision,
+  );
+  const fallbackScope = fallbackChain || anyRoleFallback
+    ? anyRoleFallback
+      ? "roles"
+      : "executor"
+    : null;
+
+  // 异步粘性探针（不挡 createUiServer）：填充 prefer_healthy 用的健康位
+  if (!options.modelClient) {
+    void probeEndpointCapabilities({
+      identity: {
+        provider: resolved.provider,
+        model: executorModelName,
+        ...(process.env.ANTHROPIC_BASE_URL || process.env.OPENAI_BASE_URL
+          ? {
+              baseURL:
+                resolved.provider === "openai"
+                  ? process.env.OPENAI_BASE_URL
+                  : process.env.ANTHROPIC_BASE_URL,
+            }
+          : {}),
+      },
+      ...(process.env.ANTHROPIC_API_KEY || process.env.OPENAI_API_KEY
+        ? {
+            apiKey:
+              resolved.provider === "openai"
+                ? process.env.OPENAI_API_KEY
+                : process.env.ANTHROPIC_API_KEY,
+          }
+        : {}),
+      env: fallbackEnv,
+    })
+      .then((caps) => {
+        executorCapabilities = caps;
+      })
+      .catch(() => {
+        /* 探针失败不影响宿主启动——fail-open */
+      });
+  }
+
+  const visionTool = visionRole && visionClient
     ? createDescribeImageTool({
         // 计量包裹：视觉调用不经 done/verification 记账路径，只能在客户端边界抓。
         // 视觉是独立 client（不在主 modelClient 的日账包裹之内），日账本也在这里喂
-        client: meterModelClient(visionRole.provider.client, (u) => {
+        client: meterModelClient(visionClient, (u) => {
           growTokens("vision", u);
           bumpDaily(u);
         }),
@@ -2319,7 +2428,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       ...(runRubric ? { verifyRubric: runRubric } : {}),
       ...(verifyMaxTurnsOf(runPack) !== undefined ? { verifyMaxTurns: verifyMaxTurnsOf(runPack)! } : {}),
       ...(verifierRole && useVerifier
-        ? { verifierModel: { client: verifierRole.provider.client, compat: verifierRole.provider.compat } }
+        ? { verifierModel: { client: verifierClient!, compat: verifierRole.provider.compat } }
         : {}),
     };
   }
@@ -2676,7 +2785,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    * 未配降级链时不建域——不为一条没启用的防线给每个 run 加一层 ALS 上下文。
    */
   function withFallbackAttribution<T>(run: StoredRun, body: () => Promise<T>): Promise<T> {
-    if (!fallbackChain) return body();
+    if (!fallbackChain && !anyRoleFallback) return body();
     return fallbackSink.run((info) => {
       run.fallbacks = (run.fallbacks ?? 0) + 1;
       // 来源记 "model"：它既不是模型说的话（main），也不是宿主的决定（host），
@@ -2687,6 +2796,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         to: info.to,
         reason: info.reason,
         turn: info.turn,
+        ...(info.role ? { role: info.role } : {}),
+        ...(info.routing ? { routing: info.routing } : {}),
       });
     }, body);
   }
@@ -3193,7 +3304,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         ...(run.abort ? { signal: run.abort.signal } : {}),
         ...(envPlanMaxTurns !== undefined ? { planMaxTurns: envPlanMaxTurns } : {}),
         ...(plannerRole && usePlanner
-          ? { plannerModel: { client: plannerRole.provider.client, compat: plannerRole.provider.compat } }
+          ? { plannerModel: { client: plannerClient!, compat: plannerRole.provider.compat } }
           : {}),
         onPlan: async (plan: Plan) => {
           planReadyAt = Date.now();
@@ -3604,8 +3715,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
        * 只报名字——链上第二家的 baseURL / key 与角色模型同规格，绝不下发。
        */
       fallbackChain,
-      // 三个角色模型不在链上（见装配处的理由）；界面照实说，别让人以为核查也保了底
-      fallbackScope: fallbackChain ? "executor" : null,
+      fallbackChains: roleFallbackChains,
+      // 有任一角色链时 scope=roles；仅执行者 = executor；未配 = null
+      fallbackScope,
+      fallbackRouting: fallbackChain || anyRoleFallback ? routingPolicy : null,
+      compatSource: executorCapabilities?.source ?? "name",
       guardrails: {
         maxTurns: cfg.maxTurns ?? null,
         maxTokens: cfg.maxTokens ?? null,
@@ -3740,7 +3854,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       // MODEL-01a：进程级降级链快照（逐 run 的同名字段走 run_config）。
       // null = 未配置这条防线，与"链上只有主端点"不是一回事
       fallbackChain,
-      fallbackScope: fallbackChain ? "executor" : null,
+      fallbackChains: roleFallbackChains,
+      fallbackScope,
+      fallbackRouting: fallbackChain || anyRoleFallback ? routingPolicy : null,
+      compatSource: executorCapabilities?.source ?? "name",
       // 核查预算与执行者解耦，但**不是常数**（9.1）：领域包可用 verify.maxTurns
       // 覆盖。这里报进程级默认包的值；逐 run 的真实值走 run_config
       verifierBudgetTurns: verifyMaxTurnsOf(pack) ?? DEFAULT_VERIFIER_MAX_TURNS,

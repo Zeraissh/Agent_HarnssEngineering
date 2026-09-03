@@ -52,6 +52,11 @@ export interface MockProviderOptions {
   scripts?: MockTurnScript[];
   /** 设了就每个请求都先吃这个故障，且**不消费**脚本队列 */
   alwaysFault?: MockFault;
+  /**
+   * MODEL-01b：拒绝 Claude 专属扩展（thinking / output_config）。
+   * 用来模拟 compat 端点——能力探针带 thinking 时应拿 400，健康仍算可达。
+   */
+  rejectClaudeExtensions?: boolean;
 }
 
 export interface MockRequestLogEntry {
@@ -388,6 +393,27 @@ export async function startMockProvider(opts: MockProviderOptions = {}): Promise
       body = raw;
     }
     requestLog.push({ wire, path: pathname, body });
+
+    if (
+      opts.rejectClaudeExtensions &&
+      wire === "anthropic" &&
+      body &&
+      typeof body === "object" &&
+      ("thinking" in (body as object) || "output_config" in (body as object))
+    ) {
+      respondStatus(res, {
+        type: "status",
+        status: 400,
+        body: {
+          type: "error",
+          error: {
+            type: "invalid_request_error",
+            message: "thinking is not supported on this mock compat endpoint",
+          },
+        },
+      });
+      return;
+    }
 
     const always = opts.alwaysFault && opts.alwaysFault.type !== "ok" ? opts.alwaysFault : undefined;
     const script = always ? undefined : scripts.shift();

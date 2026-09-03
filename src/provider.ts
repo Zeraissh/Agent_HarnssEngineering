@@ -8,8 +8,14 @@
  *     OPENAI_API_KEY（必须显式配置；不同 provider 之间绝不隐式复用密钥）
  *
  * 通用旋钮：AGENT_TIMEOUT_MS / AGENT_MAX_RETRIES
+ * MODEL-01b：`createModelClientWithProbe` 在 loopback / AGENT_MODEL_PROBE=1 时
+ * 用轻量请求代替名称猜 compat；失败 fail-open 回退名称猜测。
  */
 import Anthropic from "@anthropic-ai/sdk";
+import {
+  probeEndpointCapabilities,
+  type EndpointCapabilities,
+} from "./model-capability.js";
 import { AnthropicModelClient } from "./model-client.js";
 import { OpenAIModelClient } from "./model-client-openai.js";
 import { assertSafeProviderEndpoint } from "./provider-config.js";
@@ -22,6 +28,10 @@ export interface ResolvedProvider {
   compat: boolean;
 }
 
+export interface ResolvedProviderWithCapabilities extends ResolvedProvider {
+  capabilities: EndpointCapabilities;
+}
+
 /**
  * 端点覆盖：用于在同一进程里创建指向不同端点的第二个客户端
  * （如"执行者用本地 Ollama、verifier 用云端强模型"的跨强度核查实验）。
@@ -30,6 +40,11 @@ export interface ProviderOverrides {
   provider?: "anthropic" | "openai";
   baseURL?: string;
   apiKey?: string;
+  /**
+   * 覆盖名称猜测的 compat（MODEL-01b 探针结果）。
+   * 不传则仍按 `!model.startsWith("claude")` / openai→true。
+   */
+  compat?: boolean;
 }
 
 export function createModelClientFromEnv(
@@ -81,9 +96,49 @@ export function createModelClientFromEnv(
       })
     : undefined;
 
+  const compat = overrides.compat ?? !model.startsWith("claude");
   return {
     provider,
-    compat: !model.startsWith("claude"),
-    client: new AnthropicModelClient(model, sdkClient),
+    compat,
+    client: new AnthropicModelClient(model, sdkClient, { compat }),
   };
+}
+
+/**
+ * 先探针再装配：compat 以探针为准（失败则名称猜测）。
+ * 未触发探针条件时行为与 createModelClientFromEnv 一致，capabilities.source="name"。
+ */
+export async function createModelClientWithProbe(
+  model: string,
+  overrides: ProviderOverrides = {},
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<ResolvedProviderWithCapabilities> {
+  const rawProvider = overrides.provider ?? env.AGENT_PROVIDER ?? "anthropic";
+  if (rawProvider !== "anthropic" && rawProvider !== "openai") {
+    throw new Error('AGENT_PROVIDER 无效：只能是 "anthropic" 或 "openai"');
+  }
+  const provider = rawProvider;
+  const rawBase =
+    overrides.baseURL ??
+    (provider === "openai" ? env.OPENAI_BASE_URL : env.ANTHROPIC_BASE_URL);
+  const baseURL = rawBase?.trim() || undefined;
+  const apiKey =
+    overrides.apiKey ??
+    (provider === "openai" ? env.OPENAI_API_KEY : env.ANTHROPIC_API_KEY);
+
+  const capabilities = await probeEndpointCapabilities({
+    identity: {
+      provider,
+      model,
+      ...(baseURL ? { baseURL } : {}),
+    },
+    ...(apiKey ? { apiKey } : {}),
+    env,
+  });
+
+  const resolved = createModelClientFromEnv(model, {
+    ...overrides,
+    ...(provider === "anthropic" ? { compat: capabilities.compat } : {}),
+  });
+  return { ...resolved, capabilities };
 }

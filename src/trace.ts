@@ -238,6 +238,8 @@ export function projectTurnEventToSpans(opts: {
             to: event.to,
             reasonHash: hashPayload(event.reason),
             turn: event.turn,
+            ...(event.role ? { role: event.role } : {}),
+            ...(event.routing ? { routing: event.routing } : {}),
           },
         }),
         "ok",

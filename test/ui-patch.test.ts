@@ -1981,11 +1981,11 @@ describe("端点降级在界面上看得见", () => {
     expect(body).not.toContain("circuit_open");
   });
 
-  it("界面要说清降级只覆盖执行者——否则核查端点挂掉时会是个意料之外的失败", () => {
+  it("界面要说清默认只覆盖执行者——角色须显式配置或 inherit", () => {
     renderRunDetail(stateWithFallback(), { activeTab: "loop" });
     const body = document.querySelector(".log-entries")?.textContent ?? "";
-    expect(body).toContain("核查者");
-    expect(body).toContain("不在降级链上");
+    expect(body).toContain("主执行者");
+    expect(body).toContain("该角色的输出由新端点产生");
   });
 
   it("装配条：配了链才上条，且写出完整链路", () => {
@@ -1994,7 +1994,7 @@ describe("端点降级在界面上看得见", () => {
     ]);
     const chip = deriveAssemblyBar(configured, null).find((i) => i.key === "fallback");
     expect(chip?.chip).toContain("deepseek-v4-pro → kimi-k3");
-    expect(chip?.why).toContain("只覆盖执行者");
+    expect(chip?.why).toMatch(/角色默认不进|显式配置或 inherit/);
   });
 
   it("没配降级链时这一格根本不出现（未配是常态，摆一格「未配」只是噪声）", () => {

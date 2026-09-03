@@ -9,13 +9,17 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   CircuitBreaker,
+  CircuitBreakerRegistry,
   DEFAULT_COOLDOWN_MS,
   DEFAULT_FAILURE_THRESHOLD,
   FallbackModelClient,
+  orderEndpointsForRouting,
   readFallbackEnv,
+  readRoleFallbackMode,
   stripThinkingBlocks,
 } from "../src/model-fallback.js";
 import type { FallbackInfo } from "../src/model-fallback.js";
+import { clearCapabilityCache, setStickyCapabilities } from "../src/model-capability.js";
 import type { ModelClient, ModelRequest, ModelTurn } from "../src/types.js";
 import { FakeModelClient, fakeMessage, textBlock } from "./helpers.js";
 
@@ -132,7 +136,7 @@ describe("FallbackModelClient", () => {
     expect(primary.calls).toBe(1);
     expect(fallback.requests).toHaveLength(1);
     expect(events).toEqual([
-      { from: "primary", to: "backup", reason: "503: upstream unavailable", turn: 1 },
+      { from: "primary", to: "backup", reason: "503: upstream unavailable", turn: 1, routing: "sequential" },
     ]);
     expect(client.chain()).toEqual(["primary", "backup"]);
   });
@@ -278,8 +282,8 @@ describe("FallbackModelClient", () => {
 
     await client.send(makeRequest());
     expect(events).toEqual([
-      { from: "primary", to: "middle", reason: "503: p down", turn: 1 },
-      { from: "middle", to: "last", reason: "500: m down", turn: 1 },
+      { from: "primary", to: "middle", reason: "503: p down", turn: 1, routing: "sequential" },
+      { from: "middle", to: "last", reason: "500: m down", turn: 1, routing: "sequential" },
     ]);
   });
 
@@ -379,6 +383,7 @@ describe("readFallbackEnv", () => {
     expect(readFallbackEnv({})).toEqual({
       failureThreshold: DEFAULT_FAILURE_THRESHOLD,
       cooldownMs: DEFAULT_COOLDOWN_MS,
+      routing: "sequential",
     });
   });
 
@@ -399,6 +404,7 @@ describe("readFallbackEnv", () => {
       apiKey: "sk-test",
       failureThreshold: 5,
       cooldownMs: 1500,
+      routing: "sequential",
     });
   });
 
@@ -419,5 +425,143 @@ describe("readFallbackEnv", () => {
     expect(() => readFallbackEnv({ AGENT_CIRCUIT_COOLDOWN_MS: "1.5" })).toThrow();
     // 0 是合法的：冷却 0 = 每次都给一次试探机会
     expect(readFallbackEnv({ AGENT_CIRCUIT_COOLDOWN_MS: "0" }).cooldownMs).toBe(0);
+  });
+
+  it("AGENT_FALLBACK_ROUTING 只认 sequential / prefer_healthy", () => {
+    expect(readFallbackEnv({ AGENT_FALLBACK_ROUTING: "prefer_healthy" }).routing).toBe("prefer_healthy");
+    expect(() => readFallbackEnv({ AGENT_FALLBACK_ROUTING: "cheapest" })).toThrow(/AGENT_FALLBACK_ROUTING/);
+  });
+});
+
+describe("CircuitBreakerRegistry", () => {
+  it("同一身份共享熔断状态；不同身份互不影响", () => {
+    const reg = new CircuitBreakerRegistry({ failureThreshold: 1, cooldownMs: 10_000, now: () => 0 });
+    const a = reg.get("anthropic|m1|https://a.example");
+    const a2 = reg.get("anthropic|m1|https://a.example");
+    const b = reg.get("anthropic|m1|https://b.example");
+    expect(a).toBe(a2);
+    a.recordFailure();
+    expect(a.state()).toBe("open");
+    expect(b.state()).toBe("closed");
+  });
+});
+
+describe("readRoleFallbackMode", () => {
+  it("缺省 none；own 要有 MODEL；inherit 字面量", () => {
+    expect(readRoleFallbackMode("verifier", {})).toEqual({ mode: "none" });
+    expect(readRoleFallbackMode("verifier", { AGENT_VERIFIER_FALLBACK: "inherit" })).toEqual({
+      mode: "inherit",
+    });
+    const own = readRoleFallbackMode("verifier", {
+      AGENT_VERIFIER_FALLBACK_MODEL: "backup-v",
+      AGENT_VERIFIER_FALLBACK_PROVIDER: "anthropic",
+    });
+    expect(own.mode).toBe("own");
+    if (own.mode === "own") expect(own.config.model).toBe("backup-v");
+    expect(() => readRoleFallbackMode("planner", { AGENT_PLANNER_FALLBACK: "maybe" })).toThrow(
+      /AGENT_PLANNER_FALLBACK/,
+    );
+  });
+});
+
+describe("prefer_healthy routing stub", () => {
+  it("有健康候选时跳过粘性探针标为不健康的端点，reason=probe_unhealthy", async () => {
+    clearCapabilityCache();
+    const unhealthyId = { provider: "anthropic" as const, model: "sick", baseURL: "http://127.0.0.1:9" };
+    setStickyCapabilities({
+      identity: unhealthyId,
+      healthy: false,
+      compat: true,
+      latencyMs: 1,
+      source: "probe",
+      probedAt: Date.now(),
+      reason: "upstream:503",
+    });
+
+    const sick = new ThrowingClient(apiError(503, "should-not-call"));
+    const healthy = okClient();
+    const events: FallbackInfo[] = [];
+    const client = new FallbackModelClient({
+      primary: { name: "sick", client: sick, identity: unhealthyId },
+      fallbacks: [
+        {
+          name: "well",
+          client: healthy,
+          identity: { provider: "anthropic", model: "well", baseURL: "http://127.0.0.1:10" },
+        },
+      ],
+      routing: "prefer_healthy",
+      onFallback: (info) => events.push(info),
+      role: "executor",
+    });
+
+    await client.send(makeRequest());
+    expect(sick.calls).toBe(0);
+    expect(healthy.requests).toHaveLength(1);
+    expect(events).toEqual([
+      {
+        from: "sick",
+        to: "well",
+        reason: "probe_unhealthy",
+        turn: 1,
+        role: "executor",
+        routing: "prefer_healthy",
+      },
+    ]);
+    clearCapabilityCache();
+  });
+
+  it("全不健康时仍尝试（fail-open），不会因探针把整链拒之门外", async () => {
+    clearCapabilityCache();
+    const idA = { provider: "anthropic" as const, model: "a", baseURL: "http://127.0.0.1:11" };
+    const idB = { provider: "anthropic" as const, model: "b", baseURL: "http://127.0.0.1:12" };
+    for (const id of [idA, idB]) {
+      setStickyCapabilities({
+        identity: id,
+        healthy: false,
+        compat: true,
+        latencyMs: 1,
+        source: "probe",
+        probedAt: Date.now(),
+      });
+    }
+    const a = new ThrowingClient(apiError(503, "a down"));
+    const b = okClient();
+    const client = new FallbackModelClient({
+      primary: { name: "a", client: a, identity: idA },
+      fallbacks: [{ name: "b", client: b, identity: idB }],
+      routing: "prefer_healthy",
+    });
+    await client.send(makeRequest());
+    expect(a.calls).toBe(1);
+    expect(b.requests).toHaveLength(1);
+    clearCapabilityCache();
+  });
+});
+
+describe("orderEndpointsForRouting", () => {
+  it("变异：把 prefer_healthy 恒退化成原序会被本用例抓住——不健康必须排后", () => {
+    clearCapabilityCache();
+    const sick = {
+      name: "sick",
+      client: okClient(),
+      identity: { provider: "anthropic" as const, model: "sick", baseURL: "http://127.0.0.1:13" },
+    };
+    const well = {
+      name: "well",
+      client: okClient(),
+      identity: { provider: "anthropic" as const, model: "well", baseURL: "http://127.0.0.1:14" },
+    };
+    setStickyCapabilities({
+      identity: sick.identity!,
+      healthy: false,
+      compat: true,
+      latencyMs: null,
+      source: "probe",
+      probedAt: Date.now(),
+    });
+    const ordered = orderEndpointsForRouting([sick, well], "prefer_healthy");
+    expect(ordered.map((e) => e.name)).toEqual(["well", "sick"]);
+    clearCapabilityCache();
   });
 });

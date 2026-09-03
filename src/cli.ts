@@ -79,8 +79,8 @@ import { AUTO_CONCURRENCY_CAP, plannedStopReason, planParallelWidth, runPlanned,
 import type { VerifyOutcome } from "./verifier.js";
 import { getPack, PACKS, RULE_PRECEDENCE_DISCIPLINE, selectPackTools } from "./presets.js";
 import { routeToPack } from "./router.js";
-import { createModelClientFromEnv } from "./provider.js";
-import { createFallbackClientIfConfigured, FallbackModelClient } from "./model-fallback.js";
+import { createFallbackClientIfConfigured, createRoleFallbackClient, executorBackupEndpoints, FallbackModelClient, sharedBreakerRegistry } from "./model-fallback.js";
+import { createModelClientFromEnv, createModelClientWithProbe } from "./provider.js";
 import { ASK_USER_TOOL_NAME, createAskUserTool } from "./tools/ask-user.js";
 import {
   FINISH_TASK_TOOL_NAME,
@@ -149,7 +149,8 @@ async function main(): Promise<void> {
   }
 
   const model = process.env.AGENT_MODEL ?? "claude-opus-4-8";
-  const { client: resolvedClient, provider, compat } = createModelClientFromEnv(model);
+  const { client: resolvedClient, provider, compat, capabilities: executorCaps } =
+    await createModelClientWithProbe(model);
 
   // 领域包（可选）：AGENT_PACK 显式选用（AGENT_PRESET 为兼容别名）；
   // --auto 时由调度单元路由（显式 > 路由）；--plan 时忽略：包由 planner 按子任务选
@@ -185,7 +186,7 @@ async function main(): Promise<void> {
   // --verify 时可选的独立 verifier 模型（核查者应 ≥ 执行者强度）
   const verifierModelName = process.env.AGENT_VERIFIER_MODEL;
   const verifierProvider = verifierModelName
-    ? createModelClientFromEnv(verifierModelName, {
+    ? await createModelClientWithProbe(verifierModelName, {
         ...(process.env.AGENT_VERIFIER_PROVIDER
           ? { provider: process.env.AGENT_VERIFIER_PROVIDER as "anthropic" | "openai" }
           : {}),
@@ -204,7 +205,7 @@ async function main(): Promise<void> {
   // --plan 时可选的独立 planner 模型（拆分决策摇摆的稳定化杆,镜像 verifier 组）
   const plannerModelName = process.env.AGENT_PLANNER_MODEL;
   const plannerProvider = plannerModelName
-    ? createModelClientFromEnv(plannerModelName, {
+    ? await createModelClientWithProbe(plannerModelName, {
         ...(process.env.AGENT_PLANNER_PROVIDER
           ? { provider: process.env.AGENT_PLANNER_PROVIDER as "anthropic" | "openai" }
           : {}),
@@ -306,7 +307,7 @@ async function main(): Promise<void> {
    */
   const visionModelName = process.env.AGENT_VISION_MODEL;
   const visionProvider = visionModelName
-    ? createModelClientFromEnv(visionModelName, {
+    ? await createModelClientWithProbe(visionModelName, {
         ...(process.env.AGENT_VISION_PROVIDER
           ? { provider: process.env.AGENT_VISION_PROVIDER as "anthropic" | "openai" }
           : {}),
@@ -315,8 +316,128 @@ async function main(): Promise<void> {
       })
     : undefined;
   if (visionProvider) console.log(c.dim(`vision model: ${visionModelName}`));
-  const visionTool = visionProvider
-    ? createDescribeImageTool({ client: visionProvider.client, modelName: visionModelName! })
+
+  /**
+   * 端点降级链（MODEL-01a/b）。执行者默认可配 AGENT_FALLBACK_*；
+   * verifier/planner/vision 各自 AGENT_<ROLE>_FALLBACK_MODEL 或 =inherit。
+   * 熔断按端点身份共享（sharedBreakerRegistry），装饰器实例按角色隔离。
+   * 不配则不包装饰器。降级事件走唯一的 renderEvent。
+   */
+  let fallbackCount = 0;
+  const onAnyFallback = (info: {
+    from: string;
+    to: string;
+    reason: string;
+    turn: number;
+    role?: string;
+    routing?: string;
+  }) => {
+    fallbackCount += 1;
+    void renderEvent({
+      type: "model_fallback",
+      from: info.from,
+      to: info.to,
+      reason: info.reason,
+      turn: info.turn,
+      ...(info.role ? { role: info.role } : {}),
+      ...(info.routing ? { routing: info.routing } : {}),
+    });
+  };
+  const modelClient = createFallbackClientIfConfigured(
+    {
+      name: model,
+      client: resolvedClient,
+      identity: {
+        provider,
+        model,
+        ...(process.env.ANTHROPIC_BASE_URL || process.env.OPENAI_BASE_URL
+          ? {
+              baseURL:
+                provider === "openai"
+                  ? process.env.OPENAI_BASE_URL
+                  : process.env.ANTHROPIC_BASE_URL,
+            }
+          : {}),
+      },
+    },
+    process.env,
+    onAnyFallback,
+    { role: "executor", breakerRegistry: sharedBreakerRegistry },
+  );
+  if (modelClient instanceof FallbackModelClient) {
+    console.log(
+      c.dim(
+        `fallback chain [executor/${modelClient.routingPolicy()}]: ${modelClient.chain().join(" → ")}` +
+          (executorCaps.source !== "name" ? ` · compat=${compat} via ${executorCaps.source}` : ""),
+      ),
+    );
+  } else if (executorCaps.source === "probe" || executorCaps.source === "sticky") {
+    console.log(c.dim(`model probe: compat=${compat} healthy=${executorCaps.healthy} (${executorCaps.reason ?? executorCaps.source})`));
+  }
+
+  const executorBackups = executorBackupEndpoints(modelClient);
+  const wrapRole = (
+    role: "verifier" | "planner" | "vision",
+    name: string,
+    client: typeof resolvedClient,
+    roleProvider: typeof provider,
+    baseURL?: string,
+  ) =>
+    createRoleFallbackClient({
+      role,
+      primary: {
+        name,
+        client,
+        identity: {
+          provider: roleProvider,
+          model: name,
+          ...(baseURL ? { baseURL } : {}),
+        },
+      },
+      executorFallbacks: executorBackups,
+      onFallback: onAnyFallback,
+      breakerRegistry: sharedBreakerRegistry,
+    });
+
+  const verifierClient = verifierProvider
+    ? wrapRole(
+        "verifier",
+        verifierModelName!,
+        verifierProvider.client,
+        verifierProvider.provider,
+        process.env.AGENT_VERIFIER_BASE_URL,
+      )
+    : undefined;
+  const plannerClient = plannerProvider
+    ? wrapRole(
+        "planner",
+        plannerModelName!,
+        plannerProvider.client,
+        plannerProvider.provider,
+        process.env.AGENT_PLANNER_BASE_URL,
+      )
+    : undefined;
+  const visionClient = visionProvider
+    ? wrapRole(
+        "vision",
+        visionModelName!,
+        visionProvider.client,
+        visionProvider.provider,
+        process.env.AGENT_VISION_BASE_URL,
+      )
+    : undefined;
+  if (verifierClient instanceof FallbackModelClient) {
+    console.log(c.dim(`fallback chain [verifier]: ${verifierClient.chain().join(" → ")}`));
+  }
+  if (plannerClient instanceof FallbackModelClient) {
+    console.log(c.dim(`fallback chain [planner]: ${plannerClient.chain().join(" → ")}`));
+  }
+  if (visionClient instanceof FallbackModelClient) {
+    console.log(c.dim(`fallback chain [vision]: ${visionClient.chain().join(" → ")}`));
+  }
+
+  const visionTool = visionClient
+    ? createDescribeImageTool({ client: visionClient, modelName: visionModelName! })
     : undefined;
 
   // 内置工具按包名单装配（缺省全带）——领域包只带用得上的，减少触发面噪声
@@ -522,34 +643,6 @@ async function main(): Promise<void> {
     }
   };
 
-  /**
-   * 端点降级链（MODEL-01a）。**只包主执行者的客户端**：verifier / planner /
-   * vision 三个角色模型不进链，因为它们是**被显式指定的**——"核查者应 ≥ 执行者"
-   * 是一条设计约束，静默把核查换到另一家端点会让那条约束在无人知晓时失效。
-   * 主执行者不同：它是任务本身要跑完的那一条路，换端点跑完 > 整段作废。
-   *
-   * 降级事件走 renderEvent 而不是就地 console.log：CLI 只应有一个渲染器，
-   * 两处各写一遍就是"同一件事两种说法"的开始。
-   */
-  let fallbackCount = 0;
-  const modelClient = createFallbackClientIfConfigured(
-    { name: model, client: resolvedClient },
-    process.env,
-    (info) => {
-      fallbackCount += 1;
-      void renderEvent({
-        type: "model_fallback",
-        from: info.from,
-        to: info.to,
-        reason: info.reason,
-        turn: info.turn,
-      });
-    },
-  );
-  if (modelClient instanceof FallbackModelClient) {
-    console.log(c.dim(`fallback chain: ${modelClient.chain().join(" → ")}`));
-  }
-
   // 裁决信号浮出（案例 #1 改进项）：boot_count 规格 bug 曾藏在 passed=true 的
   // 裁决 summary 里——宿主只看布尔就会漏。最终结果块无论通过与否都展示
   // summary 与 issues（通过时 issues 以 ⚠ 警示色呈现,是"通过但有话要说"的信号）。
@@ -714,8 +807,8 @@ async function main(): Promise<void> {
       concurrency,
       plannerProtocol: planProtocol,
       ...(envPlanMaxTurns !== undefined ? { planMaxTurns: envPlanMaxTurns } : {}),
-      ...(plannerProvider
-        ? { plannerModel: { client: plannerProvider.client, compat: plannerProvider.compat } }
+      ...(plannerProvider && plannerClient
+        ? { plannerModel: { client: plannerClient, compat: plannerProvider.compat } }
         : {}),
       onPlan: (plan) => {
         planRef = plan;
@@ -762,7 +855,7 @@ async function main(): Promise<void> {
             ...((envRubric ?? p?.verify.rubric) ? { verifyRubric: (envRubric ?? p?.verify.rubric)! } : {}),
             ...(verifyMaxTurnsOf(p) !== undefined ? { verifyMaxTurns: verifyMaxTurnsOf(p)! } : {}),
             ...(verifierProvider
-              ? { verifierModel: { client: verifierProvider.client, compat: verifierProvider.compat } }
+              ? { verifierModel: { client: verifierClient!, compat: verifierProvider.compat } }
               : {}),
           },
           // 独占资源（如 swd-probe）：调度器对同标签子任务强制串行
@@ -866,7 +959,7 @@ async function main(): Promise<void> {
       ...((envRubric ?? pack?.verify.rubric) ? { verifyRubric: (envRubric ?? pack?.verify.rubric)! } : {}),
       ...(verifyMaxTurnsOf(pack) !== undefined ? { verifyMaxTurns: verifyMaxTurnsOf(pack)! } : {}),
       ...(verifierProvider
-        ? { verifierModel: { client: verifierProvider.client, compat: verifierProvider.compat } }
+        ? { verifierModel: { client: verifierClient!, compat: verifierProvider.compat } }
         : {}),
       onEvent: async (source, event) => {
         noteForLedger(source, event);
@@ -1014,7 +1107,7 @@ async function main(): Promise<void> {
         endStreamLine();
         console.log(
           c.yellow(
-            `⇄ 端点降级：${event.from} → ${event.to}（第 ${event.turn} 次调用）：${event.reason}`,
+            `⇄ 端点降级${event.role && event.role !== "executor" ? `[${event.role}]` : ""}：${event.from} → ${event.to}（第 ${event.turn} 次调用）：${event.reason}`,
           ),
         );
         break;

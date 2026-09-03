@@ -540,7 +540,17 @@ export function reduceEvent(state, sseEvent) {
         plannerBudgetSource: event.plannerBudgetSource ?? null,
         // MODEL-01a：null = 没配这条防线，[] 与它不是一回事，别用 ?? [] 抹平
         fallbackChain: Array.isArray(event.fallbackChain) ? event.fallbackChain.map(String) : null,
+        fallbackChains: event.fallbackChains && typeof event.fallbackChains === "object"
+          ? {
+              executor: Array.isArray(event.fallbackChains.executor) ? event.fallbackChains.executor.map(String) : null,
+              verifier: Array.isArray(event.fallbackChains.verifier) ? event.fallbackChains.verifier.map(String) : null,
+              planner: Array.isArray(event.fallbackChains.planner) ? event.fallbackChains.planner.map(String) : null,
+              vision: Array.isArray(event.fallbackChains.vision) ? event.fallbackChains.vision.map(String) : null,
+            }
+          : null,
         fallbackScope: event.fallbackScope ? String(event.fallbackScope) : null,
+        fallbackRouting: event.fallbackRouting ? String(event.fallbackRouting) : null,
+        compatSource: event.compatSource ? String(event.compatSource) : null,
         guardrails: event.guardrails ?? null,
         tools: Array.isArray(event.tools) ? event.tools : [],
       },
@@ -754,6 +764,8 @@ function buildTimelineEntry(seq, source, type, event) {
         to: String(event.to ?? ""),
         reason: String(event.reason ?? ""),
         turn: Number(event.turn ?? 0),
+        ...(event.role ? { role: String(event.role) } : {}),
+        ...(event.routing ? { routing: String(event.routing) } : {}),
       };
     case "recovery_decision":
       return {
@@ -2790,15 +2802,25 @@ export function deriveAssemblyBar(state, harness) {
    * 核查者所在端点挂掉时会得到一个完全意料之外的失败。
    */
   const chainCfg = cfg.fallbackChain ?? harness?.fallbackChain ?? null;
+  const chainsCfg = cfg.fallbackChains ?? harness?.fallbackChains ?? null;
+  const scopeCfg = cfg.fallbackScope ?? harness?.fallbackScope ?? null;
+  const routingCfg = cfg.fallbackRouting ?? harness?.fallbackRouting ?? null;
   if (Array.isArray(chainCfg) && chainCfg.length > 1) {
     const fellBack = (state.timeline ?? []).some((e) => e.type === "model_fallback");
+    const roleBits = [];
+    if (chainsCfg?.verifier?.length > 1) roleBits.push(`核查 ${chainsCfg.verifier.join("→")}`);
+    if (chainsCfg?.planner?.length > 1) roleBits.push(`规划 ${chainsCfg.planner.join("→")}`);
+    if (chainsCfg?.vision?.length > 1) roleBits.push(`视觉 ${chainsCfg.vision.join("→")}`);
+    const scopeLabel =
+      scopeCfg === "roles" ? "多角色" : "主执行者";
     push(
       "fallback",
-      `降级链 ${chainCfg.join(" → ")}${fellBack ? "·已降级" : ""}`,
-      "主执行者的端点降级链：瞬时错误（网络/超时/429/5xx）耗尽后换下一家再试，各端点各带一个熔断器。" +
-        "**只覆盖执行者**——核查者/planner/视觉模型仍走各自显式配置的端点，因为「核查者应 ≥ 执行者」是一条设计约束，" +
-        "静默把核查换到另一家会让那条约束在无人知晓时失效。认证失败、400 这类非瞬时错误一律原样上抛：" +
-        "换端点救不了配置错误，只会把同一个 401 打到第二家去，并掩盖真正的原因。",
+      `降级链 ${chainCfg.join(" → ")}${fellBack ? "·已降级" : ""}${routingCfg === "prefer_healthy" ? "·偏好健康" : ""}`,
+      `${scopeLabel}端点降级：瞬时错误（网络/超时/429/5xx）耗尽后换下一家再试，各端点按身份共享熔断器。` +
+        (scopeCfg === "roles"
+          ? `角色可自配 AGENT_<ROLE>_FALLBACK_* 或 inherit。${roleBits.length ? ` 已装配：${roleBits.join("；")}。` : ""}`
+          : "角色默认不进执行者链——要保底须显式配置或 inherit。") +
+        " 认证失败、400 一律原样上抛。prefer_healthy 只是粘性探针证据上的排序 stub，不是成本路由。",
     );
   }
 
@@ -5096,12 +5118,14 @@ function renderLogEntryBody(e) {
       }</div>`;
     case "model_fallback":
       // 三件事都要写出来：换到了哪家、为什么离开上一家、这之后的输出归谁。
-      // 只写"已降级"会让后面所有轮次的行为差异变成无从解释的怪事
-      return `<div class="log-entry-body">主执行者端点从 <code>${esc(e.from ?? "")}</code> 换到 <code>${esc(
-        e.to ?? "",
-      )}</code>（第 ${esc(String(e.turn ?? "?"))} 次模型调用）。<br>离开原因：${esc(
-        fallbackReasonText(e.reason),
-      )}<br>此后的输出由新端点产生——核查者/planner/视觉模型不在降级链上，仍走各自配置的端点。</div>`;
+      {
+        const roleLabel = e.role && e.role !== "executor" ? `（角色 ${esc(e.role)}）` : "（主执行者）";
+        return `<div class="log-entry-body">端点${roleLabel}从 <code>${esc(e.from ?? "")}</code> 换到 <code>${esc(
+          e.to ?? "",
+        )}</code>（第 ${esc(String(e.turn ?? "?"))} 次模型调用）。<br>离开原因：${esc(
+          fallbackReasonText(e.reason),
+        )}${e.routing ? `<br>路由策略：${esc(e.routing)}` : ""}<br>此后该角色的输出由新端点产生。</div>`;
+      }
     case "recovery_decision":
       return `<div class="log-entry-body">${esc(e.detail ?? "")}${
         typeof e.extraTurns === "number" ? `<br>追加额度：${esc(String(e.extraTurns))} 轮` : ""
@@ -5169,7 +5193,7 @@ function entryActionLabel(e) {
     case "approval_request": return `审批请求：${e.name ?? ""}`;
     case "api_retry": return `API 重试（第${e.attempt ?? "?"}次）`;
     case "segment_resume": return `瞬时失败后带正史续跑（已完成 ${e.priorTurns ?? "?"} 轮）`;
-    case "model_fallback": return `端点降级：${e.from ?? "?"} → ${e.to ?? "?"}`;
+    case "model_fallback": return `端点降级${e.role && e.role !== "executor" ? `[${e.role}]` : ""}：${e.from ?? "?"} → ${e.to ?? "?"}`;
     case "recovery_decision": {
       const labels = {
         request_completion: "要求业务收口",
@@ -5195,6 +5219,7 @@ function entryActionLabel(e) {
  */
 function fallbackReasonText(reason) {
   if (reason === "circuit_open") return "上一个端点仍在熔断隔离期，本次直接跳过";
+  if (reason === "probe_unhealthy") return "粘性探针标为不健康，prefer_healthy 跳过";
   return reason ?? "";
 }
 

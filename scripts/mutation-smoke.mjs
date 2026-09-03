@@ -136,6 +136,15 @@ const MUTANTS = [
     testFiles: ["test/compact.test.ts"],
     why: "MEM-01 压缩必须写入 compact_ledger；退回纯占位等于语义残留丢失",
   },
+  {
+    id: "prefer-healthy-never-skips",
+    file: "src/model-fallback.ts",
+    find: "        if (othersMayWork && stickySaysUnhealthy(id)) {\n          skipped.push(ep.name);\n          previous = { name: ep.name, reason: \"probe_unhealthy\" };\n          continue;\n        }",
+    replace:
+      "        // MUTATION: prefer_healthy 不再跳过不健康端点\n        if (false && othersMayWork && stickySaysUnhealthy(id)) {\n          skipped.push(ep.name);\n          previous = { name: ep.name, reason: \"probe_unhealthy\" };\n          continue;\n        }",
+    testFiles: ["test/model-fallback.test.ts"],
+    why: "prefer_healthy 有健康候选时必须跳过 sticky unhealthy；否则 stub 形同虚设",
+  },
 ];
 
 function runVitest(testFiles) {
