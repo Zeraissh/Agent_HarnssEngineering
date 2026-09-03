@@ -28,6 +28,8 @@
     "ledger:samples": "tsx --env-file-if-exists=.env eval/ledger-samples.ts",
     "eval:stats": "tsx --env-file-if-exists=.env eval/stats.ts",
     "eval:deterministic": "tsx eval/deterministic.ts",
+    "e2e:web": "tsx eval/e2e-web.ts",
+    "e2e:container": "node scripts/container-health-smoke.mjs",
     "eval:compare-baseline": "tsx eval/compare-baseline-cli.ts",
     "build": "node scripts/clean-dist.mjs && tsc -p tsconfig.build.json && node scripts/copy-ui-assets.mjs",
     "start": "node --env-file-if-exists=.env dist/ui/serve.js",
@@ -45,6 +47,7 @@
     "@vitest/coverage-v8": "^3.2.7",
     "axe-core": "^4.13.0",
     "jsdom": "^30.0.1",
+    "playwright": "^1.55.1",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"

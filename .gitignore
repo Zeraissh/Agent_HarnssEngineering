@@ -11,6 +11,9 @@ eval/stats-report.json
 # EVAL-03a 确定性场景门报告：每次 npm run eval:deterministic 重产，CI 作为 artifact 上传
 eval/deterministic-report.md
 eval/deterministic-report.json
+# E2E-01 Web E2E 报告
+eval/e2e-web-report.md
+eval/e2e-web-report.json
 # EVAL-03b nightly 产物（workflow artifact；本机偶发留档）
 eval/ab-report-nightly.md
 eval/nightly-compare.json

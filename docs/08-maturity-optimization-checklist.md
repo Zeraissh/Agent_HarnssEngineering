@@ -80,7 +80,7 @@ OCI 逃逸 canary 由 Linux CI container job 承担（run #33461119575 全绿）
 | [x] | EVAL-02 | 统计与失败分类 | 5/4/3 | 27 | 每模型/配置至少重复 3–5 次；输出 pass@1、首轮成功率、修复率、置信区间、token、成本、延迟和稳定失败 taxonomy |
 | [x] | EVAL-03 | CI/nightly/release 门 | 5/5/4 | 20 | PR 跑确定性小集；nightly 跑真实 provider 矩阵；release 对质量/成本/延迟设置退化阈值并保存报告。**PR 侧**：确定性小集 12 场景（`deterministic-eval` + release `gate`）。**Nightly 侧（EVAL-03b）**：`.github/workflows/nightly.yml` + `eval/baselines/nightly.json`。**Release 侧（EVAL-03c，2026-09-02）**：tag 门在候选提交上重跑同子集，对照 `eval/baselines/release.json`，上传 `release-quality-eval`。阈值经 nightly #33646201722（6/6、52k tok、28s）收紧为 `minPassRate=1` / `maxTotalTokens=150k` / `maxTotalWallMs=300s`。**子集已切 held-out（EVAL-01）** |
 | [~] | TEST-01 | Coverage 与 mutation | 4/4/3 | 24 | changed-line coverage、关键状态机 branch 阈值及 mutation score 纳入 CI；证明关键验收测试会在实现被破坏时变红 |
-| [ ] | E2E-01 | Web/桌面/容器真实 E2E | 5/5/4 | 20 | Playwright Web、已打包 Electron 启动/升级/卸载、容器 health+canary 自动化；覆盖流式断线、审批和崩溃恢复 |
+| [~] | E2E-01 | Web/桌面/容器真实 E2E | 5/5/4 | 20 | Playwright Web、已打包 Electron 启动/升级/卸载、容器 health+canary 自动化；覆盖流式断线、审批和崩溃恢复 |
 | [ ] | E2E-02 | Android 与 provider canary | 4/4/4 | 16 | 修正 Android instrumentation 身份并在 emulator 运行；每次 release 用少量真实 provider 请求验证协议与凭据边界 |
 
 ### Phase 1 实施记录（进行中）
@@ -95,6 +95,7 @@ OCI 逃逸 canary 由 Linux CI container job 承担（run #33461119575 全绿）
 | EVAL-03b nightly | `.github/workflows/nightly.yml`：cron + `workflow_dispatch`；**held-out** 6 用例 × `baseline` × 1（`AB_SUITE=heldout`）；`AB_TOKEN_CAP`；`npm run eval:compare-baseline` 对照 `eval/baselines/nightly.json`。凭据：`ANTHROPIC_API_KEY` + vars。单测 `test/eval-nightly.test.ts`。阈值经 research 首夜 #33646201722 收紧后沿用到 held-out ids | REPS=1 下任一 flaky 即红；held-out 首夜通过率仍待证据 |
 | EVAL-03c release | `eval/baselines/release.json`（与 nightly 同矩阵；单测锁「不得更松」）；`release.yml` `gate` 在确定性门之后要求凭据 → 重跑真实子集 → `compare-baseline` → artifact `release-quality-eval`（含 `release-compare.json`）。缺 secret/vars fail-closed | 未在本机重跑真实 provider（依赖 CI/tag）；未做多夜分布再收紧 |
 | EVAL-01 held-out | `eval/cases-heldout.ts`：**24** 条 `ho-*`（编辑/多文件/恢复/圈禁逃逸/成文口径/缺 MCP 旁路/条件分支/结构化抽取）；`eval/suite.ts` `resolveAbSuite`；`AB_SUITE` + nightly/release `AB_CASES` 切到 `HELDOUT_NIGHTLY_IDS` 六件套；`test/eval-heldout.test.ts` 锁规模/id 互斥/表面覆盖。纪律：本会话**未**为追分改 prompt/包。research `eval/cases.ts` **不是** held-out | 全量 24 条尚未跑真实 provider 矩阵；无活 MCP/HIL 调试任务；首夜 held-out 通过率仍待证据（成本/延迟天花板沿用 research 6/6） |
+| E2E-01 Phase 1 | **2026-09-03**：`eval/e2e-web.ts` + Playwright Chromium 对 **`dist/ui/serve.js`** + mock-provider（零真实 token）。五场景：approval allow/deny（真点卡片）、SSE `Last-Event-ID` 续传无回放/无重复 seq、崩溃后 same-run 热恢复（含 Playwright「同运行热恢复」）、无 checkpoint 飞行崩溃 `sameRunResume=false` 诚实。CI job `e2e-web`（install chromium --with-deps）。容器：`scripts/container-health-smoke.mjs` 接进 `container` job（镜像 `/health`）；既有 OCI 逃逸 canary 继续作隔离证据。`npm run e2e:web` / `e2e:container` | **Electron 打包启动/升级/卸载未进 CI**：cross-app 仅有本机 `desktop:smoke`（win-unpacked `/health`），无 upgrade/uninstall 自动化——不在本会话发明 electron-builder E2E。Android=E2E-02。BASE-04 仍开（真实 provider / 已安装 Electron / HIL 未齐） |
 
 ## Phase 2：可恢复、可重放、可运营
 
@@ -186,8 +187,8 @@ npx tsc --noEmit                            passed
 | MEM-01 Phase B | `src/compact-summary.ts` + `compactAsync`：可选 ModelClient（不经 ToolContext），`AGENT_COMPACT_SUMMARY=1` 默认关；有界 `max_tokens`（默认 512）；摘要 **merge** 进账本（可附 `summary:` narrative），失败 fail-open 回 Phase A；事件 `summaryApplied`；CLI + `app.js` 同提交；FakeModelClient 单测 + mutation `compact-summary-replaces-ledger` | **仍不**把长 assistant 推理从正史里 elide（只把可抽取事实写入账本）；摘要质量依赖模型，错误事实靠"不得编造"提示约束而非硬校验；未开 flag 时行为≡Phase A；跨宿主记忆合同仍归 MEM-02/03 |
 
 当前执行顺序（2026-09-03 成熟度第二波，单操作员形态）：
-`EVAL-03c → EVAL-01 held-out → OBS-01[~] → RUN-01[~ Phase 2] → MEM-01[~ Phase A+B] → MODEL-01b[~] → RUN-02[~] → SAFE-06[~ Phase 1]`。
-下一刀候选：E2E-01 / OBS-02 / OPS-01，或 MODEL-01 残余（真成本路由 / Web 同步探针回写）；
+`EVAL-03c → EVAL-01 held-out → OBS-01[~] → RUN-01[~ Phase 2] → MEM-01[~ Phase A+B] → MODEL-01b[~] → RUN-02[~] → SAFE-06[~ Phase 1] → E2E-01[~ Phase 1]`。
+下一刀候选：OBS-02 / OPS-01，或 E2E-01 Electron 打包路径，或 MODEL-01 残余（真成本路由 / Web 同步探针回写）；
 SAFE-05 2B 与 GOV-* 本波默认跳过。
 并行可继续：`A1 攒 §2.1 样本（ledger:samples）`（与质量门不冲突）。
 若目标改公网多人，`GOV-01/02/03` 必须提前到 `RUN-01` 之后、任何公开上线之前。

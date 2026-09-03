@@ -65,6 +65,31 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # E2E-01 Phase 1：dist UI + mock-provider + Playwright（零真实 token）
+  e2e-web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npx playwright install chromium --with-deps
+      - run: npm run build
+      - run: npm run e2e:web
+      - name: Upload e2e-web report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-web-report
+          path: |
+            eval/e2e-web-report.json
+            eval/e2e-web-report.md
+          if-no-files-found: error
+          retention-days: 14
+
   desktop-shell:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -100,6 +125,8 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: docker build --tag agent-harness:ci .
       - run: docker pull debian:bookworm-slim
+      - name: Container image health smoke
+        run: node scripts/container-health-smoke.mjs agent-harness:ci
       - name: OCI execution boundary escape/resource/cleanup canary
         run: |
           # 执行 worker 用最小 shell 镜像；agent-harness:ci 是 UI 运行时，不适合当 bash 沙箱。
