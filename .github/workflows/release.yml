@@ -31,10 +31,8 @@ jobs:
     timeout-minutes: 45
     outputs:
       has_signing: ${{ steps.signing.outputs.has_signing }}
-    env:
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-      ANTHROPIC_BASE_URL: ${{ vars.ANTHROPIC_BASE_URL }}
-      AGENT_MODEL: ${{ vars.AGENT_MODEL }}
+    # 真实 provider 凭据只给质量门那两步（见下），不放 job 级 env：放 job 级会漏进 npm test——
+    # test/cloud-sync-env.test.ts 读同名变量，断言 diff 会把密钥前缀原文打进日志（预演实测抓到）。
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -78,6 +76,10 @@ jobs:
       # provider 小子集，对照 eval/baselines/release.json（与 nightly 同口径、
       # 不得更松）。不复用昨夜 artifact：要测的是候选本身。
       - name: Require provider credentials for release quality gate
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_BASE_URL: ${{ vars.ANTHROPIC_BASE_URL }}
+          AGENT_MODEL: ${{ vars.AGENT_MODEL }}
         run: |
           test -n "$ANTHROPIC_API_KEY" || { echo "missing secret ANTHROPIC_API_KEY"; exit 1; }
           test -n "$ANTHROPIC_BASE_URL" || { echo "missing var ANTHROPIC_BASE_URL"; exit 1; }
@@ -87,6 +89,9 @@ jobs:
         run: rm -f eval/ab-log.jsonl
       - name: Release quality subset (real provider)
         env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_BASE_URL: ${{ vars.ANTHROPIC_BASE_URL }}
+          AGENT_MODEL: ${{ vars.AGENT_MODEL }}
           AB_SUITE: heldout
           AB_ARMS: baseline
           AB_CASES: ho-write-marker,ho-arith-product,ho-pkg-name,ho-count-md,ho-pkg-license,ho-filter-h2
