@@ -528,6 +528,16 @@ export function isExecutorLineageSource(source: string): boolean {
   return source === "main" || source === "rework";
 }
 
+/**
+ * meta.json 里的裁决是落盘再读回的 unknown（restoreArchivedRuns 只做了类型断言）。
+ * 拿它给执行者写摘要之前先验形状：坏档案该让派生少一段话，不该炸掉派生本身。
+ */
+export function isVerdictShape(value: unknown): value is Verdict {
+  if (!value || typeof value !== "object") return false;
+  const v = value as Record<string, unknown>;
+  return typeof v.passed === "boolean" && typeof v.summary === "string" && Array.isArray(v.issues);
+}
+
 /** planner/verifier 都在各自 drain 循环里自答 deny；宿主不得抢答或为其建 grant。 */
 function isInternallyResolvedApprovalSource(source: string): boolean {
   return isVerifierSource(source) || source === "planner" || source.endsWith("/planner");
@@ -3333,27 +3343,43 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   }
 
   /**
+   * 判了 previousTurn 那一轮的裁决——裁决只对它核查的那一轮负责，隔着一轮未核查的
+   * 对话就不再附给执行者。活 run 读内存里的 outcome；归档父级读 meta 落盘的
+   * outcome（含 judgedTurn）。同进程追加与重启后派生**必须从这一个口径取**，
+   * 否则执行者听到的话会因为宿主重启过而少一段。
+   */
+  function verdictJudging(run: StoredRun, previousTurn: number): Verdict | undefined {
+    if (run.outcome) {
+      const lastVerdict = run.outcome.verifications.at(-1)?.verdict;
+      return lastVerdict && run.outcomeTurn === previousTurn ? lastVerdict : undefined;
+    }
+    const archived = run.archivedOutcome;
+    if (archived?.judgedTurn === previousTurn && isVerdictShape(archived.verdict)) return archived.verdict;
+    return undefined;
+  }
+
+  /**
    * 本轮交给执行者的完整反馈 = 委托方这句话 + 它需要知道的上下文：
    *   · 上一轮若核查过 → 附裁决摘要（执行者要知道刚才被判了什么，正史里没有它）；
    *   · 无正史可续（执行阶段就失败 / 计划编排）→ 附原任务或计划摘要作开局背景。
    * 委托方的原话原样在最前面；事件流里 user_message 只记原话，附加段是宿主的装配。
+   * 同进程追加 / 归档派生两条入口共用；派生时裁决来自父档案，由调用方传入。
    */
   function composeTurnFeedback(
     run: StoredRun,
     feedback: string,
     previousTurn: number,
     history: Anthropic.MessageParam[] | undefined,
+    lastVerdict: Verdict | undefined = verdictJudging(run, previousTurn),
   ): string {
     const parts = [feedback];
-    const lastVerdict = run.outcome?.verifications.at(-1)?.verdict;
-    if (lastVerdict && run.outcomeTurn === previousTurn) {
-      parts.push(verdictFeedbackSummary(lastVerdict, previousTurn));
-    }
+    if (lastVerdict) parts.push(verdictFeedbackSummary(lastVerdict, previousTurn));
     if (!history) {
       const seed = run.planSummary ?? archivedPlanSummary(run);
+      // 措辞对两条入口都成立：活 run 无正史 = 执行阶段就失败；归档无检查点还可能是旧格式档案
       parts.push(
         seed ??
-          `【对话背景】本对话此前的任务：${run.task}\n上一轮没有留下可续的执行正史（执行阶段即失败），本轮从头开始；工作目录里可能已有部分产物，请据实核对。`,
+          `【对话背景】本对话此前的任务：${run.task}\n上一轮没有留下可续的执行正史，本轮从头开始；工作目录里可能已有部分产物，请据实核对。`,
       );
     }
     return parts.join("\n\n");
@@ -3601,7 +3627,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     run: StoredRun,
     feedback: string,
     parentApprovalGrants: readonly ArchivedApprovalGrant[] = [],
-    turn: { verify: boolean; seed?: string } = { verify: false },
+    /** previousVerdict：父档案里判了被续那一轮的裁决（调用方按 verdictJudging 取） */
+    turn: { verify: boolean; previousVerdict?: Verdict } = { verify: false },
   ): Promise<void> {
     const history = run.history?.length ? run.history : undefined;
     const inheritedBudget = run.resumeBudget;
@@ -3662,22 +3689,23 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       turn: run.conversationTurn,
       text: feedback,
       verify: turn.verify,
-      continues: history ? "history" : turn.seed ? "plan-summary" : "fresh",
+      continues: history ? "history" : run.planSummary ? "plan-summary" : "fresh",
       at: Date.now(),
     });
     broadcastLifecycle("run_updated", run);
 
-    // 无正史的派生：执行者得知道这场对话此前是什么（计划摘要 / 原任务）
-    const executorFeedback = history
-      ? feedback
-      : `${feedback}\n\n${
-          turn.seed ??
-          `【对话背景】本对话此前的任务：${run.task}\n上一轮没有留下可续的执行正史，本轮从头开始；工作目录里可能已有部分产物，请据实核对。`
-        }`;
+    // 与同进程追加同一个装配函数：原话 + 上一轮裁决摘要 + 无正史时的开局背景
+    // （计划摘要 / 原任务）。重启前后执行者必须听到同一套话。
     await executeTurn(run, {
       history,
       feedback,
-      executorFeedback,
+      executorFeedback: composeTurnFeedback(
+        run,
+        feedback,
+        run.conversationTurn - 1,
+        history,
+        turn.previousVerdict,
+      ),
       verify: turn.verify,
       signal: run.abort?.signal ?? new AbortController().signal,
     });
@@ -5168,10 +5196,13 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
               });
             }
             broadcastLifecycle("run_created", child);
+            // 被续那一轮若核查过，裁决摘要随派生一起交给执行者——口径与同进程追加
+            // 相同（verdictJudging），只是来源换成父档案 meta 里落盘的 outcome
+            const previousVerdict = verdictJudging(run, nextTurn - 1);
             void withFallbackAttribution(child, () =>
               startForkedContinuation(child, feedback, run.archivedApprovalGrantAudit ?? [], {
                 verify: turnVerify,
-                ...(planSeed ? { seed: planSeed } : {}),
+                ...(previousVerdict ? { previousVerdict } : {}),
               }),
             );
             return json(res, 200, {

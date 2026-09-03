@@ -4752,12 +4752,22 @@ describe("B2 · 运行历史落盘", () => {
 
     // 缺省沿用父档案的核查设置 → 子 run 这一轮核查了：执行 + 核查两次请求
     expect(resumedModel.requests).toHaveLength(2);
-    const execFlat = JSON.stringify(resumedModel.requests[0]!.messages);
+    const execMessages = resumedModel.requests[0]!.messages;
+    const execFlat = JSON.stringify(execMessages);
     expect(execFlat, "接的是返工段正史").toContain("REWORK-MARK");
     expect(execFlat).not.toContain("首轮交付");
     expect(execFlat).toContain("再补一句");
+    // 重启前后一套话：同进程追加早就把上一轮裁决摘要附给执行者（v2-21），派生此前
+    // 只传原话——执行者不知道刚才被判了什么。摘要从父档案 meta 的 outcome 重建，
+    // 落在本轮那条 user 消息里（与原话同一条），轮号是被续的那一轮
+    const lastUser = JSON.stringify(execMessages.filter((m: any) => m.role === "user").at(-1));
+    expect(lastUser, "派生的执行者没听到上一轮裁决").toContain("上一轮核查裁决（第 1 轮对话）");
+    expect(lastUser).toContain("通过：已修复");
+    expect(lastUser).toContain("再补一句");
     const verifierFlat = JSON.stringify(resumedModel.requests[1]!.messages);
     expect(verifierFlat).toContain("【本轮指令】再补一句");
+    // 核查者仍是全新上下文：裁决摘要是给执行者的，不进核查者的任务书
+    expect(verifierFlat).not.toContain("上一轮核查裁决");
 
     const child = ((await (await fetch(`${base}/api/runs`)).json()) as any[]).find((r) => r.runId === fork.runId);
     expect(child.verify).toBe(true);
@@ -4767,6 +4777,110 @@ describe("B2 · 运行历史落盘", () => {
     const childEvents = (await readSSEAll(await fetch(`${base}/api/runs/${fork.runId}/events`))) as any[];
     expect(childEvents.find((e) => e.event.type === "verification")?.event.judgedTurn).toBe(2);
     expect(childEvents.find((e) => e.event.type === "user_message")?.event.verify).toBe(true);
+  });
+
+  it("隔了一轮未核查再派生：裁决只对它判的那一轮负责，摘要不再附给执行者（与同进程口径一致）", async () => {
+    dir = await mkdtemp(join(tmpdir(), "history-stale-verdict-"));
+    await boot({
+      modelClient: new FakeModelClient([
+        fakeMessage([textBlock("第一轮交付")], "end_turn"),
+        fakeMessage([textBlock(JSON.stringify({ passed: true, issues: [], summary: "第一轮一致" }))], "end_turn"),
+        fakeMessage([textBlock("第二轮（未核查）改了点东西")], "end_turn"),
+      ]),
+      tools: [autoTool("noop")],
+      workdir: process.cwd(),
+      history: dir,
+    });
+    const { runId } = (await (await post("/api/runs", { task: "两轮后归档", verify: true })).json()) as { runId: string };
+    await waitForDone(base, runId);
+    expect((await post(`/api/runs/${runId}/messages`, { text: "第二轮指令", verify: false })).status).toBe(200);
+    await waitForDone(base, runId);
+    await handle!.close();
+    handle = undefined;
+
+    const resumedModel = new FakeModelClient([fakeMessage([textBlock("第三轮做完")], "end_turn")]);
+    await boot({ modelClient: resumedModel, tools: [autoTool("noop")], workdir: process.cwd(), history: dir });
+    const restored = ((await (await fetch(`${base}/api/runs`)).json()) as any[]).find((r) => r.runId === runId);
+    expect(restored.verdictTurn, "列表列仍报最近一次裁决并标明轮号").toBe(1);
+    expect(restored.conversationTurn).toBe(2);
+    const fork = (await (await post(`/api/runs/${runId}/messages`, { text: "第三轮指令" })).json()) as any;
+    expect(fork.continuationMode).toBe("fork");
+    expect(fork.conversationTurn).toBe(3);
+    await waitForDone(base, fork.runId);
+    const messages = resumedModel.requests[0]!.messages;
+    const flat = JSON.stringify(messages);
+    expect(flat).toContain("第二轮（未核查）改了点东西");
+    // 第 2 轮那条 user 消息里带着第 1 轮的裁决摘要——那是正史（当时就附给它了），照常续上
+    expect(flat).toContain("上一轮核查裁决（第 1 轮对话）");
+    // 本轮（第 3 轮）那条 user 消息不再附：第 1 轮的裁决不能拿来给第 3 轮当背景
+    const lastUser = JSON.stringify(messages.filter((m: any) => m.role === "user").at(-1));
+    expect(lastUser).toContain("第三轮指令");
+    expect(lastUser, "隔轮的裁决被当成上一轮的附给了执行者").not.toContain("上一轮核查裁决");
+  });
+
+  /**
+   * plan 归档派生的对话种子：活 run 追加时以计划摘要开局（v2-17b）；重启后派生
+   * 必须是同一份摘要（从 plan / plan_result 事件重建），continues 同样报 plan-summary。
+   */
+  it("计划编排的归档派生：新一轮按单执行者跑、开局带同一份计划摘要、continues=plan-summary", async () => {
+    dir = await mkdtemp(join(tmpdir(), "history-plan-fork-"));
+    const planJson = JSON.stringify({
+      subtasks: [
+        { id: "s1", title: "第一步", description: "做 A", acceptance: ["A 完成"], dependsOn: [] },
+        { id: "s2", title: "第二步", description: "做 B", acceptance: ["B 完成"], dependsOn: ["s1"] },
+      ],
+    });
+    const pass = (summary: string) =>
+      fakeMessage([textBlock(JSON.stringify({ passed: true, issues: [], summary }))], "end_turn");
+    await boot({
+      modelClient: new FakeModelClient([
+        fakeMessage([textBlock(["```json", planJson, "```"].join("\n"))], "end_turn"),
+        fakeMessage([textBlock("s1 完成：写了 a.txt")], "end_turn"), pass("A 一致"),
+        fakeMessage([textBlock("s2 完成：写了 b.txt")], "end_turn"), pass("B 一致"),
+      ]),
+      tools: [autoTool("noop")],
+      workdir: process.cwd(),
+      history: dir,
+    });
+    const { runId } = (await (await post("/api/runs", { task: "两步任务", mode: "plan", concurrency: 1 })).json()) as { runId: string };
+    await waitForDone(base, runId);
+    await handle!.close();
+    handle = undefined;
+
+    const resumedModel = new FakeModelClient([fakeMessage([textBlock("第二轮：合并了 a 与 b")], "end_turn")]);
+    await boot({ modelClient: resumedModel, tools: [autoTool("noop")], workdir: process.cwd(), history: dir });
+    const restored = ((await (await fetch(`${base}/api/runs`)).json()) as any[]).find((r) => r.runId === runId);
+    expect(restored.mode).toBe("plan");
+    expect(restored.canContinue).toBe(true);
+    expect(restored.continuationMode).toBe("fork");
+
+    const follow = await post(`/api/runs/${runId}/messages`, { text: "把 a 和 b 合并", verify: false });
+    expect(follow.status).toBe(200);
+    const fork = (await follow.json()) as any;
+    expect(fork.continuationMode).toBe("fork");
+    await waitForDone(base, fork.runId);
+
+    // 单执行者、全新一轮：一条 user，含原话 + 与活 run 追加同一份计划摘要（v2-17b 的断言原样成立）
+    expect(resumedModel.requests).toHaveLength(1);
+    const req = resumedModel.requests[0]!;
+    expect(req.messages).toHaveLength(1);
+    const flat = JSON.stringify(req.messages[0]);
+    expect(flat).toContain("把 a 和 b 合并");
+    expect(flat).toContain("本对话此前是一次计划编排");
+    expect(flat).toContain("s1 第一步");
+    expect(flat).toContain("s2 第二步");
+    expect(flat).toContain("核查通过");
+    expect(flat).toContain("A 一致");
+    expect(flat).toContain("全部子任务执行并通过核查");
+
+    const childEvents = (await readSSEAll(await fetch(`${base}/api/runs/${fork.runId}/events`))) as any[];
+    expect(childEvents.find((e) => e.event.type === "run_forked")!.event.checkpoint).toBeNull();
+    const um = childEvents.find((e) => e.event.type === "user_message")!.event;
+    expect(um.continues).toBe("plan-summary");
+    expect(um.turn).toBe(2);
+    // 不是重跑 DAG：子 run 没有 planner 段，来源是 main
+    expect(childEvents.some((e) => e.source === "planner")).toBe(false);
+    expect(childEvents.some((e) => e.source === "main" && e.event.type === "done")).toBe(true);
   });
 
   it("重启不能绕过当前宿主更严格的总预算：列表提前阻断，模型零调用", async () => {
