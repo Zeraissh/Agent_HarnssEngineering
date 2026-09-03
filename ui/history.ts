@@ -129,6 +129,11 @@ export interface ArchivedMeta {
   mainStopReason: string | null;
   /** ask_user 是否开启；派生 run 只继承开关，不继承已用配额或审批放行 */
   askUser?: boolean;
+  /**
+   * 逐 run 上下文预算（MEM-01 窗口 / 预算分离，请求体 contextTokenLimit）；旧档案 / 未覆盖缺省。
+   * 派生 run 沿用它，但会按**当前**宿主的窗口重新夹紧（窗口是事实，可能已经学到了新值）。
+   */
+  contextTokenLimit?: number | null;
   /** 归档可恢复检查点；旧档案缺省 = 只读 */
   checkpoint?: ArchivedCheckpoint | null;
   /** 派生谱系；父档案始终不可变 */

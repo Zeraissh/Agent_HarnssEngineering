@@ -1183,9 +1183,39 @@ describe("常驻上下文水位", () => {
     expect(g.hidden).toBe(false);
     expect(g.textContent).toContain("48%");
     const label = g.getAttribute("aria-label")!;
-    // 光念一个 48% 没有信息量——要说清分子分母是什么
+    // 光念一个 48% 没有信息量——要说清分子分母是什么。分母叫"预算"：它是压缩策略，不是模型窗口
+    //（MEM-01 窗口 / 预算分离）；窗口另报，没有就明说"窗口未知"而不是沉默
     expect(label).toContain("最近一轮输入");
-    expect(label).toContain("上限");
+    expect(label).toContain("预算");
+    expect(label).toContain("窗口未知");
+  });
+
+  /**
+   * MEM-01 窗口 / 预算分离：宿主快照带 context 时，页头表要把"预算的 48%"与"窗口的 5%"都说出来——
+   * 150k 预算在 1M 窗口上压了三个月，就是因为界面上只有一个百分比。越过水位要直说"下一轮将压缩"。
+   */
+  it("带 context 快照：页头表报窗口占比与来源；越过水位写「下一轮将压缩」", () => {
+    const H3 = {
+      ...FAKE_HARNESS,
+      guardrails: { ...FAKE_HARNESS.guardrails, contextTokenLimit: 1000 },
+      context: { window: 10_000, windowSource: "learned", budget: 1000, budgetSource: "default", maxBudget: 9000, maxTokens: 500, clamped: false },
+    };
+    renderRunDetail(stateWithUsage(480), { activeTab: "loop", harness: H3 });
+    openDrawer();
+    const g = document.querySelector(".ctx-gauge") as HTMLElement;
+    expect(g.textContent).toContain("48%");
+    expect(g.textContent).toContain("窗口 5%");
+    expect(g.textContent).not.toContain("下一轮将压缩");
+    const label = g.getAttribute("aria-label") ?? "";
+    expect(label).toContain("窗口 10.0k（learned）占 5%");
+
+    document.body.innerHTML = loadSkeleton();
+    renderRunDetail(stateWithUsage(900), { activeTab: "loop", harness: H3 });
+    openDrawer();
+    const hot = document.querySelector(".ctx-gauge") as HTMLElement;
+    expect(hot.textContent).toContain("下一轮将压缩");
+    expect(hot.classList.contains("ctx-gauge--warn")).toBe(true);
+    expect(hot.getAttribute("aria-label")).toContain("下一轮将压缩");
   });
 
   it("越过压缩水位转 warn 语域", () => {
@@ -1249,5 +1279,125 @@ describe("常驻上下文水位", () => {
     const high = document.querySelector(".ctx-gauge")!;
     expect(high.querySelector(".ph-gauge")).toBeTruthy();
     expect(high.textContent).toContain("95%");
+  });
+});
+
+/**
+ * MEM-01 渲染面：三段上下文水位条（已用 / 预算 / 窗口）与逐 run 预算控件。
+ *
+ * 派生层的锁在 ui-faces.test.ts；这一组管"画出来了没有、念出来对不对"——
+ * host-lags 那条纪律要求每个新字段三处有锁（投影 / 派生 / 渲染），这里是第三处。
+ */
+describe("MEM-01 三段上下文水位条与预算控件（渲染面）", () => {
+  function ctxState(input: number) {
+    let s = createInitialState("run-strip", "任务", false);
+    s = reduceEvent(s, {
+      seq: 0, source: "main",
+      event: { type: "usage", turn: 1, usage: { input_tokens: input, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } },
+    });
+    return s;
+  }
+  const harnessWith = (context: unknown, budget = 1000) => ({
+    ...FAKE_HARNESS,
+    guardrails: { ...FAKE_HARNESS.guardrails, contextTokenLimit: budget },
+    ...(context ? { context } : {}),
+  });
+  const CTX = { window: 10_000, windowSource: "registry", budget: 1000, budgetSource: "default", requestedBudget: 1000, maxBudget: 9000, maxTokens: 500, clamped: false, warning: null };
+  const strip = () => document.querySelector(".ctx-strip") as HTMLElement;
+
+  it("窗口已知：三段各自成段，预算段内有压缩刻度，无障碍名说全三个数", () => {
+    renderRunDetail(ctxState(480), { activeTab: "context", harness: harnessWith(CTX) });
+    openDrawer();
+    const s = strip();
+    expect(s).toBeTruthy();
+    expect(s.getAttribute("role")).toBe("img");
+    const label = s.getAttribute("aria-label")!;
+    expect(label).toContain("已用");
+    expect(label).toContain("预算 1.0k（默认）");
+    expect(label).toContain("窗口 10.0k（登记表）");
+    // 窗口段存在且铺满轨道，预算段只占 10%——"我们在窗口的 10% 处压"这件事第一次可见
+    expect(s.querySelector(".ctx-strip-seg--window")).toBeTruthy();
+    expect((s.querySelector(".ctx-strip-seg--budget") as HTMLElement).style.width).toBe("10%");
+    expect((s.querySelector(".ctx-strip-seg--used") as HTMLElement).style.width).toBe("4.8%");
+    expect((s.querySelector(".ctx-strip-threshold") as HTMLElement).style.left).toBe("8%");
+    expect(document.querySelectorAll(".ctx-strip-legend-item")).toHaveLength(3);
+  });
+
+  /** 窗口未知不画窗口段：画一段"未知"等于编一个数（同 unverified 的道理） */
+  it("窗口未知：没有窗口段，图例与名称都明说「窗口未知」", () => {
+    renderRunDetail(ctxState(480), { activeTab: "context", harness: harnessWith(null) });
+    openDrawer();
+    const s = strip();
+    expect(s.classList.contains("ctx-strip--no-window")).toBe(true);
+    expect(s.querySelector(".ctx-strip-seg--window")).toBeNull();
+    expect(s.getAttribute("aria-label")).toContain("窗口未知");
+    // 轨道总长退回预算：已用 48% 就是 48%
+    expect((s.querySelector(".ctx-strip-seg--used") as HTMLElement).style.width).toBe("48%");
+    expect(document.querySelector(".meter-note")!.textContent).toContain("窗口未知");
+  });
+
+  /** 档位边界在渲染面同样是 ≥：79% 不许说，80% 必须说 */
+  it("档位边界：79% 没有「下一轮将压缩」，80% 有且转 warn 语域", () => {
+    renderRunDetail(ctxState(790), { activeTab: "context", harness: harnessWith(CTX) });
+    openDrawer();
+    expect(document.querySelector(".meter-hint--warn")).toBeNull();
+    expect(strip().classList.contains("ctx-strip--compact-next")).toBe(false);
+
+    document.body.innerHTML = loadSkeleton();
+    renderRunDetail(ctxState(800), { activeTab: "context", harness: harnessWith(CTX) });
+    openDrawer();
+    const hint = document.querySelector(".meter-hint--warn") as HTMLElement;
+    expect(hint).toBeTruthy();
+    expect(hint.textContent).toContain("下一轮将压缩");
+    expect(hint.getAttribute("role")).toBe("status");
+    expect(strip().classList.contains("ctx-strip--compact-next")).toBe(true);
+  });
+
+  /** 夹紧要在界面上说出来（含原值），否则"我明明配了 150k"与实际行为长期不一致 */
+  it("被夹紧时把告警原文渲染出来", () => {
+    renderRunDetail(ctxState(100), {
+      activeTab: "context",
+      harness: harnessWith({ ...CTX, budget: 8000, requestedBudget: 150_000, clamped: true, warning: "上下文预算 150k（default）超过窗口允许的上限，已夹到 8k" }, 8000),
+    });
+    openDrawer();
+    const clamped = document.querySelector(".meter-hint--clamped") as HTMLElement;
+    expect(clamped.textContent).toContain("已夹到 8k");
+    expect(strip().getAttribute("aria-label")).toContain("由 150.0k 夹紧");
+  });
+
+  it("Context 面（三段条 + 档位提示 + 夹紧说明）零 violations", async () => {
+    renderRunDetail(ctxState(900), {
+      activeTab: "context",
+      harness: harnessWith({ ...CTX, budget: 1000, requestedBudget: 150_000, clamped: true, warning: "已夹到 1k" }),
+    });
+    openDrawer();
+    const violations = await runAxe();
+    expect(violations, JSON.stringify(violations, null, 2)).toEqual([]);
+  });
+
+  /**
+   * 提交表单的逐 run 预算控件：可及名称由 <label for> 给，区间与忠告由 aria-describedby 关联
+   *（只改文本不关联的话，屏幕阅读器用户听不到"可用 32k..963k"这条唯一的区间说明）。
+   */
+  it("预算控件有可及名称与关联说明，忠告是 role=status", () => {
+    const input = document.getElementById("context-budget-input") as HTMLInputElement;
+    expect(input).toBeTruthy();
+    expect(input.type).toBe("number");
+    const label = document.querySelector('label[for="context-budget-input"]') as HTMLElement;
+    expect(label.textContent).toContain("上下文预算");
+    const described = (input.getAttribute("aria-describedby") ?? "").split(/\s+/).filter(Boolean);
+    expect(described.length).toBeGreaterThan(0);
+    for (const id of described) expect(document.getElementById(id), `aria-describedby 指向的 ${id} 必须存在`).toBeTruthy();
+    expect(document.getElementById("context-budget-advisory")!.getAttribute("role")).toBe("status");
+    // 忠告默认不占位（没到 200k 就不该有一行常驻文案）
+    expect((document.getElementById("context-budget-advisory") as HTMLElement).hidden).toBe(true);
+  });
+
+  it("预算控件所在的装配面板零 violations，且不多出待复核项", async () => {
+    const violations = await runAxe();
+    expect(violations, JSON.stringify(violations, null, 2)).toEqual([]);
+    // incomplete 桶不是通过：新增一条就要人来看（这个机制本身也别被新控件悄悄撑大）
+    const extra = (await incompleteIds()).filter((id) => !KNOWN_INCOMPLETE.has(id));
+    expect(extra, `新出现的 incomplete：${extra.join(", ")}`).toEqual([]);
   });
 });

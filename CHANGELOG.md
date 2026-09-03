@@ -31,6 +31,20 @@
   `is_error` 结果取错误行）与行数；tier 2 折叠已置换的块时复用该摘录，不再写「(elided)」。真机复核里模型为
   找回被置换的事实补读了 72 次文件（8 轮），此后"这次读到了什么"随正史保留。摘录里的 `[compact_ledger]`
   字面量会被打断，避免折叠块被当成账本改写。
+- **上下文窗口（事实）与压缩预算（策略）分离**：`contextTokenLimit` 一个数此前既当"模型能装多少"
+  又当"我们在多少处压"——真机实测 deepseek-v4-flash 窗口 1,048,576，默认 150k 预算在它 11% 处就压；
+  而 128k 的模型永远到不了主动压缩（150k > 窗口），只能靠反应式压缩白吃一次 400。现在：
+  **窗口**四级来源 `AGENT_CONTEXT_WINDOW` > learned（撞 400 时从报文里学到，按 `provider|model|origin`
+  记进 `.agent-capabilities.json`，TTL 30 天，只存身份键与数字）> registry（`src/model-windows.ts`，
+  每条带出处）> 未知（**不猜**）；**预算**三级覆盖 Web 逐 run > env > 包 > 默认 150k，再夹进
+  `窗口 − maxTokens − 边际`（`max(4k, 2%)`；端点按 messages + max_tokens 之和计超长），夹紧带告警且原值可见。
+  预算**默认不随窗口自动抬高**——每轮成本与时延随上下文线性增长，抬预算是委托方的决定。
+  CLI 启动行报「预算 / 窗口（来源）」，压缩行带「学到窗口 …（下次运行生效）」；Web 提交表单新增
+  「上下文预算」控件（区间 `[32k, 上限]`，越界 **400 并报出可用区间**而非静默夹紧；>200k 给成本忠告，
+  不阻断），水位条改三段（已用 / 预算 / 窗口，窗口未知就明说而不画 0），到预算 80% 直说「下一轮将压缩」，
+  `run_config` / `/api/harness` 新增 `context` 投影，逐 run 预算随档案与派生 run 走；
+  台账行新增 `context { window, windowSource, budget, budgetSource }` + `npm run ledger` 来源直方图。
+  两条 env 的非法值在 CLI（退出码 1）与 Web（建宿主即抛）都启动即失败。
 - **台账记压缩次数**：台账行新增 `compaction { proactive, reactive, droppedBlocks, collapsedTurns }`
   （CLI 与 Web 同提交；老行缺字段按未知处理），`npm run ledger` 新增「上下文压缩」一行摘要
   （发生过压缩 / 反应式的运行数与总量）。`.env.example` 补 `AGENT_CONTEXT_LIMIT` 说明：默认 150k 保守，

@@ -10,7 +10,7 @@ import { join, extname, dirname, delimiter, resolve, basename, relative, sep } f
 import { fileURLToPath } from "node:url";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { AgentLoop, DEFAULT_MAX_TURNS } from "../src/loop.js";
+import { AgentLoop, DEFAULT_MAX_TOKENS, DEFAULT_MAX_TURNS } from "../src/loop.js";
 import {
   configuredExecutionStatus,
   createExecutionBroker,
@@ -39,7 +39,22 @@ import {
   type FallbackInfo,
   type FallbackRouting,
 } from "../src/model-fallback.js";
-import { probeEndpointCapabilities, type EndpointCapabilities } from "../src/model-capability.js";
+import {
+  capabilityStorePath,
+  configureCapabilityStore,
+  learnContextWindow,
+  probeEndpointCapabilities,
+  type EndpointCapabilities,
+  type EndpointIdentity,
+} from "../src/model-capability.js";
+import {
+  planContextBudget,
+  readContextLimitEnv,
+  readContextWindowEnv,
+  resolveContextWindow,
+  validateRunContextBudget,
+  type ContextPlan,
+} from "../src/context-window.js";
 import { getPack, selectPackTools, PACKS, RULE_PRECEDENCE_DISCIPLINE, type DomainPack } from "../src/presets.js";
 import { connectMcpServers, loadMcpConfig, type McpRuntime } from "../src/mcp.js";
 import { createWorkdirScopedMemoryTools, MEMORY_TOOL_NAMES } from "../src/memory.js";
@@ -344,6 +359,13 @@ interface StoredRun {
   packName?: string;
   effort?: Effort;
   rubric?: string;
+  /**
+   * 逐 run 上下文预算（MEM-01 窗口 / 预算分离；请求体 `contextTokenLimit`）。建 run 时已按
+   * [32k, 窗口 − maxTokens − 边际] 校验过；缺省 = env > 包 > 默认 150k。续跑 / 派生沿用。
+   */
+  contextTokenLimit?: number;
+  /** 最近一次 buildConfig 解析出的窗口 / 预算计划（台账记的是它，不是收尾时重算的） */
+  contextPlan?: ContextPlan;
   /** V-27：编排模式。plan = 走 runPlanned（planner 拆解 + 依赖调度 + 并行） */
   mode?: "single" | "plan";
   concurrency?: number | "auto";
@@ -610,6 +632,11 @@ export interface UiServerOptions {
   history?: false | string;
   /** 历史保留数（判据③），缺省 env AGENT_RUN_HISTORY_KEEP（仅真实宿主读）> DEFAULT_HISTORY_KEEP */
   historyKeep?: number;
+  /**
+   * 端点能力缓存（撞 400 学到的上下文窗口）落点。缺省逻辑同 `ledger`：注入了 modelClient
+   * 就只在进程内记（`false` 同义）；字符串 = 指定文件；真实宿主缺省 <cwd>/.agent-capabilities.json。
+   */
+  capabilityCache?: false | string;
   /** exact-input grant 的宿主级硬 TTL；工具还可声明更短上限。 */
   approvalGrantTtlMs?: number;
   /** exact-input grant 可自动复用的宿主级次数上限。 */
@@ -1443,22 +1470,27 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   const fallbackSink = new AsyncLocalStorage<(info: FallbackInfo) => void>();
   const onFallback = (info: FallbackInfo) => fallbackSink.getStore()?.(info);
   const executorModelName = process.env.AGENT_MODEL ?? "claude-opus-4-8";
+  /**
+   * 执行者端点身份（provider|model|origin，不含 key）：降级链熔断、探针粘性、学到的上下文窗口
+   * 都按它做键。三处此前各拼一份，这里收成一个。
+   */
+  const executorIdentity: EndpointIdentity = {
+    provider: resolved.provider,
+    model: executorModelName,
+    ...(process.env.ANTHROPIC_BASE_URL || process.env.OPENAI_BASE_URL
+      ? {
+          baseURL:
+            resolved.provider === "openai"
+              ? process.env.OPENAI_BASE_URL
+              : process.env.ANTHROPIC_BASE_URL,
+        }
+      : {}),
+  };
   const fallbackClient = createFallbackClientIfConfigured(
     {
       name: executorModelName,
       client: options.modelClient ?? resolved.client,
-      identity: {
-        provider: resolved.provider,
-        model: executorModelName,
-        ...(process.env.ANTHROPIC_BASE_URL || process.env.OPENAI_BASE_URL
-          ? {
-              baseURL:
-                resolved.provider === "openai"
-                  ? process.env.OPENAI_BASE_URL
-                  : process.env.ANTHROPIC_BASE_URL,
-            }
-          : {}),
-      },
+      identity: executorIdentity,
     },
     fallbackEnv,
     onFallback,
@@ -1504,6 +1536,20 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   // 保留数同一条纪律：注入宿主不读 AGENT_RUN_HISTORY_KEEP（残留的 "1" 会让测试里第二个
   // 档案刚落盘就被剪掉）；历史根本就只在真实宿主读 AGENT_RUN_HISTORY_DIR（上一行）
   const historyKeep = options.historyKeep ?? (realHost ? historyKeepCount() : DEFAULT_HISTORY_KEEP);
+  /**
+   * 端点能力缓存（学到的上下文窗口）落点。同一条仪器纪律：注入 modelClient 的宿主缺省只在
+   * 进程内记（假模型撞出来的"窗口"不该写进真缓存）；真实宿主落 <cwd>/.agent-capabilities.json
+   * （AGENT_CAPABILITY_CACHE 可改）。跨 run 同进程的学习不依赖落盘——内存表就够。
+   */
+  const capabilityCacheFile: string | null =
+    options.capabilityCache === false
+      ? null
+      : typeof options.capabilityCache === "string"
+        ? resolve(options.capabilityCache)
+        : options.modelClient
+          ? null
+          : capabilityStorePath();
+  configureCapabilityStore({ file: capabilityCacheFile });
   const maxStoredRuns = positiveInteger(options.maxStoredRuns, "maxStoredRuns")
     ?? positiveIntegerEnv("AGENT_UI_MAX_STORED_RUNS")
     ?? (realHost ? Math.max(100, historyKeep) : Number.MAX_SAFE_INTEGER);
@@ -1844,6 +1890,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       planDecision: run.planDecision ?? null,
       mainStopReason: run.mainStopReason ?? null,
       askUser: Boolean(run.askUser),
+      contextTokenLimit: run.contextTokenLimit ?? null,
       checkpoint: run.checkpoint ?? null,
       continuedFrom: run.continuedFrom ?? null,
       rootRunId: run.rootRunId ?? null,
@@ -2007,6 +2054,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           ...(a.meta.planGate ? { planGate: true } : {}),
           ...(a.meta.planDecision ? { planDecision: a.meta.planDecision } : {}),
           ...(a.meta.askUser ? { askUser: true } : {}),
+          // 逐 run 预算随档案回来（派生时按当前窗口重新夹紧；坏值忽略 = 回落 env / 包 / 默认）
+          ...(typeof a.meta.contextTokenLimit === "number" && Number.isInteger(a.meta.contextTokenLimit) && a.meta.contextTokenLimit > 0
+            ? { contextTokenLimit: a.meta.contextTokenLimit }
+            : {}),
           ...(checkpoint ? { checkpoint } : {}),
           ...(archivedApprovalGrantAudit.length ? { archivedApprovalGrantAudit } : {}),
           ...(typeof a.meta.continuedFrom === "string" && a.meta.continuedFrom
@@ -2315,10 +2366,6 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     .map((s) => s.trim())
     .filter(Boolean);
 
-  // 护栏优先级：显式 env > 领域包默认 > 全局默认（照抄 cli.ts 口径）
-  const contextTokenLimit = process.env.AGENT_CONTEXT_LIMIT
-    ? Number(process.env.AGENT_CONTEXT_LIMIT)
-    : pack?.guardrails?.contextTokenLimit;
   const compactSummaryOn = (() => {
     const v = process.env.AGENT_COMPACT_SUMMARY?.trim().toLowerCase();
     return v === "1" || v === "true" || v === "yes" || v === "on";
@@ -2326,6 +2373,43 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   const maxTokens = process.env.AGENT_MAX_TOKENS
     ? Number(process.env.AGENT_MAX_TOKENS)
     : pack?.guardrails?.maxTokens;
+  /**
+   * 上下文窗口（事实）与预算（策略）分开解析（MEM-01，口径同 cli.ts）。
+   * 窗口 env AGENT_CONTEXT_WINDOW > learned（撞过的 400）> registry > unknown——每次装配都重新解析，
+   * 这样同进程里上一个 run 学到的窗口下一个 run 就能用上；预算 run（请求体）> env > 包 > 默认 150k，
+   * 再夹进 窗口 − maxTokens − 边际。env 非法值在这里抛（口径同 AGENT_EFFORT：库里抛错，CLI 才 exit 1）。
+   */
+  const envContextLimit = readContextLimitEnv();
+  // 两条 env 都在**启动时**先读一遍：窗口那条只在 contextPlanFor 里用，不在这里验的话
+  // 非法值要等到第一次 /api/harness 才炸成 500——护栏 env 的非法值必须启动即失败（fail-closed）
+  readContextWindowEnv();
+  const contextPlanFor = (runPack?: DomainPack, runLimit?: number, tokens?: number): ContextPlan => {
+    const windowInfo = resolveContextWindow(executorIdentity);
+    return planContextBudget({
+      window: windowInfo.window,
+      windowSource: windowInfo.windowSource,
+      maxTokens: tokens ?? maxTokens ?? DEFAULT_MAX_TOKENS,
+      ...(runLimit !== undefined ? { runLimit } : {}),
+      ...(envContextLimit !== undefined ? { envLimit: envContextLimit } : {}),
+      ...(runPack?.guardrails?.contextTokenLimit !== undefined
+        ? { packLimit: runPack.guardrails.contextTokenLimit }
+        : {}),
+    });
+  };
+  /** 进程级快照用（/api/harness）：默认包、无逐 run 覆盖 */
+  const processContextPlan = (): ContextPlan => contextPlanFor(pack);
+  /** run_config / harness 的投影——七个字段一次给全，界面不许自己推算其中任何一个 */
+  const contextView = (plan: ContextPlan) => ({
+    window: plan.window,
+    windowSource: plan.windowSource,
+    budget: plan.budget,
+    budgetSource: plan.budgetSource,
+    requestedBudget: plan.requestedBudget,
+    maxBudget: plan.maxBudget,
+    maxTokens: plan.maxTokens,
+    clamped: plan.clamped,
+    warning: plan.warning,
+  });
   const maxTurns = pack?.guardrails?.maxTurns;
   const integerEnv = (name: string, min: number): number | undefined => {
     const raw = process.env[name];
@@ -2479,6 +2563,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     )
       ? (run.executionBroker ??= executionBrokerFactory(run.id, runWorkdir))
       : undefined;
+    // 窗口 / 预算：逐 run 解析（包可能不同、请求体可能带预算、上一个 run 可能刚学到窗口）
+    const contextPlan = contextPlanFor(runPack, run?.contextTokenLimit);
+    if (run) run.contextPlan = contextPlan;
     const cfg: AgentConfig = {
       systemPrompt,
       tools,
@@ -2488,7 +2575,15 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       // 此前这里只设四个字段，pack 的护栏、只读根、effort 全部丢失
       ...(runEffort ? { effort: runEffort } : {}),
       ...(readRoots.length ? { readRoots } : {}),
-      ...(contextTokenLimit !== undefined ? { contextTokenLimit } : {}),
+      contextTokenLimit: contextPlan.budget,
+      /**
+       * 窗口学习钩子：loop 撞 400 学到的窗口记到执行者端点名下（内存表 + 真实宿主落盘）。
+       * 同进程的下一个 run 在 contextPlanFor 里立刻拿到 learned 来源；编排层会给独立
+       * verifier / planner 模型剥掉这个钩子（它们的 400 说的是自己的窗口）。
+       */
+      onContextWindowLearned: (windowTokens) => {
+        learnContextWindow(executorIdentity, windowTokens);
+      },
       ...(maxTokens !== undefined ? { maxTokens } : {}),
       ...((run?.packName ? runPack?.guardrails?.maxTurns : maxTurns) !== undefined
         ? { maxTurns: (run?.packName ? runPack?.guardrails?.maxTurns : maxTurns) as number }
@@ -3336,6 +3431,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
      * 这一行就是 §2.1 与 9.9 "等证据"能不能等到的全部区别：在此之前
      * `recovery` 只活在内存 Map 里，进程一重启样本归零。
      */
+    // 台账要记的窗口 / 预算计划。算在门外是刻意的：`if (ledgerFile)` 与 `appendRunLedger` 之间
+    // 不许插语句——test/ledger.test.ts 用文本邻接锁住"写入被这个开关罩住"，插一行就等于松开那把锁。
+    // 纯函数、无 I/O，记账关掉时白算一次可以忽略。
+    const ledgerContextPlan =
+      run.contextPlan ?? contextPlanFor(run.packName ? getPack(run.packName) : pack, run.contextTokenLimit);
     if (ledgerFile) {
       void appendRunLedger(
         buildLedgerEntry({
@@ -3376,6 +3476,14 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             : null,
           recovery: run.recoveryTally ?? emptyRecoveryTally(),
           compaction: run.compactionTally ?? emptyCompactionTally(),
+          // 窗口 / 预算各带来源（口径同 CLI）：记**这次运行实际按哪份计划跑的**（buildConfig 留下的），
+          // 不是收尾时重算的——本次才学到的窗口属于下一次运行
+          context: {
+            window: ledgerContextPlan.window,
+            windowSource: ledgerContextPlan.windowSource,
+            budget: ledgerContextPlan.budget,
+            budgetSource: ledgerContextPlan.budgetSource,
+          },
         }),
         ledgerFile,
       );
@@ -4344,11 +4452,18 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       guardrails: {
         maxTurns: cfg.maxTurns ?? null,
         maxTokens: cfg.maxTokens ?? null,
+        // 生效预算（可能已被夹紧）——与 context.budget 同一个数；窗口那一侧看 context
         contextTokenLimit: cfg.contextTokenLimit ?? null,
         maxTotalTurns: cfg.maxTotalTurns ?? null,
         maxTokensBudget: cfg.maxTokensBudget ?? null,
         toolResultMaxChars: cfg.toolResultMaxChars ?? DEFAULT_TOOL_RESULT_MAX_CHARS,
       },
+      /**
+       * 上下文窗口（事实）与预算（策略）分开报（MEM-01）：窗口带来源（env / learned / registry /
+       * unknown），预算带来源（run / env / pack / default）与夹紧前原值、上限、maxTokens。
+       * 界面的三段水位条（已用 / 预算 / 窗口）全部从这里取数，不自己推算。
+       */
+      context: contextView(contextPlanFor(runPack, run.contextTokenLimit, cfg.maxTokens)),
       tools: cfg.tools.map((tool) => ({
         name: tool.name,
         permission: tool.permission,
@@ -4438,11 +4553,18 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       guardrails: {
         maxTurns: maxTurns ?? null,
         maxTokens: maxTokens ?? null,
-        contextTokenLimit: contextTokenLimit ?? null,
+        // 进程级默认包的生效预算（已夹紧）；逐 run 的真实值走 run_config
+        contextTokenLimit: processContextPlan().budget,
         maxTotalTurns: maxTotalTurns ?? null,
         maxTokensBudget: maxTokensBudget ?? null,
         toolResultMaxChars: toolResultMaxChars ?? DEFAULT_TOOL_RESULT_MAX_CHARS,
       },
+      /**
+       * 窗口 / 预算（MEM-01）：进程级默认包的解析结果，**每次快照时重算**——上一个 run 撞 400
+       * 学到窗口后，下一次刷新页面就该看到 learned。提交表单的逐 run 预算控件用 maxBudget
+       * 做上限、用 window 判断"窗口未知"。
+       */
+      context: contextView(processContextPlan()),
       hostLimits: {
         requestBodyMaxBytes,
         maxActiveRuns,
@@ -5305,6 +5427,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
               ...(run.rubric ? { rubric: run.rubric } : {}),
               ...(run.workdir ? { workdir: resolve(run.workdir) } : { workdir }),
               ...(run.askUser ? { askUser: true } : {}),
+              // 逐 run 预算随对话走；buildConfig 会按当前窗口重新夹紧（窗口可能在父 run 之后学到）
+              ...(run.contextTokenLimit !== undefined ? { contextTokenLimit: run.contextTokenLimit } : {}),
               ...(childResources.length ? { heldResources: childResources } : {}),
             };
             if (historyRoot) {
@@ -5631,7 +5755,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           task?: string; verify?: boolean; pack?: string; effort?: string; rubric?: string;
           mode?: string; concurrency?: number | string;
           workdir?: string; useVerifierModel?: boolean; usePlannerModel?: boolean;
-          planGate?: boolean; askUser?: boolean;
+          planGate?: boolean; askUser?: boolean; contextTokenLimit?: number | string;
         };
         try {
           parsed = JSON.parse(body);
@@ -5646,6 +5770,25 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         // AGENT_EFFORT 的处理）
         if (parsed.pack !== undefined && parsed.pack !== "" && !getPack(parsed.pack)) {
           return badRequest(res, `未知领域包 "${parsed.pack}"。可选：${Object.keys(PACKS).join(" | ")}`);
+        }
+        /**
+         * 逐 run 上下文预算（MEM-01 窗口 / 预算分离）：区间 [32k, 窗口 − maxTokens − 边际]
+         * （窗口未知时上限取硬顶）。越界 **400 并报出区间**，不静默夹紧——夹紧是对 env / 包这类
+         * 操作员配置的处置；请求体是这一次的显式意图，填了 900k 却被悄悄改成 60k 就是界面说谎。
+         * 校验用的窗口 / maxTokens 按本 run 的包算（包可改 maxTokens），与 buildConfig 同一口径。
+         */
+        let runContextTokenLimit: number | undefined;
+        if (parsed.contextTokenLimit !== undefined && parsed.contextTokenLimit !== "" && parsed.contextTokenLimit !== null) {
+          const admissionPackForContext = parsed.pack ? getPack(parsed.pack) : pack;
+          const plan = contextPlanFor(admissionPackForContext);
+          const checked = validateRunContextBudget(parsed.contextTokenLimit, plan.maxBudget);
+          if (!checked.ok) {
+            return json(res, 400, {
+              error: checked.error,
+              contextTokenLimit: { min: checked.min, max: checked.max, window: plan.window, windowSource: plan.windowSource, maxTokens: plan.maxTokens },
+            });
+          }
+          runContextTokenLimit = checked.value;
         }
         if (
           parsed.effort !== undefined && parsed.effort !== "" &&
@@ -5734,6 +5877,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           ...(parsed.usePlannerModel === false ? { usePlannerModel: false } : {}),
           ...(parsed.planGate === true ? { planGate: true } : {}),
           ...(askUser ? { askUser: true } : {}),
+          ...(runContextTokenLimit !== undefined ? { contextTokenLimit: runContextTokenLimit } : {}),
           ...(packResources.length ? { heldResources: packResources } : {}),
         };
         // B2：建档要在第一条事件之前——writer 的写入链从 mkdir 开始保序
@@ -5748,6 +5892,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
               { name: readFileTool.name, inputSchema: readFileTool.inputSchema },
               { name: writeFileTool.name, inputSchema: writeFileTool.inputSchema },
             ];
+            // 窗口 / 预算随 trace 根 span 走：事后回放"这次在窗口的几分之几处压缩"不必再翻台账
+            const tracePlan = contextPlanFor(run.packName ? getPack(run.packName) : pack, run.contextTokenLimit);
             const root = startSpan({
               kind: "run",
               name: "run",
@@ -5761,6 +5907,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
                 toolSchemaHash: hashToolSchemas(toolsForHash),
                 mode: run.mode ?? "single",
                 verify,
+                contextWindow: tracePlan.window,
+                contextWindowSource: tracePlan.windowSource,
+                contextBudget: tracePlan.budget,
+                contextBudgetSource: tracePlan.budgetSource,
               },
             });
             run.traceRunSpanId = root.spanId;

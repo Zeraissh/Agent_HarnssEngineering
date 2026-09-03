@@ -173,6 +173,38 @@ $env:AGENT_FALLBACK_ROUTING          = "prefer_healthy"       # 可选；缺省 
 换端点在两个宿主上都留痕：CLI `⇄ 端点降级`，Web 时间线 + 装配条；台账记
 `fallbackChain` / `fallbacks`（未配置时 `fallbackChain` 为 `null`）。
 
+### 上下文窗口（事实）与压缩预算（策略）
+
+这是两件事，此前是一个数：
+
+- **窗口** = 端点在多大处拒收。四级来源 `AGENT_CONTEXT_WINDOW` > **learned**（撞过一次
+  context-too-long 400 后从报文里学到，按 `provider|model|origin` 记进
+  `.agent-capabilities.json`，TTL 30 天）> **registry**（`src/model-windows.ts`，
+  每条都带出处）> **未知**。不认识的模型不猜数——猜大了上限虚高照样 400，猜小了白白压缩。
+- **预算** = 我们在多大处压缩（`AGENT_CONTEXT_LIMIT`，默认 150k）。三级覆盖
+  Web 逐 run > env > 领域包 > 默认，再夹进 `窗口 − maxTokens − 边际`
+  （边际 = `max(4k, 2%)`；端点按 messages + max_tokens 之和计超长，2026-09-03 真机实测）。
+
+**预算默认不随窗口自动抬高。** 知道窗口是 1M 不等于该把预算设成 1M：每轮成本与时延随上下文
+线性增长，而压缩的质量损失有账本 + 首行摘录兜着。抬预算是按任务权衡的决定，不该由 harness
+因为"发现窗口更大"替人做。
+
+```powershell
+$env:AGENT_CONTEXT_LIMIT  = "400000"   # 预算（策略）：默认 150000
+$env:AGENT_CONTEXT_WINDOW = "1048576"  # 窗口（事实）：只在自动解析不对时才需要手填
+```
+
+两个宿主都把这两个数**各带来源**报出来，不合并成一个百分比：
+
+- **CLI** 启动行 `上下文：预算 150k / 窗口 1,048k（来源：learned）`（或 `窗口未知`）；
+  被夹紧另起一行 ⚠ 并写明原值；压缩行带「学到窗口 …（下次运行生效）」。
+- **Web** 提交表单有「上下文预算」控件（区间 `[32k, 上限]`，越界 **400 并报出区间**，
+  不静默夹紧；填超过 200k 给成本忠告，不阻断）；水位条是三段——已用 / 预算 / 窗口，
+  窗口未知时不画那一段而直说「窗口未知」；到预算的 80% 直说「下一轮将压缩」；
+  `run_config` 与 `/api/harness` 的 `context` 字段是这些数字的唯一来源。
+- **台账** 每行记 `context { window, windowSource, budget, budgetSource }`，
+  `npm run ledger` 出来源直方图——"我们平均在窗口的几分之几处压"从此可查。
+
 ## 在 Cloud Agent 里跑：凭据怎么过去
 
 Cloud Agent 跑在远端 VM，读不到你本机的 `.env`。配置分两半走：

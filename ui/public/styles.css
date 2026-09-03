@@ -1672,6 +1672,67 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
   color: var(--fg2);
 }
 
+/* 档位提示（"下一轮将压缩"）与夹紧说明：状态语域各自独立，不混进 note 的说明色 */
+.meter-hint {
+  margin: 0 0 var(--space-sm);
+  font-size: var(--font-sm);
+  color: var(--fg2);
+}
+.meter-hint--warn { color: var(--status-warn); }
+.meter-hint--clamped { color: var(--yellow); }
+
+/*
+ * 三段上下文水位条（MEM-01 窗口 / 预算分离）：三层绝对定位叠在同一条轨道上——
+ * 底层窗口（事实，已知才画）、中层预算（策略）、顶层已用（最近一轮输入），预算段内一道压缩刻度。
+ * 窗口未知时没有窗口层，轨道总长就是预算；已用越过刻度整条转 warn 语域。
+ */
+.ctx-strip {
+  position: relative;
+  height: 14px;
+  border-radius: var(--radius-xs);
+  background: var(--bg3);
+  overflow: hidden;
+  margin-bottom: var(--space-sm);
+}
+.ctx-strip-seg { position: absolute; top: 0; bottom: 0; left: 0; }
+.ctx-strip-seg--window { background: var(--bg3); outline: 1px dashed var(--text-3); outline-offset: -1px; }
+.ctx-strip-seg--budget { background: color-mix(in srgb, var(--accent) 28%, transparent); }
+.ctx-strip-seg--used { background: var(--accent); }
+.ctx-strip--compact-next .ctx-strip-seg--used { background: var(--status-warn); }
+.ctx-strip-threshold {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--yellow);
+}
+.ctx-strip-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-md);
+  margin: var(--space-sm) 0 var(--space-md);
+  padding: 0;
+  list-style: none;
+  font-size: var(--font-sm);
+  color: var(--fg2);
+}
+.ctx-strip-legend-item { display: flex; flex-direction: column; gap: 2px; padding-left: 14px; position: relative; }
+.ctx-strip-legend-item::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 5px;
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  background: var(--bg3);
+}
+.ctx-strip-legend-item--used::before { background: var(--accent); }
+.ctx-strip-legend-item--budget::before { background: color-mix(in srgb, var(--accent) 28%, transparent); }
+.ctx-strip-legend-item--window::before { outline: 1px dashed var(--text-3); outline-offset: -1px; }
+.ctx-strip-legend-sub { color: var(--text-3); font-size: var(--font-xs, 0.75rem); }
+.knob-hint--advisory { color: var(--status-warn); }
+
 .token-bar {
   display: flex;
   height: 10px;

@@ -303,6 +303,38 @@ export function normalizeRecoveryConfig(raw) {
   return { armed: raw.armed !== false, ...out, sources };
 }
 
+/** 窗口来源四值 / 预算来源四值——宿主之外的字符串一律归 unknown / null，不让界面替宿主编来源 */
+const CONTEXT_WINDOW_SOURCES = new Set(["env", "learned", "registry", "unknown"]);
+const CONTEXT_BUDGET_SOURCES = new Set(["run", "env", "pack", "default"]);
+
+/**
+ * 上下文窗口 / 预算投影（run_config.context / harness.context 同形，MEM-01 窗口 / 预算分离）。
+ *
+ * 窗口是**事实**（端点在多大处拒收；null = 未知，界面必须写"窗口未知"而不是画 0），
+ * 预算是**策略**（在多大处压缩，就是 guardrails.contextTokenLimit 那个数）。两者此前是一个数，
+ * 于是 150k 在 1M 的模型上压了三个月没人看见——三段水位条（已用 / 预算 / 窗口）的数字全部
+ * 从这里取，不从 usage 反推。budget 缺就整体 null（没有预算就画不出任何一段）。
+ * @returns {{window:number|null, windowSource:string, budget:number, budgetSource:string|null,
+ *   requestedBudget:number, maxBudget:number|null, maxTokens:number|null, clamped:boolean, warning:string|null}|null}
+ */
+export function normalizeContextConfig(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const num = (v) => (typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null);
+  const budget = num(raw.budget);
+  if (budget === null) return null;
+  return {
+    window: num(raw.window),
+    windowSource: CONTEXT_WINDOW_SOURCES.has(raw.windowSource) ? raw.windowSource : "unknown",
+    budget,
+    budgetSource: CONTEXT_BUDGET_SOURCES.has(raw.budgetSource) ? raw.budgetSource : null,
+    requestedBudget: num(raw.requestedBudget) ?? budget,
+    maxBudget: num(raw.maxBudget),
+    maxTokens: num(raw.maxTokens),
+    clamped: raw.clamped === true,
+    warning: typeof raw.warning === "string" && raw.warning ? raw.warning : null,
+  };
+}
+
 /**
  * 把一条 SSE 事件折叠进渲染模型。
  * @param {RunState} state
@@ -624,6 +656,8 @@ export function reduceEvent(state, sseEvent) {
         fallbackRouting: event.fallbackRouting ? String(event.fallbackRouting) : null,
         compatSource: event.compatSource ? String(event.compatSource) : null,
         guardrails: event.guardrails ?? null,
+        // 上下文窗口（事实）/ 预算（策略）各带来源（MEM-01 窗口 / 预算分离）——三段水位条的唯一数据源
+        context: normalizeContextConfig(event.context),
         tools: Array.isArray(event.tools) ? event.tools : [],
       },
     };
@@ -1365,9 +1399,29 @@ export function describeRecoveryPolicy(recovery) {
  * 永不可恢复，那不是又一条普通警告。
  */
 export function deriveContextFace(state, harness) {
+  /**
+   * 窗口 / 预算（MEM-01 分离）：逐 run 的 run_config.context 优先于进程级 harness.context；
+   * 两处都没有（旧宿主）才退回 guardrails.contextTokenLimit——那时窗口一律未知。
+   * 预算就是水位分母：**分母不变**，只是从今起知道它离窗口有多远。
+   */
+  const contextCfg =
+    normalizeContextConfig(state.runConfig?.context) ?? normalizeContextConfig(harness?.context) ?? null;
   const limit =
-    state.runConfig?.guardrails?.contextTokenLimit ?? harness?.guardrails?.contextTokenLimit ?? null;
+    contextCfg?.budget ??
+    state.runConfig?.guardrails?.contextTokenLimit ??
+    harness?.guardrails?.contextTokenLimit ??
+    null;
   const usage = deriveContextUsage(state, limit);
+  const watermark = harness?.compactWatermark ?? usage.watermark;
+  const window = contextCfg?.window ?? null;
+  const windowRatio = window ? usage.lastInputTokens / window : null;
+  /**
+   * 三段水位条的几何：总长 = 窗口（已知）或预算（未知，此时没有窗口段）。
+   * 三段各自的占比与"下一轮将压缩"档位一起算好，渲染层只画不算。
+   */
+  const total = window ?? limit;
+  const share = (n) => (total ? Math.min(1, Math.max(0, n / total)) : null);
+  const compactNextTurn = usage.ratio !== null && usage.ratio >= watermark;
   const compactions = [...state.timeline, ...state.verifierTimeline]
     .filter((e) => e.type === "compaction")
     .sort((a, b) => a.seq - b.seq)
@@ -1383,8 +1437,31 @@ export function deriveContextFace(state, harness) {
 
   return {
     ...usage,
-    watermark: harness?.compactWatermark ?? usage.watermark,
-    nearWatermark: usage.ratio !== null && usage.ratio >= (harness?.compactWatermark ?? 0.8),
+    watermark,
+    nearWatermark: compactNextTurn,
+    /** 档位："下一轮将压缩"= 最近一轮输入 ≥ 预算 × 水位；compaction 判据取的就是这个数 */
+    compactNextTurn,
+    // ---- 窗口（事实）与预算（策略）分开报；window=null 就是"窗口未知"，不编数 ----
+    window,
+    windowSource: contextCfg?.windowSource ?? "unknown",
+    budget: limit,
+    budgetSource: contextCfg?.budgetSource ?? null,
+    requestedBudget: contextCfg?.requestedBudget ?? limit,
+    maxBudget: contextCfg?.maxBudget ?? null,
+    maxTokens: contextCfg?.maxTokens ?? null,
+    clamped: contextCfg?.clamped === true,
+    clampWarning: contextCfg?.warning ?? null,
+    windowRatio,
+    /** 三段条：used / budget / window 各占总长的比例（窗口未知时 window 为 null、总长 = 预算） */
+    strip: total
+      ? {
+          total,
+          used: share(usage.lastInputTokens),
+          budget: limit ? share(limit) : null,
+          window: window ? 1 : null,
+          threshold: limit ? share(limit * watermark) : null,
+        }
+      : null,
     compactions,
     droppedBlocks: compactions.reduce((n, c) => n + c.droppedBlocks, 0),
     ledgerEntries: compactions.reduce((n, c) => n + (c.ledgerEntries ?? 0), 0),
@@ -1461,6 +1538,8 @@ export function deriveToolsFace(state, harness) {
     history: harness?.history ?? null,
     mcp: harness?.mcp ?? null,
     guardrails: rc?.guardrails ?? harness?.guardrails ?? null,
+    // 窗口 / 预算（MEM-01）：逐 run 优先，进程级快照兜底；旧宿主两处都没有 = null（不显示这一行）
+    context: normalizeContextConfig(rc?.context) ?? normalizeContextConfig(harness?.context) ?? null,
     tools,
     totalCalls: [...stats.values()].reduce((n, s) => n + s.calls, 0),
     totalErrors: [...stats.values()].reduce((n, s) => n + s.errors, 0),
@@ -1798,14 +1877,21 @@ export function buildNewRunRequest({
   workdir,
   useVerifierModel = true,
   usePlannerModel = true,
+  contextTokenLimit,
 } = {}) {
   const trimmedRubric = String(rubric ?? "").trim();
+  // 逐 run 上下文预算：空 / 非数字不传（沿用 env > 包 > 默认）；填了就原样交给宿主校验区间——
+  // 不在浏览器里夹紧，越界该 400 报区间，静默夹紧就是界面说谎
+  const budget = contextTokenLimit === undefined || contextTokenLimit === null || String(contextTokenLimit).trim() === ""
+    ? undefined
+    : Number(contextTokenLimit);
   return {
     task: String(task ?? ""),
     verify: Boolean(verify),
     ...(pack ? { pack } : {}),
     ...(effort ? { effort } : {}),
     ...(trimmedRubric ? { rubric: trimmedRubric } : {}),
+    ...(budget !== undefined && Number.isFinite(budget) ? { contextTokenLimit: budget } : {}),
     ...(mode === "plan"
       ? {
           mode: "plan",
@@ -1818,6 +1904,53 @@ export function buildNewRunRequest({
     // 与宿主既有契约一致：角色模型默认启用，只有显式关闭才传 false。
     ...(!useVerifierModel ? { useVerifierModel: false } : {}),
     ...(!usePlannerModel ? { usePlannerModel: false } : {}),
+  };
+}
+
+/** 逐 run 预算控件的区间下限（与 src/context-window.ts MIN_CONTEXT_TOKEN_LIMIT 同值；宿主 400 是最终裁判） */
+export const CONTEXT_BUDGET_INPUT_MIN = 32_000;
+/** 窗口未知时的理智上限（同 CONTEXT_TOKEN_LIMIT_HARD_CAP） */
+export const CONTEXT_BUDGET_INPUT_HARD_CAP = 2_000_000;
+/** 超过它就给成本忠告（同 CONTEXT_BUDGET_ADVISORY_ABOVE）——忠告不是阻断，无人值守默认不弹任何确认 */
+export const CONTEXT_BUDGET_ADVISORY_ABOVE = 200_000;
+
+/**
+ * 提交表单里"上下文预算"控件的派生（纯函数，控制器只搬结果）。
+ *
+ * - 区间 [32k, maxBudget]；窗口未知时上限取硬顶并在提示里说明——不能把"不知道"画成一个数。
+ * - 忠告档：填的预算 > 200k 时说"每轮成本与时延随上下文线性增长，预计 ~X token/轮"，
+ *   X 就是预算本身——那是**上界**（真实每轮输入 ≤ 预算，且缓存命中部分便宜得多），文案里如实写"上界"。
+ * - `outOfRange` 只做提示，不阻断提交：宿主会 400 并报区间，两边口径同一处。
+ * @param {object|null} ctx  /api/harness 的 context 投影（normalizeContextConfig 之后）
+ * @param {unknown} raw      输入框当前值
+ */
+export function deriveContextBudgetKnob(ctx, raw) {
+  const min = CONTEXT_BUDGET_INPUT_MIN;
+  const max = ctx?.maxBudget ?? CONTEXT_BUDGET_INPUT_HARD_CAP;
+  const fmtK = (n) => `${Math.floor(n / 1000).toLocaleString("en-US")}k`;
+  const windowText = ctx?.window
+    ? `窗口 ${fmtK(ctx.window)}（${contextSourceLabel(ctx.windowSource)}）`
+    : "窗口未知";
+  const rangeText = ctx?.maxBudget
+    ? `可用 ${fmtK(min)}..${fmtK(max)}（上限 = 窗口 − maxTokens${ctx.maxTokens ? ` ${fmtK(ctx.maxTokens)}` : ""} − 边际）`
+    : `可用 ${fmtK(min)}..${fmtK(max)}（窗口未知，上限取硬顶）`;
+  const text = String(raw ?? "").trim();
+  const value = text === "" ? null : Number(text);
+  const valid = value !== null && Number.isInteger(value);
+  const outOfRange = valid && (value < min || value > max);
+  const advisory =
+    valid && !outOfRange && value > CONTEXT_BUDGET_ADVISORY_ABOVE
+      ? `每轮成本与时延随上下文线性增长，预计最多 ~${value.toLocaleString("en-US")} token/轮（上界：真实每轮输入 ≤ 预算，缓存命中部分更便宜）`
+      : null;
+  const placeholder = ctx?.budget ? `${ctx.budget}（${contextSourceLabel(ctx.budgetSource)}${ctx.clamped ? "，已夹紧" : ""}）` : "150000（默认）";
+  return {
+    min,
+    max,
+    value: valid ? value : null,
+    outOfRange,
+    advisory,
+    placeholder,
+    hint: `${windowText} · ${rangeText}${outOfRange ? " · 越界，宿主会拒绝" : ""}`,
   };
 }
 
@@ -2994,6 +3127,23 @@ export function deriveAssemblyBar(state, harness) {
       "所以终止原因是**一组具名值**而不是成败两值，撞边界时界面会直说「核查救不了这一类」。",
   );
 
+  /**
+   * 上下文：预算（策略）与窗口（事实）并排。这一格此前不存在——于是 150k 预算在 1M 窗口的模型上
+   * 压了三个月没人看见。窗口未知就写"窗口未知"，不编一个数。
+   */
+  const ctxCfg = normalizeContextConfig(cfg.context) ?? normalizeContextConfig(harness?.context) ?? null;
+  push(
+    "context",
+    ctxCfg
+      ? `上下文 ${Math.round(ctxCfg.budget / 1000)}k${ctxCfg.clamped ? "↓" : ""} / ${ctxCfg.window ? `窗口 ${Math.round(ctxCfg.window / 1000)}k` : "窗口未知"}`
+      : null,
+    "预算是**策略**（最近一轮输入超过它的 80% 就压缩，默认 150k），窗口是**事实**（端点在多大处拒收；来源 " +
+      `${ctxCfg ? contextSourceLabel(ctxCfg.windowSource) : "未知"}）。预算会被夹在 窗口 − maxTokens − 边际 之内` +
+      `${ctxCfg?.clamped ? `（本次由 ${Math.round(ctxCfg.requestedBudget / 1000)}k 夹到 ${Math.round(ctxCfg.budget / 1000)}k）` : ""}，` +
+      "但**默认不随窗口抬高**：每轮成本与时延随上下文线性增长，压缩的质量损失有账本与摘录兜着，抬预算是委托方按任务权衡的决定。" +
+      "窗口未知的模型撞一次 400 之后端点会说出窗口，下一次运行就按它算。",
+  );
+
   // 核查：三值裁决 + 独立上下文，这是与别家最明显的分野
   /**
    * 白名单条数上条，**且 0 要显眼**。
@@ -3178,9 +3328,11 @@ function patchContextGauge(parts, ctx) {
 
   // 应用层操作图标统一由 Phosphor 提供；数值仍用文字直接报真值。
   // 没配上限时只报绝对值，不画一个看似 0% 的伪水位。
+  // 预算之外报窗口：预算是策略、窗口是事实——48% 的预算可能只是窗口的 7%（1M 模型上 150k 默认预算）
+  const windowPart = ctx.window && ctx.windowRatio !== null ? ` · 窗口 ${Math.round(ctx.windowRatio * 100)}%` : "";
   const label = pct === null
     ? `上下文 ${formatTokens(ctx.lastInputTokens)}`
-    : `上下文 ${pct}%`;
+    : `上下文 ${pct}%${windowPart}${ctx.compactNextTurn ? " · 下一轮将压缩" : ""}`;
   setText(el.querySelector(".ctx-gauge-value"), label);
   const compacted = el.querySelector(".ctx-gauge-compactions");
   setText(compacted, ctx.compactions.length > 0 ? `压缩 ${ctx.compactions.length}` : "");
@@ -3190,7 +3342,11 @@ function patchContextGauge(parts, ctx) {
   const parts2 = [
     pct === null
       ? `上下文最近一轮输入 ${formatTokens(ctx.lastInputTokens)}（未配置上限）`
-      : `上下文水位 ${pct}%，最近一轮输入 ${formatTokens(ctx.lastInputTokens)} / 上限 ${formatTokens(ctx.limit)}`,
+      : `上下文水位 ${pct}%，最近一轮输入 ${formatTokens(ctx.lastInputTokens)} / 预算 ${formatTokens(ctx.limit)}` +
+        (ctx.window
+          ? `，窗口 ${formatTokens(ctx.window)}（${ctx.windowSource}）占 ${Math.round((ctx.windowRatio ?? 0) * 100)}%`
+          : "，窗口未知"),
+    ctx.compactNextTurn ? `已过压缩水位 ${Math.round(ctx.watermark * 100)}%，下一轮将压缩` : null,
     ctx.compactions.length > 0
       ? `已压缩 ${ctx.compactions.length} 次，置换 ${ctx.droppedBlocks} 个 tool_result 原文` +
         ((ctx.collapsedTurns ?? 0) > 0 ? `，折叠 ${ctx.collapsedTurns} 轮旧对话` : "") +
@@ -4318,19 +4474,69 @@ export function foldChain(chain) {
   return out;
 }
 
+/** 窗口来源的人话（数字必须带来源，否则无从判断"这是不是我要的那个值"） */
+export function contextSourceLabel(source) {
+  switch (source) {
+    case "env": return "env";
+    case "learned": return "撞 400 学到";
+    case "registry": return "登记表";
+    case "run": return "本次指定";
+    case "pack": return "领域包";
+    case "default": return "默认";
+    default: return "未知";
+  }
+}
+
+/**
+ * 三段上下文水位条（MEM-01 窗口 / 预算分离）：已用 / 预算 / 窗口。
+ *
+ * 总长 = 窗口（已知）或预算（未知，此时**没有窗口段**——画一段"未知"等于编一个数）。
+ * 预算段内画压缩水位刻度；已用段越过刻度即"下一轮将压缩"。三段的比例由 deriveContextFace 算好。
+ * 纯字符串渲染，jsdom 与 node 都能断言。
+ */
+export function renderContextStrip(ctx) {
+  const s = ctx.strip;
+  if (!s || !ctx.limit) return "";
+  const pctOf = (x) => `${Math.round((x ?? 0) * 1000) / 10}%`;
+  const usedPct = Math.round((ctx.ratio ?? 0) * 100);
+  const windowText = ctx.window
+    ? `窗口 ${formatTokens(ctx.window)}（${contextSourceLabel(ctx.windowSource)}）`
+    : "窗口未知";
+  const budgetText = `预算 ${formatTokens(ctx.limit)}（${contextSourceLabel(ctx.budgetSource)}${ctx.clamped ? `，由 ${formatTokens(ctx.requestedBudget)} 夹紧` : ""}）`;
+  const label = `上下文：已用 ${formatTokens(ctx.lastInputTokens)}（预算的 ${usedPct}%）· ${budgetText} · ${windowText}`;
+  let html = `<div class="ctx-strip${ctx.window ? "" : " ctx-strip--no-window"}${ctx.compactNextTurn ? " ctx-strip--compact-next" : ""}" role="img" aria-label="${esc(label)}">`;
+  if (ctx.window) html += '<div class="ctx-strip-seg ctx-strip-seg--window" style="width:100%"></div>';
+  html += `<div class="ctx-strip-seg ctx-strip-seg--budget" style="width:${pctOf(s.budget)}"></div>`;
+  html += `<div class="ctx-strip-seg ctx-strip-seg--used" style="width:${pctOf(s.used)}"></div>`;
+  if (s.threshold !== null) html += `<div class="ctx-strip-threshold" style="left:${pctOf(s.threshold)}"></div>`;
+  html += "</div>";
+  html += '<ul class="ctx-strip-legend">';
+  html += `<li class="ctx-strip-legend-item ctx-strip-legend-item--used">已用 ${formatTokens(ctx.lastInputTokens)}<span class="ctx-strip-legend-sub">最近一轮输入</span></li>`;
+  html += `<li class="ctx-strip-legend-item ctx-strip-legend-item--budget">${esc(budgetText)}<span class="ctx-strip-legend-sub">压缩水位 ${Math.round(ctx.watermark * 100)}%</span></li>`;
+  html += `<li class="ctx-strip-legend-item ctx-strip-legend-item--window">${esc(windowText)}${ctx.window && ctx.windowRatio !== null ? `<span class="ctx-strip-legend-sub">已用占窗口 ${Math.round(ctx.windowRatio * 100)}%</span>` : ""}</li>`;
+  html += "</ul>";
+  return html;
+}
+
 /** Context 面下钻：逐轮 token 与压缩点 */
 function renderContextTab(ctx) {
   let html = '<h3 class="overview-section-title">上下文水位</h3>';
 
   if (ctx.limit) {
     const pct = Math.round((ctx.ratio ?? 0) * 100);
-    html += '<div class="meter" role="progressbar"' +
-      ` aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100"` +
-      ` aria-label="上下文水位 ${pct}%">`;
-    html += `<div class="meter-fill" style="width:${pct}%"></div>`;
-    html += `<div class="meter-threshold" style="left:${Math.round(ctx.watermark * 100)}%"></div>`;
-    html += "</div>";
-    html += `<p class="meter-note">最近一轮输入 ${formatTokens(ctx.lastInputTokens)} / 上限 ${formatTokens(ctx.limit)}（${pct}%），超过 ${Math.round(ctx.watermark * 100)}% 触发压缩。<strong>口径是最近一轮，不是全程累计</strong>——压缩判据取的就是单轮输入。</p>`;
+    html += renderContextStrip(ctx);
+    // 档位提示：越过水位就直说"下一轮将压缩"——compaction 判据取的正是这一轮的读数
+    if (ctx.compactNextTurn) {
+      html += `<p class="meter-hint meter-hint--warn" role="status">下一轮将压缩：最近一轮输入已达预算的 ${pct}%（水位 ${Math.round(ctx.watermark * 100)}%）。压缩不可逆——被置换的 tool_result 只剩首行摘录。</p>`;
+    }
+    if (ctx.clamped && ctx.clampWarning) {
+      html += `<p class="meter-hint meter-hint--clamped">${esc(ctx.clampWarning)}</p>`;
+    }
+    html += `<p class="meter-note">最近一轮输入 ${formatTokens(ctx.lastInputTokens)} / 预算 ${formatTokens(ctx.limit)}（${pct}%），超过 ${Math.round(ctx.watermark * 100)}% 触发压缩。<strong>口径是最近一轮，不是全程累计</strong>——压缩判据取的就是单轮输入。` +
+      (ctx.window
+        ? `预算是策略、窗口是事实：窗口 ${formatTokens(ctx.window)} 来自${contextSourceLabel(ctx.windowSource)}${ctx.maxBudget ? `，预算上限 ${formatTokens(ctx.maxBudget)}（窗口 − maxTokens ${formatTokens(ctx.maxTokens ?? 0)} − 边际）` : ""}。默认预算不随窗口自动抬高——每轮成本与时延随上下文线性增长，抬预算是委托方的决定。`
+        : "窗口未知：登记表里没有这个模型、也还没撞过 400；撞到一次端点会说出窗口，下一次运行就按它算上限。") +
+      "</p>";
   } else {
     html += `<p class="meter-note">最近一轮输入 ${formatTokens(ctx.lastInputTokens)}（未配置上限，无法给出水位）。</p>`;
   }
@@ -4453,7 +4659,16 @@ function renderToolsTab(tools) {
   }
   if (tools.guardrails) {
     const g = tools.guardrails;
-    html += row("护栏", `maxTurns ${g.maxTurns ?? "—"} · maxTokens ${g.maxTokens ?? "—"} · 上下文上限 ${g.contextTokenLimit ?? "—"}`);
+    html += row("护栏", `maxTurns ${g.maxTurns ?? "—"} · maxTokens ${g.maxTokens ?? "—"} · 上下文预算 ${g.contextTokenLimit ?? "—"}`);
+  }
+  if (tools.context) {
+    // 预算与窗口分开报（MEM-01）：预算带来源与夹紧原值，窗口带来源或明说未知
+    const c = tools.context;
+    html += row(
+      "上下文窗口 / 预算",
+      `预算 ${c.budget}（${contextSourceLabel(c.budgetSource)}${c.clamped ? `，由 ${c.requestedBudget} 夹紧` : ""}）· ` +
+        (c.window ? `窗口 ${c.window}（${contextSourceLabel(c.windowSource)}）· 上限 ${c.maxBudget ?? "—"}` : "窗口未知"),
+    );
   }
   if (tools.mcp) {
     const servers = tools.mcp.servers ?? [];

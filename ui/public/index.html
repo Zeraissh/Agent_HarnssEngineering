@@ -272,6 +272,16 @@
         </label>
         <span class="knob-hint">交互式 Web 默认开；只问猜错会返工的岔路或只有你知道的事实。最多打断 3 次（每次 1~4 题），API 未显式传 askUser 时仍默认关。</span>
       </div>
+      <!-- MEM-01 窗口 / 预算分离：预算是策略、窗口是事实。区间与窗口由 /api/harness 给，
+           越界由宿主 400 报区间（这里只提示不阻断）；>200k 给成本忠告，无人值守不弹确认 -->
+      <div class="knob">
+        <label for="context-budget-input">上下文预算</label>
+        <input type="number" id="context-budget-input" inputmode="numeric" step="1000" min="32000"
+               aria-describedby="context-budget-hint context-budget-advisory" placeholder="150000（默认）" />
+        <span class="knob-hint" id="context-budget-hint">窗口未知 · 可用 32k..2,000k</span>
+        <!-- 忠告出现在输入之后，屏幕阅读器要能听见它冒出来（role=status 而不是只改文本） -->
+        <span class="knob-hint knob-hint--advisory" id="context-budget-advisory" role="status" hidden></span>
+      </div>
       <div class="knob knob--wide">
         <label for="rubric-input">主观评分表</label>
         <textarea id="rubric-input" rows="2" placeholder="逐条列出评分项，核查者按表评估进 advisory——不影响 passed，也不触发返工"></textarea>
@@ -309,6 +319,8 @@ import {
   deriveComposerMode,
   composerSubmitPlan,
   buildNewRunRequest,
+  deriveContextBudgetKnob,
+  normalizeContextConfig,
   buildFollowUpRequest,
   mergeForkedFollowUp,
   patchComposer,
@@ -469,6 +481,9 @@ const askUserToggle = /** @type {HTMLInputElement} */ (document.getElementById("
 const workdirSelect = /** @type {HTMLSelectElement} */ (document.getElementById("workdir-select"));
 const useVerifierModel = /** @type {HTMLInputElement} */ (document.getElementById("use-verifier-model"));
 const usePlannerModel = /** @type {HTMLInputElement} */ (document.getElementById("use-planner-model"));
+const contextBudgetInput = /** @type {HTMLInputElement} */ (document.getElementById("context-budget-input"));
+const contextBudgetHint = /** @type {HTMLElement} */ (document.getElementById("context-budget-hint"));
+const contextBudgetAdvisory = /** @type {HTMLElement} */ (document.getElementById("context-budget-advisory"));
 const sidebar = /** @type {HTMLElement} */ (document.getElementById("sidebar"));
 const mainPanel = /** @type {HTMLElement} */ (document.getElementById("main-panel"));
 const runFilter = /** @type {HTMLSelectElement} */ (document.getElementById("run-filter"));
@@ -1288,6 +1303,8 @@ async function submitNewRun({ text: task }) {
         workdir: workdirSelect?.value,
         useVerifierModel: !useVerifierModel || useVerifierModel.checked,
         usePlannerModel: !usePlannerModel || usePlannerModel.checked,
+        // 逐 run 上下文预算：空 = 沿用 env > 包 > 默认；越界由宿主 400 报区间
+        contextTokenLimit: contextBudgetInput?.value,
       })),
     });
     if (!res.ok) {
@@ -1465,6 +1482,25 @@ function populateKnobs(snap) {
   const eh = document.getElementById("effort-hint");
   // compat 端点不认识 output_config.effort——不说清楚，用户会以为自己设的档位生效了
   if (eh && snap.compat) eh.textContent = "compat 模式下该参数不会发送";
+
+  // MEM-01 窗口 / 预算：区间与窗口来自宿主快照（窗口未知就写"窗口未知"），忠告随输入实时更新
+  if (contextBudgetInput) {
+    const ctx = normalizeContextConfig(snap.context);
+    const refresh = () => {
+      const knob = deriveContextBudgetKnob(ctx, contextBudgetInput.value);
+      contextBudgetInput.min = String(knob.min);
+      contextBudgetInput.max = String(knob.max);
+      contextBudgetInput.placeholder = knob.placeholder;
+      contextBudgetInput.setAttribute("aria-invalid", knob.outOfRange ? "true" : "false");
+      if (contextBudgetHint) contextBudgetHint.textContent = knob.hint;
+      if (contextBudgetAdvisory) {
+        contextBudgetAdvisory.textContent = knob.advisory ?? "";
+        contextBudgetAdvisory.hidden = !knob.advisory;
+      }
+    };
+    refresh();
+    contextBudgetInput.addEventListener("input", refresh);
+  }
 
   // V-29 工作目录：只列宿主声明过的，浏览器不给自由输入
   if (workdirSelect && Array.isArray(snap.availableWorkdirs)) {

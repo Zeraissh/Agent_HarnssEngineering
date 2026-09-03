@@ -37,6 +37,13 @@ import {
   type UiServerHandle,
 } from "../ui/server.js";
 import { resolvePlannerMaxTurns } from "../src/planner.js";
+import { DEFAULT_MAX_TOKENS } from "../src/loop.js";
+import { clearCapabilityCache } from "../src/model-capability.js";
+import {
+  DEFAULT_CONTEXT_TOKEN_LIMIT,
+  MIN_CONTEXT_TOKEN_LIMIT,
+  maxContextBudget,
+} from "../src/context-window.js";
 import { PLAN_TOOL_NAME } from "../src/planner.js";
 import { resolveRecoveryPolicy } from "../src/recovery.js";
 import { REQUIREMENTS_TOOL_NAME } from "../src/clarifier.js";
@@ -7296,6 +7303,264 @@ describe("MODEL-01a 端点降级：宿主接线", () => {
       const fallbacks = events.filter((e) => (e as any).event.type === "model_fallback");
       expect(fallbacks, `run ${runId} 应当恰好记到自己那一次降级`).toHaveLength(1);
     }
+  });
+});
+
+/**
+ * MEM-01 窗口（事实）/ 预算（策略）分离：Web 宿主一侧的接线。
+ *
+ * 核心层的四级来源、夹紧算式与区间校验有 test/context-window.ts 的纯函数锁；这一组管
+ * **宿主有没有如实把它们报出来**，以及逐 run 预算这条外部输入的准入。
+ * 为什么重要：此前界面上只有 `contextTokenLimit` 一个数，既当"模型能装多少"又当
+ * "我们在多少处压"——150k 的默认预算在窗口 1,048,576 的端点上压了三个月没人看见。
+ * 窗口不知道就必须说"未知"，不许画 0；预算被夹紧必须说出原值。
+ */
+describe("MEM-01 窗口 / 预算分离：Web 宿主", () => {
+  let handle: UiServerHandle | undefined;
+  let dir: string | undefined;
+  const saved = new Map<string, string | undefined>();
+
+  /** env 只在本组内改，afterEach 逐键还原（残留变量武装测试宿主是仪器纪律的红线） */
+  function setEnv(key: string, value: string | undefined): void {
+    if (!saved.has(key)) saved.set(key, process.env[key]);
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+
+  afterEach(async () => {
+    await handle?.close();
+    handle = undefined;
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    saved.clear();
+    // 学到的窗口是模块级的进程内表——不清会漏进下一条用例，让"窗口未知"变成假绿的反面
+    clearCapabilityCache();
+    if (dir) await rm(dir, { recursive: true, force: true });
+    dir = undefined;
+  });
+
+  /** 干净起点：三条相关 env 全部清空，窗口来源由执行者模型名决定 */
+  function pinEnv(model: string): void {
+    setEnv("AGENT_MODEL", model);
+    setEnv("AGENT_CONTEXT_WINDOW", undefined);
+    setEnv("AGENT_CONTEXT_LIMIT", undefined);
+    setEnv("AGENT_MAX_TOKENS", undefined);
+  }
+
+  async function startWith(overrides: Record<string, unknown> = {}): Promise<string> {
+    handle = createUiServer({
+      modelClient: new FakeModelClient([fakeMessage([textBlock("ok")], "end_turn")]),
+      tools: [],
+      workdir: process.cwd(),
+      ...overrides,
+    });
+    return baseUrl(await startServer(handle));
+  }
+
+  it("快照报登记表来源：窗口带出处等级、预算上限按 窗口 − maxTokens − 边际 算", async () => {
+    pinEnv("deepseek-v4-flash");
+    const base = await startWith();
+    const snap = (await (await fetch(`${base}/api/harness`)).json()) as any;
+
+    expect(snap.context.window).toBe(1_048_576);
+    expect(snap.context.windowSource).toBe("registry");
+    expect(snap.context.budget).toBe(DEFAULT_CONTEXT_TOKEN_LIMIT);
+    expect(snap.context.budgetSource).toBe("default");
+    expect(snap.context.maxTokens).toBe(DEFAULT_MAX_TOKENS);
+    // 算式不写死数字：登记表里的窗口与边际口径归 src/context-window.ts 管
+    expect(snap.context.maxBudget).toBe(maxContextBudget(1_048_576, DEFAULT_MAX_TOKENS));
+    expect(snap.context.clamped).toBe(false);
+    expect(snap.context.warning).toBeNull();
+    // 生效预算与 guardrails 那一格是同一个数（界面两处不许各说一套）
+    expect(snap.guardrails.contextTokenLimit).toBe(snap.context.budget);
+  });
+
+  /** 不认识的模型不猜窗口：null 是"未知"，写 0 会被画成一条空条 = 编了一个数 */
+  it("不在登记表里的模型：窗口 null / unknown，预算上限也为 null", async () => {
+    pinEnv("some-unlisted-model-v0");
+    const base = await startWith();
+    const snap = (await (await fetch(`${base}/api/harness`)).json()) as any;
+    expect(snap.context.window).toBeNull();
+    expect(snap.context.windowSource).toBe("unknown");
+    expect(snap.context.maxBudget).toBeNull();
+    expect(snap.context.budget).toBe(DEFAULT_CONTEXT_TOKEN_LIMIT);
+  });
+
+  /**
+   * env 覆盖窗口 + 夹紧：200k 的窗口装不下 150k 预算 + 64k 输出，预算被夹到
+   * 200k − 64k − 4k。夹紧不是静默降级——生效值、原值、告警一起报。
+   */
+  it("env 覆盖窗口：来源 env，且预算被夹紧时报出原值与告警", async () => {
+    pinEnv("some-unlisted-model-v0");
+    setEnv("AGENT_CONTEXT_WINDOW", "200000");
+    const base = await startWith();
+    const snap = (await (await fetch(`${base}/api/harness`)).json()) as any;
+    expect(snap.context.window).toBe(200_000);
+    expect(snap.context.windowSource).toBe("env");
+    expect(snap.context.maxBudget).toBe(maxContextBudget(200_000, DEFAULT_MAX_TOKENS));
+    expect(snap.context.budget).toBe(snap.context.maxBudget);
+    expect(snap.context.clamped).toBe(true);
+    expect(snap.context.requestedBudget).toBe(DEFAULT_CONTEXT_TOKEN_LIMIT);
+    expect(snap.context.warning).toContain("夹到");
+    expect(snap.guardrails.contextTokenLimit).toBe(snap.context.budget);
+  });
+
+  it("env 覆盖预算：来源 env，窗口装得下就不夹", async () => {
+    pinEnv("deepseek-v4-flash");
+    setEnv("AGENT_CONTEXT_LIMIT", "400000");
+    const base = await startWith();
+    const snap = (await (await fetch(`${base}/api/harness`)).json()) as any;
+    expect(snap.context.budget).toBe(400_000);
+    expect(snap.context.budgetSource).toBe("env");
+    expect(snap.context.clamped).toBe(false);
+  });
+
+  /**
+   * 护栏 env 的非法值必须**启动即失败**。窗口那条只在按 run 装配时才用到，
+   * 若不在 createUiServer 里先读一遍，非法值要等第一次 /api/harness 才炸成 500——
+   * 那时宿主已经在跑，操作员以为配好了。
+   */
+  it("非法的 AGENT_CONTEXT_WINDOW / AGENT_CONTEXT_LIMIT 在建宿主时就抛，不留到请求期", () => {
+    pinEnv("deepseek-v4-flash");
+    setEnv("AGENT_CONTEXT_WINDOW", "一百万");
+    expect(() => createUiServer({ modelClient: new FakeModelClient([]), tools: [], workdir: process.cwd() }))
+      .toThrow(/AGENT_CONTEXT_WINDOW/);
+    setEnv("AGENT_CONTEXT_WINDOW", undefined);
+    setEnv("AGENT_CONTEXT_LIMIT", "0");
+    expect(() => createUiServer({ modelClient: new FakeModelClient([]), tools: [], workdir: process.cwd() }))
+      .toThrow(/AGENT_CONTEXT_LIMIT/);
+  });
+
+  /**
+   * 撞 400 学窗口的宿主侧闭环：loop 解析报文 → `onContextWindowLearned` → 记到**执行者**
+   * 端点身份下 → 同进程的下一次装配立刻拿到 learned。这条走真实的 AgentLoop，
+   * 不是直接往能力表里塞数——要验的正是那根钩子有没有接上。
+   */
+  it("撞 context-overflow 400 后学到窗口：快照与下一个 run 的 run_config 都报 learned", async () => {
+    pinEnv("some-unlisted-model-v0");
+    const overflowing: ModelClient = {
+      send: async () => {
+        throw Object.assign(new Error("prompt is too long: 250000 tokens > 200000 maximum"), { status: 400 });
+      },
+    };
+    const base = await startWith({ modelClient: overflowing });
+
+    const before = (await (await fetch(`${base}/api/harness`)).json()) as any;
+    expect(before.context.windowSource).toBe("unknown");
+
+    const { runId } = (await (await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "撞一次 400" }),
+    })).json()) as { runId: string };
+    await waitForDone(base, runId);
+
+    const after = (await (await fetch(`${base}/api/harness`)).json()) as any;
+    expect(after.context.window).toBe(200_000);
+    expect(after.context.windowSource).toBe("learned");
+    // 学到之后预算立刻被夹进新算出来的上限——窗口是分母，学到就该生效
+    expect(after.context.maxBudget).toBe(maxContextBudget(200_000, DEFAULT_MAX_TOKENS));
+    expect(after.context.clamped).toBe(true);
+
+    const { runId: second } = (await (await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "第二个 run 应当按学到的窗口算" }),
+    })).json()) as { runId: string };
+    await waitForDone(base, second);
+    const events = await readSSEAll(await fetch(`${base}/api/runs/${second}/events`));
+    const cfg = events.find((e) => (e as any).event.type === "run_config") as any;
+    expect(cfg.event.context.windowSource).toBe("learned");
+    expect(cfg.event.context.window).toBe(200_000);
+  });
+
+  it("逐 run 预算：区间内接受，run_config 报 budgetSource=run，且落进档案 meta", async () => {
+    pinEnv("deepseek-v4-flash");
+    dir = await mkdtemp(join(tmpdir(), "ctx-budget-"));
+    const base = await startWith({ history: dir });
+
+    const created = await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "逐 run 预算", contextTokenLimit: 300_000 }),
+    });
+    expect(created.status).toBe(200);
+    const { runId } = (await created.json()) as { runId: string };
+    await waitForDone(base, runId);
+
+    const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+    const cfg = events.find((e) => (e as any).event.type === "run_config") as any;
+    expect(cfg.event.context.budget).toBe(300_000);
+    expect(cfg.event.context.budgetSource).toBe("run");
+    // 生效护栏也是这个数：run_config 的两处不许各说一套
+    expect(cfg.event.guardrails.contextTokenLimit).toBe(300_000);
+
+    // 落盘：派生 run / 追问要沿用它，档案里没有就只能回落默认
+    const meta = JSON.parse(await readFile(join(dir, runId, "meta.json"), "utf8"));
+    expect(meta.contextTokenLimit).toBe(300_000);
+  });
+
+  /**
+   * 越界 **400 并报出区间**，不静默夹紧：夹紧是对 env / 包这类操作员配置的处置，
+   * 请求体是这一次的显式意图——填了 900k 却被悄悄改成 60k，就是界面说谎。
+   */
+  it("逐 run 预算越界：400 且错误文案带可用区间与算式，机器可读区间同时给出", async () => {
+    pinEnv("deepseek-v4-flash");
+    const base = await startWith();
+    const max = maxContextBudget(1_048_576, DEFAULT_MAX_TOKENS);
+
+    const tooBig = await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "越界", contextTokenLimit: 5_000_000 }),
+    });
+    expect(tooBig.status).toBe(400);
+    const body = (await tooBig.json()) as any;
+    expect(body.error).toContain(String(MIN_CONTEXT_TOKEN_LIMIT));
+    expect(body.error).toContain(String(max));
+    expect(body.error).toContain("窗口 − maxTokens − 边际");
+    expect(body.contextTokenLimit).toEqual({
+      min: MIN_CONTEXT_TOKEN_LIMIT, max, window: 1_048_576, windowSource: "registry", maxTokens: DEFAULT_MAX_TOKENS,
+    });
+
+    // 下限同款：低于 32k 连首条 user 消息 + 保护窗都装不下，压缩会每轮开火
+    const tooSmall = await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "太小", contextTokenLimit: 1000 }),
+    });
+    expect(tooSmall.status).toBe(400);
+    expect(((await tooSmall.json()) as any).error).toContain(String(MIN_CONTEXT_TOKEN_LIMIT));
+
+    // 非整数：不四舍五入、不当成"没填"
+    const notInteger = await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "非整数", contextTokenLimit: "150k" }),
+    });
+    expect(notInteger.status).toBe(400);
+    expect(((await notInteger.json()) as any).error).toContain("整数");
+
+    // 空串 = 没填：沿用 env > 包 > 默认，不是错误
+    const blank = await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "空串", contextTokenLimit: "" }),
+    });
+    expect(blank.status).toBe(200);
+    const { runId } = (await blank.json()) as { runId: string };
+    await waitForDone(base, runId);
+    const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+    const cfg = events.find((e) => (e as any).event.type === "run_config") as any;
+    expect(cfg.event.context.budgetSource).toBe("default");
+  });
+
+  /** 校验用的窗口按**本 run 的包**算（包可改 maxTokens），与 buildConfig 同一口径 */
+  it("越界判定随包的 maxTokens 走，不用进程默认", async () => {
+    pinEnv("deepseek-v4-flash");
+    const base = await startWith();
+    const packMaxTokens = PACKS["python-coding"]!.guardrails?.maxTokens ?? DEFAULT_MAX_TOKENS;
+    const res = await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "按包算区间", pack: "python-coding", contextTokenLimit: 5_000_000 }),
+    });
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as any).contextTokenLimit.max).toBe(maxContextBudget(1_048_576, packMaxTokens));
   });
 });
 

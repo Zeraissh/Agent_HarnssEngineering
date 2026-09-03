@@ -35,10 +35,20 @@
 - **MODEL-01b[~]** — 能力探针 + 每角色 fallback/inherit + `prefer_healthy` stub；见 docs/08。
 - **v1.3.0 发布（2026-09-03）+ REL-02[~]** — 根目录 `CHANGELOG.md`（1.1.0 / 1.2.0 / 1.3.0 按提交归档，新版本先写 `[Unreleased]` 再随 tag 改节名）；版本号三处（根 / cross-app `package.json` / `CLI_VERSION`）由测试锁一致；release.yml 缺签名凭据时跳过 Windows 安装包（不发布未签名产物）、`workflow_dispatch` = 预演不推送——**打 tag 前先跑一次预演**。残余见 docs/08 REL-02 行。
 
+- **MEM-01 窗口 / 预算分离（2026-09-03，两个提交：核心 + CLI + 台账 `eb4d72e`，Web + 文档见本节末）**
+  ——`contextTokenLimit` 一个数不再兼任"模型能装多少"与"我们在多少处压"。窗口四级来源
+  （env > learned 撞 400 学到 > registry 有出处登记表 > 未知，**不认识就不猜**），预算三级覆盖
+  （逐 run > env > 包 > 默认 150k）再夹进 `窗口 − maxTokens − 边际`。两个宿主与台账都**带来源**报数。
+  **预算默认不随窗口自动抬高**是有意的：每轮成本与时延随上下文线性增长，抬预算是委托方的决定。
+  接手要点：新模型第一次跑必然"窗口未知"（此时不夹紧，仍可能白吃一次 400，那一次换来往后都知道）；
+  登记表要人工维护，厂商升窗口后靠 learned 自愈（TTL 30 天）。残余逐条见 docs/08 的「MEM-01 窗口 / 预算分离」行。
+
 **下一刀**：CI 绿后开 `MEM-01 Phase B`，或 RUN-02 / MODEL-01 残余。
 RUN-01 残余：SAFE-06 toolTx、CLI 对等 durable、mid-tool 恢复。
 MEM-01 残余（Phase C 之后）：保护窗内与任务首条永不压；折叠块按行摘要不做语义合并；tier 2 触发用字符/4 粗估；
 反应式只重发一次；启发式漏检；MCP 写工具靠名字启发。逐条见 docs/08 Phase 5 实施记录的 Phase C 行。
+窗口 / 预算残余：窗口未知时不夹紧；登记表人工维护；夹紧只按 maxTokens + 固定边际算不读真实 token；
+逐 run 预算不进台账独立字段（只体现为 `budgetSource=run`）；学到的窗口按端点身份记，换 baseURL 要重学。
 MODEL-01 残余：Web 同步探针回写 compat、成本/延迟真路由、识图能力探针、链健康实时面。
 
 ## 会话中心化（2026-09-03，委托方拍板；两个提交）

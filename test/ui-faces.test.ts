@@ -24,6 +24,10 @@ import {
   filterRunsByQuery,
   whitelistSourceLabel,
   VERDICT_PARSE_FAIL,
+  normalizeContextConfig,
+  deriveContextBudgetKnob,
+  buildNewRunRequest,
+  contextSourceLabel,
 } from "../ui/public/app.js";
 
 const HARNESS = {
@@ -1024,5 +1028,268 @@ describe("裁决获得路径透出到宿主（§2.1 前置）", () => {
       }),
     ]);
     expect(s.verifications[0].recovery).toBeNull();
+  });
+});
+
+// ================================================================
+// MEM-01：上下文窗口（事实）与压缩预算（策略）分离
+// ================================================================
+
+/**
+ * 为什么这一组存在：`contextTokenLimit` 一个数此前同时充当"模型能装多少"与"我们在多少处压"。
+ * 界面上只有一个百分比，于是 150k 的默认预算在窗口 1,048,576 的端点上压了三个月没人看见。
+ * 分开之后界面必须同时说清三件事：**已用**（最近一轮输入）、**预算**（策略，带来源）、
+ * **窗口**（事实，带来源；不知道就说"窗口未知"，不画 0）。
+ *
+ * 纪律（host-lags）：`reduceEvent` 是逐字段白名单投影，不列的字段静默丢弃且不报错。
+ * 所以每个新字段都要三处有锁：投影分支、派生函数、渲染分支（渲染在 ui-a11y.test.ts）。
+ */
+describe("MEM-01 上下文窗口（事实）与预算（策略）分离", () => {
+  const usageEv = (input: number) =>
+    ev("main", {
+      type: "usage", turn: 1,
+      usage: { input_tokens: input, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    });
+
+  /** 宿主 context 投影的完整形状（run_config.context 与 /api/harness.context 同形） */
+  const ctx = (over = {}) => ({
+    window: 10_000, windowSource: "learned",
+    budget: 1000, budgetSource: "default", requestedBudget: 1000,
+    maxBudget: 9000, maxTokens: 500, clamped: false, warning: null,
+    ...over,
+  });
+
+  describe("normalizeContextConfig（白名单投影）", () => {
+    it("九个字段照收，来源按四值枚举校验", () => {
+      const c = normalizeContextConfig(ctx({ budgetSource: "run" }));
+      expect(c).toEqual({
+        window: 10_000, windowSource: "learned",
+        budget: 1000, budgetSource: "run", requestedBudget: 1000,
+        maxBudget: 9000, maxTokens: 500, clamped: false, warning: null,
+      });
+    });
+
+    /** 界面不许替宿主编来源：枚举外的字符串归 unknown / null，而不是原样显示出去 */
+    it("枚举之外的来源字符串归 unknown / null", () => {
+      const c = normalizeContextConfig(ctx({ windowSource: "我猜的", budgetSource: "probably" }));
+      expect(c.windowSource).toBe("unknown");
+      expect(c.budgetSource).toBeNull();
+    });
+
+    it("没有 budget 就整体 null——没有分母画不出任何一段", () => {
+      expect(normalizeContextConfig({ window: 10_000, windowSource: "registry" })).toBeNull();
+      expect(normalizeContextConfig(null)).toBeNull();
+      expect(normalizeContextConfig("150k")).toBeNull();
+    });
+
+    /** window=null 是"未知"，不是 0：0 会被画成一条空条，等于编了一个数 */
+    it("window 缺失 / 非正数 = 窗口未知", () => {
+      expect(normalizeContextConfig(ctx({ window: null })).window).toBeNull();
+      expect(normalizeContextConfig(ctx({ window: 0 })).window).toBeNull();
+    });
+
+    /** 幂等：装配面与两个派生函数都会各自 normalize 一次同一个对象 */
+    it("对已归一化的对象幂等", () => {
+      const once = normalizeContextConfig(ctx());
+      expect(normalizeContextConfig(once)).toEqual(once);
+    });
+  });
+
+  describe("reduceEvent 投影分支", () => {
+    it("run_config.context 进 state.runConfig.context（不列进白名单就静默丢弃）", () => {
+      seq = 0;
+      const s = feed([
+        ev("host", { type: "run_config", guardrails: { contextTokenLimit: 1000 }, context: ctx({ budgetSource: "run" }) }),
+      ]);
+      expect(s.runConfig.context.budget).toBe(1000);
+      expect(s.runConfig.context.budgetSource).toBe("run");
+      expect(s.runConfig.context.window).toBe(10_000);
+      expect(s.runConfig.context.windowSource).toBe("learned");
+    });
+
+    it("旧宿主的 run_config 没有 context 时为 null，不造一个空壳", () => {
+      seq = 0;
+      const s = feed([ev("host", { type: "run_config", guardrails: { contextTokenLimit: 1000 } })]);
+      expect(s.runConfig.context).toBeNull();
+    });
+  });
+
+  describe("deriveContextFace", () => {
+    it("逐 run run_config.context 优先于进程级 harness.context（V-24 同款）", () => {
+      seq = 0;
+      const s = feed([
+        ev("host", { type: "run_config", context: ctx({ budget: 400, budgetSource: "run", window: 20_000 }) }),
+        usageEv(200),
+      ]);
+      const f = deriveContextFace(s, { ...HARNESS, context: ctx() });
+      expect(f.budget).toBe(400); // 不是进程级的 1000
+      expect(f.limit).toBe(400); // 水位分母就是预算
+      expect(f.budgetSource).toBe("run");
+      expect(f.window).toBe(20_000);
+      expect(f.ratio).toBeCloseTo(0.5);
+    });
+
+    it("两处都没有 context 时回落 guardrails.contextTokenLimit，窗口一律未知", () => {
+      seq = 0;
+      const f = deriveContextFace(feed([usageEv(480)]), HARNESS);
+      expect(f.budget).toBe(1000);
+      expect(f.window).toBeNull();
+      expect(f.windowSource).toBe("unknown");
+      expect(f.strip.window).toBeNull();
+      expect(f.strip.total).toBe(1000); // 窗口未知 → 轨道总长就是预算
+      expect(f.windowRatio).toBeNull();
+    });
+
+    /** 窗口已知时轨道总长是窗口，预算只占其中一段——这一段的宽度就是"我们在 10% 处压" */
+    it("窗口已知：三段条总长 = 窗口，预算段与压缩刻度按窗口比例", () => {
+      seq = 0;
+      const f = deriveContextFace(feed([usageEv(480)]), { ...HARNESS, context: ctx() });
+      expect(f.strip.total).toBe(10_000);
+      expect(f.strip.window).toBe(1);
+      expect(f.strip.budget).toBeCloseTo(0.1); // 1000 / 10000
+      expect(f.strip.used).toBeCloseTo(0.048); // 480 / 10000
+      expect(f.strip.threshold).toBeCloseTo(0.08); // 1000 × 0.8 / 10000
+      expect(f.windowRatio).toBeCloseTo(0.048);
+      // 预算的 48% 只是窗口的 4.8%——两个百分比压成一个就是当初那个缺陷
+      expect(f.ratio).toBeCloseTo(0.48);
+    });
+
+    /**
+     * 档位边界：水位是 ≥ 而不是 >。79% 不许说"下一轮将压缩"（会成为一句反复被打脸的假话），
+     * 80% 必须说——compaction 判据取的就是这个数。
+     */
+    it("档位边界：79% 不说下一轮将压缩，80% 说", () => {
+      seq = 0;
+      const below = deriveContextFace(feed([usageEv(790)]), HARNESS);
+      expect(below.ratio).toBeCloseTo(0.79);
+      expect(below.compactNextTurn).toBe(false);
+      expect(below.nearWatermark).toBe(false);
+      seq = 0;
+      const at = deriveContextFace(feed([usageEv(800)]), HARNESS);
+      expect(at.ratio).toBeCloseTo(0.8);
+      expect(at.compactNextTurn).toBe(true);
+      expect(at.nearWatermark).toBe(true);
+    });
+
+    /** 夹紧不是静默降级：生效值、原值、告警原文三样都要能拿到 */
+    it("被夹紧时透出原值与告警原文", () => {
+      seq = 0;
+      const f = deriveContextFace(feed([usageEv(100)]), {
+        ...HARNESS,
+        context: ctx({ budget: 8000, requestedBudget: 150_000, clamped: true, warning: "已夹到 8k：窗口 10k − maxTokens 500 − 边际 4k" }),
+      });
+      expect(f.clamped).toBe(true);
+      expect(f.budget).toBe(8000);
+      expect(f.requestedBudget).toBe(150_000);
+      expect(f.clampWarning).toContain("已夹到 8k");
+      expect(f.maxBudget).toBe(9000);
+      expect(f.maxTokens).toBe(500);
+    });
+  });
+
+  describe("deriveToolsFace / deriveAssemblyBar", () => {
+    it("Tools 面带 context（逐 run 优先），旧宿主为 null 则不显示那一行", () => {
+      seq = 0;
+      const withCtx = deriveToolsFace(feed([ev("host", { type: "run_config", context: ctx() })]), HARNESS);
+      expect(withCtx.context.window).toBe(10_000);
+      seq = 0;
+      expect(deriveToolsFace(feed([usageEv(1)]), HARNESS).context).toBeNull();
+    });
+
+    it("装配条有 context 一格：预算带夹紧标记，窗口未知就写「窗口未知」", () => {
+      seq = 0;
+      const known = deriveAssemblyBar(feed([usageEv(1)]), { ...HARNESS, context: ctx({ budget: 150_000 }) })
+        .find((i) => i.key === "context");
+      expect(known.chip).toContain("150k");
+      expect(known.chip).toContain("窗口 10k");
+      expect(known.why).toContain("窗口 − maxTokens − 边际");
+
+      seq = 0;
+      const clamped = deriveAssemblyBar(feed([usageEv(1)]), {
+        ...HARNESS, context: ctx({ budget: 8000, requestedBudget: 150_000, clamped: true }),
+      }).find((i) => i.key === "context");
+      expect(clamped.chip).toContain("8k↓");
+      expect(clamped.why).toContain("由 150k 夹到 8k");
+
+      seq = 0;
+      const unknown = deriveAssemblyBar(feed([usageEv(1)]), { ...HARNESS, context: ctx({ window: null, windowSource: "unknown" }) })
+        .find((i) => i.key === "context");
+      expect(unknown.chip).toContain("窗口未知");
+    });
+
+    /** 装配条的口径是"chip 为空即整格不出现"（push 的规矩），所以旧宿主根本没有这一格 */
+    it("旧宿主（两处都无 context）不出现这一格，而不是出现一个空数", () => {
+      seq = 0;
+      expect(deriveAssemblyBar(feed([usageEv(1)]), HARNESS).find((i) => i.key === "context")).toBeUndefined();
+    });
+  });
+
+  describe("buildNewRunRequest 的逐 run 预算", () => {
+    it("填了就原样送宿主校验（不在浏览器里夹紧）", () => {
+      expect(buildNewRunRequest({ task: "t", contextTokenLimit: "300000" }).contextTokenLimit).toBe(300_000);
+      // 越界值也照送——夹紧口径只有宿主一处，浏览器擅自改数就是界面说谎
+      expect(buildNewRunRequest({ task: "t", contextTokenLimit: 9_999_999 }).contextTokenLimit).toBe(9_999_999);
+    });
+
+    it("空 / 非数字不送这个字段（沿用 env > 包 > 默认）", () => {
+      expect(buildNewRunRequest({ task: "t" })).not.toHaveProperty("contextTokenLimit");
+      expect(buildNewRunRequest({ task: "t", contextTokenLimit: "" })).not.toHaveProperty("contextTokenLimit");
+      expect(buildNewRunRequest({ task: "t", contextTokenLimit: "  " })).not.toHaveProperty("contextTokenLimit");
+      expect(buildNewRunRequest({ task: "t", contextTokenLimit: "abc" })).not.toHaveProperty("contextTokenLimit");
+    });
+  });
+
+  describe("deriveContextBudgetKnob（提交表单的预算控件）", () => {
+    const wide = normalizeContextConfig(ctx({ window: 1_048_576, windowSource: "registry", budget: 150_000, maxBudget: 963_605, maxTokens: 64_000 }));
+
+    it("上限取 maxBudget，提示写清算式与窗口来源", () => {
+      const k = deriveContextBudgetKnob(wide, "");
+      expect(k.min).toBe(32_000);
+      expect(k.max).toBe(963_605);
+      expect(k.hint).toContain("窗口 1,048k（登记表）");
+      expect(k.hint).toContain("上限 = 窗口 − maxTokens 64k − 边际");
+      expect(k.advisory).toBeNull();
+      expect(k.outOfRange).toBe(false);
+    });
+
+    it("窗口未知：上限取硬顶并明说，不把「不知道」画成一个数", () => {
+      const k = deriveContextBudgetKnob(null, "");
+      expect(k.max).toBe(2_000_000);
+      expect(k.hint).toContain("窗口未知");
+      expect(k.hint).toContain("上限取硬顶");
+      expect(k.placeholder).toContain("150000");
+    });
+
+    /** 忠告是忠告：>200k 说明成本随上下文线性增长，且诚实标注这是**上界**而非预测值 */
+    it("超过 200k 给成本忠告并标明是上界；200k 及以下不给", () => {
+      expect(deriveContextBudgetKnob(wide, "200000").advisory).toBeNull();
+      const hot = deriveContextBudgetKnob(wide, "200001");
+      expect(hot.advisory).toContain("线性增长");
+      expect(hot.advisory).toContain("上界");
+      expect(hot.outOfRange).toBe(false); // 忠告 ≠ 阻断
+    });
+
+    it("越界只提示、不阻断（宿主 400 是最终裁判）", () => {
+      const k = deriveContextBudgetKnob(wide, "9999999");
+      expect(k.outOfRange).toBe(true);
+      expect(k.hint).toContain("越界");
+      expect(deriveContextBudgetKnob(wide, "31999").outOfRange).toBe(true);
+      expect(deriveContextBudgetKnob(wide, "32000").outOfRange).toBe(false);
+    });
+
+    it("占位符报生效预算与来源，被夹紧时说出来", () => {
+      expect(deriveContextBudgetKnob(normalizeContextConfig(ctx({ budget: 8000, clamped: true, requestedBudget: 150_000 })), "").placeholder)
+        .toContain("已夹紧");
+      expect(deriveContextBudgetKnob(normalizeContextConfig(ctx({ budget: 200_000, budgetSource: "env" })), "").placeholder)
+        .toContain("env");
+    });
+  });
+
+  it("来源标签全部有人话，未知不落成 undefined", () => {
+    for (const s of ["env", "learned", "registry", "run", "pack", "default"]) {
+      expect(contextSourceLabel(s)).toBeTruthy();
+    }
+    expect(contextSourceLabel("unknown")).toBe("未知");
+    expect(contextSourceLabel(undefined)).toBe("未知");
   });
 });
