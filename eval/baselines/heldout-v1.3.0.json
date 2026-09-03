@@ -1,0 +1,1547 @@
+{
+  "version": 1,
+  "kind": "heldout-full-matrix-baseline",
+  "tag": "v1.3.0",
+  "commit": "0135c508a3bc26951b834052bfc56600f23a6f18",
+  "date": "2026-09-03",
+  "config": {
+    "suite": "heldout",
+    "arms": [
+      "baseline"
+    ],
+    "executorModel": "deepseek-v4-flash",
+    "verifierModel": null,
+    "plannerModel": null,
+    "reps": 3,
+    "maxTurns": 15,
+    "tokenCap": 6000000,
+    "endpoint": "https://api.deepseek.com/anthropic (Anthropic-compatible, compat mode)",
+    "tools": [
+      "bash",
+      "read_file",
+      "write_file"
+    ],
+    "platform": "win32 (PowerShell 5.1 host) / Node v22.22.3 / Git Bash for bash tool",
+    "runner": "npm run ab (eval/ab.ts) in a detached git worktree pinned to the tag"
+  },
+  "aggregate": {
+    "cases": 25,
+    "runs": 75,
+    "passes": 75,
+    "passRate": 1,
+    "wilson95": {
+      "low": 0.9513,
+      "high": 1
+    },
+    "casesAllPass": 25,
+    "totalTokens": 651543,
+    "totalWallMs": 501438,
+    "perRun": {
+      "tokens": {
+        "p50": 5071,
+        "p95": 29155.79999999999
+      },
+      "wallMs": {
+        "p50": 4161,
+        "p95": 18281.399999999998
+      },
+      "turns": {
+        "p50": 3,
+        "p95": 5.299999999999997
+      }
+    },
+    "taxonomy": {}
+  },
+  "nightlySubset": {
+    "cases": [
+      "ho-write-marker",
+      "ho-arith-product",
+      "ho-pkg-name",
+      "ho-count-md",
+      "ho-pkg-license",
+      "ho-filter-h2"
+    ],
+    "runs": 18,
+    "passes": 18,
+    "totalTokens": 129894,
+    "totalWallMs": 78423,
+    "perRepEquivalent": [
+      {
+        "rep": 1,
+        "passes": 6,
+        "tokens": 40497,
+        "wallMs": 27088
+      },
+      {
+        "rep": 2,
+        "passes": 6,
+        "tokens": 54852,
+        "wallMs": 26384
+      },
+      {
+        "rep": 3,
+        "passes": 6,
+        "tokens": 34545,
+        "wallMs": 24951
+      }
+    ],
+    "currentFloors": {
+      "minPassRate": 1,
+      "maxTotalTokens": 150000,
+      "maxTotalWallMs": 300000
+    }
+  },
+  "notRunnable": [],
+  "cases": [
+    {
+      "id": "ho-write-marker",
+      "covers": "held-out: 单文件精确写入",
+      "status": "runnable",
+      "n": 3,
+      "passes": 3,
+      "passAt1": 1,
+      "wilson95": {
+        "low": 0.4385,
+        "high": 1
+      },
+      "passAtK": {
+        "k": 3,
+        "estimate": 1
+      },
+      "turns": {
+        "p50": 3,
+        "p95": 3
+      },
+      "tokens": {
+        "p50": 3577,
+        "p95": 3937
+      },
+      "wallMs": {
+        "p50": 3251,
+        "p95": 5503.7
+      },
+      "taxonomy": {},
+      "runs": [
+        {
+          "rep": 1,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 3,
+          "tokens": 3977,
+          "wallMs": 5754,
+          "note": "标记精确"
+        },
+        {
+          "rep": 2,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 3,
+          "tokens": 3542,
+          "wallMs": 3212,
+          "note": "标记精确"
+        },
+        {
+          "rep": 3,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 3,
+          "tokens": 3577,
+          "wallMs": 3251,
+          "note": "标记精确"
+        }
+      ]
+    },
+    {
+      "id": "ho-write-two-files",
+      "covers": "held-out: 双文件写入",
+      "status": "runnable",
+      "n": 3,
+      "passes": 3,
+      "passAt1": 1,
+      "wilson95": {
+        "low": 0.4385,
+        "high": 1
+      },
+      "passAtK": {
+        "k": 3,
+        "estimate": 1
+      },
+      "turns": {
+        "p50": 3,
+        "p95": 3
+      },
+      "tokens": {
+        "p50": 3685,
+        "p95": 3699.4
+      },
+      "wallMs": {
+        "p50": 3445,
+        "p95": 3492.7000000000003
+      },
+      "taxonomy": {},
+      "runs": [
+        {
+          "rep": 1,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 3,
+          "tokens": 3701,
+          "wallMs": 3445,
+          "note": "双文件正确"
+        },
+        {
+          "rep": 2,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 3,
+          "tokens": 3555,
+          "wallMs": 3252,
+          "note": "双文件正确"
+        },
+        {
+          "rep": 3,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 3,
+          "tokens": 3685,
+          "wallMs": 3498,
+          "note": "双文件正确"
+        }
+      ]
+    },
+    {
+      "id": "ho-append-lines",
+      "covers": "held-out: 多行确定性内容",
+      "status": "runnable",
+      "n": 3,
+      "passes": 3,
+      "passAt1": 1,
+      "wilson95": {
+        "low": 0.4385,
+        "high": 1
+      },
+      "passAtK": {
+        "k": 3,
+        "estimate": 1
+      },
+      "turns": {
+        "p50": 3,
+        "p95": 3
+      },
+      "tokens": {
+        "p50": 3379,
+        "p95": 3455.5
+      },
+      "wallMs": {
+        "p50": 2921,
+        "p95": 3149.6
+      },
+      "taxonomy": {},
+      "runs": [
+        {
+          "rep": 1,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 2,
+          "tokens": 2182,
+          "wallMs": 1972,
+          "note": "三行正确"
+        },
+        {
+          "rep": 2,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 3,
+          "tokens": 3464,
+          "wallMs": 3175,
+          "note": "三行正确"
+        },
+        {
+          "rep": 3,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 3,
+          "tokens": 3379,
+          "wallMs": 2921,
+          "note": "三行正确"
+        }
+      ]
+    },
+    {
+      "id": "ho-arith-product",
+      "covers": "held-out: 生成数据后求积",
+      "status": "runnable",
+      "n": 3,
+      "passes": 3,
+      "passAt1": 1,
+      "wilson95": {
+        "low": 0.4385,
+        "high": 1
+      },
+      "passAtK": {
+        "k": 3,
+        "estimate": 1
+      },
+      "turns": {
+        "p50": 3,
+        "p95": 3
+      },
+      "tokens": {
+        "p50": 3858,
+        "p95": 3975.8999999999996
+      },
+      "wallMs": {
+        "p50": 4235,
+        "p95": 4629.2
+      },
+      "taxonomy": {},
+      "runs": [
+        {
+          "rep": 1,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 3,
+          "tokens": 3858,
+          "wallMs": 4235,
+          "note": "乘积正确 (720)"
+        },
+        {
+          "rep": 2,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 3,
+          "tokens": 3989,
+          "wallMs": 4673,
+          "note": "乘积正确 (720)"
+        },
+        {
+          "rep": 3,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 3,
+          "tokens": 3789,
+          "wallMs": 3465,
+          "note": "乘积正确 (720)"
+        }
+      ]
+    },
+    {
+      "id": "ho-arith-mean",
+      "covers": "held-out: 均值（整数截断口径写死）",
+      "status": "runnable",
+      "n": 3,
+      "passes": 3,
+      "passAt1": 1,
+      "wilson95": {
+        "low": 0.4385,
+        "high": 1
+      },
+      "passAtK": {
+        "k": 3,
+        "estimate": 1
+      },
+      "turns": {
+        "p50": 3,
+        "p95": 3
+      },
+      "tokens": {
+        "p50": 3984,
+        "p95": 3993.9
+      },
+      "wallMs": {
+        "p50": 3831,
+        "p95": 4163.1
+      },
+      "taxonomy": {},
+      "runs": [
+        {
+          "rep": 1,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 3,
+          "tokens": 3995,
+          "wallMs": 4200,
+          "note": "均值地板正确 (10)"
+        },
+        {
+          "rep": 2,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 3,
+          "tokens": 3939,
+          "wallMs": 3831,
+          "note": "均值地板正确 (10)"
+        },
+        {
+          "rep": 3,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 3,
+          "tokens": 3984,
+          "wallMs": 3581,
+          "note": "均值地板正确 (10)"
+        }
+      ]
+    },
+    {
+      "id": "ho-pkg-name",
+      "covers": "held-out: package.json name 字段",
+      "status": "runnable",
+      "n": 3,
+      "passes": 3,
+      "passAt1": 1,
+      "wilson95": {
+        "low": 0.4385,
+        "high": 1
+      },
+      "passAtK": {
+        "k": 3,
+        "estimate": 1
+      },
+      "turns": {
+        "p50": 4,
+        "p95": 4
+      },
+      "tokens": {
+        "p50": 7143,
+        "p95": 7458.9
+      },
+      "wallMs": {
+        "p50": 4072,
+        "p95": 4180.900000000001
+      },
+      "taxonomy": {},
+      "runs": [
+        {
+          "rep": 1,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 3,
+          "tokens": 5103,
+          "wallMs": 3260,
+          "note": "name 正确 (agent-harness)"
+        },
+        {
+          "rep": 2,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 4,
+          "tokens": 7143,
+          "wallMs": 4072,
+          "note": "name 正确 (agent-harness)"
+        },
+        {
+          "rep": 3,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 4,
+          "tokens": 7494,
+          "wallMs": 4193,
+          "note": "name 正确 (agent-harness)"
+        }
+      ]
+    },
+    {
+      "id": "ho-pkg-license",
+      "covers": "held-out: package.json 可选字段缺省口径",
+      "status": "runnable",
+      "n": 3,
+      "passes": 3,
+      "passAt1": 1,
+      "wilson95": {
+        "low": 0.4385,
+        "high": 1
+      },
+      "passAtK": {
+        "k": 3,
+        "estimate": 1
+      },
+      "turns": {
+        "p50": 4,
+        "p95": 4
+      },
+      "tokens": {
+        "p50": 7277,
+        "p95": 7300.4
+      },
+      "wallMs": {
+        "p50": 3983,
+        "p95": 4538.3
+      },
+      "taxonomy": {},
+      "runs": [
+        {
+          "rep": 1,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 4,
+          "tokens": 7303,
+          "wallMs": 3983,
+          "note": "license 口径正确 (UNLICENSED-HELD)"
+        },
+        {
+          "rep": 2,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 3,
+          "tokens": 5112,
+          "wallMs": 3103,
+          "note": "license 口径正确 (UNLICENSED-HELD)"
+        },
+        {
+          "rep": 3,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 4,
+          "tokens": 7277,
+          "wallMs": 4600,
+          "note": "license 口径正确 (UNLICENSED-HELD)"
+        }
+      ]
+    },
+    {
+      "id": "ho-tsconfig-module",
+      "covers": "held-out: tsconfig 字段抽取",
+      "status": "runnable",
+      "n": 3,
+      "passes": 3,
+      "passAt1": 1,
+      "wilson95": {
+        "low": 0.4385,
+        "high": 1
+      },
+      "passAtK": {
+        "k": 3,
+        "estimate": 1
+      },
+      "turns": {
+        "p50": 3,
+        "p95": 3.9
+      },
+      "tokens": {
+        "p50": 5706,
+        "p95": 8067.599999999999
+      },
+      "wallMs": {
+        "p50": 3573,
+        "p95": 4896
+      },
+      "taxonomy": {},
+      "runs": [
+        {
+          "rep": 1,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 4,
+          "tokens": 8330,
+          "wallMs": 5043,
+          "note": "module=NodeNext"
+        },
+        {
+          "rep": 2,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 3,
+          "tokens": 3730,
+          "wallMs": 3450,
+          "note": "module=NodeNext"
+        },
+        {
+          "rep": 3,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 3,
+          "tokens": 5706,
+          "wallMs": 3573,
+          "note": "module=NodeNext"
+        }
+      ]
+    },
+    {
+      "id": "ho-count-md",
+      "covers": "held-out: bash/工具统计 docs 下 md",
+      "status": "runnable",
+      "n": 3,
+      "passes": 3,
+      "passAt1": 1,
+      "wilson95": {
+        "low": 0.4385,
+        "high": 1
+      },
+      "passAtK": {
+        "k": 3,
+        "estimate": 1
+      },
+      "turns": {
+        "p50": 4,
+        "p95": 4.9
+      },
+      "tokens": {
+        "p50": 4679,
+        "p95": 6998.3
+      },
+      "wallMs": {
+        "p50": 4020,
+        "p95": 5494.2
+      },
+      "taxonomy": {},
+      "runs": [
+        {
+          "rep": 1,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 3,
+          "tokens": 3664,
+          "wallMs": 3878,
+          "note": "md 数正确 (27)"
+        },
+        {
+          "rep": 2,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 5,
+          "tokens": 7256,
+          "wallMs": 5658,
+          "note": "md 数正确 (27)"
+        },
+        {
+          "rep": 3,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 4,
+          "tokens": 4679,
+          "wallMs": 4020,
+          "note": "md 数正确 (27)"
+        }
+      ]
+    },
+    {
+      "id": "ho-filter-h2",
+      "covers": "held-out: 精确前缀过滤（README h2）",
+      "status": "runnable",
+      "n": 3,
+      "passes": 3,
+      "passAt1": 1,
+      "wilson95": {
+        "low": 0.4385,
+        "high": 1
+      },
+      "passAtK": {
+        "k": 3,
+        "estimate": 1
+      },
+      "turns": {
+        "p50": 4,
+        "p95": 4
+      },
+      "tokens": {
+        "p50": 16592,
+        "p95": 26688.199999999997
+      },
+      "wallMs": {
+        "p50": 5666,
+        "p95": 5946.8
+      },
+      "taxonomy": {},
+      "runs": [
+        {
+          "rep": 1,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 3,
+          "tokens": 16592,
+          "wallMs": 5978,
+          "note": "h2 数正确 (8)"
+        },
+        {
+          "rep": 2,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 4,
+          "tokens": 27810,
+          "wallMs": 5666,
+          "note": "h2 数正确 (8)"
+        },
+        {
+          "rep": 3,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 4,
+          "tokens": 7729,
+          "wallMs": 5422,
+          "note": "h2 数正确 (8)"
+        }
+      ]
+    },
+    {
+      "id": "ho-count-test-files",
+      "covers": "held-out: test/ 下 .test.ts 计数",
+      "status": "runnable",
+      "n": 3,
+      "passes": 3,
+      "passAt1": 1,
+      "wilson95": {
+        "low": 0.4385,
+        "high": 1
+      },
+      "passAtK": {
+        "k": 3,
+        "estimate": 1
+      },
+      "turns": {
+        "p50": 3,
+        "p95": 3
+      },
+      "tokens": {
+        "p50": 3563,
+        "p95": 6695.9
+      },
+      "wallMs": {
+        "p50": 3629,
+        "p95": 6107.6
+      },
+      "taxonomy": {},
+      "runs": [
+        {
+          "rep": 1,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 3,
+          "tokens": 3531,
+          "wallMs": 3629,
+          "note": "测试文件数正确 (46)"
+        },
+        {
+          "rep": 2,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 3,
+          "tokens": 3563,
+          "wallMs": 3599,
+          "note": "测试文件数正确 (46)"
+        },
+        {
+          "rep": 3,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 3,
+          "tokens": 7044,
+          "wallMs": 6383,
+          "note": "测试文件数正确 (46)"
+        }
+      ]
+    },
+    {
+      "id": "ho-multi-title",
+      "covers": "held-out: 两文档标题合成",
+      "status": "runnable",
+      "n": 3,
+      "passes": 3,
+      "passAt1": 1,
+      "wilson95": {
+        "low": 0.4385,
+        "high": 1
+      },
+      "passAtK": {
+        "k": 3,
+        "estimate": 1
+      },
+      "turns": {
+        "p50": 4,
+        "p95": 4
+      },
+      "tokens": {
+        "p50": 5862,
+        "p95": 65967.59999999999
+      },
+      "wallMs": {
+        "p50": 5881,
+        "p95": 16031.199999999999
+      },
+      "taxonomy": {},
+      "runs": [
+        {
+          "rep": 1,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 3,
+          "tokens": 3742,
+          "wallMs": 3211,
+          "note": "两标题齐全"
+        },
+        {
+          "rep": 2,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 4,
+          "tokens": 5862,
+          "wallMs": 5881,
+          "note": "两标题齐全"
+        },
+        {
+          "rep": 3,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 4,
+          "tokens": 72646,
+          "wallMs": 17159,
+          "note": "两标题齐全"
+        }
+      ]
+    },
+    {
+      "id": "ho-sort-eval-scripts",
+      "covers": "held-out: 列举+排序",
+      "status": "runnable",
+      "n": 3,
+      "passes": 3,
+      "passAt1": 1,
+      "wilson95": {
+        "low": 0.4385,
+        "high": 1
+      },
+      "passAtK": {
+        "k": 3,
+        "estimate": 1
+      },
+      "turns": {
+        "p50": 3,
+        "p95": 3.9
+      },
+      "tokens": {
+        "p50": 4053,
+        "p95": 7322.7
+      },
+      "wallMs": {
+        "p50": 5391,
+        "p95": 6957
+      },
+      "taxonomy": {},
+      "runs": [
+        {
+          "rep": 1,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 3,
+          "tokens": 4053,
+          "wallMs": 5391,
+          "note": "排序正确 (20)"
+        },
+        {
+          "rep": 2,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 3,
+          "tokens": 4004,
+          "wallMs": 3924,
+          "note": "排序正确 (20)"
+        },
+        {
+          "rep": 3,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 4,
+          "tokens": 7686,
+          "wallMs": 7131,
+          "note": "排序正确 (20)"
+        }
+      ]
+    },
+    {
+      "id": "ho-missing-fallback",
+      "covers": "held-out: 读失败后条件分支",
+      "status": "runnable",
+      "n": 3,
+      "passes": 3,
+      "passAt1": 1,
+      "wilson95": {
+        "low": 0.4385,
+        "high": 1
+      },
+      "passAtK": {
+        "k": 3,
+        "estimate": 1
+      },
+      "turns": {
+        "p50": 4,
+        "p95": 4
+      },
+      "tokens": {
+        "p50": 4964,
+        "p95": 5580.5
+      },
+      "wallMs": {
+        "p50": 4383,
+        "p95": 4681.8
+      },
+      "taxonomy": {},
+      "runs": [
+        {
+          "rep": 1,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 4,
+          "tokens": 5649,
+          "wallMs": 4715,
+          "note": "fallback 正确"
+        },
+        {
+          "rep": 2,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 4,
+          "tokens": 4947,
+          "wallMs": 4383,
+          "note": "fallback 正确"
+        },
+        {
+          "rep": 3,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 4,
+          "tokens": 4964,
+          "wallMs": 4292,
+          "note": "fallback 正确"
+        }
+      ]
+    },
+    {
+      "id": "ho-partial-then-fix",
+      "covers": "held-out: 先错后对（覆盖写）",
+      "status": "runnable",
+      "n": 3,
+      "passes": 3,
+      "passAt1": 1,
+      "wilson95": {
+        "low": 0.4385,
+        "high": 1
+      },
+      "passAtK": {
+        "k": 3,
+        "estimate": 1
+      },
+      "turns": {
+        "p50": 4,
+        "p95": 4
+      },
+      "tokens": {
+        "p50": 5149,
+        "p95": 5788.9
+      },
+      "wallMs": {
+        "p50": 4913,
+        "p95": 6299.9
+      },
+      "taxonomy": {},
+      "runs": [
+        {
+          "rep": 1,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 4,
+          "tokens": 4814,
+          "wallMs": 4422,
+          "note": "最终为 CORRECT"
+        },
+        {
+          "rep": 2,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 4,
+          "tokens": 5149,
+          "wallMs": 4913,
+          "note": "最终为 CORRECT"
+        },
+        {
+          "rep": 3,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 4,
+          "tokens": 5860,
+          "wallMs": 6454,
+          "note": "最终为 CORRECT"
+        }
+      ]
+    },
+    {
+      "id": "ho-workdir-escape-denied",
+      "covers": "held-out: 工作目录外写入必须失败且旁路产物",
+      "status": "runnable",
+      "n": 3,
+      "passes": 3,
+      "passAt1": 1,
+      "wilson95": {
+        "low": 0.4385,
+        "high": 1
+      },
+      "passAtK": {
+        "k": 3,
+        "estimate": 1
+      },
+      "turns": {
+        "p50": 4,
+        "p95": 4.9
+      },
+      "tokens": {
+        "p50": 32296,
+        "p95": 49445.5
+      },
+      "wallMs": {
+        "p50": 46147,
+        "p95": 69976.29999999999
+      },
+      "taxonomy": {},
+      "runs": [
+        {
+          "rep": 1,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 4,
+          "tokens": 32296,
+          "wallMs": 46147,
+          "note": "圈禁保持 + 报告正确"
+        },
+        {
+          "rep": 2,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 4,
+          "tokens": 17464,
+          "wallMs": 18861,
+          "note": "圈禁保持 + 报告正确"
+        },
+        {
+          "rep": 3,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 5,
+          "tokens": 51351,
+          "wallMs": 72624,
+          "note": "圈禁保持 + 报告正确"
+        }
+      ]
+    },
+    {
+      "id": "ho-literal-newline",
+      "covers": "held-out: 成文口径（末尾换行）",
+      "status": "runnable",
+      "n": 3,
+      "passes": 3,
+      "passAt1": 1,
+      "wilson95": {
+        "low": 0.4385,
+        "high": 1
+      },
+      "passAtK": {
+        "k": 3,
+        "estimate": 1
+      },
+      "turns": {
+        "p50": 2,
+        "p95": 2
+      },
+      "tokens": {
+        "p50": 2414,
+        "p95": 2470.7
+      },
+      "wallMs": {
+        "p50": 2749,
+        "p95": 3220.6
+      },
+      "taxonomy": {},
+      "runs": [
+        {
+          "rep": 1,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 2,
+          "tokens": 2477,
+          "wallMs": 3273,
+          "note": "4 字节 XYZ\\n"
+        },
+        {
+          "rep": 2,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 2,
+          "tokens": 2414,
+          "wallMs": 2724,
+          "note": "4 字节 XYZ\\n"
+        },
+        {
+          "rep": 3,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 2,
+          "tokens": 2376,
+          "wallMs": 2749,
+          "note": "4 字节 XYZ\\n"
+        }
+      ]
+    },
+    {
+      "id": "ho-only-digits",
+      "covers": "held-out: 输出纪律（禁止解释文字）",
+      "status": "runnable",
+      "n": 3,
+      "passes": 3,
+      "passAt1": 1,
+      "wilson95": {
+        "low": 0.4385,
+        "high": 1
+      },
+      "passAtK": {
+        "k": 3,
+        "estimate": 1
+      },
+      "turns": {
+        "p50": 5,
+        "p95": 5.9
+      },
+      "tokens": {
+        "p50": 12314,
+        "p95": 19389.8
+      },
+      "wallMs": {
+        "p50": 7907,
+        "p95": 13276.4
+      },
+      "taxonomy": {},
+      "runs": [
+        {
+          "rep": 1,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 4,
+          "tokens": 6802,
+          "wallMs": 6513,
+          "note": "整文件恰为版本号"
+        },
+        {
+          "rep": 2,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 5,
+          "tokens": 12314,
+          "wallMs": 7907,
+          "note": "整文件恰为版本号"
+        },
+        {
+          "rep": 3,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 6,
+          "tokens": 20176,
+          "wallMs": 13873,
+          "note": "整文件恰为版本号"
+        }
+      ]
+    },
+    {
+      "id": "ho-mcp-absent-bypass",
+      "covers": "held-out: 缺 MCP 工具时旁路完成",
+      "status": "runnable",
+      "n": 3,
+      "passes": 3,
+      "passAt1": 1,
+      "wilson95": {
+        "low": 0.4385,
+        "high": 1
+      },
+      "passAtK": {
+        "k": 3,
+        "estimate": 1
+      },
+      "turns": {
+        "p50": 2,
+        "p95": 2
+      },
+      "tokens": {
+        "p50": 2267,
+        "p95": 2322.8
+      },
+      "wallMs": {
+        "p50": 2205,
+        "p95": 2844.8999999999996
+      },
+      "taxonomy": {},
+      "runs": [
+        {
+          "rep": 1,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 2,
+          "tokens": 2209,
+          "wallMs": 2088,
+          "note": "旁路产物正确"
+        },
+        {
+          "rep": 2,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 2,
+          "tokens": 2329,
+          "wallMs": 2916,
+          "note": "旁路产物正确"
+        },
+        {
+          "rep": 3,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 2,
+          "tokens": 2267,
+          "wallMs": 2205,
+          "note": "旁路产物正确"
+        }
+      ]
+    },
+    {
+      "id": "ho-conditional-size",
+      "covers": "held-out: 按文件是否存在分支",
+      "status": "runnable",
+      "n": 3,
+      "passes": 3,
+      "passAt1": 1,
+      "wilson95": {
+        "low": 0.4385,
+        "high": 1
+      },
+      "passAtK": {
+        "k": 3,
+        "estimate": 1
+      },
+      "turns": {
+        "p50": 4,
+        "p95": 4
+      },
+      "tokens": {
+        "p50": 5127,
+        "p95": 5153.1
+      },
+      "wallMs": {
+        "p50": 4793,
+        "p95": 4819.099999999999
+      },
+      "taxonomy": {},
+      "runs": [
+        {
+          "rep": 1,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 4,
+          "tokens": 5027,
+          "wallMs": 3851,
+          "note": "flag=LARGE"
+        },
+        {
+          "rep": 2,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 4,
+          "tokens": 5127,
+          "wallMs": 4793,
+          "note": "flag=LARGE"
+        },
+        {
+          "rep": 3,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 4,
+          "tokens": 5156,
+          "wallMs": 4822,
+          "note": "flag=LARGE"
+        }
+      ]
+    },
+    {
+      "id": "ho-engines-node",
+      "covers": "held-out: engines.node 抽取",
+      "status": "runnable",
+      "n": 3,
+      "passes": 3,
+      "passAt1": 1,
+      "wilson95": {
+        "low": 0.4385,
+        "high": 1
+      },
+      "passAtK": {
+        "k": 3,
+        "estimate": 1
+      },
+      "turns": {
+        "p50": 4,
+        "p95": 4
+      },
+      "tokens": {
+        "p50": 7448,
+        "p95": 7466.9
+      },
+      "wallMs": {
+        "p50": 3982,
+        "p95": 4315
+      },
+      "taxonomy": {},
+      "runs": [
+        {
+          "rep": 1,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 4,
+          "tokens": 7469,
+          "wallMs": 4352,
+          "note": "engines.node=>=22"
+        },
+        {
+          "rep": 2,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 4,
+          "tokens": 7448,
+          "wallMs": 3982,
+          "note": "engines.node=>=22"
+        },
+        {
+          "rep": 3,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 3,
+          "tokens": 5000,
+          "wallMs": 2779,
+          "note": "engines.node=>=22"
+        }
+      ]
+    },
+    {
+      "id": "ho-scripts-test",
+      "covers": "held-out: scripts.test 命令抽取",
+      "status": "runnable",
+      "n": 3,
+      "passes": 3,
+      "passAt1": 1,
+      "wilson95": {
+        "low": 0.4385,
+        "high": 1
+      },
+      "passAtK": {
+        "k": 3,
+        "estimate": 1
+      },
+      "turns": {
+        "p50": 4,
+        "p95": 4
+      },
+      "tokens": {
+        "p50": 7649,
+        "p95": 7920.8
+      },
+      "wallMs": {
+        "p50": 4451,
+        "p95": 5566.099999999999
+      },
+      "taxonomy": {},
+      "runs": [
+        {
+          "rep": 1,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 4,
+          "tokens": 7649,
+          "wallMs": 4451,
+          "note": "scripts.test 正确"
+        },
+        {
+          "rep": 2,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 4,
+          "tokens": 7951,
+          "wallMs": 5690,
+          "note": "scripts.test 正确"
+        },
+        {
+          "rep": 3,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 4,
+          "tokens": 7407,
+          "wallMs": 4161,
+          "note": "scripts.test 正确"
+        }
+      ]
+    },
+    {
+      "id": "ho-docs-file-exists",
+      "covers": "held-out: 存在性探测",
+      "status": "runnable",
+      "n": 3,
+      "passes": 3,
+      "passAt1": 1,
+      "wilson95": {
+        "low": 0.4385,
+        "high": 1
+      },
+      "passAtK": {
+        "k": 3,
+        "estimate": 1
+      },
+      "turns": {
+        "p50": 3,
+        "p95": 3
+      },
+      "tokens": {
+        "p50": 3352,
+        "p95": 3415
+      },
+      "wallMs": {
+        "p50": 3052,
+        "p95": 3063.7
+      },
+      "taxonomy": {},
+      "runs": [
+        {
+          "rep": 1,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 3,
+          "tokens": 3422,
+          "wallMs": 3065,
+          "note": "exists=yes"
+        },
+        {
+          "rep": 2,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 3,
+          "tokens": 3352,
+          "wallMs": 2962,
+          "note": "exists=yes"
+        },
+        {
+          "rep": 3,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 3,
+          "tokens": 3324,
+          "wallMs": 3052,
+          "note": "exists=yes"
+        }
+      ]
+    },
+    {
+      "id": "ho-line-count-env-example",
+      "covers": "held-out: 行数口径（split 非空末行）",
+      "status": "runnable",
+      "n": 3,
+      "passes": 3,
+      "passAt1": 1,
+      "wilson95": {
+        "low": 0.4385,
+        "high": 1
+      },
+      "passAtK": {
+        "k": 3,
+        "estimate": 1
+      },
+      "turns": {
+        "p50": 9,
+        "p95": 9
+      },
+      "tokens": {
+        "p50": 27587,
+        "p95": 34296.5
+      },
+      "wallMs": {
+        "p50": 18033,
+        "p95": 19576.5
+      },
+      "taxonomy": {},
+      "runs": [
+        {
+          "rep": 1,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 9,
+          "tokens": 23043,
+          "wallMs": 18033,
+          "note": "行数正确 (123)"
+        },
+        {
+          "rep": 2,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 9,
+          "tokens": 35042,
+          "wallMs": 19748,
+          "note": "行数正确 (123)"
+        },
+        {
+          "rep": 3,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 9,
+          "tokens": 27587,
+          "wallMs": 16609,
+          "note": "行数正确 (123)"
+        }
+      ]
+    },
+    {
+      "id": "ho-private-flag",
+      "covers": "held-out: boolean JSON 字段",
+      "status": "runnable",
+      "n": 3,
+      "passes": 3,
+      "passAt1": 1,
+      "wilson95": {
+        "low": 0.4385,
+        "high": 1
+      },
+      "passAtK": {
+        "k": 3,
+        "estimate": 1
+      },
+      "turns": {
+        "p50": 4,
+        "p95": 4
+      },
+      "tokens": {
+        "p50": 7309,
+        "p95": 7594.3
+      },
+      "wallMs": {
+        "p50": 3864,
+        "p95": 4203.3
+      },
+      "taxonomy": {},
+      "runs": [
+        {
+          "rep": 1,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 4,
+          "tokens": 7309,
+          "wallMs": 3864,
+          "note": "private=TRUE"
+        },
+        {
+          "rep": 2,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 4,
+          "tokens": 7626,
+          "wallMs": 4241,
+          "note": "private=TRUE"
+        },
+        {
+          "rep": 3,
+          "pass": true,
+          "stopReason": "completed",
+          "turns": 3,
+          "tokens": 5071,
+          "wallMs": 3252,
+          "note": "private=TRUE"
+        }
+      ]
+    }
+  ]
+}

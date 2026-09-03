@@ -17,6 +17,21 @@
   逐字段来源 + `armed`（完成门关着时明说 loop 不读）。暂未给任何包填数——台账里的 max_turns 全部
   发生在恢复机制落地之前，数字等实测。
 
+### 工具（Tools）
+
+- **修复：Windows 宿主下 bash 子进程丢掉父进程 PATH**（d565e7a）。1.3.0 起（回归自 1653b7b）bash 工具
+  子进程只剩 Git usr/bin，`node` / `git` / `python` 一律 "command not found"；根因是 `{ ...process.env }`
+  展开后键名为 `Path`，而代码新建了第二个 `PATH` 键、spawn 时后者胜出。现在按大小写不敏感写回原键。
+  CI（ubuntu）与 vitest worker（键已规范为 `PATH`）都碰不到这条路径，由 EVAL-01 基线 transcript 回放发现。
+
+### 评估（Eval）
+
+- **EVAL-01 held-out 全量基线（v1.3.0）**：25 条 `ho-*` × 3 rep，`deepseek-v4-flash` × `baseline`，75/75；
+  `eval/baselines/heldout-v1.3.0.json` + `eval/heldout-report-v1.3.0.md`（含非失败形态的 transcript 归因、
+  nightly 地板建议；地板未动）。
+- 修复 `eval/stats.ts` 读不到 A/B 行墙钟：`ab.ts` 落的是 `wallMs`，stats 只认 `durationMs`，
+  wall p50/p95 此前恒为 "—"（6d7ee55）。
+
 ## [1.3.0] - 2026-09-03
 
 ### Web 宿主与对话（Web host & conversation）

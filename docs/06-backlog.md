@@ -10,8 +10,18 @@
 **已落地（含第一波）**：
 - TEST-01a / EVAL-02 / EVAL-03a / MODEL-01a / EVAL-03b — 见 docs/08。
 - **EVAL-03c** — release 质量/成本/延迟门 + 地板收紧（证据 nightly #33646201722 6/6）。
-- **EVAL-01[~]** — `eval/cases-heldout.ts` 24×`ho-*`；`AB_SUITE=heldout`；nightly/release 六件套已切 held-out。
+- **EVAL-01[~]** — `eval/cases-heldout.ts` 25×`ho-*`；`AB_SUITE=heldout`；nightly/release 六件套已切 held-out。
   research `eval/cases.ts` **不是** held-out；本会话未为追分改 prompt。
+  **v1.3.0 全量基线已跑（2026-09-03）**：在钉住 tag 的 detached worktree 里 `AB_REPS=3` × 25 = 75 run
+  （`deepseek-v4-flash` × `baseline`，与 nightly 同臂），**75/75**，651k tokens / 501 s，零失败 taxonomy；
+  机器可读 `eval/baselines/heldout-v1.3.0.json`，人读 `eval/heldout-report-v1.3.0.md`（含每条非失败形态的
+  transcript 归因与 nightly 地板建议——地板未动）。回放 transcript 抓出两条缺陷并在 main 单独修：
+  ① **Windows 宿主下 bash 子进程丢父 PATH**（1653b7b 把 `process.env["PATH"]` 换成 plain object 读取，
+  `Path`/`PATH` 两键并存、子进程只剩 Git usr/bin → node/git/python 全 "command not found"；vitest worker 里键名
+  已被规范成 `PATH` 所以单测抓不到；修 `prependBashPath` 写回原键）；② `stats.ts` 不认 ab-log 的 `wallMs`。
+  基线数字是修复前的 v1.3.0。**接手提醒**：`ho-workdir-escape-denied` 通过靠模型自律（report 模式 bash 无圈禁），
+  不是圈禁证据；下一步候选——PATH 修复后对 ho-line-count-env-example / ho-only-digits 复测轮数回落，以及
+  nightly 跨夜 ab-log 聚合进 EVAL-02 stats（n=3 单用例 Wilson 下界只有 43.8%）。
 - **OBS-01[~]** — `src/trace.ts` + `trace.jsonl`；`GET /api/runs/:id/trace` 脱敏导出。
 - **RUN-01[~ Phase 1+2]** — ADR-003；`state.json`；崩溃→interrupted；**同 run 热恢复**（checkpoint 边界，`sameRunResume`/`run_resumed`）；预算+grantAudit 进 state。
 - **MEM-01[~ Phase A]** — 语义压缩：`[compact_ledger]` + 语义占位；非 LLM；mutation `compact-ledger-skipped`。
