@@ -35,11 +35,17 @@ the npm manifest; local histories, `.env`, worktrees, demos, and customer artifa
 `desktop:dist:unsigned` is local-test-only and must never be uploaded as a release.
 
 Releases are cut by pushing a `vX.Y.Z` tag that exactly matches `package.json`. The `Release` workflow
-re-runs this entire gate, builds a Windows installer on `windows-latest`, and requires a valid
-Authenticode signature from repository secrets `WIN_CSC_LINK` and `WIN_CSC_KEY_PASSWORD`. Only after
-that artifact passes signature verification does it build and push the container image to GHCR
-(`ghcr.io/<owner>/agent-harness`, version tag plus `sha-<commit>` tag) and attach the installer to the
-GitHub Release. Production always deploys the digest recorded in that Release, never a mutable tag —
+re-runs this entire gate plus the deterministic scenario gate and the real-provider quality gate
+(`eval/baselines/release.json`). When repository secrets `WIN_CSC_LINK` and `WIN_CSC_KEY_PASSWORD` are
+present it builds a Windows installer on `windows-latest`, requires a valid Authenticode signature, and
+attaches the installer to the GitHub Release; when they are absent the `desktop-windows` job is skipped
+and the release ships without an installer — an unsigned installer is never published, and the Release
+notes state that the job was skipped. The container image is then built, smoke-tested (`/health` plus the
+OCI execution-boundary canary) and pushed to GHCR (`ghcr.io/<owner>/agent-harness`, version tag plus
+`sha-<commit>` tag); the Release notes record the image digest and the matching `CHANGELOG.md` section.
+Running the workflow manually (`workflow_dispatch`) is a dry run: same gate and image build, nothing
+pushed, no Release created — use it before tagging, because a pushed tag is never moved or deleted.
+Production always deploys the digest recorded in that Release, never a mutable tag —
 the recorded digest survives builder cache pruning and machine changes, which makes rollback executable.
 
 ## Deployment

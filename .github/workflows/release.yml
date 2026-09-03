@@ -2,12 +2,20 @@
 # 门禁（与 runbook 的 release gate 逐条一致）全过 → 镜像推 GHCR（版本 tag + git-sha tag）
 # → GitHub Release 正文记录镜像 digest——runbook 回滚程序"redeploy the previously
 # recorded image digest"的那个 digest 从此有一个不随构建机丢失的家。
+#
+# workflow_dispatch = 预演（dry run）：跑完整门禁 + 镜像构建 / health 烟测 / OCI canary，
+# 但不校验 tag、不推 GHCR、不建 Release——打标签之前先把流水线本身跑一遍，
+# 免得拿一个不可移动的 tag 去试 workflow。
+#
+# Windows 安装包：签名凭据（WIN_CSC_LINK / WIN_CSC_KEY_PASSWORD）缺失时 desktop-windows
+# 整个跳过，镜像与 Release 照常出——未签名安装包永远不发布（runbook 纪律），跳过而不是降级。
 name: Release
 
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -21,6 +29,8 @@ jobs:
   gate:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    outputs:
+      has_signing: ${{ steps.signing.outputs.has_signing }}
     env:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       ANTHROPIC_BASE_URL: ${{ vars.ANTHROPIC_BASE_URL }}
@@ -33,7 +43,21 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts
       - name: Verify tag and package version match
+        if: github.event_name == 'push'
         run: test "${GITHUB_REF_NAME}" = "v$(node -p "require('./package.json').version")"
+      # secrets 不能直接进 job 级 if，所以在这里落成 job output 给 desktop-windows 用。
+      # 只判"凭据在不在"：配了但配错必须在 desktop-windows 里大声失败，不能被当成缺失跳过。
+      - name: Detect Windows signing credentials
+        id: signing
+        env:
+          WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+        run: |
+          if [ -n "$WIN_CSC_LINK" ]; then
+            echo "has_signing=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_signing=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Windows installer skipped::WIN_CSC_LINK / WIN_CSC_KEY_PASSWORD 未配置：desktop-windows 跳过，本次发布不含 Windows 安装包（未签名产物不发布）"
+          fi
       - run: npm audit
       - run: npm run typecheck
       - run: npm test
@@ -101,6 +125,7 @@ jobs:
 
   desktop-windows:
     needs: gate
+    if: needs.gate.outputs.has_signing == 'true'
     runs-on: windows-latest
     timeout-minutes: 30
     env:
@@ -138,8 +163,14 @@ jobs:
 
   image:
     needs: [gate, desktop-windows]
+    # desktop-windows 因无签名凭据跳过时镜像照常出；gate 失败或 run 被取消仍不跑。
+    # 没有 !cancelled() 时，needs 里任一 job 跳过会把本 job 连带跳过。
+    if: ${{ !cancelled() && needs.gate.result == 'success' && (needs.desktop-windows.result == 'success' || needs.desktop-windows.result == 'skipped') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      DESKTOP_RESULT: ${{ needs.desktop-windows.result }}
+      PUBLISH: ${{ github.event_name == 'push' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -148,24 +179,31 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts
       - uses: actions/download-artifact@v4
+        if: needs.desktop-windows.result == 'success'
         with:
           name: agent-harness-windows
           path: desktop-artifact
       - name: Log in to GHCR
+        if: github.event_name == 'push'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push
-        id: push
+      - name: Build image, health smoke, OCI canary
+        id: build
         run: |
           # GHCR 引用必须全小写；镜像名固定 agent-harness，与仓库名解耦
           IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/agent-harness"
-          TAG="${GITHUB_REF_NAME}"
+          if [ "$PUBLISH" = "true" ]; then TAG="${GITHUB_REF_NAME}"; else TAG="dry-run-${GITHUB_SHA::12}"; fi
           SHA_TAG="sha-${GITHUB_SHA::12}"
           docker build --tag "$IMAGE:$TAG" --tag "$IMAGE:$SHA_TAG" .
-          IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$IMAGE:$TAG")"
+          # 运行时镜像本身：能起来并回答 /health（E2E-01 容器半边，与 CI container job 同一脚本）
+          node scripts/container-health-smoke.mjs "$IMAGE:$TAG"
+          # OCI 执行边界 canary：worker 用最小 shell 镜像（与 CI container job 同口径，61111f4）；
+          # agent-harness 是 UI 运行时，不适合当 bash 沙箱。
+          docker pull debian:bookworm-slim
+          IMAGE_ID="$(docker image inspect --format '{{.Id}}' debian:bookworm-slim)"
           RUNTIME="$(readlink -f "$(command -v docker)")"
           RUNTIME_SHA256="$(sha256sum "$RUNTIME" | awk '{print $1}')"
           test -n "$IMAGE_ID"
@@ -174,27 +212,49 @@ jobs:
           AGENT_TEST_OCI_RUNTIME="$RUNTIME" \
           AGENT_TEST_OCI_RUNTIME_SHA256="$RUNTIME_SHA256" \
             npx vitest run test/execution-broker-oci.test.ts
+          {
+            echo "image=$IMAGE"
+            echo "tag=$TAG"
+            echo "sha_tag=$SHA_TAG"
+          } >> "$GITHUB_OUTPUT"
+      - name: Push image (records digest)
+        id: push
+        if: github.event_name == 'push'
+        env:
+          IMAGE: ${{ steps.build.outputs.image }}
+          TAG: ${{ steps.build.outputs.tag }}
+          SHA_TAG: ${{ steps.build.outputs.sha_tag }}
+        run: |
           docker push "$IMAGE:$TAG"
           docker push "$IMAGE:$SHA_TAG"
           DIGEST="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$TAG")"
           test -n "$DIGEST"
-          {
-            echo "image=$IMAGE"
-            echo "tag=$TAG"
-            echo "digest=$DIGEST"
-          } >> "$GITHUB_OUTPUT"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
           {
             echo "## 发布镜像"
             echo '```'
             echo "AGENT_IMAGE=$DIGEST"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Dry-run summary (nothing pushed)
+        if: github.event_name != 'push'
+        env:
+          IMAGE: ${{ steps.build.outputs.image }}
+          TAG: ${{ steps.build.outputs.tag }}
+        run: |
+          {
+            echo "## 预演：镜像已构建并通过 health 烟测 + OCI canary，未推 GHCR、未建 Release"
+            echo
+            echo "- 本地镜像：\`${IMAGE}:${TAG}\`"
+            echo "- desktop-windows：${DESKTOP_RESULT}"
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Create GitHub Release (records the digest)
+        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
           DIGEST: ${{ steps.push.outputs.digest }}
-          IMAGE: ${{ steps.push.outputs.image }}
-          IMG_TAG: ${{ steps.push.outputs.tag }}
+          IMAGE: ${{ steps.build.outputs.image }}
+          IMG_TAG: ${{ steps.build.outputs.tag }}
         run: |
           {
             echo "部署引用（digest 固定，回滚时把 AGENT_IMAGE 换回上一个 Release 记录的 digest）："
@@ -204,6 +264,26 @@ jobs:
             echo '```'
             echo
             echo "同镜像的可读 tag：\`${IMAGE}:${IMG_TAG}\`（tag 可被覆盖，生产部署一律用上面的 digest 引用）。"
-            echo "发布门禁（typecheck / 单测 / build / 确定性场景门 / 真实 provider 质量·成本·延迟门 / pack 白名单 / cross-app / audit）在本 workflow 的 gate job 全过后才构建镜像。"
+            echo "发布门禁（typecheck / 单测 / build / 确定性场景门 / 真实 provider 质量·成本·延迟门 / pack 白名单 / cross-app / audit）在本 workflow 的 gate job 全过后才构建镜像；镜像本身另过 /health 烟测与 OCI 执行边界 canary。"
           } > release-notes.md
-          gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --notes-file release-notes.md desktop-artifact/*
+          # 没有签名凭据时 desktop-windows 被跳过，没有安装包可附；未签名产物不发布，正文照实说。
+          shopt -s nullglob
+          assets=(desktop-artifact/*)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            {
+              echo
+              echo "本次发布不含 Windows 安装包：签名凭据（WIN_CSC_LINK / WIN_CSC_KEY_PASSWORD）未配置，desktop-windows job 跳过（result: ${DESKTOP_RESULT}）；未签名产物不发布。"
+            } >> release-notes.md
+          fi
+          # CHANGELOG.md 里本版本那一节（"## [X.Y.Z]" 到下一个 "## [" 之前）附进 Release 正文；没有就只记 digest。
+          if [ -f CHANGELOG.md ]; then
+            awk -v head="## [${GITHUB_REF_NAME#v}]" '
+              index($0, head) == 1 { found = 1; next }
+              found && /^## \[/ { exit }
+              found { print }
+            ' CHANGELOG.md > changelog-section.md
+            if [ -s changelog-section.md ]; then
+              { echo; echo "## 变更（摘自 CHANGELOG.md）"; cat changelog-section.md; } >> release-notes.md
+            fi
+          fi
+          gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --notes-file release-notes.md "${assets[@]}"

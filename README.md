@@ -98,7 +98,10 @@ Nightly（`.github/workflows/nightly.yml`）跑 **held-out** 真实 provider 小
 
 Release tag 门（`.github/workflows/release.yml` `gate`）在确定性场景门之后，**在打标签的提交上重跑**
 同一 held-out 子集，对照 `eval/baselines/release.json`（不得比 nightly 更松），报告落 artifact
-`release-quality-eval`。缺少 secret/vars 时 fail-closed，不静默跳过。
+`release-quality-eval`。缺少 secret/vars 时 fail-closed，不静默跳过。发布流程本身：门禁全过 →
+镜像构建 + `/health` 烟测 + OCI canary → 推 GHCR → GitHub Release 记录 digest 并附 `CHANGELOG.md`
+对应小节；Windows 签名凭据（`WIN_CSC_LINK` / `WIN_CSC_KEY_PASSWORD`）缺失时 `desktop-windows` 跳过，
+**不发布未签名安装包**。手动触发（`workflow_dispatch`）是预演：同一门禁与镜像构建，不推送、不建 Release。
 
 真实 CLI/Web 宿主默认要求 `finish_task` 结构化收尾，`end_turn` 不再直接等于完成。
 长任务可用以下总账与恢复参数（PowerShell）：
