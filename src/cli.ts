@@ -38,6 +38,9 @@
  *   AGENT_VERIFY_MAX_TURNS 可选，核查者轮次预算（env > 包 verify.maxTurns > 默认 15）。
  *                       真机域每条验收要多次探针往返,15 装不下（案例 #8）;
  *                       非法值退出码 1,不静默降级
+ *   AGENT_VERIFY_READONLY_COMMANDS 可选，**无领域包**运行的核查者只读命令白名单（逗号分隔，
+ *                       前缀匹配），替换通用缺省 ls/cat/head/tail/wc/grep/stat/od/diff/git 只读四件。
+ *                       有包时不生效——白名单由包声明，包没声明也不补
  *   AGENT_PLAN_MAX_TURNS 可选，planner 探索轮次预算（env > 包 plan.maxTurns 取最大
  *                       > 默认 12,见 B0——planner 面对整个包菜单,故取声明值最大）。
  *                       非法值退出码 1,口径同 AGENT_VERIFY_MAX_TURNS
@@ -84,7 +87,7 @@ import { AgentLoop, DEFAULT_MAX_TURNS } from "./loop.js";
 import { connectMcpServers, loadMcpConfig } from "./mcp.js";
 import { createMemoryTools, MemoryStore } from "./memory.js";
 import { AUTO_CONCURRENCY_CAP, plannedStopReason, planParallelWidth, runPlanned, runVerified } from "./orchestrate.js";
-import type { VerifyOutcome } from "./verifier.js";
+import { resolveVerifierReadOnlyCommands, type VerifyOutcome } from "./verifier.js";
 import { getPack, PACKS, RULE_PRECEDENCE_DISCIPLINE, selectPackTools, type DomainPack } from "./presets.js";
 import { resolveRecoveryPolicy } from "./recovery.js";
 import { routeToPack } from "./router.js";
@@ -592,6 +595,16 @@ async function main(): Promise<void> {
   })();
   const verifyMaxTurnsOf = (p?: { verify: { maxTurns?: number } }): number | undefined =>
     envVerifyMaxTurns ?? p?.verify.maxTurns;
+  /**
+   * 核查白名单：包说了算（没声明也不补）；**无包**才用 AGENT_VERIFY_READONLY_COMMANDS > 通用缺省
+   * （委托方批准的例外——无包核查者连 ls/cat 都被拒，3 行文件核查 7 轮 153 s 落 unverified）。
+   */
+  const readOnlyFor = (p?: DomainPack) =>
+    resolveVerifierReadOnlyCommands(p, process.env.AGENT_VERIFY_READONLY_COMMANDS);
+  if (withVerify || withPlan) {
+    const ro = readOnlyFor(pack);
+    console.log(c.dim(`verifier whitelist: ${ro.commands.length} 条 (${ro.source})`));
+  }
 
   /** planner 探索预算的显式覆盖（口径同 AGENT_VERIFY_MAX_TURNS：非法值当场退出） */
   const envPlanMaxTurns = (() => {
@@ -940,7 +953,8 @@ async function main(): Promise<void> {
           },
           verify: {
             ...(p?.verify.instructions ? { verifyInstructions: p.verify.instructions } : {}),
-            ...(p?.verify.readOnlyCommands ? { verifyReadOnlyCommands: p.verify.readOnlyCommands } : {}),
+            // 无包子任务同样拿通用缺省（"无包"是按子任务算的，planner 漏写 pack 的子任务就是无包）
+            ...(readOnlyFor(p).commands.length ? { verifyReadOnlyCommands: readOnlyFor(p).commands } : {}),
             ...((envRubric ?? p?.verify.rubric) ? { verifyRubric: (envRubric ?? p?.verify.rubric)! } : {}),
             ...(verifyMaxTurnsOf(p) !== undefined ? { verifyMaxTurns: verifyMaxTurnsOf(p)! } : {}),
             ...(verifierProvider
@@ -1044,7 +1058,7 @@ async function main(): Promise<void> {
   } else if (withVerify) {
     const outcome = await runVerified(config, modelClient, task, {
       ...(pack?.verify.instructions ? { verifyInstructions: pack.verify.instructions } : {}),
-      ...(pack?.verify.readOnlyCommands ? { verifyReadOnlyCommands: pack.verify.readOnlyCommands } : {}),
+      ...(readOnlyFor(pack).commands.length ? { verifyReadOnlyCommands: readOnlyFor(pack).commands } : {}),
       ...((envRubric ?? pack?.verify.rubric) ? { verifyRubric: (envRubric ?? pack?.verify.rubric)! } : {}),
       ...(verifyMaxTurnsOf(pack) !== undefined ? { verifyMaxTurns: verifyMaxTurnsOf(pack)! } : {}),
       ...(verifierProvider

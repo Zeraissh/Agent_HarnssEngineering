@@ -311,26 +311,30 @@ const scenarios: Scenario[] = [
 
   {
     id: "verifier-readonly-deny",
-    title: "核查者的 bash 被只读门拒绝 → 换只读手段后交付裁决",
+    title: "无包核查者：写类 bash 被只读门拒绝，通用只读缺省放行 cat → 交付裁决",
     guards:
-      "verifier 只读硬约束（P6）：没有领域白名单时 bash 必须 deny 且回 is_error，" +
-      "而不是执行；deny 之后核查照常能收口",
+      "verifier 只读硬约束（P6）两面：① 无领域包时核查者拿**通用只读缺省**（委托方批准的例外，" +
+      "否则连 cat 都被拒、核查饥饿落 unverified）——`cat answer.txt` 必须真的执行并回 42；" +
+      "② 写类构造（重定向）仍必须 deny 且回 is_error，产物一个字节不许动",
     args: ["--yes", "--verify"],
     task: "write answer.txt containing 42",
     scripts: [
       turn(tu("write_file", { path: "answer.txt", content: "42\n" })),
       turn(finishTask("completed", "wrote answer.txt", { artifacts: ["answer.txt"] })),
-      // 核查第一轮：试图跑 bash（无白名单 → deny）
+      // 核查第一轮：试图改写产物（重定向 = 写路径）→ deny
+      turn(tu("bash", { command: "echo 0 > answer.txt" })),
+      // 核查第二轮：通用只读缺省放行 cat → 真实产出 42
       turn(tu("bash", { command: "cat answer.txt" })),
-      // 核查第二轮：改用 read_file 后交付
-      turn(submitVerdict({ passed: true, summary: "answer.txt reads 42 (verified via read_file)" })),
+      turn(submitVerdict({ passed: true, summary: "answer.txt reads 42 (verified via cat)" })),
     ],
     expect: {
       exitCode: 0,
-      includes: ["核查通过", "Verifier is read-only"],
+      // 「║ ✓ [execution boundary=」= 核查者的 bash 真的执行了（被 deny 的调用不会产生执行边界头）
+      includes: ["核查通过", "Verifier is read-only", "║ ✓ [execution boundary=", "verifier whitelist: 13 条 (default)"],
+      // deny 真的挡住了写：产物仍是 42
       files: { "answer.txt": "42\n" },
       ledger: { finalPassed: true, verificationRecoveries: ["tool"] },
-      requestCount: 4,
+      requestCount: 5,
     },
   },
 

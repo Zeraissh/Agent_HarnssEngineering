@@ -188,6 +188,73 @@ export interface VerifyOutcome {
 export const DEFAULT_VERIFIER_MAX_TURNS = 15;
 
 /**
+ * **无领域包**运行的核查者只读命令白名单（委托方批准的例外，2026-09-03）。
+ *
+ * 本仓的纪律是白名单由领域包声明（"独立重推导需要哪些命令"是领域知识）。但没有包
+ * 时核查者连 `ls` / `cat` 都被拒——每条 bash 都撞审批门被 deny，只能退化成 read_file
+ * 逐个猜，最后落 unverified。真模型冒烟：一个 3 行文件的核查跑了 7 轮 / 153 s，
+ * 结论还是"查不了"。这是案例 #4 那个 22 轮空转（核查饥饿）的无包版本。
+ *
+ * 所以给无包运行一份**最小通用只读集**：列文件、看内容、数行、搜文本、看元数据、看
+ * 字节、比对、git 只读四件。刻意不收：
+ *   - `find`——`-delete` / `-exec` 是写路径，而 isReadOnlyCommand 只看前缀不看参数；
+ *     列目录用 `ls -R` 或 `git ls-files`；
+ *   - `python` / `node` / `npx` 等解释器与构建器——那是"跑项目代码"级别的信任，
+ *     只能由包按域声明（python-coding 的 `python -m pytest`、ts-coding 的 `npx vitest run`）；
+ *   - `sed` / `awk`——`sed -i` 写文件；它们仍可作为管道**尾段**的只读过滤器（READ_FILTERS）。
+ * **只在没有领域包时生效**：包声明了什么就是什么，包没声明也不补——包的沉默可能是有意的
+ * （stm32-debug 根本不给 bash）。宿主可用 AGENT_VERIFY_READONLY_COMMANDS（逗号分隔）替换
+ * 这份缺省，同样只对无包运行生效。安全语义不变：仍经 isReadOnlyCommand 的重定向 / 链式 /
+ * 命令替换拦截。
+ */
+export const DEFAULT_VERIFIER_READ_ONLY_COMMANDS: readonly string[] = [
+  "ls",
+  "cat",
+  "head",
+  "tail",
+  "wc",
+  "grep",
+  "stat",
+  "od",
+  "diff",
+  "git status",
+  "git diff",
+  "git log",
+  "git show",
+];
+
+/** AGENT_VERIFY_READONLY_COMMANDS 的解析：逗号分隔、去空白、丢空项；未设或全空 → undefined */
+export function parseReadOnlyCommandsEnv(raw: string | undefined): string[] | undefined {
+  if (raw === undefined) return undefined;
+  const items = raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return items.length > 0 ? items : undefined;
+}
+
+export type VerifierReadOnlySource = "pack" | "env" | "default" | "none";
+
+/**
+ * 核查白名单的解析。**包优先且包说了算**：有包就用包的（没声明 = none，不补缺省）；
+ * 无包才轮到 env（AGENT_VERIFY_READONLY_COMMANDS）> 通用缺省。返回来源供宿主如实报出——
+ * 界面上"白名单 13"如果不说是通用缺省，人会以为是自己配的。
+ */
+export function resolveVerifierReadOnlyCommands(
+  pack: { verify: { readOnlyCommands?: string[] } } | undefined,
+  envRaw?: string,
+): { commands: string[]; source: VerifierReadOnlySource } {
+  if (pack) {
+    return pack.verify.readOnlyCommands
+      ? { commands: [...pack.verify.readOnlyCommands], source: "pack" }
+      : { commands: [], source: "none" };
+  }
+  const fromEnv = parseReadOnlyCommandsEnv(envRaw);
+  if (fromEnv) return { commands: fromEnv, source: "env" };
+  return { commands: [...DEFAULT_VERIFIER_READ_ONLY_COMMANDS], source: "default" };
+}
+
+/**
  * 预算用尽后"收口续跑"的额外轮次上限（9.7）。
  * 刻意很小：这一步只允许写裁决，不允许继续取证——大了就等于偷偷放宽调查预算。
  */

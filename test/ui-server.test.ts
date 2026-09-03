@@ -41,7 +41,7 @@ import { PLAN_TOOL_NAME } from "../src/planner.js";
 import { resolveRecoveryPolicy } from "../src/recovery.js";
 import { REQUIREMENTS_TOOL_NAME } from "../src/clarifier.js";
 import { FINISH_TASK_TOOL_NAME } from "../src/task-completion.js";
-import { VERDICT_TOOL_NAME } from "../src/verifier.js";
+import { DEFAULT_VERIFIER_READ_ONLY_COMMANDS, VERDICT_TOOL_NAME } from "../src/verifier.js";
 import { PACKS } from "../src/presets.js";
 import { bashTool } from "../src/tools/bash.js";
 import { DEFAULT_HISTORY_KEEP, historyKeepCount, historyRootPath } from "../ui/history.js";
@@ -1389,6 +1389,70 @@ describe("ui-server", () => {
     expect(vResult.event.result.content).toContain("916 passed");
   });
 
+  /**
+   * 无包运行的核查者拿通用只读缺省（委托方批准的例外）：此前无包 = 无白名单 = 每条 bash 都 deny，
+   * 真模型冒烟 3 行文件核查 7 轮 153 s 落 unverified。两面都锁：cat 放行、重定向仍拒；
+   * run_config / /api/harness 如实报出生效列表与来源（否则界面把它画成"白名单 0 · 核查饥饿"）。
+   */
+  it("v2-7b. 无包运行：核查者的 cat 经通用缺省放行，重定向仍被拒；快照报 source=default", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([textBlock("已实现")], "end_turn"),
+      fakeMessage([toolUseBlock("v_write", "bash", { command: "echo 0 > answer.txt" })], "tool_use"),
+      fakeMessage([toolUseBlock("v_cat", "bash", { command: "cat answer.txt" })], "tool_use"),
+      fakeMessage(
+        [textBlock(JSON.stringify({ passed: true, issues: [], summary: "answer.txt reads 42" }))],
+        "end_turn",
+      ),
+    ]);
+    handle = createUiServer({
+      modelClient: model,
+      tools: [makeTool({ name: "bash", permission: "ask", parallelSafe: false,
+        execute: async (input) => ({ content: `ran: ${(input as { command: string }).command}` }) })],
+      workdir: process.cwd(),
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+
+    const snap = await (await fetch(`${base}/api/harness`)).json() as any;
+    expect(snap.verifierReadOnlySource).toBe("default");
+    expect(snap.verifierReadOnlyCommands).toEqual([...DEFAULT_VERIFIER_READ_ONLY_COMMANDS]);
+    // 包视图照实说"包没声明"——两个字段回答的是不同的问题
+    expect(snap.pack.verify.readOnlyCommands).toEqual([]);
+
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "pack-less verifier default whitelist", verify: true }),
+    })).json() as { runId: string };
+    await waitForDone(base, runId);
+    const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+    const rc = events.find((e: any) => e.event.type === "run_config") as any;
+    expect(rc.event.verifierReadOnlySource).toBe("default");
+    expect(rc.event.verifierReadOnlyCommands).toContain("cat");
+
+    const results = events
+      .filter((e: any) => e.source === "verifier" && e.event.type === "tool_result")
+      .map((e: any) => e.event.result);
+    expect(results).toHaveLength(2);
+    expect(results[0].isError).toBe(true); // 重定向 = 写路径，仍 deny
+    expect(results[0].content).toContain("Verifier is read-only");
+    expect(results[1].isError).toBeFalsy(); // cat 经通用缺省放行并真的执行
+    expect(results[1].content).toBe("ran: cat answer.txt");
+  });
+
+  it("v2-7c. 有包但包未声明白名单 → 不补缺省（包的沉默是有意的），快照 source=none", async () => {
+    // stm32-debug 的 verify 没有 readOnlyCommands（也不给 bash）
+    handle = createUiServer({
+      modelClient: new FakeModelClient([]),
+      packName: "stm32-debug",
+      workdir: process.cwd(),
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+    const snap = await (await fetch(`${base}/api/harness`)).json() as any;
+    expect(snap.verifierReadOnlySource).toBe("none");
+    expect(snap.verifierReadOnlyCommands).toEqual([]);
+  });
+
   // ---- V-18 宿主真相快照 ----
   it("v2-8. GET /api/harness 暴露包/工具面/护栏/只读根/effort，且不含密钥", async () => {
     handle = createUiServer({
@@ -1405,6 +1469,9 @@ describe("ui-server", () => {
     // 与 CLI 同源：护栏取自领域包
     expect(snap.guardrails.maxTurns).toBe(30);
     expect(snap.pack.verify.readOnlyCommands.length).toBeGreaterThan(0);
+    // 有包 → 生效白名单就是包声明的那份，来源 pack（通用缺省只给无包运行）
+    expect(snap.verifierReadOnlySource).toBe("pack");
+    expect(snap.verifierReadOnlyCommands).toEqual(PACKS["python-coding"]!.verify.readOnlyCommands);
     expect(snap.pack.verify.mode).toBeTruthy();
     expect(snap.verifierBudgetTurns).toBe(15);
     // planner 预算同款（B0）：数字 + 来源，缺一不可。

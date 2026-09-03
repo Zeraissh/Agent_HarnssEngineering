@@ -19,8 +19,10 @@ import {
   deriveLogEntries,
   buildFactorCards,
   derivePlanFace,
+  deriveAssemblyBar,
   normalizeTab,
   filterRunsByQuery,
+  whitelistSourceLabel,
   VERDICT_PARSE_FAIL,
 } from "../ui/public/app.js";
 
@@ -882,6 +884,73 @@ describe("计划确认门", () => {
         verification: deriveVerificationFace(s, HARNESS),
       }).find((c) => c.id === "loop");
       expect(card.lines).toContain("⤷ 恢复决策 1 次");
+    });
+  });
+
+  /**
+   * 无包运行的核查者拿通用只读缺省（委托方批准的例外）。界面此前只读 pack.verify.readOnlyCommands，
+   * 无包 = "白名单 0"，再撞一次审批门就报"核查饥饿"——而核查者手里其实有 13 条。
+   * 生效值与来源经 run_config / harness 报出，三处（投影 / 派生 / 状态条）一次锁死。
+   */
+  describe("核查白名单的生效值与来源（无包 = 通用缺省）", () => {
+    const defaults = ["ls", "cat", "head", "grep", "git status"];
+
+    it("run_config 报了生效列表 → 面上用它而不是包声明；来源 default 标「通用默认」", () => {
+      seq = 0;
+      const s = feed([
+        ev("host", {
+          type: "run_config",
+          pack: { name: null, verify: { readOnlyCommands: [] } },
+          verifierReadOnlyCommands: defaults,
+          verifierReadOnlySource: "default",
+        }),
+        ev("verifier", { type: "approval_request", toolUseId: "v1", name: "bash", input: { command: "rm x" } }),
+      ]);
+      expect(s.runConfig.verifierReadOnlyCommands).toEqual(defaults);
+      expect(s.runConfig.verifierReadOnlySource).toBe("default");
+      const face = deriveVerificationFace(s, HARNESS);
+      expect(face.whitelist).toEqual(defaults);
+      expect(face.whitelistSource).toBe("default");
+      // 有 13 条缺省在手却报"无白名单饥饿"就是说谎
+      expect(face.starvation.noWhitelist).toBe(false);
+      const chip = deriveAssemblyBar(s, HARNESS).find((i) => i.key === "verify");
+      expect(chip.chip).toContain("白名单 5(通用默认)");
+      expect(whitelistSourceLabel("default")).toBe("通用默认");
+      expect(whitelistSourceLabel("pack")).toBe("");
+    });
+
+    it("包声明 → 来源 pack 不加标签；包沉默 → none 标「包未声明」且列表为空", () => {
+      seq = 0;
+      const fromPack = feed([
+        ev("host", {
+          type: "run_config",
+          pack: { name: "python-coding", verify: { readOnlyCommands: ["python -m pytest"] } },
+          verifierReadOnlyCommands: ["python -m pytest"],
+          verifierReadOnlySource: "pack",
+        }),
+      ]);
+      expect(deriveAssemblyBar(fromPack, HARNESS).find((i) => i.key === "verify").chip).toContain("白名单 1");
+      expect(deriveAssemblyBar(fromPack, HARNESS).find((i) => i.key === "verify").chip).not.toContain("(");
+
+      seq = 0;
+      const silent = feed([
+        ev("host", {
+          type: "run_config",
+          pack: { name: "stm32-debug", verify: { readOnlyCommands: [] } },
+          verifierReadOnlyCommands: [],
+          verifierReadOnlySource: "none",
+        }),
+      ]);
+      expect(deriveVerificationFace(silent, HARNESS).whitelist).toEqual([]);
+      expect(deriveVerificationFace(silent, HARNESS).whitelistSource).toBe("none");
+    });
+
+    it("旧宿主没报生效列表 → 回落到包声明（行为不变）", () => {
+      seq = 0;
+      const s = feed([ev("host", { type: "run_config", pack: { name: "python-coding", verify: { readOnlyCommands: ["python -m pytest"] } } })]);
+      const face = deriveVerificationFace(s, HARNESS);
+      expect(face.whitelist).toEqual(["python -m pytest"]);
+      expect(face.whitelistSource).toBeNull();
     });
   });
 

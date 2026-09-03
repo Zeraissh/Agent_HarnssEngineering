@@ -183,6 +183,24 @@ tier 2 跳过 / 反应式跳过 / 截断绕过 / 配对规则删除 / 超长判�
 自身不缩（20 条/桶上限）；折叠块按行摘要、轮数多时自身会长；tier 2 触发是字符/4 粗估不读真 token；反应式只重发一次
 （第二次超长即 error，不再砍保护窗）；未开 Phase B 时长 assistant 推理里的非模板事实随折叠丢失。
 
+### ④ 无包运行的核查者通用只读缺省（委托方批准的例外）—— ✅ 已实施
+
+**缺口**：白名单只来自 `DomainPack.verify.readOnlyCommands`；无包 = 无白名单 = 每条 bash 都 deny → 核查饥饿落
+`unverified`。真模型冒烟：3 行文件核查 **7 轮 / 153 s**。为什么是例外而不是纪律修订，见 docs/05 发现 7b。
+
+**落地**：`DEFAULT_VERIFIER_READ_ONLY_COMMANDS`（13 条：ls / cat / head / tail / wc / grep / stat / od / diff /
+git status / diff / log / show；刻意不含 find、解释器、sed）；`resolveVerifierReadOnlyCommands(pack, envRaw)` →
+`{ commands, source: pack | env | default | none }`——**有包就用包的，包沉默 = none 不补**；无包才
+`AGENT_VERIFY_READONLY_COMMANDS`（逗号分隔）> 缺省。CLI 三处（verified / 计划子任务；启动行 `verifier whitelist: N 条 (src)`）
+与 Web（`buildVerifyOptions` / 计划子任务；`run_config` + `/api/harness` 报 `verifierReadOnlyCommands` /
+`verifierReadOnlySource`；注入宿主读空 env）同提交；`app.js` 投影 → `deriveVerificationFace.whitelist/whitelistSource`
+（有 13 条在手不再报"无白名单饥饿"）→ 状态条「白名单 N(通用默认)」/ Verification 面来源标注。
+确定性场景 `verifier-readonly-deny` 改锁两面：`echo 0 > answer.txt` 仍 deny 且产物不动、`cat answer.txt` 真的执行。
+
+**锁**：verifier 4 条（解析规则 / 缺省集合每条过安全门且不含禁项 / 读放行写仍拦 12+12 例）；ui-server `v2-7b`
+（无包：重定向 deny + cat 放行 + 快照 source=default）/ `v2-7c`（包沉默 source=none）/ `v2-8` 补 pack 来源；
+ui-faces 3 条。变异 4 处逐一打红：包沉默补缺省 / Web 装配忽略解析结果 / reducer 丢列表 / 缺省列表混入 find。
+
 以下为历史交接页（2026-08-08 收工），仍有参考价值；新开工优先看 `docs/08`。
 
 ---

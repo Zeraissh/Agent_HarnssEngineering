@@ -239,6 +239,12 @@ case-04 的 A/B 对照量化了白名单影响：
 
 白名单使 verifier 从"只能读文件的被动观察者"升级为"能亲手重跑门禁的主动验证者"（详见第 6 节 python-coding 包）。deny 消息即教学，白名单即能力边界说明书。
 
+**发现 7b —— 无包运行的核查饥饿与"通用只读缺省"例外**（2026-09-03，`src/verifier.ts` `DEFAULT_VERIFIER_READ_ONLY_COMMANDS`）
+
+发现 7 的白名单来自领域包，而**没有领域包**的运行此前等于没有白名单：核查者的每一条 bash——哪怕是 `ls` / `cat`——都撞审批门被 deny，只能退化成 read_file 逐个猜，最后落 `unverified`。真模型冒烟（deepseek，无包 `--verify`）：核查一个 **3 行文件**跑了 **7 轮 / 153 s**，结论仍是"查不了"。这是发现 6 形态③在无包场景的常态化——不是偶发误伤，是配置面天然缺一块。
+
+本仓的纪律是"白名单由领域声明"（独立重推导需要哪些命令是领域知识，`python -m pytest` 与 `kicad-cli` 不可能有通用集）。委托方批准了一个**显式例外**：给无包运行一份最小通用只读集——列文件 / 看内容 / 数行 / 搜文本 / 元数据 / 字节 / 比对 / git 只读四件（13 条）。边界写死三条：① **只对无包运行生效**——有包就用包的，包没声明也不补（包的沉默可能是有意的，stm32-debug 根本不给 bash）；② 刻意不收 `find`（`-delete` / `-exec` 是写路径而前缀匹配不看参数）、解释器与构建器（那是"跑项目代码"级别的信任，只能由包按域声明）、`sed` / `awk`（`sed -i` 写文件；作为管道尾段过滤器仍可用）；③ 安全语义不变——仍经 `isReadOnlyCommand` 的重定向 / 链式 / 命令替换拦截，确定性场景 `verifier-readonly-deny` 同时锁两面：`echo 0 > answer.txt` 仍 deny 且产物一个字节不动，`cat answer.txt` 真的执行。宿主经 `AGENT_VERIFY_READONLY_COMMANDS` 可替换这份缺省（同样只对无包运行），并在 CLI 启动行 / Web `run_config` / `/api/harness` 报出生效列表与来源（`pack` / `env` / `default` / `none`）——"白名单 13"若不说是通用缺省，人会以为是自己配的。
+
 **发现 8 —— rule-precedence 纪律在 verifier 裁决端同样适用**（`eval/ab-report-rulefirst.md`）
 
 baseline vs rule-first（各 5 次 × 2 用例）：**合计 7/10 → 10/10**，失败模式 100% 命中 letter-vs-spirit 目标，零基建/格式噪声。该纪律已进入 `src/presets.ts`。verifier 评判执行者产出时，同样以任务给出的成文规则为最高优先级——消除 verifier 与执行者在规则解释上的不一致空间（详见第 2 节定律二）。

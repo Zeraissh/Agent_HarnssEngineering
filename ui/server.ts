@@ -43,7 +43,7 @@ import { probeEndpointCapabilities, type EndpointCapabilities } from "../src/mod
 import { getPack, selectPackTools, PACKS, RULE_PRECEDENCE_DISCIPLINE, type DomainPack } from "../src/presets.js";
 import { connectMcpServers, loadMcpConfig, type McpRuntime } from "../src/mcp.js";
 import { createWorkdirScopedMemoryTools, MEMORY_TOOL_NAMES } from "../src/memory.js";
-import { DEFAULT_VERIFIER_MAX_TURNS } from "../src/verifier.js";
+import { DEFAULT_VERIFIER_MAX_TURNS, resolveVerifierReadOnlyCommands } from "../src/verifier.js";
 import { resolvePlannerMaxTurns } from "../src/planner.js";
 import type { Plan, SubTask } from "../src/planner.js";
 import { resolveRecoveryPolicy } from "../src/recovery.js";
@@ -2722,15 +2722,24 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         ? "pack"
         : "default";
 
+  /**
+   * 核查白名单：包说了算（没声明也不补）；**无包**才用 AGENT_VERIFY_READONLY_COMMANDS > 通用缺省
+   * （委托方批准的例外——无包核查者连 ls/cat 都被拒，3 行文件核查 7 轮 153 s 落 unverified）。
+   * 仪器纪律：env 只武装真实宿主；注入模型的宿主读空 env（缺省即通用缺省）。
+   */
+  const readOnlyFor = (p?: DomainPack) =>
+    resolveVerifierReadOnlyCommands(p, realHost ? process.env.AGENT_VERIFY_READONLY_COMMANDS : undefined);
+
   function buildVerifyOptions(run?: StoredRun) {
     const runPack = run?.packName ? getPack(run.packName) : pack;
     // rubric 是任务属性，包只提供缺省：逐 run > env > 包（口径同 src/cli.ts）
     const runRubric = run?.rubric || rubric || runPack?.verify.rubric;
     // 角色模型默认启用（配了就用，口径同 CLI）；逐 run 可显式关掉做 A/B 对照
     const useVerifier = run?.useVerifierModel ?? true;
+    const readOnly = readOnlyFor(runPack);
     return {
       ...(runPack?.verify.instructions ? { verifyInstructions: runPack.verify.instructions } : {}),
-      ...(runPack?.verify.readOnlyCommands ? { verifyReadOnlyCommands: runPack.verify.readOnlyCommands } : {}),
+      ...(readOnly.commands.length ? { verifyReadOnlyCommands: readOnly.commands } : {}),
       ...(runRubric ? { verifyRubric: runRubric } : {}),
       ...(verifyMaxTurnsOf(runPack) !== undefined ? { verifyMaxTurns: verifyMaxTurnsOf(runPack)! } : {}),
       ...(verifierRole && useVerifier
@@ -3913,7 +3922,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             },
             verify: {
               ...(sp?.verify.instructions ? { verifyInstructions: sp.verify.instructions } : {}),
-              ...(sp?.verify.readOnlyCommands ? { verifyReadOnlyCommands: sp.verify.readOnlyCommands } : {}),
+              // 无包子任务同样拿通用缺省（planner 漏写 pack 的子任务就是无包）
+              ...(readOnlyFor(sp).commands.length ? { verifyReadOnlyCommands: readOnlyFor(sp).commands } : {}),
               ...(runRubric ? { verifyRubric: runRubric } : {}),
               // 逐子任务按各自的包取核查预算：编排下 s1(coding) 与 s2(debug)
               // 的核查工作量差一个量级，共用一个数就是案例 #8 那个失效
@@ -4297,6 +4307,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       plannerBudgetSource: plannerBudgetSource(),
       // 恢复策略同款：逐 run 按包解析，三字段各带来源 + armed（完成门关着时数字无效）
       recovery: recoverySnapshot(runPack),
+      // 核查白名单的生效值 + 来源：无包运行拿通用缺省，界面若只读 pack.verify.readOnlyCommands
+      // 会显示"白名单 0 · 核查饥饿"——而实际核查者手里有 13 条
+      verifierReadOnlyCommands: readOnlyFor(runPack).commands,
+      verifierReadOnlySource: readOnlyFor(runPack).source,
       workdir: cfg.workdir,
       executionIsolation: executionBoundary,
       roleModels: {
@@ -4476,6 +4490,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       plannerBudgetSource: plannerBudgetSource(),
       // 恢复策略：进程级默认包的值；逐 run 的真实值走 run_config（口径同核查预算）
       recovery: recoverySnapshot(pack),
+      // 核查白名单生效值 + 来源（无包 = 通用缺省 / env；有包 = 包声明或 none）
+      verifierReadOnlyCommands: readOnlyFor(pack).commands,
+      verifierReadOnlySource: readOnlyFor(pack).source,
       pack: packView(pack),
       tools: tools.map((t) => ({
         name: t.name,

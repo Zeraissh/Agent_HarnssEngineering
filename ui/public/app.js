@@ -604,6 +604,12 @@ export function reduceEvent(state, sseEvent) {
         // 恢复策略（领域包可声明）：三字段 + 逐字段来源 + armed。armed 必须保真——
         // 完成门关着时 loop 根本不读这些数，界面若只显示数字就是在说谎
         recovery: normalizeRecoveryConfig(event.recovery),
+        // 核查白名单的**生效值**与来源：无包运行拿通用缺省（委托方批准的例外），
+        // 只读 pack.verify.readOnlyCommands 会把它画成"白名单 0 · 核查饥饿"
+        verifierReadOnlyCommands: Array.isArray(event.verifierReadOnlyCommands)
+          ? event.verifierReadOnlyCommands.map(String)
+          : null,
+        verifierReadOnlySource: event.verifierReadOnlySource ? String(event.verifierReadOnlySource) : null,
         // MODEL-01a：null = 没配这条防线，[] 与它不是一回事，别用 ?? [] 抹平
         fallbackChain: Array.isArray(event.fallbackChain) ? event.fallbackChain.map(String) : null,
         fallbackChains: event.fallbackChains && typeof event.fallbackChains === "object"
@@ -1466,6 +1472,30 @@ export function deriveToolsFace(state, harness) {
 }
 
 /**
+ * 核查白名单的生效值与来源：逐 run 的 run_config 优先于进程级 `/api/harness`；两者都没报
+ * （旧宿主）→ commands=null，调用方回落到 pack.verify.readOnlyCommands。
+ * @returns {{commands: string[]|null, source: string|null}}
+ */
+function resolveEffectiveWhitelist(state, harness) {
+  const rc = state.runConfig;
+  if (rc && Array.isArray(rc.verifierReadOnlyCommands)) {
+    return { commands: rc.verifierReadOnlyCommands, source: rc.verifierReadOnlySource ?? null };
+  }
+  if (harness && Array.isArray(harness.verifierReadOnlyCommands)) {
+    return { commands: harness.verifierReadOnlyCommands.map(String), source: harness.verifierReadOnlySource ?? null };
+  }
+  return { commands: null, source: null };
+}
+
+/** 白名单来源的短标签（状态条 / Verification 面共用；pack 与未知不标——那是常态） */
+export function whitelistSourceLabel(source) {
+  if (source === "default") return "通用默认";
+  if (source === "env") return "env";
+  if (source === "none") return "包未声明";
+  return "";
+}
+
+/**
  * Verification 面：三值裁决 + 三类饥饿告警。
  *
  * `pass_with_notes` 是刻意独立的一态：CLI 对 passed=true 但 issues 非空会
@@ -1484,7 +1514,9 @@ export function deriveVerificationFace(state, harness) {
 
   const segments = deriveSegments(state);
   const runPack = state.runConfig?.pack ?? harness?.pack;
-  const whitelist = runPack?.verify?.readOnlyCommands ?? [];
+  // 生效白名单优先于包声明：无包运行拿的是通用缺省（run_config 报出来的才是核查者手里那份）
+  const effective = resolveEffectiveWhitelist(state, harness);
+  const whitelist = effective.commands ?? runPack?.verify?.readOnlyCommands ?? [];
 
   // ① 白名单饥饿：verifier 没有可用的只读命令，却确实撞上了审批门——案例 #4 的形态。
   //    注意判据不能看 pendingApprovals：verifier 的审批由 harness 内部自答，
@@ -1504,6 +1536,8 @@ export function deriveVerificationFace(state, harness) {
     rounds: state.verifications,
     finalPassed: state.runEnd?.finalPassed ?? (v ? v.passed : null),
     whitelist,
+    // pack = 包声明；default = 无包通用缺省；env = AGENT_VERIFY_READONLY_COMMANDS；none = 包沉默；null = 旧宿主没报
+    whitelistSource: effective.source,
     rubricSource: state.runConfig?.rubricSource ?? runPack?.verify?.rubricSource ?? null,
     // 逐 run 的 run_config 优先于进程级快照：编排下各子任务的包不同，
     // 核查预算也不同（9.1），读进程级会显示另一个包的数
@@ -2969,8 +3003,12 @@ export function deriveAssemblyBar(state, harness) {
    * 而四道门禁的地面真值早已全绿——把"查不了"错判成"没做对"，
    * 那是 fail-closed 三种误伤里代价最高的一种。所以它不适用"空就不显示"。
    */
-  const wl = (cfg.pack ?? harness?.pack)?.verify?.readOnlyCommands ?? [];
-  const wlPart = state.verify ? `·白名单 ${wl.length}` : "";
+  // 生效白名单（无包运行 = 通用缺省）优先于包声明；来源非包时标出来——"白名单 13"若不说是通用缺省，
+  // 人会以为是自己配的
+  const wlEff = resolveEffectiveWhitelist(state, harness);
+  const wl = wlEff.commands ?? (cfg.pack ?? harness?.pack)?.verify?.readOnlyCommands ?? [];
+  const wlSrc = whitelistSourceLabel(wlEff.source);
+  const wlPart = state.verify ? `·白名单 ${wl.length}${wlSrc ? `(${wlSrc})` : ""}` : "";
   push(
     "verify",
     state.verify ? `核查开${cfg.verifierBudgetTurns ? ` ${cfg.verifierBudgetTurns} 轮` : ""}${wlPart}` : "核查关",
@@ -5702,7 +5740,12 @@ function renderVerifyTab(state, face) {
     }
 
     html += '<h3 class="overview-section-title">核查者的边界</h3><dl class="boundary-list">';
-    html += `<dt>只读白名单</dt><dd>${face.whitelist.length ? esc(face.whitelist.join("、")) : "（空——只能读文件，无法重跑门禁）"}</dd>`;
+    html += `<dt>只读白名单</dt><dd>${
+      face.whitelist.length
+        ? esc(face.whitelist.join("、")) +
+          (whitelistSourceLabel(face.whitelistSource) ? ` <small>（${esc(whitelistSourceLabel(face.whitelistSource))}）</small>` : "")
+        : "（空——只能读文件，无法重跑门禁）"
+    }</dd>`;
     // 不再写"固定"：9.1 之后领域包可用 verify.maxTurns 覆盖，
     // 而"这个数从哪来"决定了人要不要去改它
     html += `<dt>核查预算</dt><dd>${face.budgetTurns ?? "—"} 轮${

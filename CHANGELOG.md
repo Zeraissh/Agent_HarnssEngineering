@@ -23,8 +23,15 @@
   （默认 40k）截断并附分页提示——MCP 返回无上限的兜底；② tier 2：tier 1 置换后估算仍在水位上时，把保护窗外的
   旧轮折叠成一个 `[compacted_turns]` 摘要块（配对不拆、幂等、只合并不二折）；③ 端点 context-too-long 400
   （Anthropic「prompt is too long」/ OpenAI `context_length_exceeded`）不再直接报错：忽略水位硬压缩后重发同一轮，
-  仍超长才以 `context_overflow` 分类收尾。`compaction` 事件新增 `collapsedTurns` / `reactive`，CLI 与 Web 同步显示；
+  仍超长才以 `context_overflow` 分类收尾。  `compaction` 事件新增 `collapsedTurns` / `reactive`，CLI 与 Web 同步显示；
   mock provider 新增 `context_overflow` 故障与确定性场景。
+
+### 核查（Verification）
+
+- **无领域包运行的核查者拿通用只读缺省**（委托方批准的例外）：13 条 ls / cat / head / tail / wc / grep / stat /
+  od / diff / git 只读四件，仍经重定向 / 链式 / 命令替换拦截；有包就用包的，包未声明也不补；
+  `AGENT_VERIFY_READONLY_COMMANDS` 可替换缺省（同样只对无包运行）。CLI 启动行与 Web `run_config` / `/api/harness`
+  报生效列表与来源。此前无包核查者连 `cat` 都被拒（3 行文件核查 7 轮 / 153 s 落 unverified）。
 
 ### 工具（Tools）
 

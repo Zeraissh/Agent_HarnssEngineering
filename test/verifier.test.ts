@@ -4,11 +4,15 @@ import { continuationVerifyTask, runVerified, verdictFeedbackSummary } from "../
 import { FINISH_TASK_TOOL_NAME, withTaskCompletion } from "../src/task-completion.js";
 import {
   DEFAULT_VERIFIER_MAX_TURNS,
+  DEFAULT_VERIFIER_READ_ONLY_COMMANDS,
   VERIFIER_WRAPUP_MAX_TURNS,
   VERDICT_PARSE_FAIL,
   VERDICT_TOOL_NAME,
   createVerdictTool,
+  isReadOnlyCommand,
+  parseReadOnlyCommandsEnv,
   parseVerdict,
+  resolveVerifierReadOnlyCommands,
   runVerifier,
   verdictFromToolInput,
 } from "../src/verifier.js";
@@ -435,6 +439,85 @@ describe("runVerified 续跑入口（continuation）", () => {
     const task = continuationVerifyTask("原任务", "本轮要求");
     expect(task.indexOf("【本轮指令】本轮要求")).toBeGreaterThanOrEqual(0);
     expect(task.indexOf("【本轮指令】")).toBeLessThan(task.indexOf("原任务"));
+  });
+});
+
+/**
+ * 无包运行的通用只读缺省（委托方批准的例外）。锁三件事：
+ *  ① 解析规则——包说了算（没声明 = none，**不补**）、无包才 env > 缺省；
+ *  ② 缺省集合过得了自己的安全门（每条都是 isReadOnlyCommand 认的只读形态），且刻意不含
+ *     find / 解释器 / sed；
+ *  ③ 缺省集合下写类构造仍被拦：重定向、链式、git 写命令、find -delete。
+ */
+describe("无包运行的通用只读缺省（resolveVerifierReadOnlyCommands）", () => {
+  it("有包：用包声明的；包未声明 → none 且不补缺省（包的沉默可能是有意的）", () => {
+    const declared = resolveVerifierReadOnlyCommands(PACKS["python-coding"]);
+    expect(declared.source).toBe("pack");
+    expect(declared.commands).toEqual(PACKS["python-coding"]!.verify.readOnlyCommands);
+    const silent = resolveVerifierReadOnlyCommands(PACKS["stm32-debug"]);
+    expect(silent).toEqual({ commands: [], source: "none" });
+    // 有包时 env 不生效——白名单是领域声明，不由宿主环境放宽
+    expect(resolveVerifierReadOnlyCommands(PACKS["stm32-debug"], "rm, dd").source).toBe("none");
+  });
+
+  it("无包：env 覆盖 > 通用缺省；env 逗号分隔去空白，全空当没设", () => {
+    const dflt = resolveVerifierReadOnlyCommands(undefined);
+    expect(dflt.source).toBe("default");
+    expect(dflt.commands).toEqual([...DEFAULT_VERIFIER_READ_ONLY_COMMANDS]);
+    expect(resolveVerifierReadOnlyCommands(undefined, " ls , git status,,")).toEqual({
+      commands: ["ls", "git status"],
+      source: "env",
+    });
+    expect(resolveVerifierReadOnlyCommands(undefined, " , ").source).toBe("default");
+    expect(parseReadOnlyCommandsEnv(undefined)).toBeUndefined();
+  });
+
+  it("缺省集合：每条都是只读形态且刻意不含 find / 解释器 / sed", () => {
+    for (const cmd of DEFAULT_VERIFIER_READ_ONLY_COMMANDS) {
+      expect(isReadOnlyCommand(cmd, [...DEFAULT_VERIFIER_READ_ONLY_COMMANDS]), cmd).toBe(true);
+    }
+    for (const banned of ["find", "python", "node", "npx", "sed", "awk", "rm"]) {
+      expect(DEFAULT_VERIFIER_READ_ONLY_COMMANDS.some((c) => c.split(" ")[0] === banned), banned).toBe(false);
+    }
+    // git 只收四个只读子命令：写类子命令一个都不在
+    for (const banned of ["git commit", "git checkout", "git stash", "git push", "git add", "git"]) {
+      expect(DEFAULT_VERIFIER_READ_ONLY_COMMANDS.includes(banned), banned).toBe(false);
+    }
+  });
+
+  it("缺省集合下：读放行、写仍拦（重定向 / 链式 / git 写命令 / find -delete / 前缀伪装）", () => {
+    const list = [...DEFAULT_VERIFIER_READ_ONLY_COMMANDS];
+    for (const ok of [
+      "cat answer.txt",
+      "ls -la src",
+      "head -n 20 README.md",
+      "wc -l a.txt b.txt",
+      'grep -n "a\\|b" file.txt',
+      "git status --short",
+      "git diff -- src/loop.ts",
+      "git log --oneline -5",
+      "git show HEAD:package.json",
+      "cat big.log | grep error | head -n 5",
+      "od -c file.bin | head",
+    ]) {
+      expect(isReadOnlyCommand(ok, list), ok).toBe(true);
+    }
+    for (const bad of [
+      "echo 0 > answer.txt",
+      "cat a.txt > b.txt",
+      "cat a.txt && rm a.txt",
+      "git commit -m x",
+      "git checkout -- .",
+      "git stash",
+      "find . -name '*.tmp' -delete",
+      "catalog",
+      "lsblk",
+      "cat $(rm -rf x)",
+      "sed -i 's/a/b/' f",
+      "python -c 'print(1)'",
+    ]) {
+      expect(isReadOnlyCommand(bad, list), bad).toBe(false);
+    }
   });
 });
 
