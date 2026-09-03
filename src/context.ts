@@ -1,10 +1,11 @@
 /**
  * L3 — ContextManager：模型每次看到什么。
  * 决策（docs/02）：system 冻结；两个缓存断点（system 尾块 + 最近一条消息尾块）；
- * v0.3 起 compact() 为真实实现；MEM-01 起 elision 附带结构化 semantic ledger。
+ * v0.3 起 compact() 为真实实现；MEM-01 起 elision 附带结构化 semantic ledger；
+ * Phase B 可选 LLM 摘要经 compactAsync 合并进账本（默认关、fail-open）。
  */
 import type Anthropic from "@anthropic-ai/sdk";
-import type { Effort, ModelRequest } from "./types.js";
+import type { Effort, ModelClient, ModelRequest } from "./types.js";
 import {
   COMPACT_LEDGER_MARKER,
   type CompactLedger,
@@ -20,6 +21,12 @@ import {
   mergeCompactLedgers,
   parseCompactLedgerText,
 } from "./compact-ledger.js";
+import {
+  DEFAULT_COMPACT_SUMMARY_MAX_TOKENS,
+  collectCompactExcerpts,
+  mergeSummaryIntoLedger,
+  summarizeForCompact,
+} from "./compact-summary.js";
 
 /** 可携带 cache_control 的 content 块类型（thinking 块不可缓存标记） */
 const CACHEABLE_TYPES = new Set(["text", "image", "tool_use", "tool_result", "document"]);
@@ -36,6 +43,13 @@ export interface ContextConfig {
   protectRecent?: number;
   /** 从持久化检查点恢复时的上一轮实际输入水位；缺省 0（全新会话） */
   initialInputTokens?: number;
+  /**
+   * MEM-01 Phase B：可选摘要 ModelClient。缺省 / 未注入 = 只走 Phase A 启发式。
+   * 不经 ToolContext——与 describe_image 同款装配纪律。
+   */
+  summaryClient?: ModelClient;
+  /** Phase B 摘要 max_tokens 上限；默认 512 */
+  summaryMaxTokens?: number;
 }
 
 export interface CompactResult {
@@ -46,6 +60,8 @@ export interface CompactResult {
   ledgerEntries: number;
   /** MEM-01：本次写入正史的结构化账本；未压缩时为空账本 */
   ledger: CompactLedger;
+  /** Phase B：本次是否成功合并了 LLM 摘要（失败/未配置均为 false） */
+  summaryApplied?: boolean;
 }
 
 /** 触发压缩的水位：上一轮实际输入超过上限的 80% */
@@ -60,6 +76,8 @@ export class DefaultContextManager {
   private readonly cacheBreakpoints: boolean;
   private readonly contextTokenLimit: number;
   private readonly protectRecent: number;
+  private readonly summaryClient: ModelClient | undefined;
+  private readonly summaryMaxTokens: number;
   /** 上一轮的实际输入规模（input + cacheW + cacheR），是"上下文有多大"的唯一可靠信号 */
   private lastInputTokens = 0;
 
@@ -72,6 +90,8 @@ export class DefaultContextManager {
     this.contextTokenLimit = cfg.contextTokenLimit ?? 150_000;
     this.protectRecent = cfg.protectRecent ?? 6;
     this.lastInputTokens = Math.max(0, Math.floor(cfg.initialInputTokens ?? 0));
+    this.summaryClient = cfg.summaryClient;
+    this.summaryMaxTokens = cfg.summaryMaxTokens ?? DEFAULT_COMPACT_SUMMARY_MAX_TOKENS;
   }
 
   /** loop 每轮调用，喂入实际 usage —— compact 的触发依据 */
@@ -116,20 +136,19 @@ export class DefaultContextManager {
   }
 
   /**
-   * 压缩策略（v0.3 + MEM-01）：
-   * 上一轮输入超过水位线时，把"保护窗口之外"的大体积 tool_result 置换为
-   * **语义占位**（保留该次交换抽取出的失败/证据/副作用摘要），并 upsert 一条
-   * `[compact_ledger]` 文本块，承载用户约束、决策、失败尝试、证据引用与
-   * side-effect 账本。结构保持不变（每个 tool_use_id 仍有对应 tool_result），
-   * 只有正文被置换 —— 不会破坏 API 约束。
-   *
-   * 注意：loop 会用返回值**替换**正史（而非仅用于本次渲染）——压缩只发生一次、
-   * 结果确定，后续请求前缀保持稳定，避免每轮重压缩导致的缓存抖动。
+   * Phase A 同步压缩：语义占位 + 启发式 `[compact_ledger]`。
+   * Phase B 走 {@link compactAsync}（可选 LLM，fail-open）。
    */
   compact(messages: Anthropic.MessageParam[]): CompactResult {
     const empty = emptyCompactLedger();
     if (this.lastInputTokens < this.contextTokenLimit * COMPACT_WATERMARK) {
-      return { messages: [...messages], droppedBlocks: 0, ledgerEntries: 0, ledger: empty };
+      return {
+        messages: [...messages],
+        droppedBlocks: 0,
+        ledgerEntries: 0,
+        ledger: empty,
+        summaryApplied: false,
+      };
     }
 
     const cutoff = Math.max(0, messages.length - this.protectRecent);
@@ -167,7 +186,13 @@ export class DefaultContextManager {
     });
 
     if (dropped === 0) {
-      return { messages: out, droppedBlocks: 0, ledgerEntries: 0, ledger: empty };
+      return {
+        messages: out,
+        droppedBlocks: 0,
+        ledgerEntries: 0,
+        ledger: empty,
+        summaryApplied: false,
+      };
     }
 
     const ledger = mergeCompactLedgers(priorLedger, scanned);
@@ -177,7 +202,46 @@ export class DefaultContextManager {
       droppedBlocks: dropped,
       ledgerEntries: ledgerEntryCount(ledger),
       ledger,
+      summaryApplied: false,
     };
+  }
+
+  /**
+   * Phase A + optional Phase B. Summary only runs when a client is injected
+   * and Phase A actually elided blocks. Any summary failure → Phase A result.
+   */
+  async compactAsync(
+    messages: Anthropic.MessageParam[],
+    signal?: AbortSignal,
+  ): Promise<CompactResult> {
+    const base = this.compact(messages);
+    if (!this.summaryClient || base.droppedBlocks === 0) return base;
+    if (signal?.aborted) return base;
+
+    const cutoff = Math.max(0, messages.length - this.protectRecent);
+    const excerpts = collectCompactExcerpts(gatherExcerptTexts(messages, cutoff));
+    try {
+      const enrichment = await summarizeForCompact({
+        client: this.summaryClient,
+        ledger: base.ledger,
+        excerpts,
+        maxTokens: this.summaryMaxTokens,
+        signal,
+      });
+      if (!enrichment) return base;
+      const ledger = mergeSummaryIntoLedger(base.ledger, enrichment);
+      // Never lose Phase A buckets.
+      if (ledgerEntryCount(ledger) < ledgerEntryCount(base.ledger)) return base;
+      return {
+        messages: upsertCompactLedger(base.messages, ledger),
+        droppedBlocks: base.droppedBlocks,
+        ledgerEntries: ledgerEntryCount(ledger),
+        ledger,
+        summaryApplied: true,
+      };
+    } catch {
+      return base;
+    }
   }
 }
 
@@ -290,6 +354,30 @@ function scanConversationLedger(
     }
   }
   return mergeCompactLedgers(...parts);
+}
+
+function gatherExcerptTexts(
+  messages: Anthropic.MessageParam[],
+  cutoff: number,
+): { role: "user" | "assistant"; text: string }[] {
+  const out: { role: "user" | "assistant"; text: string }[] = [];
+  for (let i = 0; i < cutoff; i++) {
+    const m = messages[i]!;
+    const role = m.role === "assistant" ? "assistant" : "user";
+    for (const text of messageTexts(m)) {
+      out.push({ role, text });
+    }
+    // Prefer head of large tool_results (full body is about to be elided).
+    if (role === "user" && typeof m.content !== "string") {
+      for (const b of m.content) {
+        if (b.type !== "tool_result" || typeof b.content !== "string") continue;
+        if (b.content.startsWith("[compacted]")) continue;
+        if (b.content.length <= MIN_COMPACTABLE_CHARS) continue;
+        out.push({ role: "user", text: b.content.slice(0, 800) });
+      }
+    }
+  }
+  return out;
 }
 
 function messageTexts(m: Anthropic.MessageParam): string[] {

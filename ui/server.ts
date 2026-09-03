@@ -2104,6 +2104,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   const contextTokenLimit = process.env.AGENT_CONTEXT_LIMIT
     ? Number(process.env.AGENT_CONTEXT_LIMIT)
     : pack?.guardrails?.contextTokenLimit;
+  const compactSummaryOn = (() => {
+    const v = process.env.AGENT_COMPACT_SUMMARY?.trim().toLowerCase();
+    return v === "1" || v === "true" || v === "yes" || v === "on";
+  })();
   const maxTokens = process.env.AGENT_MAX_TOKENS
     ? Number(process.env.AGENT_MAX_TOKENS)
     : pack?.guardrails?.maxTokens;
@@ -2121,6 +2125,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   // 注入 fake model 的测试保留原契约，避免用生产默认值改写研究用例。
   const maxTotalTurns = integerEnv("AGENT_TOTAL_MAX_TURNS", 1) ?? (realHost ? 120 : undefined);
   const maxTokensBudget = integerEnv("AGENT_TOTAL_TOKEN_BUDGET", 1) ?? (realHost ? 500_000 : undefined);
+  const compactSummaryMaxTokens = integerEnv("AGENT_COMPACT_SUMMARY_MAX_TOKENS", 64);
   const progressExtensionTurns = integerEnv("AGENT_PROGRESS_EXTENSION_TURNS", 0);
   const stagnationWindow = integerEnv("AGENT_STAGNATION_WINDOW", 0);
   /** §5.2 打断次数上限（决定 2/6）。 */
@@ -2250,6 +2255,14 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         : {}),
       ...(maxTotalTurns !== undefined ? { maxTotalTurns } : {}),
       ...(maxTokensBudget !== undefined ? { maxTokensBudget } : {}),
+      ...(compactSummaryOn && realHost
+        ? {
+            compactSummaryClient: modelClient,
+            ...(compactSummaryMaxTokens !== undefined
+              ? { compactSummaryMaxTokens }
+              : {}),
+          }
+        : {}),
       ...(run?.resumeBudget ? { runBudget: run.resumeBudget } : {}),
       ...(run?.initialContextInputTokens !== undefined
         ? { initialContextInputTokens: run.initialContextInputTokens }

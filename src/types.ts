@@ -283,6 +283,13 @@ export interface AgentConfig {
   /** 从持久化检查点恢复时注入的上一轮实际输入水位；全新会话不得设置 */
   initialContextInputTokens?: number;
   /**
+   * MEM-01 Phase B：可选压缩摘要 ModelClient。缺省不调用模型（CI/eval 确定性）。
+   * 宿主经 AGENT_COMPACT_SUMMARY=1 注入执行者客户端；测试注入 FakeModelClient。
+   */
+  compactSummaryClient?: ModelClient;
+  /** Phase B 摘要 max_tokens；默认 512；宿主可用 AGENT_COMPACT_SUMMARY_MAX_TOKENS */
+  compactSummaryMaxTokens?: number;
+  /**
    * 结构化禁工具（B0b，案例 #9 第二跑实弹催生）：收口续跑的"别再调工具"
    * 不能靠模型自觉——实测收口提示被无视、2 轮收口预算全烧在继续取证上。
    * 设 "none" 时：① 请求下发 tool_choice=none；② loop 对仍然返回的 tool_use
@@ -419,10 +426,16 @@ export type TurnEvent =
   | { type: "usage"; turn: number; usage: Anthropic.Usage }
   /**
    * 上下文压缩。droppedBlocks = 被置换的 tool_result 数；
-   * ledgerEntries = MEM-01 结构化账本中的事实条数（约束/决策/失败/证据/副作用）。
+   * ledgerEntries = MEM-01 结构化账本中的事实条数（约束/决策/失败/证据/副作用）；
+   * summaryApplied = Phase B LLM 摘要已合并进账本（缺省/失败均为未设或 false）。
    * 原文仍不可恢复，但账本随正史保留。
    */
-  | { type: "compaction"; droppedBlocks: number; ledgerEntries?: number }
+  | {
+      type: "compaction";
+      droppedBlocks: number;
+      ledgerEntries?: number;
+      summaryApplied?: boolean;
+    }
   /**
    * 思考增量（逐字）。与 `assistant_thinking`（turn 级整块）互补：
    * 这条用于"运行中看它在想什么"，那条用于事后回看。

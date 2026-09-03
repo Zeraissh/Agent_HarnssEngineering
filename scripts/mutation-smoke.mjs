@@ -130,11 +130,20 @@ const MUTANTS = [
   {
     id: "compact-ledger-skipped",
     file: "src/context.ts",
-    find: "    const ledger = mergeCompactLedgers(priorLedger, scanned);\n    const withLedger = upsertCompactLedger(out, ledger);\n    return {\n      messages: withLedger,\n      droppedBlocks: dropped,\n      ledgerEntries: ledgerEntryCount(ledger),\n      ledger,\n    };",
+    find: "    const ledger = mergeCompactLedgers(priorLedger, scanned);\n    const withLedger = upsertCompactLedger(out, ledger);\n    return {\n      messages: withLedger,\n      droppedBlocks: dropped,\n      ledgerEntries: ledgerEntryCount(ledger),\n      ledger,\n      summaryApplied: false,\n    };",
     replace:
-      "    // MUTATION: skip semantic ledger — regress to placeholder-only compaction\n    return {\n      messages: out,\n      droppedBlocks: dropped,\n      ledgerEntries: 0,\n      ledger: emptyCompactLedger(),\n    };",
+      "    // MUTATION: skip semantic ledger — regress to placeholder-only compaction\n    return {\n      messages: out,\n      droppedBlocks: dropped,\n      ledgerEntries: 0,\n      ledger: emptyCompactLedger(),\n      summaryApplied: false,\n    };",
     testFiles: ["test/compact.test.ts"],
     why: "MEM-01 压缩必须写入 compact_ledger；退回纯占位等于语义残留丢失",
+  },
+  {
+    id: "compact-summary-replaces-ledger",
+    file: "src/compact-summary.ts",
+    find: "export function mergeSummaryIntoLedger(\n  base: CompactLedger,\n  enrichment: CompactSummaryEnrichment,\n): CompactLedger {\n  const merged = mergeCompactLedgers(base, enrichment.additions);\n",
+    replace:
+      "export function mergeSummaryIntoLedger(\n  base: CompactLedger,\n  enrichment: CompactSummaryEnrichment,\n): CompactLedger {\n  // MUTATION: replace buckets with summary-only additions — lose Phase A facts\n  const merged = enrichment.additions;\n  void base;\n  void mergeCompactLedgers;\n",
+    testFiles: ["test/compact-summary.test.ts"],
+    why: "Phase B 必须 merge 进 Phase A 账本，不得用摘要桶替换启发式桶",
   },
   {
     id: "prefer-healthy-never-skips",

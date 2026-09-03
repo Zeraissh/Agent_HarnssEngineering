@@ -193,13 +193,14 @@ describe("deriveContextFace", () => {
 
   it("压缩事件汇总为不可逆语域的数据", () => {
     const s = feed([
-      ev("main", { type: "compaction", droppedBlocks: 4, ledgerEntries: 5 }),
+      ev("main", { type: "compaction", droppedBlocks: 4, ledgerEntries: 5, summaryApplied: true }),
       ev("main", { type: "compaction", droppedBlocks: 3, ledgerEntries: 2 }),
     ]);
     const f = deriveContextFace(s, HARNESS);
     expect(f.compactions).toHaveLength(2);
     expect(f.droppedBlocks).toBe(7);
     expect(f.ledgerEntries).toBe(7);
+    expect(f.summaryAppliedCount).toBe(1);
   });
 
   it("无上限配置时不编造水位", () => {

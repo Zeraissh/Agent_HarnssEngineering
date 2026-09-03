@@ -16,6 +16,11 @@ export interface CompactLedger {
   failures: string[];
   evidence: string[];
   sideEffects: string[];
+  /**
+   * Optional Phase B narrative prose. Never replaces the five buckets;
+   * merge appends / dedupes. Omitted from ledgerEntryCount (buckets only).
+   */
+  narrative?: string;
 }
 
 export interface ToolUseRef {
@@ -62,12 +67,20 @@ export function ledgerEntryCount(ledger: CompactLedger): number {
 
 export function mergeCompactLedgers(...parts: CompactLedger[]): CompactLedger {
   const out = emptyCompactLedger();
+  const narratives: string[] = [];
   for (const part of parts) {
     pushUnique(out.constraints, part.constraints);
     pushUnique(out.decisions, part.decisions);
     pushUnique(out.failures, part.failures);
     pushUnique(out.evidence, part.evidence);
     pushUnique(out.sideEffects, part.sideEffects);
+    if (part.narrative?.trim()) narratives.push(part.narrative.trim());
+  }
+  if (narratives.length) {
+    const joined = narratives.filter((n, i) => narratives.indexOf(n) === i).join(" | ");
+    out.narrative = joined.length > MAX_ENTRY_CHARS * 2
+      ? `${joined.slice(0, MAX_ENTRY_CHARS * 2 - 1)}…`
+      : joined;
   }
   return out;
 }
@@ -76,34 +89,51 @@ export function mergeCompactLedgers(...parts: CompactLedger[]): CompactLedger {
 export function parseCompactLedgerText(text: string): CompactLedger {
   if (!text.includes(COMPACT_LEDGER_MARKER)) return emptyCompactLedger();
   const out = emptyCompactLedger();
-  let bucket: keyof CompactLedger | null = null;
+  type Bucket = "constraints" | "decisions" | "failures" | "evidence" | "sideEffects";
+  type Mode = Bucket | "narrative" | null;
+  let mode: Mode = null;
+  const narrativeParts: string[] = [];
   for (const raw of text.split(/\r?\n/)) {
     const line = raw.trim();
     if (!line || line === COMPACT_LEDGER_MARKER) continue;
+    if (line === "(empty — no durable facts extracted)") continue;
     const header = line.toLowerCase().replace(/:$/, "");
     if (header === "constraints") {
-      bucket = "constraints";
+      mode = "constraints";
       continue;
     }
     if (header === "decisions") {
-      bucket = "decisions";
+      mode = "decisions";
       continue;
     }
     if (header === "failures") {
-      bucket = "failures";
+      mode = "failures";
       continue;
     }
     if (header === "evidence") {
-      bucket = "evidence";
+      mode = "evidence";
       continue;
     }
     if (header === "side-effects" || header === "sideeffects") {
-      bucket = "sideEffects";
+      mode = "sideEffects";
       continue;
     }
-    if (!bucket) continue;
+    if (header === "summary" || header === "narrative") {
+      mode = "narrative";
+      continue;
+    }
     const item = line.replace(/^[-*]\s*/, "").trim();
-    if (item) pushUnique(out[bucket], [item]);
+    if (!item) continue;
+    if (mode === "narrative") {
+      narrativeParts.push(item);
+      continue;
+    }
+    if (mode) {
+      pushUnique(out[mode], [item]);
+    }
+  }
+  if (narrativeParts.length) {
+    out.narrative = narrativeParts.join(" ").trim();
   }
   return out;
 }
@@ -115,6 +145,10 @@ export function formatCompactLedger(ledger: CompactLedger): string {
   appendBucket(lines, "failures", ledger.failures);
   appendBucket(lines, "evidence", ledger.evidence);
   appendBucket(lines, "side-effects", ledger.sideEffects);
+  if (ledger.narrative?.trim()) {
+    lines.push("summary:");
+    lines.push(ledger.narrative.trim());
+  }
   if (lines.length === 1) {
     lines.push("(empty — no durable facts extracted)");
   }

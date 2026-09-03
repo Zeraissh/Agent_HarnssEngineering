@@ -305,7 +305,7 @@ describe("reduceEvent", () => {
     let state = createInitialState("r9", "retry task", false);
 
     state = reduceEvent(state, sse("main", "api_retry", { turn: 2, attempt: 1, reason: "timeout" }));
-    state = reduceEvent(state, sse("main", "compaction", { droppedBlocks: 15, ledgerEntries: 4 }));
+    state = reduceEvent(state, sse("main", "compaction", { droppedBlocks: 15, ledgerEntries: 4, summaryApplied: true }));
 
     expect(state.timeline).toHaveLength(2);
     expect(state.timeline[0].type).toBe("api_retry");
@@ -314,6 +314,7 @@ describe("reduceEvent", () => {
     expect(state.timeline[1].type).toBe("compaction");
     expect(state.timeline[1].droppedBlocks).toBe(15);
     expect(state.timeline[1].ledgerEntries).toBe(4);
+    expect(state.timeline[1].summaryApplied).toBe(true);
   });
 
   // ---- 10. R-01: done 事件将 pending 审批转为 expired ----

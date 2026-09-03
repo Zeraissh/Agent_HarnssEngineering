@@ -205,6 +205,14 @@ export class AgentLoop {
       ...(cfg.initialContextInputTokens !== undefined
         ? { initialInputTokens: cfg.initialContextInputTokens }
         : {}),
+      ...(cfg.compactSummaryClient
+        ? {
+            summaryClient: cfg.compactSummaryClient,
+            ...(cfg.compactSummaryMaxTokens !== undefined
+              ? { summaryMaxTokens: cfg.compactSummaryMaxTokens }
+              : {}),
+          }
+        : {}),
     });
     this.maxTurns = cfg.maxTurns ?? DEFAULTS.maxTurns;
     this.runBudget =
@@ -444,14 +452,26 @@ export class AgentLoop {
         turn += 1;
         q.push({ type: "turn_start", turn });
 
+        /**
+         * 总轮次在模型请求发出【之前】预占。并行计划下多个 AgentLoop 共享同一对象；
+         * 若等响应回来才加，cap=1 时两条并发轨都会先看到 0 并各发一请求，硬上限
+         * 会按并发度超卖。JS 在第一个 await 前同步执行，这一步就是原子预占点。
+         *
+         * MEM-01 Phase B：compactAsync 即使无摘要客户端也会 await 一次 Promise，
+         * 预占必须排在它【之前】，否则并行轨会在微任务缝里同时通过上面的预算检查。
+         */
+        this.runBudget.usedTurns += 1;
+
         // 压缩替换正史（一次性、确定性），保证后续请求前缀稳定（见 context.ts 注释）
-        const compacted = this.context.compact(messages);
+        // Phase B：可选 LLM 摘要经 compactAsync；未配置客户端时与 Phase A 同步路径等价
+        const compacted = await this.context.compactAsync(messages, signal);
         if (compacted.droppedBlocks > 0) {
           messages = compacted.messages;
           q.push({
             type: "compaction",
             droppedBlocks: compacted.droppedBlocks,
             ledgerEntries: compacted.ledgerEntries,
+            ...(compacted.summaryApplied ? { summaryApplied: true } : {}),
           });
         }
 
@@ -461,13 +481,6 @@ export class AgentLoop {
         } else if (this.cfg.toolChoice) {
           request.toolChoice = this.cfg.toolChoice;
         }
-
-        /**
-         * 总轮次在模型请求发出【之前】预占。并行计划下多个 AgentLoop 共享同一对象；
-         * 若等响应回来才加，cap=1 时两条并发轨都会先看到 0 并各发一请求，硬上限
-         * 会按并发度超卖。JS 在第一个 await 前同步执行，这一步就是原子预占点。
-         */
-        this.runBudget.usedTurns += 1;
 
         // 同轮重试：SDK 的 HTTP 重试耗尽后，loop 层对瞬时错误再兜 errorRetries 次。
         // 请求是幂等的（同一 request 重发），非瞬时错误（认证/4xx/abort）立即终止。

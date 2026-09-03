@@ -48,6 +48,8 @@
  *                       read_file 可读取这些目录（写类工具不受益）。用于工作区外的
  *                       领域素材库（如 KiCad 官方符号/封装库）
  *   AGENT_CONTEXT_LIMIT 可选，上下文 token 上限（触发 compact），默认 150000
+ *   AGENT_COMPACT_SUMMARY=1 可选，开启 MEM-01 Phase B LLM 摘要（默认关；CI/eval 勿开）
+ *   AGENT_COMPACT_SUMMARY_MAX_TOKENS 可选，摘要 max_tokens，默认 512
  *   AGENT_MAX_TOKENS    可选，单次响应输出上限，默认 64000。本地慢速模型建议调低
  *                       （如 4096）以掐断思考螺旋——快速失败优于无限等待
  *   AGENT_TIMEOUT_MS    可选，单请求超时毫秒数，默认 SDK 的 10 分钟
@@ -242,6 +244,20 @@ async function main(): Promise<void> {
   const contextTokenLimit = process.env.AGENT_CONTEXT_LIMIT
     ? Number(process.env.AGENT_CONTEXT_LIMIT)
     : pack?.guardrails?.contextTokenLimit;
+  const compactSummaryOn = (() => {
+    const v = process.env.AGENT_COMPACT_SUMMARY?.trim().toLowerCase();
+    return v === "1" || v === "true" || v === "yes" || v === "on";
+  })();
+  const compactSummaryMaxTokens = process.env.AGENT_COMPACT_SUMMARY_MAX_TOKENS
+    ? Number(process.env.AGENT_COMPACT_SUMMARY_MAX_TOKENS)
+    : undefined;
+  if (
+    compactSummaryMaxTokens !== undefined &&
+    (!Number.isInteger(compactSummaryMaxTokens) || compactSummaryMaxTokens < 64)
+  ) {
+    console.error(c.red(`AGENT_COMPACT_SUMMARY_MAX_TOKENS "${process.env.AGENT_COMPACT_SUMMARY_MAX_TOKENS}" 无效：需为 ≥64 的整数`));
+    process.exit(1);
+  }
   const maxTokens = process.env.AGENT_MAX_TOKENS
     ? Number(process.env.AGENT_MAX_TOKENS)
     : pack?.guardrails?.maxTokens;
@@ -611,6 +627,14 @@ async function main(): Promise<void> {
     ...(maxTurns !== undefined ? { maxTurns } : {}),
     ...(maxTotalTurns !== undefined ? { maxTotalTurns } : {}),
     ...(maxTokensBudget !== undefined ? { maxTokensBudget } : {}),
+    ...(compactSummaryOn
+      ? {
+          compactSummaryClient: modelClient,
+          ...(compactSummaryMaxTokens !== undefined
+            ? { compactSummaryMaxTokens }
+            : {}),
+        }
+      : {}),
     // 易变信息走 messages 注入（P3），system prompt 保持字节冻结
     dynamicContext: {
       date: new Date().toISOString().slice(0, 10),
@@ -769,7 +793,8 @@ async function main(): Promise<void> {
           console.log(
             c.yellow(
               `${tag} ⚠ context compacted: dropped ${event.droppedBlocks} blocks` +
-                (event.ledgerEntries != null ? `, ledger ${event.ledgerEntries} facts` : ""),
+                (event.ledgerEntries != null ? `, ledger ${event.ledgerEntries} facts` : "") +
+                (event.summaryApplied ? ", LLM summary merged" : ""),
             ),
           );
           break;
@@ -1137,7 +1162,8 @@ async function main(): Promise<void> {
         console.log(
           c.yellow(
             `⚠ context compacted: dropped ${event.droppedBlocks} blocks` +
-              (event.ledgerEntries != null ? `, ledger ${event.ledgerEntries} facts` : ""),
+              (event.ledgerEntries != null ? `, ledger ${event.ledgerEntries} facts` : "") +
+              (event.summaryApplied ? ", LLM summary merged" : ""),
           ),
         );
         break;

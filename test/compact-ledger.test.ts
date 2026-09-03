@@ -56,11 +56,18 @@ describe("compact-ledger pure helpers (MEM-01)", () => {
       failures: ["bash: denied"],
       evidence: ["0x7189AAB5"],
       sideEffects: ["write_file report.md"],
+      narrative: "assistant weighed Manhattan vs free-angle",
     });
     const text = formatCompactLedger(ledger);
     expect(text.startsWith(COMPACT_LEDGER_MARKER)).toBe(true);
+    expect(text).toContain("summary:");
     const parsed = parseCompactLedgerText(text);
-    expect(parsed).toEqual(ledger);
+    expect(parsed.constraints).toEqual(ledger.constraints);
+    expect(parsed.decisions).toEqual(ledger.decisions);
+    expect(parsed.failures).toEqual(ledger.failures);
+    expect(parsed.evidence).toEqual(ledger.evidence);
+    expect(parsed.sideEffects).toEqual(ledger.sideEffects);
+    expect(parsed.narrative).toBe(ledger.narrative);
     expect(ledgerEntryCount(parsed)).toBe(5);
   });
 

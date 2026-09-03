@@ -173,31 +173,21 @@ npx tsc --noEmit                            passed
 
 | 状态 | ID | 优化项 | I/R/E | 优先分 | 完成定义 |
 |---|---|---|---:|---:|---|
-| [~] | MEM-01 | 语义化上下文压缩 | 5/4/4 | 18 | 保留用户约束、决策、失败尝试、证据引用和 side-effect ledger，不再只用占位符替换旧工具输出。**Phase A 已落地（2026-09-03）**：非 LLM 结构化 `[compact_ledger]` + 语义占位；见 Phase 5 实施记录 |
+| [~] | MEM-01 | 语义化上下文压缩 | 5/4/4 | 18 | 保留用户约束、决策、失败尝试、证据引用和 side-effect ledger，不再只用占位符替换旧工具输出。**Phase A+B 已落地（2026-09-03）**：启发式 `[compact_ledger]` + 可选 LLM 摘要合并（`AGENT_COMPACT_SUMMARY=1`，默认关）；见 Phase 5 实施记录 |
 | [ ] | MEM-02 | 分层、可治理记忆 | 4/4/5 | 8 | 原始事件→滚动摘要→artifact/reference store；按用户/项目/任务检索；记录来源、时间、置信度、冲突和删除范围 |
 | [ ] | MEM-03 | 跨宿主一致性 | 4/3/4 | 14 | CLI/Web/Electron 使用同一 memory contract；同步、权限、加密、删除和数据归属有端到端测试 |
 
-### Phase 5 实施记录（2026-09-03，MEM-01 Phase A）
+### Phase 5 实施记录（2026-09-03，MEM-01 Phase A + B）
 
 | ID | 已取得证据 | 残余边界 |
 |---|---|---|
-| MEM-01 | `src/compact-ledger.ts` 启发式抽取五桶（constraints/decisions/failures/evidence/sideEffects）；`DefaultContextManager.compact` 在 elision 前扫描保护窗外消息，写入/原地更新 `[compact_ledger]`，tool_result 改为语义占位（仍以 `[compacted]` 开头保幂等）；`compaction` 事件带 `ledgerEntries`；CLI + Web reducer/面文案同提交接线；`test/compact*.ts` + UI 锁；mutation-smoke `compact-ledger-skipped` | **非** LLM 摘要（Phase B 未做）；启发式会漏非模板表述的约束/决策；只压缩大 tool_result，不压缩 assistant 长推理；side-effect 桶覆盖内置写类 + 变异 bash 模式，MCP 写工具靠名字启发；原文仍不可恢复 |
-
-## 每项实施模板
-
-每次只把一个 ID 从 `[ ]` 改为 `[~]`；完成后记录：
-
-1. **问题与边界**：具体风险、受影响入口、不在本次范围内的内容。
-2. **设计不变量**：必须永远成立的安全或行为约束。
-3. **实施文件**：源码、测试、文档和迁移。
-4. **负向测试**：故意触发危险/失败路径，不能只测成功路径。
-5. **回归证据**：针对性测试、完整测试、typecheck/build/pack，以及需要的真实 E2E/HIL。
-6. **残余风险**：未覆盖平台、TOCTOU、外部系统或人工验收项。
+| MEM-01 Phase A | `src/compact-ledger.ts` 启发式抽取五桶；`DefaultContextManager.compact` 在 elision 前扫描保护窗外消息，写入/原地更新 `[compact_ledger]`，tool_result 改为语义占位（仍以 `[compacted]` 开头保幂等）；`compaction` 事件带 `ledgerEntries`；CLI + Web reducer/面文案同提交接线；`test/compact*.ts` + UI 锁；mutation-smoke `compact-ledger-skipped` | 启发式会漏非模板表述的约束/决策；只压缩大 tool_result，**不删除** assistant 消息正文；side-effect 桶覆盖内置写类 + 变异 bash 模式，MCP 写工具靠名字启发；原文仍不可恢复 |
+| MEM-01 Phase B | `src/compact-summary.ts` + `compactAsync`：可选 ModelClient（不经 ToolContext），`AGENT_COMPACT_SUMMARY=1` 默认关；有界 `max_tokens`（默认 512）；摘要 **merge** 进账本（可附 `summary:` narrative），失败 fail-open 回 Phase A；事件 `summaryApplied`；CLI + `app.js` 同提交；FakeModelClient 单测 + mutation `compact-summary-replaces-ledger` | **仍不**把长 assistant 推理从正史里 elide（只把可抽取事实写入账本）；摘要质量依赖模型，错误事实靠"不得编造"提示约束而非硬校验；未开 flag 时行为≡Phase A；跨宿主记忆合同仍归 MEM-02/03 |
 
 当前执行顺序（2026-09-03 成熟度第二波，单操作员形态）：
-`EVAL-03c → EVAL-01 held-out → OBS-01[~] → RUN-01[~ Phase 2] → MEM-01[~ Phase A] → MODEL-01b[~] → RUN-02[~]`。
-下一刀候选：`MEM-01 Phase B`（可选 LLM 摘要）、MODEL-01 残余（真成本路由 / Web 同步探针回写）、
-或 SAFE-06（解锁 mid-tool 崩溃证明）——本波默认不提前 GOV-* / SAFE-05 2B。
+`EVAL-03c → EVAL-01 held-out → OBS-01[~] → RUN-01[~ Phase 2] → MEM-01[~ Phase A+B] → MODEL-01b[~] → RUN-02[~]`。
+下一刀候选：SAFE-06（解锁 mid-tool 崩溃证明）、MODEL-01 残余（真成本路由 / Web 同步探针回写）、
+或 MEM-02——本波默认不提前 GOV-* / SAFE-05 2B。
 并行可继续：`A1 攒 §2.1 样本（ledger:samples）`（与质量门不冲突）。
 若目标改公网多人，`GOV-01/02/03` 必须提前到 `RUN-01` 之后、任何公开上线之前。
 Phase 2A 的 daemon-label orphan reaper 与真实 `SIGKILL → sweep` E2E 已落地；

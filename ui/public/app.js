@@ -73,6 +73,7 @@ export { createBatcher, diffKeyed, signature, patchList, appendOnly, setText, se
  *   extraTurns?: number,
  *   droppedBlocks?: number
  *   ledgerEntries?: number
+ *   summaryApplied?: boolean
  * }} TimelineEntry
  *
  * @typedef {TimelineEntry & {collapsed: boolean}} LogEntry
@@ -829,6 +830,7 @@ function buildTimelineEntry(seq, source, type, event) {
         droppedBlocks: /** @type {number} */ (event.droppedBlocks),
         ledgerEntries:
           typeof event.ledgerEntries === "number" ? /** @type {number} */ (event.ledgerEntries) : undefined,
+        summaryApplied: event.summaryApplied === true,
       };
     default:
       return base;
@@ -1271,6 +1273,7 @@ export function deriveContextFace(state, harness) {
       source: e.source,
       droppedBlocks: e.droppedBlocks ?? 0,
       ledgerEntries: e.ledgerEntries ?? 0,
+      summaryApplied: e.summaryApplied === true,
     }));
 
   return {
@@ -1280,6 +1283,7 @@ export function deriveContextFace(state, harness) {
     compactions,
     droppedBlocks: compactions.reduce((n, c) => n + c.droppedBlocks, 0),
     ledgerEntries: compactions.reduce((n, c) => n + (c.ledgerEntries ?? 0), 0),
+    summaryAppliedCount: compactions.reduce((n, c) => n + (c.summaryApplied ? 1 : 0), 0),
     perTurn: state.usageByTurn,
   };
 }
@@ -2980,7 +2984,8 @@ function patchContextGauge(parts, ctx) {
       ? `上下文最近一轮输入 ${formatTokens(ctx.lastInputTokens)}（未配置上限）`
       : `上下文水位 ${pct}%，最近一轮输入 ${formatTokens(ctx.lastInputTokens)} / 上限 ${formatTokens(ctx.limit)}`,
     ctx.compactions.length > 0
-      ? `已压缩 ${ctx.compactions.length} 次，置换 ${ctx.droppedBlocks} 个 tool_result 原文；结构化账本保留 ${ctx.ledgerEntries ?? 0} 条事实`
+      ? `已压缩 ${ctx.compactions.length} 次，置换 ${ctx.droppedBlocks} 个 tool_result 原文；结构化账本保留 ${ctx.ledgerEntries ?? 0} 条事实` +
+        ((ctx.summaryAppliedCount ?? 0) > 0 ? `（其中 ${ctx.summaryAppliedCount} 次合并了 LLM 摘要）` : "")
       : null,
     "查看上下文详情",
   ].filter(Boolean);
@@ -3915,7 +3920,10 @@ export function buildFactorCards(faces) {
   if (context.compactions.length > 0) {
     ctxLines.push(
       `⚠ 压缩 ${context.compactions.length} 次 · 置换 ${context.droppedBlocks} 块原文` +
-        ` · 账本 ${context.ledgerEntries ?? 0} 条`,
+        ` · 账本 ${context.ledgerEntries ?? 0} 条` +
+        ((context.summaryAppliedCount ?? 0) > 0
+          ? ` · LLM 摘要 ${context.summaryAppliedCount} 次`
+          : ""),
     );
   }
 
@@ -4135,7 +4143,11 @@ function renderContextTab(ctx) {
     html += `<strong>⚠ 上下文压缩 ${ctx.compactions.length} 次，置换 ${ctx.droppedBlocks} 个 tool_result 原文</strong>`;
     html +=
       "<p>tool_result 原文不可恢复，模型如需全文须重跑工具。" +
-      `结构化账本已保留 ${ctx.ledgerEntries ?? 0} 条约束/决策/失败/证据/副作用摘要。</p>`;
+      `结构化账本已保留 ${ctx.ledgerEntries ?? 0} 条约束/决策/失败/证据/副作用摘要` +
+      ((ctx.summaryAppliedCount ?? 0) > 0
+        ? `（其中 ${ctx.summaryAppliedCount} 次合并了可选 LLM 摘要）`
+        : "") +
+      "。</p>";
     html += "</div>";
   }
 
@@ -5221,6 +5233,7 @@ function renderLogEntryBody(e) {
     case "compaction":
       return `<div class="log-entry-body">丢弃 ${e.droppedBlocks ?? "?"} 个块` +
         (typeof e.ledgerEntries === "number" ? ` · 账本 ${e.ledgerEntries} 条` : "") +
+        (e.summaryApplied ? " · 已合并 LLM 摘要" : "") +
         `</div>`;
     default:
       return "";
