@@ -405,6 +405,36 @@ describe("buildFactorCards", () => {
     expect(ctx.abnormal).toBe(true);
     expect(ctx.lines.some((l: string) => l.includes("置换") && l.includes("账本"))).toBe(true);
   });
+
+  /**
+   * MEM-01 Phase C：compaction 事件新增 collapsedTurns / reactive。reducer 的投影是逐字段
+   * 白名单——不列就静默丢（本项目第 N 次踩这条），所以三处（投影 / 派生 / 卡片）一次锁死。
+   */
+  it("tier 2 折叠与反应式压缩：投影保留字段、派生汇总、Context 卡写明轮数与撞 400 次数", () => {
+    const s = feed([
+      ev("main", { type: "compaction", droppedBlocks: 2, ledgerEntries: 3, collapsedTurns: 4 }),
+      ev("main", { type: "compaction", droppedBlocks: 0, ledgerEntries: 3, collapsedTurns: 2, reactive: true }),
+      ev("main", { type: "compaction", droppedBlocks: 1, ledgerEntries: 3 }), // 旧形状：缺两字段
+    ]);
+    const entries = s.timeline.filter((e) => e.type === "compaction");
+    expect(entries.map((e) => e.collapsedTurns)).toEqual([4, 2, 0]);
+    expect(entries.map((e) => e.reactive)).toEqual([false, true, false]);
+    const f = deriveContextFace(s, HARNESS);
+    expect(f.collapsedTurns).toBe(6);
+    expect(f.reactiveCount).toBe(1);
+    const ctx = buildFactorCards(facesFor(s)).find((c) => c.id === "context");
+    const line = ctx.lines.find((l: string) => l.includes("压缩"));
+    expect(line).toContain("折叠 6 轮旧对话");
+    expect(line).toContain("撞 400 后反应式 1 次");
+  });
+
+  it("没有折叠、没有反应式时 Context 卡不多说一个字（旧行为不变）", () => {
+    const s = feed([ev("main", { type: "compaction", droppedBlocks: 5, ledgerEntries: 3 })]);
+    const ctx = buildFactorCards(facesFor(s)).find((c) => c.id === "context");
+    const line = ctx.lines.find((l: string) => l.includes("压缩"));
+    expect(line).not.toContain("折叠");
+    expect(line).not.toContain("反应式");
+  });
 });
 
 describe("normalizeTab", () => {

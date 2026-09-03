@@ -46,6 +46,39 @@ export type ApprovalFn = (
   block: Anthropic.ToolUseBlock,
 ) => Promise<{ decision: "allow" | "deny"; reason?: string }>;
 
+/**
+ * 单个 tool_result 进入正史前的字符上限缺省值（MEM-01 Phase C 入口截断）。
+ *
+ * 为什么放在执行器边界而不是各工具里：内置 read_file / bash 已各自 30k 截断，
+ * fetch_url 20k，但 MCP 工具的返回**没有任何上限**——一次 read_memory 几百 KB
+ * 就能把上下文顶穿，而 compact 要到下一轮才按水位反应。这一层是兜底，
+ * 故取得比内置上限更宽（40k > 30k），不与它们重叠、也不替它们做主。
+ */
+export const DEFAULT_TOOL_RESULT_MAX_CHARS = 40_000;
+
+/**
+ * 入口截断。保留前 maxChars 个字符，附**可操作**的标记：说清截了多少、上限是谁、
+ * 以及怎么拿到剩下的（read_file 分页 / 命令加过滤器 / 落盘再分片读）——
+ * 静默截断会让模型拿半截文件当整份用，比原样进正史更糟。
+ * 已经带内置 `...[truncated` 标记的结果照常再截（那个标记只说明工具自己截过，
+ * 不说明它符合这一层的上限）。
+ */
+export function snipToolResult(
+  result: ToolResult,
+  toolName: string,
+  maxChars: number = DEFAULT_TOOL_RESULT_MAX_CHARS,
+): ToolResult {
+  const limit = Math.max(1000, Math.floor(maxChars));
+  if (result.content.length <= limit) return result;
+  const omitted = result.content.length - limit;
+  const marker =
+    `\n...[harness truncated ${omitted} of ${result.content.length} chars: this ${toolName} result exceeded ` +
+    `AGENT_TOOL_RESULT_MAX_CHARS=${limit}. Do not assume the rest is empty. To read the remainder, page instead of ` +
+    `re-running blindly: read_file supports offset/limit (1-based lines); for commands add filters ` +
+    `(grep/head/tail/sed -n 'a,bp') or write the output to a file and read it in slices.]`;
+  return { ...result, content: result.content.slice(0, limit) + marker };
+}
+
 export interface ExecutedTool {
   toolUseId: string;
   result: ToolResult;
@@ -64,6 +97,8 @@ export class ToolExecutor {
     private readonly workdir: string,
     private readonly readRoots?: string[],
     private executionBroker?: ExecutionBroker,
+    /** 单个 tool_result 进正史前的字符上限；缺省 DEFAULT_TOOL_RESULT_MAX_CHARS */
+    private readonly toolResultMaxChars: number = DEFAULT_TOOL_RESULT_MAX_CHARS,
   ) {}
 
   /**
@@ -99,7 +134,12 @@ export class ToolExecutor {
 
     const runOne = async (block: Anthropic.ToolUseBlock): Promise<void> => {
       const started = Date.now();
-      const result = await this.executeSingle(block, signal, approve);
+      // 入口截断在事件回调之前：宿主/界面看到的必须与模型拿到的是同一份
+      const result = snipToolResult(
+        await this.executeSingle(block, signal, approve),
+        block.name,
+        this.toolResultMaxChars,
+      );
       const executed = { toolUseId: block.id, result, durationMs: Date.now() - started };
       settled.set(block.id, executed);
       onResult?.(executed);

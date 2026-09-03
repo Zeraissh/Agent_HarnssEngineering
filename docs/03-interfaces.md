@@ -112,13 +112,20 @@ interface ModelClient {
 ```ts
 interface CompactResult {
   messages: Anthropic.MessageParam[];
-  /** 本次被置换为占位文本的 tool_result 块数；0 = 未压缩 */
+  /** 本次被置换为占位文本的 tool_result 块数（tier 1）；0 = 未置换 */
   droppedBlocks: number;
   /** MEM-01：结构化账本事实条数（约束/决策/失败/证据/副作用） */
   ledgerEntries: number;
   /** MEM-01：写入正史的 durable ledger；未压缩时为空 */
   ledger: CompactLedger;
+  /** Phase C tier 2：本次新折叠进 `[compacted_turns]` 的旧轮数；0 = 未折叠 */
+  collapsedTurns: number;
+  /** 本次是否改动了正史（droppedBlocks > 0 或 collapsedTurns > 0） */
+  changed: boolean;
 }
+
+/** 反应式硬压缩用：force 忽略水位；protectRecent 收窄保护窗（REACTIVE_PROTECT_RECENT = 2） */
+interface CompactOptions { force?: boolean; protectRecent?: number }
 
 interface ContextManager {
   /** 冻结的 system prompt（构造后不可变） */
@@ -137,13 +144,18 @@ interface ContextManager {
   checkpointInputTokens(): number;
 
   /**
-   * v0.3 + MEM-01：上一轮输入超过 contextTokenLimit 的 80% 时，把保护窗口
-   * （protectRecent，默认 6 条）之外的大体积 tool_result 置换为语义占位，
-   * 并 upsert `[compact_ledger]`（约束/决策/失败/证据/副作用）。结构不变
-   * （tool_use_id 配对保持），幂等（已压缩块不重复计数）。loop 用返回值替换
-   * 正史（一次性、确定性），保证后续请求前缀稳定不抖缓存。启发式非 LLM 摘要。
+   * v0.3 + MEM-01：上一轮输入超过 contextTokenLimit 的 80% 时分级压缩，便宜的先上：
+   *   tier 1  保护窗口（protectRecent，默认 6 条）之外的大体积 tool_result 置换为语义占位，
+   *           并 upsert `[compact_ledger]`（约束/决策/失败/证据/副作用）；
+   *   tier 2  （Phase C）tier 1 之后按字符/4 估算仍在水位上、或根本无可置换时，把保护窗外、
+   *           首条任务消息之后的旧轮折叠成一个 `[compacted_turns]` 摘要块（assistant 正文首句 /
+   *           工具调用 / 结果首行 / user 文本）；tool_use / tool_result 配对永不拆散。
+   * 结构不变（配对保持）、确定性、幂等（占位块不重复计数，折叠块只合并不二折）。
+   * loop 用返回值替换正史（一次性），保证后续请求前缀稳定不抖缓存。启发式非 LLM 摘要
+   * （Phase B 的 LLM 摘要只丰富账本，经 compactAsync）。
+   * opts.force = 反应式硬压缩（loop 撞端点 context-too-long 400 时）：忽略水位，保护窗收到 2。
    */
-  compact(messages: Anthropic.MessageParam[]): CompactResult;
+  compact(messages: Anthropic.MessageParam[], opts?: CompactOptions): CompactResult;
 }
 
 /** 动态上下文注入规范（P3）：易变信息进首条 user 消息，绝不进 system */
@@ -187,7 +199,7 @@ type TurnEvent =
       /** 宿主必须调用 respond 才能让 loop 继续；deny 时可附给模型的理由 */
       respond: (decision: "allow" | "deny", reason?: string) => void }
   | { type: "usage"; turn: number; usage: Anthropic.Usage }
-  | { type: "compaction"; droppedBlocks: number; ledgerEntries?: number }
+  | { type: "compaction"; droppedBlocks: number; ledgerEntries?: number; summaryApplied?: boolean; collapsedTurns?: number; reactive?: boolean }
   | { type: "recovery_decision";
       reason: "end_turn_without_completion" | "max_tokens_without_completion" | "max_turns" | "stagnation";
       action: "request_completion" | "continue_with_context" | "change_strategy" | "force_completion";
@@ -325,5 +337,5 @@ function createMemoryTools(store: MemoryStore): Tool[];
 2. **tool_result 单条合并**：一轮内所有 ToolResult（含 error 的）合并为一条 user 消息；每个 `tool_use_id` 必须有且仅有一个对应 result。
 3. **审批语义**：`approval_request` 的 `respond("deny", reason)` 不终止循环——生成 `is_error: true` 的 tool_result（内容含 reason）回传模型。
 4. **护栏优先级**：轮数/预算检查发生在每次模型调用**之前**；`maxTurns` 约束单段，`runBudget` 约束 continuation/返工共用总账。共享轮次在发送前预占；token 按完整响应结算，显式 token 上限会串行化同一总账下的模型调用，允许最后一次响应自然越界，但禁止并发轨基于旧余额同时起跑。触发时以对应 stopReason 收尾并发 done 事件。
-5. **compact 触发点**：由 loop 在 render 前根据累计输入 token 估算决定是否调用 `compact()`；触发时发 `compaction` 事件保证可观测。
+5. **compact 触发点**：由 loop 在 render 前根据上一轮实际输入 token 决定是否调用 `compact()`；触发时发 `compaction` 事件保证可观测。**反应式路径**（Phase C）：模型调用抛出被 `isContextOverflowError` 认出的 context-too-long 400 时，loop 每轮最多一次以 `force + protectRecent=2` 硬压缩后**重发同一轮**（发 `compaction{reactive:true}`，不占瞬时重试额度）；无可压或仍超长 → `finish("error")`，错误分类以 `context_overflow` 开头。另有**入口截断**：单个 tool_result 进正史前按 `toolResultMaxChars`（默认 40k，`AGENT_TOOL_RESULT_MAX_CHARS`）截断并附分页提示，事件与正史看到的是同一份。
 6. **业务完成不等于 wire 结束**：启用完成门时，`end_turn` / `stop_sequence` 只表示本次生成结束；只有合法 `finish_task` 才能产生 `"completed"`、`"partial"` 或 `"blocked"`。重复文字收尾会被路由到有界强制收口，不能标绿。

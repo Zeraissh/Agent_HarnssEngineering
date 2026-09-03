@@ -161,8 +161,56 @@ export function isTransientApiError(err: unknown): boolean {
   return true;
 }
 
+/**
+ * 上下文超长判定（MEM-01 Phase C 反应式压缩的触发器）。
+ *
+ * 两条 wire 的形状都认：
+ *  - Anthropic：400 invalid_request_error，message「prompt is too long: N tokens > M maximum」；
+ *  - OpenAI / 兼容端点：400，`code: "context_length_exceeded"`，或 message
+ *    「This model's maximum context length is N tokens…」（DeepSeek 等措辞略有出入）。
+ * 只在 400/413（或 SDK 没给 status 但 code 命中）时认——它是永久性错误的一个**子类**，
+ * 与瞬时判定正交：isTransientApiError 仍返回 false，只是 loop 在报错之前多一次硬压缩重发。
+ * 判据取宽（措辞各家不同），误判的代价只是多做一次压缩再重发一次同样的请求。
+ */
+export function isContextOverflowError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const status = (err as { status?: unknown }).status;
+  const code = readErrorCode(err);
+  const message = String((err as { message?: unknown }).message ?? "").toLowerCase();
+  const codeHit = code === "context_length_exceeded" || code === "context_window_exceeded";
+  const messageHit =
+    /prompt is too long/.test(message) ||
+    /context[_ ]length/.test(message) ||
+    /maximum context length/.test(message) ||
+    /context window/.test(message) ||
+    /too many tokens/.test(message) ||
+    /input (is )?too long/.test(message);
+  if (typeof status === "number") return (status === 400 || status === 413) && (codeHit || messageHit);
+  return codeHit || (status === undefined && messageHit && message.includes("token"));
+}
+
+function readErrorCode(err: object): string | undefined {
+  const direct = (err as { code?: unknown }).code;
+  if (typeof direct === "string") return direct;
+  const nested = (err as { error?: { code?: unknown; error?: { code?: unknown } } }).error;
+  if (nested && typeof nested === "object") {
+    if (typeof nested.code === "string") return nested.code;
+    if (nested.error && typeof nested.error === "object" && typeof nested.error.code === "string") {
+      return nested.error.code;
+    }
+  }
+  return undefined;
+}
+
+/** classifyApiError 对上下文超长的固定前缀——台账 taxonomy 与宿主文案都靠它识别 */
+export const CONTEXT_OVERFLOW_ERROR_PREFIX = "context_overflow";
+
 /** 宿主级错误分类：loop 用它决定报错信息，不用字符串匹配 */
 export function classifyApiError(err: unknown): string {
+  if (isContextOverflowError(err)) {
+    const msg = String((err as { message?: unknown }).message ?? "").split("\n")[0] ?? "";
+    return `${CONTEXT_OVERFLOW_ERROR_PREFIX}：请求超出模型上下文窗口，反应式压缩后仍装不下（${msg.slice(0, 160)}）`;
+  }
   if (err instanceof Anthropic.AuthenticationError) return "认证失败：检查 ANTHROPIC_API_KEY 或运行 ant auth login";
   if (err instanceof Anthropic.RateLimitError) return "限流：SDK 重试已耗尽，请稍后再试";
   if (err instanceof Anthropic.NotFoundError) return "模型或端点不存在：检查 model 配置";

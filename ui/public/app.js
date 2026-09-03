@@ -74,6 +74,8 @@ export { createBatcher, diffKeyed, signature, patchList, appendOnly, setText, se
  *   droppedBlocks?: number
  *   ledgerEntries?: number
  *   summaryApplied?: boolean
+ *   collapsedTurns?: number
+ *   reactive?: boolean
  * }} TimelineEntry
  *
  * @typedef {TimelineEntry & {collapsed: boolean}} LogEntry
@@ -892,6 +894,9 @@ function buildTimelineEntry(seq, source, type, event) {
         ledgerEntries:
           typeof event.ledgerEntries === "number" ? /** @type {number} */ (event.ledgerEntries) : undefined,
         summaryApplied: event.summaryApplied === true,
+        // Phase C：折叠了几轮旧对话（正文不可恢复）、是不是撞了端点 400 才压的
+        collapsedTurns: typeof event.collapsedTurns === "number" ? event.collapsedTurns : 0,
+        reactive: event.reactive === true,
       };
     default:
       return base;
@@ -1366,6 +1371,8 @@ export function deriveContextFace(state, harness) {
       droppedBlocks: e.droppedBlocks ?? 0,
       ledgerEntries: e.ledgerEntries ?? 0,
       summaryApplied: e.summaryApplied === true,
+      collapsedTurns: e.collapsedTurns ?? 0,
+      reactive: e.reactive === true,
     }));
 
   return {
@@ -1376,6 +1383,9 @@ export function deriveContextFace(state, harness) {
     droppedBlocks: compactions.reduce((n, c) => n + c.droppedBlocks, 0),
     ledgerEntries: compactions.reduce((n, c) => n + (c.ledgerEntries ?? 0), 0),
     summaryAppliedCount: compactions.reduce((n, c) => n + (c.summaryApplied ? 1 : 0), 0),
+    // Phase C：旧轮折叠总数与反应式（撞 400 后）压缩次数——两者都比"置换了几个块"更该被看见
+    collapsedTurns: compactions.reduce((n, c) => n + (c.collapsedTurns ?? 0), 0),
+    reactiveCount: compactions.reduce((n, c) => n + (c.reactive ? 1 : 0), 0),
     perTurn: state.usageByTurn,
   };
 }
@@ -3144,7 +3154,10 @@ function patchContextGauge(parts, ctx) {
       ? `上下文最近一轮输入 ${formatTokens(ctx.lastInputTokens)}（未配置上限）`
       : `上下文水位 ${pct}%，最近一轮输入 ${formatTokens(ctx.lastInputTokens)} / 上限 ${formatTokens(ctx.limit)}`,
     ctx.compactions.length > 0
-      ? `已压缩 ${ctx.compactions.length} 次，置换 ${ctx.droppedBlocks} 个 tool_result 原文；结构化账本保留 ${ctx.ledgerEntries ?? 0} 条事实` +
+      ? `已压缩 ${ctx.compactions.length} 次，置换 ${ctx.droppedBlocks} 个 tool_result 原文` +
+        ((ctx.collapsedTurns ?? 0) > 0 ? `，折叠 ${ctx.collapsedTurns} 轮旧对话` : "") +
+        ((ctx.reactiveCount ?? 0) > 0 ? `（${ctx.reactiveCount} 次为撞 400 后的反应式压缩）` : "") +
+        `；结构化账本保留 ${ctx.ledgerEntries ?? 0} 条事实` +
         ((ctx.summaryAppliedCount ?? 0) > 0 ? `（其中 ${ctx.summaryAppliedCount} 次合并了 LLM 摘要）` : "")
       : null,
     "查看上下文详情",
@@ -4086,6 +4099,8 @@ export function buildFactorCards(faces) {
   if (context.compactions.length > 0) {
     ctxLines.push(
       `⚠ 压缩 ${context.compactions.length} 次 · 置换 ${context.droppedBlocks} 块原文` +
+        ((context.collapsedTurns ?? 0) > 0 ? ` · 折叠 ${context.collapsedTurns} 轮旧对话` : "") +
+        ((context.reactiveCount ?? 0) > 0 ? ` · 撞 400 后反应式 ${context.reactiveCount} 次` : "") +
         ` · 账本 ${context.ledgerEntries ?? 0} 条` +
         ((context.summaryAppliedCount ?? 0) > 0
           ? ` · LLM 摘要 ${context.summaryAppliedCount} 次`
@@ -4199,6 +4214,7 @@ function patchTabContent(parts, state, activeTab, overview, logEntries, callback
           faces.context.lastInputTokens, faces.context.limit,
           faces.context.compactions.length, faces.context.droppedBlocks,
           faces.context.ledgerEntries ?? 0, faces.context.perTurn.length,
+          faces.context.collapsedTurns ?? 0, faces.context.reactiveCount ?? 0,
         ])
       : activeTab === "tools"
         ? signature([
@@ -4306,9 +4322,17 @@ function renderContextTab(ctx) {
     // V-19：不可逆自成语域。被置换的 tool_result 原文永不可恢复，
     // 这不是"又一条黄色警告"，混在一起会让人对它脱敏。
     html += '<div class="callout callout--irreversible">';
-    html += `<strong>⚠ 上下文压缩 ${ctx.compactions.length} 次，置换 ${ctx.droppedBlocks} 个 tool_result 原文</strong>`;
+    html += `<strong>⚠ 上下文压缩 ${ctx.compactions.length} 次，置换 ${ctx.droppedBlocks} 个 tool_result 原文` +
+      ((ctx.collapsedTurns ?? 0) > 0 ? `，折叠 ${ctx.collapsedTurns} 轮旧对话` : "") +
+      "</strong>";
     html +=
       "<p>tool_result 原文不可恢复，模型如需全文须重跑工具。" +
+      ((ctx.collapsedTurns ?? 0) > 0
+        ? "被折叠的旧轮只剩一行摘要（assistant 正文首句 / 工具调用 / 结果首行），正文同样不可恢复。"
+        : "") +
+      ((ctx.reactiveCount ?? 0) > 0
+        ? `其中 ${ctx.reactiveCount} 次是端点返回上下文超长 400 后的反应式硬压缩（保护窗收到 2），随即重发了同一轮。`
+        : "") +
       `结构化账本已保留 ${ctx.ledgerEntries ?? 0} 条约束/决策/失败/证据/副作用摘要` +
       ((ctx.summaryAppliedCount ?? 0) > 0
         ? `（其中 ${ctx.summaryAppliedCount} 次合并了可选 LLM 摘要）`
@@ -5457,7 +5481,8 @@ function renderLogEntryBody(e) {
         `${Array.isArray(e.reset) && e.reset.length ? `<br>未恢复：${esc(e.reset.join("、"))}` : ""}</div>`;
     }
     case "compaction":
-      return `<div class="log-entry-body">丢弃 ${e.droppedBlocks ?? "?"} 个块` +
+      return `<div class="log-entry-body">${e.reactive ? "反应式（撞上下文超长 400 后重发同一轮）· " : ""}丢弃 ${e.droppedBlocks ?? "?"} 个块` +
+        (e.collapsedTurns ? ` · 折叠 ${e.collapsedTurns} 轮旧对话` : "") +
         (typeof e.ledgerEntries === "number" ? ` · 账本 ${e.ledgerEntries} 条` : "") +
         (e.summaryApplied ? " · 已合并 LLM 摘要" : "") +
         `</div>`;

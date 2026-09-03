@@ -280,6 +280,14 @@ export interface AgentConfig {
   compat?: boolean;
   /** 上下文 token 上限（触发 compact 的依据，按上一轮实际输入衡量）。默认 150_000 */
   contextTokenLimit?: number;
+  /**
+   * 单个 tool_result 进入正史前的字符上限（MEM-01 Phase C 的"入口截断"）。默认 40_000，
+   * 见 `DEFAULT_TOOL_RESULT_MAX_CHARS`。内置 read_file / bash 自带 30k 截断，这一层是
+   * **兜底**——MCP 工具的返回没有任何上限，一次几百 KB 的返回能直接把上下文顶穿。
+   * 截断标记会告诉模型怎么分页（read_file offset/limit、命令加过滤器），不是静默吞掉。
+   * 宿主经 AGENT_TOOL_RESULT_MAX_CHARS 注入。
+   */
+  toolResultMaxChars?: number;
   /** 从持久化检查点恢复时注入的上一轮实际输入水位；全新会话不得设置 */
   initialContextInputTokens?: number;
   /**
@@ -472,9 +480,11 @@ export type TurnEvent =
     }
   | { type: "usage"; turn: number; usage: Anthropic.Usage }
   /**
-   * 上下文压缩。droppedBlocks = 被置换的 tool_result 数；
+   * 上下文压缩。droppedBlocks = 被置换的 tool_result 数（tier 1）；
    * ledgerEntries = MEM-01 结构化账本中的事实条数（约束/决策/失败/证据/副作用）；
-   * summaryApplied = Phase B LLM 摘要已合并进账本（缺省/失败均为未设或 false）。
+   * summaryApplied = Phase B LLM 摘要已合并进账本（缺省/失败均为未设或 false）；
+   * collapsedTurns = tier 2 本次折叠进 `[compacted_turns]` 块的旧轮数（缺省 = 未折叠）；
+   * reactive = 由端点的 context-too-long 400 触发的硬压缩（保护窗收到 2），随即重发同一轮。
    * 原文仍不可恢复，但账本随正史保留。
    */
   | {
@@ -482,6 +492,8 @@ export type TurnEvent =
       droppedBlocks: number;
       ledgerEntries?: number;
       summaryApplied?: boolean;
+      collapsedTurns?: number;
+      reactive?: boolean;
     }
   /**
    * 思考增量（逐字）。与 `assistant_thinking`（turn 级整块）互补：

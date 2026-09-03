@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type Anthropic from "@anthropic-ai/sdk";
 import { COMPACT_LEDGER_MARKER, parseCompactLedgerText } from "../src/compact-ledger.js";
-import { DefaultContextManager, userMessageWithContext } from "../src/context.js";
+import {
+  COMPACTED_TURNS_MARKER,
+  DefaultContextManager,
+  REACTIVE_PROTECT_RECENT,
+  userMessageWithContext,
+} from "../src/context.js";
 import { diffRenderedRequests } from "../src/diagnostics.js";
 import { AgentLoop } from "../src/loop.js";
 import type { TurnEvent } from "../src/types.js";
@@ -258,9 +263,13 @@ describe("AgentLoop 集成：compaction 事件与正史替换", () => {
     const done = events.at(-1);
     if (done?.type !== "done") throw new Error("no done event");
     expect(done.result.stopReason).toBe("completed");
-    // 正史里最老的 tool_result 应已被占位文本替换
+    // 正史里最老的 tool_result 应已被压缩：tier 1 的占位文本，或（水位仍高时）被 tier 2
+    // 连同所在轮一起折叠进 [compacted_turns]——两者都算"原文不再在正史里"
     const flat = JSON.stringify(done.result.messages);
-    expect(flat).toContain("[compacted]");
+    expect(flat).toMatch(/\[compacted\]|\[compacted_turns\]/);
+    // 每一轮的 usage 都钉在 5000（水位之上），tier 1 置换后估算仍在水位上 → tier 2 必须跟上
+    expect(flat).toContain(COMPACTED_TURNS_MARKER);
+    expect(compactions.some((c) => c.type === "compaction" && (c.collapsedTurns ?? 0) > 0)).toBe(true);
   });
 
   it("从持久化检查点恢复时，首个请求先按旧水位压缩，不能盲发完整大历史", async () => {

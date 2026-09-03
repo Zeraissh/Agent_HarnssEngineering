@@ -59,6 +59,7 @@ import { fetchUrlTool } from "../src/tools/fetch-url.js";
 import { readFileTool } from "../src/tools/read-file.js";
 import { writeFileTool } from "../src/tools/write-file.js";
 import { resolveInWorkdir } from "../src/tools/fs-util.js";
+import { DEFAULT_TOOL_RESULT_MAX_CHARS } from "../src/tools/registry.js";
 import {
   appendRunLedger,
   buildLedgerEntry,
@@ -2335,6 +2336,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   const maxTotalTurns = integerEnv("AGENT_TOTAL_MAX_TURNS", 1) ?? (realHost ? 120 : undefined);
   const maxTokensBudget = integerEnv("AGENT_TOTAL_TOKEN_BUDGET", 1) ?? (realHost ? 500_000 : undefined);
   const compactSummaryMaxTokens = integerEnv("AGENT_COMPACT_SUMMARY_MAX_TOKENS", 64);
+  // 单个 tool_result 入口截断上限（MEM-01 Phase C，口径同 CLI）；缺省 40k
+  const toolResultMaxChars = integerEnv("AGENT_TOOL_RESULT_MAX_CHARS", 1000);
   /**
    * 恢复策略三级解析：env > 包 `recovery` > 默认（口径同 verifyMaxTurnsOf / planner 预算）。
    * env 侧逐字段：只写了 AGENT_STAGNATION_WINDOW 时另两个仍落到包/默认。
@@ -2487,6 +2490,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         : {}),
       ...(maxTotalTurns !== undefined ? { maxTotalTurns } : {}),
       ...(maxTokensBudget !== undefined ? { maxTokensBudget } : {}),
+      ...(toolResultMaxChars !== undefined ? { toolResultMaxChars } : {}),
       ...(compactSummaryOn && realHost
         ? {
             compactSummaryClient: modelClient,
@@ -4319,6 +4323,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         contextTokenLimit: cfg.contextTokenLimit ?? null,
         maxTotalTurns: cfg.maxTotalTurns ?? null,
         maxTokensBudget: cfg.maxTokensBudget ?? null,
+        toolResultMaxChars: cfg.toolResultMaxChars ?? DEFAULT_TOOL_RESULT_MAX_CHARS,
       },
       tools: cfg.tools.map((tool) => ({
         name: tool.name,
@@ -4412,6 +4417,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         contextTokenLimit: contextTokenLimit ?? null,
         maxTotalTurns: maxTotalTurns ?? null,
         maxTokensBudget: maxTokensBudget ?? null,
+        toolResultMaxChars: toolResultMaxChars ?? DEFAULT_TOOL_RESULT_MAX_CHARS,
       },
       hostLimits: {
         requestBodyMaxBytes,

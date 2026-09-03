@@ -152,7 +152,7 @@ bash，出现 gate/校验/渲染/并行需求时再晋升。
 | system prompt | 构造时冻结（P3）；动态上下文（当前时间、环境信息）以文本块追加在 messages 中，永不改 system |
 | 缓存断点 | 两个：① system 最后一个 text 块（缓存 tools+system）；② 最近一条 user 消息的最后一个 content 块（会话增量缓存）。注意 20 块回溯窗口：单轮工具块过多时在中段补打断点 |
 | 缓存最小长度 | Opus 4.8 最小可缓存前缀为 4096 token——system+tools 太短时打了标记也不缓存，属正常现象，文档化即可 |
-| 窗口逼近策略 | v0.3 + **MEM-01**：水位 80% 时把保护窗口外大体积 `tool_result` 置换为**语义占位**（保留该次交换的失败/证据/副作用摘要），并 upsert `[compact_ledger]` 文本块（用户约束、决策、失败尝试、证据引用、side-effect 账本）。结构不破坏、操作幂等；loop **替换正史**保缓存前缀稳定。仍非 LLM 摘要；server-side compaction（beta）仍属更远 |
+| 窗口逼近策略 | v0.3 + **MEM-01**，分级、便宜的先上：**入口截断**（单个 `tool_result` 进正史前按 `toolResultMaxChars` 截断并附分页提示——MCP 返回无上限的兜底）→ **tier 1** 水位 80% 时把保护窗口外大体积 `tool_result` 置换为**语义占位**（保留该次交换的失败/证据/副作用摘要），并 upsert `[compact_ledger]` 文本块（用户约束、决策、失败尝试、证据引用、side-effect 账本）→ **tier 2**（Phase C）置换后估算仍在水位上或无可置换时，把保护窗外、任务首条之后的旧轮折叠成一个 `[compacted_turns]` 摘要块（配对永不拆散、只合并不二折）→ **反应式**：端点 context-too-long 400 时忽略水位硬压缩（保护窗收到 2）重发同一轮，仍超长才 error。结构不破坏、操作幂等；loop **替换正史**保缓存前缀稳定。仍非 LLM 摘要（Phase B 只丰富账本）；server-side compaction（beta）仍属更远 |
 | 跨重启恢复 | 每个完整 main 段导出最后输入水位；恢复后的 `AgentLoop` 用该水位在首个请求前决定是否 compact，避免把大历史盲发一次后才发现超窗 |
 | Token 核算 | 汇总口径 = `input + cache_creation + cache_read`（`input_tokens` 只是未缓存部分）；对外报表必须区分三者，否则"缓存是否生效"无法判断 |
 

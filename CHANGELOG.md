@@ -19,6 +19,12 @@
 - **台账「终止原因 × 包」**：`npm run ledger` 新增终止原因 × 包表、max_turns 明细（用了多少轮 vs 单段护栏，
   比值按段归一）与恢复触发计数；台账行新增 `maxTurns` / `recoveryPolicy` / `recovery`，老行仍可读并按
   「推算 / 未知」标注；Web 裸跑的 `turns` 不再恒 null。
+- **MEM-01 Phase C：分级压缩 + 反应式压缩**。① 单个 tool_result 进正史前按 `AGENT_TOOL_RESULT_MAX_CHARS`
+  （默认 40k）截断并附分页提示——MCP 返回无上限的兜底；② tier 2：tier 1 置换后估算仍在水位上时，把保护窗外的
+  旧轮折叠成一个 `[compacted_turns]` 摘要块（配对不拆、幂等、只合并不二折）；③ 端点 context-too-long 400
+  （Anthropic「prompt is too long」/ OpenAI `context_length_exceeded`）不再直接报错：忽略水位硬压缩后重发同一轮，
+  仍超长才以 `context_overflow` 分类收尾。`compaction` 事件新增 `collapsedTurns` / `reactive`，CLI 与 Web 同步显示；
+  mock provider 新增 `context_overflow` 故障与确定性场景。
 
 ### 工具（Tools）
 

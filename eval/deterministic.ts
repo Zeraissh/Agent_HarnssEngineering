@@ -449,6 +449,35 @@ const scenarios: Scenario[] = [
   },
 
   {
+    id: "context-overflow-reactive-compaction",
+    title: "端点 400「prompt is too long」→ 反应式硬压缩 → 同轮重发成功",
+    guards:
+      "MEM-01 Phase C：上下文超长是永久性 400，此前直接 finish(error) 整段作废。现在必须" +
+      "忽略水位做一次硬压缩（折叠旧轮、保护窗收到 2）并重发同一轮，且不占瞬时重试额度。" +
+      "请求条数可数：3 轮工具 + 1 次撞墙 + 1 次重发 = 5；三个文件都在，run 以 completed 收尾",
+    args: ["--yes"],
+    env: { AGENT_MAX_RETRIES: "0" },
+    task: "write three notes then finish",
+    scripts: [
+      turn(tu("write_file", { path: "n1.txt", content: "one\n" })),
+      turn(tu("write_file", { path: "n2.txt", content: "two\n" })),
+      turn(tu("write_file", { path: "n3.txt", content: "three\n" })),
+      // 第 4 次请求撞上下文超长：loop 应硬压缩后用同一轮重发（下一条脚本）
+      faultTurn({ type: "context_overflow" }),
+      turn(finishTask("completed", "three notes written", { artifacts: ["n1.txt", "n2.txt", "n3.txt"] })),
+    ],
+    expect: {
+      exitCode: 0,
+      includes: ["context compacted (reactive", "collapsed 2 earlier turns", "completed"],
+      // 以 error 收尾时终端会打出 context_overflow 分类；成功路径上它不该出现
+      excludes: ["context_overflow"],
+      files: { "n1.txt": "one\n", "n2.txt": "two\n", "n3.txt": "three\n" },
+      ledger: { stopReason: "completed" },
+      requestCount: 5,
+    },
+  },
+
+  {
     id: "plan-two-subtasks-serial",
     title: "freeform 计划：两个子任务串行执行并逐个核查",
     guards:

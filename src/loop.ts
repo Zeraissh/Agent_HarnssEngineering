@@ -6,10 +6,10 @@
  * approval_request 事件挂起循环直到宿主调用 respond；最后一个事件恒为 done。
  */
 import type Anthropic from "@anthropic-ai/sdk";
-import { DefaultContextManager, userMessageWithContext } from "./context.js";
+import { DefaultContextManager, REACTIVE_PROTECT_RECENT, userMessageWithContext } from "./context.js";
 import { createHash } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
-import { classifyApiError, isTransientApiError } from "./model-client.js";
+import { classifyApiError, isContextOverflowError, isTransientApiError } from "./model-client.js";
 import { decideRecovery } from "./recovery.js";
 import { type DurableToolTx, type ToolTxController } from "./tool-tx.js";
 import { ToolExecutor, ToolRegistry } from "./tools/registry.js";
@@ -253,6 +253,7 @@ export class AgentLoop {
       cfg.workdir,
       cfg.readRoots,
       cfg.executionBroker,
+      cfg.toolResultMaxChars,
     );
     // SAFE-06：有 runId 就武装事务层。宿主可注入持久化 controller；否则内存表。
     if (cfg.runId) {
@@ -573,22 +574,29 @@ export class AgentLoop {
         // 压缩替换正史（一次性、确定性），保证后续请求前缀稳定（见 context.ts 注释）
         // Phase B：可选 LLM 摘要经 compactAsync；未配置客户端时与 Phase A 同步路径等价
         const compacted = await this.context.compactAsync(messages, signal);
-        if (compacted.droppedBlocks > 0) {
+        if (compacted.changed) {
           messages = compacted.messages;
           q.push({
             type: "compaction",
             droppedBlocks: compacted.droppedBlocks,
             ledgerEntries: compacted.ledgerEntries,
+            ...(compacted.collapsedTurns > 0 ? { collapsedTurns: compacted.collapsedTurns } : {}),
             ...(compacted.summaryApplied ? { summaryApplied: true } : {}),
           });
         }
 
-        const request = this.context.render(messages, this.registry.toApiTools());
-        if (forceTerminal && this.cfg.terminalTool) {
-          request.toolChoice = { type: "tool", name: this.cfg.terminalTool };
-        } else if (this.cfg.toolChoice) {
-          request.toolChoice = this.cfg.toolChoice;
-        }
+        const buildRequest = () => {
+          const req = this.context.render(messages, this.registry.toApiTools());
+          if (forceTerminal && this.cfg.terminalTool) {
+            req.toolChoice = { type: "tool", name: this.cfg.terminalTool };
+          } else if (this.cfg.toolChoice) {
+            req.toolChoice = this.cfg.toolChoice;
+          }
+          return req;
+        };
+        let request = buildRequest();
+        // 反应式压缩每轮最多一次：第二次仍超长就是真的装不下了，如实报错
+        let reactiveCompactionUsed = false;
 
         // 同轮重试：SDK 的 HTTP 重试耗尽后，loop 层对瞬时错误再兜 errorRetries 次。
         // 请求是幂等的（同一 request 重发），非瞬时错误（认证/4xx/abort）立即终止。
@@ -614,6 +622,35 @@ export class AgentLoop {
              * 而且 error 路径还会触发段级续跑（9.8），变成"停一下又自己接着跑"。
              */
             if (signal.aborted) return finish("aborted");
+            /**
+             * 反应式压缩（MEM-01 Phase C）：端点明说"prompt is too long"/
+             * context_length_exceeded 是**永久性** 400，此前直接 finish("error")——
+             * 整段工作因为一次超长请求作废，而按水位触发的压缩此时已经晚了一轮
+             * （水位是上一轮的读数）。正解：忽略水位做一次硬压缩（tier 1 + tier 2，
+             * 保护窗收到 2），用压缩后的正史**重发同一轮**；没东西可压、或压完仍
+             * 超长，才是真的装不下，照旧如实报错。不消耗 errorRetries——这不是瞬时抖动。
+             */
+            if (isContextOverflowError(err) && !reactiveCompactionUsed) {
+              reactiveCompactionUsed = true;
+              const hard = await this.context.compactAsync(messages, signal, {
+                force: true,
+                protectRecent: REACTIVE_PROTECT_RECENT,
+              });
+              if (hard.changed) {
+                messages = hard.messages;
+                q.push({
+                  type: "compaction",
+                  droppedBlocks: hard.droppedBlocks,
+                  ledgerEntries: hard.ledgerEntries,
+                  ...(hard.collapsedTurns > 0 ? { collapsedTurns: hard.collapsedTurns } : {}),
+                  ...(hard.summaryApplied ? { summaryApplied: true } : {}),
+                  reactive: true,
+                });
+                request = buildRequest();
+                attempt -= 1; // 不占瞬时重试额度
+                continue;
+              }
+            }
             if (!isTransientApiError(err) || attempt >= this.errorRetries) {
               // 原始错误挂在 cause 上：分类过的消息是给人看的，但编排层要靠
               // isTransientApiError(原始错误) 决定"这段能不能带着正史续跑"（9.8）。

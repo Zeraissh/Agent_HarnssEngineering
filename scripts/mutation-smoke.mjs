@@ -130,9 +130,9 @@ const MUTANTS = [
   {
     id: "compact-ledger-skipped",
     file: "src/context.ts",
-    find: "    const ledger = mergeCompactLedgers(priorLedger, scanned);\n    const withLedger = upsertCompactLedger(out, ledger);\n    return {\n      messages: withLedger,\n      droppedBlocks: dropped,\n      ledgerEntries: ledgerEntryCount(ledger),\n      ledger,\n      summaryApplied: false,\n    };",
+    find: "    const ledger = mergeCompactLedgers(priorLedger, scanned, collapsedLedger);\n    const withLedger = upsertCompactLedger(out, ledger);\n    return {\n      messages: withLedger,\n      droppedBlocks: dropped,\n      ledgerEntries: ledgerEntryCount(ledger),\n      ledger,\n      summaryApplied: false,\n      collapsedTurns,\n      changed: true,\n    };",
     replace:
-      "    // MUTATION: skip semantic ledger — regress to placeholder-only compaction\n    return {\n      messages: out,\n      droppedBlocks: dropped,\n      ledgerEntries: 0,\n      ledger: emptyCompactLedger(),\n      summaryApplied: false,\n    };",
+      "    // MUTATION: skip semantic ledger — regress to placeholder-only compaction\n    return {\n      messages: out,\n      droppedBlocks: dropped,\n      ledgerEntries: 0,\n      ledger: emptyCompactLedger(),\n      summaryApplied: false,\n      collapsedTurns,\n      changed: true,\n    };",
     testFiles: ["test/compact.test.ts"],
     why: "MEM-01 压缩必须写入 compact_ledger；退回纯占位等于语义残留丢失",
   },
@@ -144,6 +144,31 @@ const MUTANTS = [
       "export function mergeSummaryIntoLedger(\n  base: CompactLedger,\n  enrichment: CompactSummaryEnrichment,\n): CompactLedger {\n  // MUTATION: replace buckets with summary-only additions — lose Phase A facts\n  const merged = enrichment.additions;\n  void base;\n  void mergeCompactLedgers;\n",
     testFiles: ["test/compact-summary.test.ts"],
     why: "Phase B 必须 merge 进 Phase A 账本，不得用摘要桶替换启发式桶",
+  },
+  {
+    id: "compact-tier2-skipped",
+    file: "src/context.ts",
+    find: "    const needTier2 =\n      force || dropped === 0 || estimatedAfter >= this.contextTokenLimit * COMPACT_WATERMARK;",
+    replace:
+      "    // MUTATION: tier 2 never runs — long assistant text / small results stay forever\n    const needTier2 = false as boolean;\n    void force; void estimatedAfter;",
+    testFiles: ["test/compact-tier2.test.ts"],
+    why: "MEM-01 Phase C：tier 1 无可置换或置换后仍在水位上时必须折叠旧轮；退回 tier 1 = 水位只涨不落",
+  },
+  {
+    id: "reactive-compaction-skipped",
+    file: "src/loop.ts",
+    find: "            if (isContextOverflowError(err) && !reactiveCompactionUsed) {",
+    replace: "            if (false && isContextOverflowError(err) && !reactiveCompactionUsed) { // MUTATION",
+    testFiles: ["test/compact-tier2.test.ts"],
+    why: "端点 context-too-long 400 必须触发硬压缩重发；跳过 = 整段工作因一次超长请求作废",
+  },
+  {
+    id: "tool-result-snip-bypassed",
+    file: "src/tools/registry.ts",
+    find: "  const limit = Math.max(1000, Math.floor(maxChars));\n  if (result.content.length <= limit) return result;",
+    replace: "  const limit = Math.max(1000, Math.floor(maxChars));\n  if (true || result.content.length <= limit) return result; // MUTATION",
+    testFiles: ["test/compact-tier2.test.ts"],
+    why: "单个 tool_result 入口截断是兜底：MCP 返回无上限，绕过它一次几百 KB 就顶穿上下文",
   },
   {
     id: "prefer-healthy-never-skips",

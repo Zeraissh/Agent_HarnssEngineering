@@ -175,7 +175,7 @@ npx tsc --noEmit                            passed
 
 | 状态 | ID | 优化项 | I/R/E | 优先分 | 完成定义 |
 |---|---|---|---:|---:|---|
-| [~] | MEM-01 | 语义化上下文压缩 | 5/4/4 | 18 | 保留用户约束、决策、失败尝试、证据引用和 side-effect ledger，不再只用占位符替换旧工具输出。**Phase A+B 已落地（2026-09-03）**：启发式 `[compact_ledger]` + 可选 LLM 摘要合并（`AGENT_COMPACT_SUMMARY=1`，默认关）；见 Phase 5 实施记录 |
+| [~] | MEM-01 | 语义化上下文压缩 | 5/4/4 | 18 | 保留用户约束、决策、失败尝试、证据引用和 side-effect ledger，不再只用占位符替换旧工具输出。**Phase A+B 已落地（2026-09-03）**：启发式 `[compact_ledger]` + 可选 LLM 摘要合并（`AGENT_COMPACT_SUMMARY=1`，默认关）；**Phase C 已落地（2026-09-03）**：入口截断 + tier 2 折叠旧轮 + 反应式硬压缩重发；见 Phase 5 实施记录 |
 | [ ] | MEM-02 | 分层、可治理记忆 | 4/4/5 | 8 | 原始事件→滚动摘要→artifact/reference store；按用户/项目/任务检索；记录来源、时间、置信度、冲突和删除范围 |
 | [ ] | MEM-03 | 跨宿主一致性 | 4/3/4 | 14 | CLI/Web/Electron 使用同一 memory contract；同步、权限、加密、删除和数据归属有端到端测试 |
 
@@ -184,7 +184,8 @@ npx tsc --noEmit                            passed
 | ID | 已取得证据 | 残余边界 |
 |---|---|---|
 | MEM-01 Phase A | `src/compact-ledger.ts` 启发式抽取五桶；`DefaultContextManager.compact` 在 elision 前扫描保护窗外消息，写入/原地更新 `[compact_ledger]`，tool_result 改为语义占位（仍以 `[compacted]` 开头保幂等）；`compaction` 事件带 `ledgerEntries`；CLI + Web reducer/面文案同提交接线；`test/compact*.ts` + UI 锁；mutation-smoke `compact-ledger-skipped` | 启发式会漏非模板表述的约束/决策；只压缩大 tool_result，**不删除** assistant 消息正文；side-effect 桶覆盖内置写类 + 变异 bash 模式，MCP 写工具靠名字启发；原文仍不可恢复 |
-| MEM-01 Phase B | `src/compact-summary.ts` + `compactAsync`：可选 ModelClient（不经 ToolContext），`AGENT_COMPACT_SUMMARY=1` 默认关；有界 `max_tokens`（默认 512）；摘要 **merge** 进账本（可附 `summary:` narrative），失败 fail-open 回 Phase A；事件 `summaryApplied`；CLI + `app.js` 同提交；FakeModelClient 单测 + mutation `compact-summary-replaces-ledger` | **仍不**把长 assistant 推理从正史里 elide（只把可抽取事实写入账本）；摘要质量依赖模型，错误事实靠"不得编造"提示约束而非硬校验；未开 flag 时行为≡Phase A；跨宿主记忆合同仍归 MEM-02/03 |
+| MEM-01 Phase B | `src/compact-summary.ts` + `compactAsync`：可选 ModelClient（不经 ToolContext），`AGENT_COMPACT_SUMMARY=1` 默认关；有界 `max_tokens`（默认 512）；摘要 **merge** 进账本（可附 `summary:` narrative），失败 fail-open 回 Phase A；事件 `summaryApplied`；CLI + `app.js` 同提交；FakeModelClient 单测 + mutation `compact-summary-replaces-ledger` | 摘要质量依赖模型，错误事实靠"不得编造"提示约束而非硬校验；未开 flag 时行为≡Phase A；跨宿主记忆合同仍归 MEM-02/03 |
+| MEM-01 Phase C | 分级流水线，便宜的先上：① **入口截断** `snipToolResult`（ToolExecutor 边界，`AGENT_TOOL_RESULT_MAX_CHARS` 默认 40k > 内置 30k，MCP 返回无上限的兜底；标记带分页提示；事件与正史同一份）；② **tier 2** `collapseOldTurns`：tier 1 后按字符/4 估算仍在水位上或无可置换 → 保护窗外、任务首条之后的旧轮折叠为一个 `[compacted_turns]` 块（assistant 首句 / 工具调用 / 结果首行 / user 文本；配对永不拆散——窗首是 tool_result 时其 assistant 一并保留；只合并不二折 = 幂等；被折叠的小结果也过账本）；③ **反应式** `isContextOverflowError`（Anthropic「prompt is too long」/ OpenAI `context_length_exceeded`，两条真实 SDK 的形状经 mock 锁住）→ loop 每轮一次 `force + protectRecent=2` 硬压缩重发同一轮，事件 `compaction{reactive:true, collapsedTurns}`，不占瞬时重试额度；仍超长 → `finish("error")`，分类前缀 `context_overflow`。CLI + `app.js` 三处同提交；`eval/mock-provider` 新故障 `context_overflow` + 确定性场景 `context-overflow-reactive-compaction`（13/13）；mutation-smoke 新增 3 个变异（tier2 跳过 / 反应式跳过 / 截断绕过），16/16 killed | **仍不压缩的**：保护窗内（默认最近 6 条 / 反应式 2 条）的一切；任务首条 user 消息（含 `<context>` 块，可能很大）；`[compact_ledger]` 本身（有 20 条/桶上限但不缩）；折叠块只按行摘要不做语义合并，轮数多时块本身会长（每轮 1~2 行）；tier 2 的触发用 4 字符/token 粗估，不读真实 token；system prompt / tools 声明不在压缩范围；反应式只重发一次，第二次超长即 error（不做"再砍保护窗"）；未开 Phase B 时折叠块与账本全是启发式，长 assistant 推理里的非模板事实会随折叠丢失 |
 
 当前执行顺序（2026-09-03 成熟度第二波，单操作员形态）：
 `EVAL-03c → EVAL-01 held-out → OBS-01[~] → RUN-01[~ Phase 2] → MEM-01[~ Phase A+B] → MODEL-01b[~] → RUN-02[~] → SAFE-06[~ Phase 1] → E2E-01[~ Phase 1]`。

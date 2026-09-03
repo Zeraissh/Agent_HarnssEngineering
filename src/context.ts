@@ -54,7 +54,7 @@ export interface ContextConfig {
 
 export interface CompactResult {
   messages: Anthropic.MessageParam[];
-  /** 本次被置换为占位文本的 tool_result 块数量；0 = 未压缩 */
+  /** 本次被置换为占位文本的 tool_result 块数量（tier 1）；0 = 未置换 */
   droppedBlocks: number;
   /** MEM-01：压缩后账本中的事实条数（含既有 + 新提取） */
   ledgerEntries: number;
@@ -62,12 +62,47 @@ export interface CompactResult {
   ledger: CompactLedger;
   /** Phase B：本次是否成功合并了 LLM 摘要（失败/未配置均为 false） */
   summaryApplied?: boolean;
+  /**
+   * tier 2（MEM-01 Phase C）：本次新折叠进 `[compacted_turns]` 块的 assistant 轮数。
+   * 0 = 未折叠（tier 1 够用、或保护窗外已无可折叠的旧轮）。
+   */
+  collapsedTurns: number;
+  /** 本次是否改动了正史（droppedBlocks > 0 或 collapsedTurns > 0）。loop 据此决定要不要替换正史与发事件 */
+  changed: boolean;
+}
+
+/**
+ * 压缩选项。缺省 = 常规路径（按水位判定、保护窗 = 构造参数）。
+ * `force` 是反应式硬压缩（loop 撞上端点的 context-too-long 400 时）：忽略水位，
+ * tier 1 + tier 2 一起上；通常配 `protectRecent: REACTIVE_PROTECT_RECENT`。
+ */
+export interface CompactOptions {
+  force?: boolean;
+  protectRecent?: number;
 }
 
 /** 触发压缩的水位：上一轮实际输入超过上限的 80% */
 const COMPACT_WATERMARK = 0.8;
 /** 小于该字符数的 tool_result 不值得压缩 */
 const MIN_COMPACTABLE_CHARS = 500;
+/**
+ * tier 2 折叠块的标记。以它开头的 user 文本块 = 早先轮次的摘要，再次压缩时只会
+ * 被**合并**（新老出保护窗的轮追加进同一块），不会被二次折叠——这是幂等的来源。
+ */
+export const COMPACTED_TURNS_MARKER = "[compacted_turns]";
+/**
+ * 反应式压缩的保护窗：端点已经明说"装不下"，常规的 6 条（3 轮）保护窗此时是奢侈品；
+ * 收到 2 = 只保最近一轮 assistant + 它的 tool_result（模型接着往下走至少要看见这个）。
+ */
+export const REACTIVE_PROTECT_RECENT = 2;
+/**
+ * tier 1 节省量的 token 估算系数（字符/token）。只用于判断"置换之后估计还在水位上吗"
+ * ——真实水位下一轮 noteUsage 才知道；估得偏保守（英文约 4、中文更低）即可，
+ * 错判的代价只是多折叠一轮旧对话。
+ */
+const CHARS_PER_TOKEN_ESTIMATE = 4;
+/** 折叠块里每条摘要行的字符上限 */
+const COLLAPSE_LINE_CHARS = 160;
 
 export class DefaultContextManager {
   readonly systemPrompt: string;
@@ -136,28 +171,47 @@ export class DefaultContextManager {
   }
 
   /**
-   * Phase A 同步压缩：语义占位 + 启发式 `[compact_ledger]`。
-   * Phase B 走 {@link compactAsync}（可选 LLM，fail-open）。
+   * 同步压缩：分级流水线，便宜的先上。
+   *
+   *  tier 1（Phase A）：保护窗外的大 tool_result 置换为语义占位 + 启发式 `[compact_ledger]`；
+   *  tier 2（Phase C）：tier 1 之后**估计**仍在水位上（或根本没有可置换的块）时，把保护窗外、
+   *    首条任务消息之后的旧轮（assistant 正文 + tool_use 摘要 + 结果首行 + user 文本）折叠成
+   *    一个 `[compacted_turns]` 摘要块。tool_use / tool_result 配对永不拆散：保护窗起点若是
+   *    tool_result，其 tool_use 所在的 assistant 一并保留。确定性、幂等（同一输入二次调用
+   *    不再改动——折叠块只合并不二折）。
+   *
+   * 为什么 tier 2 不能省（MEM-01 残余）：tier 1 只碰 tool_result；长 assistant 推理、
+   * 控制消息、已置换过的占位符本身都在"永不缩小"的集合里，几十轮之后 tier 1 一个块都
+   * 置换不出来而水位还在涨——此前的结局是端点 400 → `finish("error")`。
+   *
+   * Phase B（可选 LLM 摘要进账本）走 {@link compactAsync}。
    */
-  compact(messages: Anthropic.MessageParam[]): CompactResult {
+  compact(messages: Anthropic.MessageParam[], opts: CompactOptions = {}): CompactResult {
     const empty = emptyCompactLedger();
-    if (this.lastInputTokens < this.contextTokenLimit * COMPACT_WATERMARK) {
-      return {
-        messages: [...messages],
-        droppedBlocks: 0,
-        ledgerEntries: 0,
-        ledger: empty,
-        summaryApplied: false,
-      };
+    const force = opts.force === true;
+    const protectRecent = Math.max(0, Math.floor(opts.protectRecent ?? this.protectRecent));
+    const unchanged = (msgs: Anthropic.MessageParam[]): CompactResult => ({
+      messages: msgs,
+      droppedBlocks: 0,
+      ledgerEntries: 0,
+      ledger: empty,
+      summaryApplied: false,
+      collapsedTurns: 0,
+      changed: false,
+    });
+    if (!force && this.lastInputTokens < this.contextTokenLimit * COMPACT_WATERMARK) {
+      return unchanged([...messages]);
     }
 
-    const cutoff = Math.max(0, messages.length - this.protectRecent);
+    const cutoff = Math.max(0, messages.length - protectRecent);
     const toolUses = indexToolUses(messages);
     const priorLedger = findExistingLedger(messages);
     const scanned = scanConversationLedger(messages, cutoff, toolUses);
 
+    // ---- tier 1：大 tool_result → 语义占位 ----
     let dropped = 0;
-    const out = messages.map((m, i) => {
+    let savedChars = 0;
+    let out = messages.map((m, i) => {
       if (i >= cutoff || typeof m.content === "string") return m;
       let touched = false;
       const blocks = m.content.map((b) => {
@@ -171,31 +225,35 @@ export class DefaultContextManager {
           dropped += 1;
           const tool = toolUses.get(b.tool_use_id);
           const local = extractFromToolExchange(tool, b.content, b.is_error === true);
-          return {
-            ...b,
-            content: formatSemanticPlaceholder({
-              originalChars: b.content.length,
-              toolName: tool?.name,
-              local,
-            }),
-          };
+          const placeholder = formatSemanticPlaceholder({
+            originalChars: b.content.length,
+            toolName: tool?.name,
+            local,
+          });
+          savedChars += Math.max(0, b.content.length - placeholder.length);
+          return { ...b, content: placeholder };
         }
         return b;
       });
       return touched ? { ...m, content: blocks } : m;
     });
 
-    if (dropped === 0) {
-      return {
-        messages: out,
-        droppedBlocks: 0,
-        ledgerEntries: 0,
-        ledger: empty,
-        summaryApplied: false,
-      };
+    // ---- tier 2：置换之后估计仍在水位上（或无可置换）→ 折叠旧轮 ----
+    const estimatedAfter = this.lastInputTokens - savedChars / CHARS_PER_TOKEN_ESTIMATE;
+    const needTier2 =
+      force || dropped === 0 || estimatedAfter >= this.contextTokenLimit * COMPACT_WATERMARK;
+    let collapsedTurns = 0;
+    let collapsedLedger = emptyCompactLedger();
+    if (needTier2) {
+      const folded = collapseOldTurns(out, cutoff, toolUses);
+      out = folded.messages;
+      collapsedTurns = folded.collapsedTurns;
+      collapsedLedger = folded.ledger;
     }
 
-    const ledger = mergeCompactLedgers(priorLedger, scanned);
+    if (dropped === 0 && collapsedTurns === 0) return unchanged(out);
+
+    const ledger = mergeCompactLedgers(priorLedger, scanned, collapsedLedger);
     const withLedger = upsertCompactLedger(out, ledger);
     return {
       messages: withLedger,
@@ -203,22 +261,26 @@ export class DefaultContextManager {
       ledgerEntries: ledgerEntryCount(ledger),
       ledger,
       summaryApplied: false,
+      collapsedTurns,
+      changed: true,
     };
   }
 
   /**
-   * Phase A + optional Phase B. Summary only runs when a client is injected
-   * and Phase A actually elided blocks. Any summary failure → Phase A result.
+   * Phase A(+C) + optional Phase B. Summary only runs when a client is injected
+   * and the sync pass actually changed history. Any summary failure → sync result.
    */
   async compactAsync(
     messages: Anthropic.MessageParam[],
     signal?: AbortSignal,
+    opts: CompactOptions = {},
   ): Promise<CompactResult> {
-    const base = this.compact(messages);
-    if (!this.summaryClient || base.droppedBlocks === 0) return base;
+    const base = this.compact(messages, opts);
+    if (!this.summaryClient || !base.changed) return base;
     if (signal?.aborted) return base;
 
-    const cutoff = Math.max(0, messages.length - this.protectRecent);
+    const protectRecent = Math.max(0, Math.floor(opts.protectRecent ?? this.protectRecent));
+    const cutoff = Math.max(0, messages.length - protectRecent);
     const excerpts = collectCompactExcerpts(gatherExcerptTexts(messages, cutoff));
     try {
       const enrichment = await summarizeForCompact({
@@ -233,8 +295,8 @@ export class DefaultContextManager {
       // Never lose Phase A buckets.
       if (ledgerEntryCount(ledger) < ledgerEntryCount(base.ledger)) return base;
       return {
+        ...base,
         messages: upsertCompactLedger(base.messages, ledger),
-        droppedBlocks: base.droppedBlocks,
         ledgerEntries: ledgerEntryCount(ledger),
         ledger,
         summaryApplied: true,
@@ -243,6 +305,168 @@ export class DefaultContextManager {
       return base;
     }
   }
+}
+
+// ---------------------------------------------------------------- tier 2：折叠旧轮
+
+/**
+ * 把 `[start, end)` 的旧轮折叠成一个 `[compacted_turns]` user 文本块。
+ *
+ * 区间由三条规则确定，缺一条就会产出端点拒收的正史：
+ *  ① 起点 = 首条**任务** user 消息之后（账本消息不算任务；任务原文永不折叠）；
+ *  ② 终点 = 保护窗起点；若保护窗首条是 tool_result，其 tool_use 所在的 assistant
+ *     一并保留（终点前移一格）——否则保护窗里会出现没有 tool_use 的 tool_result；
+ *  ③ 区间开头若已是折叠块，取出其摘要行**合并**进新块（幂等：只有它一个时无事发生）。
+ *
+ * 折叠同时把区间里**所有** tool_result（含 tier 1 不碰的小结果）过一遍账本抽取——
+ * 它们从正史里消失了，"小结果保留原文"这条 tier 1 的前提不再成立。
+ */
+function collapseOldTurns(
+  messages: Anthropic.MessageParam[],
+  cutoff: number,
+  toolUses: Map<string, ToolUseRef>,
+): { messages: Anthropic.MessageParam[]; collapsedTurns: number; ledger: CompactLedger } {
+  const none = { messages, collapsedTurns: 0, ledger: emptyCompactLedger() };
+  const taskIndex = messages.findIndex((m) => m.role === "user" && !isLedgerMessage(m));
+  if (taskIndex < 0) return none;
+  const start = taskIndex + 1;
+  let end = Math.min(cutoff, messages.length);
+  while (end > start && end < messages.length && isToolResultMessage(messages[end]!)) end -= 1;
+  if (end <= start) return none;
+
+  const region = messages.slice(start, end);
+  const prior = isCollapsedTurnsMessage(region[0]!) ? parseCollapsedTurns(region[0]!) : null;
+  const fresh = prior ? region.slice(1) : region;
+  // 区间里除了既有折叠块什么都没有 → 幂等出口；账本消息混在区间里也不算新内容
+  const foldable = fresh.filter((m) => !isLedgerMessage(m));
+  if (foldable.length === 0) return none;
+
+  const lines: string[] = prior ? [...prior.lines] : [];
+  let turns = prior?.turns ?? 0;
+  let chars = prior?.chars ?? 0;
+  const ledgerParts: CompactLedger[] = [];
+  for (const m of foldable) {
+    chars += messageChars(m);
+    if (m.role === "assistant") {
+      turns += 1;
+      lines.push(describeAssistantMessage(m));
+      continue;
+    }
+    if (typeof m.content === "string") {
+      lines.push(`- user: ${clipLine(m.content)}`);
+      continue;
+    }
+    const results: string[] = [];
+    const texts: string[] = [];
+    for (const b of m.content) {
+      if (b.type === "tool_result" && typeof b.content === "string") {
+        const tool = toolUses.get(b.tool_use_id);
+        ledgerParts.push(extractFromToolExchange(tool, b.content, b.is_error === true));
+        const head = b.content.startsWith("[compacted]") ? "(elided)" : clipLine(firstLine(b.content), 100);
+        results.push(`${b.is_error ? "✗" : "✓"} ${tool?.name ?? "tool"}: ${head}`);
+      } else if (b.type === "text") {
+        texts.push(clipLine(b.text));
+      }
+    }
+    if (results.length) lines.push(`  results: ${results.join("; ")}`);
+    for (const t of texts) lines.push(`- user: ${t}`);
+  }
+
+  const kept = messages.filter((m, i) => i >= start && i < end && isLedgerMessage(m));
+  const block: Anthropic.MessageParam = {
+    role: "user",
+    content: [{ type: "text", text: formatCollapsedTurns(turns, chars, lines) }],
+  };
+  return {
+    messages: [...messages.slice(0, start), ...kept, block, ...messages.slice(end)],
+    collapsedTurns: turns - (prior?.turns ?? 0),
+    ledger: mergeCompactLedgers(...ledgerParts),
+  };
+}
+
+/**
+ * 折叠块正文。**头部不得出现 `[compact_ledger]` 字面量**：账本的 upsert / 识别都是按
+ * "文本含该标记"判的，写进去这个块就会被当成账本改写掉（首版实测：块被账本覆盖、
+ * 正史里出现两份账本、被折叠的轮凭空消失）。
+ */
+function formatCollapsedTurns(turns: number, chars: number, lines: string[]): string {
+  return [
+    `${COMPACTED_TURNS_MARKER} ${turns} earlier turns collapsed (was ${chars} chars). ` +
+      "Durable facts are kept in the compact ledger block; re-run a tool if you need its exact output.",
+    ...lines,
+  ].join("\n");
+}
+
+function parseCollapsedTurns(m: Anthropic.MessageParam): { turns: number; chars: number; lines: string[] } {
+  const text = messageTexts(m).find((t) => t.startsWith(COMPACTED_TURNS_MARKER)) ?? "";
+  const [header = "", ...lines] = text.split("\n");
+  const turns = Number(/(\d+) earlier turns/.exec(header)?.[1] ?? 0);
+  const chars = Number(/was (\d+) chars/.exec(header)?.[1] ?? 0);
+  return { turns: Number.isFinite(turns) ? turns : 0, chars: Number.isFinite(chars) ? chars : 0, lines };
+}
+
+function describeAssistantMessage(m: Anthropic.MessageParam): string {
+  if (typeof m.content === "string") return `- assistant: ${clipLine(m.content)}`;
+  const text = m.content
+    .filter((b): b is Anthropic.TextBlockParam => b.type === "text")
+    .map((b) => b.text)
+    .join(" ");
+  const tools = m.content
+    .filter((b): b is Anthropic.ToolUseBlockParam => b.type === "tool_use")
+    .map((b) => describeToolUse(b.name, b.input));
+  const head = text.trim() ? clipLine(text) : "(no text)";
+  return `- assistant: ${head}${tools.length ? ` | tools: ${tools.join("; ")}` : ""}`;
+}
+
+function describeToolUse(name: string, input: unknown): string {
+  if (!input || typeof input !== "object") return `${name}()`;
+  const obj = input as Record<string, unknown>;
+  for (const key of ["command", "path", "elf_path", "file", "url", "address"]) {
+    if (typeof obj[key] === "string" && (obj[key] as string).trim()) {
+      return `${name}(${key}=${clipLine(String(obj[key]), 80)})`;
+    }
+  }
+  return `${name}(${clipLine(JSON.stringify(obj), 60)})`;
+}
+
+function isLedgerMessage(m: Anthropic.MessageParam): boolean {
+  return messageTexts(m).some((t) => t.includes(COMPACT_LEDGER_MARKER));
+}
+
+function isCollapsedTurnsMessage(m: Anthropic.MessageParam): boolean {
+  return m.role === "user" && messageTexts(m).some((t) => t.startsWith(COMPACTED_TURNS_MARKER));
+}
+
+function isToolResultMessage(m: Anthropic.MessageParam): boolean {
+  return (
+    m.role === "user" &&
+    typeof m.content !== "string" &&
+    m.content.some((b) => b.type === "tool_result")
+  );
+}
+
+function messageChars(m: Anthropic.MessageParam): number {
+  if (typeof m.content === "string") return m.content.length;
+  let n = 0;
+  for (const b of m.content) {
+    if (b.type === "text") n += b.text.length;
+    else if (b.type === "tool_result" && typeof b.content === "string") n += b.content.length;
+    else if (b.type === "tool_use") n += JSON.stringify(b.input ?? {}).length + b.name.length;
+  }
+  return n;
+}
+
+function firstLine(text: string): string {
+  for (const line of text.split(/\r?\n/)) {
+    const t = line.trim();
+    if (t) return t;
+  }
+  return "";
+}
+
+function clipLine(s: string, max = COLLAPSE_LINE_CHARS): string {
+  const one = s.replace(/\s+/g, " ").trim();
+  return one.length <= max ? one : `${one.slice(0, max - 1)}…`;
 }
 
 /**

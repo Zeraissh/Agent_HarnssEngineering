@@ -14,7 +14,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import Anthropic from "@anthropic-ai/sdk";
 import type { Message, TextBlock, ToolUseBlock } from "@anthropic-ai/sdk/resources/messages";
-import { AnthropicModelClient, isTransientApiError } from "../src/model-client.js";
+import { AnthropicModelClient, isContextOverflowError, isTransientApiError } from "../src/model-client.js";
 import { OpenAIModelClient } from "../src/model-client-openai.js";
 import {
   anthropicSseEvents,
@@ -338,6 +338,27 @@ describe("故障注入：坏得也要对", () => {
       .catch((e: unknown) => e);
     expect((err as { status?: number }).status).toBe(400);
     expect(isTransientApiError(err)).toBe(false);
+  });
+
+  /**
+   * MEM-01 Phase C：反应式压缩靠 L0 认出"上下文超长"这个 400 子类。两条 wire 的真实 SDK
+   * 各把 mock 的报文包成自己的错误对象，都必须被 isContextOverflowError 认出、且不算瞬时。
+   * 这条锁的是**真实 wire 上的形状**——纯对象单测认得的字段，SDK 包装后未必还在原位。
+   */
+  it("context_overflow：两条 wire 的真实 SDK 错误都被判为上下文超长（不算瞬时）", async () => {
+    const anthropic = await mock({ scripts: [{ content: [{ type: "text", text: "x" }], fault: { type: "context_overflow" } }] });
+    const errA = await anthropicClient(anthropic).send(req).catch((e: unknown) => e);
+    expect((errA as { status?: number }).status).toBe(400);
+    expect(isContextOverflowError(errA)).toBe(true);
+    expect(isTransientApiError(errA)).toBe(false);
+
+    const openai = await mock({ scripts: [{ content: [{ type: "text", text: "x" }], fault: { type: "context_overflow" } }] });
+    const errO = await openaiClient(openai).send(req).catch((e: unknown) => e);
+    expect((errO as { status?: number }).status).toBe(400);
+    expect(isContextOverflowError(errO)).toBe(true);
+    expect(isTransientApiError(errO)).toBe(false);
+    // 故障消费脚本：下一条请求才是"重发"
+    expect(anthropic.remainingScripts()).toBe(0);
   });
 
   it("cut_stream：message_start 之后断流 → 调用失败，不会静默变成空成功", async () => {

@@ -52,6 +52,8 @@
  *                       read_file 可读取这些目录（写类工具不受益）。用于工作区外的
  *                       领域素材库（如 KiCad 官方符号/封装库）
  *   AGENT_CONTEXT_LIMIT 可选，上下文 token 上限（触发 compact），默认 150000
+ *   AGENT_TOOL_RESULT_MAX_CHARS 可选，单个 tool_result 进正史前的字符上限，默认 40000（≥1000）。
+ *                       MCP 工具返回无上限，这是兜底；截断标记会告诉模型如何分页
  *   AGENT_COMPACT_SUMMARY=1 可选，开启 MEM-01 Phase B LLM 摘要（默认关；CI/eval 勿开）
  *   AGENT_COMPACT_SUMMARY_MAX_TOKENS 可选，摘要 max_tokens，默认 512
  *   AGENT_MAX_TOKENS    可选，单次响应输出上限，默认 64000。本地慢速模型建议调低
@@ -121,6 +123,21 @@ const c = {
   red: (s: string) => `\x1b[31m${s}\x1b[0m`,
   magenta: (s: string) => `\x1b[35m${s}\x1b[0m`,
 };
+
+/**
+ * 压缩事件一行文案（两条渲染路径共用）。reactive 与 collapsedTurns 必须可见：
+ * 前者说明这一轮是撞了端点 400 才压的（不是水位触发），后者说明旧轮正文已被折叠成摘要——
+ * 两者都是"模型此后看不见原文"的不可逆动作，不能只报一个 dropped 数。
+ */
+function describeCompaction(event: Extract<TurnEvent, { type: "compaction" }>): string {
+  return (
+    `⚠ context compacted${event.reactive ? " (reactive, after context-overflow 400; same turn re-sent)" : ""}: ` +
+    `dropped ${event.droppedBlocks} blocks` +
+    (event.collapsedTurns ? `, collapsed ${event.collapsedTurns} earlier turns` : "") +
+    (event.ledgerEntries != null ? `, ledger ${event.ledgerEntries} facts` : "") +
+    (event.summaryApplied ? ", LLM summary merged" : "")
+  );
+}
 
 const SYSTEM_PROMPT = `You are a capable autonomous agent operating in a local working directory.
 Complete the user's task end to end using the available tools.
@@ -297,6 +314,17 @@ async function main(): Promise<void> {
   };
   const maxTotalTurns = positiveEnv("AGENT_TOTAL_MAX_TURNS");
   const maxTokensBudget = positiveEnv("AGENT_TOTAL_TOKEN_BUDGET");
+  // 单个 tool_result 入口截断上限（MEM-01 Phase C）；缺省 40k，下限 1000——再小连截断标记都放不下
+  const toolResultMaxChars = (() => {
+    const raw = process.env.AGENT_TOOL_RESULT_MAX_CHARS;
+    if (raw === undefined || raw === "") return undefined;
+    const value = Number(raw);
+    if (!Number.isInteger(value) || value < 1000) {
+      console.error(c.red(`AGENT_TOOL_RESULT_MAX_CHARS "${raw}" 无效：需为 ≥1000 的整数`));
+      process.exit(1);
+    }
+    return value;
+  })();
   /**
    * 恢复策略三级解析：env > 包 `recovery` > 默认（口径同 verifyMaxTurnsOf / planner 预算）。
    * env 侧逐字段：只写了 AGENT_STAGNATION_WINDOW 时另两个仍落到包/默认。
@@ -655,6 +683,7 @@ async function main(): Promise<void> {
     ...(maxTurns !== undefined ? { maxTurns } : {}),
     ...(maxTotalTurns !== undefined ? { maxTotalTurns } : {}),
     ...(maxTokensBudget !== undefined ? { maxTokensBudget } : {}),
+    ...(toolResultMaxChars !== undefined ? { toolResultMaxChars } : {}),
     ...(compactSummaryOn
       ? {
           compactSummaryClient: modelClient,
@@ -828,13 +857,7 @@ async function main(): Promise<void> {
           break;
         }
         case "compaction":
-          console.log(
-            c.yellow(
-              `${tag} ⚠ context compacted: dropped ${event.droppedBlocks} blocks` +
-                (event.ledgerEntries != null ? `, ledger ${event.ledgerEntries} facts` : "") +
-                (event.summaryApplied ? ", LLM summary merged" : ""),
-            ),
-          );
+          console.log(c.yellow(`${tag} ${describeCompaction(event)}`));
           break;
         case "api_retry":
           console.log(
@@ -1226,13 +1249,8 @@ async function main(): Promise<void> {
         console.log(c.yellow(`⤷ 恢复决策：${event.detail}`));
         break;
       case "compaction":
-        console.log(
-          c.yellow(
-            `⚠ context compacted: dropped ${event.droppedBlocks} blocks` +
-              (event.ledgerEntries != null ? `, ledger ${event.ledgerEntries} facts` : "") +
-              (event.summaryApplied ? ", LLM summary merged" : ""),
-          ),
-        );
+        endStreamLine();
+        console.log(c.yellow(describeCompaction(event)));
         break;
       case "done": {
         endStreamLine();

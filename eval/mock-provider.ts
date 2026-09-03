@@ -28,7 +28,13 @@ export type MockFault =
   | { type: "status"; status: number; body?: unknown; headers?: Record<string, string> }
   | { type: "cut_stream"; afterEvents?: number }
   | { type: "timeout"; ms: number }
-  | { type: "bad_json" };
+  | { type: "bad_json" }
+  /**
+   * 上下文超长（MEM-01 Phase C 反应式压缩的触发器）。两条 wire 各按真端点的形状回 400：
+   * Anthropic「prompt is too long: N tokens > M maximum」；OpenAI `code: context_length_exceeded`。
+   * 它描述的是"这一次请求装不下"，所以**消费**脚本（下一条请求才是重发）。
+   */
+  | { type: "context_overflow" };
 
 export type MockContentBlock =
   | { type: "text"; text: string }
@@ -274,6 +280,28 @@ const STATUS_ERROR_TYPES: Record<number, string> = {
   529: "overloaded_error",
 };
 
+/** 两条 wire 的"上下文超长"400 报文——形状照抄真端点，不是自己发明的 */
+export function contextOverflowBody(wire: "anthropic" | "openai"): Record<string, unknown> {
+  return wire === "anthropic"
+    ? {
+        type: "error",
+        error: {
+          type: "invalid_request_error",
+          message: "prompt is too long: 213462 tokens > 200000 maximum",
+        },
+      }
+    : {
+        error: {
+          message:
+            "This model's maximum context length is 128000 tokens. However, your messages resulted in 131072 tokens. " +
+            "Please reduce the length of the messages.",
+          type: "invalid_request_error",
+          param: "messages",
+          code: "context_length_exceeded",
+        },
+      };
+}
+
 function lowercaseHeaders(headers: Record<string, string> | undefined): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(headers ?? {})) out[k.toLowerCase()] = v;
@@ -424,6 +452,10 @@ export async function startMockProvider(opts: MockProviderOptions = {}): Promise
 
     if (fault.type === "status") {
       respondStatus(res, fault);
+      return;
+    }
+    if (fault.type === "context_overflow") {
+      respondStatus(res, { type: "status", status: 400, body: contextOverflowBody(wire) });
       return;
     }
 

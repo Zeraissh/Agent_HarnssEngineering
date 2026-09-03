@@ -24,13 +24,15 @@
   nightly 跨夜 ab-log 聚合进 EVAL-02 stats（n=3 单用例 Wilson 下界只有 43.8%）。
 - **OBS-01[~]** — `src/trace.ts` + `trace.jsonl`；`GET /api/runs/:id/trace` 脱敏导出。
 - **RUN-01[~ Phase 1+2]** — ADR-003；`state.json`；崩溃→interrupted；**同 run 热恢复**（checkpoint 边界，`sameRunResume`/`run_resumed`）；预算+grantAudit 进 state。
-- **MEM-01[~ Phase A]** — 语义压缩：`[compact_ledger]` + 语义占位；非 LLM；mutation `compact-ledger-skipped`。
+- **MEM-01[~ Phase A+B+C]** — 语义压缩：`[compact_ledger]` + 语义占位（A）；可选 LLM 摘要进账本（B）；
+  入口截断 + tier 2 折叠旧轮 + 反应式硬压缩重发（C，见下文「loop / context 四件 ③」）；mutation 4 个。
 - **MODEL-01b[~]** — 能力探针 + 每角色 fallback/inherit + `prefer_healthy` stub；见 docs/08。
 - **v1.3.0 发布（2026-09-03）+ REL-02[~]** — 根目录 `CHANGELOG.md`（1.1.0 / 1.2.0 / 1.3.0 按提交归档，新版本先写 `[Unreleased]` 再随 tag 改节名）；版本号三处（根 / cross-app `package.json` / `CLI_VERSION`）由测试锁一致；release.yml 缺签名凭据时跳过 Windows 安装包（不发布未签名产物）、`workflow_dispatch` = 预演不推送——**打 tag 前先跑一次预演**。残余见 docs/08 REL-02 行。
 
 **下一刀**：CI 绿后开 `MEM-01 Phase B`，或 RUN-02 / MODEL-01 残余。
 RUN-01 残余：SAFE-06 toolTx、CLI 对等 durable、mid-tool 恢复。
-MEM-01 残余：启发式漏检、无 LLM 摘要、MCP 写工具靠名字启发。
+MEM-01 残余（Phase C 之后）：保护窗内与任务首条永不压；折叠块按行摘要不做语义合并；tier 2 触发用字符/4 粗估；
+反应式只重发一次；启发式漏检；MCP 写工具靠名字启发。逐条见 docs/08 Phase 5 实施记录的 Phase C 行。
 MODEL-01 残余：Web 同步探针回写 compat、成本/延迟真路由、识图能力探针、链健康实时面。
 
 ## 会话中心化（2026-09-03，委托方拍板；两个提交）
@@ -143,6 +145,43 @@ Web 裸跑 turns=null（老写入口的缺口，本提交已补）。**恢复机
 **锁**：ledger 5 条（含真实老行 JSONL 形状）；Web `v2-8e`（台账行 turns / maxTurns / recovery / recoveryPolicy，
 裸跑 turns=3 不再 null）。变异 4 处逐一打红：比值漏乘段数 / 老行不推算分母 / 裸跑 turns 回退删除 /
 计数不按来源过滤。
+
+### ③ MEM-01 Phase C：入口截断 + tier 2 折叠旧轮 + 反应式压缩 —— ✅ 已实施（四件里最大的一件）
+
+**缺口**：`compact()` 只置换保护窗外 >500 字符的 tool_result；长 assistant 正文、控制消息、已置换的占位符本身都在
+"永不缩小"的集合里，几十轮后一个块都置换不出来而水位还在涨；端点的 context-too-long 400 是永久错误 →
+`finish("error")`，整段工作因一次超长请求作废；MCP 工具返回没有任何上限。
+
+**落地**（`src/context.ts` / `src/loop.ts` / `src/model-client.ts` / `src/tools/registry.ts`）：
+- **a. 入口截断** `snipToolResult`：ToolExecutor 边界，`AgentConfig.toolResultMaxChars` / `AGENT_TOOL_RESULT_MAX_CHARS`
+  默认 40k（> 内置 read_file / bash 的 30k，不重叠不替代）；标记写清截了多少、上限是谁、怎么分页
+  （read_file offset/limit、命令加过滤器、落盘分片读）；事件回调之前截，宿主看到的与模型拿到的同一份。
+- **b. tier 1** 不变；新增 `savedChars` 估算。
+- **c. tier 2** `collapseOldTurns`：tier 1 后 `lastInputTokens − savedChars/4` 仍 ≥ 水位、或 tier 1 无可置换 → 折叠
+  保护窗外、**任务首条之后**的旧轮为一个 `[compacted_turns]` user 块（assistant 首句 | tools: name(key=…) /
+  results: ✓|✗ tool: 首行 / user 文本）。**配对永不拆散**：窗首是 tool_result 时其 tool_use 所在 assistant 一并保留。
+  **幂等**：区间开头已是折叠块则只合并（头部 turns/chars 计数累加）；同一输入二次调用 changed=false。
+  被折叠的**小结果**也过一遍账本抽取（tier 1"小结果保留原文"的前提不再成立）。**块头部不得含 `[compact_ledger]`
+  字面量**——首版踩坑：账本 upsert 按"文本含标记"识别，块被当账本改写、正史出现两份账本。
+- **d. 反应式** `isContextOverflowError`（Anthropic「prompt is too long」/ OpenAI `context_length_exceeded` /
+  嵌套 error.code；两条真实 SDK 的错误形状经 mock 锁住）→ loop 每轮最多一次 `compactAsync(force, protectRecent=2)`
+  → `changed` 才重发同一轮（`attempt -= 1`，不占 errorRetries）→ 事件 `compaction{reactive:true, collapsedTurns}`；
+  无可压 / 仍超长 → `finish("error")`，`classifyApiError` 前缀 `context_overflow`（台账 taxonomy 可认）。
+- **宿主同提交**：CLI 一行文案 `context compacted (reactive, after context-overflow 400; same turn re-sent): …
+  collapsed N earlier turns`；`app.js` 投影（collapsedTurns / reactive）→ `deriveContextFace.collapsedTurns /
+  reactiveCount` → Context 卡 / 水位表 / 详情页 / 日志行；`run_config.guardrails.toolResultMaxChars`。
+- **仪器**：`eval/mock-provider` 新故障 `context_overflow`（两 wire 报文照抄真端点）；确定性场景
+  `context-overflow-reactive-compaction`（3 轮 + 撞墙 + 重发 = 5 请求，13/13 通过）；`scripts/mutation-smoke.mjs`
+  新增 `compact-tier2-skipped` / `reactive-compaction-skipped` / `tool-result-snip-bypassed`，16/16 killed。
+
+**锁**：`test/compact-tier2.test.ts` 19 条（tier 2 折叠 / 配对 / 幂等 / 确定性 / 合并 / 账本唯一 / 估算闸 / force /
+两 wire 分类 / 反应式成功 / 二次超长 error / 无可压 error / 常规路径无 reactive / 截断三条）；compact.test
+AgentLoop 集成改锁"tier 2 必须跟上"；ui-faces 2 条；mock-provider 1 条。变异 5 处逐一打红（3 处进常驻 smoke）：
+tier 2 跳过 / 反应式跳过 / 截断绕过 / 配对规则删除 / 超长判定恒 false。
+
+**残余（诚实，docs/08 Phase C 行逐条）**：保护窗内与任务首条 user 消息（含 `<context>`）永不压；`[compact_ledger]`
+自身不缩（20 条/桶上限）；折叠块按行摘要、轮数多时自身会长；tier 2 触发是字符/4 粗估不读真 token；反应式只重发一次
+（第二次超长即 error，不再砍保护窗）；未开 Phase B 时长 assistant 推理里的非模板事实随折叠丢失。
 
 以下为历史交接页（2026-08-08 收工），仍有参考价值；新开工优先看 `docs/08`。
 
