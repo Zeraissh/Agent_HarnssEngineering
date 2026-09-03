@@ -6,7 +6,7 @@ import { ToolExecutor, ToolRegistry } from "../src/tools/registry.js";
 import { credentialLikeName, resolveInWorkdir, resolveReadable, truncate } from "../src/tools/fs-util.js";
 import { readFileTool } from "../src/tools/read-file.js";
 import { writeFileTool } from "../src/tools/write-file.js";
-import { SHELL_DESC, bashTool, sanitizeChildEnv } from "../src/tools/bash.js";
+import { SHELL_DESC, bashTool, prependBashPath, sanitizeChildEnv } from "../src/tools/bash.js";
 import { makeTool, toolUseBlock } from "./helpers.js";
 
 let workdir: string;
@@ -406,6 +406,52 @@ describe("bash 子进程环境剥密钥", () => {
       } finally {
         delete process.env.HARNESS_LEAK_TEST_API_KEY;
       }
+    },
+  );
+});
+
+describe("bash 子进程 PATH 前置（Git coreutils）不得丢掉父进程 PATH", () => {
+  const D = path.delimiter;
+  const git = `D:${path.sep}Git${path.sep}usr${path.sep}bin`;
+
+  it("Windows 形状的键名 Path：写回同一个键，前置 Git 目录，原条目全保留，且不并存第二个 PATH 键", () => {
+    const out = prependBashPath({ Path: `C:${D}C:\\nodejs`, HOME: "h" }, [git]);
+    const pathKeys = Object.keys(out).filter((k) => k.toLowerCase() === "path");
+    // 1653b7b 的形态是 Path + PATH 两键并存，spawn 时只剩 Git usr/bin
+    expect(pathKeys).toEqual(["Path"]);
+    expect(out.Path).toBe(`${git}${D}C:${D}C:\\nodejs`);
+    expect(out.HOME).toBe("h");
+  });
+
+  it("POSIX 形状的键名 PATH：同样前置且保留", () => {
+    const out = prependBashPath({ PATH: "/usr/local/bin" }, [git]);
+    expect(Object.keys(out).filter((k) => k.toLowerCase() === "path")).toEqual(["PATH"]);
+    expect(out.PATH).toBe(`${git}${D}/usr/local/bin`);
+  });
+
+  it("父进程完全没有 PATH：新建 PATH 只含 Git 目录，不带悬空分隔符", () => {
+    const out = prependBashPath({ HOME: "h" }, [git]);
+    expect(out.PATH).toBe(git);
+  });
+
+  it("无缺失目录（非 Windows / Git 已在 PATH）：env 原样返回", () => {
+    const env = { Path: "C:" };
+    expect(prependBashPath(env, [])).toBe(env);
+  });
+
+  // 行为锁：跑 vitest 的 node 一定在父进程 PATH 上，子 shell 里也必须找得到。
+  // 回归形态（v1.3.0）：Windows 下 `command -v node` → "command not found"，
+  // 模型只能靠 perl/awk 逃生（EVAL-01 基线 transcript 实录）。cmd.exe 无 command -v，跳过。
+  // 诚实说明：vitest worker 里 process.env 的键已被规范成大写 PATH（实测），所以这条
+  // 在 vitest 下抓不到 "Path/PATH 并存" 这一具体回归——真宿主（PowerShell → npm → tsx）
+  // 才是 Path。上面那条显式喂 `Path` 键的纯函数测试才是这个回归的守门人；本条守的是
+  // "子进程完全丢掉父 PATH" 这一更粗的形态。
+  it.runIf(!SHELL_DESC.includes("cmd.exe"))(
+    "bash 子进程能看到父进程 PATH 上的 node",
+    async () => {
+      const r = await bashTool.execute({ command: "command -v node" }, ctx());
+      expect(r.isError, r.content).toBeUndefined();
+      expect(r.content).toMatch(/node/);
     },
   );
 });

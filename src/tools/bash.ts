@@ -71,15 +71,35 @@ const BASH_PATH_MISSING = bashPathMissing();
 export { sanitizeChildEnv } from "../execution-broker.js";
 
 /**
+ * 把缺失的 Git coreutils 目录**前置**进 PATH——写回 env 里原有的那个键。
+ *
+ * Windows 上 `{ ...process.env }` 展开成 plain object 后键名多半是 `Path`，而
+ * plain object 不再大小写不敏感：直接写 `base["PATH"]` 读到的是 undefined，于是
+ * 新键 PATH 只剩 Git usr/bin，与旧键 Path 并存——spawn 时谁胜出不由我们定（实测
+ * 新键胜出），子进程里 node / git / python 全部 "command not found"，模型只能靠
+ * perl/awk 逃生，一条任务多烧 4–6 轮。1653b7b 把 2bf2c69 的 `process.env["PATH"]`
+ * （特殊对象，大小写不敏感）改成 plain object 读取时引入；EVAL-01 v1.3.0 基线矩阵
+ * 回放 transcript 发现（`echo $PATH` → `/usr/bin`）。
+ */
+export function prependBashPath(
+  env: NodeJS.ProcessEnv,
+  missing: readonly string[],
+): NodeJS.ProcessEnv {
+  if (missing.length === 0) return env;
+  const key = Object.keys(env).find((k) => k.toLowerCase() === "path") ?? "PATH";
+  const current = env[key] ?? "";
+  return {
+    ...env,
+    [key]: [...missing, ...(current ? [current] : [])].join(path.delimiter),
+  };
+}
+
+/**
  * 每次执行时从**活的** process.env 合成（而非模块加载快照——快照会漏掉
  * 运行期设置的变量，剥密钥就有了绕过窗口），再补 Git Bash 的 PATH、过安检。
  */
 function childEnv(): NodeJS.ProcessEnv {
-  const base: NodeJS.ProcessEnv = { ...process.env };
-  if (BASH_PATH_MISSING.length) {
-    base["PATH"] = [...BASH_PATH_MISSING, base["PATH"] ?? ""].join(path.delimiter);
-  }
-  return sanitizeChildEnv(base);
+  return sanitizeChildEnv(prependBashPath({ ...process.env }, BASH_PATH_MISSING));
 }
 
 /** 实际使用的 shell 描述（宿主注入 dynamicContext 用，保持与工具行为一致） */
