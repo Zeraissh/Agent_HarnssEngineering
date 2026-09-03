@@ -38,6 +38,7 @@ import {
   mergeForkedFollowUp,
   buildNewRunRequest,
   deriveLoopFace,
+  deriveAssemblyBar,
 } from "../ui/public/app.js";
 import { plannedStopReason } from "../src/orchestrate.js";
 import { STOP_REASONS } from "../src/types.js";
@@ -91,10 +92,38 @@ describe("reduceEvent", () => {
       boundary: "使用当前宿主",
       inheritedBudget: { maxTurns: 8, usedTurns: 3, usedTokens: 120 },
       reset: ["审批放行规则"],
+      kind: "fork",
     });
     const [entry] = deriveLogEntries(state);
     expect(entry.type).toBe("run_forked");
     expect(entry.collapsed).toBe(false);
+  });
+
+  it("同 run 热恢复事件写 lineage.kind=same-run 并默认展开", () => {
+    let state = createInitialState("r1", "热恢复", false);
+    state = reduceEvent(state, {
+      seq: 0,
+      source: "host",
+      event: {
+        type: "run_resumed",
+        runId: "r1",
+        rootRunId: "r1",
+        boundary: "同 run 热恢复",
+        checkpoint: {
+          runBudget: { usedTurns: 1, usedTokens: 10 },
+          segmentIndex: 0,
+        },
+        reset: ["AbortController"],
+      },
+    });
+    expect(state.lineage?.kind).toBe("same-run");
+    expect(state.status).toBe("running");
+    const [entry] = deriveLogEntries(state);
+    expect(entry.type).toBe("run_resumed");
+    expect(entry.collapsed).toBe(false);
+    expect(
+      deriveAssemblyBar(state, null).some((i) => i.key === "durable" && i.chip?.includes("同 run")),
+    ).toBe(true);
   });
 
   // ---- AC3-1: 时间线折叠 ----

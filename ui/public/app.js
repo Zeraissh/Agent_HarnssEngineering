@@ -396,6 +396,28 @@ export function reduceEvent(state, sseEvent) {
           ? /** @type {any} */ (event.checkpoint).runBudget ?? null
           : null,
         reset: Array.isArray(event.reset) ? event.reset.map(String) : [],
+        kind: "fork",
+      },
+      timeline: [...state.timeline, entry],
+    };
+  }
+  if (type === "run_resumed") {
+    const entry = buildTimelineEntry(seq, source, type, event);
+    return {
+      ...state,
+      status: "running",
+      runEnd: null,
+      stopReason: null,
+      error: null,
+      lineage: {
+        parentRunId: String(event.runId ?? ""),
+        rootRunId: String(event.rootRunId ?? event.runId ?? ""),
+        boundary: String(event.boundary ?? ""),
+        inheritedBudget: event.checkpoint && typeof event.checkpoint === "object"
+          ? /** @type {any} */ (event.checkpoint).runBudget ?? null
+          : null,
+        reset: Array.isArray(event.reset) ? event.reset.map(String) : [],
+        kind: "same-run",
       },
       timeline: [...state.timeline, entry],
     };
@@ -784,6 +806,21 @@ function buildTimelineEntry(seq, source, type, event) {
         inheritedBudget: event.checkpoint && typeof event.checkpoint === "object"
           ? /** @type {any} */ (event.checkpoint).runBudget ?? null
           : null,
+        reset: Array.isArray(event.reset) ? event.reset.map(String) : [],
+      };
+    case "run_resumed":
+      return {
+        ...base,
+        runId: String(event.runId ?? ""),
+        rootRunId: String(event.rootRunId ?? event.runId ?? ""),
+        boundary: String(event.boundary ?? ""),
+        inheritedBudget: event.checkpoint && typeof event.checkpoint === "object"
+          ? /** @type {any} */ (event.checkpoint).runBudget ?? null
+          : null,
+        segmentIndex:
+          event.checkpoint && typeof event.checkpoint === "object"
+            ? /** @type {any} */ (event.checkpoint).segmentIndex ?? null
+            : null,
         reset: Array.isArray(event.reset) ? event.reset.map(String) : [],
       };
     case "compaction":
@@ -1472,6 +1509,21 @@ export function deriveComposerMode({ info, localStatus, submitting, error } = {}
   }
 
   if (info.canContinue) {
+    if (info.continuationMode === "same-run") {
+      return {
+        ...base,
+        mode: "same-run",
+        kind: "append",
+        buttonLabel: "同运行恢复",
+        labelText: "恢复指令",
+        placeholder: "从检查点在同一运行上继续…（Ctrl+Enter 发送）",
+        note:
+          "将在同一 runId 上从最后提交的检查点续跑：会话正史与总预算延续；不恢复原进程的审批放行与在飞工具。" +
+          (info.durablePhase ? ` 崩溃相：${info.durablePhase}。` : ""),
+        canSubmit: true,
+        optionsEnabled: false,
+      };
+    }
     if (info.continuationMode === "fork") {
       return {
         ...base,
@@ -1661,6 +1713,7 @@ export function patchComposer(mode, root = document) {
       new: "新建对话",
       append: "继续当前对话",
       fork: "从归档派生续跑",
+      "same-run": "同运行热恢复",
       running: "任务运行中",
       submitting: "正在创建",
       "new-blocked": "另建新对话",
@@ -1848,6 +1901,7 @@ function defaultCollapsed(entry) {
   if (entry.type === "segment_resume") return false;
   if (entry.type === "recovery_decision") return false;
   if (entry.type === "run_forked") return false;
+  if (entry.type === "run_resumed") return false;
   // 上下文压缩 → 展开
   if (entry.type === "compaction") return false;
   // 其余（turn_start、tool_call、成功 tool_result、assistant_text）→ 折叠
@@ -2759,6 +2813,16 @@ export function deriveAssemblyBar(state, harness) {
     "工具的写入圈禁根。路径校验在**宿主**这一侧做，不靠提示词让模型自觉——" +
       "模型给出的路径是不可信输入，`..` 逃逸与工作区外的绝对路径一律在执行前被拒。",
   );
+
+  // RUN-01 Phase 2：同 run 恢复痕迹（来自 run_resumed 事件，重放可复原）
+  if (state.lineage?.kind === "same-run") {
+    push(
+      "durable",
+      "同 run 热恢复",
+      "本会话从 state.json 的 interrupted 相 + 已提交检查点在同一 runId 上续跑；" +
+        "未恢复 active grant / 原 AbortController / 在飞工具（无 SAFE-06 toolTx）。",
+    );
+  }
 
   /**
    * 识图能力。**没配就明说没配**——委托方遇到的正是这一条：
@@ -5058,6 +5122,7 @@ function renderLogEntry(e) {
   if (e.type === "model_fallback") cls += " log-entry--warning";
   if (e.type === "recovery_decision") cls += " log-entry--warning";
   if (e.type === "run_forked") cls += " log-entry--warning";
+  if (e.type === "run_resumed") cls += " log-entry--warning";
   if (e.type === "compaction") cls += " log-entry--warning";
   if (collapsed) cls += " log-entry--collapsed";
 
@@ -5141,6 +5206,18 @@ function renderLogEntryBody(e) {
         `<br>继承总账：${esc(budgetText)}` +
         `${Array.isArray(e.reset) && e.reset.length ? `<br>已重置：${esc(e.reset.join("、"))}` : ""}</div>`;
     }
+    case "run_resumed": {
+      const budget = e.inheritedBudget ?? {};
+      const budgetText = [
+        budget.maxTurns != null ? `轮次 ${budget.usedTurns ?? 0}/${budget.maxTurns}` : `已用轮次 ${budget.usedTurns ?? 0}`,
+        budget.maxTokens != null ? `token ${budget.usedTokens ?? 0}/${budget.maxTokens}` : `已用 token ${budget.usedTokens ?? 0}`,
+      ].join("；");
+      return `<div class="log-entry-body">${esc(e.boundary ?? "")}` +
+        `<br>同 run：<code>${esc(e.runId ?? "")}</code>` +
+        (e.segmentIndex != null ? `<br>检查点段号：${esc(String(e.segmentIndex))}` : "") +
+        `<br>继承总账：${esc(budgetText)}` +
+        `${Array.isArray(e.reset) && e.reset.length ? `<br>未恢复：${esc(e.reset.join("、"))}` : ""}</div>`;
+    }
     case "compaction":
       return `<div class="log-entry-body">丢弃 ${e.droppedBlocks ?? "?"} 个块` +
         (typeof e.ledgerEntries === "number" ? ` · 账本 ${e.ledgerEntries} 条` : "") +
@@ -5171,6 +5248,7 @@ function entryIcon(type, isError) {
     case "model_fallback": return "⇄";   // 前两个换的是时机，这个换的是端点（cli.ts 同款）
     case "recovery_decision": return "⤷";
     case "run_forked": return "↗";
+    case "run_resumed": return "↺";
     // CLI 对压缩也用 ⚠，这里刻意分开：V-19 要求不可逆自成语域，
     // 与普通警告共用符号会让人对它脱敏
     case "compaction": return "⊟";
@@ -5204,6 +5282,7 @@ function entryActionLabel(e) {
       return labels[e.action] ?? "恢复路由";
     }
     case "run_forked": return "从归档检查点派生";
+    case "run_resumed": return "同运行热恢复";
     case "compaction": return "上下文压缩";
     case "usage": return "本轮用量";
     case "user_message": return `追加指令（第 ${e.turn ?? "?"} 轮对话）`;
@@ -5241,6 +5320,8 @@ function entryDetail(e) {
     case "recovery_decision":
       return e.detail ?? e.reason ?? "";
     case "run_forked":
+      return e.boundary ?? "";
+    case "run_resumed":
       return e.boundary ?? "";
     case "user_message":
       return truncate(e.text ?? "", 80);

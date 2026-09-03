@@ -71,9 +71,12 @@ import {
   type ArchivedMeta,
 } from "./history.js";
 import {
+  canSameRunResume,
   initialRunState,
   recoveryActionForPhase,
   transitionRunState,
+  type DurableBudgetSnapshot,
+  type DurableGrantAuditEntry,
   type DurablePlanSnapshot,
   type DurableRunState,
   type RunStateEvent,
@@ -368,8 +371,8 @@ interface StoredRun {
   initialContextInputTokens?: number;
   /**
    * RUN-01 / ADR-003：进程内 Durable RunState 游标；与 `state.json` 同步。
-   * 归档恢复只读；崩溃相按 recoveryActionForPhase 收成 closed/interrupted，
-   * **从不**把 archived 冒充成可同 run 热续跑。
+   * 崩溃相收成 closed/interrupted；Phase 2 在 interrupted+checkpoint 时可同
+   * runId 段边界续跑（不恢复 live loop / active grant）。
    */
   durableState?: DurableRunState;
   // ---- OBS-01 trace ----
@@ -643,7 +646,9 @@ export function durablePlanFromPlan(
 }
 
 /**
- * 崩溃档案按 ADR-003 表收成终态：不恢复 grant、不热续跑。
+ * 崩溃档案按 ADR-003 表收成终态：不恢复 grant。
+ * Phase 2：executing→interrupted 后，若有 checkpoint 可由 canSameRunResume
+ * 在同 runId 续跑；本函数只负责相迁移，不执行续跑。
  * 返回应用后的 state（调用方落盘）；只读相原样返回。
  */
 export function recoverDurableStateOnCrash(
@@ -1958,6 +1963,19 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     const liveCanContinue = liveStructurallyContinuable && liveBudgetBlockReason === null;
     const archiveBlockReason = r.archived ? archivedForkBlockReason(r) : null;
     const archiveCanFork = Boolean(r.archived && archiveBlockReason === null);
+    // same-run 仅 interrupted（崩溃收口）+ checkpoint；完成态档案仍走 fork
+    const archiveCanSameRun = Boolean(
+      r.archived &&
+        r.durableState &&
+        archiveBlockReason === null &&
+        canSameRunResume({
+          phase: r.durableState.phase,
+          hasCheckpoint: Boolean(r.checkpoint),
+          verify: r.verify,
+          mode: r.mode === "plan" ? "plan" : "single",
+          budgetExhausted: false,
+        }),
+    );
     const grantCanStillBeCalled = !r.archived && (r.status === "running" || liveCanContinue);
     const activeApprovalGrants = grantCanStillBeCalled
       ? approvalGrantCheckpointSnapshot(r, approvalClock()).length
@@ -1999,20 +2017,30 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       conversationTurn: r.conversationTurn,
       continuedFrom: r.continuedFrom ?? null,
       rootRunId: r.rootRunId ?? null,
-      // RUN-01：编排游标诚实展示。有 state 就报 phase + 崩溃恢复策略；
-      // 明确 sameRunResume=false——Phase 1 只 fork/checkpoint，不热续跑。
+      // RUN-01 Phase 2：sameRunResume 仅在 interrupted+checkpoint 且边界放行时为 true
       durablePhase: r.durableState?.phase ?? null,
       durableRecovery: r.durableState ? recoveryActionForPhase(r.durableState.phase) : null,
-      sameRunResume: false,
+      sameRunResume: archiveCanSameRun,
+      durableBudget: r.durableState?.budget ?? r.checkpoint?.runBudget ?? null,
+      durableGrantAuditCount: r.durableState?.grantAudit?.length ?? 0,
+      lastSameRunResumeAt: r.durableState?.lastSameRunResumeAt ?? null,
       // V-32：侧栏按工作目录分组。workdir 是工具的写入圈禁边界，
       // 也就是"这段工作触碰的范围"——它是这个 harness 自己长出来的分组键，
       // 不是从别家侧栏照搬来的层级
       workdir: r.workdir ?? workdir,
       // 能否追加：让界面据此决定要不要显示输入框，而不是点了才报错。
-      canContinue: liveCanContinue || archiveCanFork,
-      continuationMode: archiveCanFork ? "fork" : liveCanContinue ? "same" : null,
+      canContinue: liveCanContinue || archiveCanSameRun || archiveCanFork,
+      continuationMode: archiveCanSameRun
+        ? "same-run"
+        : archiveCanFork
+          ? "fork"
+          : liveCanContinue
+            ? "same"
+            : null,
       continuationBlockReason:
-        !archiveCanFork && r.archived ? archiveBlockReason : liveBudgetBlockReason,
+        !archiveCanSameRun && !archiveCanFork && r.archived
+          ? archiveBlockReason
+          : liveBudgetBlockReason,
     };
   }
 
@@ -2748,7 +2776,35 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
     // B2：durable 事件逐条落盘（delta 在上面早已 return——本来就不进缓冲）
     run.archiveWriter?.appendEvent(sseEvent);
-    // RUN-01：事件落盘后再迁游标（ADR 写序）。段起点 / 审批挂起。
+    // RUN-01：事件落盘后再迁游标（ADR 写序）。段起点 / 审批挂起 / 预算与 grant。
+    if (
+      event.type === "done" &&
+      source === "main" &&
+      run.checkpoint?.runBudget &&
+      run.durableState
+    ) {
+      applyDurableTransition(run, {
+        type: "budget_snapshot",
+        budget: { ...run.checkpoint.runBudget } as DurableBudgetSnapshot,
+      }, sseEvent.ts);
+      for (const g of run.checkpoint.approvalGrants ?? []) {
+        applyDurableTransition(run, {
+          type: "grant_audit",
+          entry: {
+            grantId: g.grantId,
+            approvalId: g.approvalId,
+            name: g.name,
+            inputHash: g.inputHash,
+            issuedAt: g.issuedAt,
+            expiresAt: g.expiresAt,
+            maxUses: g.maxUses,
+            usedUses: g.usedUses,
+            outcome: "checkpointed",
+            at: sseEvent.ts,
+          } satisfies DurableGrantAuditEntry,
+        }, sseEvent.ts);
+      }
+    }
     if (
       run.durableState &&
       (run.durableState.segmentSource !== source || run.durableState.segmentIndex !== run.segmentIndex) &&
@@ -3137,6 +3193,123 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         error: { name: "Error", message: errorMsg },
         messageCount: 0,
         usage: { inputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputTokens: 0, turns: 0, cacheHitRatio: 0 },
+      });
+    } finally {
+      finalizeRun(run, {
+        outcome: runOutcomeForStopReason(mainStopReason),
+        ...(mainStopReason ? { mainStopReason } : {}),
+        ...(mainError || mainStopReason === "error" ? { error: mainError ?? ledgerErrorClass("error") } : {}),
+      });
+    }
+  }
+
+  /**
+   * Phase 2：同 runId 从检查点热恢复。
+   *
+   * 与 fork 的差别：不新建 run、不写 continuedFrom、首条事件是 run_resumed。
+   * 诚实边界：不恢复 AbortController 以外的"原进程"——loop 是新建的；
+   * active grant 一律不继承；只从最后提交的 main checkpoint 续跑。
+   */
+  async function startSameRunResume(
+    run: StoredRun,
+    feedback: string,
+    parentApprovalGrants: readonly ArchivedApprovalGrant[] = [],
+  ): Promise<void> {
+    const history = run.history;
+    const inheritedBudget = run.resumeBudget;
+    if (!history?.length || !inheritedBudget) {
+      pushSyntheticEvent(run, "host", {
+        type: "run_resume_failed",
+        reason: "同 run 恢复缺少正史或预算快照",
+        at: Date.now(),
+      });
+      finalizeRun(run, {
+        outcome: "error",
+        mainStopReason: "error",
+        error: ledgerErrorClass("同 run 恢复缺少正史或预算快照"),
+      });
+      return;
+    }
+
+    const resumeAt = Date.now();
+    applyDurableTransition(run, { type: "resume", at: resumeAt });
+
+    pushSyntheticEvent(run, "host", {
+      type: "run_resumed",
+      runId: run.id,
+      rootRunId: run.rootRunId ?? run.id,
+      boundary:
+        "同 run 热恢复：从最后提交的 main 检查点续跑；不恢复原进程 loop/审批回调/active grant；" +
+        "无 toolTx（SAFE-06）——idempotency 边界是 checkpoint 段号。",
+      checkpoint: {
+        conversationTurn: run.conversationTurn - 1,
+        contextInputTokens: run.initialContextInputTokens ?? 0,
+        segmentIndex: run.checkpoint?.segmentIndex ?? null,
+        runBudget: { ...inheritedBudget },
+      },
+      reset: ["审批放行规则", "挂起交互", "ask_user 已用配额", "AbortController", "AgentLoop"],
+      at: resumeAt,
+    });
+    for (const grant of parentApprovalGrants) {
+      pushSyntheticEvent(run, "host", {
+        type: "approval_grant_not_inherited",
+        grantId: grant.grantId,
+        boundRunId: grant.boundRunId,
+        childRunId: run.id,
+        name: grant.name,
+        inputScope: grant.inputScope,
+        inputHash: grant.inputHash,
+        expiresAt: grant.expiresAt,
+        reason: "same_run_resume_no_active_grant",
+        actor: "system",
+        at: approvalClock(),
+      });
+    }
+    pushSyntheticEvent(run, "host", {
+      type: "user_message",
+      turn: run.conversationTurn,
+      text: feedback,
+      at: Date.now(),
+    });
+    broadcastLifecycle("run_updated", run);
+
+    await ensureMcp();
+    if (!(await pushRunConfig(run))) {
+      finalizeRun(run, {
+        outcome: "error",
+        mainStopReason: "execution_unavailable",
+        error: ledgerErrorClass("execution_unavailable"),
+      });
+      return;
+    }
+    const cfg = await buildRunConfig(run);
+    const loop = new AgentLoop(cfg, modelClient);
+    run.loop = loop;
+
+    let mainStopReason: string | undefined;
+    let mainError: string | null = null;
+    try {
+      for await (const event of loop.runContinuation(history, feedback, run.abort?.signal)) {
+        if (event.type === "done") {
+          mainStopReason = event.result.stopReason;
+          if (event.result.stopReason === "error" && event.result.error) {
+            mainError = ledgerErrorClass(event.result.error);
+          }
+        }
+        pushEvent(run, "main", event);
+      }
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      mainStopReason = "error";
+      mainError = ledgerErrorClass(err);
+      pushSyntheticEvent(run, "main", {
+        type: "done",
+        stopReason: "error",
+        error: { name: "Error", message: errorMsg },
+        messageCount: history.length,
+        usage: { inputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputTokens: 0, turns: 0, cacheHitRatio: 0 },
+        runBudget: { ...inheritedBudget },
+        contextInputTokens: run.initialContextInputTokens ?? 0,
       });
     } finally {
       finalizeRun(run, {
@@ -4564,6 +4737,65 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             if (!history) {
               return json(res, 409, {
                 error: `归档检查点损坏：transcript 中找不到 main 段 ${checkpoint.segmentIndex}`,
+              });
+            }
+
+            const preferSameRun = Boolean(
+              run.durableState &&
+                canSameRunResume({
+                  phase: run.durableState.phase,
+                  hasCheckpoint: Boolean(run.checkpoint),
+                  verify: run.verify,
+                  mode: run.mode === "plan" ? "plan" : "single",
+                  budgetExhausted: false,
+                }),
+            );
+
+            if (preferSameRun) {
+              // Phase 2：同 runId 复活——追加原目录，不派生 child
+              const resumePack = run.packName ? getPack(run.packName) : pack;
+              const resumeResources = resumePack?.resources ?? [];
+              if (acquireRunResources(res, run.id, resumeResources) === "refused") return;
+              if (refuseOrWarnSharedWorkdir(res, run.id, run.workdir ?? workdir, run.id)) {
+                hostResources.release(resumeResources, run.id);
+                return;
+              }
+              delete run.archived;
+              run.status = "running";
+              delete run.finishedAt;
+              run.abort = new AbortController();
+              run.history = history;
+              run.resumeBudget = restoredBudget(checkpoint, { maxTotalTurns, maxTokensBudget });
+              run.initialContextInputTokens = checkpoint.contextInputTokens;
+              run.conversationTurn = checkpoint.conversationTurn + 1;
+              run.segmentIndex = run.transcript.length;
+              run.pendingApprovals = new Map();
+              run.respondedApprovals = new Map();
+              run.respondedToolUseIds = new Set();
+              delete run.autoAllow;
+              if (resumeResources.length) run.heldResources = resumeResources;
+              if (run.archiveDir && historyRoot) {
+                run.archiveWriter = new RunHistoryWriter(run.archiveDir, reportHistoryError);
+              }
+              persistMeta(run);
+              if (realHost) {
+                operationalLog("info", "run_started", {
+                  runId: run.id,
+                  mode: "single",
+                  verify: false,
+                  continuation: "same-run",
+                });
+              }
+              broadcastLifecycle("run_updated", run);
+              void withFallbackAttribution(run, () =>
+                startSameRunResume(run, feedback, run.archivedApprovalGrantAudit ?? []),
+              );
+              return json(res, 200, {
+                runId: run.id,
+                conversationTurn: run.conversationTurn,
+                continuationMode: "same-run",
+                sameRunResume: true,
+                run: runSummary(run),
               });
             }
 

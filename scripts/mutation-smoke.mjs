@@ -145,6 +145,15 @@ const MUTANTS = [
     testFiles: ["test/model-fallback.test.ts"],
     why: "prefer_healthy 有健康候选时必须跳过 sticky unhealthy；否则 stub 形同虚设",
   },
+  {
+    id: "same-run-resume-allows-executing",
+    file: "src/run-state.ts",
+    find: "  if (input.phase !== \"interrupted\") return false;\n  if (!input.hasCheckpoint) return false;",
+    replace:
+      "  if (false && input.phase !== \"interrupted\") return false; // MUTATION: allow non-interrupted\n  if (!input.hasCheckpoint) return false;",
+    testFiles: ["test/run-state.test.ts"],
+    why: "sameRunResume 仅 interrupted；放宽会把完成态档案谎报可同 run 热续",
+  },
 ];
 
 function runVitest(testFiles) {

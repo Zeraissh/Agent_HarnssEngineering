@@ -1,9 +1,10 @@
 /**
- * RUN-01 Phase 1 — Durable RunState 纯函数内核（见 docs/adr/ADR-003）。
+ * RUN-01 Durable RunState 纯函数内核（见 docs/adr/ADR-003）。
  *
- * 本文件锁定 phase 迁移与快照形状；Web 宿主经 `ui/history.ts`（state.json）
- * + `ui/server.ts`（plan/execute/approval/finalize 接线）落盘。CLI 对等与
- * 热恢复 / toolTx / 跨重启 grant **不在** Phase 1。
+ * Phase 1：phase 迁移 + 快照形状。
+ * Phase 2：预算/grant 审计进 state；同 run 热恢复仅在「已提交 checkpoint
+ * 段边界」上合法（idempotency ≡ checkpoint.segmentIndex）。不恢复 live
+ * loop / AbortController / active grant；不做 SAFE-06 toolTx。
  */
 export const RUN_STATE_VERSION = 1 as const;
 
@@ -33,6 +34,32 @@ export interface DurablePlanSnapshot {
   rejectedAt: number | null;
 }
 
+/** SharedRunBudget 的可序列化快照（字段同 src/types，避免循环依赖）。 */
+export interface DurableBudgetSnapshot {
+  maxTurns?: number;
+  maxTokens?: number;
+  usedTurns: number;
+  usedTokens: number;
+}
+
+/**
+ * Grant 审计条目——只记账，永不活化为 capability（SAFE-04 / ADR）。
+ * 形状对齐 ArchivedApprovalGrant 的可移植子集。
+ */
+export interface DurableGrantAuditEntry {
+  grantId: string;
+  approvalId: string;
+  name: string;
+  inputHash: string;
+  issuedAt: number;
+  expiresAt: number;
+  maxUses: number;
+  usedUses: number;
+  /** 审计事件：issued | exhausted | expired | invalidated | checkpointed */
+  outcome: "issued" | "exhausted" | "expired" | "invalidated" | "checkpointed";
+  at: number;
+}
+
 export interface DurableRunState {
   version: typeof RUN_STATE_VERSION;
   runId: string;
@@ -46,6 +73,15 @@ export interface DurableRunState {
   pendingQuestionIds: string[];
   rootRunId: string | null;
   continuedFrom: string | null;
+  /** Phase 2：执行谱系预算快照；旧档案缺省 null */
+  budget: DurableBudgetSnapshot | null;
+  /** Phase 2：grant 审计（不恢复 active grant） */
+  grantAudit: DurableGrantAuditEntry[];
+  /**
+   * Phase 2：最后一次同 run 恢复成功时的墙钟。
+   * 有值 = 本档案曾诚实做过 same-run resume（非 fork）。
+   */
+  lastSameRunResumeAt: number | null;
 }
 
 export type RunStateEvent =
@@ -61,6 +97,9 @@ export type RunStateEvent =
   | { type: "approval_resolved"; approvalId: string }
   | { type: "question_wait"; questionId: string }
   | { type: "question_resolved"; questionId: string }
+  | { type: "budget_snapshot"; budget: DurableBudgetSnapshot }
+  | { type: "grant_audit"; entry: DurableGrantAuditEntry }
+  | { type: "resume"; at: number }
   | { type: "complete" }
   | { type: "fail" }
   | { type: "close" }
@@ -80,6 +119,9 @@ export function initialRunState(runId: string, at = Date.now()): DurableRunState
     pendingQuestionIds: [],
     rootRunId: null,
     continuedFrom: null,
+    budget: null,
+    grantAudit: [],
+    lastSameRunResumeAt: null,
   };
 }
 
@@ -93,6 +135,8 @@ export function transitionRunState(
     ...state,
     pendingApprovalIds: [...state.pendingApprovalIds],
     pendingQuestionIds: [...state.pendingQuestionIds],
+    grantAudit: [...state.grantAudit],
+    budget: state.budget ? { ...state.budget } : null,
     plan: state.plan ? { ...state.plan, edges: { ...state.plan.edges } } : null,
     updatedAt: at,
   };
@@ -167,6 +211,25 @@ export function transitionRunState(
         next.phase = "executing";
       }
       return next;
+    case "budget_snapshot":
+      if (["completed", "failed", "closed"].includes(state.phase)) return null;
+      next.budget = { ...event.budget };
+      return next;
+    case "grant_audit": {
+      if (["completed", "failed", "closed"].includes(state.phase)) return null;
+      const idx = next.grantAudit.findIndex((g) => g.grantId === event.entry.grantId);
+      if (idx >= 0) next.grantAudit[idx] = { ...event.entry };
+      else next.grantAudit.push({ ...event.entry });
+      return next;
+    }
+    case "resume":
+      // 仅 interrupted → executing。不恢复 grant / 不假装 loop 还在。
+      if (state.phase !== "interrupted") return null;
+      next.phase = "executing";
+      next.pendingApprovalIds = [];
+      next.pendingQuestionIds = [];
+      next.lastSameRunResumeAt = event.at;
+      return next;
     case "complete":
       if (["closed", "failed", "interrupted"].includes(state.phase)) return null;
       next.phase = "completed";
@@ -215,4 +278,26 @@ export function recoveryActionForPhase(
     default:
       return "fork_from_checkpoint";
   }
+}
+
+/**
+ * Phase 2 同 run 热恢复准入（ADR：需 toolTx **或** idempotency 边界）。
+ *
+ * 本实现取后者：只在 interrupted + 已提交 main checkpoint 时放行。
+ * 中途 tool 调用无 prepared/committed（SAFE-06 残余）——故不以 mid-tool 续跑。
+ * Active grant 永不因本函数为 true 而复活。
+ */
+export function canSameRunResume(input: {
+  phase: RunPhase;
+  hasCheckpoint: boolean;
+  verify: boolean;
+  mode: "single" | "plan";
+  budgetExhausted: boolean;
+}): boolean {
+  if (input.phase !== "interrupted") return false;
+  if (!input.hasCheckpoint) return false;
+  if (input.verify) return false;
+  if (input.mode === "plan") return false;
+  if (input.budgetExhausted) return false;
+  return true;
 }

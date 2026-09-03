@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  canSameRunResume,
   initialRunState,
   recoveryActionForPhase,
   transitionRunState,
@@ -57,5 +58,72 @@ describe("RUN-01 Phase 1 run-state", () => {
     })!;
     expect(s.phase).toBe("interrupted");
     expect(recoveryActionForPhase(s.phase)).toBe("readonly");
+  });
+});
+
+describe("RUN-01 Phase 2 same-run resume", () => {
+  it("resume only from interrupted → executing and stamps lastSameRunResumeAt", () => {
+    let s = transitionRunState(initialRunState("r"), { type: "start" })!;
+    s = transitionRunState(s, { type: "interrupt" }, 10)!;
+    const next = transitionRunState(s, { type: "resume", at: 20 }, 20)!;
+    expect(next.phase).toBe("executing");
+    expect(next.lastSameRunResumeAt).toBe(20);
+    expect(transitionRunState(next, { type: "resume", at: 30 })).toBeNull();
+  });
+
+  it("budget_snapshot and grant_audit persist without phase change", () => {
+    let s = transitionRunState(initialRunState("r"), { type: "start" })!;
+    s = transitionRunState(s, {
+      type: "budget_snapshot",
+      budget: { usedTurns: 3, usedTokens: 100, maxTurns: 120 },
+    })!;
+    expect(s.phase).toBe("executing");
+    expect(s.budget).toEqual({ usedTurns: 3, usedTokens: 100, maxTurns: 120 });
+    s = transitionRunState(s, {
+      type: "grant_audit",
+      entry: {
+        grantId: "g1",
+        approvalId: "a1",
+        name: "bash",
+        inputHash: "h",
+        issuedAt: 1,
+        expiresAt: 2,
+        maxUses: 1,
+        usedUses: 0,
+        outcome: "issued",
+        at: 3,
+      },
+    })!;
+    expect(s.grantAudit).toHaveLength(1);
+    expect(s.grantAudit[0]!.outcome).toBe("issued");
+  });
+
+  it("canSameRunResume requires interrupted + checkpoint; never for completed/plan/verify", () => {
+    const base = {
+      hasCheckpoint: true,
+      verify: false,
+      mode: "single" as const,
+      budgetExhausted: false,
+    };
+    expect(canSameRunResume({ ...base, phase: "interrupted" })).toBe(true);
+    expect(canSameRunResume({ ...base, phase: "executing" })).toBe(false);
+    expect(canSameRunResume({ ...base, phase: "completed" })).toBe(false);
+    expect(canSameRunResume({ ...base, phase: "interrupted", hasCheckpoint: false })).toBe(false);
+    expect(canSameRunResume({ ...base, phase: "interrupted", verify: true })).toBe(false);
+    expect(canSameRunResume({ ...base, phase: "interrupted", mode: "plan" })).toBe(false);
+    expect(canSameRunResume({ ...base, phase: "interrupted", budgetExhausted: true })).toBe(false);
+  });
+
+  it("mutation lock: canSameRunResume must not allow executing phase", () => {
+    // 若有人把 phase 检查删掉，完成态档案会被谎报可同 run 热续
+    expect(
+      canSameRunResume({
+        phase: "executing",
+        hasCheckpoint: true,
+        verify: false,
+        mode: "single",
+        budgetExhausted: false,
+      }),
+    ).toBe(false);
   });
 });

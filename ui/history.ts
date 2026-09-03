@@ -9,18 +9,19 @@
  *    这正是 V-05 重放幂等锁存在的原因）、`transcript.jsonl`（逐段会话正文，
  *    可达数 MB/段，与事件流分开、按需读——当初把 transcript 从 SSE 摘出去
  *    的理由在磁盘上同样成立）、`state.json`（RUN-01 / ADR-003 编排游标：
- *    phase / plan DAG / segment / 挂起审批 id——**不是**第二套事件流；
- *    Phase 1 不恢复 active grant、不冒充同 run 热续跑）。活对象一概不存：
- *    loop/abort/SSE 客户端存不了，挂起审批的 respond 回调也存不了——收尾时
- *    它们已被宣告过期并落进事件流。
+ *    phase / plan DAG / segment / 挂起审批 id / 预算与 grant 审计——**不是**
+ *    第二套事件流；不恢复 active grant）。活对象一概不存：loop/abort/SSE
+ *    客户端存不了，挂起审批的 respond 回调也存不了——收尾时它们已被宣告
+ *    过期并落进事件流。
  * ② **存哪**：`<root>/<runId>/` 每 run 一个目录。删一条 = 删一个目录，
  *    root 缺省 `<cwd>/.agent-run-history`，`AGENT_RUN_HISTORY_DIR` 可覆盖。
  * ③ **存多久**：只保留最近 DEFAULT_HISTORY_KEEP 个 run（启动与每次收尾后
  *    修剪，在跑的永不删）。没有清理策略的持久化最后都会变成没人敢删的占用。
- * ④ **怎样恢复续跑**：归档本身保持只读；每个已完成 main 段把 transcript 段号、
- *    ContextManager 水位和共享预算快照写进 meta。重启后从该检查点**派生新 run**，
- *    新 run 使用当前宿主的模型/工具/策略并显式记录 lineage，不冒充原进程无缝继续。
- *    没有检查点的旧档案仍只能回看。`state.json` 只回答"崩在哪一相"，续跑仍走 fork。
+ * ④ **怎样恢复续跑**：每个已完成 main 段把 transcript 段号、ContextManager
+ *    水位和共享预算快照写进 meta。崩溃后 phase=interrupted 且有检查点时，
+ *    Phase 2 可在**同一 runId** 上从检查点续跑（`sameRunResume`，idempotency
+ *    = checkpoint 段边界；不恢复 live loop/grant）。无检查点或非 interrupted
+ *    的只读/完成档案仍可 **派生新 run**（fork）。没有检查点的旧档案只能回看。
  *
  * 写失败不打断正在跑的 run，但必须通过健康状态显式上报；生产宿主不能把
  * “任务完成但历史全丢了”伪装成健康。meta/state 采用同目录临时文件 + rename，避免
@@ -32,6 +33,8 @@ import { join, resolve, dirname } from "node:path";
 import {
   RUN_PHASES,
   RUN_STATE_VERSION,
+  type DurableBudgetSnapshot,
+  type DurableGrantAuditEntry,
   type DurablePlanSnapshot,
   type DurableRunState,
   type RunPhase,
@@ -318,6 +321,23 @@ export function parseDurableRunState(raw: unknown): DurableRunState | null {
   if (o.continuedFrom !== null && typeof o.continuedFrom !== "string") return null;
   const plan = parseDurablePlanSnapshot(o.plan);
   if (o.plan !== null && plan === null) return null;
+  // Phase 2 字段：旧档案缺省兼容（budget/grantAudit/lastSameRunResumeAt）
+  const budget = parseDurableBudget(o.budget);
+  if (o.budget !== undefined && o.budget !== null && budget === null) return null;
+  let grantAudit: DurableGrantAuditEntry[] = [];
+  if (o.grantAudit !== undefined) {
+    if (!Array.isArray(o.grantAudit)) return null;
+    const parsed = o.grantAudit.map(parseGrantAuditEntry);
+    if (parsed.some((x) => x === null)) return null;
+    grantAudit = parsed as DurableGrantAuditEntry[];
+  }
+  if (
+    o.lastSameRunResumeAt !== undefined &&
+    o.lastSameRunResumeAt !== null &&
+    (typeof o.lastSameRunResumeAt !== "number" || !Number.isFinite(o.lastSameRunResumeAt))
+  ) {
+    return null;
+  }
   return {
     version: RUN_STATE_VERSION,
     runId: o.runId,
@@ -331,6 +351,66 @@ export function parseDurableRunState(raw: unknown): DurableRunState | null {
     pendingQuestionIds: [...o.pendingQuestionIds],
     rootRunId: (o.rootRunId as string | null) ?? null,
     continuedFrom: (o.continuedFrom as string | null) ?? null,
+    budget,
+    grantAudit,
+    lastSameRunResumeAt:
+      typeof o.lastSameRunResumeAt === "number" ? o.lastSameRunResumeAt : null,
+  };
+}
+
+function parseDurableBudget(raw: unknown): DurableBudgetSnapshot | null {
+  if (raw === null || raw === undefined) return null;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const b = raw as Record<string, unknown>;
+  if (typeof b.usedTurns !== "number" || !Number.isFinite(b.usedTurns)) return null;
+  if (typeof b.usedTokens !== "number" || !Number.isFinite(b.usedTokens)) return null;
+  const out: DurableBudgetSnapshot = {
+    usedTurns: b.usedTurns,
+    usedTokens: b.usedTokens,
+  };
+  if (b.maxTurns !== undefined) {
+    if (typeof b.maxTurns !== "number" || !Number.isFinite(b.maxTurns)) return null;
+    out.maxTurns = b.maxTurns;
+  }
+  if (b.maxTokens !== undefined) {
+    if (typeof b.maxTokens !== "number" || !Number.isFinite(b.maxTokens)) return null;
+    out.maxTokens = b.maxTokens;
+  }
+  return out;
+}
+
+const GRANT_AUDIT_OUTCOMES = new Set([
+  "issued",
+  "exhausted",
+  "expired",
+  "invalidated",
+  "checkpointed",
+]);
+
+function parseGrantAuditEntry(raw: unknown): DurableGrantAuditEntry | null {
+  if (!raw || typeof raw !== "object") return null;
+  const o = raw as Record<string, unknown>;
+  if (typeof o.grantId !== "string" || o.grantId === "") return null;
+  if (typeof o.approvalId !== "string") return null;
+  if (typeof o.name !== "string") return null;
+  if (typeof o.inputHash !== "string") return null;
+  if (typeof o.issuedAt !== "number" || !Number.isFinite(o.issuedAt)) return null;
+  if (typeof o.expiresAt !== "number" || !Number.isFinite(o.expiresAt)) return null;
+  if (typeof o.maxUses !== "number" || !Number.isInteger(o.maxUses)) return null;
+  if (typeof o.usedUses !== "number" || !Number.isInteger(o.usedUses)) return null;
+  if (typeof o.outcome !== "string" || !GRANT_AUDIT_OUTCOMES.has(o.outcome)) return null;
+  if (typeof o.at !== "number" || !Number.isFinite(o.at)) return null;
+  return {
+    grantId: o.grantId,
+    approvalId: o.approvalId,
+    name: o.name,
+    inputHash: o.inputHash,
+    issuedAt: o.issuedAt,
+    expiresAt: o.expiresAt,
+    maxUses: o.maxUses,
+    usedUses: o.usedUses,
+    outcome: o.outcome as DurableGrantAuditEntry["outcome"],
+    at: o.at,
   };
 }
 

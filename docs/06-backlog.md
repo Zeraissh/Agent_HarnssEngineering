@@ -3,7 +3,7 @@
 # 交接：从这里接着做（2026-09-03 成熟度第二波）
 
 **进行中**：按 `docs/08-maturity-optimization-checklist.md` Wave 2：
-`EVAL-03c → EVAL-01 → OBS-01 → RUN-01（state.json）→ MEM-01[~] → MODEL-01b[~]`。
+`EVAL-03c → EVAL-01 → OBS-01 → RUN-01（Phase 2）→ MEM-01[~] → MODEL-01b[~]`。
 单操作员形态；GOV-* 与 SAFE-05 Phase 2B **本波不做**（除非已解锁且很小）。
 每项独立 commit + push，等 CI 绿再开下一项。
 
@@ -13,12 +13,12 @@
 - **EVAL-01[~]** — `eval/cases-heldout.ts` 24×`ho-*`；`AB_SUITE=heldout`；nightly/release 六件套已切 held-out。
   research `eval/cases.ts` **不是** held-out；本会话未为追分改 prompt。
 - **OBS-01[~]** — `src/trace.ts` + `trace.jsonl`；`GET /api/runs/:id/trace` 脱敏导出。
-- **RUN-01[~]** — ADR-003 + 内核 + **Web `state.json` 接线**（plan/execute/approval/finalize；崩溃收口；`sameRunResume:false`）。
+- **RUN-01[~ Phase 1+2]** — ADR-003；`state.json`；崩溃→interrupted；**同 run 热恢复**（checkpoint 边界，`sameRunResume`/`run_resumed`）；预算+grantAudit 进 state。
 - **MEM-01[~ Phase A]** — 语义压缩：`[compact_ledger]` + 语义占位；非 LLM；mutation `compact-ledger-skipped`。
 - **MODEL-01b[~]** — 能力探针 + 每角色 fallback/inherit + `prefer_healthy` stub；见 docs/08。
 
-**下一刀**：CI 绿后开 `MEM-01 Phase B` / `RUN-01 Phase 2`，或 MODEL-01 残余（真成本路由）。
-RUN-01 残余：同 run 热恢复 / toolTx / CLI 对等 / 预算与 grant 审计进 state。
+**下一刀**：CI 绿后开 `MEM-01 Phase B`，或 RUN-02 / MODEL-01 残余。
+RUN-01 残余：SAFE-06 toolTx、CLI 对等 durable、mid-tool 恢复。
 MEM-01 残余：启发式漏检、无 LLM 摘要、MCP 写工具靠名字启发。
 MODEL-01 残余：Web 同步探针回写 compat、成本/延迟真路由、识图能力探针、链健康实时面。
 

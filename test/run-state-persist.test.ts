@@ -91,4 +91,53 @@ describe("RUN-01 state.json persistence", () => {
     expect(snap.taskIds).toEqual(["s1", "s2"]);
     expect(snap.edges).toEqual({ s1: [], s2: ["s1"] });
   });
+
+  it("Phase 2：budget + grantAudit round-trip；旧档案缺字段仍可解析", async () => {
+    const dir = await temp();
+    const w = new RunHistoryWriter(dir);
+    let state = initialRunState("r2", 10);
+    state = transitionRunState(state, { type: "start" }, 11)!;
+    state = transitionRunState(state, {
+      type: "budget_snapshot",
+      budget: { usedTurns: 1, usedTokens: 50, maxTurns: 10 },
+    }, 12)!;
+    state = transitionRunState(state, {
+      type: "grant_audit",
+      entry: {
+        grantId: "g",
+        approvalId: "a",
+        name: "bash",
+        inputHash: "hh",
+        issuedAt: 1,
+        expiresAt: 9,
+        maxUses: 1,
+        usedUses: 0,
+        outcome: "checkpointed",
+        at: 12,
+      },
+    }, 12)!;
+    w.writeState(state);
+    await w.flush();
+    const loaded = await readArchivedState(dir);
+    expect(loaded?.budget?.usedTurns).toBe(1);
+    expect(loaded?.grantAudit).toHaveLength(1);
+
+    // 旧 Phase 1 档案（无 budget/grantAudit）仍合法
+    const legacy = {
+      version: 1,
+      runId: "legacy",
+      phase: "executing",
+      updatedAt: 1,
+      plan: null,
+      segmentIndex: 0,
+      segmentSource: "main",
+      verificationRound: 0,
+      pendingApprovalIds: [],
+      pendingQuestionIds: [],
+      rootRunId: null,
+      continuedFrom: null,
+    };
+    expect(parseDurableRunState(legacy)?.budget).toBeNull();
+    expect(parseDurableRunState(legacy)?.grantAudit).toEqual([]);
+  });
 });

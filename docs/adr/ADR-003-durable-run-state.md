@@ -1,7 +1,7 @@
 # ADR-003: Durable RunState（分阶段）
 
-**Status:** Proposed（Phase 1 内核 + Web state.json 接线已落地；Phase 2 热恢复未开，不得标 Accepted）  
-**Date:** 2026-09-02  
+**Status:** Accepted（Phase 1 + Phase 2 已落地；SAFE-06 toolTx / CLI 对等仍为残余，不得标 Phase 3）  
+**Date:** 2026-09-02（Phase 2：2026-09-03）  
 **Deciders:** Agent_Design 维护者  
 **Related:** RUN-01 / RUN-02；B2 `ui/history.ts`；SAFE-04 grant 边界；OBS-01 `trace.jsonl`
 
@@ -44,12 +44,14 @@ version: 1
 runId, rootRunId?, continuedFrom?
 phase: created | planning | plan_gated | executing | verifying | reworking
        | awaiting_approval | awaiting_question | completed | failed | closed
+       | interrupted
 plan?: { protocol, tasks[], approvedAt?, rejectedAt? }   # DAG 快照
 segment: { index, source, startedAt }
 verification?: { round, recovery?, lastVerdictHash? }
-budget: SharedRunBudget 快照
-approvals: { pendingIds[], grantAudit[] }   # 只审计，不恢复 active grant（Phase 1）
-toolTx?: never                              # Phase 1 禁止；等 SAFE-06
+budget: SharedRunBudget 快照                    # Phase 2
+approvals: { pendingIds[], grantAudit[] }       # Phase 2：只审计，不恢复 active grant
+lastSameRunResumeAt?: number | null             # Phase 2
+toolTx?: never                                  # 禁止直至 SAFE-06
 ```
 
 **恢复语义（Phase 1）**：
@@ -63,19 +65,29 @@ toolTx?: never                              # Phase 1 禁止；等 SAFE-06
 
 Phase 1 **明确不做**：同 runId 热恢复、跨重启复用 active grant、tool compensation。
 
+**恢复语义（Phase 2 增量）**：
+
+| 条件 | 行为 |
+|---|---|
+| `interrupted` + 已提交 main checkpoint + 非 verify/plan + 预算未耗尽 | **同 runId 热恢复**（`sameRunResume:true`，`continuationMode:"same-run"`）；首条事件 `run_resumed`；新建 AgentLoop/AbortController；**不**恢复 active grant |
+| 同上但无 checkpoint | 只读 interrupted；不可续 |
+| 完成态归档 + checkpoint | 仍走 **fork**（新 runId）；`sameRunResume:false` |
+
+Idempotency 边界（无 SAFE-06 toolTx）：**checkpoint 段号**——只从最后完整 main `done` 之后续跑，不声称 mid-tool 安全。
+
 ### Phase 划分
 
 | Phase | 范围 | 验收 |
 |---|---|---|
-| **1（本 ADR 授权实现）** | 写 `state.json` 与 phase 迁移；崩溃档案带 phase；计划 DAG 快照进 state；与 meta/checkpoint 一致；单测 + 变异（丢 phase 变红） | docs/08 RUN-01 → `[~]` |
-| **2** | 同 run 热恢复执行游标（需 toolTx 或至少 idempotency key） | 依赖 SAFE-06 或等价 |
+| **1（已落地）** | 写 `state.json` 与 phase 迁移；崩溃档案带 phase；计划 DAG 快照进 state；与 meta/checkpoint 一致；单测 + 变异（丢 phase 变红） | docs/08 RUN-01 → `[~]` |
+| **2（已落地）** | 同 run 热恢复执行游标（idempotency = checkpoint）；预算/grantAudit 进 state；UI/API `sameRunResume` 诚实；变异 `same-run-resume-allows-executing` | docs/08 RUN-01 仍 `[~]`（toolTx/CLI 残余） |
 | **3** | 崩溃注入套件（RUN-02） | model/tool/approval/history 各点 |
 
 ### 与现有件的关系
 
 - **events.jsonl** 仍是 UI 重放事实源；state.json 是 **编排游标**，不是第二套事件流。
 - **OBS-01 trace** 旁路观测；不参与恢复决策。
-- **SAFE-04**：Phase 1 只持久化 grant **审计**；激活仍禁跨重启。
+- **SAFE-04**：Phase 1–2 只持久化 grant **审计**；激活仍禁跨重启。
 
 ## Options Considered
 
@@ -93,22 +105,21 @@ Phase 1 **明确不做**：同 runId 热恢复、跨重启复用 active grant、
 
 ## Consequences
 
-- 正向：RUN-01 有可验收的 Phase 1 边界；接手不必重推演“同 run 热恢复 vs 派生”。
-- 负向：用户仍会看见“中断后开新 run”，不是无缝续聊——界面必须继续诚实（archived / interrupted）。
-- 风险：state 与 events 短暂不一致——写序必须 **先 append 关键事件，再写 state**（或同链 enqueue）。
+- 正向：RUN-01 有可验收的 Phase 1–2 边界；接手不必重推演“同 run 热恢复 vs 派生”。
+- 负向：无 toolTx 时 mid-segment 崩溃仍会丢该段未落盘工具副作用——界面必须继续诚实（interrupted / run_resumed 边界文案）。
+- 风险：state 与 events 短暂不一致——写序必须 **先 append 相关事件，再写 state**（或同链 enqueue）。
 
-## Phase 1 非目标（写进残余）
+## Phase 1–2 非目标（写进残余）
 
-- SAFE-06 tool transaction
+- SAFE-06 tool transaction（prepared/committed）
 - GOV-01 主体绑定的跨重启 grant
-- CLI 对等 durable state（可随后镜像 Web）
-- MEM-01 语义压缩
+- CLI 对等 durable state（Web 先行；CLI 可随后镜像）
+- MEM-01 语义压缩（独立项）
 
-## Implementation notes（Phase 1 开工清单）
+## Implementation notes
 
-1. ~~`src/run-state.ts`：类型 + `transition(phase, event) → next` 纯函数 + 单测。~~
-2. ~~`ui/history.ts`：`writeState` / `readState`（坏文件跳过，同 meta）。~~
-3. ~~`ui/server.ts`：在 plan/execute/verify/approval/finalize 点调用 transition；崩溃 hydrate 读 phase。~~
-4. docs/08 RUN-01 → `[~]` 并记残余；不得在 Phase 2 未做时标 `[x]`。
-
-**Phase 1 已接线残余**：CLI 对等 durable state；同 run 热恢复（Phase 2）；toolTx（SAFE-06）；预算快照进 state；grant 审计数组进 state（当前只 pendingIds）。
+1. ~~`src/run-state.ts`：类型 + `transition` + `canSameRunResume`~~
+2. ~~`ui/history.ts`：`writeState` / `readState` / Phase 2 字段解析~~
+3. ~~`ui/server.ts`：迁移接线、崩溃收口、same-run followUp、预算/grant 快照~~
+4. ~~UI：`continuationMode:"same-run"` + `run_resumed` reducer/装配条~~
+5. docs/08 RUN-01 保持 `[~]`；残余写清 toolTx / CLI。

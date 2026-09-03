@@ -4666,8 +4666,82 @@ describe("B2 · 运行历史落盘", () => {
     expect(row.durablePhase).toBe("interrupted");
     expect(row.sameRunResume).toBe(false);
     expect(row.continuationMode).not.toBe("same");
+    expect(row.continuationMode).not.toBe("same-run");
     const recovered = JSON.parse(await readFile(join(runDir, "state.json"), "utf8"));
     expect(recovered.phase).toBe("interrupted");
+  });
+
+  it("RUN-01 Phase 2：崩溃+checkpoint → sameRunResume；续跑同 runId 发 run_resumed", async () => {
+    dir = await mkdtemp(join(tmpdir(), "history-same-run-"));
+    await boot({
+      modelClient: new FakeModelClient([
+        fakeMessage([textBlock("段1 secret-z9")], "end_turn", {
+          input_tokens: 80,
+          output_tokens: 20,
+        }),
+      ]),
+      tools: [autoTool("noop")],
+      workdir: process.cwd(),
+      history: dir,
+    });
+    const { runId } = (await (await post("/api/runs", { task: "热恢复我", verify: false })).json()) as {
+      runId: string;
+    };
+    await waitForDone(base, runId);
+    await handle!.close();
+    handle = undefined;
+
+    // 模拟进程崩溃：meta 仍 running，state 停在 executing（有 checkpoint）
+    const runDir = join(dir, runId);
+    const meta = JSON.parse(await readFile(join(runDir, "meta.json"), "utf8"));
+    expect(meta.checkpoint).toBeTruthy();
+    meta.status = "running";
+    meta.finishedAt = null;
+    await writeFile(join(runDir, "meta.json"), JSON.stringify(meta), "utf8");
+    const state = JSON.parse(await readFile(join(runDir, "state.json"), "utf8"));
+    state.phase = "executing";
+    await writeFile(join(runDir, "state.json"), JSON.stringify(state), "utf8");
+
+    const resumedModel = new FakeModelClient([
+      fakeMessage([textBlock("段2 仍见 secret-z9")], "end_turn", {
+        input_tokens: 30,
+        output_tokens: 10,
+      }),
+    ]);
+    await boot({
+      modelClient: resumedModel,
+      tools: [autoTool("noop")],
+      workdir: process.cwd(),
+      history: dir,
+    });
+    const list = (await (await fetch(`${base}/api/runs`)).json()) as any[];
+    const row = list.find((r) => r.runId === runId);
+    expect(row.durablePhase).toBe("interrupted");
+    expect(row.sameRunResume).toBe(true);
+    expect(row.continuationMode).toBe("same-run");
+    expect(row.canContinue).toBe(true);
+    expect(row.durableBudget?.usedTurns).toBeGreaterThanOrEqual(1);
+
+    const follow = await post(`/api/runs/${runId}/messages`, { text: "接着跑" });
+    expect(follow.status).toBe(200);
+    const body = (await follow.json()) as any;
+    expect(body.runId).toBe(runId);
+    expect(body.continuationMode).toBe("same-run");
+    expect(body.sameRunResume).toBe(true);
+    await waitForDone(base, runId);
+
+    const events = (await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`))) as any[];
+    const resumed = events.find((item) => item.event.type === "run_resumed");
+    expect(resumed?.event.runId).toBe(runId);
+    expect(events.some((item) => item.event.type === "run_forked")).toBe(false);
+
+    const flattened = JSON.stringify(resumedModel.requests[0]!.messages);
+    expect(flattened).toContain("secret-z9");
+    expect(flattened).toContain("接着跑");
+
+    const afterState = JSON.parse(await readFile(join(runDir, "state.json"), "utf8"));
+    expect(afterState.lastSameRunResumeAt).toBeTruthy();
+    expect(["executing", "completed"]).toContain(afterState.phase);
   });
 });
 

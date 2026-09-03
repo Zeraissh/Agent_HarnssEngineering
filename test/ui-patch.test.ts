@@ -1895,6 +1895,25 @@ describe("B2 · 归档运行在底栏的说法", () => {
     expect(m.note).toContain("归档");
     expect(m.note).not.toContain("失败");
   });
+
+  it("RUN-01 Phase 2：same-run 续跑文案不冒充 fork", () => {
+    const m = deriveComposerMode({
+      info: {
+        runId: "r1",
+        status: "done",
+        canContinue: true,
+        archived: true,
+        continuationMode: "same-run",
+        sameRunResume: true,
+        durablePhase: "interrupted",
+      },
+    });
+    expect(m.mode).toBe("same-run");
+    expect(m.buttonLabel).toContain("同运行");
+    expect(m.note).toContain("同一 runId");
+    expect(m.note).toContain("interrupted");
+    expect(m.note).not.toContain("派生新运行");
+  });
 });
 
 describe("装配条的识图那一格", () => {
