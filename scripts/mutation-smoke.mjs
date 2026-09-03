@@ -196,6 +196,23 @@ const MUTANTS = [
     why: "台账不记压缩次数，反应式救回超长请求的代价（补读）就永远只在事件流里可见",
   },
   {
+    id: "context-budget-clamp-dropped",
+    file: "src/context-window.ts",
+    find: "  if (maxBudget === null || requested <= maxBudget) {",
+    replace: "  if (true || maxBudget === null || requested <= maxBudget) { // MUTATION: never clamp",
+    testFiles: ["test/context-window.test.ts"],
+    why: "预算必须夹进 窗口 − maxTokens − 边际：128k 模型上 150k 默认预算不夹 = 主动压缩永不触发，只剩反应式白吃 400",
+  },
+  {
+    id: "context-window-learn-dropped",
+    file: "src/loop.ts",
+    find: "              const learnedWindow = parseContextWindowFromOverflowError(err);",
+    replace:
+      "              const learnedWindow = null as number | null; void parseContextWindowFromOverflowError; // MUTATION: never learn",
+    testFiles: ["test/compact-tier2.test.ts"],
+    why: "撞 400 时报文里的窗口必须学走：不学，下一次同端点的运行仍按 unknown 算预算，反应式 400 每次都吃",
+  },
+  {
     id: "prefer-healthy-never-skips",
     file: "src/model-fallback.ts",
     find: "        if (othersMayWork && stickySaysUnhealthy(id)) {\n          skipped.push(ep.name);\n          previous = { name: ep.name, reason: \"probe_unhealthy\" };\n          continue;\n        }",

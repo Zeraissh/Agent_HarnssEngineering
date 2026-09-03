@@ -140,6 +140,17 @@ export function tallyCompaction(
   return tally;
 }
 
+/** 台账里记的上下文窗口 / 预算快照。window=null 且 windowSource=unknown 是合法读数（"不知道"要如实记） */
+export interface LedgerContext {
+  window: number | null;
+  windowSource: "env" | "learned" | "registry" | "unknown";
+  budget: number | null;
+  budgetSource: "run" | "env" | "pack" | "default" | null;
+}
+
+const WINDOW_SOURCES: LedgerContext["windowSource"][] = ["env", "learned", "registry", "unknown"];
+const BUDGET_SOURCES: NonNullable<LedgerContext["budgetSource"]>[] = ["run", "env", "pack", "default"];
+
 /** 台账里记的恢复策略快照（完成门关着时为 null——那时 loop 到 maxTurns 即停） */
 export interface LedgerRecoveryPolicy {
   progressExtensionTurns: number;
@@ -195,6 +206,12 @@ export interface RunLedgerEntry {
   /** 上下文压缩计数（全部角色）。老行没有这个字段（undefined）= 早于计数落地（2026-09-03），不是零次 */
   compaction?: LedgerCompactionTally;
   /**
+   * 上下文窗口（事实）与压缩预算（策略）各带来源（MEM-01 窗口 / 预算分离）。
+   * 没有它，事后无从回答"这次运行在窗口的百分之几处压缩、阈值是谁定的"——正是导致
+   * 150k 在 1M 模型上压了三个月没人发现的那种盲区。老行没有这个字段（undefined）= 未知。
+   */
+  context?: LedgerContext;
+  /**
    * 仪器纪律：**这一行是不是由带终结工具（§2.1）的构建写下的**。
    *
    * 不是配置项，是**构建标记**——`buildLedgerEntry` 恒写 true。为什么必须有它：
@@ -244,9 +261,20 @@ export interface LedgerInput {
   recoveryPolicy?: LedgerRecoveryPolicy | null;
   recovery?: Partial<LedgerRecoveryTally> | null;
   compaction?: Partial<LedgerCompactionTally> | null;
+  context?: {
+    window?: number | null;
+    windowSource?: string | null;
+    budget?: number | null;
+    budgetSource?: string | null;
+  } | null;
 }
 
 const RECOVERIES: LedgerRecovery[] = ["tool", "direct", "reformat", "wrapup", "failed"];
+
+function positiveIntOrNull(v: unknown): number | null {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : null;
+}
 
 function nonNegativeInt(v: unknown): number {
   const n = Number(v);
@@ -320,6 +348,17 @@ export function buildLedgerEntry(input: LedgerInput): RunLedgerEntry {
       reactive: nonNegativeInt(input.compaction?.reactive),
       droppedBlocks: nonNegativeInt(input.compaction?.droppedBlocks),
       collapsedTurns: nonNegativeInt(input.compaction?.collapsedTurns),
+    },
+    // 窗口 / 预算 + 来源。宿主漏传就是 unknown/null——不许把"没传"画成某个数
+    context: {
+      window: positiveIntOrNull(input.context?.window),
+      windowSource: WINDOW_SOURCES.includes(input.context?.windowSource as LedgerContext["windowSource"])
+        ? (input.context!.windowSource as LedgerContext["windowSource"])
+        : "unknown",
+      budget: positiveIntOrNull(input.context?.budget),
+      budgetSource: BUDGET_SOURCES.includes(input.context?.budgetSource as NonNullable<LedgerContext["budgetSource"]>)
+        ? (input.context!.budgetSource as LedgerContext["budgetSource"])
+        : null,
     },
     // 构建标记，不是配置：这个构建的 verifier/planner 一律带终结工具
     structuredDelivery: true,
@@ -457,6 +496,21 @@ export interface LedgerSummary {
     droppedBlocks: number;
     collapsedTurns: number;
   };
+  /**
+   * 上下文窗口 / 预算分布（MEM-01 窗口 / 预算分离）。只统计带 `context` 字段的行；老行是未知。
+   * 回答的是"窗口是从哪知道的"与"预算相对窗口在哪"——150k 在 1M 上压了三个月，就是因为
+   * 没有一个地方把这两个数并排放着。
+   */
+  context: {
+    /** 带 context 字段的行数（分母） */
+    rows: number;
+    windowSources: Record<"env" | "learned" | "registry" | "unknown", number>;
+    budgetSources: Record<"run" | "env" | "pack" | "default" | "unknown", number>;
+    /** 预算值 → 次数（按 token 数原样分桶，通常只有几个值） */
+    budgets: Record<string, number>;
+    /** 窗口已知的行里 budget / window 的均值；没有已知窗口时 null */
+    meanBudgetToWindow: number | null;
+  };
 }
 
 /** verifier 侧出现这些就值得看一眼——只读核查不该写东西 */
@@ -476,10 +530,34 @@ export function summarizeLedger(entries: RunLedgerEntry[]): LedgerSummary {
   const compaction: LedgerSummary["compaction"] = {
     rows: 0, runsWithAny: 0, runsWithReactive: 0, proactive: 0, reactive: 0, droppedBlocks: 0, collapsedTurns: 0,
   };
+  const context: LedgerSummary["context"] = {
+    rows: 0,
+    windowSources: { env: 0, learned: 0, registry: 0, unknown: 0 },
+    budgetSources: { run: 0, env: 0, pack: 0, default: 0, unknown: 0 },
+    budgets: {},
+    meanBudgetToWindow: null,
+  };
+  let ratioSum = 0;
+  let ratioRows = 0;
 
   for (const e of entries) {
     if (e.verify) verifiedRuns++;
     if (e.verifierHitBudget) hitBudget++;
+    if (e.context !== undefined && e.context !== null) {
+      const c = e.context;
+      context.rows += 1;
+      const ws = WINDOW_SOURCES.includes(c.windowSource) ? c.windowSource : "unknown";
+      context.windowSources[ws] += 1;
+      const bs = c.budgetSource && BUDGET_SOURCES.includes(c.budgetSource) ? c.budgetSource : "unknown";
+      context.budgetSources[bs] += 1;
+      const budget = positiveIntOrNull(c.budget);
+      if (budget !== null) context.budgets[String(budget)] = (context.budgets[String(budget)] ?? 0) + 1;
+      const window = positiveIntOrNull(c.window);
+      if (budget !== null && window !== null) {
+        ratioSum += budget / window;
+        ratioRows += 1;
+      }
+    }
     if (e.compaction !== undefined) {
       const c = e.compaction;
       compaction.rows += 1;
@@ -530,6 +608,7 @@ export function summarizeLedger(entries: RunLedgerEntry[]): LedgerSummary {
     tools,
     verifierWriteCalls,
     compaction,
+    context: { ...context, meanBudgetToWindow: ratioRows > 0 ? ratioSum / ratioRows : null },
   };
 }
 

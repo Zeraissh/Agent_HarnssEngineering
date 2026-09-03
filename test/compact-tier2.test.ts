@@ -482,6 +482,45 @@ describe("反应式压缩：端点 context-too-long 400 → 硬压缩 → 重发
     expect(model.requests).toHaveLength(2);
   });
 
+  /**
+   * MEM-01 窗口 / 预算分离的学习钩子：那条 400 是端点对"我的窗口有多大"的第一手陈述。
+   * loop 只认识 ModelClient、不知道端点身份，所以只负责解析 + 回调 + 把数挂到 compaction 事件上，
+   * 记到哪个 provider|model|origin 下面是宿主的事。变异：删掉 loop 里的 parse/回调 → 这条红。
+   */
+  it("撞 400 时解析报文里的窗口：回调 onContextWindowLearned(200000)，compaction{reactive} 带 learnedWindow", async () => {
+    const model = new OverflowingModel(
+      [...threeToolTurns, fakeMessage([textBlock("done")], "end_turn", { input_tokens: 100 })],
+      [4],
+    );
+    const learned: number[] = [];
+    const events = await runLoop(model, { errorRetries: 0, onContextWindowLearned: (n: number) => learned.push(n) });
+    expect(learned).toEqual([200_000]);
+    const reactive = events.find((e) => e.type === "compaction" && e.reactive === true);
+    if (reactive?.type !== "compaction") throw new Error("no reactive compaction");
+    expect(reactive.learnedWindow).toBe(200_000);
+    // 常规 done 照常
+    const done = events.at(-1);
+    if (done?.type !== "done") throw new Error("no done");
+    expect(done.result.stopReason).toBe("completed");
+  });
+
+  it("没有可压的东西时仍然学（先学再压，学到的事实不随压缩失败作废）；钩子抛错不影响本轮", async () => {
+    const model = new OverflowingModel(threeToolTurns.slice(0, 1), [2]);
+    const learned: number[] = [];
+    const events = await runLoop(model, {
+      errorRetries: 1,
+      onContextWindowLearned: (n: number) => {
+        learned.push(n);
+        throw new Error("store exploded");
+      },
+    });
+    expect(learned).toEqual([200_000]);
+    const done = events.at(-1);
+    if (done?.type !== "done") throw new Error("no done");
+    expect(done.result.stopReason).toBe("error");
+    expect(done.result.error?.message.startsWith(CONTEXT_OVERFLOW_ERROR_PREFIX)).toBe(true);
+  });
+
   it("常规水位路径的 compaction 事件带 collapsedTurns，不带 reactive", async () => {
     const script = [
       ...Array.from({ length: 5 }, (_, i) =>

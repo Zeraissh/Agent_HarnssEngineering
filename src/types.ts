@@ -278,8 +278,18 @@ export interface AgentConfig {
    * 缺省时由宿主按模型名推断（非 claude-* 即 true）。
    */
   compat?: boolean;
-  /** 上下文 token 上限（触发 compact 的依据，按上一轮实际输入衡量）。默认 150_000 */
+  /**
+   * 上下文 token **预算**（触发 compact 的依据，按上一轮实际输入衡量）。默认 150_000。
+   * 这是策略不是事实：模型的窗口（事实）由宿主按 env > learned > registry > unknown 解析
+   * （`context-window.ts`），并据此把这个预算夹在 `window − maxTokens − margin` 之内。
+   */
   contextTokenLimit?: number;
+  /**
+   * 学习钩子（MEM-01 窗口 / 预算分离）：loop 撞上 context-overflow 400 且报文里带着端点声明的
+   * 窗口大小时调用一次。loop 只认识 ModelClient，不知道端点身份——记到哪个 provider|model|origin
+   * 下面是宿主的事（`learnContextWindow`）。不设 = 学不到，只做反应式压缩。
+   */
+  onContextWindowLearned?: (windowTokens: number) => void;
   /**
    * 单个 tool_result 进入正史前的字符上限（MEM-01 Phase C 的"入口截断"）。默认 40_000，
    * 见 `DEFAULT_TOOL_RESULT_MAX_CHARS`。内置 read_file / bash 自带 30k 截断，这一层是
@@ -485,6 +495,8 @@ export type TurnEvent =
    * summaryApplied = Phase B LLM 摘要已合并进账本（缺省/失败均为未设或 false）；
    * collapsedTurns = tier 2 本次折叠进 `[compacted_turns]` 块的旧轮数（缺省 = 未折叠）；
    * reactive = 由端点的 context-too-long 400 触发的硬压缩（保护窗收到 2），随即重发同一轮。
+   * learnedWindow = 那条 400 报文里端点声明的窗口大小（只随 reactive 出现；宿主已经由
+   * onContextWindowLearned 记下，下一次同端点 + 同模型的运行拿到的就是这个窗口）。
    * 原文仍不可恢复，但账本随正史保留。
    */
   | {
@@ -494,6 +506,7 @@ export type TurnEvent =
       summaryApplied?: boolean;
       collapsedTurns?: number;
       reactive?: boolean;
+      learnedWindow?: number;
     }
   /**
    * 思考增量（逐字）。与 `assistant_thinking`（turn 级整块）互补：

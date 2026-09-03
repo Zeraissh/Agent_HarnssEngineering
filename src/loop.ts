@@ -9,6 +9,7 @@ import type Anthropic from "@anthropic-ai/sdk";
 import { DefaultContextManager, REACTIVE_PROTECT_RECENT, userMessageWithContext } from "./context.js";
 import { createHash } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
+import { parseContextWindowFromOverflowError } from "./model-capability.js";
 import { classifyApiError, isContextOverflowError, isTransientApiError } from "./model-client.js";
 import { decideRecovery } from "./recovery.js";
 import { type DurableToolTx, type ToolTxController } from "./tool-tx.js";
@@ -30,11 +31,16 @@ import type {
  * 要能算，台账里就得有分母——包没声明 guardrails.maxTurns 时分母就是它。
  */
 export const DEFAULT_MAX_TURNS = 50;
+/**
+ * 单次响应输出上限的缺省值。导出给宿主算上下文预算上限用：端点把 max_tokens 算进窗口
+ * （2026-09-03 真机实测），`maxBudget = window − maxTokens − margin` 的第二项就是它。
+ */
+export const DEFAULT_MAX_TOKENS = 64_000;
 
 const DEFAULTS = {
   model: "claude-opus-4-8",
   effort: "high",
-  maxTokens: 64_000,
+  maxTokens: DEFAULT_MAX_TOKENS,
   maxTurns: DEFAULT_MAX_TURNS,
 } as const;
 
@@ -632,6 +638,20 @@ export class AgentLoop {
              */
             if (isContextOverflowError(err) && !reactiveCompactionUsed) {
               reactiveCompactionUsed = true;
+              /**
+               * 学习钩子（MEM-01 窗口 / 预算分离）：这条 400 是端点对"我的窗口有多大"的
+               * 第一手陈述，报文里带着数就记下来——下一次同端点 + 同模型的运行据此解析窗口，
+               * 预算夹紧也才有分母。压不压得动是另一回事：先学，再压。钩子归宿主，
+               * 钩子抛错不能反过来影响本轮（它是仪器，不是被测对象）。
+               */
+              const learnedWindow = parseContextWindowFromOverflowError(err);
+              if (learnedWindow !== null) {
+                try {
+                  this.cfg.onContextWindowLearned?.(learnedWindow);
+                } catch {
+                  /* 学习失败就当没学到；反应式压缩照常 */
+                }
+              }
               const hard = await this.context.compactAsync(messages, signal, {
                 force: true,
                 protectRecent: REACTIVE_PROTECT_RECENT,
@@ -645,6 +665,7 @@ export class AgentLoop {
                   ...(hard.collapsedTurns > 0 ? { collapsedTurns: hard.collapsedTurns } : {}),
                   ...(hard.summaryApplied ? { summaryApplied: true } : {}),
                   reactive: true,
+                  ...(learnedWindow !== null ? { learnedWindow } : {}),
                 });
                 request = buildRequest();
                 attempt -= 1; // 不占瞬时重试额度

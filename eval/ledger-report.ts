@@ -117,6 +117,31 @@ if (cp.rows === 0) {
 console.log("");
 
 /**
+ * 上下文窗口 / 预算（MEM-01 窗口 / 预算分离）：窗口是从哪知道的、预算相对窗口在哪。
+ * 150k 预算在 1M 窗口上压了三个月没人发现，就是因为没有一处把这两个数并排放着。
+ */
+const cx = s.context;
+console.log("── 上下文窗口 / 预算 ──");
+if (cx.rows === 0) {
+  console.log("  0 行带窗口 / 预算字段（早于窗口 / 预算分离的老行不记，是未知不是零）。");
+} else {
+  const dist = (o: Record<string, number>) =>
+    Object.entries(o).filter(([, n]) => n > 0).map(([k, n]) => `${k}×${n}`).join(" ") || "—";
+  console.log(`  有字段的运行 ${cx.rows} 次：窗口来源 ${dist(cx.windowSources)}；预算来源 ${dist(cx.budgetSources)}`);
+  const budgets = Object.entries(cx.budgets)
+    .sort((a, b) => Number(a[0]) - Number(b[0]))
+    .map(([k, n]) => `${Math.floor(Number(k) / 1000)}k×${n}`)
+    .join(" ");
+  console.log(
+    `  预算分布 ${budgets || "—"}` +
+      (cx.meanBudgetToWindow === null
+        ? "；窗口全部未知，算不出预算 / 窗口比"
+        : `；窗口已知的行里预算 / 窗口均值 ${pct(cx.meanBudgetToWindow)}`),
+  );
+}
+console.log("");
+
+/**
  * 终止原因 × 包 —— 领域包的恢复策略（`DomainPack.recovery`）该填几，只能从这里读。
  * 老行没有 maxTurns 字段时按**当前** presets 推算分母并标 `~`：包护栏是会改的
  * （kicad 40 → 70），推算值只能当参考。plan 模式 turns 是各子任务之和，不算比值。

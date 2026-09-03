@@ -16,6 +16,8 @@
  * 触发：仅 `AGENT_MODEL_PROBE=1`。远程与 loopback 都不默认打——
  * 确定性 eval 的 mock 也在 loopback 上，自动探针会吃掉脚本队列。
  */
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import path from "node:path";
 import { inspectProviderEndpoint } from "./provider-config.js";
 
 export type CapabilitySource = "probe" | "name" | "sticky" | "assumed";
@@ -45,8 +47,172 @@ export const DEFAULT_PROBE_TTL_MS = 300_000;
 /** 进程内粘性结果：同一端点身份在 TTL 内不重复探针 */
 const stickyCache = new Map<string, EndpointCapabilities>();
 
+/** 清空进程内两张表（探针粘性 + 学到的窗口）；不碰磁盘文件、不改 store 配置 */
 export function clearCapabilityCache(): void {
   stickyCache.clear();
+  learnedWindows.clear();
+}
+
+// ---------------------------------------------------------------- 学到的上下文窗口
+
+/**
+ * 从一次真实的 context-overflow 400 学到的窗口（MEM-01 窗口 / 预算分离的第二级来源）。
+ *
+ * 为什么它比登记表（`model-windows.ts`）优先：登记表是"官方说的"，这条是**这台端点**
+ * 亲口说的——同名模型挂在不同兼容端点后面可以被配成不同窗口。为什么它比 env 低：
+ * 操作员显式写的 `AGENT_CONTEXT_WINDOW` 是有意为之，机器学到的数不该压过人。
+ *
+ * 粘性 + TTL（30 天）：窗口是模型的事实，不是会话状态，跨 run 跨进程都该记得；
+ * 但厂商会升窗口（Kimi K2→K3 从 256k 到 1M），所以不永久——过期就退回登记表 / unknown，
+ * 下一次 400 再学。**只存身份键（provider|model|origin）与数字，永不存 key。**
+ */
+export interface LearnedContextWindow {
+  windowTokens: number;
+  learnedAt: number;
+  /** 目前只有一种证据；留字段是为了以后能区分"探针量出来的"与"撞 400 学到的" */
+  evidence: "overflow_400";
+}
+
+export const DEFAULT_LEARNED_WINDOW_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+const learnedWindows = new Map<string, LearnedContextWindow>();
+/** 磁盘落点；null = 只在进程内记（注入 modelClient 的测试宿主缺省如此——仪器纪律） */
+let capabilityStoreFile: string | null = null;
+
+interface CapabilityStoreFileShape {
+  version: 1;
+  contextWindows: Record<string, LearnedContextWindow>;
+}
+
+/**
+ * 缺省落点：与台账 / 记忆 / 历史同一套约定——cwd 下的 `.agent-capabilities.json`，
+ * `AGENT_CAPABILITY_CACHE` 可改路径（绝对或相对 cwd）。
+ */
+export function capabilityStorePath(env: NodeJS.ProcessEnv = process.env, cwd = process.cwd()): string {
+  const override = env.AGENT_CAPABILITY_CACHE;
+  if (override && override.trim()) return path.resolve(cwd, override.trim());
+  return path.join(cwd, ".agent-capabilities.json");
+}
+
+/**
+ * 配置磁盘落点并同步装载已有内容进内存表。**永不抛**：文件坏了 / 读不到就当空表——
+ * 能力缓存是加速器不是准入闸门，它坏了不能把宿主拖死。
+ * `file: null` = 关掉落盘（只留内存表）。
+ * @returns 装载进来的条数（诊断用）
+ */
+export function configureCapabilityStore(opts: { file: string | null }): { loaded: number } {
+  capabilityStoreFile = opts.file;
+  if (!opts.file) return { loaded: 0 };
+  try {
+    const raw = readFileSync(opts.file, "utf8");
+    const parsed = JSON.parse(raw) as Partial<CapabilityStoreFileShape>;
+    const windows = parsed && typeof parsed === "object" ? parsed.contextWindows : undefined;
+    let loaded = 0;
+    if (windows && typeof windows === "object") {
+      for (const [key, value] of Object.entries(windows)) {
+        if (!value || typeof value !== "object") continue;
+        const tokens = Number((value as LearnedContextWindow).windowTokens);
+        const at = Number((value as LearnedContextWindow).learnedAt);
+        if (!Number.isInteger(tokens) || tokens < MIN_LEARNABLE_WINDOW || !Number.isFinite(at)) continue;
+        learnedWindows.set(key, { windowTokens: tokens, learnedAt: at, evidence: "overflow_400" });
+        loaded += 1;
+      }
+    }
+    return { loaded };
+  } catch {
+    return { loaded: 0 };
+  }
+}
+
+export function capabilityStoreFilePath(): string | null {
+  return capabilityStoreFile;
+}
+
+function persistCapabilityStore(): void {
+  if (!capabilityStoreFile) return;
+  try {
+    const shape: CapabilityStoreFileShape = { version: 1, contextWindows: Object.fromEntries(learnedWindows) };
+    mkdirSync(path.dirname(capabilityStoreFile), { recursive: true });
+    const tmp = `${capabilityStoreFile}.tmp`;
+    writeFileSync(tmp, `${JSON.stringify(shape, null, 2)}\n`, "utf8");
+    renameSync(tmp, capabilityStoreFile);
+  } catch {
+    // 落盘失败就当这次没记——下次 400 会再学；绝不让缓存把运行搞挂
+  }
+}
+
+/** 小于这个数的"窗口"不可信（没有模型的窗口小于 1k；报文里的数若这么小，多半解析到了别的字段） */
+const MIN_LEARNABLE_WINDOW = 1_024;
+
+/**
+ * 记下一个学到的窗口。非法值（非正整数 / 小于 1k）忽略并返回 null。
+ * 同身份重复学到同一个数也刷新时间戳（TTL 从最近一次证据起算）。
+ */
+export function learnContextWindow(
+  identity: EndpointIdentity,
+  windowTokens: number,
+  now = Date.now(),
+): LearnedContextWindow | null {
+  if (!Number.isInteger(windowTokens) || windowTokens < MIN_LEARNABLE_WINDOW) return null;
+  const entry: LearnedContextWindow = { windowTokens, learnedAt: now, evidence: "overflow_400" };
+  learnedWindows.set(endpointIdentityKey(identity), entry);
+  persistCapabilityStore();
+  return entry;
+}
+
+/** 读学到的窗口；过 TTL 视为不存在（并从内存表删掉，磁盘文件下次写入时随之清理） */
+export function getLearnedContextWindow(
+  identity: EndpointIdentity,
+  now = Date.now(),
+  ttlMs = DEFAULT_LEARNED_WINDOW_TTL_MS,
+): LearnedContextWindow | undefined {
+  const key = endpointIdentityKey(identity);
+  const hit = learnedWindows.get(key);
+  if (!hit) return undefined;
+  if (now - hit.learnedAt > ttlMs) {
+    learnedWindows.delete(key);
+    return undefined;
+  }
+  return hit;
+}
+
+/**
+ * 从 context-overflow 400 的报文里解析端点声明的窗口大小（学习钩子的输入）。
+ *
+ * 只认两种**已在真机 / SDK 上见过**的措辞，取的是"最大值"那个数而不是"你发了多少"：
+ *  - OpenAI / DeepSeek（含兼容路由把 JSON 整段塞进 message 的形状）：
+ *    「This model's maximum context length is N tokens. However, you requested …」→ N
+ *  - Anthropic：「prompt is too long: N tokens > M maximum」→ M
+ * 措辞对不上就返回 null——宁可不学，不能学错：学错的数会变成下一次运行的预算上限。
+ * 调用方应先用 `isContextOverflowError` 确认这确实是超长错误。
+ */
+export function parseContextWindowFromOverflowError(err: unknown): number | null {
+  const texts: string[] = [];
+  if (err && typeof err === "object") {
+    const message = (err as { message?: unknown }).message;
+    if (typeof message === "string") texts.push(message);
+    const nested = (err as { error?: { message?: unknown; error?: { message?: unknown } } }).error;
+    if (nested && typeof nested === "object") {
+      if (typeof nested.message === "string") texts.push(nested.message);
+      if (nested.error && typeof nested.error === "object" && typeof nested.error.message === "string") {
+        texts.push(nested.error.message);
+      }
+    }
+  } else if (typeof err === "string") {
+    texts.push(err);
+  }
+  for (const text of texts) {
+    const openai = /maximum context length is\s+(\d[\d,]*)\s+tokens/i.exec(text);
+    if (openai) return toWindow(openai[1]!);
+    const anthropic = /(\d[\d,]*)\s+tokens\s*>\s*(\d[\d,]*)\s+maximum/i.exec(text);
+    if (anthropic) return toWindow(anthropic[2]!);
+  }
+  return null;
+}
+
+function toWindow(digits: string): number | null {
+  const n = Number(digits.replace(/,/g, ""));
+  return Number.isInteger(n) && n >= MIN_LEARNABLE_WINDOW ? n : null;
 }
 
 export function endpointIdentityKey(id: EndpointIdentity): string {

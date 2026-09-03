@@ -130,6 +130,10 @@ interface LedgerExpectation {
   verify?: boolean;
   /** 逐轮裁决的获得路径（verifier.ts 的 VerdictRecovery），按顺序比对 */
   verificationRecoveries?: (string | null)[];
+  /** 台账 context.windowSource（MEM-01 窗口 / 预算分离）：env | learned | registry | unknown */
+  contextWindowSource?: string;
+  /** 台账 context.window（token 数；null = 未知） */
+  contextWindow?: number | null;
 }
 
 interface Expectation {
@@ -142,11 +146,26 @@ interface Expectation {
   occurrences?: { needle: string; atLeast: number }[];
   /** 工作目录下的产物：路径 → 精确内容 */
   files?: Record<string, string>;
+  /** 工作目录下的文件必须**包含**这些片段（内容带时间戳、逐字节比对不可行时用） */
+  filesContain?: Record<string, string[]>;
   /** 必须不存在的产物（圈禁类断言） */
   absentFiles?: string[];
   ledger?: LedgerExpectation;
-  /** 请求总条数。多一条少一条都是行为变了 */
+  /** 请求总条数（含 secondRun 的请求）。多一条少一条都是行为变了 */
   requestCount: number;
+}
+
+/**
+ * 同一场景里的**第二个进程**：同工作目录、同 mock（脚本追加进队列）。用来钉只有跨进程
+ * 才验得出的事——落盘到 cwd 的状态（学到的上下文窗口）被下一次启动读回。
+ * 它的输出单独断言（includes / excludes / exitCode）；台账与 requestCount 看整个场景的终态。
+ */
+interface SecondRun {
+  args: string[];
+  task: string;
+  env?: Record<string, string>;
+  scripts: MockTurnScript[];
+  expect: { exitCode: number; includes?: string[]; excludes?: string[] };
 }
 
 interface Scenario {
@@ -164,6 +183,7 @@ interface Scenario {
   seed?: Record<string, string>;
   scripts: MockTurnScript[];
   expect: Expectation;
+  secondRun?: SecondRun;
 }
 
 // ---------------------------------------------------------------- 场景
@@ -482,6 +502,51 @@ const scenarios: Scenario[] = [
   },
 
   {
+    id: "context-window-learned-across-runs",
+    title: "撞 400 学到窗口 → 落盘 → 下一个进程按 learned 解析",
+    guards:
+      "MEM-01 窗口 / 预算分离：mock-model 不在登记表，第一跑启动行必须写「窗口未知」；撞 context_overflow" +
+      "（报文 > 200000 maximum）除了反应式压缩还要把 200000 记进 .agent-capabilities.json；第二跑是**新进程**，" +
+      "启动行必须写「窗口 200k（来源：learned）」且默认预算 150k 不被夹（200000 − 4096 − 4096 = 191,808 ≥ 150k）；" +
+      "台账 context.windowSource=learned。请求 5 + 2 = 7",
+    args: ["--yes"],
+    env: { AGENT_MAX_RETRIES: "0" },
+    task: "write three notes then finish",
+    scripts: [
+      turn(tu("write_file", { path: "n1.txt", content: "one\n" })),
+      turn(tu("write_file", { path: "n2.txt", content: "two\n" })),
+      turn(tu("write_file", { path: "n3.txt", content: "three\n" })),
+      faultTurn({ type: "context_overflow" }),
+      turn(finishTask("completed", "three notes written", { artifacts: ["n1.txt", "n2.txt", "n3.txt"] })),
+    ],
+    expect: {
+      exitCode: 0,
+      includes: ["窗口未知", "context compacted (reactive", "学到窗口 200k", "completed"],
+      excludes: ["来源：learned", "context_overflow"],
+      files: { "n1.txt": "one\n", "n2.txt": "two\n", "n3.txt": "three\n", "n4.txt": "four\n" },
+      // 落盘格式：身份键 provider|model|origin（不含 key）+ 学到的数；时间戳不可逐字节比对，只查片段
+      filesContain: {
+        ".agent-capabilities.json": ['"windowTokens": 200000', "anthropic|mock-model|http://127.0.0.1:", '"evidence": "overflow_400"'],
+      },
+      ledger: { stopReason: "completed", contextWindowSource: "learned", contextWindow: 200000 },
+      requestCount: 7,
+    },
+    secondRun: {
+      args: ["--yes"],
+      task: "write one more note",
+      scripts: [
+        turn(tu("write_file", { path: "n4.txt", content: "four\n" })),
+        turn(finishTask("completed", "one more note", { artifacts: ["n4.txt"] })),
+      ],
+      expect: {
+        exitCode: 0,
+        includes: ["上下文：预算 150k / 窗口 200k（来源：learned）", "completed"],
+        excludes: ["窗口未知", "夹紧"],
+      },
+    },
+  },
+
+  {
     id: "plan-two-subtasks-serial",
     title: "freeform 计划：两个子任务串行执行并逐个核查",
     guards:
@@ -617,7 +682,11 @@ interface ProcessOutcome {
   durationMs: number;
 }
 
-function runCli(scenario: Scenario, workdir: string, mock: MockProviderHandle): Promise<ProcessOutcome> {
+function runCli(
+  scenario: Pick<Scenario, "args" | "task" | "env" | "stdin">,
+  workdir: string,
+  mock: MockProviderHandle,
+): Promise<ProcessOutcome> {
   const args = [CLI_ENTRY, "run", ...scenario.args, scenario.task];
   const startedAt = Date.now();
   return new Promise((resolve) => {
@@ -706,40 +775,60 @@ function countOccurrences(haystack: string, needle: string): number {
   }
 }
 
-async function evaluate(
-  scenario: Scenario,
-  workdir: string,
-  mock: MockProviderHandle,
+/** 一个进程的退出码 / 输出片段断言；第二个进程复用同一套（名字带前缀以便区分） */
+function processChecks(
+  label: string,
   outcome: ProcessOutcome,
-): Promise<Check[]> {
+  expect: { exitCode: number; includes?: string[]; excludes?: string[] },
+): Check[] {
   const checks: Check[] = [];
   const out = stripAnsi(`${outcome.stdout}\n${outcome.stderr}`);
-  const expect = scenario.expect;
-
   checks.push({
-    name: "进程正常结束（未超时）",
+    name: `${label}进程正常结束（未超时）`,
     ok: !outcome.timedOut,
     ...(outcome.timedOut ? { detail: `超过 ${SCENARIO_TIMEOUT_MS}ms 被杀` } : {}),
   });
   checks.push({
-    name: `退出码 = ${expect.exitCode}`,
+    name: `${label}退出码 = ${expect.exitCode}`,
     ok: outcome.exitCode === expect.exitCode,
     ...(outcome.exitCode === expect.exitCode ? {} : { detail: `实测 ${outcome.exitCode}` }),
   });
-
   for (const needle of expect.includes ?? []) {
     checks.push({
-      name: `输出含「${needle}」`,
+      name: `${label}输出含「${needle}」`,
       ok: out.includes(needle),
       ...(out.includes(needle) ? {} : { detail: "未出现" }),
     });
   }
   for (const needle of expect.excludes ?? []) {
     checks.push({
-      name: `输出不含「${needle}」`,
+      name: `${label}输出不含「${needle}」`,
       ok: !out.includes(needle),
       ...(out.includes(needle) ? { detail: "出现了" } : {}),
     });
+  }
+  return checks;
+}
+
+async function evaluate(
+  scenario: Scenario,
+  workdir: string,
+  mock: MockProviderHandle,
+  outcome: ProcessOutcome,
+  secondOutcome?: ProcessOutcome,
+): Promise<Check[]> {
+  const checks: Check[] = [];
+  const out = stripAnsi(`${outcome.stdout}\n${outcome.stderr}`);
+  const expect = scenario.expect;
+
+  checks.push(...processChecks("", outcome, expect));
+  if (scenario.secondRun) {
+    checks.push({
+      name: "第二个进程跑了",
+      ok: secondOutcome !== undefined,
+      ...(secondOutcome ? {} : { detail: "没有第二次执行" }),
+    });
+    if (secondOutcome) checks.push(...processChecks("第二跑：", secondOutcome, scenario.secondRun.expect));
   }
   for (const { needle, atLeast } of expect.occurrences ?? []) {
     const n = countOccurrences(out, needle);
@@ -758,6 +847,17 @@ async function evaluate(
       ok,
       ...(ok ? {} : { detail: actual === null ? "文件不存在" : `实测 ${JSON.stringify(actual)}` }),
     });
+  }
+  for (const [rel, needles] of Object.entries(expect.filesContain ?? {})) {
+    const actual = await readIfExists(path.join(workdir, rel));
+    for (const needle of needles) {
+      const ok = actual !== null && actual.includes(needle);
+      checks.push({
+        name: `产物 ${rel} 含「${needle}」`,
+        ok,
+        ...(ok ? {} : { detail: actual === null ? "文件不存在" : `实测 ${JSON.stringify(actual.slice(0, 300))}` }),
+      });
+    }
   }
   for (const rel of expect.absentFiles ?? []) {
     const actual = await readIfExists(path.resolve(workdir, rel));
@@ -783,6 +883,9 @@ async function evaluate(
       if (e.finalPassed !== undefined) scalar.push(["finalPassed", e.finalPassed, entry.finalPassed]);
       if (e.mode !== undefined) scalar.push(["mode", e.mode, entry.mode]);
       if (e.verify !== undefined) scalar.push(["verify", e.verify, entry.verify]);
+      const ctx = (entry.context ?? {}) as { windowSource?: unknown; window?: unknown };
+      if (e.contextWindowSource !== undefined) scalar.push(["context.windowSource", e.contextWindowSource, ctx.windowSource]);
+      if (e.contextWindow !== undefined) scalar.push(["context.window", e.contextWindow, ctx.window]);
       for (const [field, want, got] of scalar) {
         checks.push({
           name: `台账 ${field} = ${JSON.stringify(want)}`,
@@ -911,15 +1014,24 @@ async function main(): Promise<void> {
     }
     const mock = await startMockProvider({ scripts: scenario.scripts });
     let outcome: ProcessOutcome;
+    let secondOutcome: ProcessOutcome | undefined;
     try {
       outcome = await runCli(scenario, workdir, mock);
+      if (scenario.secondRun) {
+        // 第二个进程：脚本追加进同一个队列，工作目录不动——要钉的正是"落盘的东西被下一次启动读回"
+        for (const script of scenario.secondRun.scripts) mock.pushScript(script);
+        secondOutcome = await runCli(scenario.secondRun, workdir, mock);
+      }
     } finally {
       // 先关端点再判定：判定要读 requestLog，但服务不能留着不关
       await mock.close();
     }
-    const checks = await evaluate(scenario, workdir, mock, outcome);
+    const checks = await evaluate(scenario, workdir, mock, outcome, secondOutcome);
     const passed = checks.every((c) => c.ok);
-    const tail = stripAnsi(`${outcome.stdout}\n${outcome.stderr}`).trimEnd().split("\n").slice(-40).join("\n");
+    const tail = stripAnsi(
+      `${outcome.stdout}\n${outcome.stderr}` +
+        (secondOutcome ? `\n--- second run ---\n${secondOutcome.stdout}\n${secondOutcome.stderr}` : ""),
+    ).trimEnd().split("\n").slice(-40).join("\n");
     reports.push({
       id: scenario.id,
       title: scenario.title,

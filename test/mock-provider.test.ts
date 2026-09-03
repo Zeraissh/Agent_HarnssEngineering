@@ -15,9 +15,11 @@ import { afterEach, describe, expect, it } from "vitest";
 import Anthropic from "@anthropic-ai/sdk";
 import type { Message, TextBlock, ToolUseBlock } from "@anthropic-ai/sdk/resources/messages";
 import { AnthropicModelClient, isContextOverflowError, isTransientApiError } from "../src/model-client.js";
+import { parseContextWindowFromOverflowError } from "../src/model-capability.js";
 import { OpenAIModelClient } from "../src/model-client-openai.js";
 import {
   anthropicSseEvents,
+  contextOverflowBody,
   openaiSseChunks,
   resolveTurn,
   startMockProvider,
@@ -359,6 +361,28 @@ describe("故障注入：坏得也要对", () => {
     expect(isTransientApiError(errO)).toBe(false);
     // 故障消费脚本：下一条请求才是"重发"
     expect(anthropic.remainingScripts()).toBe(0);
+  });
+
+  /**
+   * MEM-01 窗口 / 预算分离：学习钩子读的是报文里"最大值"那个数。两条 wire 经真实 SDK 包装后
+   * 都要能解析出来；`windowTokens` 可替换那个数（缺省 Anthropic 200000 / OpenAI 128000 不动，
+   * 与被逐字锁住的真机形状一致）。
+   */
+  it("context_overflow 的报文经真实 SDK 包装后仍能解析出窗口；windowTokens 可指定", async () => {
+    const anthropic = await mock({ scripts: [{ content: [{ type: "text", text: "x" }], fault: { type: "context_overflow" } }] });
+    expect(parseContextWindowFromOverflowError(await anthropicClient(anthropic).send(req).catch((e: unknown) => e))).toBe(200_000);
+    const openai = await mock({ scripts: [{ content: [{ type: "text", text: "x" }], fault: { type: "context_overflow" } }] });
+    expect(parseContextWindowFromOverflowError(await openaiClient(openai).send(req).catch((e: unknown) => e))).toBe(128_000);
+
+    const custom = await mock({
+      scripts: [{ content: [{ type: "text", text: "x" }], fault: { type: "context_overflow", windowTokens: 1_048_576 } }],
+    });
+    const err = await anthropicClient(custom).send(req).catch((e: unknown) => e);
+    expect(isContextOverflowError(err)).toBe(true);
+    expect(parseContextWindowFromOverflowError(err)).toBe(1_048_576);
+    expect(contextOverflowBody("openai", 1_048_576)).toMatchObject({
+      error: { message: expect.stringContaining("maximum context length is 1048576 tokens"), code: "context_length_exceeded" },
+    });
   });
 
   it("cut_stream：message_start 之后断流 → 调用失败，不会静默变成空成功", async () => {

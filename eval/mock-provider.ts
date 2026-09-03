@@ -33,8 +33,10 @@ export type MockFault =
    * 上下文超长（MEM-01 Phase C 反应式压缩的触发器）。两条 wire 各按真端点的形状回 400：
    * Anthropic「prompt is too long: N tokens > M maximum」；OpenAI `code: context_length_exceeded`。
    * 它描述的是"这一次请求装不下"，所以**消费**脚本（下一条请求才是重发）。
+   * `windowTokens` = 报文里端点声明的窗口 M / N（缺省 Anthropic 200000、OpenAI 128000，
+   * 与被逐字锁住的真机形状一致）——学习钩子（`parseContextWindowFromOverflowError`）读的就是它。
    */
-  | { type: "context_overflow" };
+  | { type: "context_overflow"; windowTokens?: number };
 
 export type MockContentBlock =
   | { type: "text"; text: string }
@@ -280,26 +282,35 @@ const STATUS_ERROR_TYPES: Record<number, string> = {
   529: "overloaded_error",
 };
 
-/** 两条 wire 的"上下文超长"400 报文——形状照抄真端点，不是自己发明的 */
-export function contextOverflowBody(wire: "anthropic" | "openai"): Record<string, unknown> {
-  return wire === "anthropic"
-    ? {
-        type: "error",
-        error: {
-          type: "invalid_request_error",
-          message: "prompt is too long: 213462 tokens > 200000 maximum",
-        },
-      }
-    : {
-        error: {
-          message:
-            "This model's maximum context length is 128000 tokens. However, your messages resulted in 131072 tokens. " +
-            "Please reduce the length of the messages.",
-          type: "invalid_request_error",
-          param: "messages",
-          code: "context_length_exceeded",
-        },
-      };
+/**
+ * 两条 wire 的"上下文超长"400 报文——形状照抄真端点，不是自己发明的。
+ * `windowTokens` 只替换"最大值"那个数；"你发了多少"固定为最大值 + 3072，保持超长的语义。
+ */
+export function contextOverflowBody(
+  wire: "anthropic" | "openai",
+  windowTokens?: number,
+): Record<string, unknown> {
+  if (wire === "anthropic") {
+    const max = windowTokens ?? 200_000;
+    return {
+      type: "error",
+      error: {
+        type: "invalid_request_error",
+        message: `prompt is too long: ${windowTokens === undefined ? 213_462 : max + 3072} tokens > ${max} maximum`,
+      },
+    };
+  }
+  const max = windowTokens ?? 128_000;
+  return {
+    error: {
+      message:
+        `This model's maximum context length is ${max} tokens. However, your messages resulted in ` +
+        `${windowTokens === undefined ? 131_072 : max + 3072} tokens. Please reduce the length of the messages.`,
+      type: "invalid_request_error",
+      param: "messages",
+      code: "context_length_exceeded",
+    },
+  };
 }
 
 function lowercaseHeaders(headers: Record<string, string> | undefined): Record<string, string> {
@@ -455,7 +466,7 @@ export async function startMockProvider(opts: MockProviderOptions = {}): Promise
       return;
     }
     if (fault.type === "context_overflow") {
-      respondStatus(res, { type: "status", status: 400, body: contextOverflowBody(wire) });
+      respondStatus(res, { type: "status", status: 400, body: contextOverflowBody(wire, fault.windowTokens) });
       return;
     }
 

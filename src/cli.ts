@@ -54,7 +54,12 @@
  *   AGENT_READ_ROOTS    可选，额外只读根（分号/路径分隔符分隔的绝对路径）：
  *                       read_file 可读取这些目录（写类工具不受益）。用于工作区外的
  *                       领域素材库（如 KiCad 官方符号/封装库）
- *   AGENT_CONTEXT_LIMIT 可选，上下文 token 上限（触发 compact），默认 150000
+ *   AGENT_CONTEXT_LIMIT 可选，上下文 token **预算**（触发 compact 的水位分母），默认 150000。
+ *                       与模型窗口是两个概念：窗口按 AGENT_CONTEXT_WINDOW > 撞 400 学到的 >
+ *                       登记表 > 未知 解析，预算会被夹在 窗口 − maxTokens − 边际 之内（夹紧有告警）。
+ *                       默认不随窗口抬高——每轮成本与时延随上下文线性增长，抬预算是委托方的决定
+ *   AGENT_CONTEXT_WINDOW 可选，显式声明模型上下文窗口（token 数），压过学到的与登记表的值
+ *   AGENT_CAPABILITY_CACHE 可选，学到的窗口等端点能力的落盘路径，默认 <cwd>/.agent-capabilities.json
  *   AGENT_TOOL_RESULT_MAX_CHARS 可选，单个 tool_result 进正史前的字符上限，默认 40000（≥1000）。
  *                       MCP 工具返回无上限，这是兜底；截断标记会告诉模型如何分页
  *   AGENT_COMPACT_SUMMARY=1 可选，开启 MEM-01 Phase B LLM 摘要（默认关；CI/eval 勿开）
@@ -83,7 +88,21 @@ import {
   formatStaticDoctor,
   parseCliArgs,
 } from "./cli-args.js";
-import { AgentLoop, DEFAULT_MAX_TURNS } from "./loop.js";
+import { AgentLoop, DEFAULT_MAX_TOKENS, DEFAULT_MAX_TURNS } from "./loop.js";
+import {
+  describeContextPlan,
+  formatTokensK,
+  planContextBudget,
+  readContextLimitEnv,
+  resolveContextWindow,
+  type ContextPlan,
+} from "./context-window.js";
+import {
+  capabilityStorePath,
+  configureCapabilityStore,
+  learnContextWindow,
+  type EndpointIdentity,
+} from "./model-capability.js";
 import { connectMcpServers, loadMcpConfig } from "./mcp.js";
 import { createMemoryTools, MemoryStore } from "./memory.js";
 import { AUTO_CONCURRENCY_CAP, plannedStopReason, planParallelWidth, runPlanned, runVerified } from "./orchestrate.js";
@@ -140,7 +159,9 @@ function describeCompaction(event: Extract<TurnEvent, { type: "compaction" }>): 
     `dropped ${event.droppedBlocks} blocks` +
     (event.collapsedTurns ? `, collapsed ${event.collapsedTurns} earlier turns` : "") +
     (event.ledgerEntries != null ? `, ledger ${event.ledgerEntries} facts` : "") +
-    (event.summaryApplied ? ", LLM summary merged" : "")
+    (event.summaryApplied ? ", LLM summary merged" : "") +
+    // 那条 400 顺带说出了窗口大小——记下来了，下一次同端点的运行就按它算预算上限
+    (event.learnedWindow ? `; 学到窗口 ${formatTokensK(event.learnedWindow)}（下次运行生效）` : "")
   );
 }
 
@@ -172,6 +193,9 @@ async function main(): Promise<void> {
 
   // .env 被残留环境变量压掉时大声说出来（可能意味着凭据发往另一家端点）
   warnEnvConflicts();
+
+  // 端点能力缓存（学到的上下文窗口）：与台账 / 记忆同一套 cwd 约定；坏了就当空表，不挡启动
+  configureCapabilityStore({ file: capabilityStorePath() });
 
   const autoYes = parsedArgs.autoYes;
   const withPlan = parsedArgs.plan;
@@ -276,9 +300,49 @@ async function main(): Promise<void> {
   }
 
   // 护栏参数优先级：显式 env > 领域包默认 > 全局默认
-  const contextTokenLimit = process.env.AGENT_CONTEXT_LIMIT
-    ? Number(process.env.AGENT_CONTEXT_LIMIT)
-    : pack?.guardrails?.contextTokenLimit;
+  const maxTokens = process.env.AGENT_MAX_TOKENS
+    ? Number(process.env.AGENT_MAX_TOKENS)
+    : pack?.guardrails?.maxTokens;
+  /**
+   * 执行者端点身份：窗口按 provider|model|origin 记（学到的窗口、探针粘性都用它做键）。
+   * 不含 key——身份是给缓存与降级链认端点用的，不是凭据。
+   */
+  const executorIdentity: EndpointIdentity = {
+    provider,
+    model,
+    ...(process.env.ANTHROPIC_BASE_URL || process.env.OPENAI_BASE_URL
+      ? {
+          baseURL:
+            provider === "openai"
+              ? process.env.OPENAI_BASE_URL
+              : process.env.ANTHROPIC_BASE_URL,
+        }
+      : {}),
+  };
+  /**
+   * 上下文窗口（事实）与预算（策略）分开解析（MEM-01）。窗口 env > learned > registry > unknown；
+   * 预算 env > 包 > 默认 150k，再夹进 窗口 − maxTokens − 边际。非法 env 当场退出（口径同其它护栏）。
+   */
+  const contextPlanFor = (p?: DomainPack, tokens?: number): ContextPlan => {
+    const windowInfo = resolveContextWindow(executorIdentity);
+    return planContextBudget({
+      window: windowInfo.window,
+      windowSource: windowInfo.windowSource,
+      maxTokens: tokens ?? maxTokens ?? DEFAULT_MAX_TOKENS,
+      ...(readContextLimitEnv() !== undefined ? { envLimit: readContextLimitEnv()! } : {}),
+      ...(p?.guardrails?.contextTokenLimit !== undefined ? { packLimit: p.guardrails.contextTokenLimit } : {}),
+    });
+  };
+  let contextPlan: ContextPlan;
+  try {
+    contextPlan = contextPlanFor(pack);
+  } catch (err) {
+    console.error(c.red(err instanceof Error ? err.message : String(err)));
+    process.exit(1);
+  }
+  const contextTokenLimit = contextPlan.budget;
+  console.log(c.dim(describeContextPlan(contextPlan)));
+  if (contextPlan.warning) console.log(c.yellow(`⚠ ${contextPlan.warning}`));
   const compactSummaryOn = (() => {
     const v = process.env.AGENT_COMPACT_SUMMARY?.trim().toLowerCase();
     return v === "1" || v === "true" || v === "yes" || v === "on";
@@ -293,9 +357,6 @@ async function main(): Promise<void> {
     console.error(c.red(`AGENT_COMPACT_SUMMARY_MAX_TOKENS "${process.env.AGENT_COMPACT_SUMMARY_MAX_TOKENS}" 无效：需为 ≥64 的整数`));
     process.exit(1);
   }
-  const maxTokens = process.env.AGENT_MAX_TOKENS
-    ? Number(process.env.AGENT_MAX_TOKENS)
-    : pack?.guardrails?.maxTokens;
   const maxTurns = pack?.guardrails?.maxTurns;
   const positiveEnv = (name: string): number | undefined => {
     const raw = process.env[name];
@@ -422,18 +483,7 @@ async function main(): Promise<void> {
     {
       name: model,
       client: resolvedClient,
-      identity: {
-        provider,
-        model,
-        ...(process.env.ANTHROPIC_BASE_URL || process.env.OPENAI_BASE_URL
-          ? {
-              baseURL:
-                provider === "openai"
-                  ? process.env.OPENAI_BASE_URL
-                  : process.env.ANTHROPIC_BASE_URL,
-            }
-          : {}),
-      },
+      identity: executorIdentity,
     },
     process.env,
     onAnyFallback,
@@ -694,6 +744,14 @@ async function main(): Promise<void> {
     compat,
     ...(effort ? { effort } : {}),
     contextTokenLimit,
+    /**
+     * 窗口学习钩子：loop 撞 400 学到的窗口记到执行者端点名下（provider|model|origin），
+     * 落盘到 .agent-capabilities.json——下一次同端点的运行启动行就会写「来源：learned」。
+     * 独立角色模型（verifier / planner）的 loop 由编排层剥掉这个钩子，它们的 400 不算执行者的。
+     */
+    onContextWindowLearned: (windowTokens) => {
+      learnContextWindow(executorIdentity, windowTokens);
+    },
     maxTokens,
     ...(maxTurns !== undefined ? { maxTurns } : {}),
     ...(maxTotalTurns !== undefined ? { maxTotalTurns } : {}),
@@ -952,6 +1010,13 @@ async function main(): Promise<void> {
             ...(p?.guardrails?.maxTokens !== undefined && !process.env.AGENT_MAX_TOKENS
               ? { maxTokens: p.guardrails.maxTokens }
               : {}),
+            // 子任务的包可能改 maxTokens / 声明自己的预算——预算上限随之重算（窗口不变）
+            contextTokenLimit: contextPlanFor(
+              p,
+              p?.guardrails?.maxTokens !== undefined && !process.env.AGENT_MAX_TOKENS
+                ? p.guardrails.maxTokens
+                : undefined,
+            ).budget,
             // 逐子任务按各自的包取恢复策略（与核查预算同款：s1(coding) 与 s2(debug)
             // 的"进展续跑该给几轮"可以不同）；完成门关着时不装
             ...(config.requireTerminalTool ? { recovery: recoveryFor(p).policy } : {}),
@@ -1152,6 +1217,13 @@ async function main(): Promise<void> {
       recoveryPolicy: taskCompletionEnabled ? recoveryFor(pack).policy : null,
       recovery: ledgerRecovery,
       compaction: ledgerCompaction,
+      // 窗口 / 预算各带来源：事后才能回答"这次运行的压缩阈值到底是谁定的、离窗口多远"
+      context: {
+        window: contextPlan.window,
+        windowSource: contextPlan.windowSource,
+        budget: contextPlan.budget,
+        budgetSource: contextPlan.budgetSource,
+      },
     }),
   );
 

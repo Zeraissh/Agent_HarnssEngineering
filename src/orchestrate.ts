@@ -20,6 +20,18 @@ import { isTransientApiError } from "./model-client.js";
 import type { DomainPack } from "./presets.js";
 import type { AgentConfig, AgentRunResult, AggregateUsage, ModelClient, TurnEvent } from "./types.js";
 
+/**
+ * 去掉窗口学习钩子：宿主把它绑在**执行者**的端点身份上（`learnContextWindow(identity, N)`）。
+ * 角色模型（verifier / planner）走另一个端点时若沿用同一个钩子，它撞的 400 会被记到
+ * 执行者名下——下一次运行拿着别人的窗口算预算上限。没有独立角色模型时不剥：那是同一个端点。
+ */
+export function withoutContextWindowLearner(cfg: AgentConfig): AgentConfig {
+  if (!cfg.onContextWindowLearned) return cfg;
+  const { onContextWindowLearned: _dropped, ...rest } = cfg;
+  void _dropped;
+  return rest;
+}
+
 export interface VerifiedRunOptions {
   /**
    * 中止信号。
@@ -288,10 +300,13 @@ async function runVerifierWithEvents(
 ): Promise<VerifyOutcome> {
   const executorReport = reportFromResult(main) || "(执行者没有留下文字或结构化报告)";
   const verifierClient = opts.verifierModel?.client ?? model;
-  const verifierCfg =
-    opts.verifierModel && opts.verifierModel.compat !== undefined
-      ? { ...cfg, compat: opts.verifierModel.compat }
-      : cfg;
+  const verifierCfg = opts.verifierModel
+    ? {
+        // 独立核查模型 = 另一个端点：它撞的 400 说的是它自己的窗口，不能记到执行者身上
+        ...withoutContextWindowLearner(cfg),
+        ...(opts.verifierModel.compat !== undefined ? { compat: opts.verifierModel.compat } : {}),
+      }
+    : cfg;
   // verifier 的过程事件（工具调用/复核）经 onEvent 下沉透出，宿主可见其独立核查过程；
   // 但压掉 verifier 的最终 assistant_text（裁决 JSON 是内部契约，不直接展示给用户）。
   const outcome = await runVerifier(
@@ -580,10 +595,13 @@ export async function runPlanned(
     planOutcome = { plan: opts.plan, usage: ZERO_USAGE, raw: "(host-provided plan)" };
   } else {
     const plannerClient = opts.plannerModel?.client ?? model;
-    const plannerCfg =
-      opts.plannerModel && opts.plannerModel.compat !== undefined
-        ? { ...baseCfg, compat: opts.plannerModel.compat }
-        : baseCfg;
+    const plannerCfg = opts.plannerModel
+      ? {
+          // 同 verifier：独立 planner 端点学到的窗口是它自己的，不归执行者
+          ...withoutContextWindowLearner(baseCfg),
+          ...(opts.plannerModel.compat !== undefined ? { compat: opts.plannerModel.compat } : {}),
+        }
+      : baseCfg;
     clarification = await runClarificationGate(
       plannerCfg,
       plannerClient,

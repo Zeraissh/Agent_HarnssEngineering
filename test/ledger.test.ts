@@ -357,6 +357,57 @@ describe("上下文压缩计数（compaction）", () => {
   });
 });
 
+/**
+ * MEM-01 窗口 / 预算分离：台账行记窗口与预算各带来源。150k 预算在 1M 窗口上压了三个月
+ * 没人发现，正是因为没有一处把这两个数并排放着——这里锁的是"两个数 + 两个来源都在行里"。
+ */
+describe("上下文窗口 / 预算（context）", () => {
+  it("buildLedgerEntry：四字段照录；宿主漏传 = unknown / null，不许画成某个数；非法来源归 unknown / null", () => {
+    const e = buildLedgerEntry({
+      ...base,
+      context: { window: 1_048_576, windowSource: "learned", budget: 150_000, budgetSource: "default" },
+    });
+    expect(e.context).toEqual({ window: 1_048_576, windowSource: "learned", budget: 150_000, budgetSource: "default" });
+    expect(buildLedgerEntry(base).context).toEqual({ window: null, windowSource: "unknown", budget: null, budgetSource: null });
+    expect(
+      buildLedgerEntry({ ...base, context: { window: -5, windowSource: "guess", budget: 0, budgetSource: "magic" } }).context,
+    ).toEqual({ window: null, windowSource: "unknown", budget: null, budgetSource: null });
+  });
+
+  it("老行（无 context 字段）仍可读，且不进分母——未知不是零", () => {
+    const legacy = JSON.parse(JSON.stringify(buildLedgerEntry(base))) as RunLedgerEntry;
+    delete (legacy as Partial<RunLedgerEntry>).context;
+    const s = summarizeLedger([legacy]);
+    expect(s.runs).toBe(1);
+    expect(s.context.rows).toBe(0);
+    expect(s.context.meanBudgetToWindow).toBeNull();
+  });
+
+  it("summarizeLedger.context：窗口来源 / 预算来源直方图、预算分桶、窗口已知行的预算 / 窗口均值", () => {
+    const rows = [
+      buildLedgerEntry({ ...base, context: { window: 1_048_576, windowSource: "registry", budget: 150_000, budgetSource: "default" } }),
+      buildLedgerEntry({ ...base, context: { window: 1_048_576, windowSource: "learned", budget: 524_288, budgetSource: "run" } }),
+      buildLedgerEntry({ ...base, context: { window: null, windowSource: "unknown", budget: 150_000, budgetSource: "default" } }),
+      buildLedgerEntry({ ...base, context: { window: 128_000, windowSource: "env", budget: 59_904, budgetSource: "env" } }),
+    ];
+    const s = summarizeLedger(rows);
+    expect(s.context.rows).toBe(4);
+    expect(s.context.windowSources).toEqual({ env: 1, learned: 1, registry: 1, unknown: 1 });
+    expect(s.context.budgetSources).toEqual({ run: 1, env: 1, pack: 0, default: 2, unknown: 0 });
+    expect(s.context.budgets).toEqual({ "150000": 2, "524288": 1, "59904": 1 });
+    // 三行窗口已知：150000/1048576 + 524288/1048576 + 59904/128000，均值 ≈ 0.370
+    expect(s.context.meanBudgetToWindow).toBeCloseTo((150_000 / 1_048_576 + 524_288 / 1_048_576 + 59_904 / 128_000) / 3, 6);
+  });
+
+  it("CLI 写入口带 context，读数器把分布印出来（源码锁：漏接一处这里就红）", () => {
+    const cli = readFileSync(join(__dirname, "..", "src", "cli.ts"), "utf-8");
+    const report = readFileSync(join(__dirname, "..", "eval", "ledger-report.ts"), "utf-8");
+    expect(cli).toMatch(/context:\s*\{\s*\n\s*window:\s*contextPlan\.window,\s*\n\s*windowSource:\s*contextPlan\.windowSource,\s*\n\s*budget:\s*contextPlan\.budget,\s*\n\s*budgetSource:\s*contextPlan\.budgetSource,/);
+    expect(report).toMatch(/s\.context/);
+    expect(report).toMatch(/windowSources[\s\S]{0,300}budgetSources/);
+  });
+});
+
 describe("appendRunLedger：仪器坏了不能影响被测对象", () => {
   it("正常路径写成一行 JSONL", async () => {
     const dir = await mkdtemp(join(tmpdir(), "ledger-"));
