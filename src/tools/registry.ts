@@ -130,6 +130,20 @@ export class ToolExecutor {
     signal: AbortSignal,
     approve: ApprovalFn,
   ): Promise<ToolResult> {
+    /**
+     * 中止后一个块都不再评估——尤其不再**请求审批**。
+     *
+     * 真机现场（2026-09-03，Web 宿主）：一轮里 5 个串行 write_file，人在第一个
+     * 审批卡上按了停止。宿主把当时挂起的那一个 deny 掉，可下一个块照样走到审批门，
+     * 又挂出一张新卡——没人会给一个已经叫停的运行放行，于是 run 永远停在
+     * running / pendingApprovals=1，每按一次停止只解开一个。停止按钮不能停，
+     * 比没有更糟。中止位在块与块之间必须先查，审批门之后的那次检查只管
+     * "等审批期间被中止"这一形态。
+     */
+    if (signal.aborted) {
+      return { content: `Tool "${block.name}" aborted before execution.`, isError: true };
+    }
+
     const tool = this.registry.get(block.name);
     if (!tool) {
       /**

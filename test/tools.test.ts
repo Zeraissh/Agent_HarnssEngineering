@@ -2,12 +2,12 @@ import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { ToolRegistry } from "../src/tools/registry.js";
+import { ToolExecutor, ToolRegistry } from "../src/tools/registry.js";
 import { credentialLikeName, resolveInWorkdir, resolveReadable, truncate } from "../src/tools/fs-util.js";
 import { readFileTool } from "../src/tools/read-file.js";
 import { writeFileTool } from "../src/tools/write-file.js";
 import { SHELL_DESC, bashTool, sanitizeChildEnv } from "../src/tools/bash.js";
-import { makeTool } from "./helpers.js";
+import { makeTool, toolUseBlock } from "./helpers.js";
 
 let workdir: string;
 const ctx = (toolUseId = "tu_test") => ({
@@ -256,6 +256,60 @@ describe("ToolRegistry", () => {
     const reg = new ToolRegistry();
     reg.register(makeTool({ name: "dup" }));
     expect(() => reg.register(makeTool({ name: "dup" }))).toThrow(/already registered/);
+  });
+});
+
+describe("ToolExecutor 中止语义", () => {
+  /**
+   * 真机现场（2026-09-03，Web 宿主 + deepseek-v4-flash）：一轮里 5 个串行 write_file，
+   * 人在第一张审批卡上按停止 → 宿主 deny 掉挂起的那一个，可第二个块照样走到审批门，
+   * 再挂一张卡，run 停在 running/pendingApprovals=1。修前这条测试里 approve 会被叫两次。
+   */
+  it("中止后串行的后续块不再请求审批，每个 tool_use 仍各有一条 tool_result", async () => {
+    const reg = new ToolRegistry();
+    const ran: string[] = [];
+    for (const name of ["first", "second", "third"]) {
+      reg.register(makeTool({
+        name, permission: "ask", parallelSafe: false,
+        execute: async () => { ran.push(name); return { content: `${name} ok` }; },
+      }));
+    }
+    const ac = new AbortController();
+    const approvals: string[] = [];
+    const executor = new ToolExecutor(reg, workdir);
+    const results = await executor.executeAll(
+      [toolUseBlock("tu_1", "first", {}), toolUseBlock("tu_2", "second", {}), toolUseBlock("tu_3", "third", {})],
+      ac.signal,
+      async (block) => {
+        approvals.push(block.name);
+        // 宿主的停止路径：先立中止位，再把当时挂起的审批 deny 掉
+        ac.abort();
+        return { decision: "deny", reason: "委托方已停止这次运行" };
+      },
+    );
+    expect(approvals, "已中止的运行不该再向人要一次授权").toEqual(["first"]);
+    expect(ran).toEqual([]);
+    // API 硬约束：每个 tool_use 有且仅有一个 tool_result，顺序不变
+    expect(results.map((r) => r.tool_use_id)).toEqual(["tu_1", "tu_2", "tu_3"]);
+    expect(results.every((r) => r.is_error)).toBe(true);
+    expect(String(results[0]!.content)).toMatch(/denied permission/);
+    expect(String(results[1]!.content)).toMatch(/aborted before execution/);
+    expect(String(results[2]!.content)).toMatch(/aborted before execution/);
+  });
+
+  it("未中止时审批门照常逐块询问（对照：修法没有把审批门整个短路）", async () => {
+    const reg = new ToolRegistry();
+    reg.register(makeTool({ name: "a", permission: "ask", parallelSafe: false }));
+    reg.register(makeTool({ name: "b", permission: "ask", parallelSafe: false }));
+    const approvals: string[] = [];
+    const executor = new ToolExecutor(reg, workdir);
+    const results = await executor.executeAll(
+      [toolUseBlock("tu_a", "a", {}), toolUseBlock("tu_b", "b", {})],
+      new AbortController().signal,
+      async (block) => { approvals.push(block.name); return { decision: "allow" }; },
+    );
+    expect(approvals).toEqual(["a", "b"]);
+    expect(results.map((r) => r.content)).toEqual(["a ok", "b ok"]);
   });
 });
 

@@ -2401,6 +2401,57 @@ describe("ui-server", () => {
     expect(model.calls).toBe(2);
   });
 
+  /**
+   * 真机现场（2026-09-03，deepseek-v4-flash）：一轮里 5 个串行 write_file，人在第一张
+   * 审批卡上按停止。宿主 deny 掉挂起的那一个，可执行器照样把第二个块送到审批门，
+   * 又挂出一张卡——没人会给已叫停的运行放行，run 永远停在 running/pendingApprovals=1，
+   * 每按一次停止只解开一个。修在执行器：中止后块与块之间先查中止位，不再请求审批。
+   */
+  it("v2-21f. 停止时一轮里还有后续串行审批：run 必须结束，不再挂出新的审批卡", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([
+        toolUseBlock("tu_w1", "writer", { path: "g1.txt" }),
+        toolUseBlock("tu_w2", "writer", { path: "g2.txt" }),
+        toolUseBlock("tu_w3", "writer", { path: "g3.txt" }),
+      ], "tool_use"),
+      // 修后到不了这里（第二次 send 之前循环就以 aborted 收尾）；留着是为了修前
+      // 的失败形态是"挂死"而不是"脚本耗尽"
+      fakeMessage([textBlock("done")], "end_turn"),
+    ]);
+    handle = createUiServer({ modelClient: model, tools: [askTool("writer")], workdir: process.cwd() });
+    port = await startServer(handle);
+    base = baseUrl(port);
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "批量写三个文件", verify: false }),
+    })).json() as { runId: string };
+
+    const first = await waitForEvent(base, runId, (e) =>
+      (e as any).event.type === "approval_request" && (e as any).event.toolUseId === "tu_w1");
+    expect(first).toBeDefined();
+    expect((await fetch(`${base}/api/runs/${runId}/stop`, { method: "POST" })).status).toBe(200);
+
+    // 修前：这里超时——第二个块的 approval_request 进了 pendingApprovals，run 一直 running
+    await waitForDone(base, runId);
+    const row = ((await (await fetch(`${base}/api/runs`)).json() as any[]).find((r) => r.runId === runId));
+    expect(row.stopReason).toBe("aborted");
+    expect(row.pendingApprovals).toBe(0);
+
+    const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`)) as any[];
+    const requests = events.filter((e) => e.event.type === "approval_request").map((e) => e.event.toolUseId);
+    expect(requests, "已叫停的运行不该再向人要授权").toEqual(["tu_w1"]);
+    // 每个 tool_use 仍各有一条回执（API 硬约束 1；这段正史可能被续跑复用）
+    const results = events.filter((e) => e.event.type === "tool_result").map((e) => e.event.toolUseId);
+    expect(results).toEqual(["tu_w1", "tu_w2", "tu_w3"]);
+    // 停止之后还能接着对话（v2-21d 的语义在这条路径上同样成立）
+    const res = await fetch(`${base}/api/runs/${runId}/messages`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "继续" }),
+    });
+    expect(res.status).toBe(200);
+    await waitForDone(base, runId);
+  });
+
   it("v2-21e. verify 字段必须是布尔：非布尔 400，不静默降级", async () => {
     handle = createUiServer({
       modelClient: new FakeModelClient([fakeMessage([textBlock("ok")], "end_turn")]),
