@@ -5121,6 +5121,46 @@ describe("B2 · 运行历史落盘", () => {
     expect(recovered.phase).toBe("interrupted");
   });
 
+  /**
+   * 会话中心化后新一轮的落盘顺序是 meta(running) → state(reopen)。两笔之间被硬杀：
+   * meta 说在跑、state 还停在上一轮的 completed。按 meta 走（它是"当时在跑"的事实源），
+   * 收成 interrupted；有检查点就能同 run 热恢复。CI 实测抓到的窗口（e2e crash 场景）。
+   * 反面：plan_gated 崩溃经 ADR 表收成 closed 的路径不受影响（只看盘上原相）。
+   */
+  it("RUN-01：meta=running 而 state 仍是上一轮 completed（reopen 未落盘就崩）→ interrupted + sameRunResume", async () => {
+    dir = await mkdtemp(join(tmpdir(), "history-reopen-crash-"));
+    await boot({
+      modelClient: new FakeModelClient([fakeMessage([textBlock("第一轮 secret-r1")], "end_turn")]),
+      tools: [autoTool("noop")],
+      workdir: process.cwd(),
+      history: dir,
+    });
+    const { runId } = (await (await post("/api/runs", { task: "reopen 前崩", verify: false })).json()) as { runId: string };
+    await waitForDone(base, runId);
+    await handle!.close();
+    handle = undefined;
+    // 模拟"新一轮开始、meta 已写 running、reopen 还没落盘"的现场
+    const runDir = join(dir, runId);
+    const meta = JSON.parse(await readFile(join(runDir, "meta.json"), "utf8"));
+    expect(meta.status).toBe("done");
+    await writeFile(join(runDir, "meta.json"), JSON.stringify({ ...meta, status: "running", finishedAt: null, conversationTurn: 2 }), "utf8");
+    expect(JSON.parse(await readFile(join(runDir, "state.json"), "utf8")).phase).toBe("completed");
+
+    const resumedModel = new FakeModelClient([fakeMessage([textBlock("热恢复：仍记得 secret-r1")], "end_turn")]);
+    await boot({ modelClient: resumedModel, tools: [autoTool("noop")], workdir: process.cwd(), history: dir });
+    const row = ((await (await fetch(`${base}/api/runs`)).json()) as any[]).find((r) => r.runId === runId);
+    expect(row.durablePhase).toBe("interrupted");
+    expect(row.sameRunResume).toBe(true);
+    expect(row.continuationMode).toBe("same-run");
+    expect(JSON.parse(await readFile(join(runDir, "state.json"), "utf8")).phase).toBe("interrupted");
+
+    const follow = await post(`/api/runs/${runId}/messages`, { text: "接着来" });
+    expect(follow.status).toBe(200);
+    expect(((await follow.json()) as any).continuationMode).toBe("same-run");
+    await waitForDone(base, runId);
+    expect(JSON.stringify(resumedModel.requests[0]!.messages)).toContain("secret-r1");
+  });
+
   it("RUN-01 Phase 2：崩溃+checkpoint → sameRunResume；续跑同 runId 发 run_resumed", async () => {
     dir = await mkdtemp(join(tmpdir(), "history-same-run-"));
     await boot({

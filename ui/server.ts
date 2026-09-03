@@ -1883,7 +1883,19 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         // RUN-01：读 state.json；崩溃相按 ADR 表收成 closed/interrupted 并回写。
         let durableState = await readArchivedState(a.dir);
         if (durableState && crashed) {
-          const recovered = recoverDurableStateOnCrash(durableState);
+          let recovered = recoverDurableStateOnCrash(durableState);
+          // meta 说在跑、盘上 state 却已是终态：新一轮的 reopen 还没落盘就崩了（meta 先写、
+          // 先到）。按 meta 走——它是"当时在跑"的事实源；有检查点就能同 run 热恢复。
+          // 只看**盘上原相**：plan_gated 崩溃经 ADR 表收成 closed 是另一回事，不许在这里被改写
+          if (["completed", "failed", "closed"].includes(durableState.phase)) {
+            recovered = {
+              ...recovered,
+              phase: "interrupted",
+              pendingApprovalIds: [],
+              pendingQuestionIds: [],
+              updatedAt: Date.now(),
+            };
+          }
           if (recovered !== durableState && recovered.phase !== durableState.phase) {
             durableState = recovered;
             try {
@@ -3376,9 +3388,16 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     // 上一轮按了停止的话 abort 位还立着；新一轮是新的决定，要新的闸
     const abort = new AbortController();
     run.abort = abort;
+    // meta 必须是新一轮的**第一笔**落盘：崩溃恢复靠 meta.status=running 判"当时在跑"。
+    // 先写 state(reopen) 再写 meta 的话，两笔之间被硬杀 → meta 还说 done、state 已说
+    // executing，重启后会被当成一个正常收尾的档案（CI 实测抓到的窗口）
+    persistMeta(run); // 追加轮开始也要进档案：轮数与"回到运行中"都是状态
+    // 等它真的落盘再往下：写链是异步的，不等的话新一轮的事件可能已经通过 SSE 被人看见、
+    // 宿主随即被杀，而盘上 meta 还停在上一轮的 done——恢复时就会把一个"跑到一半"的
+    // run 当成正常收尾的档案（CI 实测）。代价是一次 rename 的等待，在任何模型调用之前
+    await run.archiveWriter?.flush();
     // 终态 → executing：state.json 在两轮之间说"这一轮完了"，新一轮显式 reopen
     applyDurableTransition(run, { type: "reopen" });
-    persistMeta(run); // 追加轮开始也要进档案：轮数与"回到运行中"都是状态
 
     // 追加的这句话本身要进事件流：它是会话的一部分，也是"这一段为什么开始"的解释。
     // verify 是本轮的核查设置（前端 reducer 据此判断 done 是不是 run 终止）；
