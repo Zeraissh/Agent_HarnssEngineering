@@ -38,6 +38,7 @@ import {
 } from "../ui/server.js";
 import { resolvePlannerMaxTurns } from "../src/planner.js";
 import { PLAN_TOOL_NAME } from "../src/planner.js";
+import { resolveRecoveryPolicy } from "../src/recovery.js";
 import { REQUIREMENTS_TOOL_NAME } from "../src/clarifier.js";
 import { FINISH_TASK_TOOL_NAME } from "../src/task-completion.js";
 import { VERDICT_TOOL_NAME } from "../src/verifier.js";
@@ -1424,6 +1425,107 @@ describe("ui-server", () => {
     const asText = JSON.stringify(snap);
     expect(asText).not.toContain("apiKey");
     expect(asText).not.toContain("sk-");
+  });
+
+  /**
+   * 恢复策略进快照（领域包可声明，env > 包 > 默认）。锁三件事：
+   * ① /api/harness 与 run_config 都报三字段 + 逐字段来源 + armed；
+   * ② env 显式设 0 → 值 0、来源 env（0 不得被抹成"未设置"）；
+   * ③ 完成门关着（注入宿主缺省）→ armed=false，数字照报但明说 loop 不读。
+   * 与解析器同答案，不写死数字——数字归 presets / recovery.ts 管。
+   */
+  it("v2-8c. 恢复策略快照：三字段带来源 + armed 保真，env 显式 0 不被抹平", async () => {
+    const prior = process.env.AGENT_PROGRESS_EXTENSION_TURNS;
+    process.env.AGENT_PROGRESS_EXTENSION_TURNS = "0";
+    try {
+      handle = createUiServer({
+        modelClient: new FakeModelClient([fakeMessage([textBlock("ok")], "end_turn")]),
+        tools: [autoTool("noop")],
+        packName: "python-coding",
+        workdir: process.cwd(),
+        taskCompletion: false,
+      });
+      port = await startServer(handle);
+      base = baseUrl(port);
+
+      const expected = resolveRecoveryPolicy({
+        explicit: { progressExtensionTurns: 0 },
+        pack: PACKS["python-coding"]!.recovery,
+      });
+      const snap = await (await fetch(`${base}/api/harness`)).json() as any;
+      expect(snap.recovery).toEqual({ armed: false, ...expected.policy, sources: expected.sources });
+      expect(snap.recovery.progressExtensionTurns).toBe(0);
+      expect(snap.recovery.sources.progressExtensionTurns).toBe("env");
+      // 另两个字段没设 env，来源必须落回包/默认——逐字段独立
+      expect(snap.recovery.sources.stagnationWindow).not.toBe("env");
+
+      const { runId } = await (await fetch(`${base}/api/runs`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task: "recovery snapshot" }),
+      })).json() as { runId: string };
+      await waitForDone(base, runId);
+      const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+      const rc = events.find((e: any) => e.event.type === "run_config") as any;
+      expect(rc.event.recovery).toEqual(snap.recovery);
+    } finally {
+      if (prior === undefined) delete process.env.AGENT_PROGRESS_EXTENSION_TURNS;
+      else process.env.AGENT_PROGRESS_EXTENSION_TURNS = prior;
+    }
+  });
+
+  /**
+   * 快照说了不算，loop 拿到的才算：用停滞路径做行为锁。
+   * 窗 2 + 换策略 0 次 → 第二次相同观察就直接 force_completion（默认 1 次时会先
+   * change_strategy）。解析出的策略若没真的装进 AgentConfig，这里的 action 就是默认值。
+   */
+  it("v2-8d. 完成门开着时 armed=true，且解析出的策略真的装进了 loop（停滞行为锁）", async () => {
+    const priorWindow = process.env.AGENT_STAGNATION_WINDOW;
+    const priorMax = process.env.AGENT_MAX_STAGNATION_RECOVERIES;
+    process.env.AGENT_STAGNATION_WINDOW = "2";
+    process.env.AGENT_MAX_STAGNATION_RECOVERIES = "0";
+    try {
+      handle = createUiServer({
+        modelClient: new FakeModelClient([
+          fakeMessage([toolUseBlock("t1", "noop", {})], "tool_use"),
+          fakeMessage([toolUseBlock("t2", "noop", {})], "tool_use"), // 同工具同入参同结果 → 停滞
+          fakeMessage(
+            [toolUseBlock("t3", FINISH_TASK_TOOL_NAME, {
+              status: "partial", summary: "stalled", artifacts: [], verification: [], assumptions: [], blockers: ["x"],
+            })],
+            "tool_use",
+          ),
+        ]),
+        tools: [autoTool("noop")],
+        workdir: process.cwd(),
+        taskCompletion: true,
+      });
+      port = await startServer(handle);
+      base = baseUrl(port);
+      const snap = await (await fetch(`${base}/api/harness`)).json() as any;
+      expect(snap.recovery.armed).toBe(true);
+      expect(snap.recovery.stagnationWindow).toBe(2);
+      expect(snap.recovery.maxStagnationRecoveries).toBe(0);
+      expect(snap.recovery.sources).toEqual({
+        progressExtensionTurns: "default", stagnationWindow: "env", maxStagnationRecoveries: "env",
+      });
+
+      const { runId } = await (await fetch(`${base}/api/runs`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task: "stagnation policy reaches loop" }),
+      })).json() as { runId: string };
+      await waitForDone(base, runId);
+      const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+      const decisions = events
+        .filter((e: any) => e.event.type === "recovery_decision" && e.event.reason === "stagnation")
+        .map((e: any) => e.event.action);
+      // 默认策略（换策略 1 次）这里会是 change_strategy；env 解析真的到了 loop 才是 force_completion
+      expect(decisions).toEqual(["force_completion"]);
+    } finally {
+      if (priorWindow === undefined) delete process.env.AGENT_STAGNATION_WINDOW;
+      else process.env.AGENT_STAGNATION_WINDOW = priorWindow;
+      if (priorMax === undefined) delete process.env.AGENT_MAX_STAGNATION_RECOVERIES;
+      else process.env.AGENT_MAX_STAGNATION_RECOVERIES = priorMax;
+    }
   });
 
   it("v2-8b. Web 宿主接入 memory 工具与快照", async () => {

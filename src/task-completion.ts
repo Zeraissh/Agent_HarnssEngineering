@@ -6,12 +6,17 @@
  * 收笔，宿主却把运行标绿。本模块给主执行者一个显式的完成动作，并把
  * completed / partial / blocked 三态保真带回宿主。
  */
+import {
+  DEFAULT_MAX_STAGNATION_RECOVERIES,
+  DEFAULT_PROGRESS_EXTENSION_TURNS,
+  DEFAULT_STAGNATION_WINDOW,
+} from "./recovery.js";
 import type { AgentConfig, TaskCompletion, Tool } from "./types.js";
 
 export const FINISH_TASK_TOOL_NAME = "finish_task";
-export const DEFAULT_PROGRESS_EXTENSION_TURNS = 8;
-export const DEFAULT_STAGNATION_WINDOW = 3;
-export const DEFAULT_MAX_STAGNATION_RECOVERIES = 1;
+// 缺省值的唯一事实源在 src/recovery.ts（与三级解析 resolveRecoveryPolicy 同处）；
+// 这里保留同名导出，旧调用方与测试不必改 import
+export { DEFAULT_MAX_STAGNATION_RECOVERIES, DEFAULT_PROGRESS_EXTENSION_TURNS, DEFAULT_STAGNATION_WINDOW };
 
 export const FINISH_TASK_REMINDER =
   `你刚才结束了本轮输出，但还没有通过 ${FINISH_TASK_TOOL_NAME} 声明任务状态。` +

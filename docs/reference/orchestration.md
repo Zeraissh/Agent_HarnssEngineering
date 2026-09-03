@@ -417,12 +417,23 @@ export interface DomainPack {
     mode: "programmatic" | "rubric";
     instructions?: string;
     readOnlyCommands?: string[];
+    rubric?: string;
+    maxTurns?: number;          // 核查预算（9.1）：env AGENT_VERIFY_MAX_TURNS > 包 > 默认 15
   };
+  plan?: { maxTurns?: number }; // planner 预算（B0）：env AGENT_PLAN_MAX_TURNS > 包菜单取最大 > 默认 12
+  resources?: string[];         // 独占资源标签（调度器互斥）
   guardrails?: {
     maxTurns?: number;
     maxTokens?: number;
     contextTokenLimit?: number;
   };
+  /**
+   * 目标级恢复策略（完成门开启时生效），逐字段三级解析：
+   * env（AGENT_PROGRESS_EXTENSION_TURNS / AGENT_STAGNATION_WINDOW / AGENT_MAX_STAGNATION_RECOVERIES）
+   * > 包 > 默认 8 / 3 / 1（`resolveRecoveryPolicy`，src/recovery.ts）。0 合法（= 关掉该项）。
+   * 目前没有包填数——台账里的 max_turns 全部发生在恢复机制落地之前，数字等实测。
+   */
+  recovery?: RecoveryPolicy;
 }
 ```
 

@@ -10,6 +10,13 @@
 
 ## [Unreleased]
 
+### 循环与上下文（Loop & context）
+
+- **领域包可声明恢复策略**：`DomainPack.recovery`，逐字段三级解析 env > 包 > 默认（8 / 3 / 1），
+  新增 `AGENT_MAX_STAGNATION_RECOVERIES`；CLI 启动行、Web `run_config` / `/api/harness` 报生效值 +
+  逐字段来源 + `armed`（完成门关着时明说 loop 不读）。暂未给任何包填数——台账里的 max_turns 全部
+  发生在恢复机制落地之前，数字等实测。
+
 ## [1.3.0] - 2026-09-03
 
 ### Web 宿主与对话（Web host & conversation）

@@ -279,6 +279,29 @@ export function classifyStopReason(stopReason) {
 // ---------------------------------------------------------------
 
 /**
+ * 恢复策略投影（run_config.recovery / harness.recovery 同形）。
+ * 三字段缺一就整体 null——半份策略比没有更糟（会显示"续跑 8 轮"却不知道
+ * 停滞窗是多少）；sources 缺省全 "default"，armed 缺省按 true（旧宿主没这个字段
+ * 时完成门是默认开的）。
+ * @returns {{armed:boolean,progressExtensionTurns:number,stagnationWindow:number,maxStagnationRecoveries:number,sources:Record<string,string>}|null}
+ */
+export function normalizeRecoveryConfig(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const fields = ["progressExtensionTurns", "stagnationWindow", "maxStagnationRecoveries"];
+  const out = {};
+  for (const f of fields) {
+    if (typeof raw[f] !== "number" || !Number.isFinite(raw[f])) return null;
+    out[f] = raw[f];
+  }
+  const sources = {};
+  for (const f of fields) {
+    const s = raw.sources && typeof raw.sources === "object" ? raw.sources[f] : undefined;
+    sources[f] = s === "env" || s === "pack" ? s : "default";
+  }
+  return { armed: raw.armed !== false, ...out, sources };
+}
+
+/**
  * 把一条 SSE 事件折叠进渲染模型。
  * @param {RunState} state
  * @param {{seq:number, source:string, event:Record<string,unknown>}} sseEvent
@@ -576,6 +599,9 @@ export function reduceEvent(state, sseEvent) {
         verifierBudgetSource: event.verifierBudgetSource ?? null,
         plannerBudgetTurns: event.plannerBudgetTurns ?? null,
         plannerBudgetSource: event.plannerBudgetSource ?? null,
+        // 恢复策略（领域包可声明）：三字段 + 逐字段来源 + armed。armed 必须保真——
+        // 完成门关着时 loop 根本不读这些数，界面若只显示数字就是在说谎
+        recovery: normalizeRecoveryConfig(event.recovery),
         // MODEL-01a：null = 没配这条防线，[] 与它不是一回事，别用 ?? [] 抹平
         fallbackChain: Array.isArray(event.fallbackChain) ? event.fallbackChain.map(String) : null,
         fallbackChains: event.fallbackChains && typeof event.fallbackChains === "object"
@@ -1293,7 +1319,30 @@ export function deriveLoopFace(state, harness) {
     fallbacks: state.timeline.filter((e) => e.type === "model_fallback"),
     effort: rc?.effort ?? harness?.effort ?? null,
     effortApplies: Boolean(rc ? rc.effortApplies : harness?.effortApplies),
+    // 恢复策略：逐 run 优先于进程级快照（编排下各子任务的包可声明不同的续跑额度）。
+    // 与它管着的那几条 recovery_decision 放在同一个面上——策略与它的触发记录并排
+    recovery: rc?.recovery ?? normalizeRecoveryConfig(harness?.recovery) ?? null,
+    recoveryDecisions: state.timeline.filter((e) => e.type === "recovery_decision"),
   };
+}
+
+/**
+ * 恢复策略一行文案（Loop 卡 / 状态条共用）。
+ * armed=false 时明说"关"——数字照配着但 loop 不读它们，把它画成"续跑 8 轮"就是谎话。
+ * 来源只在**非默认**时标注：全默认时"（默认）"一个词就够，逐字段标三遍是噪声。
+ */
+export function describeRecoveryPolicy(recovery) {
+  if (!recovery) return null;
+  if (!recovery.armed) return "恢复：关（完成门关闭，到轮数上限即停）";
+  const src = (f) => (recovery.sources?.[f] === "env" ? "·env" : recovery.sources?.[f] === "pack" ? "·包" : "");
+  const allDefault = ["progressExtensionTurns", "stagnationWindow", "maxStagnationRecoveries"]
+    .every((f) => !src(f));
+  return (
+    `恢复：续跑 ${recovery.progressExtensionTurns} 轮${src("progressExtensionTurns")}` +
+    ` · 停滞窗 ${recovery.stagnationWindow}${src("stagnationWindow")}` +
+    ` · 换策略 ${recovery.maxStagnationRecoveries} 次${src("maxStagnationRecoveries")}` +
+    (allDefault ? "（默认）" : "")
+  );
 }
 
 /**
@@ -4020,6 +4069,12 @@ export function buildFactorCards(faces) {
   if (loop.reworks > 0) loopLines.push(`↺ 返工 ${loop.reworks} 轮`);
   if (loop.retries.length > 0) loopLines.push(`⟳ 重试 ${loop.retries.length} 次已自愈`);
   if (loop.effort) loopLines.push(`effort ${loop.effort}${loop.effortApplies ? "" : "（compat 下不发送）"}`);
+  // 恢复策略与它的触发记录并排：配了几轮续跑、这次到底触发了几次
+  const recoveryLine = describeRecoveryPolicy(loop.recovery);
+  if (recoveryLine) loopLines.push(recoveryLine);
+  if ((loop.recoveryDecisions?.length ?? 0) > 0) {
+    loopLines.push(`⤷ 恢复决策 ${loop.recoveryDecisions.length} 次`);
+  }
 
   const ctxLines = [];
   if (context.limit) {

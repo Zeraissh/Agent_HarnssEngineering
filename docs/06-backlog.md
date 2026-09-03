@@ -77,6 +77,30 @@ outcome，归档读 meta 的 outcome+judgedTurn）；注入 `modelClient` 的宿
 `AGENT_<ROLE>_MODEL` / `AGENT_FALLBACK_*` / `AGENT_RUN_HISTORY_KEEP`（残留一个 verifier 变量就红
 10 条测试）——现缺省读空 env，测试要武装就显式传 `roleEnv` / `fallbackEnv`（锁 v2-30b）。
 
+## loop / context 四件（2026-09-03，v1.3.0 之后；逐件一个提交）
+
+### ① 领域包可声明恢复策略 —— ✅ 已实施
+
+**缺口**：`AgentConfig.recovery`（progressExtensionTurns / stagnationWindow / maxStagnationRecoveries）
+只能由宿主从 env 装配，且第三个字段连 env 都没有；`DomainPack.guardrails` 只有
+maxTurns / maxTokens / contextTokenLimit——与 9.1（核查预算）、B0（planner 预算）修之前是同一个形态。
+
+**落地**：`DomainPack.recovery?: RecoveryPolicy`；`resolveRecoveryPolicy`（`src/recovery.ts`）逐字段
+三级解析 env > 包 > 默认（8 / 3 / 1，缺省常量的唯一事实源迁到 recovery.ts，task-completion 同名再导出）；
+新增 env `AGENT_MAX_STAGNATION_RECOVERIES`；0 是合法显式值（= 关掉该项）。CLI 启动打一行
+`recovery: extension=8(default) …`，编排下逐子任务按各自的包重解析；Web `buildConfig` / 子任务同款，
+`run_config` 与 `/api/harness` 报 `recovery: { armed, 三字段, sources }`——**armed=false（完成门关着）时
+数字照报但明说 loop 不读**。`app.js` 三处同提交：reduceEvent 投影 → `deriveLoopFace.recovery` +
+`recoveryDecisions` → Loop 卡一行「恢复：续跑 N 轮 · 停滞窗 N · 换策略 N 次」（非默认字段标来源）。
+
+**刻意没给任何包填数**（口径同 B0）：台账 16 次 max_turns（kicad 12、无包 4）全部发生在恢复机制
+落地（2026-08-24 ddedd2d）**之前**，没有一条能说明"续跑 8 轮救回了/没救回"。数字等 ② 的读数攒够。
+不等式锁：`recovery.progressExtensionTurns ≤ guardrails.maxTurns`（`test/recovery.test.ts`）。
+
+**锁**：解析器 7 条 + 包声明 2 条；Web `v2-8c`（快照三字段带来源、env 显式 0 不被抹平、armed 保真）+
+`v2-8d`（停滞行为锁：窗 2 / 换策略 0 → 首次停滞即 force_completion，证明解析结果真进了 loop）；
+ui-faces 5 条。变异 4 处逐一打红：解析器忽略包 / reducer 丢字段 / Web 装配忽略解析结果 / armed 恒 true。
+
 以下为历史交接页（2026-08-08 收工），仍有参考价值；新开工优先看 `docs/08`。
 
 ---

@@ -46,6 +46,7 @@ import { createWorkdirScopedMemoryTools, MEMORY_TOOL_NAMES } from "../src/memory
 import { DEFAULT_VERIFIER_MAX_TURNS } from "../src/verifier.js";
 import { resolvePlannerMaxTurns } from "../src/planner.js";
 import type { Plan, SubTask } from "../src/planner.js";
+import { resolveRecoveryPolicy } from "../src/recovery.js";
 import type Anthropic from "@anthropic-ai/sdk";
 import { bashTool, SHELL_DESC } from "../src/tools/bash.js";
 import { ASK_USER_TOOL_NAME, createAskUserTool } from "../src/tools/ask-user.js";
@@ -107,6 +108,7 @@ import type {
   SharedRunBudget,
   ExecutionBroker,
   ExecutionBoundaryStatus,
+  RecoveryPolicy,
 } from "../src/types.js";
 import type { Verdict } from "../src/verifier.js";
 
@@ -2313,8 +2315,31 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   const maxTotalTurns = integerEnv("AGENT_TOTAL_MAX_TURNS", 1) ?? (realHost ? 120 : undefined);
   const maxTokensBudget = integerEnv("AGENT_TOTAL_TOKEN_BUDGET", 1) ?? (realHost ? 500_000 : undefined);
   const compactSummaryMaxTokens = integerEnv("AGENT_COMPACT_SUMMARY_MAX_TOKENS", 64);
-  const progressExtensionTurns = integerEnv("AGENT_PROGRESS_EXTENSION_TURNS", 0);
-  const stagnationWindow = integerEnv("AGENT_STAGNATION_WINDOW", 0);
+  /**
+   * 恢复策略三级解析：env > 包 `recovery` > 默认（口径同 verifyMaxTurnsOf / planner 预算）。
+   * env 侧逐字段：只写了 AGENT_STAGNATION_WINDOW 时另两个仍落到包/默认。
+   * 此前第三个字段（maxStagnationRecoveries）连 env 都没有，包更覆盖不了。
+   */
+  const envProgressExtensionTurns = integerEnv("AGENT_PROGRESS_EXTENSION_TURNS", 0);
+  const envStagnationWindow = integerEnv("AGENT_STAGNATION_WINDOW", 0);
+  const envMaxStagnationRecoveries = integerEnv("AGENT_MAX_STAGNATION_RECOVERIES", 0);
+  const envRecovery: RecoveryPolicy = {
+    ...(envProgressExtensionTurns !== undefined ? { progressExtensionTurns: envProgressExtensionTurns } : {}),
+    ...(envStagnationWindow !== undefined ? { stagnationWindow: envStagnationWindow } : {}),
+    ...(envMaxStagnationRecoveries !== undefined
+      ? { maxStagnationRecoveries: envMaxStagnationRecoveries }
+      : {}),
+  };
+  const recoveryFor = (p?: DomainPack) => resolveRecoveryPolicy({ explicit: envRecovery, pack: p?.recovery });
+  /**
+   * 快照/run_config 用的恢复策略投影：数字 + 逐字段来源 + **armed**。
+   * armed=false（完成门关着）时数字照报但 loop 根本不会用它们——不带这个标记，
+   * 界面会把"配了 8 轮续跑"画成"有 8 轮续跑"，而实际到 maxTurns 就停。
+   */
+  const recoverySnapshot = (p?: DomainPack) => {
+    const r = recoveryFor(p);
+    return { armed: taskCompletionEnabled, ...r.policy, sources: r.sources };
+  };
   /** §5.2 打断次数上限（决定 2/6）。 */
   const maxAskRounds = integerEnv("AGENT_MAX_ASK_ROUNDS", 1);
 
@@ -2463,10 +2488,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         : {}),
     };
     return taskCompletionEnabled
-      ? withTaskCompletion(cfg, {
-          ...(progressExtensionTurns !== undefined ? { progressExtensionTurns } : {}),
-          ...(stagnationWindow !== undefined ? { stagnationWindow } : {}),
-        })
+      ? withTaskCompletion(cfg, recoveryFor(runPack).policy)
       : cfg;
   }
 
@@ -3843,6 +3865,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
               ...(sp?.guardrails?.maxTokens !== undefined && maxTokens === undefined
                 ? { maxTokens: sp.guardrails.maxTokens }
                 : {}),
+              // 逐子任务按各自的包取恢复策略（与核查预算同款）；完成门关着时不装
+              ...(baseCfg.requireTerminalTool ? { recovery: recoveryFor(sp).policy } : {}),
             },
             verify: {
               ...(sp?.verify.instructions ? { verifyInstructions: sp.verify.instructions } : {}),
@@ -4228,6 +4252,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       // planner 预算同款（B0）：报数字必须带来源，否则无从判断"这是不是我要的值"
       plannerBudgetTurns: plannerBudgetTurns(),
       plannerBudgetSource: plannerBudgetSource(),
+      // 恢复策略同款：逐 run 按包解析，三字段各带来源 + armed（完成门关着时数字无效）
+      recovery: recoverySnapshot(runPack),
       workdir: cfg.workdir,
       executionIsolation: executionBoundary,
       roleModels: {
@@ -4403,6 +4429,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           : "default",
       plannerBudgetTurns: plannerBudgetTurns(),
       plannerBudgetSource: plannerBudgetSource(),
+      // 恢复策略：进程级默认包的值；逐 run 的真实值走 run_config（口径同核查预算）
+      recovery: recoverySnapshot(pack),
       pack: packView(pack),
       tools: tools.map((t) => ({
         name: t.name,

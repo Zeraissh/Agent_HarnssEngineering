@@ -768,6 +768,93 @@ describe("计划确认门", () => {
     expect(bare.budgetSource).toBe("default");
   });
 
+  /**
+   * 恢复策略（领域包可声明）进宿主的三处：reduceEvent 投影 / deriveLoopFace / 卡片文案。
+   * 这条与 9.1 的核查预算同款——白名单投影不列字段就静默丢，这里一次把三处锁住。
+   */
+  describe("恢复策略进 Loop 面（run_config.recovery，逐字段来源 + armed）", () => {
+    const recovery = {
+      armed: true,
+      progressExtensionTurns: 12,
+      stagnationWindow: 3,
+      maxStagnationRecoveries: 1,
+      sources: { progressExtensionTurns: "pack", stagnationWindow: "default", maxStagnationRecoveries: "default" },
+    };
+
+    it("reduceEvent 投影保留 recovery（三字段 + sources + armed），派生进 Loop 面", () => {
+      seq = 0;
+      const s = feed([ev("host", { type: "run_config", pack: { name: "kicad" }, recovery })]);
+      expect(s.runConfig.recovery).toEqual(recovery);
+      const loop = deriveLoopFace(s, HARNESS);
+      expect(loop.recovery).toEqual(recovery);
+      // 卡片文案：数字 + 非默认字段标来源
+      const card = buildFactorCards({
+        loop, context: deriveContextFace(s, HARNESS), tools: deriveToolsFace(s, HARNESS),
+        verification: deriveVerificationFace(s, HARNESS),
+      }).find((c) => c.id === "loop");
+      const line = card.lines.find((l) => l.startsWith("恢复"));
+      expect(line).toContain("续跑 12 轮·包");
+      expect(line).toContain("停滞窗 3");
+      expect(line).toContain("换策略 1 次");
+      expect(line).not.toContain("（默认）"); // 有一个字段来自包，就不能整体标"默认"
+    });
+
+    it("armed=false 时明说'关'，不把配着的数字画成生效的续跑", () => {
+      seq = 0;
+      const s = feed([ev("host", { type: "run_config", recovery: { ...recovery, armed: false } })]);
+      const loop = deriveLoopFace(s, HARNESS);
+      expect(loop.recovery.armed).toBe(false);
+      const card = buildFactorCards({
+        loop, context: deriveContextFace(s, HARNESS), tools: deriveToolsFace(s, HARNESS),
+        verification: deriveVerificationFace(s, HARNESS),
+      }).find((c) => c.id === "loop");
+      const line = card.lines.find((l) => l.startsWith("恢复"));
+      expect(line).toContain("关");
+      expect(line).not.toContain("续跑 12 轮");
+    });
+
+    it("全默认时只标一次（默认）；没有 run_config 时回落进程级快照；快照也没有则不显示", () => {
+      seq = 0;
+      const allDefault = {
+        ...recovery,
+        progressExtensionTurns: 8,
+        sources: { progressExtensionTurns: "default", stagnationWindow: "default", maxStagnationRecoveries: "default" },
+      };
+      const viaHarness = deriveLoopFace(feed([]), { ...HARNESS, recovery: allDefault });
+      expect(viaHarness.recovery).toEqual(allDefault);
+      const card = buildFactorCards({
+        loop: viaHarness, context: deriveContextFace(feed([]), HARNESS), tools: deriveToolsFace(feed([]), HARNESS),
+        verification: deriveVerificationFace(feed([]), HARNESS),
+      }).find((c) => c.id === "loop");
+      expect(card.lines.find((l) => l.startsWith("恢复"))).toBe("恢复：续跑 8 轮 · 停滞窗 3 · 换策略 1 次（默认）");
+
+      seq = 0;
+      const none = deriveLoopFace(feed([]), HARNESS);
+      expect(none.recovery).toBeNull();
+    });
+
+    it("半份策略（缺字段）整体判 null——半份比没有更糟", () => {
+      seq = 0;
+      const s = feed([ev("host", { type: "run_config", recovery: { armed: true, progressExtensionTurns: 8 } })]);
+      expect(s.runConfig.recovery).toBeNull();
+    });
+
+    it("recovery_decision 事件计入 Loop 面，与策略并排", () => {
+      seq = 0;
+      const s = feed([
+        ev("host", { type: "run_config", recovery }),
+        ev("main", { type: "recovery_decision", reason: "max_turns", action: "continue_with_context", detail: "x", extraTurns: 12 }),
+      ]);
+      const loop = deriveLoopFace(s, HARNESS);
+      expect(loop.recoveryDecisions).toHaveLength(1);
+      const card = buildFactorCards({
+        loop, context: deriveContextFace(s, HARNESS), tools: deriveToolsFace(s, HARNESS),
+        verification: deriveVerificationFace(s, HARNESS),
+      }).find((c) => c.id === "loop");
+      expect(card.lines).toContain("⤷ 恢复决策 1 次");
+    });
+  });
+
   it("plan 事件带 gated 标记——否则前端会以为计划已经在跑了", () => {
     seq = 0;
     expect(feed([planEvent(true)]).plan.gated).toBe(true);

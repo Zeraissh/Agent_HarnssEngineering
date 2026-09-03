@@ -1,4 +1,4 @@
-import type { Tool } from "./types.js";
+import type { RecoveryPolicy, Tool } from "./types.js";
 import {
   applyMcpPackPermission,
   originalMcpToolName,
@@ -110,6 +110,23 @@ export interface DomainPack {
     maxTokens?: number;
     contextTokenLimit?: number;
   };
+  /**
+   * 目标级恢复策略（完成门开启时生效；可选，逐字段覆盖）。
+   *
+   * 此前 `AgentConfig.recovery` 只能由宿主从 env 装配（且第三个字段
+   * maxStagnationRecoveries 连 env 都没有），领域包一个字段都覆盖不了——
+   * 与 9.1（核查预算）/ B0（planner 预算）修之前是同一个形态。三级解析
+   * `AGENT_PROGRESS_EXTENSION_TURNS` / `AGENT_STAGNATION_WINDOW` /
+   * `AGENT_MAX_STAGNATION_RECOVERIES` > 包 > 默认（8 / 3 / 1），
+   * 见 `src/recovery.ts` 的 resolveRecoveryPolicy。
+   *
+   * **刻意先不给任何包填数**（口径同 B0）：台账里 16 次 max_turns 全部发生在
+   * 恢复机制落地（2026-08-24）之前，没有一条能说明"续跑 8 轮救回了/没救回"；
+   * `npm run ledger` 的「终止原因 × 包」表与 extension/stagnation 触发字段
+   * 就是为攒这份证据加的——数字等实测，由不等式锁守着
+   * （`recovery.progressExtensionTurns ≤ guardrails.maxTurns`）。
+   */
+  recovery?: RecoveryPolicy;
 }
 
 /**

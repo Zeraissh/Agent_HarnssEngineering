@@ -41,6 +41,10 @@
  *   AGENT_PLAN_MAX_TURNS 可选，planner 探索轮次预算（env > 包 plan.maxTurns 取最大
  *                       > 默认 12,见 B0——planner 面对整个包菜单,故取声明值最大）。
  *                       非法值退出码 1,口径同 AGENT_VERIFY_MAX_TURNS
+ *   AGENT_PROGRESS_EXTENSION_TURNS / AGENT_STAGNATION_WINDOW / AGENT_MAX_STAGNATION_RECOVERIES
+ *                       可选，恢复策略三字段（env > 包 recovery > 默认 8 / 3 / 1），
+ *                       逐字段独立覆盖；0 合法（=关掉该项）；≥0 整数，非法值退出码 1。
+ *                       仅完成门开启时生效（AGENT_REQUIRE_FINISH_TASK≠0）
  *   AGENT_MAX_ASK_ROUNDS 可选，--ask 时整个 run 的【打断次数】上限（默认 3）。
  *                       单位是打断不是问题数：一次可提交 1~4 个问题（§5.2 决定 6）——
  *                       贵的是打断人，不是问题本身。配额由 harness 硬执行
@@ -79,7 +83,8 @@ import { connectMcpServers, loadMcpConfig } from "./mcp.js";
 import { createMemoryTools, MemoryStore } from "./memory.js";
 import { AUTO_CONCURRENCY_CAP, plannedStopReason, planParallelWidth, runPlanned, runVerified } from "./orchestrate.js";
 import type { VerifyOutcome } from "./verifier.js";
-import { getPack, PACKS, RULE_PRECEDENCE_DISCIPLINE, selectPackTools } from "./presets.js";
+import { getPack, PACKS, RULE_PRECEDENCE_DISCIPLINE, selectPackTools, type DomainPack } from "./presets.js";
+import { resolveRecoveryPolicy } from "./recovery.js";
 import { routeToPack } from "./router.js";
 import { createFallbackClientIfConfigured, createRoleFallbackClient, executorBackupEndpoints, FallbackModelClient, sharedBreakerRegistry } from "./model-fallback.js";
 import { createModelClientFromEnv, createModelClientWithProbe } from "./provider.js";
@@ -96,7 +101,7 @@ import { writeFileTool } from "./tools/write-file.js";
 import { appendRunLedger, buildLedgerEntry, ledgerErrorClass, tallyToolCall, type ToolTally } from "./ledger.js";
 import { warnEnvConflicts } from "./env-check.js";
 import { EFFORT_LEVELS } from "./types.js";
-import type { AgentConfig, Effort, ExecutionBroker, TurnEvent } from "./types.js";
+import type { AgentConfig, Effort, ExecutionBroker, RecoveryPolicy, TurnEvent } from "./types.js";
 
 let activeCliExecutionBroker: ExecutionBroker | undefined;
 
@@ -284,8 +289,21 @@ async function main(): Promise<void> {
   };
   const maxTotalTurns = positiveEnv("AGENT_TOTAL_MAX_TURNS");
   const maxTokensBudget = positiveEnv("AGENT_TOTAL_TOKEN_BUDGET");
-  const progressExtensionTurns = nonNegativeEnv("AGENT_PROGRESS_EXTENSION_TURNS");
-  const stagnationWindow = nonNegativeEnv("AGENT_STAGNATION_WINDOW");
+  /**
+   * 恢复策略三级解析：env > 包 `recovery` > 默认（口径同 verifyMaxTurnsOf / planner 预算）。
+   * env 侧逐字段：只写了 AGENT_STAGNATION_WINDOW 时另两个仍落到包/默认。
+   */
+  const envProgressExtensionTurns = nonNegativeEnv("AGENT_PROGRESS_EXTENSION_TURNS");
+  const envStagnationWindow = nonNegativeEnv("AGENT_STAGNATION_WINDOW");
+  const envMaxStagnationRecoveries = nonNegativeEnv("AGENT_MAX_STAGNATION_RECOVERIES");
+  const envRecovery: RecoveryPolicy = {
+    ...(envProgressExtensionTurns !== undefined ? { progressExtensionTurns: envProgressExtensionTurns } : {}),
+    ...(envStagnationWindow !== undefined ? { stagnationWindow: envStagnationWindow } : {}),
+    ...(envMaxStagnationRecoveries !== undefined
+      ? { maxStagnationRecoveries: envMaxStagnationRecoveries }
+      : {}),
+  };
+  const recoveryFor = (p?: DomainPack) => resolveRecoveryPolicy({ explicit: envRecovery, pack: p?.recovery });
   const maxAskRounds = positiveEnv("AGENT_MAX_ASK_ROUNDS");
 
   // 跨会话记忆（L5）：默认 <cwd>/.agent-memory，可用 AGENT_MEMORY_DIR 覆盖
@@ -654,13 +672,20 @@ async function main(): Promise<void> {
     },
   };
   // 主执行者默认走结构化完成门；设 AGENT_REQUIRE_FINISH_TASK=0 可为兼容端点退回旧语义。
-  const config: AgentConfig =
-    process.env.AGENT_REQUIRE_FINISH_TASK === "0"
-      ? baseConfig
-      : withTaskCompletion(baseConfig, {
-          ...(progressExtensionTurns !== undefined ? { progressExtensionTurns } : {}),
-          ...(stagnationWindow !== undefined ? { stagnationWindow } : {}),
-        });
+  const taskCompletionEnabled = process.env.AGENT_REQUIRE_FINISH_TASK !== "0";
+  const config: AgentConfig = taskCompletionEnabled
+    ? withTaskCompletion(baseConfig, recoveryFor(pack).policy)
+    : baseConfig;
+  if (taskCompletionEnabled) {
+    // 与 pack/verifier/planner 那几行同款：报数字带来源，装配变了这一行就变
+    const r = recoveryFor(pack);
+    const fmt = (k: keyof typeof r.policy) => `${r.policy[k]}(${r.sources[k]})`;
+    console.log(
+      c.dim(
+        `recovery: extension=${fmt("progressExtensionTurns")} stagnation=${fmt("stagnationWindow")} recoveries=${fmt("maxStagnationRecoveries")}`,
+      ),
+    );
+  }
   let streamingText = false;
   const endStreamLine = () => {
     if (streamingText) {
@@ -875,6 +900,9 @@ async function main(): Promise<void> {
             ...(p?.guardrails?.maxTokens !== undefined && !process.env.AGENT_MAX_TOKENS
               ? { maxTokens: p.guardrails.maxTokens }
               : {}),
+            // 逐子任务按各自的包取恢复策略（与核查预算同款：s1(coding) 与 s2(debug)
+            // 的"进展续跑该给几轮"可以不同）；完成门关着时不装
+            ...(config.requireTerminalTool ? { recovery: recoveryFor(p).policy } : {}),
           },
           verify: {
             ...(p?.verify.instructions ? { verifyInstructions: p.verify.instructions } : {}),
