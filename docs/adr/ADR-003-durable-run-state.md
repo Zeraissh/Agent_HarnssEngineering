@@ -70,6 +70,17 @@ Idempotency 边界：
 
 `canSameRunResume` **不**因 toolTx 放宽——续跑入口与副作用幂等是两层。
 
+## Addendum — 会话中心化（2026-09-03）
+
+| 变化 | 说明 |
+|---|---|
+| 新迁移 `reopen` | `completed / failed / closed / interrupted → executing`（挂起 id 清空；budget / grantAudit / toolTx 保留）。同进程内对已收尾的 run 追加新一轮对话时由宿主显式调用。与 `resume` 是两件事：resume 只在崩溃相 `interrupted` 上同 run 热恢复；reopen 是"这场对话还没完"。`created / planning / plan_gated / awaiting_*` 上拒绝——那些相意味着有一轮还没结束 |
+| 收尾一律进终态 | `finalizeDurableState` 去掉了"可追问的 completed 保持 executing"的例外（当初为了让下一轮的 `segment_begin` 不被非法迁移挡住）。两轮之间 state.json 说的是实话：这一轮完了 |
+| 检查点来源 = 执行者谱系 | `main` **与 `rework`** 段都更新 checkpoint / budget_snapshot；此前只认 main，返工后的正史从未进过检查点。verifier / planner / `sN/*` 仍不算 |
+| `meta.outcome.judgedTurn` | 裁决核查的是第几轮对话；列表 `verdictTurn` 由此恢复 |
+
+`canSameRunResume` 的门**没动**（仍 interrupted + checkpoint + 非 verify/plan）；核查 / 编排的归档走 fork，无检查点的归档也可 fork 成"无正史的新一轮"（`run_forked.checkpoint = null`）。
+
 **恢复语义（Phase 1）**：
 
 | 崩溃时 phase | 重启后行为 |

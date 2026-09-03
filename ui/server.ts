@@ -22,7 +22,10 @@ import {
   plannedStopReason,
   planParallelWidth,
   createResourceCoordinator,
+  continuationVerifyTask,
+  verdictFeedbackSummary,
   AUTO_CONCURRENCY_CAP,
+  type VerifiedRunOptions,
   type VerifiedRunResult,
 } from "../src/orchestrate.js";
 import { createModelClientFromEnv, type ResolvedProvider } from "../src/provider.js";
@@ -249,8 +252,19 @@ interface StoredRun {
   sseClients: Set<ServerResponse>;
   /** 段计数：每个 main/rework 的 done 递增一次，用于把日志按段归属 */
   segmentIndex: number;
-  /** 核查运行的完整结果（含 executionUsage / reworks / 全部裁决），run_end 用 */
+  /**
+   * 最近一次**核查过的那一轮**的完整结果（含 executionUsage / reworks / 全部裁决）。
+   * 会话中心化之后核查是逐轮选项：`outcomeTurn` 记它属于哪一轮——run_end / 台账只在
+   * 本轮确实核查过时才带它，列表列则始终报最近一次裁决并标明轮号。
+   */
   outcome?: VerifiedRunResult;
+  outcomeTurn?: number;
+  /**
+   * plan 模式收尾时的结构化摘要（子任务 / 结局 / 交接摘要 / 裁决）。计划编排没有
+   * 单一执行者正史可续，下一轮对话以它为种子、按单执行者跑——"续的是对话，
+   * 不是 DAG"。归档恢复时从 plan / plan_result 事件重建。
+   */
+  planSummary?: string;
   /**
    * 本 run（single/verified 模式）在宿主级资源表里整体持有的独占标签——
    * 准入时按包声明占用，finalize 释放。plan 模式不走这里：资源按子任务
@@ -305,10 +319,10 @@ interface StoredRun {
   mode?: "single" | "plan";
   concurrency?: number | "auto";
   /**
-   * V-28 多轮对话：会话正史与复用的 loop 实例。
-   *
-   * loop 留着而不是每轮新建，是为了让 ContextManager 的水位记忆延续——
-   * 新建实例的 lastInputTokens 归零，压缩判据会在续跑第一轮失准。
+   * V-28 多轮对话：会话正史（执行者谱系 main/rework 最后一段的完整消息）与本轮的
+   * loop 实例。会话中心化之后每轮**新建** AgentLoop：预算与 Context 水位从检查点
+   * 延续（与归档派生 / 同 run 热恢复同一口径），不再靠"活对象还在"才能续——
+   * 那正是"执行阶段失败就再也续不上"的来源之一。
    */
   loop?: AgentLoop;
   history?: Anthropic.MessageParam[];
@@ -359,7 +373,12 @@ interface StoredRun {
   /** 归档的懒加载：首次访问 events/transcript 时才付读盘代价，且只付一次 */
   hydration?: Promise<void>;
   /** 归档的裁决摘要（列表列用）；活 run 走 outcome，两者在 runSummary 合流 */
-  archivedOutcome?: { finalPassed: boolean | null; reworks: number | null; verdict: Verdict | null };
+  archivedOutcome?: {
+    finalPassed: boolean | null;
+    reworks: number | null;
+    verdict: Verdict | null;
+    judgedTurn?: number;
+  };
   /** 最近一个完整 main 段的可恢复检查点；归档本身保持只读，续跑会派生新 run。 */
   checkpoint?: ArchivedCheckpoint;
   /** 从 checkpoint 恢复的只读授权审计；永不装进 autoAllow。 */
@@ -497,6 +516,16 @@ export function approvalToolFingerprint(tool: Tool): string {
  */
 function isVerifierSource(source: string): boolean {
   return source === "verifier" || source.endsWith("/verifier");
+}
+
+/**
+ * 执行者谱系（会话中心化的核心概念）：main 与 rework 段——含续跑段，它们也以
+ * main 发出——构成**对话**；verifier / planner / 计划子任务（sN/…）不属于对话。
+ * 会话正史与检查点只从这些段捕获：返工段的正史此前根本没被记，返工后再续跑
+ * 接的是陈旧正史。
+ */
+export function isExecutorLineageSource(source: string): boolean {
+  return source === "main" || source === "rework";
 }
 
 /** planner/verifier 都在各自 drain 循环里自答 deny；宿主不得抢答或为其建 grant。 */
@@ -1015,14 +1044,91 @@ function restoredBudget(
   };
 }
 
-function exhaustedBudgetReason(budget: SharedRunBudget): string | null {
+/**
+ * 预算耗尽是会话唯一会被挡住的结构性原因，所以文案必须说清**哪个预算、怎么提**：
+ * 只报"用尽"等于把人晾在那里。两个 env 名与 buildConfig 读的一致。
+ */
+export function exhaustedBudgetReason(budget: SharedRunBudget): string | null {
   if (budget.maxTurns !== undefined && budget.usedTurns >= budget.maxTurns) {
-    return `执行谱系的总轮次预算已用尽（${budget.usedTurns}/${budget.maxTurns}）`;
+    return (
+      `执行谱系的总轮次预算已用尽（${budget.usedTurns}/${budget.maxTurns}）。` +
+      "要在这场对话里继续，请提高 AGENT_TOTAL_MAX_TURNS 后重启宿主；或者新建对话"
+    );
   }
   if (budget.maxTokens !== undefined && budget.usedTokens >= budget.maxTokens) {
-    return `执行谱系的总 token 预算已用尽（${budget.usedTokens}/${budget.maxTokens}）`;
+    return (
+      `执行谱系的总 token 预算已用尽（${budget.usedTokens}/${budget.maxTokens}）。` +
+      "要在这场对话里继续，请提高 AGENT_TOTAL_TOKEN_BUDGET 后重启宿主；或者新建对话"
+    );
   }
   return null;
+}
+
+interface PlanSummarySubtask {
+  id: string;
+  title?: string;
+  pack?: string | null;
+  description?: string;
+}
+
+interface PlanSummaryStep {
+  id: string;
+  title?: string;
+  pack?: string | null;
+  passed?: boolean;
+  reworks?: number;
+  stopReason?: string;
+  completion?: { summary?: string; artifacts?: string[] } | null;
+  verdict?: { passed?: boolean; summary?: string; issues?: string[] } | null;
+}
+
+/**
+ * 计划编排的对话种子（会话中心化语义 B）。plan run 没有单一执行者正史可续——
+ * 续的是**对话**，不是 DAG：下一轮以这份结构化摘要开局，按单执行者执行。
+ * 只放事实（子任务 / 结局 / 交接摘要 / 裁决 / 未执行项），不替执行者下结论。
+ * 纯函数：活 run 收尾时与归档重建时共用，两边看到的是同一份文本。
+ */
+export function buildPlanSummary(input: {
+  task: string;
+  stopReason?: string | undefined;
+  subtasks: PlanSummarySubtask[];
+  steps: PlanSummaryStep[];
+  skipped: { id: string; title?: string }[];
+  completed: boolean;
+  plannerFailure?: string | undefined;
+}): string {
+  const byId = new Map(input.subtasks.map((s) => [s.id, s]));
+  const lines: string[] = [
+    `【本对话此前是一次计划编排】原任务：${input.task}`,
+    `编排结局：${input.completed ? "全部子任务执行并通过核查" : "未全部完成"}` +
+      (input.stopReason ? `（终止原因 ${input.stopReason}）` : ""),
+  ];
+  if (input.plannerFailure) lines.push(`拆解未产出可执行计划：${input.plannerFailure}`);
+  if (input.steps.length > 0) {
+    lines.push("已执行的子任务：");
+    for (const st of input.steps) {
+      const sub = byId.get(st.id);
+      const title = st.title ?? sub?.title ?? "";
+      const pack = st.pack ?? sub?.pack;
+      const head =
+        `- ${st.id}${title ? ` ${title}` : ""}${pack ? `（包 ${pack}）` : ""}：` +
+        `${st.passed ? "核查通过" : "核查未通过"}` +
+        `${st.reworks ? ` · 返工 ${st.reworks} 轮` : ""}` +
+        `${st.stopReason ? ` · 执行终止 ${st.stopReason}` : ""}`;
+      lines.push(head);
+      if (st.completion?.summary) lines.push(`  交接摘要：${st.completion.summary}`);
+      if (st.completion?.artifacts?.length) lines.push(`  产物：${st.completion.artifacts.join("、")}`);
+      if (st.verdict?.summary) lines.push(`  裁决：${st.verdict.summary}`);
+      if (st.verdict?.issues?.length) lines.push(`  裁决列出的问题：${st.verdict.issues.join("；")}`);
+    }
+  }
+  if (input.skipped.length > 0) {
+    lines.push(`未执行的子任务：${input.skipped.map((s) => `${s.id}${s.title ? ` ${s.title}` : ""}`).join("、")}`);
+  }
+  lines.push(
+    "从本轮起你以单一执行者继续这场对话；上述子任务的产物就在工作目录里，请据实核对后再动手，不要凭摘要臆断。",
+  );
+  return lines.join("\n");
 }
 
 function isMessageHistory(value: unknown): value is Anthropic.MessageParam[] {
@@ -1686,6 +1792,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             finalPassed: run.outcome.finalPassed,
             reworks: run.outcome.reworks,
             verdict: run.outcome.verifications.at(-1)?.verdict ?? null,
+            judgedTurn: run.outcomeTurn ?? null,
           }
         : null,
     };
@@ -1741,14 +1848,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       applyDurableTransition(run, { type: "fail" });
       return;
     }
-    // 同进程还可追问的 completed：保持 executing，不标 completed——
-    // 否则 startContinuation 的 segment_begin 会被非法迁移挡住。
-    const structurallyContinuable =
-      !run.verify && run.mode !== "plan" && Boolean(run.loop && run.history?.length);
-    if (structurallyContinuable && endInfo.outcome === "completed") {
-      if (run.durableState) run.archiveWriter?.writeState(run.durableState);
-      return;
-    }
+    // 会话中心化：收尾一律进终态。此前"还可追问的 completed 保持 executing"是为了
+    // 让下一轮的 segment_begin 不被非法迁移挡住——现在下一轮由 `reopen` 显式把
+    // 游标从终态拉回 executing，state.json 在两轮之间说的就是实话：这一轮完了。
     applyDurableTransition(run, { type: "complete" });
   }
 
@@ -1854,6 +1956,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
                   finalPassed: a.meta.outcome.finalPassed,
                   reworks: a.meta.outcome.reworks,
                   verdict: (a.meta.outcome.verdict as Verdict | null) ?? null,
+                  ...(nonNegativeInteger(a.meta.outcome.judgedTurn)
+                    ? { judgedTurn: a.meta.outcome.judgedTurn }
+                    : {}),
                 },
               }
             : {}),
@@ -1903,18 +2008,44 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   }
 
   /**
-   * 只从 checkpoint 指定的 main 段恢复，不拿“最后一段”猜。归档里可能同时有
-   * verifier/rework 段，按数组尾部取会把独立核查上下文误接进主会话。
+   * 只从 checkpoint 指定的执行者段恢复，不拿“最后一段”猜。归档里可能同时有
+   * verifier 段，按数组尾部取会把独立核查上下文误接进主会话。执行者谱系含
+   * rework：返工后的正史才是执行者手里的现状。
    */
   function archivedCheckpointHistory(run: StoredRun): Anthropic.MessageParam[] | undefined {
     const checkpoint = run.checkpoint;
     if (!checkpoint) return undefined;
     const segment = run.transcript.find(
-      (candidate) => candidate.index === checkpoint.segmentIndex && candidate.source === "main",
+      (candidate) =>
+        candidate.index === checkpoint.segmentIndex && isExecutorLineageSource(candidate.source),
     );
     if (!segment || !isMessageHistory(segment.messages)) return undefined;
     // 子 run 可以压缩自己的正史；父档案的内存投影也必须保持不可变。
     return structuredClone(segment.messages);
+  }
+
+  /**
+   * 归档 plan run 的对话种子：从事件流里的 plan / plan_result 重建结构化摘要
+   * （活 run 收尾时已算好存在 run.planSummary；归档没有内存态，读事件重建）。
+   */
+  function archivedPlanSummary(run: StoredRun): string | undefined {
+    if (run.mode !== "plan") return undefined;
+    let planEvent: Record<string, unknown> | undefined;
+    let resultEvent: Record<string, unknown> | undefined;
+    for (const e of run.events) {
+      const ev = e.event as Record<string, unknown>;
+      if (ev.type === "plan") planEvent = ev;
+      else if (ev.type === "plan_result") resultEvent = ev;
+    }
+    return buildPlanSummary({
+      task: run.task,
+      stopReason: run.mainStopReason,
+      subtasks: Array.isArray(planEvent?.subtasks) ? (planEvent!.subtasks as PlanSummarySubtask[]) : [],
+      steps: Array.isArray(resultEvent?.steps) ? (resultEvent!.steps as PlanSummaryStep[]) : [],
+      skipped: Array.isArray(resultEvent?.skipped) ? (resultEvent!.skipped as { id: string; title?: string }[]) : [],
+      completed: resultEvent?.completed === true,
+      plannerFailure: typeof resultEvent?.plannerFailure === "string" ? resultEvent.plannerFailure : undefined,
+    });
   }
 
   /**
@@ -1931,12 +2062,19 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    * 归档续跑不是“有 checkpoint 字段就放行”。当前宿主仍是安全边界：
    * 工作目录必须还在白名单内、领域包必须仍然存在、旧/新两套总预算都不能
    * 被重启绕过。返回值既供 API 409，也供列表提前算 canContinue。
+   *
+   * 会话中心化：核查 / 编排 / 无检查点**都不再是拒绝理由**——封的是裁决的
+   * 适用范围（它只对核查过的那一轮负责，事件流里带 judgedTurn），不是对话。
+   * 无检查点的归档派生出来的是一次"无正史的新一轮"（plan 归档以计划摘要为种子），
+   * 与活 run 上执行阶段就失败后再追问同一口径。
    */
+  /** 活 run 追加的唯一结构性阻断：执行谱系预算耗尽（检查点里的累计读数） */
+  function liveBudgetBlockReasonOf(r: StoredRun): string | null {
+    return r.checkpoint ? exhaustedBudgetReason(r.checkpoint.runBudget) : null;
+  }
+
   function archivedForkBlockReason(r: StoredRun): string | null {
     if (!r.archived) return "该运行不是归档运行";
-    if (r.verify) return "开启独立核查的归档不能派生续跑：追加会绕过已出具的裁决";
-    if (r.mode === "plan") return "计划编排的归档不能派生续跑：runPlanned 没有检查点续跑入口";
-    if (!r.checkpoint) return "该归档没有可恢复检查点（旧格式或主执行段未完整结束）";
     if (r.packName && !getPack(r.packName)) {
       return `归档使用的领域包 \"${r.packName}\" 在当前宿主中不存在`;
     }
@@ -1949,6 +2087,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     if (!allowedWorkdirs.includes(target)) {
       return `归档工作目录不在当前宿主白名单内：${target}`;
     }
+    if (!r.checkpoint) return null; // 无正史的新一轮：预算按当前宿主上限从零起算
     const budget = restoredBudget(r.checkpoint, { maxTotalTurns, maxTokensBudget });
     return exhaustedBudgetReason(budget);
   }
@@ -1958,16 +2097,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    * ——此前核查结论一列只有打开过的 run 才有值。
    */
   function runSummary(r: StoredRun): Record<string, unknown> {
-    const liveStructurallyContinuable =
-      !r.archived &&
-      r.status === "done" &&
-      !r.verify &&
-      r.mode !== "plan" &&
-      Boolean(r.loop && r.history?.length);
-    const liveBudgetBlockReason = liveStructurallyContinuable && r.checkpoint
-      ? exhaustedBudgetReason(r.checkpoint.runBudget)
-      : null;
-    const liveCanContinue = liveStructurallyContinuable && liveBudgetBlockReason === null;
+    // 会话中心化：活 run 只要收了尾就能追加——核查 / 编排 / 无正史都不是封印，
+    // 唯一的结构性阻断是执行谱系预算耗尽（且文案说清怎么提）。
+    const liveBudgetBlockReason = liveBudgetBlockReasonOf(r);
+    const liveCanContinue = !r.archived && r.status === "done" && liveBudgetBlockReason === null;
     const archiveBlockReason = r.archived ? archivedForkBlockReason(r) : null;
     const archiveCanFork = Boolean(r.archived && archiveBlockReason === null);
     // same-run 仅 interrupted（崩溃收口）+ checkpoint；完成态档案仍走 fork
@@ -1999,6 +2132,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       // 活 run 走 outcome，归档 run 走 meta 里的摘要——列表列不因重启而变
       finalPassed: r.outcome?.finalPassed ?? r.archivedOutcome?.finalPassed ?? null,
       reworks: r.outcome?.reworks ?? r.archivedOutcome?.reworks ?? null,
+      // 裁决只对它核查的那一轮负责：列表报最近一次裁决时必须带轮号，
+      // 否则"第 1 轮通过、第 3 轮没核查"会被读成"这场对话通过了"
+      verdictTurn: r.outcome ? (r.outcomeTurn ?? null) : (r.archivedOutcome?.judgedTurn ?? null),
       pendingApprovals: r.pendingApprovals.size,
       approvalGrants: {
         active: activeApprovalGrants,
@@ -2802,8 +2938,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       run.archiveWriter?.appendTranscriptSegment(segment);
       run.segmentIndex += 1;
       // V-28：留下会话正史，下一轮 runContinuation 要接在它后面。
-      // 只认主线（main）——verifier 是全新上下文的独立复核，它的正史不属于对话
-      if (source === "main" && event.result.messages?.length) {
+      // 只认执行者谱系（main / rework）——verifier 是全新上下文的独立复核，
+      // 它的正史不属于对话；返工段属于对话：返工后执行者手里的现状就是它
+      if (isExecutorLineageSource(source) && event.result.messages?.length) {
         run.history = event.result.messages;
         if (event.result.runBudget) {
           const fallbackContextTokens =
@@ -2831,7 +2968,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     // RUN-01：事件落盘后再迁游标（ADR 写序）。段起点 / 审批挂起 / 预算与 grant。
     if (
       event.type === "done" &&
-      source === "main" &&
+      isExecutorLineageSource(source) &&
       run.checkpoint?.runBudget &&
       run.durableState
     ) {
@@ -2958,11 +3095,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
     run.status = "done";
     run.finishedAt = Date.now();
-    const liveGrantCanContinue =
-      !run.verify &&
-      run.mode !== "plan" &&
-      Boolean(run.loop && run.history?.length) &&
-      !(run.checkpoint && exhaustedBudgetReason(run.checkpoint.runBudget));
+    // 会话中心化：只要这场对话还能继续（预算未耗尽），本次对话的放行规则就
+    // 留在 TTL 内——核查 / 编排 / 无正史都不再是"不可续跑"的理由
+    const liveGrantCanContinue = liveBudgetBlockReasonOf(run) === null;
     if (!liveGrantCanContinue && run.autoAllow?.size) {
       const at = approvalClock();
       for (const grant of run.autoAllow.values()) {
@@ -3030,7 +3165,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     // V-07：成本必须用 executionUsage（全部执行轮合计，含被否掉的中间轮）。
     // 前端此前用最后一条 done 的 usage——返工场景下那只是最后一轮，主轮与
     // verifier 的开销全部漏计。核查开销单独列出，口径不混。
-    const o = run.outcome;
+    // 会话中心化：run.outcome 是**最近一次核查过的那一轮**的结果；本轮没核查时
+    // run_end / 台账不得挂上一轮的裁决——那是拿旧裁决为新产物担保
+    const o = run.outcome && run.outcomeTurn === run.conversationTurn ? run.outcome : undefined;
     const verificationUsage = o
       ? o.verifications.reduce(
           (acc, v) => ({
@@ -3056,8 +3193,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             reworks: o.reworks,
             executionUsage: o.executionUsage,
             verificationUsage,
+            // 裁决只对它核查的那一轮负责——run_end 里的每条裁决都带轮号
+            judgedTurn: run.conversationTurn,
             verifications: o.verifications.map((v, i) => ({
               round: i,
+              judgedTurn: run.conversationTurn,
               verdict: v.verdict,
               usage: v.usage,
               raw: v.raw,
@@ -3181,38 +3321,113 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   }
 
   /**
-   * 追加一轮对话（V-28）。
-   *
-   * `AgentLoop.runContinuation` 早就存在——它是为返工的 inherit 模式建的，
-   * 文档字符串写着"在已有会话正史之上追加一条 user 反馈继续执行"。
-   * 也就是说多轮对话在 harness 层一直可行，只是 Web 宿主从没接。
-   *
-   * 每段 maxTurns 重新起算；AGENT_TOTAL_MAX_TURNS / AGENT_TOTAL_TOKEN_BUDGET
-   * 绑定在同一个 AgentLoop 上累计，不会被追加对话重置。
+   * 本轮交给执行者的完整反馈 = 委托方这句话 + 它需要知道的上下文：
+   *   · 上一轮若核查过 → 附裁决摘要（执行者要知道刚才被判了什么，正史里没有它）；
+   *   · 无正史可续（执行阶段就失败 / 计划编排）→ 附原任务或计划摘要作开局背景。
+   * 委托方的原话原样在最前面；事件流里 user_message 只记原话，附加段是宿主的装配。
    */
-  async function startContinuation(run: StoredRun, feedback: string): Promise<void> {
-    const loop = run.loop;
-    const history = run.history;
-    if (!loop || !history) return;
+  function composeTurnFeedback(
+    run: StoredRun,
+    feedback: string,
+    previousTurn: number,
+    history: Anthropic.MessageParam[] | undefined,
+  ): string {
+    const parts = [feedback];
+    const lastVerdict = run.outcome?.verifications.at(-1)?.verdict;
+    if (lastVerdict && run.outcomeTurn === previousTurn) {
+      parts.push(verdictFeedbackSummary(lastVerdict, previousTurn));
+    }
+    if (!history) {
+      const seed = run.planSummary ?? archivedPlanSummary(run);
+      parts.push(
+        seed ??
+          `【对话背景】本对话此前的任务：${run.task}\n上一轮没有留下可续的执行正史（执行阶段即失败），本轮从头开始；工作目录里可能已有部分产物，请据实核对。`,
+      );
+    }
+    return parts.join("\n\n");
+  }
+
+  /**
+   * 追加一轮对话（V-28 → 会话中心化）。
+   *
+   * `AgentLoop.runContinuation` 早就存在——它是为返工的 inherit 模式建的；多轮
+   * 对话在 harness 层一直可行，只是 Web 宿主从没接。现在的语义（委托方拍板）：
+   *   · **error 只结束这一轮**，不结束对话——没正史就从头开一轮，不再 409；
+   *   · **核查 / 编排是逐轮选项**，不是 run 级封印：核查过的轮次续跑接执行者
+   *     最后一段（返工过就接返工段）的正史，裁决留在事件流里带 judgedTurn；
+   *     plan run 以计划摘要为种子按单执行者继续（续的是对话，不是 DAG）；
+   *   · 每轮可选是否核查（缺省沿用上一轮）；核查者仍是全新上下文。
+   *
+   * 每轮**新建** AgentLoop：预算与 Context 水位从检查点延续（fork / 同 run 热恢复
+   * 同一口径），单段 maxTurns 重新起算，AGENT_TOTAL_* 沿执行谱系累计不重置。
+   */
+  async function startConversationTurn(
+    run: StoredRun,
+    feedback: string,
+    turn: { verify: boolean },
+  ): Promise<void> {
+    const previousTurn = run.conversationTurn;
+    const history = run.history?.length ? run.history : undefined;
 
     run.status = "running";
     delete run.finishedAt;
     run.conversationTurn += 1;
+    run.verify = turn.verify;
+    // 上一轮按了停止的话 abort 位还立着；新一轮是新的决定，要新的闸
+    const abort = new AbortController();
+    run.abort = abort;
+    // 终态 → executing：state.json 在两轮之间说"这一轮完了"，新一轮显式 reopen
+    applyDurableTransition(run, { type: "reopen" });
     persistMeta(run); // 追加轮开始也要进档案：轮数与"回到运行中"都是状态
 
-    // 追加的这句话本身要进事件流：它是会话的一部分，也是"这一段为什么开始"的解释
+    // 追加的这句话本身要进事件流：它是会话的一部分，也是"这一段为什么开始"的解释。
+    // verify 是本轮的核查设置（前端 reducer 据此判断 done 是不是 run 终止）；
+    // continues 说清这一轮接的是什么：正史 / 计划摘要 / 从头
     pushSyntheticEvent(run, "host", {
       type: "user_message",
       turn: run.conversationTurn,
       text: feedback,
+      verify: turn.verify,
+      continues: history ? "history" : run.mode === "plan" ? "plan-summary" : "fresh",
       at: Date.now(),
     });
     broadcastLifecycle("run_updated", run);
 
-    // finalizeRun 已把上一段的 broker 从 run 上摘除并启动回收。续跑保留同一个
-    // AgentLoop（从而保留 ContextManager 与累计预算），但执行器必须在模型可能
-    // 发出下一条 bash tool_use 之前换成一个经过强制探针的新 broker。否则它会
-    // 继续持有已 dispose 的旧实例，既错误失败，也绕过本段的 workdir canary。
+    // 预算与水位从检查点延续（旧上限与当前上限取更严格者——续跑不能成为洗掉总账的办法）
+    if (run.checkpoint) {
+      run.resumeBudget = restoredBudget(run.checkpoint, { maxTotalTurns, maxTokensBudget });
+      run.initialContextInputTokens = run.checkpoint.contextInputTokens;
+    }
+    await executeTurn(run, {
+      history,
+      feedback,
+      executorFeedback: composeTurnFeedback(run, feedback, previousTurn, history),
+      verify: turn.verify,
+      signal: abort.signal,
+    });
+  }
+
+  /**
+   * 一轮执行的公共尾部——同进程追加 / 归档派生 / 同 run 热恢复三条入口共用：
+   * 装配（MCP / 准入探针 / 配置）→ 核查轮或普通轮 → 收尾。
+   * 调用方已把本轮的 user_message 与谱系事件推进事件流、把 run 置为 running。
+   *
+   * finalizeRun 已把上一段的 broker 从 run 上摘除并启动回收；本轮由 buildRunConfig
+   * 绑一个经过强制探针的新 broker，不复用已 dispose 的旧实例。
+   */
+  async function executeTurn(
+    run: StoredRun,
+    turn: {
+      history: Anthropic.MessageParam[] | undefined;
+      /** 委托方原话——核查者的核查对象 */
+      feedback: string;
+      /** 交给执行者的完整输入（原话 + 裁决摘要 / 开局背景） */
+      executorFeedback: string;
+      verify: boolean;
+      signal: AbortSignal;
+    },
+  ): Promise<void> {
+    await ensureMcp();
     if (!(await pushRunConfig(run))) {
       finalizeRun(run, {
         outcome: "error",
@@ -3221,12 +3436,26 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       });
       return;
     }
-    loop.setExecutionBroker(run.executionBroker);
+    const cfg = await buildRunConfig(run);
 
+    if (turn.verify) {
+      // 核查者核查的是本轮指令（原任务只作背景）；执行者在正史上续跑或从头开一轮
+      await runVerifiedTurn(run, cfg, continuationVerifyTask(run.task, turn.feedback), {
+        ...(turn.history ? { history: turn.history } : {}),
+        feedback: turn.executorFeedback,
+      });
+      return;
+    }
+
+    const loop = new AgentLoop(cfg, modelClient);
+    run.loop = loop;
     let mainStopReason: string | undefined;
     let mainError: string | null = null;
     try {
-      for await (const event of loop.runContinuation(history, feedback, run.abort?.signal)) {
+      const events = turn.history
+        ? loop.runContinuation(turn.history, turn.executorFeedback, turn.signal)
+        : loop.run(turn.executorFeedback, turn.signal);
+      for await (const event of events) {
         if (event.type === "done") {
           mainStopReason = event.result.stopReason;
           if (event.result.stopReason === "error" && event.result.error) {
@@ -3243,7 +3472,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         type: "done",
         stopReason: "error",
         error: { name: "Error", message: errorMsg },
-        messageCount: 0,
+        messageCount: turn.history?.length ?? 0,
         usage: { inputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputTokens: 0, turns: 0, cacheHitRatio: 0 },
       });
     } finally {
@@ -3266,6 +3495,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     run: StoredRun,
     feedback: string,
     parentApprovalGrants: readonly ArchivedApprovalGrant[] = [],
+    turn: { verify: boolean } = { verify: false },
   ): Promise<void> {
     const history = run.history;
     const inheritedBudget = run.resumeBudget;
@@ -3322,81 +3552,50 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       type: "user_message",
       turn: run.conversationTurn,
       text: feedback,
+      verify: turn.verify,
+      continues: "history",
       at: Date.now(),
     });
     broadcastLifecycle("run_updated", run);
 
-    await ensureMcp();
-    if (!(await pushRunConfig(run))) {
-      finalizeRun(run, {
-        outcome: "error",
-        mainStopReason: "execution_unavailable",
-        error: ledgerErrorClass("execution_unavailable"),
-      });
-      return;
-    }
-    const cfg = await buildRunConfig(run);
-    const loop = new AgentLoop(cfg, modelClient);
-    run.loop = loop;
-
-    let mainStopReason: string | undefined;
-    let mainError: string | null = null;
-    try {
-      for await (const event of loop.runContinuation(history, feedback, run.abort?.signal)) {
-        if (event.type === "done") {
-          mainStopReason = event.result.stopReason;
-          if (event.result.stopReason === "error" && event.result.error) {
-            mainError = ledgerErrorClass(event.result.error);
-          }
-        }
-        pushEvent(run, "main", event);
-      }
-    } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : String(err);
-      mainStopReason = "error";
-      mainError = ledgerErrorClass(err);
-      pushSyntheticEvent(run, "main", {
-        type: "done",
-        stopReason: "error",
-        error: { name: "Error", message: errorMsg },
-        messageCount: history.length,
-        usage: { inputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputTokens: 0, turns: 0, cacheHitRatio: 0 },
-        runBudget: { ...inheritedBudget },
-        contextInputTokens: run.initialContextInputTokens ?? 0,
-      });
-    } finally {
-      finalizeRun(run, {
-        outcome: runOutcomeForStopReason(mainStopReason),
-        ...(mainStopReason ? { mainStopReason } : {}),
-        ...(mainError || mainStopReason === "error" ? { error: mainError ?? ledgerErrorClass("error") } : {}),
-      });
-    }
+    await executeTurn(run, {
+      history,
+      feedback,
+      executorFeedback: feedback,
+      verify: turn.verify,
+      signal: run.abort?.signal ?? new AbortController().signal,
+    });
   }
 
   /**
-   * 从磁盘检查点派生一次续跑。
+   * 从磁盘档案派生一次续跑。
    *
    * 这不是把 archived run “复活”：父档案没有 loop/AbortController，也不应再
    * 接收事件。新 run 只继承可序列化的会话正史、上下文水位、累计预算与任务
    * 装配选择；模型/工具/策略取当前宿主，审批放行与 ask_user 已用配额全部重置。
+   *
+   * 会话中心化：父档案没有检查点（执行阶段就失败 / 计划编排 / 旧格式）时也能派生
+   * ——子 run 以"无正史的新一轮"开局（plan 父档案以计划摘要为种子），预算按当前
+   * 宿主上限从零起算；run_forked 事件里 checkpoint 为 null，照实说没继承正史。
    */
   async function startForkedContinuation(
     run: StoredRun,
     feedback: string,
     parentApprovalGrants: readonly ArchivedApprovalGrant[] = [],
+    turn: { verify: boolean; seed?: string } = { verify: false },
   ): Promise<void> {
-    const history = run.history;
+    const history = run.history?.length ? run.history : undefined;
     const inheritedBudget = run.resumeBudget;
-    if (!history?.length || !inheritedBudget || !run.continuedFrom) {
+    if (!run.continuedFrom || (history && !inheritedBudget)) {
       pushSyntheticEvent(run, "host", {
         type: "run_fork_failed",
-        reason: "派生 run 缺少正史、预算或父级标识",
+        reason: "派生 run 缺少父级标识，或有正史却缺预算快照",
         at: Date.now(),
       });
       finalizeRun(run, {
         outcome: "error",
         mainStopReason: "error",
-        error: ledgerErrorClass("派生 run 缺少正史、预算或父级标识"),
+        error: ledgerErrorClass("派生 run 缺少父级标识，或有正史却缺预算快照"),
       });
       return;
     }
@@ -3409,12 +3608,16 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       type: "run_forked",
       parentRunId: run.continuedFrom,
       rootRunId: run.rootRunId ?? run.continuedFrom,
-      boundary: "从归档检查点派生新运行；会话正史与累计预算延续，模型、工具和策略使用当前宿主，父档案保持只读。",
-      checkpoint: {
-        conversationTurn: run.conversationTurn - 1,
-        contextInputTokens: run.initialContextInputTokens ?? 0,
-        runBudget: { ...inheritedBudget },
-      },
+      boundary: history
+        ? "从归档检查点派生新运行；会话正史与累计预算延续，模型、工具和策略使用当前宿主，父档案保持只读。"
+        : "从无检查点的归档派生新运行：没有可续的执行正史，本轮从头开始（以原任务/计划摘要为背景）；预算按当前宿主上限从零起算，父档案保持只读。",
+      checkpoint: history && inheritedBudget
+        ? {
+            conversationTurn: run.conversationTurn - 1,
+            contextInputTokens: run.initialContextInputTokens ?? 0,
+            runBudget: { ...inheritedBudget },
+          }
+        : null,
       reset: ["审批放行规则", "挂起交互", "ask_user 已用配额"],
       at: Date.now(),
     });
@@ -3439,55 +3642,26 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       type: "user_message",
       turn: run.conversationTurn,
       text: feedback,
+      verify: turn.verify,
+      continues: history ? "history" : turn.seed ? "plan-summary" : "fresh",
       at: Date.now(),
     });
     broadcastLifecycle("run_updated", run);
 
-    await ensureMcp();
-    if (!(await pushRunConfig(run))) {
-      finalizeRun(run, {
-        outcome: "error",
-        mainStopReason: "execution_unavailable",
-        error: ledgerErrorClass("execution_unavailable"),
-      });
-      return;
-    }
-    const cfg = await buildRunConfig(run);
-    const loop = new AgentLoop(cfg, modelClient);
-    run.loop = loop;
-
-    let mainStopReason: string | undefined;
-    let mainError: string | null = null;
-    try {
-      for await (const event of loop.runContinuation(history, feedback, run.abort?.signal)) {
-        if (event.type === "done") {
-          mainStopReason = event.result.stopReason;
-          if (event.result.stopReason === "error" && event.result.error) {
-            mainError = ledgerErrorClass(event.result.error);
-          }
-        }
-        pushEvent(run, "main", event);
-      }
-    } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : String(err);
-      mainStopReason = "error";
-      mainError = ledgerErrorClass(err);
-      pushSyntheticEvent(run, "main", {
-        type: "done",
-        stopReason: "error",
-        error: { name: "Error", message: errorMsg },
-        messageCount: history.length,
-        usage: { inputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputTokens: 0, turns: 0, cacheHitRatio: 0 },
-        runBudget: { ...inheritedBudget },
-        contextInputTokens: run.initialContextInputTokens ?? 0,
-      });
-    } finally {
-      finalizeRun(run, {
-        outcome: runOutcomeForStopReason(mainStopReason),
-        ...(mainStopReason ? { mainStopReason } : {}),
-        ...(mainError || mainStopReason === "error" ? { error: mainError ?? ledgerErrorClass("error") } : {}),
-      });
-    }
+    // 无正史的派生：执行者得知道这场对话此前是什么（计划摘要 / 原任务）
+    const executorFeedback = history
+      ? feedback
+      : `${feedback}\n\n${
+          turn.seed ??
+          `【对话背景】本对话此前的任务：${run.task}\n上一轮没有留下可续的执行正史，本轮从头开始；工作目录里可能已有部分产物，请据实核对。`
+        }`;
+    await executeTurn(run, {
+      history,
+      feedback,
+      executorFeedback,
+      verify: turn.verify,
+      signal: run.abort?.signal ?? new AbortController().signal,
+    });
   }
 
   /**
@@ -3691,6 +3865,34 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           savedMs: Math.max(0, stepSum - subtaskWall),
         },
       });
+
+      // 会话中心化：下一轮对话的种子——续的是对话，不是 DAG。与归档重建走同一个纯函数。
+      run.planSummary = buildPlanSummary({
+        task: run.task,
+        stopReason: mainStopReason,
+        subtasks: (outcome.plan?.subtasks ?? []).map((t) => ({
+          id: t.id, title: t.title, pack: t.pack ?? null, description: t.description,
+        })),
+        steps: outcome.steps.map((st) => ({
+          id: st.sub.id,
+          title: st.sub.title,
+          pack: st.sub.pack ?? null,
+          passed: st.result.finalPassed,
+          reworks: st.result.reworks,
+          stopReason: st.result.main.stopReason,
+          completion: st.result.main.completion
+            ? { summary: st.result.main.completion.summary, artifacts: st.result.main.completion.artifacts }
+            : null,
+          verdict: st.result.verifications.at(-1)?.verdict ?? null,
+        })),
+        skipped: outcome.skipped.map((t) => ({ id: t.id, title: t.title })),
+        completed: outcome.completed,
+        plannerFailure: outcome.planOutcome.failureSummary,
+      });
+      // 全部子任务共用一份执行总账（planExecutionBudget）；任一步的收尾快照就是
+      // 整场编排的累计读数——下一轮单执行者从这里接着记，续跑不重置总账
+      const planBudget = outcome.steps.at(-1)?.result.main.runBudget;
+      if (planBudget) run.resumeBudget = { ...planBudget };
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
       // 计划被否决不是失败，是决定——单独一个终止原因，不混进 error。
@@ -3709,6 +3911,17 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         ...(err instanceof PlanRejectedError ? { reason: errorMsg } : {}),
         messageCount: 0,
         usage: { inputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputTokens: 0, turns: 0, cacheHitRatio: 0 },
+      });
+      // 编排没跑起来（计划被否 / 宿主级异常）也要留下对话种子：下一轮从头开一轮，
+      // 但执行者得知道"之前那次编排为什么没成"
+      run.planSummary = buildPlanSummary({
+        task: run.task,
+        stopReason: mainStopReason,
+        subtasks: [],
+        steps: [],
+        skipped: [],
+        completed: false,
+        plannerFailure: err instanceof PlanRejectedError ? errorMsg : `编排异常终止：${errorMsg}`,
       });
     } finally {
       finalizeRun(run, {
@@ -3733,12 +3946,30 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     }
     applyDurableTransition(run, { type: "start" });
     const cfg = await buildRunConfig(run);
+    await runVerifiedTurn(run, cfg, run.task);
+  }
+
+  /**
+   * 跑一轮带核查的执行并收尾——首轮（task 即任务）与续跑轮（continuation 给正史与
+   * 本轮反馈，task 是 continuationVerifyTask 组好的核查任务书）共用。
+   *
+   * 裁决带 `judgedTurn`：核查是逐轮选项之后，一份裁决只对它核查的那一轮负责，
+   * 事件流里必须写明它判的是第几轮，否则第 1 轮的"通过"会被读成整场对话的通过。
+   */
+  async function runVerifiedTurn(
+    run: StoredRun,
+    cfg: AgentConfig,
+    task: string,
+    continuation?: VerifiedRunOptions["continuation"],
+  ): Promise<void> {
+    const judgedTurn = run.conversationTurn;
     let mainStopReason: string | undefined;
     let mainError: string | null = null;
     try {
-      const outcome = await runVerified(cfg, modelClient, run.task, {
+      const outcome = await runVerified(cfg, modelClient, task, {
         ...buildVerifyOptions(run),
         ...(run.abort ? { signal: run.abort.signal } : {}),
+        ...(continuation ? { continuation } : {}),
         onEvent: (source, event) => {
           // 只记主/返工段的终止原因：verifier 的 done 已被 orchestrate 压掉，
           // 这里取到的最后一个就是最终交付那一段的
@@ -3758,6 +3989,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           pushSyntheticEvent(run, "verifier", {
             type: "verification",
             round,
+            judgedTurn,
             verdict: vo.verdict,
             usage: vo.usage,
             // 裁决是怎么拿到的（direct/wrapup/reformat/failed）——让 fail-closed
@@ -3767,10 +3999,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         },
       });
       run.outcome = outcome;
+      run.outcomeTurn = judgedTurn;
       // 追加 verdict 合成事件（末轮裁决，保持既有契约）
       const lastVerdict = outcome.verifications.at(-1)?.verdict;
       if (lastVerdict) {
-        pushSyntheticEvent(run, "verifier", { type: "verdict", verdict: lastVerdict });
+        pushSyntheticEvent(run, "verifier", { type: "verdict", judgedTurn, verdict: lastVerdict });
       }
       if (!mainStopReason) mainStopReason = outcome.main.stopReason;
       if (mainStopReason === "error" && !mainError && outcome.main.error) {
@@ -4714,10 +4947,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         const run = runs.get(route.runId);
         if (!run) return notFound(res, `Run not found: ${route.runId}`);
 
-        // 边界要说清，不能含糊地失败：
-        //  · 运行中不接受追加——两条指令并发进同一个会话会互相踩
-        //  · live run 复用原 loop；archived run 只能从检查点派生新 run
-        //  · 核查/编排都没有安全的续跑入口，不能绕过裁决或调度重新接主线
+        // 会话中心化（委托方："对话一出错就只能新开，为什么不能一直用"）：
+        // 一场对话只会被两件事挡住——**这一轮还在跑**，或**执行谱系预算耗尽**
+        // （文案说清哪个预算、怎么提）。核查 / 编排 / 执行阶段就失败 / 归档无
+        // 检查点，都不再是 409：封的是裁决的适用范围（裁决带 judgedTurn 只对它
+        // 核查的那一轮负责），不是对话本身。归档仍受宿主边界约束（包 / 白名单 / 预算）。
         if (run.archived) {
           const blockReason = archivedForkBlockReason(run);
           if (blockReason) return json(res, 409, { error: blockReason });
@@ -4725,22 +4959,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           if (run.status === "running") {
             return json(res, 409, { error: "运行进行中，请等它这一轮结束再追加指令" });
           }
-          if (run.mode === "plan") {
-            return json(res, 409, {
-              error: "计划编排的运行不支持追加指令：runPlanned 每次都从拆解开始，没有续跑入口",
-            });
-          }
-          if (run.verify) {
-            return json(res, 409, {
-              error: "开启独立核查的运行不支持追加指令：runVerified 无续跑入口，追加会绕过已出具的裁决",
-            });
-          }
-          if (!run.loop || !run.history?.length) {
-            return json(res, 409, { error: "该运行没有可续跑的会话正史（可能是执行阶段就失败了）" });
-          }
-          const budgetBlockReason = run.checkpoint
-            ? exhaustedBudgetReason(run.checkpoint.runBudget)
-            : null;
+          const budgetBlockReason = liveBudgetBlockReasonOf(run);
           if (budgetBlockReason) return json(res, 409, { error: budgetBlockReason });
         }
 
@@ -4750,7 +4969,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         } catch (error) {
           return requestBodyFailure(res, error);
         }
-        let parsed: { text?: string };
+        let parsed: { text?: string; verify?: unknown };
         try {
           parsed = JSON.parse(body);
         } catch {
@@ -4759,7 +4978,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         if (!parsed.text || typeof parsed.text !== "string" || !parsed.text.trim()) {
           return badRequest(res, 'Missing or invalid "text" field');
         }
+        // 逐轮核查开关：缺省沿用这个 run 上一轮的设置；非布尔值当场拒绝，不静默降级（V-24 口径）
+        if (parsed.verify !== undefined && typeof parsed.verify !== "boolean") {
+          return badRequest(res, '"verify" 必须是布尔值');
+        }
         const feedback = parsed.text.trim();
+        const turnVerify = typeof parsed.verify === "boolean" ? parsed.verify : run.verify;
         // 状态门在 readBody 之前查过一次——await 期间另一条并发 followUp 可能
         // 已把 run 置回 running。不复查的话同一 AgentLoop 会被两条 continuation
         // 并发驱动（资源门因同 holder 幂等恰好拦不住），先收尾的一段还会把
@@ -4785,15 +5009,21 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         if (run.archived) {
           try {
             await hydrateArchive(run);
-            const history = archivedCheckpointHistory(run);
-            const checkpoint = run.checkpoint!;
-            if (!history) {
+            const checkpoint = run.checkpoint;
+            // 有检查点就必须能读回正史——读不回是档案损坏，不能静默降级成"从头开一轮"
+            // 冒充续跑；没检查点则光明正大地开一轮无正史的新对话轮
+            const history = checkpoint ? archivedCheckpointHistory(run) : undefined;
+            if (checkpoint && !history) {
               return json(res, 409, {
-                error: `归档检查点损坏：transcript 中找不到 main 段 ${checkpoint.segmentIndex}`,
+                error: `归档检查点损坏：transcript 中找不到执行者段 ${checkpoint.segmentIndex}`,
               });
             }
+            const planSeed = archivedPlanSummary(run);
+            const nextTurn = (checkpoint?.conversationTurn ?? run.conversationTurn) + 1;
 
             const preferSameRun = Boolean(
+              checkpoint &&
+              history &&
               run.durableState &&
                 canSameRunResume({
                   phase: run.durableState.phase,
@@ -4804,7 +5034,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
                 }),
             );
 
-            if (preferSameRun) {
+            if (preferSameRun && checkpoint && history) {
               // Phase 2：同 runId 复活——追加原目录，不派生 child
               const resumePack = run.packName ? getPack(run.packName) : pack;
               const resumeResources = resumePack?.resources ?? [];
@@ -4816,6 +5046,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
               delete run.archived;
               run.status = "running";
               delete run.finishedAt;
+              run.verify = turnVerify;
               run.abort = new AbortController();
               run.history = history;
               run.resumeBudget = restoredBudget(checkpoint, { maxTotalTurns, maxTokensBudget });
@@ -4835,13 +5066,13 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
                 operationalLog("info", "run_started", {
                   runId: run.id,
                   mode: "single",
-                  verify: false,
+                  verify: turnVerify,
                   continuation: "same-run",
                 });
               }
               broadcastLifecycle("run_updated", run);
               void withFallbackAttribution(run, () =>
-                startSameRunResume(run, feedback, run.archivedApprovalGrantAudit ?? []),
+                startSameRunResume(run, feedback, run.archivedApprovalGrantAudit ?? [], { verify: turnVerify }),
               );
               return json(res, 200, {
                 runId: run.id,
@@ -4867,7 +5098,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
               // 子 run 仍是同一项任务；新增指令由 user_message 事件精确记录。
               task: run.task,
               status: "running",
-              verify: false,
+              // 逐轮核查设置随对话走：缺省沿用父档案上一轮的设置
+              verify: turnVerify,
               createdAt: Date.now(),
               events: [],
               pendingApprovals: new Map(),
@@ -4876,14 +5108,21 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
               sseClients: new Set(),
               segmentIndex: 0,
               transcript: [],
-              conversationTurn: checkpoint.conversationTurn + 1,
+              conversationTurn: nextTurn,
               toolTally: {},
               abort: new AbortController(),
-              history,
+              ...(history ? { history } : {}),
               continuedFrom: run.id,
               rootRunId,
-              resumeBudget: restoredBudget(checkpoint, { maxTotalTurns, maxTokensBudget }),
-              initialContextInputTokens: checkpoint.contextInputTokens,
+              // 有检查点：正史/预算/水位延续；无检查点：无正史新一轮，预算按当前上限从零起算
+              ...(checkpoint
+                ? {
+                    resumeBudget: restoredBudget(checkpoint, { maxTotalTurns, maxTokensBudget }),
+                    initialContextInputTokens: checkpoint.contextInputTokens,
+                  }
+                : {}),
+              // 子 run 是单执行者对话（plan 父档案的计划摘要作种子，不再重跑 DAG）
+              ...(planSeed ? { planSummary: planSeed } : {}),
               // 继承任务选择，不继承任何活权限状态；模型/工具由 buildConfig 取当前宿主。
               ...(run.packName ? { packName: run.packName } : {}),
               ...(run.effort ? { effort: run.effort } : {}),
@@ -4905,13 +5144,16 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
               operationalLog("info", "run_started", {
                 runId: id,
                 mode: "single",
-                verify: false,
+                verify: turnVerify,
                 continuation: "fork",
               });
             }
             broadcastLifecycle("run_created", child);
             void withFallbackAttribution(child, () =>
-              startForkedContinuation(child, feedback, run.archivedApprovalGrantAudit ?? []),
+              startForkedContinuation(child, feedback, run.archivedApprovalGrantAudit ?? [], {
+                verify: turnVerify,
+                ...(planSeed ? { seed: planSeed } : {}),
+              }),
             );
             return json(res, 200, {
               runId: id,
@@ -4927,9 +5169,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         }
 
         // 追问续跑重启执行：finalize 时已释放的资源要重新占——否则另一个持有
-        // 同资源的 run 与本次续跑会同时上探针
+        // 同资源的 run 与本次续跑会同时上探针。plan run 的后续轮按单执行者跑，
+        // 资源也按包声明整占（不再是调度器按子任务粒度管）
         const resumePack = run.packName ? getPack(run.packName) : pack;
-        const resumeResources = run.mode === "plan" ? [] : (resumePack?.resources ?? []);
+        const resumeResources = resumePack?.resources ?? [];
         if (acquireRunResources(res, run.id, resumeResources) === "refused") {
           releaseAdmission();
           return;
@@ -4940,12 +5183,21 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           return;
         }
         if (resumeResources.length) run.heldResources = resumeResources;
-        // startContinuation 在第一个 await 之前就把轮数加过了，这里不能再 +1
-        void withFallbackAttribution(run, () => startContinuation(run, feedback));
+        if (realHost) {
+          operationalLog("info", "run_started", {
+            runId: run.id,
+            mode: run.mode ?? "single",
+            verify: turnVerify,
+            continuation: "same",
+          });
+        }
+        // startConversationTurn 在第一个 await 之前就把轮数加过了，这里不能再 +1
+        void withFallbackAttribution(run, () => startConversationTurn(run, feedback, { verify: turnVerify }));
         releaseAdmission();
         return json(res, 200, {
           runId: run.id,
           conversationTurn: run.conversationTurn,
+          verify: turnVerify,
           continuationMode: "same",
           run: runSummary(run),
         });

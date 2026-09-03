@@ -1215,6 +1215,51 @@ describe("R-03 无需展开下钻面即可判断结果", () => {
   });
 
   /**
+   * 会话中心化：核查是逐轮选项，一场对话可能有多轮裁决。裁决必须**落回它出炉的
+   * 位置**并标明判的是第几轮——全堆在末尾会把第 1 轮的通过画在第 2 轮指令之后，
+   * 读成整场对话通过了。这是渲染锁（host-lags 纪律：新字段 judgedTurn 三处同提交）。
+   */
+  it("多轮对话里的裁决按出炉位置排、带「判第 N 轮对话」标签；同 round 不同轮的键不撞", () => {
+    let s = createInitialState("run-mt", "任务", true);
+    s = reduceEvents(s, [
+      sse(0, "main", "turn_start", { turn: 1 }),
+      sse(1, "main", "assistant_text", { text: "第一轮做完" }),
+      sse(2, "main", "done", { stopReason: "completed", usage: { turns: 1 } }),
+      sse(3, "verifier", "verification", {
+        round: 0, judgedTurn: 1,
+        verdict: { passed: true, issues: [], unverified: [], advisory: [], summary: "第一轮一致" },
+      }),
+      sse(4, "host", "run_end", { stopReason: "completed" }),
+      sse(5, "host", "user_message", { turn: 2, text: "再改一点", verify: true, continues: "history" }),
+      sse(6, "main", "assistant_text", { text: "第二轮做完" }),
+      sse(7, "main", "done", { stopReason: "completed", usage: { turns: 1 } }),
+      sse(8, "verifier", "verification", {
+        round: 0, judgedTurn: 2,
+        verdict: { passed: false, issues: ["第二轮缺一项"], unverified: [], advisory: [], summary: "第二轮未通过" },
+      }),
+      sse(9, "host", "run_end", { stopReason: "completed" }),
+    ]);
+    const items = deriveChatItems(s, null);
+    const kinds = items.map((it) => `${it.kind}${it.kind === "verdict" ? `@${it.judgedTurn}` : it.kind === "user" ? `:${it.text}` : ""}`);
+    const firstVerdict = kinds.indexOf("verdict@1");
+    const secondUser = kinds.indexOf("user:再改一点");
+    const secondVerdict = kinds.indexOf("verdict@2");
+    expect(firstVerdict, "第 1 轮裁决必须存在").toBeGreaterThan(0);
+    expect(firstVerdict, "第 1 轮裁决要排在第 2 轮指令之前").toBeLessThan(secondUser);
+    expect(secondVerdict).toBeGreaterThan(secondUser);
+    // 键唯一：两轮 round 都是 0，键里必须带轮号
+    const keys = items.filter((it) => it.kind === "verdict").map((it) => it.key);
+    expect(new Set(keys).size).toBe(2);
+
+    renderRunDetail(s, { activeTab: "loop", harness: null });
+    const tags = [...document.querySelectorAll(".chat-verdict-turn")];
+    expect(tags.map((t) => t.getAttribute("data-judged-turn"))).toEqual(["1", "2"]);
+    expect(tags[0]!.textContent).toContain("判第 1 轮对话");
+    // 追加指令旁标出本轮核查与轮号
+    expect(document.querySelector(".conversation")!.textContent).toContain("本轮核查");
+  });
+
+  /**
    * 反过来：**非正常收尾必须留着**。对话里只表现为"停了"，看不出是撞了轮数上限；
    * 而这几种各有各的下一步（六值分档的全部意义就在这个提示上）。
    */

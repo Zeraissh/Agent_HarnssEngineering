@@ -425,15 +425,30 @@ export function reduceEvent(state, sseEvent) {
   }
   if (type === "user_message") {
     // 追加的这句话既是会话内容，也标志 run 从终态回到运行中——
-    // 状态由事件本身驱动，客户端不必另写一套特判
+    // 状态由事件本身驱动，客户端不必另写一套特判。
+    // 会话中心化：核查是逐轮选项，事件带本轮的 verify——reducer 的 `state.verify`
+    // 从此是"当前这一轮核查不核查"，applySegmentDone 的单段快路径靠它判 done 是不是
+    // run 终止。不接这个字段，第 1 轮没核查、第 2 轮核查的 run 会在执行者 done 时被
+    // 判成结束，控制器随即关流，verifier 段与 run_end 全部收不到（V-01 那条缝的第三个现身）
     return {
       ...state,
       status: "running",
       runEnd: null,
       stopReason: null,
       error: null,
+      ...(typeof event.verify === "boolean" ? { verify: event.verify } : {}),
       conversationTurn: Number(event.turn ?? state.conversationTurn + 1),
-      timeline: [...state.timeline, { seq, source, type: "user_message", text: String(event.text ?? ""), turn: Number(event.turn ?? 0) }],
+      timeline: [
+        ...state.timeline,
+        {
+          seq, source, type: "user_message",
+          text: String(event.text ?? ""),
+          turn: Number(event.turn ?? 0),
+          ...(typeof event.verify === "boolean" ? { verify: event.verify } : {}),
+          // 这一轮接的是什么：history / plan-summary / fresh（旧事件没有，缺省不显示）
+          ...(typeof event.continues === "string" ? { continues: event.continues } : {}),
+        },
+      ],
     };
   }
   if (type === "plan") {
@@ -583,7 +598,7 @@ export function reduceEvent(state, sseEvent) {
     return applyUsage(state, event);
   }
   if (type === "verification") {
-    return applyVerification(state, event);
+    return applyVerification(state, seq, event);
   }
 
   // 其余事件进入时间线
@@ -633,7 +648,7 @@ function applyUsage(state, event) {
 }
 
 /** 逐轮核查裁决（V-08）：中间轮的 issues 就是"为什么要返工"。@returns {RunState} */
-function applyVerification(state, event) {
+function applyVerification(state, seq, event) {
   const raw = /** @type {any} */ (event.verdict) ?? {};
   return {
     ...state,
@@ -641,6 +656,12 @@ function applyVerification(state, event) {
       ...state.verifications,
       {
         round: Number(event.round ?? state.verifications.length),
+        // 会话中心化：裁决只对它核查的那一轮负责——轮号与事件序号一起带走，
+        // 对话里才能把它放回它出炉的位置、并标明判的是第几轮
+        judgedTurn: Number.isFinite(Number(event.judgedTurn)) && event.judgedTurn !== undefined
+          ? Number(event.judgedTurn)
+          : null,
+        seq: typeof seq === "number" ? seq : null,
         // 裁决获得路径（第五次提醒：这是逐字段白名单投影，不列出就静默丢弃）
         recovery: event.recovery ? String(event.recovery) : null,
         verdict: {
@@ -949,6 +970,10 @@ function applyVerdict(state, event) {
       issues: Array.isArray(raw.issues) ? raw.issues.map(String) : [],
       unverified: Array.isArray(raw.unverified) ? raw.unverified.map(String) : [],
       advisory: Array.isArray(raw.advisory) ? raw.advisory.map(String) : [],
+      // 末轮裁决判的是第几轮对话（会话中心化）；旧事件流没有这个字段
+      ...(Number.isFinite(Number(event.judgedTurn)) && event.judgedTurn !== undefined
+        ? { judgedTurn: Number(event.judgedTurn) }
+        : {}),
     },
   };
 }
@@ -1035,6 +1060,10 @@ function applyRunEnd(state, event) {
         ? state.verifications
         : /** @type {any[]} */ (event.verifications).map((v, i) => ({
             round: Number(v.round ?? i),
+            judgedTurn: Number.isFinite(Number(v.judgedTurn)) && v.judgedTurn !== undefined
+              ? Number(v.judgedTurn)
+              : null,
+            seq: null,
             verdict: v.verdict,
             usage: v.usage ?? null,
           })),
@@ -1460,6 +1489,12 @@ export function deriveComposerMode({ info, localStatus, submitting, error } = {}
     workdir: info?.workdir ?? null,
     error: error ?? null,
     optionsEnabled: true,
+    /**
+     * 独立核查开关的逐模式契约（会话中心化：核查是**每一轮**的选项）。
+     * 新建：用户自己的选择，不动；追加：缺省沿用该 run 上一轮的设置（defaultChecked），
+     * 由 patchComposer 在**切到这个 run 时**套一次；运行中/提交中：禁用。
+     */
+    verifyToggle: { enabled: true, defaultChecked: null, label: "独立核查" },
   };
 
   // 提交在飞：服务端在 json(res) **之前**就广播了 run_created，于是列表先一步
@@ -1477,6 +1512,7 @@ export function deriveComposerMode({ info, localStatus, submitting, error } = {}
       note: "",
       canSubmit: false,
       optionsEnabled: false,
+      verifyToggle: { ...base.verifyToggle, enabled: false },
     };
   }
 
@@ -1523,10 +1559,18 @@ export function deriveComposerMode({ info, localStatus, submitting, error } = {}
       note: "运行进行中，等这一轮结束后可以追加指令；要现在开新任务请点左侧「+ 新建对话」。按「停止」会让它在下一次模型调用之前收手。",
       canSubmit: true,
       optionsEnabled: false,
+      verifyToggle: { ...base.verifyToggle, enabled: false },
     };
   }
 
   if (info.canContinue) {
+    // 追加轮的核查开关：缺省沿用该 run 上一轮的设置，可逐轮改（会话中心化）
+    const verifyToggle = { enabled: true, defaultChecked: Boolean(info.verify), label: "本轮独立核查" };
+    // 这一轮接的是什么，要让人看得见：有正史续正史；plan 以计划摘要开局；否则从头
+    const lineage =
+      info.mode === "plan"
+        ? "此前是计划编排：本轮以计划摘要为背景、按单执行者继续（续的是对话，不是重跑 DAG）。"
+        : "";
     if (info.continuationMode === "same-run") {
       return {
         ...base,
@@ -1540,6 +1584,7 @@ export function deriveComposerMode({ info, localStatus, submitting, error } = {}
           (info.durablePhase ? ` 崩溃相：${info.durablePhase}。` : ""),
         canSubmit: true,
         optionsEnabled: false,
+        verifyToggle,
       };
     }
     if (info.continuationMode === "fork") {
@@ -1549,10 +1594,13 @@ export function deriveComposerMode({ info, localStatus, submitting, error } = {}
         kind: "append",
         buttonLabel: "从归档继续",
         labelText: "续跑指令",
-        placeholder: "从归档检查点派生新运行继续…（Ctrl+Enter 发送）",
-        note: "将从检查点派生新运行：会话正史与总预算继续累计；模型、工具和策略使用当前宿主，父归档保持只读。",
+        placeholder: "从归档派生新运行继续…（Ctrl+Enter 发送）",
+        note:
+          "将从归档派生新运行：有检查点则会话正史与总预算继续累计，没有则从头开一轮；模型、工具和策略使用当前宿主，父归档保持只读。" +
+          lineage,
         canSubmit: true,
         optionsEnabled: false,
+        verifyToggle,
       };
     }
     return {
@@ -1562,12 +1610,16 @@ export function deriveComposerMode({ info, localStatus, submitting, error } = {}
       buttonLabel: "继续对话",
       labelText: "追加指令",
       placeholder: "追加一条指令，接着这次会话继续…（Ctrl+Enter 发送）",
-      // 轮次预算每轮重新起算，不说清楚用户会以为 maxTurns 是整场对话的总额
-      note: "续跑复用这次运行的装配（包 / 思考预算 / 工作目录 / 核查）；单段轮次预算每轮重新起算，总轮次 / token 预算沿执行谱系累计。",
+      // 轮次预算每轮重新起算，不说清楚用户会以为 maxTurns 是整场对话的总额。
+      // 裁决只对它核查的那一轮负责——续跑不会抹掉它，也不会让它替新一轮担保
+      note:
+        "续跑复用这次运行的装配（包 / 思考预算 / 工作目录）；是否核查按本轮开关；已出具的裁决留在对话里、只对它核查的那一轮负责。单段轮次预算每轮重新起算，总轮次 / token 预算沿执行谱系累计。" +
+        lineage,
       canSubmit: true,
-      // 装配项在续跑里**构造上无效**：startContinuation 只取 run.loop 与
-      // run.history，pack/effort/workdir/mode/rubric 一个都不读
+      // 装配项在续跑里**构造上无效**：续跑只取正史与检查点，pack/effort/workdir/
+      // mode/rubric 一个都不读——唯一逐轮可改的是核查开关（单列在 verifyToggle）
       optionsEnabled: false,
+      verifyToggle,
     };
   }
 
@@ -1590,22 +1642,34 @@ export function deriveComposerMode({ info, localStatus, submitting, error } = {}
   };
 }
 
-/** 不能追加的原因（V-28：不能只是"没有输入框"，要说为什么） */
+/**
+ * 不能追加的原因（V-28：不能只是"没有输入框"，要说为什么）。
+ *
+ * 会话中心化之后这里只剩两类：服务端按当前边界算出的阻断理由（活 run 唯一的是
+ * 执行谱系预算耗尽——文案里带 env 名与提法；归档还有包不存在 / 目录越权），
+ * 以及"服务端没给理由"的兜底。核查 / 编排 / 执行失败**不再是**理由：
+ * 旧文案「追加会绕过已出具的裁决」「没有续跑入口」「没有可续跑的会话正史」已退役，
+ * 裁决现在带轮号留在对话里、只对它核查的那一轮负责。
+ */
 function blockedReason(info) {
-  // B2：旧格式、预算耗尽、目录越权等阻断理由由服务端按当前宿主边界计算。
-  if (info.archived) {
-    return `这是只读归档，当前不能派生续跑：${info.continuationBlockReason || "没有可用的持久化检查点"}。`;
-  }
-  if (info.mode === "plan") {
-    return "计划编排的运行不支持追加：runPlanned 每次都从拆解开始，没有续跑入口。";
-  }
-  if (info.verify) {
-    return "开启独立核查的运行不支持追加：追加会绕过已出具的裁决。";
-  }
   if (info.continuationBlockReason) {
-    return `${info.continuationBlockReason}。`;
+    return `${info.archived ? "这是只读归档，当前不能派生续跑：" : ""}${info.continuationBlockReason}。`;
   }
-  return "这次运行没有可续跑的会话正史（可能执行阶段就失败了）。";
+  if (info.archived) {
+    return "这是只读归档，当前不能派生续跑（服务端未给出原因）。";
+  }
+  return "这次运行当前不能追加（服务端未给出原因）。";
+}
+
+/**
+ * 追加一轮的网络载荷（纯函数，与 buildNewRunRequest 同规格）。
+ * verify 是**本轮**的核查开关；未给时不发字段，服务端沿用该 run 上一轮的设置。
+ */
+export function buildFollowUpRequest({ text, verify }) {
+  return {
+    text: String(text ?? ""),
+    ...(typeof verify === "boolean" ? { verify } : {}),
+  };
 }
 
 /**
@@ -1767,7 +1831,6 @@ export function patchComposer(mode, root = document) {
    *    用户为下一次新建准备好的设置。禁用 + 一句说明比篡改用户的值诚实。
    */
   const knobs = [
-    q("#verify-toggle"),
     ...(q("#composer-scopebar")
       ? q("#composer-scopebar").querySelectorAll("input, select")
       : []),
@@ -1780,6 +1843,29 @@ export function patchComposer(mode, root = document) {
   }
   // 禁用一个正被聚焦的控件会让焦点掉回 body（后续按键全丢）。把它交还给输入框。
   if (!mode.optionsEnabled && active && knobs.includes(active) && input?.focus) input.focus();
+
+  /**
+   * 独立核查开关单独走（会话中心化：核查是每一轮的选项，追加轮它**进请求体**）。
+   * 缺省值只在**切到另一个 run 的追加模式时**套一次（data-verify-run 记着已经套过
+   * 哪个 run），之后由用户随意改——每次 syncComposer 都重套会把用户刚拨的开关拨回去。
+   * 回到新建模式时清掉记号，下次再选中同一个 run 会重新套它上一轮的设置。
+   */
+  const verify = q("#verify-toggle");
+  const toggle = mode.verifyToggle ?? { enabled: mode.optionsEnabled, defaultChecked: null, label: "独立核查" };
+  if (verify) {
+    setAttr(verify, "disabled", toggle.enabled ? null : "");
+    if (mode.kind === "append" && mode.runId && toggle.defaultChecked !== null) {
+      if (form?.dataset.verifyRun !== mode.runId) {
+        verify.checked = Boolean(toggle.defaultChecked);
+        if (form) form.dataset.verifyRun = mode.runId;
+      }
+    } else if (mode.kind === "new" && form?.dataset.verifyRun) {
+      delete form.dataset.verifyRun;
+    }
+    const caption = verify.closest?.("label")?.querySelector?.("span");
+    if (caption) setText(caption, toggle.label);
+    if (!toggle.enabled && active === verify && input?.focus) input.focus();
+  }
 }
 
 /**
@@ -2318,8 +2404,16 @@ function updateRunItem(el, r, metaMap, selectedRunId) {
   if (conclusion && marks[conclusion]) {
     setAttr(verdictEl, "hidden", null);
     verdictEl.innerHTML = `<i class="ph ${marks[conclusion]}" aria-hidden="true"></i>`;
-    setAttr(verdictEl, "aria-label", conclusion === "passed" ? "核查通过" : conclusion === "failed" ? "核查未通过" : "等待核查");
-    verdictEl.className = `run-item-verdict run-item-verdict--${conclusion === "passed" ? "pass" : conclusion === "failed" ? "fail" : "pending"}`;
+    // 裁决只对它核查的那一轮负责：列表列的裁决若不是最近一轮出的，标出轮号
+    // ——"第 1 轮通过、第 3 轮没核查"不能被读成"这场对话通过了"
+    const judged = Number(r.verdictTurn);
+    const turns = Number(r.conversationTurn ?? 1);
+    const stale = Number.isFinite(judged) && judged > 0 && judged < turns;
+    const base = conclusion === "passed" ? "核查通过" : conclusion === "failed" ? "核查未通过" : "等待核查";
+    setAttr(verdictEl, "aria-label", stale ? `${base}（判第 ${judged} 轮，此后未再核查）` : base);
+    setAttr(verdictEl, "title", stale ? `判第 ${judged} 轮对话；之后的轮次未核查` : null);
+    setAttr(verdictEl, "data-judged-turn", Number.isFinite(judged) && judged > 0 ? String(judged) : null);
+    verdictEl.className = `run-item-verdict run-item-verdict--${conclusion === "passed" ? "pass" : conclusion === "failed" ? "fail" : "pending"}${stale ? " run-item-verdict--stale" : ""}`;
   } else {
     setAttr(verdictEl, "hidden", "");
   }
@@ -4529,7 +4623,12 @@ export function deriveChatItems(state, live) {
     }
     switch (e.type) {
       case "user_message":
-        items.push({ kind: "user", text: e.text, seq: e.seq });
+        items.push({
+          kind: "user", text: e.text, seq: e.seq,
+          ...(e.turn ? { turn: e.turn } : {}),
+          ...(typeof e.verify === "boolean" ? { verify: e.verify } : {}),
+          ...(e.continues ? { continues: e.continues } : {}),
+        });
         break;
       case "assistant_thinking":
         if (e.text || e.redacted) {
@@ -4574,10 +4673,30 @@ export function deriveChatItems(state, live) {
     }
   }
 
-  // 裁决作为**这一段的收尾卡**排在末尾——它是对话的一部分，不是另一个页面
-  for (const v of state.verifications ?? []) {
-    items.push({ kind: "verdict", round: v.round, verdict: v.verdict, recovery: v.recovery ?? null });
+  /**
+   * 裁决是对话的一部分，不是另一个页面。会话中心化之后一场对话可能有多轮核查，
+   * 裁决必须落回**它出炉的位置**（按事件序号插进流里）并标明判的是第几轮——
+   * 全部堆在末尾会把第 1 轮的"通过"画在第 3 轮的指令后面，读成整场对话通过了。
+   * 没有序号的（旧事件流 / run_end 补齐）仍按老办法排在末尾。
+   */
+  const verdictItems = (state.verifications ?? []).map((v) => ({
+    kind: "verdict",
+    round: v.round,
+    judgedTurn: v.judgedTurn ?? null,
+    verdict: v.verdict,
+    recovery: v.recovery ?? null,
+    seq: typeof v.seq === "number" ? v.seq : null,
+  }));
+  const placed = verdictItems.filter((v) => v.seq !== null);
+  if (placed.length > 0) {
+    // 按 seq 插入：找到第一个序号更大的对话条目，插在它前面
+    for (const v of placed) {
+      const at = items.findIndex((it) => typeof it.seq === "number" && it.seq > v.seq);
+      if (at < 0) items.push(v);
+      else items.splice(at, 0, v);
+    }
   }
+  for (const v of verdictItems.filter((v) => v.seq === null)) items.push(v);
 
   /**
    * **正在流入的那一轮**（委托方："对话中的流式输出也没有做好，思考过程也没法
@@ -4603,7 +4722,8 @@ export function deriveChatItems(state, live) {
   for (const it of items) {
     it.key =
       it.kind === "live" ? "live"
-      : it.kind === "verdict" ? `verdict:${it.round}`
+      // 多轮核查后 round 会重复（每轮从 0 起），键里必须带轮号才唯一
+      : it.kind === "verdict" ? `verdict:${it.judgedTurn ?? "x"}:${it.round}`
       : `${it.kind}:${it.seq ?? "x"}:${n}`;
     n++;
   }
@@ -4721,11 +4841,21 @@ export function renderChatItem(it, thinkingOpen = false) {
       case "boundary":
         html += renderSegmentBoundary({ role: it.role, round: it.round ?? 0, source: it.source });
         break;
-      case "user":
+      case "user": {
+        // 追加轮的两条元信息并列在署名旁：这一轮核查不核查、接的是什么（正史 /
+        // 计划摘要 / 从头）。不显示的话"为什么这一轮没有裁决"要靠猜
+        const turnMeta = [
+          it.turn ? `第 ${it.turn} 轮` : "",
+          it.verify === true ? "本轮核查" : it.verify === false && it.turn ? "本轮不核查" : "",
+          it.continues === "plan-summary" ? "以计划摘要开局" : it.continues === "fresh" ? "无正史，从头开始" : "",
+        ].filter(Boolean);
         html +=
-          '<div class="chat-msg chat-msg--user"><div class="chat-role">委托方</div>' +
+          `<div class="chat-msg chat-msg--user"><div class="chat-role">委托方${
+            turnMeta.length ? `<span class="aside-peek chat-turn-meta">${esc(turnMeta.join(" · "))}</span>` : ""
+          }</div>` +
           `<div class="chat-body chat-body--text md">${renderMarkdown(it.text)}</div></div>`;
         break;
+      }
       case "text":
         html +=
           `<div class="chat-msg chat-msg--assistant"><div class="chat-role">¶ ${esc(ROLE_PERSONA[it.role] ?? "Agent")}</div>` +
@@ -4885,10 +5015,17 @@ function renderVerdictInline(it) {
           .map((x) => `<li class="md-inline">${mark} ${renderMarkdownInline(x)}</li>`)
           .join("")}</ul>`
       : "";
+  // 裁决只对它核查的那一轮对话负责——轮号必须与结论并列显示，不能让"通过"
+  // 看起来像是整场对话的通过（判的是哪一轮 = 这份裁决的适用范围）
+  const judged =
+    it.judgedTurn != null
+      ? `<span class="aside-peek chat-verdict-turn" data-judged-turn="${Number(it.judgedTurn)}">判第 ${Number(it.judgedTurn)} 轮对话</span>`
+      : "";
   return (
     `<div class="chat-verdict chat-verdict--${tone}">` +
     `<div class="chat-verdict-head">◆ ${esc(label)}` +
-    (it.round ? `<span class="aside-peek">第 ${it.round} 轮</span>` : "") +
+    judged +
+    (it.round ? `<span class="aside-peek">返工第 ${it.round} 轮</span>` : "") +
     "</div>" +
     (v.summary ? `<p class="md-inline chat-verdict-summary">${renderMarkdownInline(v.summary)}</p>` : "") +
     list(v.issues, v.passed ? "⚠" : "✗", "bad") +
@@ -5334,7 +5471,8 @@ function entryActionLabel(e) {
     case "run_resumed": return "同运行热恢复";
     case "compaction": return "上下文压缩";
     case "usage": return "本轮用量";
-    case "user_message": return `追加指令（第 ${e.turn ?? "?"} 轮对话）`;
+    case "user_message":
+      return `追加指令（第 ${e.turn ?? "?"} 轮对话${e.verify === true ? "，本轮核查" : e.verify === false ? "，本轮不核查" : ""}）`;
     default: return e.type;
   }
 }

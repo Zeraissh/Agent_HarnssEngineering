@@ -623,6 +623,55 @@ describe("v2 R1 · 段终止 ≠ run 终止 (V-01)", () => {
     expect(state.status).toBe("done");
     expect(state.pendingApprovals[0].status).toBe("expired");
   });
+
+  /**
+   * 会话中心化：核查是逐轮选项。第 1 轮没核查、第 2 轮核查的 run，第 2 轮执行者的
+   * done 不是 run 终止——reducer 必须从 user_message.verify 学到"这一轮核查"，
+   * 否则快路径把 run 判 done、控制器随即关流，verifier 段与 run_end 全丢
+   * （V-01 那条缝在 reducer 侧的第三个现身）。
+   */
+  it("逐轮核查：user_message.verify 改写 state.verify，本轮 done 不再走单段快路径", () => {
+    let state = createInitialState("pv", "plain then verified", false);
+    state = reduceEvents(state, [
+      seqSse(0, "main", "done", { stopReason: "completed", usage: null }),
+      seqSse(1, "host", "run_end", { outcome: "completed", mainStopReason: "completed" }),
+    ]);
+    expect(state.status).toBe("done");
+    expect(state.verify).toBe(false);
+
+    state = reduceEvents(state, [
+      seqSse(2, "host", "user_message", { turn: 2, text: "这一轮请核查", verify: true, continues: "history" }),
+      seqSse(3, "main", "done", { stopReason: "completed", usage: null }),
+    ]);
+    expect(state.verify).toBe(true);
+    expect(state.conversationTurn).toBe(2);
+    expect(state.status, "核查轮的执行者 done 不是 run 终止").toBe("running");
+    // 时间线条目带上本轮的两条元信息（逐字段白名单投影：不列出就静默丢弃）
+    const um = state.timeline.find((e) => e.type === "user_message");
+    expect(um.verify).toBe(true);
+    expect(um.continues).toBe("history");
+
+    state = reduceEvents(state, [
+      seqSse(4, "verifier", "verification", {
+        round: 0, judgedTurn: 2,
+        verdict: { passed: true, issues: [], summary: "一致" },
+      }),
+      seqSse(5, "host", "verdict", { judgedTurn: 2, verdict: { passed: true, issues: [], summary: "一致" } }),
+      seqSse(6, "host", "run_end", { outcome: "completed", mainStopReason: "completed", finalPassed: true }),
+    ]);
+    expect(state.status).toBe("done");
+    expect(state.verifications[0].judgedTurn).toBe(2);
+    expect(state.verifications[0].seq).toBe(4);
+    expect(state.verdict.judgedTurn).toBe(2);
+
+    // 反向：第 3 轮关掉核查 → 快路径恢复
+    state = reduceEvents(state, [
+      seqSse(7, "host", "user_message", { turn: 3, text: "这轮不用核查", verify: false }),
+      seqSse(8, "main", "done", { stopReason: "completed", usage: null }),
+    ]);
+    expect(state.verify).toBe(false);
+    expect(state.status).toBe("done");
+  });
 });
 
 describe("v2 R1 · 审批审计 (V-02/V-03)", () => {

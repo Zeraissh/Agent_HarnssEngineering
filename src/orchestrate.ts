@@ -85,10 +85,14 @@ export interface VerifiedRunOptions {
    * 它核查的是 `task`（宿主应把本轮指令与原任务背景一起写进去）对照工作目录
    * 的实际产出，不读执行者正史。
    *
+   * `history` 缺省 / 为空 = 这一轮没有可续的正史（上一轮执行阶段就失败了、或
+   * 此前是计划编排）：执行者以 `feedback` 从头开一轮，核查者照样核查 `task`——
+   * 执行者输入与核查者任务书在这里解耦，两者不再被迫是同一段文字。
+   *
    * 提供它时返工模式**强制 inherit**：fresh 返工会把对话正史整个丢掉，
    * 下一轮再续跑就接不上了——对一场对话而言那不是"独立重试"，是失忆。
    */
-  continuation?: { history: Anthropic.MessageParam[]; feedback: string };
+  continuation?: { history?: Anthropic.MessageParam[]; feedback: string };
 }
 
 export interface VerifiedRunResult {
@@ -178,7 +182,7 @@ export async function runVerified(
     const priorHistory =
       round > 0 && reworkMode === "inherit"
         ? main!.messages
-        : round === 0 && continuation
+        : round === 0 && continuation?.history?.length
           ? continuation.history
           : undefined;
     const events = priorHistory

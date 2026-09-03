@@ -1707,6 +1707,69 @@ describe("ui-server", () => {
     expect(result.event.timing.totalMs).toBeGreaterThanOrEqual(result.event.timing.subtaskWallMs);
   });
 
+  /**
+   * 会话中心化语义 B：计划编排的 run 可以继续对话——续的是**对话**不是 DAG：
+   * 新一轮以计划摘要（子任务 / 结局 / 交接 / 裁决）为种子按单执行者跑。
+   * 旧锁「计划编排的运行不支持追加：没有续跑入口」有记录退役（2026-09-03）。
+   */
+  it("v2-17b. plan run 可追加：新一轮按单执行者跑，开局带计划摘要（含子任务结局与裁决）", async () => {
+    const planJson = JSON.stringify({
+      subtasks: [
+        { id: "s1", title: "第一步", description: "做 A", acceptance: ["A 完成"], dependsOn: [] },
+        { id: "s2", title: "第二步", description: "做 B", acceptance: ["B 完成"], dependsOn: ["s1"] },
+      ],
+    });
+    const pass = (summary: string) =>
+      fakeMessage([textBlock(JSON.stringify({ passed: true, issues: [], summary }))], "end_turn");
+    const model = new FakeModelClient([
+      fakeMessage([textBlock(["```json", planJson, "```"].join("\n"))], "end_turn"),
+      fakeMessage([textBlock("s1 完成：写了 a.txt")], "end_turn"), pass("A 一致"),
+      fakeMessage([textBlock("s2 完成：写了 b.txt")], "end_turn"), pass("B 一致"),
+      fakeMessage([textBlock("第二轮：合并了 a 与 b")], "end_turn"), // 追问轮（单执行者）
+    ]);
+    handle = createUiServer({ modelClient: model, tools: [autoTool("noop")], workdir: process.cwd() });
+    port = await startServer(handle);
+    base = baseUrl(port);
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "两步任务", mode: "plan", concurrency: 1 }),
+    })).json() as { runId: string };
+    await waitForDone(base, runId);
+    const row1 = (await (await fetch(`${base}/api/runs`)).json() as any[]).find((r) => r.runId === runId);
+    expect(row1.mode).toBe("plan");
+    expect(row1.canContinue).toBe(true);
+    expect(row1.continuationMode).toBe("same");
+
+    const res = await fetch(`${base}/api/runs/${runId}/messages`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "把 a 和 b 合并", verify: false }),
+    });
+    expect(res.status).toBe(200);
+    await waitForDone(base, runId);
+    expect(model.requests).toHaveLength(6);
+    const req = model.requests[5]!;
+    // 单执行者、全新一轮（没有子任务正史可续）：一条 user，含原话 + 计划摘要
+    expect(req.messages).toHaveLength(1);
+    const flat = JSON.stringify(req.messages[0]);
+    expect(flat).toContain("把 a 和 b 合并");
+    expect(flat).toContain("本对话此前是一次计划编排");
+    expect(flat).toContain("s1 第一步");
+    expect(flat).toContain("s2 第二步");
+    expect(flat).toContain("核查通过");
+    expect(flat).toContain("A 一致");
+    expect(flat).toContain("全部子任务执行并通过核查");
+    // 不是重跑 DAG：本轮没有 planner 事件，来源是 main
+    const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`)) as any[];
+    const um = events.find((e) => e.event.type === "user_message")!;
+    expect(um.event.continues).toBe("plan-summary");
+    const afterUm = events.filter((e) => e.seq > um.seq);
+    expect(afterUm.some((e) => e.source === "planner")).toBe(false);
+    expect(afterUm.some((e) => e.source === "main" && e.event.type === "done")).toBe(true);
+    const row2 = (await (await fetch(`${base}/api/runs`)).json() as any[]).find((r) => r.runId === runId);
+    expect(row2.conversationTurn).toBe(2);
+    expect(row2.stopReason).toBe("completed");
+  });
+
   it("v2-18. planner 产不出可解析计划时 fail-closed：planned=false 且零子任务执行", async () => {
     handle = createUiServer({
       modelClient: new FakeModelClient([
@@ -2128,32 +2191,234 @@ describe("ui-server", () => {
     expect(t.segments.length).toBeGreaterThanOrEqual(2);
   });
 
-  it("v2-21. 追加的边界一律显式 409，并说清为什么", async () => {
-    // ① 核查模式：runVerified 无续跑入口，追加会绕过已出具的裁决
+  /**
+   * **旧锁有记录退役（会话中心化，2026-09-03）**：v2-21 原本钉着「核查 run 追加 → 409
+   * "追加会绕过已出具的裁决"」。语义已改：核查是逐轮选项，裁决带 judgedTurn 留在事件流
+   * 里只对它核查的那一轮负责；续跑接执行者最后一段正史。下面几条是替代锁。
+   */
+  it("v2-21. 核查过的 run 可以继续对话：正史接上、裁决带轮号、本轮可选是否再核查", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([textBlock("第一轮：暗号 alpha-7 已写入")], "end_turn"), // turn 1 main
+      fakeMessage([textBlock(JSON.stringify({ passed: true, issues: [], summary: "第一轮一致" }))], "end_turn"), // turn 1 verifier
+      fakeMessage([textBlock("第二轮：暗号仍是 alpha-7")], "end_turn"), // turn 2 main（本轮不核查）
+      fakeMessage([textBlock("第三轮：改好了")], "end_turn"), // turn 3 main
+      fakeMessage([textBlock(JSON.stringify({ passed: false, issues: ["第三轮缺一项"], summary: "第三轮未通过" }))], "end_turn"), // turn 3 verifier #1
+      fakeMessage([textBlock("第三轮返工：还是缺")], "end_turn"), // turn 3 rework（续跑轮强制 inherit）
+      fakeMessage([textBlock(JSON.stringify({ passed: false, issues: ["仍缺一项"], summary: "返工后仍未通过" }))], "end_turn"), // turn 3 verifier #2
+    ]);
+    handle = createUiServer({ modelClient: model, tools: [autoTool("noop")], workdir: process.cwd() });
+    port = await startServer(handle);
+    base = baseUrl(port);
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "带核查：记住暗号 alpha-7", verify: true }),
+    })).json() as { runId: string };
+    await waitForDone(base, runId);
+
+    // 核查过的 run 也报"可以追加"
+    const list1 = (await (await fetch(`${base}/api/runs`)).json() as any[]).find((r) => r.runId === runId);
+    expect(list1.canContinue).toBe(true);
+    expect(list1.continuationMode).toBe("same");
+    expect(list1.verdictTurn).toBe(1);
+
+    // 第 2 轮：显式关掉核查
+    const res2 = await fetch(`${base}/api/runs/${runId}/messages`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "暗号是什么？", verify: false }),
+    });
+    expect(res2.status).toBe(200);
+    expect((await res2.json() as any).verify).toBe(false);
+    await waitForDone(base, runId);
+    // 执行者带着第一轮正史 + 上一轮裁决摘要续跑；核查者本轮不出场
+    const req3 = model.requests[2]!;
+    const flat3 = JSON.stringify(req3.messages);
+    expect(flat3, "第二轮没带上第一轮的正史").toContain("暗号 alpha-7 已写入");
+    expect(flat3, "上一轮的裁决摘要要让执行者知道").toContain("上一轮核查裁决（第 1 轮对话）");
+    expect(flat3).toContain("暗号是什么？");
+    expect(model.requests).toHaveLength(3);
+
+    // 第 3 轮：缺省沿用上一轮设置（false）→ 显式再开核查
+    const res3 = await fetch(`${base}/api/runs/${runId}/messages`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "把暗号写进 out.txt", verify: true }),
+    });
+    expect(res3.status).toBe(200);
+    await waitForDone(base, runId);
+    // 执行 + 核查①（未通过）+ 返工 + 核查②（仍未通过，达 maxReworks）= 4 次
+    expect(model.requests).toHaveLength(7);
+    // 核查者：全新上下文（单条 user），核查的是本轮指令，原任务只作背景
+    const verifierReq = model.requests[4]!;
+    expect(verifierReq.messages).toHaveLength(1);
+    const vflat = JSON.stringify(verifierReq.messages[0]);
+    expect(vflat).toContain("【本轮指令】把暗号写进 out.txt");
+    expect(vflat).toContain("记住暗号 alpha-7");
+    expect(vflat).not.toContain("第二轮：暗号仍是 alpha-7");
+    // 续跑轮的返工在正史上继续（强制 inherit）：返工请求带着前两轮的话
+    const reworkFlat = JSON.stringify(model.requests[5]!.messages);
+    expect(reworkFlat).toContain("暗号 alpha-7 已写入");
+    expect(reworkFlat).toContain("第三轮缺一项");
+
+    // 事件流：裁决各带自己判的轮号（第 3 轮两次核查都判第 3 轮）；user_message 带本轮 verify 与 continues
+    const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`)) as any[];
+    const verifications = events.filter((e) => e.event.type === "verification").map((e) => e.event);
+    expect(verifications.map((v) => v.judgedTurn)).toEqual([1, 3, 3]);
+    const verdicts = events.filter((e) => e.event.type === "verdict").map((e) => e.event.judgedTurn);
+    expect(verdicts).toEqual([1, 3]);
+    const ums = events.filter((e) => e.event.type === "user_message").map((e) => e.event);
+    expect(ums.map((u) => [u.turn, u.verify, u.continues])).toEqual([[2, false, "history"], [3, true, "history"]]);
+    // 第 2 轮（未核查）的 run_end 不得挂第 1 轮的裁决；第 3 轮的带自己的
+    const ends = events.filter((e) => e.event.type === "run_end").map((e) => e.event);
+    expect(ends).toHaveLength(3);
+    expect(ends[1].finalPassed, "未核查的轮次不能拿上一轮裁决担保").toBeUndefined();
+    expect(ends[2].finalPassed).toBe(false);
+    expect(ends[2].judgedTurn).toBe(3);
+
+    const list3 = (await (await fetch(`${base}/api/runs`)).json() as any[]).find((r) => r.runId === runId);
+    expect(list3.verdictTurn).toBe(3);
+    expect(list3.finalPassed).toBe(false);
+    expect(list3.conversationTurn).toBe(3);
+    expect(list3.verify).toBe(true);
+    expect(list3.canContinue).toBe(true);
+  });
+
+  it("v2-21b. 核查未通过并返工后再追问：接的是返工段（执行者最后一段）的正史", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([textBlock("首轮交付")], "end_turn"), // main
+      fakeMessage([textBlock(JSON.stringify({ passed: false, issues: ["缺收尾"], summary: "未通过" }))], "end_turn"), // verifier #1
+      fakeMessage([textBlock("返工后补了收尾 REWORK-MARK")], "end_turn"), // rework（Web 首轮缺省 fresh）
+      fakeMessage([textBlock(JSON.stringify({ passed: true, issues: [], summary: "已修复" }))], "end_turn"), // verifier #2
+      fakeMessage([textBlock("第二轮")], "end_turn"), // 追问
+    ]);
+    handle = createUiServer({ modelClient: model, tools: [autoTool("noop")], workdir: process.cwd() });
+    port = await startServer(handle);
+    base = baseUrl(port);
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "会返工的任务", verify: true }),
+    })).json() as { runId: string };
+    await waitForDone(base, runId);
+    expect(model.requests).toHaveLength(4);
+
+    const res = await fetch(`${base}/api/runs/${runId}/messages`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "再补一句", verify: false }),
+    });
+    expect(res.status).toBe(200);
+    await waitForDone(base, runId);
+    // 续跑请求带的是返工段的正史（含返工产出），不是首轮那段陈旧正史
+    const flat = JSON.stringify(model.requests[4]!.messages);
+    expect(flat).toContain("REWORK-MARK");
+    expect(flat).not.toContain("首轮交付");
+    // 段序：main / rework / 续跑 main（verifier 的 done 被 orchestrate 压掉，不落段）；
+    // 续跑段的正史长度 = 返工段 + 本轮 user + assistant，证明接的是返工段
+    const t = await (await fetch(`${base}/api/runs/${runId}/transcript`)).json() as any;
+    const sources = t.segments.map((s: any) => s.source);
+    expect(sources).toEqual(["main", "rework", "main"]);
+    expect(t.segments[2].messages.length).toBe(t.segments[1].messages.length + 2);
+  });
+
+  it("v2-21c. 执行阶段就失败（无正史）的 run 仍可继续对话：新一轮从头开始", async () => {
+    class FailOnceClient extends FakeModelClient {
+      calls = 0;
+      override send(req: ModelRequest) {
+        this.calls += 1;
+        // 首次调用 401：非瞬时错误，段级续跑不救，loop 以 error 收尾且正史只有半截
+        if (this.calls === 1) return Promise.reject(Object.assign(new Error("bad key"), { status: 401 }));
+        return super.send(req);
+      }
+    }
+    const model = new FailOnceClient([fakeMessage([textBlock("这次成了")], "end_turn")]);
+    handle = createUiServer({ modelClient: model, tools: [autoTool("noop")], workdir: process.cwd() });
+    port = await startServer(handle);
+    base = baseUrl(port);
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "会先失败的任务", verify: false }),
+    })).json() as { runId: string };
+    await waitForDone(base, runId);
+    const row1 = (await (await fetch(`${base}/api/runs`)).json() as any[]).find((r) => r.runId === runId);
+    expect(row1.stopReason).toBe("error");
+    // 旧行为：409「没有可续跑的会话正史」。现在：error 只结束这一轮
+    expect(row1.canContinue).toBe(true);
+
+    const res = await fetch(`${base}/api/runs/${runId}/messages`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "再试一次" }),
+    });
+    expect(res.status).toBe(200);
+    await waitForDone(base, runId);
+    const row2 = (await (await fetch(`${base}/api/runs`)).json() as any[]).find((r) => r.runId === runId);
+    expect(row2.stopReason).toBe("completed");
+    expect(row2.conversationTurn).toBe(2);
+    const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`)) as any[];
+    const um = events.find((e) => e.event.type === "user_message")!.event;
+    // 首轮 error 时正史只有一条 user（模型没答上）；续跑接了它，所以是 history 而非 fresh。
+    // 两种都是"对话没死"；这里锁的是**没有 409**、且执行者拿到了背景
+    expect(["history", "fresh"]).toContain(um.continues);
+    expect(JSON.stringify(model.requests.at(-1)!.messages)).toContain("再试一次");
+  });
+
+  it("v2-21d. 按停止之后还能继续对话：新一轮不会被上一轮的中止位掐掉", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    class SlowClient extends FakeModelClient {
+      calls = 0;
+      override async send(req: ModelRequest, onDelta?: unknown, signal?: AbortSignal) {
+        this.calls += 1;
+        if (this.calls === 1) {
+          // 第一轮：吊着直到被 abort
+          await new Promise<void>((resolve) => {
+            signal?.addEventListener("abort", () => resolve(), { once: true });
+            release();
+          });
+          throw Object.assign(new Error("aborted"), { name: "AbortError" });
+        }
+        return super.send(req);
+      }
+    }
+    const model = new SlowClient([fakeMessage([textBlock("第二轮正常")], "end_turn")]);
+    handle = createUiServer({ modelClient: model, tools: [autoTool("noop")], workdir: process.cwd() });
+    port = await startServer(handle);
+    base = baseUrl(port);
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "会被停的任务", verify: false }),
+    })).json() as { runId: string };
+    await gate;
+    expect((await fetch(`${base}/api/runs/${runId}/stop`, { method: "POST" })).status).toBe(200);
+    await waitForDone(base, runId);
+    expect(((await (await fetch(`${base}/api/runs`)).json() as any[]).find((r) => r.runId === runId)).stopReason).toBe("aborted");
+
+    const res = await fetch(`${base}/api/runs/${runId}/messages`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "继续吧" }),
+    });
+    expect(res.status).toBe(200);
+    await waitForDone(base, runId);
+    const row = ((await (await fetch(`${base}/api/runs`)).json() as any[]).find((r) => r.runId === runId));
+    // 修前：新一轮复用已 abort 的 AbortController，立刻又是 aborted
+    expect(row.stopReason).toBe("completed");
+    expect(model.calls).toBe(2);
+  });
+
+  it("v2-21e. verify 字段必须是布尔：非布尔 400，不静默降级", async () => {
     handle = createUiServer({
-      modelClient: new FakeModelClient([
-        fakeMessage([textBlock("done")], "end_turn"),
-        fakeMessage([textBlock(JSON.stringify({ passed: true, issues: [], summary: "ok" }))], "end_turn"),
-      ]),
+      modelClient: new FakeModelClient([fakeMessage([textBlock("ok")], "end_turn")]),
       tools: [autoTool("noop")], workdir: process.cwd(),
     });
     port = await startServer(handle);
     base = baseUrl(port);
     const { runId } = await (await fetch(`${base}/api/runs`, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ task: "带核查", verify: true }),
+      body: JSON.stringify({ task: "t", verify: false }),
     })).json() as { runId: string };
     await waitForDone(base, runId);
-
-    const res = await fetch(`${base}/api/runs/${runId}/messages`, {
+    const bad = await fetch(`${base}/api/runs/${runId}/messages`, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: "再改一点" }),
+      body: JSON.stringify({ text: "x", verify: "yes" }),
     });
-    expect(res.status).toBe(409);
-    expect((await res.json() as any).error).toContain("裁决");
-
-    const list = await (await fetch(`${base}/api/runs`)).json() as any[];
-    expect(list.find((r) => r.runId === runId).canContinue).toBe(false);
+    expect(bad.status).toBe(400);
+    expect((await bad.json() as any).error).toContain("verify");
   });
 
   it("v2-22. 空文本 400、未知 run 404", async () => {
@@ -4064,7 +4329,12 @@ describe("本次对话精确输入放行：省的是重复点击，不是扩大�
     await waitForDone(base, runId);
   });
 
-  it("不可续跑的核查 run 收尾时终止 active grant，UI 摘要不能继续报活跃", async () => {
+  /**
+   * **旧锁有记录退役（会话中心化，2026-09-03）**：此前这条钉「核查 run 不可续跑 → 收尾即
+   * 终止 active grant」。核查 run 现在可以继续对话，"本次对话放行"就该活到 TTL/次数用完；
+   * 收尾即终止只剩一种触发——执行谱系预算耗尽（对话真的续不下去了），见下一条。
+   */
+  it("可继续对话的核查 run 收尾时保留 active grant（本次对话放行随对话走）", async () => {
     const model = new FakeModelClient([
       fakeMessage([toolUseBlock("t_verified", "danger", {})], "tool_use"),
       fakeMessage([textBlock("main done")], "end_turn"),
@@ -4074,7 +4344,7 @@ describe("本次对话精确输入放行：省的是重复点击，不是扩大�
     base = baseUrl(await startServer(handle));
     const runId = (await (await fetch(`${base}/api/runs`, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ task: "核查后不可续跑", verify: true }),
+      body: JSON.stringify({ task: "核查后仍可续跑", verify: true }),
     })).json()).runId;
     const ref = await firstPending(runId);
     await fetch(`${base}/api/runs/${runId}/approvals/${encodeURIComponent(ref)}`, {
@@ -4085,14 +4355,54 @@ describe("本次对话精确输入放行：省的是重复点击，不是扩大�
 
     const summary = ((await (await fetch(`${base}/api/runs`)).json()) as any[])
       .find((item) => item.runId === runId);
-    expect(summary.canContinue).toBe(false);
-    expect(summary.approvalGrants.active).toBe(0);
+    expect(summary.canContinue).toBe(true);
+    expect(summary.approvalGrants.active).toBe(1);
     const events = await readSSESnapshot(base, runId) as any[];
-    const invalidated = events.find(
-      (item) => item.event.type === "approval_grant_invalidated" && item.event.cause === "run_not_continuable",
-    );
-    expect(invalidated).toBeDefined();
+    expect(events.some((item) => item.event.type === "approval_grant_invalidated")).toBe(false);
     expect(events.at(-1)?.event.type).toBe("run_end");
+  });
+
+  it("预算耗尽的 run 收尾时终止 active grant：对话真的续不下去了，放行不能悬着", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("t_budget", "danger", {})], "tool_use"),
+      fakeMessage([textBlock("main done")], "end_turn"),
+    ]);
+    // 总轮次预算 2：首轮恰好用满（tool_use + end_turn）→ 收尾时 canContinue=false
+    process.env.AGENT_TOTAL_MAX_TURNS = "2";
+    try {
+      handle = createUiServer({ modelClient: model, tools: [askEvery("danger")], workdir: process.cwd() });
+      base = baseUrl(await startServer(handle));
+      const runId = (await (await fetch(`${base}/api/runs`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task: "预算刚好用完", verify: false }),
+      })).json()).runId;
+      const ref = await firstPending(runId);
+      await fetch(`${base}/api/runs/${runId}/approvals/${encodeURIComponent(ref)}`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ decision: "allow", scope: "conversation" }),
+      });
+      await waitForDone(base, runId);
+
+      const summary = ((await (await fetch(`${base}/api/runs`)).json()) as any[])
+        .find((item) => item.runId === runId);
+      expect(summary.canContinue).toBe(false);
+      expect(summary.continuationBlockReason).toContain("AGENT_TOTAL_MAX_TURNS");
+      expect(summary.approvalGrants.active).toBe(0);
+      const events = await readSSESnapshot(base, runId) as any[];
+      const invalidated = events.find(
+        (item) => item.event.type === "approval_grant_invalidated" && item.event.cause === "run_not_continuable",
+      );
+      expect(invalidated).toBeDefined();
+      // 追加也被同一条理由挡住，且文案说清哪个预算、怎么提
+      const res = await fetch(`${base}/api/runs/${runId}/messages`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: "再来" }),
+      });
+      expect(res.status).toBe(409);
+      expect((await res.json() as any).error).toContain("AGENT_TOTAL_MAX_TURNS");
+    } finally {
+      delete process.env.AGENT_TOTAL_MAX_TURNS;
+    }
   });
 });
 
@@ -4347,6 +4657,67 @@ describe("B2 · 运行历史落盘", () => {
     expect(parentAfter).toEqual(before);
   });
 
+  /**
+   * 会话中心化语义 E：核查过的归档也能派生——正史取执行者谱系检查点（返工过就是返工段），
+   * 本轮核查设置缺省沿用父档案，列表带 verdictTurn。旧锁「开启独立核查的归档不能派生续跑」
+   * 有记录退役（2026-09-03）。
+   */
+  it("核查过（且返工过）的归档可派生：接返工段正史、缺省沿用核查设置、裁决轮号随档案走", async () => {
+    dir = await mkdtemp(join(tmpdir(), "history-verified-fork-"));
+    await boot({
+      modelClient: new FakeModelClient([
+        fakeMessage([textBlock("首轮交付")], "end_turn"), // main
+        fakeMessage([textBlock(JSON.stringify({ passed: false, issues: ["缺收尾"], summary: "未通过" }))], "end_turn"),
+        fakeMessage([textBlock("返工补了收尾 REWORK-MARK")], "end_turn"), // rework（fresh）
+        fakeMessage([textBlock(JSON.stringify({ passed: true, issues: [], summary: "已修复" }))], "end_turn"),
+      ]),
+      tools: [autoTool("noop")],
+      workdir: process.cwd(),
+      history: dir,
+    });
+    const { runId } = (await (await post("/api/runs", { task: "核查归档", verify: true })).json()) as { runId: string };
+    await waitForDone(base, runId);
+    await handle!.close();
+    handle = undefined;
+
+    const resumedModel = new FakeModelClient([
+      fakeMessage([textBlock("续跑轮做完")], "end_turn"), // 子 run 执行者
+      fakeMessage([textBlock(JSON.stringify({ passed: true, issues: [], summary: "续跑轮一致" }))], "end_turn"), // 子 run 核查者
+    ]);
+    await boot({ modelClient: resumedModel, tools: [autoTool("noop")], workdir: process.cwd(), history: dir });
+    const restored = ((await (await fetch(`${base}/api/runs`)).json()) as any[]).find((r) => r.runId === runId);
+    expect(restored.verify).toBe(true);
+    expect(restored.finalPassed).toBe(true);
+    expect(restored.reworks).toBe(1);
+    expect(restored.verdictTurn, "裁决轮号要跟档案一起回来").toBe(1);
+    expect(restored.canContinue).toBe(true);
+    expect(restored.continuationMode).toBe("fork");
+
+    const follow = await post(`/api/runs/${runId}/messages`, { text: "再补一句" });
+    expect(follow.status).toBe(200);
+    const fork = (await follow.json()) as any;
+    expect(fork.continuationMode).toBe("fork");
+    await waitForDone(base, fork.runId);
+
+    // 缺省沿用父档案的核查设置 → 子 run 这一轮核查了：执行 + 核查两次请求
+    expect(resumedModel.requests).toHaveLength(2);
+    const execFlat = JSON.stringify(resumedModel.requests[0]!.messages);
+    expect(execFlat, "接的是返工段正史").toContain("REWORK-MARK");
+    expect(execFlat).not.toContain("首轮交付");
+    expect(execFlat).toContain("再补一句");
+    const verifierFlat = JSON.stringify(resumedModel.requests[1]!.messages);
+    expect(verifierFlat).toContain("【本轮指令】再补一句");
+
+    const child = ((await (await fetch(`${base}/api/runs`)).json()) as any[]).find((r) => r.runId === fork.runId);
+    expect(child.verify).toBe(true);
+    expect(child.finalPassed).toBe(true);
+    expect(child.verdictTurn).toBe(2);
+    expect(child.conversationTurn).toBe(2);
+    const childEvents = (await readSSEAll(await fetch(`${base}/api/runs/${fork.runId}/events`))) as any[];
+    expect(childEvents.find((e) => e.event.type === "verification")?.event.judgedTurn).toBe(2);
+    expect(childEvents.find((e) => e.event.type === "user_message")?.event.verify).toBe(true);
+  });
+
   it("重启不能绕过当前宿主更严格的总预算：列表提前阻断，模型零调用", async () => {
     dir = await mkdtemp(join(tmpdir(), "history-budget-"));
     await boot({
@@ -4497,12 +4868,55 @@ describe("B2 · 运行历史落盘", () => {
     const r = ((await (await fetch(`${base}/api/runs`)).json()) as any[]).find((x) => x.runId === "crash-run");
     expect(r.status).toBe("done");
     expect(r.stopReason).toBe("error");
-    expect(r.canContinue).toBe(false);
+    // 会话中心化：无检查点的归档不再是只读——可派生一次"无正史的新一轮"（fork），
+    // 但绝不冒充同 run 热恢复。旧断言 canContinue=false 有记录退役（2026-09-03）
+    expect(r.canContinue).toBe(true);
+    expect(r.continuationMode).toBe("fork");
+    expect(r.sameRunResume).toBe(false);
     // 事件流缺 run_end 时合成一条，否则重放出来的界面会永远"运行中"
     const events = (await readSSEAll(await fetch(`${base}/api/runs/crash-run/events`))) as any[];
     expect(events.at(-1)!.event.type).toBe("run_end");
     expect(events.at(-1)!.event.mainStopReason).toBe("error");
     expect(events.at(-1)!.event.synthesized).toBe("host_not_finalized");
+  });
+
+  it("无检查点的归档派生：子 run 从头开一轮、run_forked.checkpoint=null、预算按当前上限从零起算", async () => {
+    dir = await mkdtemp(join(tmpdir(), "history-nockpt-"));
+    const runDir = join(dir, "old-run");
+    await mkdir(runDir, { recursive: true });
+    await writeFile(
+      join(runDir, "meta.json"),
+      JSON.stringify({
+        version: 1, runId: "old-run", task: "旧格式任务", status: "done", verify: false,
+        createdAt: 1000, finishedAt: 2000, packName: null, mode: "single", effort: null,
+        rubric: null, workdir: null, conversationTurn: 1, planGate: false, planDecision: null,
+        mainStopReason: "error", outcome: null,
+      }),
+      "utf8",
+    );
+    const model = new FakeModelClient([fakeMessage([textBlock("新一轮成了")], "end_turn")]);
+    await boot({ modelClient: model, tools: [autoTool("noop")], workdir: process.cwd(), history: dir });
+    const res = await post("/api/runs/old-run/messages", { text: "接着做" });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as any;
+    expect(body.continuationMode).toBe("fork");
+    expect(body.continuedFrom).toBe("old-run");
+    await waitForDone(base, body.runId);
+    const events = (await readSSEAll(await fetch(`${base}/api/runs/${body.runId}/events`))) as any[];
+    const forked = events.find((e) => e.event.type === "run_forked")!.event;
+    expect(forked.checkpoint).toBeNull();
+    expect(forked.boundary).toContain("没有可续的执行正史");
+    const um = events.find((e) => e.event.type === "user_message")!.event;
+    expect(um.continues).toBe("fresh");
+    // 执行者拿到原话 + 对话背景（原任务）；没有正史可带
+    expect(model.requests).toHaveLength(1);
+    const flat = JSON.stringify(model.requests[0]!.messages);
+    expect(model.requests[0]!.messages).toHaveLength(1);
+    expect(flat).toContain("接着做");
+    expect(flat).toContain("旧格式任务");
+    const child = ((await (await fetch(`${base}/api/runs`)).json()) as any[]).find((x) => x.runId === body.runId);
+    expect(child.stopReason).toBe("completed");
+    expect(child.conversationTurn).toBe(2);
   });
 
   it("保留策略（判据③）：超出 keep 的最老档案被修剪，重启后列表同口径", async () => {
@@ -4600,16 +5014,52 @@ describe("B2 · 运行历史落盘", () => {
     const list = (await (await fetch(`${base}/api/runs`)).json()) as any[];
     const row = list.find((r) => r.runId === runId);
     expect(row.sameRunResume).toBe(false);
-    expect(row.durablePhase).toBe("executing"); // 可追问的 completed 保持 executing
-    expect(row.durableRecovery).toBe("fork_from_checkpoint");
+    // 会话中心化前这里钉的是 executing（"可追问的 completed 保持 executing"，为了让下一轮
+    // 的 segment_begin 不被非法迁移挡住）。现在下一轮由 reopen 显式拉回 executing，
+    // 两轮之间 state.json 说实话：这一轮完了。旧锁有记录退役（2026-09-03）
+    expect(row.durablePhase).toBe("completed");
+    expect(row.durableRecovery).toBe("readonly");
+    // 但对话没完：completed 的活 run 照样能追加（可续性不由 durable phase 决定）
+    expect(row.canContinue).toBe(true);
     // writer 链是异步的：关宿主 flush 后再读盘，避免 waitForDone 与 rename 赛跑
     await handle!.close();
     handle = undefined;
     const statePath = join(dir, runId, "state.json");
     const state = JSON.parse(await readFile(statePath, "utf8"));
-    expect(state.phase).toBe("executing");
+    expect(state.phase).toBe("completed");
     expect(state.runId).toBe(runId);
     expect(state.segmentSource).toBe("main");
+  });
+
+  it("RUN-01 · reopen：追加一轮把游标从 completed 拉回 executing，收尾再回 completed；返工段也进检查点", async () => {
+    dir = await mkdtemp(join(tmpdir(), "history-reopen-"));
+    await boot({
+      modelClient: new FakeModelClient([
+        fakeMessage([textBlock("第一轮")], "end_turn"),
+        fakeMessage([textBlock("第二轮")], "end_turn"),
+      ]),
+      tools: [autoTool("noop")],
+      workdir: process.cwd(),
+      history: dir,
+    });
+    const { runId } = (await (await post("/api/runs", { task: "reopen me", verify: false })).json()) as { runId: string };
+    await waitForDone(base, runId);
+    expect((await (await post(`/api/runs/${runId}/messages`, { text: "再来一轮" })).status)).toBe(200);
+    await waitForDone(base, runId);
+    await handle!.close();
+    handle = undefined;
+    const state = JSON.parse(await readFile(join(dir, runId, "state.json"), "utf8"));
+    expect(state.phase).toBe("completed");
+    expect(state.segmentSource).toBe("main");
+    // 变异锁：不 reopen 的话第二轮的 budget_snapshot 会在 completed 相被拒，游标停在 1
+    expect(state.budget.usedTurns).toBe(2);
+    // 两轮各一段 main：段号 0 / 1，检查点指向最后一段
+    const meta = JSON.parse(await readFile(join(dir, runId, "meta.json"), "utf8"));
+    expect(meta.conversationTurn).toBe(2);
+    expect(meta.checkpoint.segmentIndex).toBe(1);
+    expect(meta.checkpoint.conversationTurn).toBe(2);
+    // 预算沿谱系累计：两轮各一次模型调用
+    expect(meta.checkpoint.runBudget.usedTurns).toBe(2);
   });
 
   it("RUN-01：崩溃档案(meta=running)恢复后 phase=interrupted，不冒充可同 run 续跑", async () => {

@@ -309,6 +309,7 @@ import {
   deriveComposerMode,
   composerSubmitPlan,
   buildNewRunRequest,
+  buildFollowUpRequest,
   mergeForkedFollowUp,
   patchComposer,
   shouldShowReconnecting,
@@ -763,13 +764,14 @@ function syncComposer() {
   patchComposer(composerMode);
 }
 
-async function postFollowUp(runId, text) {
+async function postFollowUp(runId, text, verify) {
   followUpErrors.delete(runId);
   try {
     const res = await fetch(`/api/runs/${runId}/messages`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text }),
+      // verify 是本轮的核查开关（会话中心化：核查逐轮可选，缺省沿用上一轮）
+      body: JSON.stringify(buildFollowUpRequest({ text, verify })),
     });
     if (!res.ok) {
       let detail = `HTTP ${res.status}`;
@@ -1346,9 +1348,11 @@ async function stopRun(runId) {
 
 async function submitAppend({ runId, text }) {
   submitting = true;
+  // 提交前读：syncComposer 会把开关禁用，但 checked 值不动
+  const verify = verifyToggle.checked;
   syncComposer();
   try {
-    await postFollowUp(runId, text);
+    await postFollowUp(runId, text, verify);
     if (!followUpErrors.has(runId)) {
       taskInput.value = "";
       clearUploads();

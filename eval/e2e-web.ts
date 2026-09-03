@@ -1035,6 +1035,134 @@ const scenarios: Scenario[] = [
       return { checks };
     },
   },
+
+  {
+    id: "web-verified-turn-follow-up",
+    title: "会话中心化：核查过的轮次之后继续对话",
+    guards:
+      "核查 run 收尾后 canContinue=true（旧 409「绕过已出具的裁决」已退役）；" +
+      "追加轮执行者带正史 + 上一轮裁决摘要续跑；裁决事件带 judgedTurn；" +
+      "user_message 带本轮 verify；本轮不核查则 run_end 不挂旧裁决",
+    needsBrowser: false,
+    async run() {
+      const checks: Check[] = [];
+      const root = await mkdtemp(path.join(os.tmpdir(), "e2e-verified-followup-"));
+      const workdir = path.join(root, "work");
+      const historyDir = path.join(root, "history");
+      await mkdir(workdir, { recursive: true });
+      await mkdir(historyDir, { recursive: true });
+      // 只用 read_file（auto 权限）：本场景走纯 API，没有人点审批卡
+      await writeFile(path.join(workdir, "note.txt"), "alpha-7\n", "utf8");
+
+      const mock = await startMockProvider({
+        scripts: [
+          // 第 1 轮：执行者读 note.txt 并交付
+          turn(tu("read_file", { path: "note.txt" })),
+          turn(finishTask("completed", "read note.txt", { verification: ["note.txt = alpha-7"] })),
+          // 第 1 轮：核查者读回并出裁决
+          turn(tu("read_file", { path: "note.txt" })),
+          turn(
+            tu("submit_verdict", {
+              passed: true,
+              issues: [],
+              unverified: [],
+              advisory: [],
+              summary: "note.txt reads alpha-7",
+            }),
+          ),
+        ],
+      });
+      const serve = await startServe(mock, workdir, historyDir);
+      try {
+        const created = await postJson(serve.baseUrl, "/api/runs", {
+          task: "read alpha-7 from note.txt",
+          verify: true,
+        });
+        const runId = (created.json as { runId: string }).runId;
+        const row1 = await waitRunStatus(serve.baseUrl, runId, "done");
+        checks.push({
+          name: "核查 run 收尾后 canContinue=true",
+          ok: row1.canContinue === true,
+          ...(row1.canContinue === true ? {} : { detail: JSON.stringify(row1.continuationBlockReason) }),
+        });
+        checks.push({
+          name: "列表带 verdictTurn=1",
+          ok: row1.verdictTurn === 1,
+          ...(row1.verdictTurn === 1 ? {} : { detail: `实测 ${JSON.stringify(row1.verdictTurn)}` }),
+        });
+
+        // 第 2 轮（本轮不核查）：执行者应带着正史 + 裁决摘要续跑
+        mock.pushScript(turn(tu("read_file", { path: "note.txt" })));
+        mock.pushScript(turn(finishTask("completed", "re-read note.txt", { verification: ["still alpha-7"] })));
+        const follow = await postJson(serve.baseUrl, `/api/runs/${runId}/messages`, {
+          text: "read note.txt back",
+          verify: false,
+        });
+        checks.push({
+          name: "核查过的 run 追加 HTTP 200（旧 409 已退役）",
+          ok: follow.status === 200,
+          ...(follow.status === 200 ? {} : { detail: `status ${follow.status} ${JSON.stringify(follow.json).slice(0, 200)}` }),
+        });
+        const followBody = follow.json as { verify?: boolean; continuationMode?: string };
+        checks.push({
+          name: "响应 verify=false、continuationMode=same",
+          ok: followBody.verify === false && followBody.continuationMode === "same",
+          ...(followBody.verify === false && followBody.continuationMode === "same"
+            ? {}
+            : { detail: JSON.stringify(followBody) }),
+        });
+        const row2 = await waitRunStatus(serve.baseUrl, runId, "done");
+        checks.push({
+          name: "第 2 轮收尾 completed、conversationTurn=2",
+          ok: row2.stopReason === "completed" && row2.conversationTurn === 2,
+          ...(row2.stopReason === "completed" && row2.conversationTurn === 2
+            ? {}
+            : { detail: `stopReason=${JSON.stringify(row2.stopReason)} turn=${JSON.stringify(row2.conversationTurn)}` }),
+        });
+
+        // mock 端点收到的第 2 轮首个请求（第 5 次 send：前四次 = 执行 2 + 核查 2）：
+        // 带第 1 轮正史 + 裁决摘要
+        const requests = mock.requestLog;
+        const secondTurnReq = requests[4];
+        const flat = secondTurnReq ? JSON.stringify(secondTurnReq.body) : "";
+        checks.push({
+          name: "第 2 轮执行者请求带第 1 轮正史（note.txt 读回）",
+          ok: flat.includes("alpha-7") && flat.includes("read note.txt back"),
+          ...(flat.includes("alpha-7") ? {} : { detail: `requests=${requests.length}` }),
+        });
+        checks.push({
+          name: "第 2 轮执行者请求带上一轮裁决摘要（判第 1 轮）",
+          ok: flat.includes("上一轮核查裁决") && flat.includes("第 1 轮对话"),
+        });
+
+        const events = await collectSse(serve.baseUrl, runId, { timeoutMs: 5_000, stopOnTypes: [] });
+        const ev = (e: Record<string, unknown>) => e.event as Record<string, unknown>;
+        const verification = events.find((e) => ev(e).type === "verification");
+        checks.push({
+          name: "verification 事件带 judgedTurn=1",
+          ok: Boolean(verification) && ev(verification!).judgedTurn === 1,
+          ...(verification ? {} : { detail: "没有 verification 事件" }),
+        });
+        const um = events.find((e) => ev(e).type === "user_message");
+        checks.push({
+          name: "user_message 带 verify=false、continues=history",
+          ok: Boolean(um) && ev(um!).verify === false && ev(um!).continues === "history",
+          ...(um ? { detail: `verify=${JSON.stringify(ev(um).verify)} continues=${JSON.stringify(ev(um).continues)}` } : {}),
+        });
+        const ends = events.filter((e) => ev(e).type === "run_end");
+        checks.push({
+          name: "两次 run_end；第 2 次不挂第 1 轮的裁决",
+          ok: ends.length === 2 && ev(ends[1]!).finalPassed === undefined && ev(ends[0]!).judgedTurn === 1,
+          ...(ends.length === 2 ? {} : { detail: `run_end 数=${ends.length}` }),
+        });
+      } finally {
+        await serve.stop();
+        await mock.close();
+        await rm(root, { recursive: true, force: true }).catch(() => {});
+      }
+      return { checks };
+    },
+  },
 ];
 
 // ---------------------------------------------------------------- report

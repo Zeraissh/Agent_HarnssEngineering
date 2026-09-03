@@ -22,6 +22,54 @@ RUN-01 残余：SAFE-06 toolTx、CLI 对等 durable、mid-tool 恢复。
 MEM-01 残余：启发式漏检、无 LLM 摘要、MCP 写工具靠名字启发。
 MODEL-01 残余：Web 同步探针回写 compat、成本/延迟真路由、识图能力探针、链健康实时面。
 
+## 会话中心化（2026-09-03，委托方拍板；两个提交）
+
+**委托方原话**："很多时候对话只要一出错就直接宕机了，都不能继续对话了，只能新开。
+为什么不能与市面上的 agent 一样一个对话一直用？"
+
+**设计改变一句话：封的是裁决范围，不是对话。** 此前 Web 宿主把三件事当成 run 级封印：
+开了核查（"追加会绕过已出具的裁决"）、走了编排（"runPlanned 没有续跑入口"）、
+执行阶段就失败（"没有可续跑的会话正史"）——三条 409 加起来就是委托方说的"一出错就
+只能新开"。现在：
+
+- **error 只结束这一轮**。无正史就从头开一轮（执行者拿到原任务背景），不再 409。
+- **核查是逐轮选项**（`POST /messages` 带 `verify`，缺省沿用上一轮）。续跑接**执行者
+  谱系**（main / rework）最后一段正史——返工过就接返工段，此前 `run.history` 只记 main，
+  返工后再续跑接的是陈旧正史。裁决留在事件流里带 `judgedTurn`，**只对它核查的那一轮
+  负责**；下一轮的执行者反馈里附上一轮裁决摘要（`verdictFeedbackSummary`）；核查者仍是
+  全新上下文，核查的是本轮指令（`continuationVerifyTask`，原任务只作背景）。续跑轮的
+  返工**强制 inherit**（fresh 会把对话正史丢掉）。
+- **plan run 可追加**：续的是对话不是 DAG——下一轮以计划摘要（子任务 / 结局 / 交接 /
+  裁决，`buildPlanSummary`）为种子按单执行者跑；执行总账从 plan 的共享预算延续。
+  `replan: true` **没做**（残余，见下）。
+- **归档同口径**：核查 / 编排 / 无检查点的档案都可派生（无检查点 = 无正史新一轮，
+  `run_forked.checkpoint = null` 照实说）；RUN-01 同 run 热恢复规则不变（仅 interrupted +
+  checkpoint + 非 verify/plan）。
+- **唯一结构性阻断 = 执行谱系预算耗尽**，文案带 env 名（`AGENT_TOTAL_MAX_TURNS` /
+  `AGENT_TOTAL_TOKEN_BUDGET`）与提法；仍 409。日预算门 / 并发门 / 隔离准入照旧。
+- **每轮新建 AgentLoop**：预算与 Context 水位从检查点延续（与 fork / same-run 同口径），
+  不再依赖"活对象还在"才能续。顺带修掉一个潜伏缺陷：按停止后再追问会复用已 abort 的
+  AbortController，新一轮当场又是 aborted——现在每轮新闸。
+- **durable state**：新增 `reopen` 迁移（completed/failed/closed/interrupted → executing）；
+  `finalizeDurableState` 去掉了"可追问的 completed 保持 executing"那个 hack，两轮之间
+  state.json 说实话。ADR-003 有 addendum。
+- **P6 不变量**：`repairHistoryForContinuation`——续跑正史末条若是悬空 tool_use 的
+  assistant，补 is_error 回执再合并反馈（补而不删）。
+
+**退役的旧锁（有记录）**：`test/ui-server.test.ts` v2-21（核查 run 追加 409）、
+「不可续跑的核查 run 收尾时终止 active grant」（改为"可续跑则保留、预算耗尽才终止"）、
+崩溃档案 `canContinue=false`、RUN-01 `durablePhase=executing`；`test/ui-a11y.test.ts`
+的「绕过已出具的裁决 / 没有续跑入口」文案锁与「追加时 #verify-toggle 禁用」。
+替代锁：verified → follow-up 200 且正史接上、plan → follow-up 单执行者带计划摘要、
+无正史 → 从头一轮、停止后可续、返工段进检查点、裁决带 judgedTurn（服务端 + reducer +
+渲染）、user_message.verify 改写 reducer 快路径、reopen 游标、无检查点归档派生、
+核查归档派生。e2e `web-verified-turn-follow-up`。变异验证 8 处逐一打红（提交信息有数）。
+
+**残余（诚实）**：① `replan: true`（重跑 runPlanned 并把反馈并入任务）未做——成本不低
+（要把整场 DAG 重新拆解），先看有没有真实需求；② plan run 后续轮按单执行者跑，资源按包
+声明整占，不再按子任务粒度；③ `cross-app/app.js` 是早已漂移的静态副本，仍写着旧
+blockedReason 文案——同步它是另一件事（备忘录有记）；④ 视觉调用仍不进 runBudget。
+
 以下为历史交接页（2026-08-08 收工），仍有参考价值；新开工优先看 `docs/08`。
 
 ---

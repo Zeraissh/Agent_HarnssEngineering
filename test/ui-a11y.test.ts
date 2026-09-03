@@ -850,27 +850,77 @@ describe("统一 composer：一个框，两种去向", () => {
   /**
    * V-28 的原意保留：不能追加时要说清为什么。合并之后它不再表现为
    * "没有输入框"，而是同一个框换个去向——**但绝不静默**，必须明说会新建。
+   *
+   * **旧锁有记录退役（会话中心化，2026-09-03）**：此前这里钉着两条文案——
+   * 「开启独立核查的运行不支持追加：追加会绕过已出具的裁决」与「计划编排的运行
+   * 不支持追加：没有续跑入口」。两条语义已废：核查 / 编排是逐轮选项不是 run 级
+   * 封印（裁决带 judgedTurn 留在对话里、只对它核查的那一轮负责），服务端对这两类
+   * run 报 canContinue=true。剩下的唯一结构性阻断是预算耗尽，文案由服务端给。
    */
-  it("不能追加时说清原因，并明说这一提交会新建一次运行", () => {
-    const verify = deriveComposerMode({ info: { ...CONTINUABLE, canContinue: false, verify: true } });
-    expect(verify.mode).toBe("new-blocked");
-    expect(verify.note).toContain("绕过已出具的裁决");
-    expect(verify.note).toContain("将新建一次运行");
-    expect(verify.canSubmit).toBe(true);
-
-    const plan = deriveComposerMode({ info: { ...CONTINUABLE, canContinue: false, mode: "plan" } });
-    expect(plan.note).toContain("没有续跑入口");
-    expect(plan.note).toContain("将新建一次运行");
-
+  it("不能追加时说清原因，并明说这一提交会新建一次运行（仅预算耗尽等服务端理由）", () => {
     const exhausted = deriveComposerMode({
       info: {
         ...CONTINUABLE,
         canContinue: false,
-        continuationBlockReason: "执行谱系的总轮次预算已用尽（2/2）",
+        continuationBlockReason:
+          "执行谱系的总轮次预算已用尽（2/2）。要在这场对话里继续，请提高 AGENT_TOTAL_MAX_TURNS 后重启宿主；或者新建对话",
       },
     });
+    expect(exhausted.mode).toBe("new-blocked");
     expect(exhausted.note).toContain("总轮次预算已用尽");
+    expect(exhausted.note).toContain("AGENT_TOTAL_MAX_TURNS");
     expect(exhausted.note).toContain("将新建一次运行");
+    expect(exhausted.canSubmit).toBe(true);
+
+    // 核查 / 编排本身不再产生任何"不能追加"的文案——服务端说能续就能续
+    for (const info of [{ ...CONTINUABLE, verify: true }, { ...CONTINUABLE, mode: "plan" }]) {
+      const m = deriveComposerMode({ info, localStatus: "done" });
+      expect(m.mode).toBe("append");
+      expect(m.note).not.toContain("绕过已出具的裁决");
+      expect(m.note).not.toContain("没有续跑入口");
+    }
+    // plan 的追加要说清接的是什么：计划摘要开局，不是重跑 DAG
+    expect(deriveComposerMode({ info: { ...CONTINUABLE, mode: "plan" }, localStatus: "done" }).note)
+      .toContain("计划摘要");
+  });
+
+  /**
+   * 会话中心化：独立核查开关是**每一轮**的选项——追加模式下它不再随装配项一起禁用，
+   * 缺省沿用该 run 上一轮的设置；切到别的 run 才重套缺省，用户中途拨过的不被改回去。
+   */
+  it("追加模式的核查开关：可用、缺省=该 run 上一轮设置、只在切 run 时重套", () => {
+    const toggle = q("#verify-toggle") as HTMLInputElement;
+    const label = toggle.closest("label")!.querySelector("span")!;
+    toggle.checked = false;
+
+    patchComposer(deriveComposerMode({ info: { ...CONTINUABLE, verify: true }, localStatus: "done" }));
+    expect(toggle.disabled).toBe(false);
+    expect(toggle.checked, "缺省沿用上一轮：verify=true 的 run 追加时预勾").toBe(true);
+    expect(label.textContent).toBe("本轮独立核查");
+
+    // 用户在这一轮把它拨掉；后台 syncComposer 再跑一遍不能拨回去
+    toggle.checked = false;
+    patchComposer(deriveComposerMode({ info: { ...CONTINUABLE, verify: true }, localStatus: "done" }));
+    expect(toggle.checked).toBe(false);
+
+    // 切到另一个（未核查的）run：重套它的缺省
+    toggle.checked = true;
+    patchComposer(deriveComposerMode({ info: { ...CONTINUABLE, runId: "run-other", verify: false }, localStatus: "done" }));
+    expect(toggle.checked).toBe(false);
+
+    // 回到新建：开关仍可用、标签回到"独立核查"，且下次再选同一 run 会重新套缺省
+    patchComposer(deriveComposerMode({ info: null }));
+    expect(toggle.disabled).toBe(false);
+    expect(label.textContent).toBe("独立核查");
+    toggle.checked = true;
+    patchComposer(deriveComposerMode({ info: { ...CONTINUABLE, runId: "run-other", verify: false }, localStatus: "done" }));
+    expect(toggle.checked).toBe(false);
+
+    // 运行中禁用
+    patchComposer(deriveComposerMode({
+      info: { ...CONTINUABLE, status: "running", canContinue: false }, localStatus: "running",
+    }));
+    expect(toggle.disabled).toBe(true);
   });
 
   it("提交在飞时按钮不可点——服务端在返回响应之前就广播了 run_created", () => {
@@ -916,8 +966,10 @@ describe("统一 composer：一个框，两种去向", () => {
     expect(q("#composer-note").hidden).toBe(false);
     expect(q("#task-input").getAttribute("aria-describedby")).toBe("composer-note");
 
-    // 续跑复用原运行的装配，这一组构造上无效——禁用而不是藏起来
-    expect((q("#verify-toggle") as HTMLInputElement).disabled).toBe(true);
+    // 续跑复用原运行的装配，这一组构造上无效——禁用而不是藏起来。
+    // 例外是核查开关：核查是每一轮的选项，追加轮它进请求体（见下一条测试；
+    // 旧锁「追加时 #verify-toggle 禁用」于会话中心化时退役）
+    expect((q("#verify-toggle") as HTMLInputElement).disabled).toBe(false);
     expect((q("#rubric-input") as HTMLTextAreaElement).disabled).toBe(true);
     // 但**不动面板的开合**：那是用户状态，后台事件去改它会把焦点踢回 body
     expect(q("#run-knobs").hidden).toBe(true); // 骨架初始就是折叠的，没被动过

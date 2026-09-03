@@ -134,8 +134,17 @@ export interface ArchivedMeta {
   /** 派生谱系；父档案始终不可变 */
   continuedFrom?: string | null;
   rootRunId?: string | null;
-  /** 列表列所需的裁决摘要；完整裁决在事件流里，不重复存 */
-  outcome: { finalPassed: boolean | null; reworks: number | null; verdict: unknown } | null;
+  /**
+   * 列表列所需的裁决摘要；完整裁决在事件流里，不重复存。
+   * judgedTurn = 这份裁决核查的是第几轮对话（会话中心化后核查是逐轮选项，
+   * 裁决只对它核查的那一轮负责）；旧档案缺省。
+   */
+  outcome: {
+    finalPassed: boolean | null;
+    reworks: number | null;
+    verdict: unknown;
+    judgedTurn?: number | null;
+  } | null;
 }
 
 export interface ArchivedRun {
