@@ -5394,6 +5394,10 @@ describe("B2 · 运行历史落盘", () => {
     expect(flattened).toContain("secret-z9");
     expect(flattened).toContain("接着跑");
 
+    // 写链是异步的：列表报 done 时 state.json 可能还停在恢复时写下的 interrupted
+    // （CI 满载 runner 实测抓到 lastSameRunResumeAt=null）。close() 等全部写落盘再读盘
+    await handle!.close();
+    handle = undefined;
     const afterState = JSON.parse(await readFile(join(runDir, "state.json"), "utf8"));
     expect(afterState.lastSameRunResumeAt).toBeTruthy();
     expect(["executing", "completed"]).toContain(afterState.phase);

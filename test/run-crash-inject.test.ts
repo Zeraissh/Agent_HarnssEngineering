@@ -567,6 +567,9 @@ describe("RUN-02 crash injection", () => {
     const flattened = JSON.stringify(resumeModel.requests[0]?.messages ?? []);
     expect(flattened).toContain("marker-alpha");
 
+    // 同 ui-server 的 RUN-01 Phase 2 锁：写链异步，读盘前先 close() 等它落盘
+    await handle!.close();
+    handle = undefined;
     const after = await readArchivedState(join(dir, runId));
     expect(after?.lastSameRunResumeAt).toBeTruthy();
   });
