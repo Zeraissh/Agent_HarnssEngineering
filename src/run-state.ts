@@ -4,8 +4,17 @@
  * Phase 1：phase 迁移 + 快照形状。
  * Phase 2：预算/grant 审计进 state；同 run 热恢复仅在「已提交 checkpoint
  * 段边界」上合法（idempotency ≡ checkpoint.segmentIndex）。不恢复 live
- * loop / AbortController / active grant；不做 SAFE-06 toolTx。
+ * loop / AbortController / active grant。
+ * SAFE-06 Phase 1：toolTx[] 持久化 prepared/running/committed；mid-tool
+ * 同 key 不重复 commit；不自动重放未完成 assistant 轮（见 ADR 附录）。
  */
+import {
+  parseDurableToolTx,
+  type DurableToolTx,
+  upsertToolTx,
+} from "./tool-tx.js";
+
+export type { DurableToolTx };
 export const RUN_STATE_VERSION = 1 as const;
 
 export const RUN_PHASES = [
@@ -82,6 +91,11 @@ export interface DurableRunState {
    * 有值 = 本档案曾诚实做过 same-run resume（非 fork）。
    */
   lastSameRunResumeAt: number | null;
+  /**
+   * SAFE-06：副作用工具事务表（按 idempotencyKey upsert）。
+   * 旧档案缺省 []。中断后保留——恢复时 seed 给 ToolExecutor 防重复 commit。
+   */
+  toolTx: DurableToolTx[];
 }
 
 export type RunStateEvent =
@@ -100,6 +114,7 @@ export type RunStateEvent =
   | { type: "budget_snapshot"; budget: DurableBudgetSnapshot }
   | { type: "grant_audit"; entry: DurableGrantAuditEntry }
   | { type: "resume"; at: number }
+  | { type: "tool_tx"; tx: DurableToolTx }
   | { type: "complete" }
   | { type: "fail" }
   | { type: "close" }
@@ -122,6 +137,7 @@ export function initialRunState(runId: string, at = Date.now()): DurableRunState
     budget: null,
     grantAudit: [],
     lastSameRunResumeAt: null,
+    toolTx: [],
   };
 }
 
@@ -136,6 +152,7 @@ export function transitionRunState(
     pendingApprovalIds: [...state.pendingApprovalIds],
     pendingQuestionIds: [...state.pendingQuestionIds],
     grantAudit: [...state.grantAudit],
+    toolTx: state.toolTx.map((t) => ({ ...t })),
     budget: state.budget ? { ...state.budget } : null,
     plan: state.plan ? { ...state.plan, edges: { ...state.plan.edges } } : null,
     updatedAt: at,
@@ -224,11 +241,16 @@ export function transitionRunState(
     }
     case "resume":
       // 仅 interrupted → executing。不恢复 grant / 不假装 loop 还在。
+      // toolTx 故意保留：同 key 防重复 commit 的种子。
       if (state.phase !== "interrupted") return null;
       next.phase = "executing";
       next.pendingApprovalIds = [];
       next.pendingQuestionIds = [];
       next.lastSameRunResumeAt = event.at;
+      return next;
+    case "tool_tx":
+      if (["completed", "failed", "closed"].includes(state.phase)) return null;
+      next.toolTx = upsertToolTx(next.toolTx, { ...event.tx });
       return next;
     case "complete":
       if (["closed", "failed", "interrupted"].includes(state.phase)) return null;
@@ -281,10 +303,11 @@ export function recoveryActionForPhase(
 }
 
 /**
- * Phase 2 同 run 热恢复准入（ADR：需 toolTx **或** idempotency 边界）。
+ * Phase 2 同 run 热恢复准入（ADR：checkpoint 段边界；SAFE-06 不改此门）。
  *
- * 本实现取后者：只在 interrupted + 已提交 main checkpoint 时放行。
- * 中途 tool 调用无 prepared/committed（SAFE-06 残余）——故不以 mid-tool 续跑。
+ * 仍只在 interrupted + 已提交 main checkpoint 时放行。
+ * toolTx 让「同 key 再入不重复 commit」可证，但**不**把 mid-tool 未完成轮
+ * 自动重放成续跑入口——那仍是残余（见 ADR-003 附录）。
  * Active grant 永不因本函数为 true 而复活。
  */
 export function canSameRunResume(input: {
@@ -300,4 +323,17 @@ export function canSameRunResume(input: {
   if (input.mode === "plan") return false;
   if (input.budgetExhausted) return false;
   return true;
+}
+
+/** 供 history 解析复用：坏条目整表拒（与 grantAudit 同纪律）。 */
+export function parseToolTxList(raw: unknown): DurableToolTx[] | null {
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) return null;
+  const out: DurableToolTx[] = [];
+  for (const item of raw) {
+    const tx = parseDurableToolTx(item);
+    if (!tx) return null;
+    out.push(tx);
+  }
+  return out;
 }

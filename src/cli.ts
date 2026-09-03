@@ -618,6 +618,8 @@ async function main(): Promise<void> {
       ...askUserTools,
     ],
     workdir: process.cwd(),
+    // SAFE-06：CLI 武装内存 toolTx（事件可见）；durable state 仍是 Web 先行残余
+    runId: `cli-${Date.now()}`,
     ...(executionBroker ? { executionBroker } : {}),
     ...(readRoots.length ? { readRoots } : {}),
     compat,
@@ -1088,6 +1090,28 @@ async function main(): Promise<void> {
       case "tool_call":
         endStreamLine();
         console.log(`${c.cyan("→ tool")} ${event.name} ${c.dim(JSON.stringify(event.input))}`);
+        break;
+      case "tool_prepared":
+        endStreamLine();
+        console.log(
+          c.dim(`⬡ prepared ${event.name} ${event.idempotencyKey.slice(0, 24)}…`),
+        );
+        break;
+      case "tool_running":
+        console.log(c.dim(`⬡ running ${event.name}`));
+        break;
+      case "tool_committed":
+        console.log(
+          c.dim(
+            `⬡ committed ${event.name}${event.skipped ? " (skipped duplicate)" : ""}`,
+          ),
+        );
+        break;
+      case "tool_failed":
+        console.log(c.yellow(`⬡ failed ${event.name}: ${event.reason}`));
+        break;
+      case "tool_aborted":
+        console.log(c.yellow(`⬡ aborted ${event.name}`));
         break;
       case "tool_result": {
         const head = event.result.content.split("\n")[0] ?? "";

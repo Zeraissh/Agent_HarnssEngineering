@@ -1,9 +1,9 @@
 # ADR-003: Durable RunState（分阶段）
 
-**Status:** Accepted（Phase 1–2 已落地；Phase 3 / RUN-02 崩溃注入套件已落地；SAFE-06 toolTx / CLI 对等仍为残余）  
-**Date:** 2026-09-02（Phase 2+3：2026-09-03）  
+**Status:** Accepted（Phase 1–3 已落地；SAFE-06 Phase 1 toolTx 已落地；CLI 对等 durable / mid-tool 自动重放仍为残余）  
+**Date:** 2026-09-02（Phase 2+3：2026-09-03；SAFE-06 Phase 1：2026-09-03）  
 **Deciders:** Agent_Design 维护者  
-**Related:** RUN-01 / RUN-02；B2 `ui/history.ts`；SAFE-04 grant 边界；OBS-01 `trace.jsonl`
+**Related:** RUN-01 / RUN-02；B2 `ui/history.ts`；SAFE-04 grant 边界；SAFE-06 toolTx；OBS-01 `trace.jsonl`
 
 ## Context
 
@@ -51,8 +51,24 @@ verification?: { round, recovery?, lastVerdictHash? }
 budget: SharedRunBudget 快照                    # Phase 2
 approvals: { pendingIds[], grantAudit[] }       # Phase 2：只审计，不恢复 active grant
 lastSameRunResumeAt?: number | null             # Phase 2
-toolTx?: never                                  # 禁止直至 SAFE-06
+toolTx: DurableToolTx[]                         # SAFE-06 Phase 1：prepared|running|committed|failed|aborted
 ```
+
+Idempotency 边界：
+
+- **续跑入口**（同 run）：仍是 **checkpoint 段号**（interrupted + 已提交 main done）。
+- **副作用提交**：`idempotencyKey = runId:toolUseId`；同 key 已 `committed` 不得再执行；`write_file` 另有内容级幂等；`bash` 在 prepared/running 残留上 **fail-closed 不重试**（无 undo）。
+
+## Addendum — SAFE-06 Phase 1（2026-09-03）
+
+| 已落地 | 残余 |
+|---|---|
+| `src/tool-tx.ts` + TurnEvent `tool_prepared/running/committed/failed/aborted` | CLI 对等 durable `state.json`（CLI 仅内存 toolTx + 事件） |
+| `DurableRunState.toolTx` 进 state.json；prepared 刷盘后再副作用 | 未完成 assistant 轮的 **自动 mid-tool 重放** |
+| `write_file` / `bash` 武装；崩溃注入同 key 不重复写 | bash **compensation/undo**（明确不做假） |
+| CLI + Web reducer/渲染同提交；RUN-02 扩展 | MCP 写类工具未进 SIDE_EFFECT 集合 |
+
+`canSameRunResume` **不**因 toolTx 放宽——续跑入口与副作用幂等是两层。
 
 **恢复语义（Phase 1）**：
 
@@ -69,25 +85,24 @@ Phase 1 **明确不做**：同 runId 热恢复、跨重启复用 active grant、
 
 | 条件 | 行为 |
 |---|---|
-| `interrupted` + 已提交 main checkpoint + 非 verify/plan + 预算未耗尽 | **同 runId 热恢复**（`sameRunResume:true`，`continuationMode:"same-run"`）；首条事件 `run_resumed`；新建 AgentLoop/AbortController；**不**恢复 active grant |
+| `interrupted` + 已提交 main checkpoint + 非 verify/plan + 预算未耗尽 | **同 runId 热恢复**（`sameRunResume:true`，`continuationMode:"same-run"`）；首条事件 `run_resumed`；新建 AgentLoop/AbortController；**不**恢复 active grant；**seed toolTx** |
 | 同上但无 checkpoint | 只读 interrupted；不可续 |
 | 完成态归档 + checkpoint | 仍走 **fork**（新 runId）；`sameRunResume:false` |
-
-Idempotency 边界（无 SAFE-06 toolTx）：**checkpoint 段号**——只从最后完整 main `done` 之后续跑，不声称 mid-tool 安全。
 
 ### Phase 划分
 
 | Phase | 范围 | 验收 |
 |---|---|---|
 | **1（已落地）** | 写 `state.json` 与 phase 迁移；崩溃档案带 phase；计划 DAG 快照进 state；与 meta/checkpoint 一致；单测 + 变异（丢 phase 变红） | docs/08 RUN-01 → `[~]` |
-| **2（已落地）** | 同 run 热恢复执行游标（idempotency = checkpoint）；预算/grantAudit 进 state；UI/API `sameRunResume` 诚实；变异 `same-run-resume-allows-executing` | docs/08 RUN-01 仍 `[~]`（toolTx/CLI 残余） |
-| **3（已落地）** | 崩溃注入套件（RUN-02）：`test/run-crash-inject.test.ts` 覆盖 model / approval wait / history write / same-run / fork；**不**伪造 tool prepared/committed | docs/08 RUN-02 → `[~]`；SAFE-06 仍开 |
+| **2（已落地）** | 同 run 热恢复执行游标（idempotency = checkpoint）；预算/grantAudit 进 state；UI/API `sameRunResume` 诚实；变异 `same-run-resume-allows-executing` | docs/08 RUN-01 仍 `[~]`（CLI 残余） |
+| **3（已落地）** | 崩溃注入套件（RUN-02）+ SAFE-06 Phase 1 tool prepared/committed | docs/08 RUN-02 / SAFE-06 → `[~]` |
 
 ### 与现有件的关系
 
 - **events.jsonl** 仍是 UI 重放事实源；state.json 是 **编排游标**，不是第二套事件流。
 - **OBS-01 trace** 旁路观测；不参与恢复决策。
 - **SAFE-04**：Phase 1–2 只持久化 grant **审计**；激活仍禁跨重启。
+- **SAFE-06**：toolTx 进 state；生命周期事件进 events.jsonl。
 
 ## Options Considered
 
@@ -105,16 +120,18 @@ Idempotency 边界（无 SAFE-06 toolTx）：**checkpoint 段号**——只从�
 
 ## Consequences
 
-- 正向：RUN-01 有可验收的 Phase 1–2 边界；接手不必重推演“同 run 热恢复 vs 派生”。
-- 负向：无 toolTx 时 mid-segment 崩溃仍会丢该段未落盘工具副作用——界面必须继续诚实（interrupted / run_resumed 边界文案）。
-- 风险：state 与 events 短暂不一致——写序必须 **先 append 相关事件，再写 state**（或同链 enqueue）。
+- 正向：RUN-01 有可验收的 Phase 1–2 边界；SAFE-06 同 key 不重复 commit 可证。
+- 负向：mid-tool **自动重放**未完成轮仍不做——界面须诚实；bash 无 compensation。
+- 风险：state 与 events 短暂不一致——写序必须 **先 append 相关事件，再写 state**（或同链 enqueue）；prepared 额外 `flush` 后再副作用。
 
-## Phase 1–2 非目标（写进残余）
+## Phase 1–2 非目标（更新后残余）
 
-- SAFE-06 tool transaction（prepared/committed）
+- ~~SAFE-06 tool transaction（prepared/committed）~~ → Phase 1 已落地，见上表残余
 - GOV-01 主体绑定的跨重启 grant
-- CLI 对等 durable state（Web 先行；CLI 可随后镜像）
-- MEM-01 语义压缩（独立项）
+- CLI 对等 durable state（Web 先行；CLI 仅内存 toolTx + 事件）
+- mid-tool 未完成 assistant 轮自动重放
+- bash undo / 通用 compensation
+- MEM-01 语义压缩（独立项，已另轨）
 
 ## Implementation notes
 
@@ -122,5 +139,5 @@ Idempotency 边界（无 SAFE-06 toolTx）：**checkpoint 段号**——只从�
 2. ~~`ui/history.ts`：`writeState` / `readState` / Phase 2 字段解析~~
 3. ~~`ui/server.ts`：迁移接线、崩溃收口、same-run followUp、预算/grant 快照~~
 4. ~~UI：`continuationMode:"same-run"` + `run_resumed` reducer/装配条~~
-5. docs/08 RUN-01 保持 `[~]`；残余写清 toolTx / CLI。
-6. ~~RUN-02 崩溃注入套件~~（`test/run-crash-inject.test.ts`）；docs/08 RUN-02 → `[~]`，SAFE-06 残余照实写。
+5. docs/08 RUN-01 / SAFE-06 / RUN-02 保持 `[~]`；残余写清。
+6. ~~RUN-02 崩溃注入套件~~；~~SAFE-06 Phase 1~~（`src/tool-tx.ts` + `test/tool-tx.test.ts`）。

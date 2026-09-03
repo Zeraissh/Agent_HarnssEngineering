@@ -126,6 +126,35 @@ describe("reduceEvent", () => {
     ).toBe(true);
   });
 
+  it("SAFE-06：tool_prepared/committed 投影保留 idempotencyKey（host-lags 白名单锁）", () => {
+    let state = createInitialState("r1", "tx", false);
+    state = reduceEvent(
+      state,
+      sse("main", "tool_prepared", {
+        toolUseId: "tu_w",
+        name: "write_file",
+        idempotencyKey: "r1:tu_w",
+        inputHash: "abc",
+      }),
+    );
+    state = reduceEvent(
+      state,
+      sse("main", "tool_committed", {
+        toolUseId: "tu_w",
+        name: "write_file",
+        idempotencyKey: "r1:tu_w",
+        skipped: true,
+      }),
+    );
+    const logs = deriveLogEntries(state);
+    const prep = logs.find((e) => e.type === "tool_prepared");
+    const commit = logs.find((e) => e.type === "tool_committed");
+    expect(prep?.idempotencyKey).toBe("r1:tu_w");
+    expect(prep?.inputHash).toBe("abc");
+    expect(commit?.skipped).toBe(true);
+    expect(commit?.idempotencyKey).toBe("r1:tu_w");
+  });
+
   // ---- AC3-1: 时间线折叠 ----
   it("1. 时间线折叠: turn_start → tool_call → tool_result 顺序", () => {
     let state = createInitialState("r1", "test task", false);

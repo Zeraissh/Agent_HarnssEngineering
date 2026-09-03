@@ -636,35 +636,90 @@ describe("RUN-02 crash injection", () => {
     );
   });
 
-  // ---- 7. SAFE-06 / toolTx 残余诚实锁 ------------------------------------
+  // ---- 7. SAFE-06 / toolTx Phase 1 ---------------------------------------
 
-  it("残余：无 tool prepared/committed 事件；mid-tool 不声称可恢复", async () => {
-    // 契约锁：今天的事件类型集合里没有 toolTx 生命周期
-    dir = await mkdtemp(join(tmpdir(), "run02-no-tooltx-"));
+  it("write_file 发射 prepared/committed；state.toolTx 持久化；noop 不假装有事务", async () => {
+    dir = await mkdtemp(join(tmpdir(), "run02-tooltx-"));
+    const work = await mkdtemp(join(tmpdir(), "run02-tooltx-wd-"));
+    const writes = { n: 0 };
+    const countingWrite: Tool = {
+      name: "write_file",
+      description: "write",
+      inputSchema: {
+        type: "object",
+        properties: { path: { type: "string" }, content: { type: "string" } },
+        required: ["path", "content"],
+      },
+      permission: "auto",
+      parallelSafe: false,
+      async execute(input) {
+        writes.n += 1;
+        const { path: p, content } = input as { path: string; content: string };
+        const { writeFile: wf, mkdir } = await import("node:fs/promises");
+        const { dirname, join: j } = await import("node:path");
+        const full = j(work, p);
+        await mkdir(dirname(full), { recursive: true });
+        await wf(full, content, "utf8");
+        return { content: `Wrote to ${p}` };
+      },
+    };
     const base = await boot({
       modelClient: new FakeModelClient([
-        fakeMessage([toolUseBlock("t", "noop", {})], "tool_use"),
-        fakeMessage([textBlock("ok")], "end_turn"),
+        fakeMessage(
+          [toolUseBlock("tu_w", "write_file", { path: "x.txt", content: "v1" })],
+          "tool_use",
+        ),
+        fakeMessage([textBlock("done")], "end_turn"),
       ]),
-      tools: [makeTool({ name: "noop", permission: "auto" })],
+      tools: [countingWrite],
+      workdir: work,
       history: dir,
     });
     const { runId } = (await (
       await fetch(`${base}/api/runs`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ task: "no tooltx", verify: false }),
+        body: JSON.stringify({ task: "write once", verify: false }),
       })
     ).json()) as { runId: string };
     await waitForDone(base, runId);
     const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
     const types = events.map((e) => (e as any).event.type);
-    expect(types).not.toContain("tool_prepared");
-    expect(types).not.toContain("tool_committed");
-    expect(types).not.toContain("tool_compensated");
+    expect(types).toContain("tool_prepared");
+    expect(types).toContain("tool_committed");
+    expect(writes.n).toBe(1);
+
+    const state = JSON.parse(await readFile(join(dir, runId, "state.json"), "utf8"));
+    expect(Array.isArray(state.toolTx)).toBe(true);
+    expect(state.toolTx.some((t: any) => t.status === "committed" && t.name === "write_file")).toBe(
+      true,
+    );
+
+    // noop 仍无事务事件（非副作用工具）
+    const base2 = await boot({
+      modelClient: new FakeModelClient([
+        fakeMessage([toolUseBlock("t", "noop", {})], "tool_use"),
+        fakeMessage([textBlock("ok")], "end_turn"),
+      ]),
+      tools: [makeTool({ name: "noop", permission: "auto" })],
+      history: await mkdtemp(join(tmpdir(), "run02-noop-")),
+    });
+    const { runId: r2 } = (await (
+      await fetch(`${base2}/api/runs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task: "noop", verify: false }),
+      })
+    ).json()) as { runId: string };
+    await waitForDone(base2, r2);
+    const types2 = (await readSSEAll(await fetch(`${base2}/api/runs/${r2}/events`))).map(
+      (e) => (e as any).event.type,
+    );
+    expect(types2).not.toContain("tool_prepared");
+    expect(types2).not.toContain("tool_committed");
 
     // canSameRunResume 在 executing（mid-segment 活相）上必须 false——
-    // 只有 interrupted+checkpoint 才是 idempotency 边界
+    // 续跑入口仍是 interrupted+checkpoint，不因 toolTx 放宽
     expect(
       canSameRunResume({
         phase: "executing",
@@ -674,5 +729,109 @@ describe("RUN-02 crash injection", () => {
         budgetExhausted: false,
       }),
     ).toBe(false);
+  });
+
+  it("crash after prepared → resume same key does not double-write (Web inject)", async () => {
+    dir = await mkdtemp(join(tmpdir(), "run02-crash-prep-"));
+    const work = await mkdtemp(join(tmpdir(), "run02-crash-prep-wd-"));
+    const writes = { n: 0 };
+    const countingWrite: Tool = {
+      name: "write_file",
+      description: "write",
+      inputSchema: {
+        type: "object",
+        properties: { path: { type: "string" }, content: { type: "string" } },
+        required: ["path", "content"],
+      },
+      permission: "auto",
+      parallelSafe: false,
+      async execute(input) {
+        writes.n += 1;
+        const { path: p, content } = input as { path: string; content: string };
+        const { writeFile: wf, mkdir } = await import("node:fs/promises");
+        const { dirname, join: j } = await import("node:path");
+        const full = j(work, p);
+        await mkdir(dirname(full), { recursive: true });
+        await wf(full, content, "utf8");
+        return { content: `Wrote to ${p}` };
+      },
+    };
+
+    // 第一次：prepared 后崩溃
+    const h1 = createUiServer({
+      modelClient: new FakeModelClient([
+        fakeMessage(
+          [toolUseBlock("tu_w", "write_file", { path: "once.txt", content: "only-once" })],
+          "tool_use",
+        ),
+        fakeMessage([textBlock("done")], "end_turn"),
+      ]),
+      tools: [countingWrite],
+      workdir: work,
+      history: dir,
+      crashAfterToolPrepared: () => true,
+    });
+    handle = h1;
+    const port1 = await startServer(h1);
+    const base1 = baseUrl(port1);
+    const { runId } = (await (
+      await fetch(`${base1}/api/runs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task: "crash write", verify: false }),
+      })
+    ).json()) as { runId: string };
+    await waitForDone(base1, runId);
+    expect(writes.n).toBe(0);
+    const state1 = JSON.parse(await readFile(join(dir, runId, "state.json"), "utf8"));
+    const prepared = state1.toolTx?.find((t: any) => t.toolUseId === "tu_w");
+    expect(prepared?.status).toBe("prepared");
+    await h1.close();
+    handle = undefined;
+
+    // 第二次：同 history 根上用 ToolExecutor 模拟同 key 恢复（不依赖 mid-tool 自动重放）
+    const { ToolExecutor, ToolRegistry } = await import("../src/tools/registry.js");
+    const { findToolTx } = await import("../src/tool-tx.js");
+    const reg = new ToolRegistry();
+    reg.register(countingWrite);
+    const exec = new ToolExecutor(reg, work);
+    const seed = state1.toolTx as any[];
+    exec.setToolTx({
+      runId,
+      get: (key) => findToolTx(seed, key),
+      notify: (phase, tx) => {
+        const idx = seed.findIndex((t) => t.idempotencyKey === tx.idempotencyKey);
+        if (idx >= 0) seed[idx] = tx;
+        else seed.push(tx);
+        void phase;
+      },
+    });
+    await exec.executeAll(
+      [
+        {
+          type: "tool_use",
+          id: "tu_w",
+          name: "write_file",
+          input: { path: "once.txt", content: "only-once" },
+        } as any,
+      ],
+      new AbortController().signal,
+      async () => ({ decision: "allow" }),
+    );
+    expect(writes.n).toBe(1);
+    // 再入同 key → skip
+    await exec.executeAll(
+      [
+        {
+          type: "tool_use",
+          id: "tu_w",
+          name: "write_file",
+          input: { path: "once.txt", content: "only-once" },
+        } as any,
+      ],
+      new AbortController().signal,
+      async () => ({ decision: "allow" }),
+    );
+    expect(writes.n).toBe(1);
   });
 });

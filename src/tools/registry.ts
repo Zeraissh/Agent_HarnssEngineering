@@ -2,7 +2,16 @@
  * L2 — ToolRegistry + ToolExecutor：工具注册、确定性序列化、权限评估与并行调度。
  */
 import type Anthropic from "@anthropic-ai/sdk";
-import type { ExecutionBroker, Tool, ToolResult } from "../types.js";
+import type { ExecutionBroker, Tool, ToolResult, TurnEvent } from "../types.js";
+import {
+  canonicalInputHash,
+  decideToolTxReplay,
+  isSideEffectTool,
+  retryPolicyForTool,
+  toolIdempotencyKey,
+  type DurableToolTx,
+  type ToolTxController,
+} from "../tool-tx.js";
 import { validateToolInput } from "./validate-input.js";
 
 export class ToolRegistry {
@@ -43,7 +52,13 @@ export interface ExecutedTool {
   durationMs: number;
 }
 
+/** SAFE-06：生命周期事件交给 loop 推入 TurnEvent 流 */
+export type ToolTxEventSink = (event: TurnEvent) => void | Promise<void>;
+
 export class ToolExecutor {
+  private toolTx: ToolTxController | undefined;
+  private onTxEvent: ToolTxEventSink | undefined;
+
   constructor(
     private readonly registry: ToolRegistry,
     private readonly workdir: string,
@@ -61,11 +76,18 @@ export class ToolExecutor {
     this.executionBroker = executionBroker;
   }
 
+  /** SAFE-06：注入/替换事务控制器与事件出口（loop 在 drive 前设置）。 */
+  setToolTx(controller?: ToolTxController, onTxEvent?: ToolTxEventSink): void {
+    this.toolTx = controller;
+    this.onTxEvent = onTxEvent;
+  }
+
   /**
    * 执行一轮内的全部 tool_use 块：
    * - parallelSafe 的并发执行，其余串行；
    * - 结果按原 block 顺序返回（合并进单条 user 消息由 loop 负责）；
    * - 任何失败都收敛为 isError result，绝不向上抛（P5）。
+   * - 副作用工具走 prepared→committed；崩溃注入在 prepared 之后可抛（供测试）。
    */
   async executeAll(
     blocks: Anthropic.ToolUseBlock[],
@@ -155,21 +177,213 @@ export class ToolExecutor {
       }
     }
 
+    const sideEffect = isSideEffectTool(tool.name) && this.toolTx;
+    if (!sideEffect) {
+      try {
+        return await tool.execute(block.input, {
+          workdir: this.workdir,
+          ...(this.readRoots?.length ? { readRoots: this.readRoots } : {}),
+          toolUseId: block.id,
+          signal,
+          ...(this.executionBroker ? { executionBroker: this.executionBroker } : {}),
+        });
+      } catch (err) {
+        if (err instanceof ToolTxCrashError) throw err;
+        return {
+          content: `Tool "${block.name}" failed: ${err instanceof Error ? err.message : String(err)}`,
+          isError: true,
+        };
+      }
+    }
+
+    return this.executeSideEffect(tool, block, signal);
+  }
+
+  /**
+   * SAFE-06 副作用路径：prepared →（crash 注入点）→ running → execute → committed。
+   * 同 key 已 committed → 跳过；bash prepared/running → fail-closed 不重跑。
+   */
+  private async executeSideEffect(
+    tool: Tool,
+    block: Anthropic.ToolUseBlock,
+    signal: AbortSignal,
+  ): Promise<ToolResult> {
+    const ctrl = this.toolTx!;
+    const inputHash = canonicalInputHash(block.input);
+    const key = toolIdempotencyKey(ctrl.runId, block.id);
+    const existing = ctrl.get(key);
+    const decision = decideToolTxReplay(existing, inputHash);
+
+    if (decision.action === "skip_committed") {
+      const tx: DurableToolTx = {
+        ...(existing as DurableToolTx),
+        status: "committed",
+        updatedAt: Date.now(),
+      };
+      await this.emitTx("tool_committed", tx, { skipped: true });
+      await ctrl.notify("committed", tx, { skipped: true });
+      return decision.result;
+    }
+
+    if (decision.action === "fail_closed") {
+      const base =
+        existing ??
+        ({
+          idempotencyKey: key,
+          toolUseId: block.id,
+          name: tool.name,
+          inputHash,
+          status: "failed" as const,
+          retryPolicy: retryPolicyForTool(tool.name),
+          preparedAt: Date.now(),
+          updatedAt: Date.now(),
+        } satisfies DurableToolTx);
+      const tx: DurableToolTx = {
+        ...base,
+        status: "failed",
+        updatedAt: Date.now(),
+        resultContent: decision.reason,
+        resultIsError: true,
+      };
+      await this.emitTx("tool_failed", tx, { reason: decision.reason });
+      await ctrl.notify("failed", tx, { reason: decision.reason });
+      return { content: decision.reason, isError: true };
+    }
+
+    const now = Date.now();
+    const prepared: DurableToolTx = {
+      idempotencyKey: key,
+      toolUseId: block.id,
+      name: tool.name,
+      inputHash,
+      status: "prepared",
+      retryPolicy: retryPolicyForTool(tool.name),
+      preparedAt: existing?.preparedAt ?? now,
+      updatedAt: now,
+    };
+    await this.emitTx("tool_prepared", prepared);
+    await ctrl.notify("prepared", prepared);
+
+    if (ctrl.injectCrashAfterPrepared?.()) {
+      // 崩溃注入：prepared 已落盘；不进入 running/execute。向上抛让宿主收成 interrupted。
+      throw new ToolTxCrashError(key);
+    }
+
+    if (signal.aborted) {
+      const aborted: DurableToolTx = { ...prepared, status: "aborted", updatedAt: Date.now() };
+      await this.emitTx("tool_aborted", aborted);
+      await ctrl.notify("aborted", aborted);
+      return { content: `Tool "${tool.name}" aborted before execution.`, isError: true };
+    }
+
+    const running: DurableToolTx = { ...prepared, status: "running", updatedAt: Date.now() };
+    await this.emitTx("tool_running", running);
+    await ctrl.notify("running", running);
+
     try {
-      return await tool.execute(block.input, {
+      const result = await tool.execute(block.input, {
         workdir: this.workdir,
         ...(this.readRoots?.length ? { readRoots: this.readRoots } : {}),
         toolUseId: block.id,
         signal,
         ...(this.executionBroker ? { executionBroker: this.executionBroker } : {}),
       });
+      const committed: DurableToolTx = {
+        ...running,
+        status: "committed",
+        updatedAt: Date.now(),
+        resultContent: result.content,
+        ...(result.isError ? { resultIsError: true } : {}),
+      };
+      await this.emitTx("tool_committed", committed);
+      await ctrl.notify("committed", committed);
+      return result;
     } catch (err) {
-      // 错误进上下文，写给模型看（P5）
+      if (err instanceof ToolTxCrashError) throw err;
+      if (signal.aborted) {
+        const aborted: DurableToolTx = { ...running, status: "aborted", updatedAt: Date.now() };
+        await this.emitTx("tool_aborted", aborted);
+        await ctrl.notify("aborted", aborted);
+        return { content: `Tool "${tool.name}" aborted during execution.`, isError: true };
+      }
+      const reason = err instanceof Error ? err.message : String(err);
+      const failed: DurableToolTx = {
+        ...running,
+        status: "failed",
+        updatedAt: Date.now(),
+        resultContent: reason,
+        resultIsError: true,
+      };
+      await this.emitTx("tool_failed", failed, { reason });
+      await ctrl.notify("failed", failed, { reason });
       return {
-        content: `Tool "${block.name}" failed: ${err instanceof Error ? err.message : String(err)}`,
+        content: `Tool "${block.name}" failed: ${reason}`,
         isError: true,
       };
     }
+  }
+
+  private async emitTx(
+    type: "tool_prepared" | "tool_running" | "tool_committed" | "tool_failed" | "tool_aborted",
+    tx: DurableToolTx,
+    meta?: { skipped?: boolean; reason?: string },
+  ): Promise<void> {
+    if (!this.onTxEvent) return;
+    if (type === "tool_prepared") {
+      await this.onTxEvent({
+        type,
+        toolUseId: tx.toolUseId,
+        name: tx.name,
+        idempotencyKey: tx.idempotencyKey,
+        inputHash: tx.inputHash,
+      });
+      return;
+    }
+    if (type === "tool_running") {
+      await this.onTxEvent({
+        type,
+        toolUseId: tx.toolUseId,
+        name: tx.name,
+        idempotencyKey: tx.idempotencyKey,
+      });
+      return;
+    }
+    if (type === "tool_committed") {
+      await this.onTxEvent({
+        type,
+        toolUseId: tx.toolUseId,
+        name: tx.name,
+        idempotencyKey: tx.idempotencyKey,
+        ...(meta?.skipped ? { skipped: true } : {}),
+      });
+      return;
+    }
+    if (type === "tool_failed") {
+      await this.onTxEvent({
+        type,
+        toolUseId: tx.toolUseId,
+        name: tx.name,
+        idempotencyKey: tx.idempotencyKey,
+        reason: meta?.reason ?? tx.resultContent ?? "failed",
+      });
+      return;
+    }
+    await this.onTxEvent({
+      type: "tool_aborted",
+      toolUseId: tx.toolUseId,
+      name: tx.name,
+      idempotencyKey: tx.idempotencyKey,
+    });
+  }
+}
+
+/** prepared 落盘后、副作用前注入的崩溃——不得被 executeSingle 收成 isError。 */
+export class ToolTxCrashError extends Error {
+  readonly idempotencyKey: string;
+  constructor(idempotencyKey: string) {
+    super(`SAFE-06 crash injection after tool_prepared (${idempotencyKey})`);
+    this.name = "ToolTxCrashError";
+    this.idempotencyKey = idempotencyKey;
   }
 }
 

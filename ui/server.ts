@@ -81,6 +81,7 @@ import {
   type DurableRunState,
   type RunStateEvent,
 } from "../src/run-state.js";
+import { findToolTx, type DurableToolTx, type ToolTxController } from "../src/tool-tx.js";
 import {
   endSpan,
   exportRedactedTrace,
@@ -603,6 +604,11 @@ export interface UiServerOptions {
   fallbackEnv?: NodeJS.ProcessEnv;
   /** 只在宿主确实位于可信反向代理之后时读取 X-Forwarded-Proto/Host。 */
   trustProxy?: boolean;
+  /**
+   * SAFE-06 测试钩子：tool_prepared 落盘后、副作用前崩溃。
+   * 返回 true 时抛 ToolTxCrashError；宿主收成 interrupted 且不 finalize 完成态。
+   */
+  crashAfterToolPrepared?: (runId: string, tx: DurableToolTx) => boolean;
 }
 
 /**
@@ -1254,6 +1260,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     ?? 15_000;
   const bashEnabled = options.enableBash ?? (realHost ? process.env.AGENT_UI_ENABLE_BASH !== "0" : true);
   const trustProxy = options.trustProxy ?? (realHost && process.env.AGENT_UI_TRUST_PROXY === "1");
+  const crashAfterToolPrepared = options.crashAfterToolPrepared;
 
   // F1: 缺省模型从环境变量读取，compat 取自 createModelClientFromEnv 返回值
   // MODEL-01b：Web 启动保持同步装配（createUiServer 契约）；compat 仍可名称猜测，
@@ -2267,6 +2274,13 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       ...(run?.initialContextInputTokens !== undefined
         ? { initialContextInputTokens: run.initialContextInputTokens }
         : {}),
+      // SAFE-06：逐 run 武装 idempotency + durable toolTx
+      ...(run
+        ? {
+            runId: run.id,
+            toolTx: makeToolTxController(run),
+          }
+        : {}),
     };
     return taskCompletionEnabled
       ? withTaskCompletion(cfg, {
@@ -2279,6 +2293,31 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   function appendMemoryTools(tools: Tool[]): Tool[] {
     const names = new Set(tools.map((tool) => tool.name));
     return [...tools, ...memoryTools.filter((tool) => !names.has(tool.name))];
+  }
+
+  /** SAFE-06：按 run 装配事务控制器——查 durableState.toolTx，prepared 刷盘。 */
+  function makeToolTxController(run: StoredRun): ToolTxController {
+    return {
+      runId: run.id,
+      get: (key) => findToolTx(run.durableState?.toolTx, key),
+      notify: async (phase, tx) => {
+        applyDurableTransition(run, { type: "tool_tx", tx }, tx.updatedAt);
+        // prepared 必须在副作用前落盘——崩溃注入才能证明不丢意图
+        if (phase === "prepared" && run.archiveWriter) {
+          await run.archiveWriter.flush();
+        }
+      },
+      ...(crashAfterToolPrepared
+        ? {
+            injectCrashAfterPrepared: () => {
+              const prepared = [...(run.durableState?.toolTx ?? [])]
+                .reverse()
+                .find((t) => t.status === "prepared");
+              return prepared ? crashAfterToolPrepared(run.id, prepared) : false;
+            },
+          }
+        : {}),
+    };
   }
 
   async function buildRunConfig(
@@ -3253,7 +3292,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       rootRunId: run.rootRunId ?? run.id,
       boundary:
         "同 run 热恢复：从最后提交的 main 检查点续跑；不恢复原进程 loop/审批回调/active grant；" +
-        "无 toolTx（SAFE-06）——idempotency 边界是 checkpoint 段号。",
+        "SAFE-06 toolTx 从 state.json 种子化（同 key 不重复 commit）；续跑入口仍是 checkpoint 段号，" +
+        "不自动重放未完成的 mid-tool assistant 轮。",
       checkpoint: {
         conversationTurn: run.conversationTurn - 1,
         contextInputTokens: run.initialContextInputTokens ?? 0,

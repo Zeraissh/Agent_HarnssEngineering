@@ -750,6 +750,20 @@ function buildTimelineEntry(seq, source, type, event) {
         name: /** @type {string} */ (event.name),
         input: event.input,
       };
+    case "tool_prepared":
+    case "tool_running":
+    case "tool_committed":
+    case "tool_failed":
+    case "tool_aborted":
+      return {
+        ...base,
+        toolUseId: /** @type {string} */ (event.toolUseId),
+        name: /** @type {string} */ (event.name),
+        idempotencyKey: String(event.idempotencyKey ?? ""),
+        ...(typeof event.inputHash === "string" ? { inputHash: event.inputHash } : {}),
+        ...(event.skipped === true ? { skipped: true } : {}),
+        ...(typeof event.reason === "string" ? { reason: event.reason } : {}),
+      };
     case "tool_result":
       return {
         ...base,
@@ -2824,7 +2838,8 @@ export function deriveAssemblyBar(state, harness) {
       "durable",
       "同 run 热恢复",
       "本会话从 state.json 的 interrupted 相 + 已提交检查点在同一 runId 上续跑；" +
-        "未恢复 active grant / 原 AbortController / 在飞工具（无 SAFE-06 toolTx）。",
+        "未恢复 active grant / 原 AbortController；SAFE-06 toolTx 从 state 种子化（同 key 不重复 commit），" +
+        "不自动重放未完成 mid-tool 轮。",
     );
   }
 
@@ -5173,6 +5188,16 @@ function renderLogEntryBody(e) {
   switch (e.type) {
     case "tool_call":
       return `<pre class="log-entry-body">${esc(formatInput(e.input))}</pre>`;
+    case "tool_prepared":
+    case "tool_running":
+    case "tool_committed":
+    case "tool_failed":
+    case "tool_aborted":
+      return `<div class="log-entry-body">idempotencyKey=<code>${esc(e.idempotencyKey ?? "")}</code>${
+        e.skipped ? "<br>skipped duplicate commit" : ""
+      }${e.reason ? `<br>${esc(e.reason)}` : ""}${
+        e.inputHash ? `<br>inputHash=<code>${esc(String(e.inputHash).slice(0, 16))}…</code>` : ""
+      }</div>`;
     case "tool_result":
       return `<pre class="log-entry-body">${esc(e.resultContent ?? "")}</pre>`;
     case "assistant_text":
@@ -5252,6 +5277,11 @@ function entryIcon(type, isError) {
   switch (type) {
     case "turn_start": return "──";      // cli.ts:516
     case "tool_call": return "→";        // cli.ts:527
+    case "tool_prepared": return "⬡";
+    case "tool_running": return "⬡";
+    case "tool_committed": return "⬡";
+    case "tool_failed": return "⬡";
+    case "tool_aborted": return "⬡";
     case "tool_result": return isError ? "✗" : "✓"; // cli.ts:530-531
     case "assistant_text": return "¶";   // CLI 直接流式打印无标记，列表里需要一个
     case "assistant_thinking": return "✽"; // 与对话视图同款，自成语域
@@ -5276,6 +5306,12 @@ function entryActionLabel(e) {
   switch (e.type) {
     case "turn_start": return `第 ${e.turn ?? "?"} 轮`;
     case "tool_call": return e.name ?? "";
+    case "tool_prepared": return `${e.name ?? ""} prepared`;
+    case "tool_running": return `${e.name ?? ""} running`;
+    case "tool_committed":
+      return `${e.name ?? ""} committed${e.skipped ? " (skipped)" : ""}`;
+    case "tool_failed": return `${e.name ?? ""} tx failed`;
+    case "tool_aborted": return `${e.name ?? ""} tx aborted`;
     // name 由 deriveLogEntries 按 toolUseId 回填；真取不到才退回 id（V-12）
     case "tool_result": return `${e.name ?? e.toolUseId ?? ""} ${e.resultIsError ? "失败" : "成功"}`;
     case "assistant_text": return "助手消息";
@@ -5320,6 +5356,14 @@ function entryDetail(e) {
   switch (e.type) {
     case "tool_call":
       return truncate(formatInput(e.input), 60);
+    case "tool_prepared":
+    case "tool_running":
+    case "tool_committed":
+      return truncate(e.idempotencyKey ?? "", 48);
+    case "tool_failed":
+      return truncate(e.reason ?? "", 60);
+    case "tool_aborted":
+      return truncate(e.idempotencyKey ?? "", 48);
     case "tool_result":
       return truncate(e.resultContent ?? "", 60);
     case "assistant_text":

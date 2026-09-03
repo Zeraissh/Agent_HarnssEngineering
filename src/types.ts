@@ -327,6 +327,15 @@ export interface AgentConfig {
   errorRetryBackoffMs?: number;
   /** 动态上下文（时间/环境等易变信息）：注入首条 user 消息，绝不进 system（P3） */
   dynamicContext?: Record<string, string>;
+  /**
+   * SAFE-06：本 run 的稳定身份，用于 tool idempotencyKey（runId:toolUseId）。
+   * 缺省时副作用工具仍执行，但不发 tool_prepared/committed（无 key 可钉）。
+   */
+  runId?: string;
+  /**
+   * SAFE-06：宿主事务控制器（查表 + prepared 落盘）。Web 注入；CLI Phase 1 可省略持久化。
+   */
+  toolTx?: import("./tool-tx.js").ToolTxController;
 }
 
 export interface AggregateUsage {
@@ -415,6 +424,44 @@ export type TurnEvent =
   | { type: "assistant_text"; text: string }
   | { type: "tool_call"; toolUseId: string; name: string; input: unknown }
   | { type: "tool_result"; toolUseId: string; result: ToolResult; durationMs: number }
+  /**
+   * SAFE-06：副作用工具事务生命周期。仅 write_file / bash 等 side-effect 工具发射。
+   * prepared 必须在真正副作用之前落盘；committed 之后同 idempotencyKey 不得再执行。
+   */
+  | {
+      type: "tool_prepared";
+      toolUseId: string;
+      name: string;
+      idempotencyKey: string;
+      inputHash: string;
+    }
+  | {
+      type: "tool_running";
+      toolUseId: string;
+      name: string;
+      idempotencyKey: string;
+    }
+  | {
+      type: "tool_committed";
+      toolUseId: string;
+      name: string;
+      idempotencyKey: string;
+      /** true = 同 key 已提交，本次跳过副作用 */
+      skipped?: boolean;
+    }
+  | {
+      type: "tool_failed";
+      toolUseId: string;
+      name: string;
+      idempotencyKey: string;
+      reason: string;
+    }
+  | {
+      type: "tool_aborted";
+      toolUseId: string;
+      name: string;
+      idempotencyKey: string;
+    }
   | {
       type: "approval_request";
       toolUseId: string;

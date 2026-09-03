@@ -163,6 +163,15 @@ const MUTANTS = [
     testFiles: ["test/run-state.test.ts"],
     why: "sameRunResume 仅 interrupted；放宽会把完成态档案谎报可同 run 热续",
   },
+  {
+    id: "tool-tx-committed-must-skip",
+    file: "src/tool-tx.ts",
+    find: "  if (existing.status === \"committed\") {\n    return {\n      action: \"skip_committed\",",
+    replace:
+      "  if (false && existing.status === \"committed\") {\n    // MUTATION: committed 不再跳过 → 重复副作用\n    return {\n      action: \"skip_committed\",",
+    testFiles: ["test/tool-tx.test.ts"],
+    why: "SAFE-06：已 committed 同 key 必须跳过，否则崩溃恢复会重复写入",
+  },
 ];
 
 function runVitest(testFiles) {

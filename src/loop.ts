@@ -11,6 +11,7 @@ import { createHash } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { classifyApiError, isTransientApiError } from "./model-client.js";
 import { decideRecovery } from "./recovery.js";
+import { type DurableToolTx, type ToolTxController } from "./tool-tx.js";
 import { ToolExecutor, ToolRegistry } from "./tools/registry.js";
 import type {
   AgentConfig,
@@ -184,6 +185,8 @@ export class AgentLoop {
   private readonly runBudget: SharedRunBudget;
   private readonly errorRetries: number;
   private readonly errorRetryBackoffMs: number;
+  /** SAFE-06：当前 run 的事务控制器（可无——无 runId 时不武装） */
+  private toolTxCtrl: ToolTxController | undefined;
 
   constructor(
     private readonly cfg: AgentConfig,
@@ -196,6 +199,10 @@ export class AgentLoop {
       cfg.readRoots,
       cfg.executionBroker,
     );
+    // SAFE-06：有 runId 就武装事务层。宿主可注入持久化 controller；否则内存表。
+    if (cfg.runId) {
+      this.installToolTx(cfg.runId, cfg.toolTx);
+    }
     this.context = new DefaultContextManager({
       systemPrompt: cfg.systemPrompt,
       maxTokens: cfg.maxTokens ?? DEFAULTS.maxTokens,
@@ -238,6 +245,43 @@ export class AgentLoop {
    */
   setExecutionBroker(executionBroker?: ExecutionBroker): void {
     this.executor.setExecutionBroker(executionBroker);
+  }
+
+  /**
+   * SAFE-06：安装/替换 toolTx 控制器。续跑同 runId 时应带上磁盘 seed
+   * （cfg.toolTx.get 读 durableState.toolTx）。
+   */
+  setToolTx(controller?: ToolTxController): void {
+    if (!this.cfg.runId && !controller) {
+      this.toolTxCtrl = undefined;
+      this.executor.setToolTx(undefined, undefined);
+      return;
+    }
+    this.installToolTx(controller?.runId ?? this.cfg.runId!, controller);
+  }
+
+  private installToolTx(runId: string, external?: ToolTxController): void {
+    const memory = new Map<string, DurableToolTx>();
+    this.toolTxCtrl = external
+      ? {
+          runId: external.runId,
+          get: (key) => external.get(key) ?? memory.get(key),
+          notify: async (phase, tx, meta) => {
+            memory.set(tx.idempotencyKey, tx);
+            await external.notify(phase, tx, meta);
+          },
+          ...(external.injectCrashAfterPrepared
+            ? { injectCrashAfterPrepared: external.injectCrashAfterPrepared }
+            : {}),
+        }
+      : {
+          runId,
+          get: (key) => memory.get(key),
+          notify: (_phase, tx) => {
+            memory.set(tx.idempotencyKey, tx);
+          },
+        };
+    this.executor.setToolTx(this.toolTxCtrl);
   }
 
   /**
@@ -300,6 +344,12 @@ export class AgentLoop {
     q: AsyncEventQueue<TurnEvent>,
     history?: Anthropic.MessageParam[],
   ): Promise<void> {
+    // SAFE-06：把事务生命周期事件推入本段队列（与 tool_call 同流）
+    if (this.toolTxCtrl) {
+      this.executor.setToolTx(this.toolTxCtrl, async (event) => {
+        q.push(event);
+      });
+    }
     // 续跑且正史末条是 user（如 max_turns 停在 tool_result 后）：反馈合并进同一条
     // user 消息，避免连续两条 user——Anthropic 官方允许，但第三方兼容端点未必。
     if (history && history.at(-1)?.role === "user") {

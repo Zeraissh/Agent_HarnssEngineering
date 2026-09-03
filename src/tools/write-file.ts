@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Tool } from "../types.js";
 import { resolveInWorkdir } from "./fs-util.js";
@@ -31,7 +31,17 @@ export const writeFileTool: Tool = {
     // 这会抓住创建过程中出现的 symlink/junction，但 Node 的跨平台 fs API 没有
     // openat-style、逐路径分量的原子圈禁，校验与 writeFile 间仍存在很窄的 TOCTOU。
     const revalidated = resolveInWorkdir(ctx.workdir, p);
+    const bytes = Buffer.byteLength(content, "utf8");
+    // SAFE-06：内容级幂等——写后未 committed 的崩溃重入时，同内容不二次覆盖。
+    try {
+      const existing = await readFile(revalidated, "utf8");
+      if (existing === content) {
+        return { content: `Wrote ${bytes} bytes to ${p} (unchanged)` };
+      }
+    } catch {
+      // 不存在或不可读 → 正常写入
+    }
     await writeFile(revalidated, content, "utf8");
-    return { content: `Wrote ${Buffer.byteLength(content, "utf8")} bytes to ${p}` };
+    return { content: `Wrote ${bytes} bytes to ${p}` };
   },
 };

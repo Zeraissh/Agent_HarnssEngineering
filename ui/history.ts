@@ -33,6 +33,7 @@ import { join, resolve, dirname } from "node:path";
 import {
   RUN_PHASES,
   RUN_STATE_VERSION,
+  parseToolTxList,
   type DurableBudgetSnapshot,
   type DurableGrantAuditEntry,
   type DurablePlanSnapshot,
@@ -338,6 +339,8 @@ export function parseDurableRunState(raw: unknown): DurableRunState | null {
   ) {
     return null;
   }
+  const toolTx = parseToolTxList(o.toolTx);
+  if (toolTx === null) return null;
   return {
     version: RUN_STATE_VERSION,
     runId: o.runId,
@@ -355,6 +358,7 @@ export function parseDurableRunState(raw: unknown): DurableRunState | null {
     grantAudit,
     lastSameRunResumeAt:
       typeof o.lastSameRunResumeAt === "number" ? o.lastSameRunResumeAt : null,
+    toolTx,
   };
 }
 

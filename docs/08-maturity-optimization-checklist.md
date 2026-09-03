@@ -33,7 +33,7 @@
 | [x] | SAFE-03 | `fetch_url` SSRF/重定向防护 | 5/5/3 | 30 | 仅 HTTPS；拒绝本机/私网/link-local/保留地址；每次重定向重新验证；限制跳转；测试覆盖 DNS 与重定向路径 |
 | [~] | SAFE-04 | 参数级审批授权 | 5/5/4 | 20 | approval grant 绑定 run、tool、规范化 input hash、scope 与 expiry；不同 bash/path/device 参数不能复用旧授权；审批可恢复、可审计 |
 | [~] | SAFE-05 | OS/容器执行隔离 | 5/5/5 | 10 Gate | 每 run 独立 worktree、UID、文件系统和网络策略；资源/CPU/内存上限；硬件操作经受控 gateway；逃逸测试通过 |
-| [ ] | SAFE-06 | 工具副作用事务层 | 5/5/5 | 10 Gate | side-effect 工具具有 idempotency key、prepared/running/committed 事件、重试策略及必要的 compensation；崩溃注入不重复写入 |
+| [~] | SAFE-06 | 工具副作用事务层 | 5/5/5 | 10 Gate | **Phase 1 已落地（2026-09-03）**：`write_file`/`bash` 具 idempotencyKey（runId:toolUseId）、`tool_prepared/running/committed/failed/aborted` 事件、`state.json.toolTx`；write_file 可幂等重入 + 内容级 unchanged；bash prepared/running **fail-closed 不重试**（无 undo）；崩溃注入同 key 不重复写；CLI+Web 同提交。**残余**：CLI durable state、mid-tool 自动重放未完成轮、MCP 写工具、bash compensation |
 
 ### Phase 0 验收命令
 
@@ -100,8 +100,8 @@ OCI 逃逸 canary 由 Linux CI container job 承担（run #33461119575 全绿）
 
 | 状态 | ID | 优化项 | I/R/E | 优先分 | 完成定义 |
 |---|---|---|---:|---:|---|
-| [~] | RUN-01 | Durable RunState | 5/5/5 | 10 Gate | 持久化 plan DAG、segment、审批/提问、verifier/rework、预算与 tool transaction；进程重启从明确状态恢复。**Phase 1+2 已落地（2026-09-03）**：`state.json` + Web 迁移；崩溃→interrupted；**同 run 热恢复**（`sameRunResume` / `run_resumed`，idempotency=checkpoint 段边界）；预算与 grantAudit 进 state；UI 文案同提交。**仍开**：SAFE-06 toolTx、CLI 对等 durable、mid-tool 恢复 |
-| [~] | RUN-02 | 恢复与故障注入 | 5/5/4 | 20 | 在 model call、tool prepared/committed、审批等待和历史写入各点注入崩溃；不丢状态、不重复副作用、可安全 fork。**已落地（2026-09-03）**：`test/run-crash-inject.test.ts` 覆盖飞行中硬崩溃（无 checkpoint）、mid-model Fake 抛错、mock-provider `alwaysFault` 500、审批等待硬崩溃、history/state 原子写与半截 tmp、checkpoint→same-run（工具不重跑）、完成态 fork 诚实；**明确不做假** tool prepared/committed（见残余） |
+| [~] | RUN-01 | Durable RunState | 5/5/5 | 10 Gate | 持久化 plan DAG、segment、审批/提问、verifier/rework、预算与 tool transaction；进程重启从明确状态恢复。**Phase 1+2 已落地（2026-09-03）**：`state.json` + Web 迁移；崩溃→interrupted；**同 run 热恢复**（`sameRunResume` / `run_resumed`，idempotency=checkpoint 段边界）；预算与 grantAudit 进 state；UI 文案同提交。**SAFE-06 Phase 1**：`toolTx[]` 已进 state。**仍开**：CLI 对等 durable、mid-tool 自动重放 |
+| [~] | RUN-02 | 恢复与故障注入 | 5/5/4 | 20 | 在 model call、tool prepared/committed、审批等待和历史写入各点注入崩溃；不丢状态、不重复副作用、可安全 fork。**已落地（2026-09-03）**：原套件 + **SAFE-06**：`tool_prepared` 后崩溃 → 同 key 恢复不双写；write_file 事件与 state.toolTx 契约锁。**残余**：mid-tool 自动重放；真实 SIGKILL 子进程；CLI durable |
 | [~] | OBS-01 | 端到端 trace | 5/4/4 | 18 | run→segment→model/tool spans；记录 commit、模型、工具/schema/pack 版本与输入输出哈希；支持脱敏导出和离线 playback。**已落地（2026-09-02）**：`src/trace.ts` + `trace.jsonl` 旁路（扩展 history，无 OTel）；Web `GET /api/runs/:id/trace` 脱敏导出 + playback 摘要；事件投影 tool/model/segment。**仍开**：CLI 同等接线、完整 model span 起止（非 done 摘要）、跨进程统一 collector |
 | [ ] | OBS-02 | 成本、延迟与 SLO | 4/4/3 | 24 | TTFT、模型/工具延迟、排队/审批等待、重试/错误、USD 成本和 provider/model/pack 归因；持久预算账与 p50/p95/p99 仪表盘 |
 | [ ] | OPS-01 | 备份、恢复与升级演练 | 5/4/4 | 18 | 定义并验证 RPO/RTO；完成异地加密备份恢复、版本迁移、回滚及在途任务升级演练 |
@@ -112,8 +112,9 @@ OCI 逃逸 canary 由 Linux CI container job 承担（run #33461119575 全绿）
 |---|---|---|
 | OBS-01 | `src/trace.ts`：span 模型 + redact/hash + TurnEvent 投影 + JSONL playback；`RunHistoryWriter.appendTraceSpan` → `trace.jsonl`；Web 建 run 写根 span（harness/git/model/pack/toolSchemaHash），`pushEvent` 投影 tool/model/segment，收尾关根 span；`GET /api/runs/:id/trace` 返回脱敏导出 + playback 摘要。`test/trace.test.ts` 7 测。未引入 OTel | CLI 未接线；model span 仍是 done/api_retry/fallback 摘要而非逐 send 起止；无跨进程 collector；UI 未渲染 trace 面 |
 | RUN-01 Phase 1 | ADR-003 + `src/run-state.ts`；`ui/history.ts` `writeState`/`readArchivedState`；`ui/server.ts` 迁移接线与崩溃收口；`test/run-state*.ts` + ui-server 两条；API 诚实字段 | 见 Phase 2 |
-| RUN-01 Phase 2 | `canSameRunResume` + `resume` 迁移；崩溃+checkpoint → `sameRunResume:true` / `continuationMode:same-run`；`startSameRunResume` 同 runId；预算/grantAudit 进 state；`run_resumed` 事件 + UI 三处；mutation `same-run-resume-allows-executing` | **未** SAFE-06 toolTx（mid-tool）；**未** CLI 对等；完成态归档仍走 fork |
-| RUN-02 | `test/run-crash-inject.test.ts`：飞行中硬崩溃（无 done/checkpoint→不可 same-run）、mid-model Fake 抛错（status:400 防瞬时重试糊掉注入点）、mock-provider `alwaysFault` 500、`awaiting_approval` 硬崩溃→`interrupted`+pending 清空、`RunHistoryWriter` 原子写/半截 tmp fail-closed、checkpoint 段边界 same-run 且计数工具不重跑、完成态 fork 不冒充 same-run、事件流无 `tool_prepared/committed` 契约锁 | **SAFE-06**：无 toolTx → 不能在 mid-tool prepared/committed 注入并证明不重复副作用；idempotency 仍=checkpoint 段号。CLI 无对等 durable。进程内「关停再改盘」/预制档案模拟硬崩溃，非真实 SIGKILL 子进程 |
+| RUN-01 Phase 2 | `canSameRunResume` + `resume` 迁移；崩溃+checkpoint → `sameRunResume:true` / `continuationMode:same-run`；`startSameRunResume` 同 runId；预算/grantAudit 进 state；`run_resumed` 事件 + UI 三处；mutation `same-run-resume-allows-executing` | **SAFE-06 Phase 1 toolTx 已进 state**；**未** CLI 对等 durable；完成态归档仍走 fork；mid-tool 自动重放未做 |
+| RUN-02 | 原套件 + SAFE-06：`tool_prepared/committed` 事件与 `state.toolTx`；crash-after-prepared 同 key 不双写；noop 无事务契约锁 | mid-tool **自动重放**未完成轮；CLI 无对等 durable；进程内模拟硬崩溃，非真实 SIGKILL |
+| SAFE-06 Phase 1 | `src/tool-tx.ts`；TurnEvent 五态；`write_file`/`bash`；内容级 unchanged；bash fail-closed；CLI+Web 渲染；`test/tool-tx.test.ts` + RUN-02 扩展；mutation `tool-tx-committed-must-skip`；ADR-003 附录 | CLI durable；MCP 写工具；bash undo；mid-tool 自动重放 |
 
 ## Phase 3：动态协作与扩展平台
 
@@ -185,9 +186,9 @@ npx tsc --noEmit                            passed
 | MEM-01 Phase B | `src/compact-summary.ts` + `compactAsync`：可选 ModelClient（不经 ToolContext），`AGENT_COMPACT_SUMMARY=1` 默认关；有界 `max_tokens`（默认 512）；摘要 **merge** 进账本（可附 `summary:` narrative），失败 fail-open 回 Phase A；事件 `summaryApplied`；CLI + `app.js` 同提交；FakeModelClient 单测 + mutation `compact-summary-replaces-ledger` | **仍不**把长 assistant 推理从正史里 elide（只把可抽取事实写入账本）；摘要质量依赖模型，错误事实靠"不得编造"提示约束而非硬校验；未开 flag 时行为≡Phase A；跨宿主记忆合同仍归 MEM-02/03 |
 
 当前执行顺序（2026-09-03 成熟度第二波，单操作员形态）：
-`EVAL-03c → EVAL-01 held-out → OBS-01[~] → RUN-01[~ Phase 2] → MEM-01[~ Phase A+B] → MODEL-01b[~] → RUN-02[~]`。
-下一刀候选：SAFE-06（解锁 mid-tool 崩溃证明）、MODEL-01 残余（真成本路由 / Web 同步探针回写）、
-或 MEM-02——本波默认不提前 GOV-* / SAFE-05 2B。
+`EVAL-03c → EVAL-01 held-out → OBS-01[~] → RUN-01[~ Phase 2] → MEM-01[~ Phase A+B] → MODEL-01b[~] → RUN-02[~] → SAFE-06[~ Phase 1]`。
+下一刀候选：E2E-01 / OBS-02 / OPS-01，或 MODEL-01 残余（真成本路由 / Web 同步探针回写）；
+SAFE-05 2B 与 GOV-* 本波默认跳过。
 并行可继续：`A1 攒 §2.1 样本（ledger:samples）`（与质量门不冲突）。
 若目标改公网多人，`GOV-01/02/03` 必须提前到 `RUN-01` 之后、任何公开上线之前。
 Phase 2A 的 daemon-label orphan reaper 与真实 `SIGKILL → sweep` E2E 已落地；
