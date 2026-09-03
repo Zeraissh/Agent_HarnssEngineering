@@ -1,7 +1,7 @@
 {
   "name": "agent-harness-console",
   "private": true,
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Sandboxed Electron and experimental Capacitor shell for Agent Harness",
   "type": "module",
   "main": "electron/main.cjs",

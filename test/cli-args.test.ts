@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   buildStaticDoctorReport,
@@ -50,6 +51,15 @@ describe("CLI argument contract", () => {
     expect(() => parseCliArgs(["--doctor", "--verify"])).toThrow(/不能与任务或 run 参数/);
     expect(cliHelpText()).toContain("npm run agent -- doctor");
     expect(CLI_VERSION).toMatch(/^\d+\.\d+\.\d+$/);
+  });
+
+  // 发布门只校验 tag == 根 package.json；--version 打印的常量与桌面壳版本不在那道门里，
+  // 三者不锁在一起就会各自漂移（REL-02 的"版本同步 CI"起步）。
+  it("CLI_VERSION 与根 / cross-app 的 package.json 版本一致", () => {
+    const readVersion = (path: string) =>
+      (JSON.parse(readFileSync(new URL(path, import.meta.url), "utf8")) as { version: string }).version;
+    expect(CLI_VERSION).toBe(readVersion("../package.json"));
+    expect(CLI_VERSION).toBe(readVersion("../cross-app/package.json"));
   });
 });
 

@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { parseEnvFile } from "./env-check.js";
 import { inspectProviderEndpoint } from "./provider-config.js";
 
-export const CLI_VERSION = "1.2.0";
+export const CLI_VERSION = "1.3.0";
 
 export type CliCommand = "run" | "help" | "version" | "doctor";
 

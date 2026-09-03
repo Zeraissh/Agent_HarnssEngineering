@@ -16,6 +16,7 @@
 - **RUN-01[~ Phase 1+2]** — ADR-003；`state.json`；崩溃→interrupted；**同 run 热恢复**（checkpoint 边界，`sameRunResume`/`run_resumed`）；预算+grantAudit 进 state。
 - **MEM-01[~ Phase A]** — 语义压缩：`[compact_ledger]` + 语义占位；非 LLM；mutation `compact-ledger-skipped`。
 - **MODEL-01b[~]** — 能力探针 + 每角色 fallback/inherit + `prefer_healthy` stub；见 docs/08。
+- **v1.3.0 发布（2026-09-03）+ REL-02[~]** — 根目录 `CHANGELOG.md`（1.1.0 / 1.2.0 / 1.3.0 按提交归档，新版本先写 `[Unreleased]` 再随 tag 改节名）；版本号三处（根 / cross-app `package.json` / `CLI_VERSION`）由测试锁一致；release.yml 缺签名凭据时跳过 Windows 安装包（不发布未签名产物）、`workflow_dispatch` = 预演不推送——**打 tag 前先跑一次预演**。残余见 docs/08 REL-02 行。
 
 **下一刀**：CI 绿后开 `MEM-01 Phase B`，或 RUN-02 / MODEL-01 残余。
 RUN-01 残余：SAFE-06 toolTx、CLI 对等 durable、mid-tool 恢复。

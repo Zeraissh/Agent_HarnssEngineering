@@ -169,7 +169,7 @@ npx tsc --noEmit                            passed
 | [ ] | GOV-02 | 多租户数据隔离 | 5/5/5 | 10 Gate | run/history/artifact/model key/quota 都有不可缺省 tenant+owner；跨租户负向测试与删除/导出流程通过 |
 | [ ] | GOV-03 | Secret 与不可抵赖审计 | 5/5/5 | 10 Gate | KMS/Keychain/DPAPI/Keystore；日志 DLP；带真实主体的 append-only 审计和保留策略 |
 | [ ] | REL-01 | 正式发布与供应链 | 4/5/4 | 18 | 发布与源码版本一致的签名资产；安装/升级/回滚实测；SBOM、provenance、镜像签名/扫描和依赖锁定 |
-| [ ] | REL-02 | 版本与数据迁移治理 | 4/4/3 | 24 | CHANGELOG、兼容矩阵、deprecation policy、历史 schema migration/rollback 测试及版本同步 CI |
+| [~] | REL-02 | 版本与数据迁移治理 | 4/4/3 | 24 | CHANGELOG、兼容矩阵、deprecation policy、历史 schema migration/rollback 测试及版本同步 CI。**2026-09-03 v1.3.0**：CHANGELOG 已建立（根目录 `CHANGELOG.md`，Keep a Changelog，每条对应真实提交，Release 正文自动附对应小节）；版本同步起步——`CLI_VERSION` 与根 / cross-app `package.json` 三者由 `test/cli-args.test.ts` 锁一致，release gate 校验 tag == 版本。**残余**：兼容矩阵 / deprecation policy / schema migration 测试仍开 |
 
 ## Phase 5：上下文与长期记忆
 

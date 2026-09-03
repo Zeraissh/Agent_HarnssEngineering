@@ -29,6 +29,7 @@
 | [docs/03-interfaces.md](docs/03-interfaces.md) | 核心 TypeScript 接口定义（实现蓝本） |
 | [docs/04-roadmap.md](docs/04-roadmap.md) | 演进路线（v0.1 → v1.1）与每阶段验证 checklist |
 | [docs/08-maturity-optimization-checklist.md](docs/08-maturity-optimization-checklist.md) | 对标成熟 Agent 的分阶段优化清单、优先级与验收证据 |
+| [CHANGELOG.md](CHANGELOG.md) | 版本变更日志（Keep a Changelog；每条对应真实提交；Release 正文自动附对应小节） |
 | [docs/reference/README.md](docs/reference/README.md) | `src/` 全部 21 个模块的参考文档（签名与源码逐一核对；由 v1.1 并行编排自举生成，见案例 #2） |
 | [docs/cases/](docs/cases) | 真实任务案例：#1 遥测固件真机闭环、#2 并行编排交付参考文档（墙钟 −43%） |
 
