@@ -27,10 +27,10 @@ describe("guessCompatFromName / shouldRunModelProbe", () => {
     expect(guessCompatFromName("deepseek-v4-pro", "anthropic")).toBe(true);
   });
 
-  it("AGENT_MODEL_PROBE=1 强制开；=0 强制关；loopback 默认开", () => {
+  it("只有 AGENT_MODEL_PROBE=1 才开；缺省与 =0 都不探针（避免吃掉 mock 脚本）", () => {
     expect(shouldRunModelProbe({ AGENT_MODEL_PROBE: "1" }, "https://api.example.com")).toBe(true);
     expect(shouldRunModelProbe({ AGENT_MODEL_PROBE: "0" }, "http://127.0.0.1:9")).toBe(false);
-    expect(shouldRunModelProbe({}, "http://127.0.0.1:9")).toBe(true);
+    expect(shouldRunModelProbe({}, "http://127.0.0.1:9")).toBe(false);
     expect(shouldRunModelProbe({}, "https://api.deepseek.com/anthropic")).toBe(false);
   });
 });

@@ -139,7 +139,7 @@ OCI 逃逸 canary 由 Linux CI container job 承担（run #33461119575 全绿）
 
 | ID | 已取得证据 | 残余边界 |
 |---|---|---|
-| MODEL-01b 能力探针 | `src/model-capability.ts`：端点身份键 + 粘性 TTL 缓存；Anthropic 路径带 `thinking/adaptive` 轻量 POST——原生 200→compat=false，compat 400→compat=true；OpenAI 路径只做健康检查。**fail-open**：探针失败/未触发 → 名称猜测（错判 compat=true 可恢复，错判 false 会永久 400）。触发：`AGENT_MODEL_PROBE=1` 或 baseURL loopback（`=0` 强制关）。`createModelClientWithProbe` 写入 client 的 compat。mock provider 增 `rejectClaudeExtensions`。`test/model-capability.test.ts` **8 测试** | Web `createUiServer` 仍**同步**名称猜 compat（契约不改 async）；仅异步填充粘性供路由。未做 tools/vision 能力位、未做远程默认探针 |
+| MODEL-01b 能力探针 | `src/model-capability.ts`：端点身份键 + 粘性 TTL 缓存；Anthropic 路径带 `thinking/adaptive` 轻量 POST——原生 200→compat=false，compat 400→compat=true；OpenAI 路径只做健康检查。**fail-open**：探针失败/未触发 → 名称猜测。**仅 `AGENT_MODEL_PROBE=1` 触发**（loopback 不自动开——会吃掉确定性 eval 的 mock 脚本队列）。`createModelClientWithProbe` 写入 client 的 compat。mock provider 增 `rejectClaudeExtensions`。`test/model-capability.test.ts` **8 测试** | Web `createUiServer` 仍**同步**名称猜 compat；异步探针同样要 env=1 才跑。未做 tools/vision 能力位 |
 | MODEL-01b 每角色 fallback | `readRoleFallbackMode` / `createRoleFallbackClient`：`AGENT_<ROLE>_FALLBACK_MODEL`（own）或 `AGENT_<ROLE>_FALLBACK=inherit`。`CircuitBreakerRegistry` 按身份共享；装饰器实例按角色隔离。CLI + Web 同提交接线；`model_fallback` 事件带可选 `role`/`routing`；`run_config.fallbackChains` + `fallbackScope=roles\|executor\|null` | 台账仍只记执行者 `fallbackChain`（角色次数未分列）；inherit 只继承执行者**备用**端点，不把执行者 primary 塞进角色链 |
 | MODEL-01b 路由 stub | `AGENT_FALLBACK_ROUTING=prefer_healthy`：保持配置链原序，有健康候选时跳过粘性 `healthy=false`（reason=`probe_unhealthy`）；全不健康仍尝试。装配条/CLI 可见。mutation `prefer-healthy-never-skips` | **不是**成本/延迟路由——无 token 单价、无 p50 延迟模型、无多目标优化。下一步若做真路由，应另开 ID，勿在 stub 上堆 |
 

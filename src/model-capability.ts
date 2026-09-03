@@ -13,10 +13,10 @@
  *   - **健康位如实**：探针失败就标 unhealthy，路由 stub 可据此偏好；但若
  *     全链都 unhealthy，仍允许尝试（fail-open：探针不是准入闸门）。
  *
- * 触发：`AGENT_MODEL_PROBE=1`，或 baseURL 是 loopback（本地 mock / 自测）。
- * 远程真端点默认**不**打探针——省一次启动往返，也避免无 key 时误伤。
+ * 触发：仅 `AGENT_MODEL_PROBE=1`。远程与 loopback 都不默认打——
+ * 确定性 eval 的 mock 也在 loopback 上，自动探针会吃掉脚本队列。
  */
-import { isLoopbackHostname, inspectProviderEndpoint } from "./provider-config.js";
+import { inspectProviderEndpoint } from "./provider-config.js";
 
 export type CapabilitySource = "probe" | "name" | "sticky" | "assumed";
 
@@ -69,22 +69,15 @@ export function guessCompatFromName(model: string, provider: ModelProviderKind):
 /**
  * 要不要发探针。
  *
- * loopback 默认开：mock provider 与本地自测是 MODEL-01b 的主验证面，
- * 不靠手动翻 env。远程必须显式 `AGENT_MODEL_PROBE=1`。
+ * **只认 `AGENT_MODEL_PROBE=1`**。loopback 不自动开——确定性 eval / 本机 mock
+ * 也走 loopback，自动探针会吃掉脚本队列里的第一条，把整批场景打成"文件不存在"。
+ * 测探针的用例显式翻 env；远程真端点同样要显式打开（省启动往返）。
  */
 export function shouldRunModelProbe(
   env: NodeJS.ProcessEnv = process.env,
-  baseURL?: string,
+  _baseURL?: string,
 ): boolean {
-  if (env.AGENT_MODEL_PROBE === "0") return false;
-  if (env.AGENT_MODEL_PROBE === "1") return true;
-  if (!baseURL?.trim()) return false;
-  try {
-    const host = new URL(baseURL.trim()).hostname;
-    return isLoopbackHostname(host);
-  } catch {
-    return false;
-  }
+  return env.AGENT_MODEL_PROBE === "1";
 }
 
 export function getStickyCapabilities(key: string, now = Date.now(), ttlMs = DEFAULT_PROBE_TTL_MS): EndpointCapabilities | undefined {

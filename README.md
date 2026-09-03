@@ -146,7 +146,8 @@ $env:AGENT_FALLBACK_ROUTING          = "prefer_healthy"       # 可选；缺省 
 # 角色自有链或继承执行者备用端点（不会静默共用执行者的装饰器实例）：
 # $env:AGENT_VERIFIER_FALLBACK_MODEL = "…"
 # $env:AGENT_VERIFIER_FALLBACK = "inherit"   # 或 planner / vision
-# 能力探针（compat 不再只靠 claude-* 名称）：loopback 默认开；远程需显式打开
+# 能力探针（compat 不再只靠 claude-* 名称）：显式 AGENT_MODEL_PROBE=1 才打
+# （loopback 也不自动开——会吃掉确定性 eval 的 mock 脚本）
 # $env:AGENT_MODEL_PROBE = "1"
 # $env:AGENT_MODEL_PROBE_TTL_MS = "300000"
 ```
