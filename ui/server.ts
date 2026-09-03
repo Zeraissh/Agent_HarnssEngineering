@@ -5,7 +5,7 @@
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
 import { readFile, writeFile, mkdir, stat } from "node:fs/promises";
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join, extname, dirname, delimiter, resolve, basename, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
@@ -35,8 +35,18 @@ import {
   observeWaitSeconds,
   preregisterObservability,
   WAIT_KINDS,
+  costUnpricedTokensTotal,
+  costUsdTotal,
   type MetricRole,
 } from "../src/metrics.js";
+import {
+  computeCost,
+  loadPriceTable,
+  lookupModelPrice,
+  sumRunCost,
+  type CostResult,
+  type PriceTable,
+} from "../src/pricing.js";
 import {
   createFallbackClientIfConfigured,
   createRoleFallbackClient,
@@ -79,6 +89,7 @@ import {
 } from "../src/task-completion.js";
 import { createDescribeImageTool } from "../src/tools/describe-image.js";
 import { fetchUrlTool } from "../src/tools/fetch-url.js";
+import { editFileTool } from "../src/tools/edit-file.js";
 import { globTool } from "../src/tools/glob.js";
 import { grepTool } from "../src/tools/grep.js";
 import { readFileTool } from "../src/tools/read-file.js";
@@ -137,7 +148,6 @@ import {
   startSpan,
   type TraceSpan,
 } from "../src/trace.js";
-import { readFileSync } from "node:fs";
 import { EFFORT_LEVELS } from "../src/types.js";
 import type {
   ModelClient,
@@ -339,6 +349,13 @@ interface StoredRun {
    * 每个对话轮起点归零，口径与 executionUsage.turns（本轮各执行段之和）一致。
    */
   turnExecutorTurns?: number;
+  /**
+   * OBS-02：逐次记账事件的成本折算结果（execution / verification / planner）。
+   * 与 toolTally 同一条纪律——事件旁路逐条累加，不在收尾回扫。
+   * **视觉不在内**：describe_image 的 client 是宿主级的，调用发生在工具内部，
+   * 拿不到是哪个 run 在用它；它只进 /metrics 的成本曲线（与现有 token 记账同边界）。
+   */
+  costParts?: Array<{ role: string; cost: CostResult }>;
   /** 核查是否撞过轮次上限（"预算不够"这个嫌疑要有据可查，见案例 #8 的三层归因） */
   verifierHitBudget?: boolean;
   /** 本 run 主执行者换端点的次数（MODEL-01a）。未配降级链时恒 0 */
@@ -1341,7 +1358,15 @@ export function localPathTarget(value: string): string {
   return String(value ?? "").trim().replace(/:\d+(?::\d+)?$/, "");
 }
 
-const BUILTIN_POOL: Tool[] = [bashTool, fetchUrlTool, readFileTool, writeFileTool, globTool, grepTool];
+const BUILTIN_POOL: Tool[] = [
+  bashTool,
+  fetchUrlTool,
+  readFileTool,
+  writeFileTool,
+  editFileTool,
+  globTool,
+  grepTool,
+];
 
 /** 上传落点：工作目录下的固定子目录，便于人和 agent 都一眼知道东西在哪 */
 const UPLOAD_SUBDIR = "uploads";
@@ -1863,6 +1888,20 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     historyErrors: 0,
   };
 
+  /**
+   * OBS-02 单价表。读不到 / 格式坏 → **整体停用折算**（cost 一律 null，界面写
+   * "单价未登记"），而不是静默退回内置表：运维改了价却没生效，记出来的每一笔
+   * 都是错的，比没有数字危险得多。也不因此拒绝启动——观测装置不该掐掉被观测对象。
+   */
+  let priceTableError: string | null = null;
+  let priceTable: PriceTable | null = null;
+  try {
+    priceTable = loadPriceTable(process.env, (p) => readFileSync(p, "utf8"));
+  } catch (error) {
+    priceTableError = (error as Error).message;
+    if (realHost) operationalLog("error", "price_table_load_failed", { error: priceTableError });
+  }
+
   /** 日预算账本（进程态；宿主重启当日归零，与 /metrics 同边界） */
   let dailyTokens = { day: localDayKey(), used: 0 };
 
@@ -1877,10 +1916,32 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     dailyTokens.used += n;
   }
 
+  /**
+   * OBS-02：角色 → 这次运行**实际用的**模型与 wire 协议。
+   * 没配独立角色模型时该角色就跑在执行者客户端上——报执行者的模型才是实话
+   * （同 run_config 报"本 run 实际用了什么"而不是"配了什么"的口径）。
+   */
+  function endpointOfRole(role: (typeof TOKEN_ROLES)[number]): { model: string; provider: string } {
+    const executor = { model: executorModelName, provider: resolved.provider as string };
+    if (role === "verification") {
+      return verifierRole
+        ? { model: verifierRole.name, provider: verifierRole.provider.provider }
+        : executor;
+    }
+    if (role === "planner") {
+      return plannerRole ? { model: plannerRole.name, provider: plannerRole.provider.provider } : executor;
+    }
+    if (role === "vision") {
+      return visionRole ? { model: visionRole.name, provider: visionRole.provider.provider } : executor;
+    }
+    return executor;
+  }
+
   /** token 计数累加（AggregateUsage → role 四档）。全部记账路径共用这一个入口 */
   function growTokens(
     role: (typeof TOKEN_ROLES)[number],
     u: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number },
+    run?: StoredRun,
   ): void {
     const grow = (kind: (typeof TOKEN_KINDS)[number], n: number) => {
       const key = `${role}/${kind}`;
@@ -1892,6 +1953,20 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     grow("cache_creation", u.cacheCreationTokens);
     // 日账本不在这里累：它由 meterModelClient 逐调用喂入（见 bumpDaily）。
     // 在这条事件路径上再累一遍就是双计。
+
+    // OBS-02 成本归属：与 token 走同一个入口，两条曲线口径天然一致。
+    // 单价未登记的量走另一条计数器——**绝不按 0 计入成本曲线**。
+    const { model, provider } = endpointOfRole(role);
+    const cost = computeCost(u, lookupModelPrice(priceTable, provider, model));
+    if (cost.usd !== null) {
+      costUsdTotal.inc({ role, provider, model }, cost.usd);
+    } else if (cost.unpricedTokens > 0) {
+      costUnpricedTokensTotal.inc({ role, provider, model }, cost.unpricedTokens);
+    }
+    if (run) {
+      const tally = (run.costParts ??= []);
+      tally.push({ role, cost });
+    }
   }
 
   function reportHistoryError(error: Error): void {
@@ -3082,7 +3157,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     // done 被 orchestrate 压掉（runVerifierWithEvents），usage 由 onVerification
     // /plan steps 记账；这里若也记，将来解除压制的那天就是双计的第一天。
     if (event.type === "done" && event.result.usage && !isVerifierSource(source)) {
-      growTokens(source === "planner" ? "planner" : "execution", event.result.usage);
+      growTokens(source === "planner" ? "planner" : "execution", event.result.usage, run);
     }
     // 台账 turns 的裸跑口径：执行者谱系各段轮次之和（planner / verifier 各有独立预算，不混）
     if (event.type === "done" && isExecutorSource(source)) {
@@ -3431,10 +3506,37 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         )
       : undefined;
 
+    /**
+     * OBS-02 本次运行的 USD 成本。口径与 usage 脚注一致（逐段记账之和，
+     * 含被否掉的中间轮），但**任一角色单价未登记，合计就是 null**——
+     * 把能算的加起来当"本次成本"是一句长得像总额的半真话。
+     */
+    const costParts = run.costParts ?? [];
+    const runCost = sumRunCost(costParts);
+    // 一条记账都没有 ≠ 花了 0 元。前者是"没读数"，后者是个断言——
+    // 在第一次模型调用之前就 error 终止的 run 正落在这个缝里
+    const noUsage = costParts.length === 0;
+    const costFace = {
+      usd: noUsage ? null : runCost.usd,
+      byRole: runCost.byRole,
+      unpricedRoles: runCost.unpricedRoles,
+      unpricedTokens: runCost.unpricedTokens,
+      // 折算为什么没数：没记账 / 单价未登记 / 价表本身坏了，三件事界面上要分得开
+      reason: noUsage
+        ? "no_usage"
+        : priceTableError
+          ? "price_table_error"
+          : runCost.usd === null
+            ? "model_not_listed"
+            : "ok",
+      pack: run.packName ?? pack?.name ?? null,
+    };
+
     pushSyntheticEvent(run, "host", {
       type: "run_end",
       finishedAt: run.finishedAt,
       outcome: endInfo.outcome,
+      cost: costFace,
       ...(endInfo.mainStopReason ? { mainStopReason: endInfo.mainStopReason } : {}),
       ...(o
         ? {
@@ -3522,6 +3624,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             budget: ledgerContextPlan.budget,
             budgetSource: ledgerContextPlan.budgetSource,
           },
+          // OBS-02：成本与界面读的是同一份 costFace，两处不许各算一遍
+          cost: costFace,
         }),
         ledgerFile,
       );
@@ -4101,7 +4205,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         // pushEvent；此前从返回值 steps 收尾回扫——宿主级异常时已完成轮次
         // 整体漏记，长 run 期间成本指标到收尾才跳变，违背入口记账原则）
         onVerification: (_subtaskId, _round, vo) => {
-          growTokens("verification", vo.usage);
+          growTokens("verification", vo.usage, run);
         },
         // 跨 run 资源互斥：把宿主表注入调度器——子任务粒度互斥，被别的 run
         // 持有时等待而非 skip；holder 前缀 = runId，冲突诊断可读
@@ -4287,7 +4391,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         // 在界面上永远看不到
         onVerification: (round, vo) => {
           // verifier 的 done 不经 pushEvent（被 orchestrate 压掉），核查成本在此记账
-          growTokens("verification", vo.usage);
+          growTokens("verification", vo.usage, run);
           pushSyntheticEvent(run, "verifier", {
             type: "verification",
             round,

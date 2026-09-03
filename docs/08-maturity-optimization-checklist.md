@@ -104,7 +104,7 @@ OCI 逃逸 canary 由 Linux CI container job 承担（run #33461119575 全绿）
 | [~] | RUN-01 | Durable RunState | 5/5/5 | 10 Gate | 持久化 plan DAG、segment、审批/提问、verifier/rework、预算与 tool transaction；进程重启从明确状态恢复。**Phase 1+2 已落地（2026-09-03）**：`state.json` + Web 迁移；崩溃→interrupted；**同 run 热恢复**（`sameRunResume` / `run_resumed`，idempotency=checkpoint 段边界）；预算与 grantAudit 进 state；UI 文案同提交。**SAFE-06 Phase 1**：`toolTx[]` 已进 state。**会话中心化（2026-09-03）**：`reopen` 迁移（终态→executing）取代"可追问的 completed 保持 executing"；检查点从执行者谱系（main+rework）取；`meta.outcome.judgedTurn`。**仍开**：CLI 对等 durable、mid-tool 自动重放 |
 | [~] | RUN-02 | 恢复与故障注入 | 5/5/4 | 20 | 在 model call、tool prepared/committed、审批等待和历史写入各点注入崩溃；不丢状态、不重复副作用、可安全 fork。**已落地（2026-09-03）**：原套件 + **SAFE-06**：`tool_prepared` 后崩溃 → 同 key 恢复不双写；write_file 事件与 state.toolTx 契约锁。**残余**：mid-tool 自动重放；真实 SIGKILL 子进程；CLI durable |
 | [~] | OBS-01 | 端到端 trace | 5/4/4 | 18 | run→segment→model/tool spans；记录 commit、模型、工具/schema/pack 版本与输入输出哈希；支持脱敏导出和离线 playback。**已落地（2026-09-02）**：`src/trace.ts` + `trace.jsonl` 旁路（扩展 history，无 OTel）；Web `GET /api/runs/:id/trace` 脱敏导出 + playback 摘要；事件投影 tool/model/segment。**仍开**：CLI 同等接线、完整 model span 起止（非 done 摘要）、跨进程统一 collector |
-| [ ] | OBS-02 | 成本、延迟与 SLO | 4/4/3 | 24 | TTFT、模型/工具延迟、排队/审批等待、重试/错误、USD 成本和 provider/model/pack 归因；持久预算账与 p50/p95/p99 仪表盘 |
+| [~] | OBS-02 | 成本、延迟与 SLO | 4/4/3 | 24 | TTFT、模型/工具延迟、排队/审批等待、重试/错误、USD 成本和 provider/model/pack 归因；持久预算账与 p50/p95/p99 仪表盘。**延迟面已落地（a9ab8aa）**；**成本归因部分落地（2026-09-03）**：单价表 + Web/台账/metrics，未登记→null 纪律。**仍开**：持久日预算账、p50/p95/p99 视图、SLO 告警 |
 | [ ] | OPS-01 | 备份、恢复与升级演练 | 5/4/4 | 18 | 定义并验证 RPO/RTO；完成异地加密备份恢复、版本迁移、回滚及在途任务升级演练 |
 
 ### Phase 2 实施记录（进行中）

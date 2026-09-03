@@ -158,6 +158,20 @@ export interface LedgerRecoveryPolicy {
   maxStagnationRecoveries: number;
 }
 
+/** OBS-02 台账里的成本口径 */
+export interface LedgerCost {
+  /** 全部记账角色合计。任一角色单价未登记 → null（不是"能算的那部分"） */
+  usd: number | null;
+  /** 能算出来的部分，逐角色。usd 为 null 时它仍有值——照实说哪块算得出 */
+  byRole: Record<string, number>;
+  /** 单价未登记的角色 */
+  unpricedRoles: string[];
+  /** 折不出价的 token 量（非 cache_read 口径） */
+  unpricedTokens: number;
+  /** ok / no_usage / model_not_listed / price_table_error */
+  reason: string;
+}
+
 export interface RunLedgerEntry {
   /** 传入而不是内部取，纯函数才可测 */
   at: number;
@@ -211,6 +225,12 @@ export interface RunLedgerEntry {
    * 150k 在 1M 模型上压了三个月没人发现的那种盲区。老行没有这个字段（undefined）= 未知。
    */
   context?: LedgerContext;
+  /**
+   * OBS-02 USD 成本。老行没有这个字段（undefined）= 早于成本折算落地，不是零元。
+   * `usd: null` 同理——**未登记单价与花了 0 元必须分得开**，否则读数器一求和，
+   * 未登记的模型就等于免费（与 fallbackChain: null 同一条纪律）。
+   */
+  cost?: LedgerCost;
   /**
    * 仪器纪律：**这一行是不是由带终结工具（§2.1）的构建写下的**。
    *
@@ -266,6 +286,13 @@ export interface LedgerInput {
     windowSource?: string | null;
     budget?: number | null;
     budgetSource?: string | null;
+  } | null;
+  cost?: {
+    usd?: number | null;
+    byRole?: Record<string, number>;
+    unpricedRoles?: string[];
+    unpricedTokens?: number;
+    reason?: string;
   } | null;
 }
 
@@ -360,8 +387,28 @@ export function buildLedgerEntry(input: LedgerInput): RunLedgerEntry {
         ? (input.context!.budgetSource as LedgerContext["budgetSource"])
         : null,
     },
+    // OBS-02 成本。宿主没传就整个字段不写——写一个 usd:null 的空壳会让读数器
+    // 分不清"这个构建还不会算钱"和"这次算不出价"
+    ...(input.cost ? { cost: normalizeLedgerCost(input.cost) } : {}),
     // 构建标记，不是配置：这个构建的 verifier/planner 一律带终结工具
     structuredDelivery: true,
+  };
+}
+
+/** 成本字段的防御式归一（台账每行形状必须一致，脏输入不许留 NaN） */
+function normalizeLedgerCost(raw: NonNullable<LedgerInput["cost"]>): LedgerCost {
+  const byRole: Record<string, number> = {};
+  for (const [role, v] of Object.entries(raw.byRole ?? {})) {
+    const n = Number(v);
+    if (Number.isFinite(n) && n >= 0) byRole[String(role)] = n;
+  }
+  const usd = Number(raw.usd);
+  return {
+    usd: raw.usd === null || raw.usd === undefined || !Number.isFinite(usd) || usd < 0 ? null : usd,
+    byRole,
+    unpricedRoles: Array.isArray(raw.unpricedRoles) ? raw.unpricedRoles.map(String) : [],
+    unpricedTokens: nonNegativeInt(raw.unpricedTokens),
+    reason: typeof raw.reason === "string" && raw.reason ? raw.reason : "unknown",
   };
 }
 

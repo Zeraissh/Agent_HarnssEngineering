@@ -10,7 +10,19 @@
 
 ## [Unreleased]
 
-### 循环与上下文（Loop & context）
+### 工具面（Tools）
+
+- **`edit_file` 内置工具（A1）**：str_replace 局部编辑，唯一性由宿主执行（0/多命中均 `is_error`），
+  字节保真（CRLF/BOM/无尾换行），SAFE-06 `idempotent_retry`，verifier/planner 工具面硬剔除；
+  36 条行为锁 + 2 条确定性场景（`edit-file-targeted` / `edit-file-widen-context`）。
+
+### 可观测性（Observability）
+
+- **OBS-02 成本归因（部分）**：`src/pricing.ts` 内置单价表 + `AGENT_PRICE_TABLE` 覆盖；
+  未登记模型 `usd: null`（绝不按 0 计）；Web `run_end.cost` + 用量脚注 + 台账字段 +
+  `agent_harness_cost_usd_total` / `_unpriced_tokens_total` 指标。**仍开**：持久日预算账、
+  p50/p95/p99 仪表盘、SLO 告警。
+
 
 - **领域包可声明恢复策略**：`DomainPack.recovery`，逐字段三级解析 env > 包 > 默认（8 / 3 / 1），
   新增 `AGENT_MAX_STAGNATION_RECOVERIES`；CLI 启动行、Web `run_config` / `/api/harness` 报生效值 +

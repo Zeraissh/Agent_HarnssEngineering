@@ -39,6 +39,7 @@ import {
   buildNewRunRequest,
   deriveLoopFace,
   deriveAssemblyBar,
+  deriveCostFace,
 } from "../ui/public/app.js";
 import { plannedStopReason } from "../src/orchestrate.js";
 import { STOP_REASONS } from "../src/types.js";
@@ -982,6 +983,55 @@ describe("v2 R2 · 上下文水位与成本口径 (V-07/V-09)", () => {
     expect(s.runEnd.verificationUsage.turns).toBe(3);
     expect(s.runEnd.reworks).toBe(1);
     expect(s.runEnd.finalPassed).toBe(true);
+  });
+});
+
+describe("OBS-02 · run_end 成本投影与 deriveCostFace", () => {
+  it("run_end.cost 全字段投影进 runEnd（缺字段就静默丢——host-lags 纪律）", () => {
+    let s = createInitialState("cost1", "t", false);
+    s = reduceEvents(s, [
+      seqSse(0, "host", "run_end", {
+        outcome: "completed",
+        finishedAt: 1,
+        cost: {
+          usd: 0.0123,
+          byRole: { execution: 0.01, verification: 0.0023 },
+          unpricedRoles: [],
+          unpricedTokens: 0,
+          reason: "ok",
+          pack: "ts-coding",
+        },
+      }),
+    ]);
+    expect(s.runEnd.cost.usd).toBeCloseTo(0.0123, 6);
+    expect(s.runEnd.cost.byRole.execution).toBeCloseTo(0.01, 6);
+    expect(s.runEnd.cost.reason).toBe("ok");
+    expect(s.runEnd.cost.pack).toBe("ts-coding");
+    const face = deriveCostFace(s);
+    expect(face.known).toBe(true);
+    expect(face.text).toContain("$0.01");
+  });
+
+  it("usd 为 null 时 deriveCostFace 说「单价未登记」，绝不冒充 $0.00", () => {
+    let s = createInitialState("cost2", "t", false);
+    s = reduceEvents(s, [
+      seqSse(0, "host", "run_end", {
+        outcome: "completed",
+        cost: {
+          usd: null,
+          byRole: { execution: 0.05 },
+          unpricedRoles: ["verification"],
+          unpricedTokens: 900,
+          reason: "model_not_listed",
+          pack: null,
+        },
+      }),
+    ]);
+    const face = deriveCostFace(s);
+    expect(face.known).toBe(false);
+    expect(face.text).toContain("单价未登记");
+    expect(face.text).not.toContain("$0.00");
+    expect(face.title).toContain("900");
   });
 });
 

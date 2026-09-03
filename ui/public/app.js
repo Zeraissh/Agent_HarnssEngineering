@@ -1148,7 +1148,63 @@ function applyRunEnd(state, event) {
       // verificationUsage 是核查侧开销，两者分列不混。
       ...(event.executionUsage ? { executionUsage: event.executionUsage } : {}),
       ...(event.verificationUsage ? { verificationUsage: event.verificationUsage } : {}),
+      // OBS-02 成本。逐字段白名单投影（第 N 次提醒：不列出就静默丢弃），
+      // 每个字段都要——只取 usd 的话，"为什么没有数字"就永远说不出口
+      ...(event.cost && typeof event.cost === "object"
+        ? {
+            cost: {
+              usd:
+                typeof /** @type {any} */ (event.cost).usd === "number"
+                  ? Number(/** @type {any} */ (event.cost).usd)
+                  : null,
+              byRole: /** @type {any} */ (event.cost).byRole ?? {},
+              unpricedRoles: Array.isArray(/** @type {any} */ (event.cost).unpricedRoles)
+                ? /** @type {any} */ (event.cost).unpricedRoles.map(String)
+                : [],
+              unpricedTokens: Number(/** @type {any} */ (event.cost).unpricedTokens ?? 0),
+              reason: String(/** @type {any} */ (event.cost).reason ?? "unknown"),
+              pack: /** @type {any} */ (event.cost).pack
+                ? String(/** @type {any} */ (event.cost).pack)
+                : null,
+            },
+          }
+        : {}),
     },
+  };
+}
+
+/**
+ * 成本文案（OBS-02）。
+ *
+ * 一条纪律：**算不出来就说算不出来，绝不显示 $0.00**。未登记单价的模型
+ * 显示 0 元，在账单来之前都长得像"这个模型不花钱"。三种"没有数字"的原因
+ * 分开说——运维要能一眼分出该去登记单价、还是价表本身坏了。
+ * @returns {{text: string, title: string, known: boolean}|null}
+ */
+export function deriveCostFace(state) {
+  const cost = state.runEnd && state.runEnd.cost;
+  if (!cost) return null;
+  const packSuffix = cost.pack ? `（${cost.pack}）` : "";
+  if (typeof cost.usd === "number") {
+    const text = cost.usd < 0.01 ? `$${cost.usd.toFixed(4)}` : `$${cost.usd.toFixed(2)}`;
+    const roles = Object.entries(cost.byRole || {})
+      .map(([role, v]) => `${role} $${Number(v).toFixed(4)}`)
+      .join("｜");
+    return { text: `成本${packSuffix}：${text}`, title: roles || "按角色明细不可用", known: true };
+  }
+  const why =
+    cost.reason === "price_table_error"
+      ? "单价表读取失败，本次不折算"
+      : cost.reason === "no_usage"
+        ? "本次没有模型调用记账"
+        : `单价未登记：${(cost.unpricedRoles || []).join("、") || "未知角色"}`;
+  return {
+    text: `成本${packSuffix}：${why}`,
+    title:
+      cost.unpricedTokens > 0
+        ? `${cost.unpricedTokens} token 没折算成钱——登记单价（AGENT_PRICE_TABLE）后即可`
+        : why,
+    known: false,
   };
 }
 
@@ -5439,8 +5495,9 @@ function patchUsageFooter(parts, state) {
 function renderUsageFooterBody(state) {
   const exec = state.runEnd && state.runEnd.executionUsage;
   const verify = state.runEnd && state.runEnd.verificationUsage;
+  const cost = deriveCostFace(state);
 
-  if (!exec && !state.usage) return "";
+  if (!exec && !state.usage && !cost) return "";
 
   let html = "";
   if (exec) {
@@ -5455,10 +5512,14 @@ function renderUsageFooterBody(state) {
     if (denom > 0) {
       html += `<span class="usage-item">缓存命中 ${((exec.cacheReadTokens / denom) * 100).toFixed(0)}%</span>`;
     }
-  } else {
+  } else if (state.usage) {
     // 运行中：只有段级数据，标注清楚它不是全程合计
     html += `<span class="usage-item">本段：${state.usage.turns} 轮 · 入 ${formatTokens(state.usage.inputTokens)} · 出 ${formatTokens(state.usage.outputTokens)}</span>`;
     html += `<span class="usage-item">缓存命中 ${(state.usage.cacheHitRatio * 100).toFixed(0)}%</span>`;
+  }
+  // OBS-02：钱与 token 并排。算不出价时这一格写"为什么"，不写 $0.00
+  if (cost) {
+    html += `<span class="usage-item usage-item--cost${cost.known ? "" : " usage-item--unknown"}" title="${esc(cost.title)}">${esc(cost.text)}</span>`;
   }
   return html;
 }
