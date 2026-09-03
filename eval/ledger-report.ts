@@ -101,6 +101,22 @@ for (const [source, counts] of Object.entries(s.tools)) {
 console.log("");
 
 /**
+ * 上下文压缩（MEM-01）：反应式压缩救回超长请求的代价（模型补读被置换掉的事实）此前只在
+ * 事件流里可见——台账行不记，`npm run ledger` 就看不见。只读带字段的行，老行是未知不是零。
+ */
+const cp = s.compaction;
+console.log("── 上下文压缩（MEM-01）──");
+if (cp.rows === 0) {
+  console.log("  0 行带压缩计数（2026-09-03 之前的老行不记，是未知不是零次）。");
+} else {
+  console.log(
+    `  有计数的运行 ${cp.rows} 次：发生过压缩 ${cp.runsWithAny} 次（其中反应式 ${cp.runsWithReactive} 次）；` +
+      `常规 ${cp.proactive} 次 / 反应式 ${cp.reactive} 次；置换 ${cp.droppedBlocks} 块 / 折叠 ${cp.collapsedTurns} 轮`,
+  );
+}
+console.log("");
+
+/**
  * 终止原因 × 包 —— 领域包的恢复策略（`DomainPack.recovery`）该填几，只能从这里读。
  * 老行没有 maxTurns 字段时按**当前** presets 推算分母并标 `~`：包护栏是会改的
  * （kicad 40 → 70），推算值只能当参考。plan 模式 turns 是各子任务之和，不算比值。

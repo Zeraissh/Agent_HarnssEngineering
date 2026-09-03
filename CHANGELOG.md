@@ -27,6 +27,14 @@
   mock provider 新增 `context_overflow` 故障与确定性场景。真端点复核（deepseek-v4-flash，窗口实测 1,048,576）：
   兼容路由回 OpenAI 信封且 `code` 只是 `invalid_request_error`，识别靠 message；该真实形状已逐字加锁；
   CLI 真跑一次 987k+64k 撞 400 → 反应式压缩 → 重发 107k → 完成。
+- **压缩占位符带原文首行摘录**：tier 1 `[compacted]` 占位符新增 `excerpt:` 行（原文首个非空行 ≤100 字符，
+  `is_error` 结果取错误行）与行数；tier 2 折叠已置换的块时复用该摘录，不再写「(elided)」。真机复核里模型为
+  找回被置换的事实补读了 72 次文件（8 轮），此后"这次读到了什么"随正史保留。摘录里的 `[compact_ledger]`
+  字面量会被打断，避免折叠块被当成账本改写。
+- **台账记压缩次数**：台账行新增 `compaction { proactive, reactive, droppedBlocks, collapsedTurns }`
+  （CLI 与 Web 同提交；老行缺字段按未知处理），`npm run ledger` 新增「上下文压缩」一行摘要
+  （发生过压缩 / 反应式的运行数与总量）。`.env.example` 补 `AGENT_CONTEXT_LIMIT` 说明：默认 150k 保守，
+  deepseek-v4-flash 实测窗口 1,048,576 且按 messages + max_tokens 之和计超长。
 
 ### 核查（Verification）
 

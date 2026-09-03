@@ -1637,7 +1637,71 @@ describe("ui-server", () => {
     expect(row.maxTurns).toBe(50); // 无包 → DEFAULT_MAX_TURNS
     expect(row.recovery).toEqual({ extensions: 0, stagnations: 0, forced: 0 });
     expect(row.recoveryPolicy).toBeNull(); // 注入宿主缺省完成门关 → 策略无效，照实记 null
+    // 没压过就是 0 次（新行恒有对象）——与老行的 undefined（未知）分开
+    expect(row.compaction).toEqual({ proactive: 0, reactive: 0, droppedBlocks: 0, collapsedTurns: 0 });
     await rm(dir, { recursive: true, force: true });
+  });
+
+  /**
+   * 台账压缩计数的 Web 写入口。2026-09-03 真机：反应式压缩 dropped 72 / collapsed 10 之后模型补读 72 次，
+   * 而台账行不记 compaction——`npm run ledger` 看不见这笔代价。这里让水位真的触发（AGENT_CONTEXT_LIMIT=1000、
+   * 每轮 usage 5000），证明事件旁路的计数真的落进台账行。变异验证：删掉 server.ts 的 tallyCompaction 调用 → 红。
+   */
+  it("v2-8f. 台账行带 compaction：水位触发的常规压缩计入 proactive / collapsedTurns，reactive 为 0", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ui-ledger-compact-"));
+    const file = join(dir, "runs.jsonl");
+    const prior = process.env.AGENT_CONTEXT_LIMIT;
+    process.env.AGENT_CONTEXT_LIMIT = "1000";
+    try {
+      handle = createUiServer({
+        modelClient: new FakeModelClient([
+          ...Array.from({ length: 5 }, (_, i) =>
+            fakeMessage([toolUseBlock(`t${i}`, "noop", { i })], "tool_use", { input_tokens: 5000 }),
+          ),
+          fakeMessage([textBlock("ok")], "end_turn", { input_tokens: 5000 }),
+        ]),
+        tools: [autoTool("noop")],
+        workdir: process.cwd(),
+        ledger: file,
+      });
+      port = await startServer(handle);
+      base = baseUrl(port);
+      const { runId } = await (await fetch(`${base}/api/runs`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task: "ledger compaction fields" }),
+      })).json() as { runId: string };
+      await waitForDone(base, runId);
+
+      // 事件流里真的发生了常规压缩（对照：台账数字要与事件一致，不是另一套口径）
+      const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+      const compactions = events.filter((e: any) => e.event.type === "compaction");
+      expect(compactions.length).toBeGreaterThan(0);
+      const collapsed = compactions.reduce((n: number, e: any) => n + (e.event.collapsedTurns ?? 0), 0);
+      const dropped = compactions.reduce((n: number, e: any) => n + (e.event.droppedBlocks ?? 0), 0);
+      expect(collapsed).toBeGreaterThan(0);
+
+      const deadline = Date.now() + 3000;
+      let rows: any[] = [];
+      while (Date.now() < deadline) {
+        if (existsSync(file)) {
+          rows = (await readFile(file, "utf8")).trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
+          if (rows.length > 0) break;
+        }
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      expect(rows).toHaveLength(1);
+      expect(rows[0].stopReason).toBe("completed");
+      expect(rows[0].compaction).toEqual({
+        proactive: compactions.length,
+        reactive: 0,
+        droppedBlocks: dropped,
+        collapsedTurns: collapsed,
+      });
+    } finally {
+      if (prior === undefined) delete process.env.AGENT_CONTEXT_LIMIT;
+      else process.env.AGENT_CONTEXT_LIMIT = prior;
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   it("v2-8b. Web 宿主接入 memory 工具与快照", async () => {

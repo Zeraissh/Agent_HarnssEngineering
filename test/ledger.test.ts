@@ -22,6 +22,7 @@ import {
   buildLedgerEntry,
   decideStructuredOutput,
   decideStructuredOutputEffect,
+  emptyCompactionTally,
   emptyRecoveryTally,
   isExecutorSource,
   LEDGER_NO_PACK,
@@ -33,6 +34,7 @@ import {
   STRUCTURED_OUTPUT_BASELINE,
   STRUCTURED_OUTPUT_EFFECT_RULE,
   STRUCTURED_OUTPUT_RULE,
+  tallyCompaction,
   tallyRecoveryDecision,
   tallyToolCall,
   type RunLedgerEntry,
@@ -273,6 +275,85 @@ describe("恢复决策计数与 max_turns 分母（终止原因 × 包）", () =
     expect(t.byPack).toEqual([{ pack: LEDGER_NO_PACK, total: 1, counts: { max_turns: 1 } }]);
     expect(t.maxTurnsRuns[0]).toMatchObject({ maxTurns: 50, maxTurnsSource: "inferred", ratio: null });
     expect(t.postRecovery.runs).toBe(0);
+  });
+});
+
+/**
+ * 上下文压缩计数（MEM-01）。2026-09-03 真机：反应式压缩救回 987k 超长请求（dropped 72 / collapsed 10），
+ * 模型随后补读 72 次文件（8 轮）才找回被置换的事实——这笔代价在台账里完全不可见，`npm run ledger`
+ * 报不出"这次运行压过几次"。这组锁：① 事件计数（常规 / 反应式分开，块与轮累加）；② 写入形状
+ * （新行恒有对象，老行 undefined = 未知不是零）；③ 读数器只算带字段的行；④ 两个宿主写入口都接了。
+ */
+describe("上下文压缩计数（compaction）", () => {
+  it("tallyCompaction：reactive 与常规分开数，droppedBlocks / collapsedTurns 累加，非 compaction 事件忽略", () => {
+    const t = emptyCompactionTally();
+    tallyCompaction(t, { type: "compaction", droppedBlocks: 3 });
+    tallyCompaction(t, { type: "compaction", droppedBlocks: 0, collapsedTurns: 4 });
+    tallyCompaction(t, { type: "compaction", droppedBlocks: 72, collapsedTurns: 10, reactive: true });
+    tallyCompaction(t, { type: "tool_call" }); // 不是压缩
+    tallyCompaction(t, { type: "compaction", droppedBlocks: -1, collapsedTurns: Number.NaN }); // 脏值按 0
+    expect(t).toEqual({ proactive: 3, reactive: 1, droppedBlocks: 75, collapsedTurns: 14 });
+  });
+
+  it("buildLedgerEntry：新行恒有 compaction 对象（没压过就是 0）；脏值归 0；老行 JSON 缺字段仍可读", () => {
+    const e = buildLedgerEntry({ ...base, compaction: { proactive: 1, reactive: 1, droppedBlocks: 72, collapsedTurns: 10 } });
+    expect(e.compaction).toEqual({ proactive: 1, reactive: 1, droppedBlocks: 72, collapsedTurns: 10 });
+    expect(buildLedgerEntry(base).compaction).toEqual({ proactive: 0, reactive: 0, droppedBlocks: 0, collapsedTurns: 0 });
+    expect(buildLedgerEntry({ ...base, compaction: { reactive: -2 } }).compaction!.reactive).toBe(0);
+
+    // 2026-09-03 真机那一行的形状（本提交之前写下：有 recovery、没有 compaction）
+    const line =
+      '{"at":1788436346029,"runId":"cli-1788435994738","host":"cli","taskChars":284,"pack":null,"model":"deepseek-v4-flash",' +
+      '"effort":null,"mode":"single","verify":false,"rubric":false,"stopReason":"completed","error":null,"turns":28,"reworks":null,' +
+      '"finalPassed":null,"verifications":[],"verifierBudgetTurns":null,"verifierHitBudget":false,"fallbackChain":null,"fallbacks":0,' +
+      '"tools":{"main":{"read_file":198,"bash":3,"write_file":1,"finish_task":1}},"durationMs":351291,"maxTurns":50,' +
+      '"recoveryPolicy":{"progressExtensionTurns":8,"stagnationWindow":3,"maxStagnationRecoveries":1},' +
+      '"recovery":{"extensions":0,"stagnations":0,"forced":0},"structuredDelivery":true}';
+    const legacy = JSON.parse(line) as RunLedgerEntry;
+    expect(legacy.compaction).toBeUndefined();
+    const s = summarizeLedger([legacy]);
+    expect(s.runs).toBe(1);
+    // 老行是未知不是零：不进分母
+    expect(s.compaction).toEqual({
+      rows: 0, runsWithAny: 0, runsWithReactive: 0, proactive: 0, reactive: 0, droppedBlocks: 0, collapsedTurns: 0,
+    });
+  });
+
+  it("summarizeLedger.compaction：只算带字段的行；发生过压缩 / 反应式的运行数与总量分开", () => {
+    const rows = [
+      buildLedgerEntry({ ...base, compaction: { proactive: 2, reactive: 0, droppedBlocks: 5, collapsedTurns: 3 } }),
+      buildLedgerEntry({ ...base, compaction: { proactive: 0, reactive: 1, droppedBlocks: 72, collapsedTurns: 10 } }),
+      buildLedgerEntry({ ...base, compaction: { proactive: 1, reactive: 1, droppedBlocks: 4, collapsedTurns: 0 } }),
+      buildLedgerEntry(base), // 新行、没压过
+    ];
+    const legacy = JSON.parse(JSON.stringify(buildLedgerEntry(base))) as RunLedgerEntry;
+    delete (legacy as Partial<RunLedgerEntry>).compaction;
+    const s = summarizeLedger([...rows, legacy]);
+    expect(s.runs).toBe(5);
+    expect(s.compaction).toEqual({
+      rows: 4,
+      runsWithAny: 3,
+      runsWithReactive: 2,
+      proactive: 3,
+      reactive: 2,
+      droppedBlocks: 81,
+      collapsedTurns: 13,
+    });
+  });
+
+  it("两个宿主的写入口都接了计数，读数器把它印出来（源码锁：漏接一处这里就红）", () => {
+    const web = readFileSync(join(__dirname, "..", "ui", "server.ts"), "utf-8");
+    const cli = readFileSync(join(__dirname, "..", "src", "cli.ts"), "utf-8");
+    const report = readFileSync(join(__dirname, "..", "eval", "ledger-report.ts"), "utf-8");
+    // Web：事件旁路累加 + 台账行带字段
+    expect(web).toMatch(/if \(event\.type === "compaction"\) \{\s*\n\s*tallyCompaction\(\(run\.compactionTally \?\?= emptyCompactionTally\(\)\), event\);/);
+    expect(web).toMatch(/compaction:\s*run\.compactionTally \?\? emptyCompactionTally\(\)/);
+    // CLI：三条执行路径共用的 noteForLedger 里累加 + 台账行带字段
+    expect(cli).toMatch(/tallyCompaction\(ledgerCompaction, event\);/);
+    expect(cli).toMatch(/compaction:\s*ledgerCompaction,/);
+    // 读数器一行摘要：发生过压缩的运行数 / 反应式次数
+    expect(report).toMatch(/s\.compaction/);
+    expect(report).toMatch(/runsWithAny[\s\S]{0,200}runsWithReactive|runsWithReactive[\s\S]{0,200}runsWithAny/);
   });
 });
 

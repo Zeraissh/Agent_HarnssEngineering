@@ -63,12 +63,15 @@ import { DEFAULT_TOOL_RESULT_MAX_CHARS } from "../src/tools/registry.js";
 import {
   appendRunLedger,
   buildLedgerEntry,
+  emptyCompactionTally,
   emptyRecoveryTally,
   isExecutorSource,
   ledgerErrorClass,
   ledgerPath,
+  tallyCompaction,
   tallyRecoveryDecision,
   tallyToolCall,
+  type LedgerCompactionTally,
   type LedgerRecoveryTally,
   type ToolTally,
 } from "../src/ledger.js";
@@ -302,6 +305,8 @@ interface StoredRun {
   toolTally: ToolTally;
   /** 执行者谱系的恢复决策计数（续跑/停滞/强制收口），与 toolTally 同在事件旁路累加 */
   recoveryTally?: LedgerRecoveryTally;
+  /** 上下文压缩计数（全部角色；常规 / 反应式 / 置换块 / 折叠轮），同在事件旁路累加 */
+  compactionTally?: LedgerCompactionTally;
   /**
    * 本对话轮执行者谱系（main / rework / 子任务 main）各段 done.usage.turns 之和。
    * 台账 `turns` 此前只在带核查时有值（读 outcome.executionUsage），裸跑一律 null——
@@ -2911,6 +2916,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     if (event.type === "recovery_decision") {
       tallyRecoveryDecision((run.recoveryTally ??= emptyRecoveryTally()), source, event);
     }
+    // 压缩计数同款：反应式救回超长请求的代价（模型补读被置换掉的事实）此前只在事件流里可见
+    if (event.type === "compaction") {
+      tallyCompaction((run.compactionTally ??= emptyCompactionTally()), event);
+    }
     // OBS-01：事件旁路投影 span（失败不打断 run）
     try {
       if (!run.openToolSpans) run.openToolSpans = new Map();
@@ -3366,6 +3375,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             ? recoveryFor(run.packName ? getPack(run.packName) : pack).policy
             : null,
           recovery: run.recoveryTally ?? emptyRecoveryTally(),
+          compaction: run.compactionTally ?? emptyCompactionTally(),
         }),
         ledgerFile,
       );

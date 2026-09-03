@@ -171,6 +171,31 @@ const MUTANTS = [
     why: "单个 tool_result 入口截断是兜底：MCP 返回无上限，绕过它一次几百 KB 就顶穿上下文",
   },
   {
+    id: "compact-excerpt-dropped",
+    file: "src/context.ts",
+    find: "            excerpt: excerptToolResult(b.content, b.is_error === true),\n            local,\n          });",
+    replace: "            local, // MUTATION: excerpt dropped — placeholder carries no fact from the original\n          });",
+    testFiles: ["test/compact.test.ts", "test/compact-tier2.test.ts"],
+    why: "占位符必须带原文首行摘录；丢了模型只能重跑工具找回事实（真机 72 次补读 / 8 轮）",
+  },
+  {
+    id: "compact-tier2-elided-again",
+    file: "src/context.ts",
+    find: '          ? (parseSemanticPlaceholderExcerpt(b.content) ?? "(elided)")\n',
+    replace: '          ? "(elided)" // MUTATION: collapse throws the excerpt away again\n',
+    testFiles: ["test/compact-tier2.test.ts"],
+    why: "tier 2 折叠已置换的块时必须复用占位符里的摘录；写回 (elided) 首行事实随折叠丢失",
+  },
+  {
+    id: "ledger-compaction-uncounted",
+    file: "src/ledger.ts",
+    find: '  if (event.type !== "compaction") return tally;\n  if (event.reactive === true) tally.reactive += 1;',
+    replace:
+      '  return tally; // MUTATION: compaction never counted\n  if (event.type !== "compaction") return tally;\n  if (event.reactive === true) tally.reactive += 1;',
+    testFiles: ["test/ledger.test.ts"],
+    why: "台账不记压缩次数，反应式救回超长请求的代价（补读）就永远只在事件流里可见",
+  },
+  {
     id: "prefer-healthy-never-skips",
     file: "src/model-fallback.ts",
     find: "        if (othersMayWork && stickySaysUnhealthy(id)) {\n          skipped.push(ep.name);\n          previous = { name: ep.name, reason: \"probe_unhealthy\" };\n          continue;\n        }",

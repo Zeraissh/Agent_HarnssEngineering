@@ -238,6 +238,77 @@ describe("tier 2：折叠旧轮（tier 1 无可置换 / 置换后估计仍在水
     expect(out.changed).toBe(false);
     expect(out.collapsedTurns).toBe(0);
   });
+
+  /**
+   * 折叠质量缺口（2026-09-03 真机复核）：tier 1 置换过的结果在折叠块 results 行只剩「(elided)」，
+   * 首行事实一并丢失——模型靠占位符提示自行 `read_file limit=1` 补读 72 次（8 轮）才凑齐。
+   * 现在折叠时复用占位符里的摘录。变异验证：results 行改回 "(elided)" → 这条红。
+   */
+  it("tier 2 折叠已置换的占位符时，results 行带原文首行摘录而不是 (elided)；二次压缩摘录不变", () => {
+    const FIRST = "FILE-001 :: the lighthouse keeper counted thirty-seven gulls at dawn :: code M519";
+    const big: Anthropic.MessageParam[] = [
+      { role: "user", content: "任务：汇总每个文件的首行。" },
+      { role: "assistant", content: [toolUseBlock("tu_big", "read_file", { path: "data/chunks/f001.txt" })] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_big", content: `${FIRST}\n${"body ".repeat(700)}` }] },
+      ...turnPair(2),
+    ];
+    // 第一次：只有 tier 1（大结果置换后估算落回水位下），占位符带摘录
+    const m = mgr(1000, 2);
+    m.noteUsage(usage(900));
+    const first = m.compact(big);
+    expect(first.droppedBlocks).toBe(1);
+    expect(first.collapsedTurns).toBe(0);
+    expect(JSON.stringify(first.messages)).toContain(`excerpt: ${FIRST}`);
+
+    // 第二次：又跑了两轮，第 1 轮（已是占位符）出保护窗 → tier 2 折叠它
+    const second = m.compact([...first.messages, ...turnPair(3), ...turnPair(4)]);
+    expect(second.collapsedTurns).toBeGreaterThan(0);
+    const [block] = collapsedBlocks(second.messages);
+    expect(block).toBeDefined();
+    expect(block).toContain(`✓ read_file: ${FIRST}`);
+    expect(block).not.toContain("(elided)");
+    // 未置换的小结果照旧带首行
+    expect(block).toContain("✓ read_file: line1 of f2");
+    assertPairingValid(second.messages);
+
+    // 三次：折叠块只合并不二折，摘录逐字节稳定
+    const third = m.compact(second.messages);
+    expect(third.changed).toBe(false);
+    expect(collapsedBlocks(third.messages)[0]).toBe(block);
+  });
+
+  it("本版之前写下的占位符（没有 excerpt 行）折叠时退回 (elided)——老检查点续跑不崩、不编造", () => {
+    const legacy = "[compacted] semantic elision (was 3600 chars). Re-run the tool if you need full output.\ntool: read_file";
+    const m = mgr(1000, 2);
+    m.noteUsage(usage(900));
+    const out = m.compact([
+      { role: "user", content: "task" },
+      { role: "assistant", content: [toolUseBlock("tu_old", "read_file", { path: "old.txt" })] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_old", content: legacy }] },
+      ...turnPair(2),
+      ...turnPair(3),
+    ]);
+    expect(out.collapsedTurns).toBeGreaterThan(0);
+    expect(collapsedBlocks(out.messages)[0]).toContain("✓ read_file: (elided)");
+  });
+
+  it("摘录里的 [compact_ledger] 字面量进折叠块前被打断——否则整个折叠块会被当成账本改写", () => {
+    const m = mgr(1000, 2);
+    m.noteUsage(usage(900));
+    const out = m.compact([
+      { role: "user", content: "task" },
+      { role: "assistant", content: [toolUseBlock("tu_g", "bash", { command: "grep -rn compact_ledger src" })] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_g", content: `src/compact-ledger.ts:11:export const COMPACT_LEDGER_MARKER = "${COMPACT_LEDGER_MARKER}";\nx` }] },
+      ...turnPair(2),
+      ...turnPair(3),
+    ]);
+    const blocks = collapsedBlocks(out.messages);
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0]).toContain("compact_ledger");
+    expect(blocks[0]).not.toContain(COMPACT_LEDGER_MARKER);
+    // 账本仍只有一份，且折叠块没有被它顶掉
+    expect(out.messages.filter((x) => JSON.stringify(x).includes(COMPACT_LEDGER_MARKER))).toHaveLength(1);
+  });
 });
 
 // ---------------------------------------------------------------- 上下文超长判定

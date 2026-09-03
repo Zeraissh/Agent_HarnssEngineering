@@ -10,7 +10,9 @@ import {
   COMPACT_LEDGER_MARKER,
   type CompactLedger,
   type ToolUseRef,
+  countLines,
   emptyCompactLedger,
+  excerptToolResult,
   extractConstraintsFromText,
   extractDecisionsFromText,
   extractEvidenceFromText,
@@ -20,6 +22,7 @@ import {
   ledgerEntryCount,
   mergeCompactLedgers,
   parseCompactLedgerText,
+  parseSemanticPlaceholderExcerpt,
 } from "./compact-ledger.js";
 import {
   DEFAULT_COMPACT_SUMMARY_MAX_TOKENS,
@@ -225,9 +228,12 @@ export class DefaultContextManager {
           dropped += 1;
           const tool = toolUses.get(b.tool_use_id);
           const local = extractFromToolExchange(tool, b.content, b.is_error === true);
+          // 占位符带原文首行摘录："这次读到了什么"不该只能靠重跑工具找回
           const placeholder = formatSemanticPlaceholder({
             originalChars: b.content.length,
+            originalLines: countLines(b.content),
             toolName: tool?.name,
+            excerpt: excerptToolResult(b.content, b.is_error === true),
             local,
           });
           savedChars += Math.max(0, b.content.length - placeholder.length);
@@ -362,7 +368,10 @@ function collapseOldTurns(
       if (b.type === "tool_result" && typeof b.content === "string") {
         const tool = toolUses.get(b.tool_use_id);
         ledgerParts.push(extractFromToolExchange(tool, b.content, b.is_error === true));
-        const head = b.content.startsWith("[compacted]") ? "(elided)" : clipLine(firstLine(b.content), 100);
+        // 已置换的块复用占位符里的摘录；只有本版之前写下的占位符（没有摘录行）才退回 "(elided)"
+        const head = b.content.startsWith("[compacted]")
+          ? (parseSemanticPlaceholderExcerpt(b.content) ?? "(elided)")
+          : excerptToolResult(b.content, b.is_error === true);
         results.push(`${b.is_error ? "✗" : "✓"} ${tool?.name ?? "tool"}: ${head}`);
       } else if (b.type === "text") {
         texts.push(clipLine(b.text));
@@ -454,14 +463,6 @@ function messageChars(m: Anthropic.MessageParam): number {
     else if (b.type === "tool_use") n += JSON.stringify(b.input ?? {}).length + b.name.length;
   }
   return n;
-}
-
-function firstLine(text: string): string {
-  for (const line of text.split(/\r?\n/)) {
-    const t = line.trim();
-    if (t) return t;
-  }
-  return "";
 }
 
 function clipLine(s: string, max = COLLAPSE_LINE_CHARS): string {

@@ -99,6 +99,47 @@ export function tallyRecoveryDecision(
   return tally;
 }
 
+/**
+ * 上下文压缩计数（MEM-01）。
+ *
+ * 为什么要它（2026-09-03 真机）：反应式压缩救回了一次 987k 的超长请求，但代价——模型为找回
+ * 被置换掉的事实补读了 72 次文件（8 轮）——在台账里完全不可见，`compaction` 只活在事件流里。
+ * 一条要靠"回放日志才看得见"的成本，等于没被计量。
+ *
+ * 与 `recovery` 不同，**不按角色过滤**：问的是"这次运行的上下文有没有被压、压掉多少"，
+ * 哪个角色压的都算（verifier 的反应式压缩同样是这次运行付出的代价）。
+ */
+export interface LedgerCompactionTally {
+  /** 水位触发的常规压缩次数（compaction 事件且 reactive 不为 true） */
+  proactive: number;
+  /** 端点 context-overflow 400 触发的硬压缩次数（reactive=true，随即重发同一轮） */
+  reactive: number;
+  /** tier 1 置换为占位符的 tool_result 块总数 */
+  droppedBlocks: number;
+  /** tier 2 折叠进 `[compacted_turns]` 的旧轮总数 */
+  collapsedTurns: number;
+}
+
+export function emptyCompactionTally(): LedgerCompactionTally {
+  return { proactive: 0, reactive: 0, droppedBlocks: 0, collapsedTurns: 0 };
+}
+
+/**
+ * 累加一次压缩事件（原地改，两个宿主都在事件回调里逐条喂，与 tallyToolCall 同款）。
+ * 非 compaction 事件一律忽略；缺省字段按 0 计。
+ */
+export function tallyCompaction(
+  tally: LedgerCompactionTally,
+  event: { type: string; droppedBlocks?: number; collapsedTurns?: number; reactive?: boolean },
+): LedgerCompactionTally {
+  if (event.type !== "compaction") return tally;
+  if (event.reactive === true) tally.reactive += 1;
+  else tally.proactive += 1;
+  tally.droppedBlocks += nonNegativeInt(event.droppedBlocks);
+  tally.collapsedTurns += nonNegativeInt(event.collapsedTurns);
+  return tally;
+}
+
 /** 台账里记的恢复策略快照（完成门关着时为 null——那时 loop 到 maxTurns 即停） */
 export interface LedgerRecoveryPolicy {
   progressExtensionTurns: number;
@@ -151,6 +192,8 @@ export interface RunLedgerEntry {
   recoveryPolicy?: LedgerRecoveryPolicy | null;
   /** 执行者谱系的恢复决策计数。老行没有这个字段（undefined）= 早于恢复机制，读数器按"未知"标注 */
   recovery?: LedgerRecoveryTally;
+  /** 上下文压缩计数（全部角色）。老行没有这个字段（undefined）= 早于计数落地（2026-09-03），不是零次 */
+  compaction?: LedgerCompactionTally;
   /**
    * 仪器纪律：**这一行是不是由带终结工具（§2.1）的构建写下的**。
    *
@@ -200,6 +243,7 @@ export interface LedgerInput {
   maxTurns?: number | null;
   recoveryPolicy?: LedgerRecoveryPolicy | null;
   recovery?: Partial<LedgerRecoveryTally> | null;
+  compaction?: Partial<LedgerCompactionTally> | null;
 }
 
 const RECOVERIES: LedgerRecovery[] = ["tool", "direct", "reformat", "wrapup", "failed"];
@@ -269,6 +313,13 @@ export function buildLedgerEntry(input: LedgerInput): RunLedgerEntry {
       extensions: nonNegativeInt(input.recovery?.extensions),
       stagnations: nonNegativeInt(input.recovery?.stagnations),
       forced: nonNegativeInt(input.recovery?.forced),
+    },
+    // 同款：新行恒有对象（没压过就是 0 次）；老行 undefined = 未知
+    compaction: {
+      proactive: nonNegativeInt(input.compaction?.proactive),
+      reactive: nonNegativeInt(input.compaction?.reactive),
+      droppedBlocks: nonNegativeInt(input.compaction?.droppedBlocks),
+      collapsedTurns: nonNegativeInt(input.compaction?.collapsedTurns),
     },
     // 构建标记，不是配置：这个构建的 verifier/planner 一律带终结工具
     structuredDelivery: true,
@@ -390,6 +441,22 @@ export interface LedgerSummary {
   tools: ToolTally;
   /** 9.9 的观察项：verifier 侧的写类工具调用（它本该是只读的） */
   verifierWriteCalls: Record<string, number>;
+  /**
+   * 上下文压缩（MEM-01）。**只统计带 `compaction` 字段的行**——老行没有 = 未知，
+   * 不冒充零次（口径同 recovery 的 postRecovery）。
+   */
+  compaction: {
+    /** 有 compaction 字段的行数（分母） */
+    rows: number;
+    /** 发生过至少一次压缩的运行数 */
+    runsWithAny: number;
+    /** 发生过反应式压缩（撞 400 才压）的运行数 */
+    runsWithReactive: number;
+    proactive: number;
+    reactive: number;
+    droppedBlocks: number;
+    collapsedTurns: number;
+  };
 }
 
 /** verifier 侧出现这些就值得看一眼——只读核查不该写东西 */
@@ -406,10 +473,23 @@ export function summarizeLedger(entries: RunLedgerEntry[]): LedgerSummary {
 
   // §2.1 之后的行单独一套计数——效果判据只读这一套
   const post = { verdicts: 0, tool: 0, wrapup: 0, failed: 0 };
+  const compaction: LedgerSummary["compaction"] = {
+    rows: 0, runsWithAny: 0, runsWithReactive: 0, proactive: 0, reactive: 0, droppedBlocks: 0, collapsedTurns: 0,
+  };
 
   for (const e of entries) {
     if (e.verify) verifiedRuns++;
     if (e.verifierHitBudget) hitBudget++;
+    if (e.compaction !== undefined) {
+      const c = e.compaction;
+      compaction.rows += 1;
+      compaction.proactive += nonNegativeInt(c.proactive);
+      compaction.reactive += nonNegativeInt(c.reactive);
+      compaction.droppedBlocks += nonNegativeInt(c.droppedBlocks);
+      compaction.collapsedTurns += nonNegativeInt(c.collapsedTurns);
+      if (nonNegativeInt(c.proactive) + nonNegativeInt(c.reactive) > 0) compaction.runsWithAny += 1;
+      if (nonNegativeInt(c.reactive) > 0) compaction.runsWithReactive += 1;
+    }
     for (const v of e.verifications) {
       recovery[v.recovery ?? "unknown"]++;
       if (e.structuredDelivery) {
@@ -449,6 +529,7 @@ export function summarizeLedger(entries: RunLedgerEntry[]): LedgerSummary {
     hitBudget,
     tools,
     verifierWriteCalls,
+    compaction,
   };
 }
 

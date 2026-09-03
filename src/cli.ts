@@ -106,8 +106,10 @@ import { writeFileTool } from "./tools/write-file.js";
 import {
   appendRunLedger,
   buildLedgerEntry,
+  emptyCompactionTally,
   emptyRecoveryTally,
   ledgerErrorClass,
+  tallyCompaction,
   tallyRecoveryDecision,
   tallyToolCall,
   type ToolTally,
@@ -802,6 +804,8 @@ async function main(): Promise<void> {
   const ledgerTally: ToolTally = {};
   // 执行者谱系的恢复决策计数（续跑/停滞/强制收口）——领域包该填几轮续跑，只能从它读出来
   const ledgerRecovery = emptyRecoveryTally();
+  // 上下文压缩计数（全部角色）——反应式救回超长请求的代价此前只在事件流里可见
+  const ledgerCompaction = emptyCompactionTally();
   let ledgerHitBudget = false;
   /** 三条路径各自把收尾事实归一到这里，最后统一写一行 */
   let ledgerFacts: {
@@ -816,6 +820,7 @@ async function main(): Promise<void> {
   const noteForLedger = (source: string, event: TurnEvent): void => {
     if (event.type === "tool_call") tallyToolCall(ledgerTally, source, event.name);
     tallyRecoveryDecision(ledgerRecovery, source, event);
+    tallyCompaction(ledgerCompaction, event);
     if (
       event.type === "done" &&
       source.includes("verifier") &&
@@ -1146,6 +1151,7 @@ async function main(): Promise<void> {
       maxTurns: withPlan ? null : (config.maxTurns ?? DEFAULT_MAX_TURNS),
       recoveryPolicy: taskCompletionEnabled ? recoveryFor(pack).policy : null,
       recovery: ledgerRecovery,
+      compaction: ledgerCompaction,
     }),
   );
 

@@ -155,19 +155,83 @@ export function formatCompactLedger(ledger: CompactLedger): string {
   return lines.join("\n");
 }
 
+/** 占位符 / 折叠块里一行原文摘录的字符上限（含省略号） */
+export const EXCERPT_MAX_CHARS = 100;
+/** 占位符里摘录行的标签——tier 2 折叠已置换的块时按它把摘录取回来，别改 */
+const EXCERPT_LABEL = "excerpt: ";
+const ERROR_LINE_RE = /\b(?:error|failed|denied|traceback|exception|fatal)\b/i;
+
+/**
+ * 从 tool_result 原文摘录一行事实："这次读到了什么"要在原文被置换之后仍留在正史里。
+ *
+ * 为什么（2026-09-03 真机）：反应式压缩救回了 987k 的超长请求，但 72 个占位符里没有一个
+ * 字的原文——模型只能逐个 `read_file limit=1` 补读 72 次（8 轮）才凑齐首行事实。
+ *
+ * 规则：首个非空行；`is_error` 时优先取首个像错误的行（"Command output:\n\nError: …" 这种
+ * 形状错误不在首行）；空白折叠成单空格；≤ {@link EXCERPT_MAX_CHARS} 字符。
+ * 含 `[compact_ledger]` 字面量时打断它：摘录会进 text 块（折叠块），而账本的识别 / upsert
+ * 是按"文本含该标记"判的，原样放进去整块会被当成账本改写（tier 2 首版实测踩过）。
+ */
+export function excerptToolResult(content: string, isError = false): string {
+  const lines = content.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  let pick = lines[0] ?? "";
+  if (isError) {
+    const errorLine = lines.find((l) => ERROR_LINE_RE.test(l));
+    if (errorLine) pick = errorLine;
+  }
+  const one = pick.replace(/\s+/g, " ").split(COMPACT_LEDGER_MARKER).join("[compact_ledger…]");
+  return clipTo(one, EXCERPT_MAX_CHARS);
+}
+
+/** 行数：按 \n 或 \r\n 切，末尾一个换行不多算一行；空串 = 0 */
+export function countLines(text: string): number {
+  if (!text) return 0;
+  const parts = text.split(/\r?\n/);
+  if (parts.at(-1) === "") parts.pop();
+  return parts.length;
+}
+
+/**
+ * tier 1 占位符。首行以 `[compacted]` 开头是契约（幂等判定、扫描跳过、Phase B 摘要
+ * 过滤都靠它）；`excerpt:` 行是原文首行摘录（{@link excerptToolResult}），
+ * {@link parseSemanticPlaceholderExcerpt} 按标签取回——折叠时复用，不再写 "(elided)"。
+ * 体积有界：摘录行 ≤ 9 + 100 字符，头部多出的 ", N lines" ≤ 20 字符。
+ */
 export function formatSemanticPlaceholder(args: {
   originalChars: number;
+  /** 原文行数；缺省不写 */
+  originalLines?: number;
   toolName?: string;
+  /** 原文首行摘录；缺省不写（老调用方 / 无内容） */
+  excerpt?: string;
   local: CompactLedger;
 }): string {
   const lines = [
-    `[compacted] semantic elision (was ${args.originalChars} chars). Re-run the tool if you need full output.`,
+    `[compacted] semantic elision (was ${args.originalChars} chars` +
+      (args.originalLines != null ? `, ${args.originalLines} lines` : "") +
+      "). Re-run the tool if you need full output.",
   ];
   if (args.toolName) lines.push(`tool: ${args.toolName}`);
+  if (args.excerpt) lines.push(`${EXCERPT_LABEL}${clipTo(args.excerpt.replace(/\s+/g, " ").trim(), EXCERPT_MAX_CHARS)}`);
   for (const item of args.local.sideEffects.slice(0, 4)) lines.push(`side-effect: ${item}`);
   for (const item of args.local.failures.slice(0, 4)) lines.push(`failure: ${item}`);
   for (const item of args.local.evidence.slice(0, 6)) lines.push(`evidence: ${item}`);
   return lines.join("\n");
+}
+
+/**
+ * 从占位符取回摘录行；没有（本版之前写下的占位符，或空摘录）→ undefined，调用方自行退回 "(elided)"。
+ * 只认 `[compacted]` 开头的文本——别把普通 tool_result 里恰好含 "excerpt:" 的行认成摘录。
+ */
+export function parseSemanticPlaceholderExcerpt(placeholder: string): string | undefined {
+  if (!placeholder.startsWith("[compacted]")) return undefined;
+  for (const line of placeholder.split("\n")) {
+    if (line.startsWith(EXCERPT_LABEL)) {
+      const v = line.slice(EXCERPT_LABEL.length).trim();
+      return v || undefined;
+    }
+  }
+  return undefined;
 }
 
 export function extractConstraintsFromText(text: string): string[] {
@@ -277,9 +341,13 @@ function summarizeToolInput(name: string, input: unknown): string {
 }
 
 function clip(s: string): string {
-  const one = s.replace(/\s+/g, " ").trim();
-  if (one.length <= MAX_ENTRY_CHARS) return one;
-  return `${one.slice(0, MAX_ENTRY_CHARS - 1)}…`;
+  return clipTo(s.replace(/\s+/g, " ").trim(), MAX_ENTRY_CHARS);
+}
+
+/** 截到 ≤ max 字符，超出时末位是省略号（"…" 算一个字符，总长恰为 max） */
+function clipTo(one: string, max: number): string {
+  if (one.length <= max) return one;
+  return `${one.slice(0, max - 1)}…`;
 }
 
 function pushUnique(target: string[], items: string[]): void {

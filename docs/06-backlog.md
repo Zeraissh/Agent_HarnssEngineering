@@ -28,6 +28,10 @@
 - **RUN-01[~ Phase 1+2]** — ADR-003；`state.json`；崩溃→interrupted；**同 run 热恢复**（checkpoint 边界，`sameRunResume`/`run_resumed`）；预算+grantAudit 进 state。
 - **MEM-01[~ Phase A+B+C]** — 语义压缩：`[compact_ledger]` + 语义占位（A）；可选 LLM 摘要进账本（B）；
   入口截断 + tier 2 折叠旧轮 + 反应式硬压缩重发（C，见下文「loop / context 四件 ③」）；mutation 4 个。
+  **C 之后的一刀（2026-09-03）**：占位符 / 折叠块 results 行带原文首行摘录（≤100 字符 + 行数，`excerpt:`），台账行记
+  `compaction { proactive, reactive, droppedBlocks, collapsedTurns }`，`npm run ledger` 一行摘要。起因是真机复核
+  （`D:\Work\scratch\reactive-smoke-20260903\run2`，未入仓）：反应式压缩 dropped 72 / collapsed 10 救回 987k 超长请求，
+  但占位符零原文、折叠块写「(elided)」，模型 `read_file limit=1` 补读 72 次（8 轮）才凑齐 112 行摘要；台账行对此零记录。
 - **MODEL-01b[~]** — 能力探针 + 每角色 fallback/inherit + `prefer_healthy` stub；见 docs/08。
 - **v1.3.0 发布（2026-09-03）+ REL-02[~]** — 根目录 `CHANGELOG.md`（1.1.0 / 1.2.0 / 1.3.0 按提交归档，新版本先写 `[Unreleased]` 再随 tag 改节名）；版本号三处（根 / cross-app `package.json` / `CLI_VERSION`）由测试锁一致；release.yml 缺签名凭据时跳过 Windows 安装包（不发布未签名产物）、`workflow_dispatch` = 预演不推送——**打 tag 前先跑一次预演**。残余见 docs/08 REL-02 行。
 
@@ -191,9 +195,11 @@ tier 2 跳过 / 反应式跳过 / 截断绕过 / 配对规则删除 / 超长判�
 「maximum context length」识别；已按真机报文逐字加锁（变异：删该正则分支只有它红）。CLI 真跑（112 文件 / 14 页清单，
 `AGENT_CONTEXT_LIMIT=1e7` 令水位路径永不触发）：第 12 轮 ≈ 987k + 64k 撞 400 → `compaction{reactive}` dropped 72 / collapsed 10 /
 ledger 22 → 重发 107k 成功 → `completed` 28 轮，in 1.38M / cacheR 10.6M / out 21.7k / 352 s，summary 112/112 逐字正确，水位路径 0 次。
-**折叠质量缺口（新残余）**：tier 1 置换过的结果在折叠块 results 行只剩「(elided)」，首行事实一并丢失；模型靠占位符提示
-自行 `read_file limit=1` 补读 72 次（8 轮）才凑齐。下一层候选：占位符 / results 行带原结果首行（≤100 字符）。
-台账行不记 compaction 次数（reactive 只在事件流里可见）。产物在 `D:\Work\scratch\reactive-smoke-20260903\`（run1 / run2，未入仓）。
+**折叠质量缺口（已修，同日）**：tier 1 置换过的结果在折叠块 results 行只剩「(elided)」，首行事实一并丢失；模型靠占位符提示
+自行 `read_file limit=1` 补读 72 次（8 轮）才凑齐。修法：占位符带 `excerpt:` 行（原文首个非空行 ≤100 字符，`is_error` 取错误行；
+头部加行数）；tier 2 折叠已置换的块时按标签取回摘录，只有本版之前写下的占位符才退回「(elided)」；摘录里的 `[compact_ledger]`
+字面量打断（否则折叠块会被当账本改写）。台账行新增 `compaction` 四计数（两宿主写入口同提交；老行 undefined = 未知不是零），
+`npm run ledger` 新增「上下文压缩」一行。产物在 `D:\Work\scratch\reactive-smoke-20260903\`（run1 / run2，未入仓）。
 
 ### ④ 无包运行的核查者通用只读缺省（委托方批准的例外）—— ✅ 已实施
 

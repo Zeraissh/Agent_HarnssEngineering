@@ -89,6 +89,102 @@ describe("DefaultContextManager.compact（v0.3 真实实现）", () => {
   });
 });
 
+/**
+ * 占位符带原文首行摘录（2026-09-03 真机复核的缺口）：反应式压缩救回 987k 超长请求后，
+ * 72 个 `[compacted]` 占位符里没有一个字的原文，模型只能 `read_file limit=1` 补读 72 次（8 轮）。
+ * 变异验证：tier 1 调用处删掉 excerpt 参数 → 下面三条全红。
+ */
+describe("tier 1 占位符带原文首行摘录", () => {
+  const FIRST = "FILE-001 :: the lighthouse keeper counted thirty-seven gulls at dawn :: code M519";
+  function readResult(id: string, firstLine: string, isError = false): Anthropic.MessageParam {
+    return {
+      role: "user",
+      content: [{
+        type: "tool_result",
+        tool_use_id: id,
+        ...(isError ? { is_error: true } : {}),
+        content: `${firstLine}\n${"body ".repeat(700)}\ntail`,
+      }],
+    };
+  }
+  const placeholderOf = (out: Anthropic.MessageParam[], id: string): string => {
+    const msg = out.find(
+      (m) => typeof m.content !== "string" && m.content.some((b) => b.type === "tool_result" && b.tool_use_id === id),
+    )!;
+    const block = (msg.content as Anthropic.ToolResultBlockParam[]).find((b) => b.tool_use_id === id)!;
+    return block.content as string;
+  };
+
+  it("占位符首行仍以 [compacted] 开头，带行数，且有 excerpt 行 = 原文首个非空行", () => {
+    const m = mgr(1000, 1);
+    m.noteUsage(usage(900));
+    const out = m.compact([
+      { role: "assistant", content: [toolUseBlock("tu_r", "read_file", { path: "data/chunks/f001.txt" })] },
+      readResult("tu_r", FIRST),
+      { role: "user", content: "latest" },
+    ]);
+    expect(out.droppedBlocks).toBe(1);
+    const text = placeholderOf(out.messages, "tu_r");
+    expect(text.startsWith("[compacted] semantic elision (was ")).toBe(true);
+    expect(text.split("\n")[0]).toMatch(/was \d+ chars, 3 lines\)/);
+    expect(text).toContain("tool: read_file");
+    expect(text).toContain(`excerpt: ${FIRST}`);
+    // 体积有界：摘录相关只多出 ≤ 150 字符
+    const bare = text.split("\n").filter((l) => !l.startsWith("excerpt: ")).join("\n").replace(/, 3 lines/, "");
+    expect(text.length - bare.length).toBeLessThanOrEqual(150);
+  });
+
+  it("首行超过 100 字符 → 摘录恰好 100 字符、末位省略号", () => {
+    const m = mgr(1000, 1);
+    m.noteUsage(usage(900));
+    const long = "X".repeat(260);
+    const out = m.compact([
+      { role: "assistant", content: [toolUseBlock("tu_l", "bash", { command: "cat big.log" })] },
+      readResult("tu_l", long),
+      { role: "user", content: "latest" },
+    ]);
+    const line = placeholderOf(out.messages, "tu_l").split("\n").find((l) => l.startsWith("excerpt: "))!;
+    const excerpt = line.slice("excerpt: ".length);
+    expect(excerpt.length).toBe(100);
+    expect(excerpt).toBe(`${"X".repeat(99)}…`);
+  });
+
+  it("is_error 的结果摘录错误行（不在首行也要找到）", () => {
+    const m = mgr(1000, 1);
+    m.noteUsage(usage(900));
+    const out = m.compact([
+      { role: "assistant", content: [toolUseBlock("tu_e", "bash", { command: "openocd -f x.cfg" })] },
+      {
+        role: "user",
+        content: [{
+          type: "tool_result",
+          tool_use_id: "tu_e",
+          is_error: true,
+          content: `Command output:\n\nError: LIBUSB_ERROR_ACCESS probe held by PID 4242\n${"e".repeat(600)}`,
+        }],
+      },
+      { role: "user", content: "latest" },
+    ]);
+    expect(placeholderOf(out.messages, "tu_e")).toContain("excerpt: Error: LIBUSB_ERROR_ACCESS probe held by PID 4242");
+  });
+
+  it("幂等：二次压缩不重置换，占位符逐字节不变（摘录稳定）", () => {
+    const m = mgr(1000, 1);
+    m.noteUsage(usage(900));
+    const first = m.compact([
+      { role: "assistant", content: [toolUseBlock("tu_r", "read_file", { path: "f001.txt" })] },
+      readResult("tu_r", FIRST),
+      { role: "user", content: "latest" },
+    ]);
+    const before = placeholderOf(first.messages, "tu_r");
+    const second = m.compact(first.messages);
+    expect(second.droppedBlocks).toBe(0);
+    expect(placeholderOf(second.messages, "tu_r")).toBe(before);
+    // 摘录只出现一次——不会被"占位符再摘录"套娃
+    expect(before.split("\n").filter((l) => l.startsWith("excerpt: "))).toHaveLength(1);
+  });
+});
+
 describe("MEM-01 语义账本（结构化压缩残留）", () => {
   it("压缩后保留用户约束、决策、失败、证据与 write_file 副作用", () => {
     const m = mgr(1000, 1);
