@@ -127,3 +127,49 @@ describe("RUN-01 Phase 2 same-run resume", () => {
     ).toBe(false);
   });
 });
+
+/**
+ * 会话中心化：同进程内对已收尾的 run 追加新一轮。`reopen` 与 `resume` 是两件事——
+ * resume 是崩溃后同 run 热恢复（仅 interrupted），reopen 是"这场对话还没完"。
+ */
+describe("reopen（会话续轮）", () => {
+  const started = () => transitionRunState(initialRunState("r"), { type: "start" })!;
+
+  it("completed / failed / closed / interrupted 都能回到 executing，挂起 id 清空", () => {
+    for (const terminal of ["complete", "fail", "close", "interrupt"] as const) {
+      const ended = transitionRunState(started(), { type: terminal })!;
+      const reopened = transitionRunState(ended, { type: "reopen" }, 99);
+      expect(reopened?.phase, `${terminal} → reopen`).toBe("executing");
+      expect(reopened?.pendingApprovalIds).toEqual([]);
+      expect(reopened?.updatedAt).toBe(99);
+    }
+  });
+
+  it("有一轮还没结束时拒绝（created / plan_gated / awaiting_approval）——追加会与它并发", () => {
+    expect(transitionRunState(initialRunState("r"), { type: "reopen" })).toBeNull();
+    const gated = transitionRunState(
+      transitionRunState(initialRunState("r"), { type: "plan_begin" })!,
+      { type: "plan_ready", plan, gated: true },
+    )!;
+    expect(transitionRunState(gated, { type: "reopen" })).toBeNull();
+    const waiting = transitionRunState(started(), { type: "approval_wait", approvalId: "a1" })!;
+    expect(transitionRunState(waiting, { type: "reopen" })).toBeNull();
+  });
+
+  it("reopen 保留 toolTx / grantAudit / budget（它们是账，不是挂起态）", () => {
+    let s = started();
+    s = transitionRunState(s, { type: "budget_snapshot", budget: { usedTurns: 4, usedTokens: 9 } })!;
+    s = transitionRunState(s, {
+      type: "grant_audit",
+      entry: { grantId: "g", approvalId: "a", name: "bash", inputHash: "h", issuedAt: 1, expiresAt: 2, maxUses: 1, usedUses: 0, outcome: "issued", at: 3 },
+    })!;
+    s = transitionRunState(s, { type: "complete" })!;
+    const reopened = transitionRunState(s, { type: "reopen" })!;
+    expect(reopened.budget).toEqual({ usedTurns: 4, usedTokens: 9 });
+    expect(reopened.grantAudit).toHaveLength(1);
+    // 续轮之后仍能正常记段与收尾
+    const seg = transitionRunState(reopened, { type: "segment_begin", index: 2, source: "main" })!;
+    expect(seg.phase).toBe("executing");
+    expect(transitionRunState(seg, { type: "complete" })!.phase).toBe("completed");
+  });
+});

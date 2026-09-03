@@ -114,6 +114,13 @@ export type RunStateEvent =
   | { type: "budget_snapshot"; budget: DurableBudgetSnapshot }
   | { type: "grant_audit"; entry: DurableGrantAuditEntry }
   | { type: "resume"; at: number }
+  /**
+   * 会话中心化：同进程内对一个已收尾的 run 追加新一轮对话。
+   * 与 `resume` 的区别：resume 是崩溃后同 run 热恢复（仅 interrupted）；
+   * reopen 是"这场对话还没完"——completed/failed/closed/interrupted 都可回到
+   * executing。挂起 id 清空（收尾时已宣告过期）；toolTx/grantAudit/budget 保留。
+   */
+  | { type: "reopen" }
   | { type: "tool_tx"; tx: DurableToolTx }
   | { type: "complete" }
   | { type: "fail" }
@@ -247,6 +254,20 @@ export function transitionRunState(
       next.pendingApprovalIds = [];
       next.pendingQuestionIds = [];
       next.lastSameRunResumeAt = event.at;
+      return next;
+    case "reopen":
+      // 只有"已收尾"或"仍在执行相"的 run 能开新一轮；created/planning/plan_gated/
+      // awaiting_* 都意味着有一轮还没结束，追加会与它并发——拒绝。
+      if (
+        !["completed", "failed", "closed", "interrupted", "executing", "verifying", "reworking"].includes(
+          state.phase,
+        )
+      ) {
+        return null;
+      }
+      next.phase = "executing";
+      next.pendingApprovalIds = [];
+      next.pendingQuestionIds = [];
       return next;
     case "tool_tx":
       if (["completed", "failed", "closed"].includes(state.phase)) return null;

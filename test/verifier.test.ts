@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type Anthropic from "@anthropic-ai/sdk";
-import { runVerified } from "../src/orchestrate.js";
+import { continuationVerifyTask, runVerified, verdictFeedbackSummary } from "../src/orchestrate.js";
 import { FINISH_TASK_TOOL_NAME, withTaskCompletion } from "../src/task-completion.js";
 import {
   DEFAULT_VERIFIER_MAX_TURNS,
@@ -340,6 +340,101 @@ describe("runVerified：返工模式与纯产物核查", () => {
     );
     expect(outcome.main.stopReason).toBe("max_turns");
     expect(outcome.finalPassed).toBe(true);
+  });
+});
+
+/**
+ * 会话中心化：核查是"每一轮的选项"而不是 run 级封印。续跑轮由 continuation 入口
+ * 进来——执行者在正史上续跑，核查者仍是全新上下文、核查的是本轮指令。
+ */
+describe("runVerified 续跑入口（continuation）", () => {
+  class ScriptedClient3 implements ModelClient {
+    requests: ModelRequest[] = [];
+    constructor(private script: Anthropic.Message[]) {}
+    send(req: ModelRequest): Promise<ModelTurn> {
+      this.requests.push(structuredClone(req));
+      const m = this.script.shift();
+      if (!m) throw new Error("script exhausted");
+      return Promise.resolve({ message: m, stopReason: m.stop_reason, usage: m.usage });
+    }
+  }
+  const history: Anthropic.MessageParam[] = [
+    { role: "user", content: "第一轮：记住暗号 alpha-7" },
+    { role: "assistant", content: [textBlock("记住了 alpha-7")] },
+  ];
+
+  it("执行者带正史续跑；核查者拿到的任务书是本轮指令 + 原任务背景，不带执行者正史", async () => {
+    const model = new ScriptedClient3([
+      fakeMessage([textBlock("暗号是 alpha-7，已写入 out.txt")], "end_turn"), // 续跑执行
+      fakeMessage([textBlock('{"passed": true, "issues": [], "summary": "out.txt 一致"}')], "end_turn"), // verifier
+    ]);
+    const task = continuationVerifyTask("原任务：记住暗号", "把暗号写进 out.txt");
+    const outcome = await runVerified({ ...baseConfig, tools: [] }, model, task, {
+      continuation: { history, feedback: "把暗号写进 out.txt" },
+    });
+    expect(outcome.finalPassed).toBe(true);
+    expect(outcome.reworks).toBe(0);
+
+    // 执行者：正史 + 本轮反馈（第 3 条 user）——不是从零开始
+    const exec = model.requests[0]!.messages;
+    expect(exec).toHaveLength(3);
+    expect(JSON.stringify(exec[0])).toContain("alpha-7");
+    expect(exec[2]!.role).toBe("user");
+    expect(JSON.stringify(exec[2]!.content)).toContain("把暗号写进 out.txt");
+    // 核查者：全新上下文（单条 user），任务书含本轮指令与原任务；不含执行者正史原文
+    const verifierReq = model.requests[1]!.messages;
+    expect(verifierReq).toHaveLength(1);
+    const text = JSON.stringify(verifierReq[0]);
+    expect(text).toContain("把暗号写进 out.txt");
+    expect(text).toContain("原任务：记住暗号");
+    expect(text).toContain("【本轮指令】");
+    expect(text).not.toContain("第一轮：记住暗号 alpha-7");
+    // 返回的 main.messages 就是下一轮该接的正史（含本轮全部）
+    expect(outcome.main.messages).toHaveLength(4);
+  });
+
+  it("续跑轮的返工强制 inherit：即使传 fresh，返工也在正史上继续（变异锁）", async () => {
+    const model = new ScriptedClient3([
+      fakeMessage([textBlock("写了")], "end_turn"), // 续跑执行
+      fakeMessage([textBlock('{"passed": false, "issues": ["out.txt 为空"], "summary": "未通过"}')], "end_turn"), // verifier #1
+      fakeMessage([textBlock("补上了")], "end_turn"), // rework
+      fakeMessage([textBlock('{"passed": true, "issues": [], "summary": "已修复"}')], "end_turn"), // verifier #2
+    ]);
+    const outcome = await runVerified({ ...baseConfig, tools: [] }, model, "任务", {
+      reworkMode: "fresh",
+      continuation: { history, feedback: "写 out.txt" },
+    });
+    expect(outcome.finalPassed).toBe(true);
+    expect(outcome.reworks).toBe(1);
+    const rework = model.requests[2]!.messages;
+    // fresh 会只剩 1 条（任务+返工）；inherit 是 正史2 + 本轮 user + assistant + 返工 user = 5
+    expect(rework).toHaveLength(5);
+    expect(JSON.stringify(rework[0])).toContain("alpha-7");
+    expect(JSON.stringify(rework[4]!.content)).toContain("out.txt 为空");
+    // 返工段的正史是完整谱系：下一轮续跑就该接它
+    expect(outcome.main.messages.length).toBeGreaterThan(rework.length);
+  });
+
+  it("verdictFeedbackSummary / continuationVerifyTask：给执行者的裁决摘要与给核查者的任务书", () => {
+    const failed = verdictFeedbackSummary(
+      { passed: false, summary: "两处不符", issues: ["行数 3≠4", "缺换行"], unverified: ["a"], advisory: ["b", "c"] },
+      2,
+    );
+    expect(failed).toContain("第 2 轮对话");
+    expect(failed).toContain("未通过：两处不符");
+    expect(failed).toContain("1. 行数 3≠4");
+    expect(failed).toContain("2. 缺换行");
+    expect(failed).toContain("未能核查 1 项");
+    expect(failed).toContain("评审意见 2 条");
+
+    const passed = verdictFeedbackSummary({ passed: true, summary: "一致", issues: [] });
+    expect(passed).toContain("通过：一致");
+    expect(passed).not.toContain("问题");
+    expect(passed).not.toContain("轮对话");
+
+    const task = continuationVerifyTask("原任务", "本轮要求");
+    expect(task.indexOf("【本轮指令】本轮要求")).toBeGreaterThanOrEqual(0);
+    expect(task.indexOf("【本轮指令】")).toBeLessThan(task.indexOf("原任务"));
   });
 });
 

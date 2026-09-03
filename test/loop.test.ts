@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type Anthropic from "@anthropic-ai/sdk";
-import { AgentLoop, backoffWithJitter, createRunBudget } from "../src/loop.js";
+import {
+  ABORTED_TOOL_RESULT,
+  AgentLoop,
+  backoffWithJitter,
+  createRunBudget,
+  repairHistoryForContinuation,
+} from "../src/loop.js";
 import {
   FINISH_TASK_TOOL_NAME,
   withTaskCompletion,
@@ -888,5 +894,104 @@ describe("目标级闭环：停滞检测与恢复路由", () => {
     const { events, result } = await collect(new AgentLoop(cfg, model).run("处理"));
     expect(result.stopReason).toBe("completed");
     expect(events.some((e) => e.type === "recovery_decision" && e.reason === "stagnation")).toBe(false);
+  });
+});
+
+/**
+ * 会话中心化 P6：续跑正史必须先修复。API 硬约束 1 要求每个 assistant tool_use 都有
+ * 紧随的 tool_result；停在工具中途的正史（宿主中止 / 半截档案 / 外部拼接）原样续跑
+ * 会被端点整条拒绝——"对话一出错就只能新开"的形态之一。
+ */
+describe("续跑正史修复（repairHistoryForContinuation）", () => {
+  /** 每个 assistant tool_use 的 id 都必须在紧随的 user 消息里有 tool_result */
+  function assertToolUsePairing(messages: Anthropic.MessageParam[]): void {
+    for (let i = 0; i < messages.length; i++) {
+      const m = messages[i]!;
+      if (m.role !== "assistant" || typeof m.content === "string") continue;
+      const ids = m.content.filter((b) => b.type === "tool_use").map((b) => (b as Anthropic.ToolUseBlockParam).id);
+      if (ids.length === 0) continue;
+      const next = messages[i + 1];
+      expect(next?.role, `assistant#${i} 的 tool_use 后面必须紧跟 user`).toBe("user");
+      const results = new Set(
+        (Array.isArray(next!.content) ? next!.content : [])
+          .filter((b) => b.type === "tool_result")
+          .map((b) => (b as Anthropic.ToolResultBlockParam).tool_use_id),
+      );
+      for (const id of ids) expect(results.has(id), `tool_use ${id} 没有 tool_result`).toBe(true);
+    }
+  }
+
+  const dangling: Anthropic.MessageParam[] = [
+    { role: "user", content: "开始" },
+    { role: "assistant", content: [textBlock("先看两个文件"), toolUseBlock("tu_a", "alpha", {}), toolUseBlock("tu_b", "beta", {})] },
+  ];
+
+  it("纯函数：悬空 tool_use → 逐 id 合成 is_error 的 tool_result；不改入参", () => {
+    const before = JSON.stringify(dangling);
+    const repaired = repairHistoryForContinuation(dangling);
+    expect(JSON.stringify(dangling)).toBe(before);
+    expect(repaired).toHaveLength(3);
+    const tail = repaired.at(-1)!;
+    expect(tail.role).toBe("user");
+    const blocks = tail.content as Anthropic.ToolResultBlockParam[];
+    expect(blocks.map((b) => b.tool_use_id)).toEqual(["tu_a", "tu_b"]);
+    expect(blocks.every((b) => b.type === "tool_result" && b.is_error === true)).toBe(true);
+    expect(blocks.every((b) => b.content === ABORTED_TOOL_RESULT)).toBe(true);
+    assertToolUsePairing(repaired);
+  });
+
+  it("纯函数：末条是纯文本 assistant / user 时原样返回同一引用；末尾空 assistant 被剥掉", () => {
+    const textOnly: Anthropic.MessageParam[] = [
+      { role: "user", content: "开始" },
+      { role: "assistant", content: [textBlock("说完了")] },
+    ];
+    expect(repairHistoryForContinuation(textOnly)).toBe(textOnly);
+    const userTail: Anthropic.MessageParam[] = [...textOnly, { role: "user", content: "再来" }];
+    expect(repairHistoryForContinuation(userTail)).toBe(userTail);
+    const emptyTail: Anthropic.MessageParam[] = [...textOnly, { role: "assistant", content: [] }];
+    expect(repairHistoryForContinuation(emptyTail)).toEqual(textOnly);
+    // 空 assistant 之下还压着悬空 tool_use：两步都要做
+    const emptyOverDangling: Anthropic.MessageParam[] = [...dangling, { role: "assistant", content: [] }];
+    const repaired = repairHistoryForContinuation(emptyOverDangling);
+    expect(repaired).toHaveLength(3);
+    assertToolUsePairing(repaired);
+  });
+
+  it("runContinuation：修复后的回执与反馈合并进同一条 user，请求满足配对约束（变异锁）", async () => {
+    const model = new FakeModelClient([fakeMessage([textBlock("接着做")], "end_turn")]);
+    const loop = new AgentLoop(
+      { ...baseConfig, tools: [makeTool({ name: "alpha" }), makeTool({ name: "beta" })] },
+      model,
+    );
+    const { result } = await collect(loop.runContinuation(dangling, "继续"));
+    expect(result.stopReason).toBe("completed");
+
+    const sent = model.requests[0]!.messages;
+    // 修复关掉时这里会是 assistant(tool_use) → user("继续")：配对断言当场变红
+    assertToolUsePairing(sent);
+    // 回执与反馈在**同一条** user 里（不制造连续两条 user——兼容端点未必接受）
+    expect(sent).toHaveLength(3);
+    const merged = sent[2]!.content as Anthropic.ContentBlockParam[];
+    expect(merged.filter((b) => b.type === "tool_result")).toHaveLength(2);
+    expect(merged.some((b) => b.type === "text" && b.text === "继续")).toBe(true);
+    // 结果正史同样成对，且下一次续跑无需再修
+    assertToolUsePairing(result.messages);
+    expect(repairHistoryForContinuation(result.messages)).toBe(result.messages);
+  });
+
+  it("runContinuation：末条是纯文本 assistant 时反馈作为普通新 user 消息追加（原行为不变）", async () => {
+    const model = new FakeModelClient([fakeMessage([textBlock("好")], "end_turn")]);
+    const history: Anthropic.MessageParam[] = [
+      { role: "user", content: "开始" },
+      { role: "assistant", content: [textBlock("说完了")] },
+    ];
+    await collect(new AgentLoop({ ...baseConfig, tools: [] }, model).runContinuation(history, "继续"));
+    const sent = model.requests[0]!.messages;
+    expect(sent).toHaveLength(3);
+    expect(sent[2]!.role).toBe("user");
+    // 渲染层会给末条 user 挂缓存断点，所以比内容不比形状
+    const blocks = Array.isArray(sent[2]!.content) ? sent[2]!.content : [{ type: "text", text: sent[2]!.content }];
+    expect(blocks.filter((b) => b.type === "tool_result")).toHaveLength(0);
+    expect(blocks.some((b) => b.type === "text" && b.text === "继续")).toBe(true);
   });
 });

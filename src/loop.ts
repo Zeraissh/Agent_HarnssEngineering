@@ -145,6 +145,55 @@ export function backoffWithJitter(
   return Math.round(ceiling / 2 + (random() * ceiling) / 2);
 }
 
+/** 中止后悬空的 tool_use 补的回执正文——告诉模型"没结果不是你的错，需要就再调" */
+export const ABORTED_TOOL_RESULT = "执行被中止，未产生结果；如仍需要请重新调用。";
+
+/**
+ * 续跑前的正史修复（P6 不变量）。
+ *
+ * API 硬约束 1：每个 assistant `tool_use` 都必须有紧随其后的 `tool_result`。
+ * 正常路径下 loop 自己保证这一点（工具结果总是整批进同一条 user 消息），
+ * 但**续跑喂进来的正史不都是 loop 刚产出的**：宿主中止在工具执行中途、
+ * 从磁盘档案读回的半截段、外部调用方拼出来的历史，都可能停在一条带
+ * `tool_use` 的 assistant 消息上。原样续跑，下一次请求会被端点整条拒绝——
+ * 而那正是"对话一出错就只能新开"的形态之一。
+ *
+ * 修法是补而不是删：为每个悬空 id 合成一条 `is_error` 的 `tool_result`
+ * （正文说清"被中止、无结果、需要就再调"），让模型自己决定要不要重做。
+ * 删掉那条 assistant 消息等于篡改正史，模型会重复它刚做过的决定。
+ *
+ * 纯函数、不改入参；末条不是"带 tool_use 的 assistant"时原样返回同一引用。
+ * 也顺手清掉末尾**空内容**的 assistant 消息（`content: []`）——端点同样拒收，
+ * 且它不承载任何决定，删除不构成篡改。
+ */
+export function repairHistoryForContinuation(
+  history: Anthropic.MessageParam[],
+): Anthropic.MessageParam[] {
+  let out = history;
+  // 末尾空 assistant：可能有多条（极端崩溃形态），逐条剥
+  while (out.length > 0) {
+    const last = out.at(-1)!;
+    const empty =
+      last.role === "assistant" &&
+      (last.content === "" || (Array.isArray(last.content) && last.content.length === 0));
+    if (!empty) break;
+    out = out.slice(0, -1);
+  }
+  const last = out.at(-1);
+  if (!last || last.role !== "assistant" || typeof last.content === "string") return out;
+  const dangling = last.content.filter(
+    (block): block is Anthropic.ToolUseBlockParam => block.type === "tool_use",
+  );
+  if (dangling.length === 0) return out;
+  const results: Anthropic.ToolResultBlockParam[] = dangling.map((block) => ({
+    type: "tool_result",
+    tool_use_id: block.id,
+    content: ABORTED_TOOL_RESULT,
+    is_error: true,
+  }));
+  return [...out, { role: "user", content: results }];
+}
+
 /** push 式异步事件队列：让 loop 在 await 模型/工具期间也能实时发事件 */
 class AsyncEventQueue<T> implements AsyncIterable<T> {
   private buffer: T[] = [];
@@ -350,6 +399,9 @@ export class AgentLoop {
         q.push(event);
       });
     }
+    // 续跑正史先修复（P6）：末条若是悬空 tool_use 的 assistant，补 is_error 回执——
+    // 否则下一次请求被端点整条拒绝，对话就此"宕机"。修完末条必为 user 或纯文本 assistant。
+    if (history) history = repairHistoryForContinuation(history);
     // 续跑且正史末条是 user（如 max_turns 停在 tool_result 后）：反馈合并进同一条
     // user 消息，避免连续两条 user——Anthropic 官方允许，但第三方兼容端点未必。
     if (history && history.at(-1)?.role === "user") {

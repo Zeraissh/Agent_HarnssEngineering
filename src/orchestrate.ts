@@ -2,6 +2,7 @@
  * L4 — 编排：主 agent 执行 → verifier 核查 → 未通过则带着问题清单返工。
  * 主 loop 与 verifier 共用 systemPrompt/tools（缓存前缀一致），上下文互相隔离。
  */
+import type Anthropic from "@anthropic-ai/sdk";
 import { randomUUID } from "node:crypto";
 import { runClarificationGate, type ClarificationOutcome } from "./clarifier.js";
 import { AgentLoop, createRunBudget } from "./loop.js";
@@ -14,7 +15,7 @@ import {
   type SplitRule,
   type SubTask,
 } from "./planner.js";
-import { runVerifier, sumUsage, type VerifyOutcome } from "./verifier.js";
+import { runVerifier, sumUsage, type Verdict, type VerifyOutcome } from "./verifier.js";
 import { isTransientApiError } from "./model-client.js";
 import type { DomainPack } from "./presets.js";
 import type { AgentConfig, AgentRunResult, AggregateUsage, ModelClient, TurnEvent } from "./types.js";
@@ -78,6 +79,16 @@ export interface VerifiedRunOptions {
    * 纯附加、不影响控制流；不实现即完全等价于原行为。
    */
   onVerification?: (round: number, outcome: VerifyOutcome) => void | Promise<void>;
+  /**
+   * 续跑入口（会话中心化）：执行者不从零开始，而是在 `history` 之上追加
+   * `feedback` 继续（`AgentLoop.runContinuation`）。核查者仍是全新上下文——
+   * 它核查的是 `task`（宿主应把本轮指令与原任务背景一起写进去）对照工作目录
+   * 的实际产出，不读执行者正史。
+   *
+   * 提供它时返工模式**强制 inherit**：fresh 返工会把对话正史整个丢掉，
+   * 下一轮再续跑就接不上了——对一场对话而言那不是"独立重试"，是失忆。
+   */
+  continuation?: { history: Anthropic.MessageParam[]; feedback: string };
 }
 
 export interface VerifiedRunResult {
@@ -93,6 +104,40 @@ export interface VerifiedRunResult {
 }
 
 /**
+ * 上一轮裁决的简明摘要——会话续跑时追加进本轮反馈，让执行者知道刚才被判了什么。
+ * 只放结论、issue 清单与两类降级项的**条数**：完整裁决留在事件流里带 judgedTurn
+ * 标签，不往正史里重复搬运。裁决只对它核查的那一轮负责，所以轮号必须写明。
+ */
+export function verdictFeedbackSummary(
+  verdict: Pick<Verdict, "passed" | "summary" | "issues"> & Partial<Pick<Verdict, "unverified" | "advisory">>,
+  judgedTurn?: number,
+): string {
+  const where = judgedTurn !== undefined ? `（第 ${judgedTurn} 轮对话）` : "";
+  const head = `【上一轮核查裁决${where}】${verdict.passed ? "通过" : "未通过"}：${verdict.summary}`;
+  const issues = verdict.issues.length
+    ? `\n核查列出的问题：\n${verdict.issues.map((s, i) => `${i + 1}. ${s}`).join("\n")}`
+    : "";
+  const counts: string[] = [];
+  if (verdict.unverified?.length) counts.push(`未能核查 ${verdict.unverified.length} 项`);
+  if (verdict.advisory?.length) counts.push(`评审意见 ${verdict.advisory.length} 条`);
+  const tail = counts.length ? `\n（另有${counts.join("、")}，见裁决记录；主观项由委托方裁定）` : "";
+  return `${head}${issues}${tail}`;
+}
+
+/**
+ * 续跑轮交给核查者的任务书：核查对象是**本轮指令**要求的产出，原任务只作背景。
+ * 不这样分层的话，核查者会把整场对话的每条旧要求重新逐条判一遍——既烧预算，
+ * 也会把早已被后续指令改写的旧要求当成现行标准来拒签。
+ */
+export function continuationVerifyTask(originalTask: string, feedback: string): string {
+  return `【本轮指令】${feedback}
+
+【对话背景：原始任务】${originalTask}
+
+核查对象是【本轮指令】要求的产出；原始任务只作背景，除本轮指令明确涉及的部分外不必重新逐条核查。`;
+}
+
+/**
  * 段级续跑的提示语。刻意短：模型手里的正史已经说明了一切，这里只需要告诉它
  * "刚才是基础设施抖了一下，不是你做错了"，以及别从头再来。
  */
@@ -105,7 +150,9 @@ export async function runVerified(
   opts: VerifiedRunOptions = {},
 ): Promise<VerifiedRunResult> {
   const maxReworks = opts.maxReworks ?? 1;
-  const reworkMode = opts.reworkMode ?? "fresh";
+  const continuation = opts.continuation;
+  // 续跑轮的返工必须在正史上继续（见 VerifiedRunOptions.continuation）
+  const reworkMode = continuation ? "inherit" : (opts.reworkMode ?? "fresh");
   const verifications: VerifyOutcome[] = [];
   /** main / inherit / fresh 返工 / 瞬时续跑共同扣这一份总账。 */
   const executionCfg: AgentConfig = {
@@ -120,16 +167,23 @@ export async function runVerified(
 
   let main: AgentRunResult | undefined;
   let executionUsage: AggregateUsage | undefined;
-  let feedback = task; // 首轮 = 任务本身；返工轮 = 反馈消息（fresh 含完整任务，inherit 只有增量）
+  // 首轮 = 任务本身（续跑时 = 本轮追加的指令）；返工轮 = 反馈消息（fresh 含完整任务，inherit 只有增量）
+  let feedback = continuation ? continuation.feedback : task;
   let reworks = 0;
 
   for (let round = 0; ; round++) {
     const source = round === 0 ? "main" : "rework";
-    // inherit 模式的返工在上一轮正史上续跑；fresh（与首轮）全新开局
-    const events =
+    // inherit 模式的返工在上一轮正史上续跑；续跑首轮在宿主给的正史上续跑；
+    // fresh（与非续跑首轮）全新开局
+    const priorHistory =
       round > 0 && reworkMode === "inherit"
-        ? new AgentLoop(executionCfg, model).runContinuation(main!.messages, feedback, opts.signal)
-        : new AgentLoop(executionCfg, model).run(feedback, opts.signal);
+        ? main!.messages
+        : round === 0 && continuation
+          ? continuation.history
+          : undefined;
+    const events = priorHistory
+      ? new AgentLoop(executionCfg, model).runContinuation(priorHistory, feedback, opts.signal)
+      : new AgentLoop(executionCfg, model).run(feedback, opts.signal);
     main = await drain(events, (e) => opts.onEvent?.(source, e));
     executionUsage = executionUsage ? sumUsage(executionUsage, main.usage) : main.usage;
 
