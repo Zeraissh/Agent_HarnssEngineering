@@ -121,3 +121,23 @@ $env:AB_SUITE='heldout'; $env:AB_ARMS='baseline'; $env:AB_REPS='3'; $env:AB_TOKE
 npm run ab
 $env:EVAL_AB_LOG='eval/ab-log.jsonl'; $env:AGENT_RUN_LEDGER='0'; npm run eval:stats
 ```
+
+## 7. PATH 修复后复测（2026-09-03，§5.3 的执行；缺陷修复效果测量，不是调优）
+
+- 被测提交：`bdc3cd9`（含 d565e7a 的 `prependBashPath` 修复），detached worktree `D:\Work\scratch\pathfix-measure`，`npm ci --ignore-scripts`，`.env` 从主检出复制；进程内继承的 `ANTHROPIC_* / OPENAI_* / AGENT_*` 全部清空后启动
+- 配置与 nightly 同口径：`AB_SUITE=heldout` / `AB_ARMS=baseline` / `deepseek-v4-flash` / `maxTurns=15`；`AB_REPS=3`；`AB_CASES` 只取 §3 里被 PATH 缺陷波及的三条；`AB_TOKEN_CAP=1000000`（未触顶）；9 runs 墙钟 71 s
+- 对照：`eval/baselines/heldout-v1.3.0.json` 同三用例的逐 rep 数字（修复前）
+
+| 用例 | 版本 | pass | turns (rep1/2/3) | tokens (rep1/2/3) | wall ms (rep1/2/3) | Σturns | Σtokens | Σwall ms |
+|---|---|---:|---|---|---|---:|---:|---:|
+| ho-line-count-env-example | v1.3.0（修复前） | 3/3 | 9/9/9 | 23043/35042/27587 | 18033/19748/16609 | 27 | 85672 | 54390 |
+| ho-line-count-env-example | bdc3cd9（修复后） | 3/3 | 5/6/6 | 10965/10640/15148 | 13593/9635/10868 | 17 | 36753 | 34096 |
+| ho-only-digits | v1.3.0（修复前） | 3/3 | 4/5/6 | 6802/12314/20176 | 6513/7907/13873 | 15 | 39292 | 28293 |
+| ho-only-digits | bdc3cd9（修复后） | 3/3 | 4/4/3 | 10653/8904/7476 | 6499/5760/5459 | 11 | 27033 | 17718 |
+| ho-arith-product | v1.3.0（修复前） | 3/3 | 3/3/3 | 3858/3989/3789 | 4235/4673/3465 | 9 | 11636 | 12373 |
+| ho-arith-product | bdc3cd9（修复后） | 3/3 | 3/3/4 | 3766/3808/8368 | 3814/3633/5480 | 10 | 15942 | 12927 |
+
+- 三用例 ×3 合计：turns **51 → 38**（−25%）；tokens **136,600 → 79,728**（−42%）；wall **95.1 s → 64.7 s**（−32%）；pass 9/9 → 9/9
+- 缺陷本身的直接读数：修复前 3 用例 8/9 run 出现 `command not found`（node ×6 / python ×4，见 §3）；修复后 9 份 transcript **0 次**。ho-line-count 三次都用 `python3` heredoc + `node -e` 交叉核对后一次写对（此前靠 perl / awk / sed 逃生跑满 9 轮）；ho-only-digits 三次都 `node -p "require('./package.json').version"` 一发命中
+- ho-arith-product 不受缺陷影响（修复前就是 3/3/3），rep3 多一轮是模型先 `ls` 探目录再写（8.4k tokens 离群），属模型选择噪声，不归修复
+- 墙钟为同机不同时段读数，只作方向参考；transcript / `ab-log.jsonl` / 控制台日志留存 `D:\Work\scratch\pathfix-measure-artifacts\`（未入仓）；基线 JSON **不改**——它钉的是 v1.3.0 tag 的数字
