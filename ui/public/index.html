@@ -147,13 +147,16 @@
     连接中断，正在重连…（运行仍在服务端继续）
   </div>
 
-  <!-- 内容区 -->
-  <div id="main-area" class="content-area">
-    <div class="empty-state empty-state--welcome">
-      <div class="empty-icon" aria-hidden="true"><i class="ph ph-chat-centered-dots"></i></div>
-      <span class="empty-eyebrow">HARNESS WORKSPACE</span>
-      <h2>从一个明确目标开始</h2>
-      <p>选择左侧对话继续工作，或新建一次受工作目录约束的任务。</p>
+  <!-- 内容区 + 预览停靠面板的横向容器（T10 升级：dock 是这里的 flex 子项，
+       打开时对话主列被压缩但仍可见可交互；关闭时 dock display:none 不占位） -->
+  <div id="center-row" class="center-row">
+    <div id="main-area" class="content-area">
+      <div class="empty-state empty-state--welcome">
+        <div class="empty-icon" aria-hidden="true"><i class="ph ph-chat-centered-dots"></i></div>
+        <span class="empty-eyebrow">HARNESS WORKSPACE</span>
+        <h2>从一个明确目标开始</h2>
+        <p>选择左侧对话继续工作，或新建一次受工作目录约束的任务。</p>
+      </div>
     </div>
   </div>
   <!-- 跳转箭头：**在滚动容器之外**，所以它自己不会被滚走。
@@ -356,6 +359,7 @@ import {
   deriveRunListItems,
   deriveThreadFiles,
   deriveSessionFiles,
+  deriveWrittenPaths,
   conversationChainIds,
   ancestorRunIds,
   filterRunsByStatus,
@@ -470,9 +474,9 @@ function syncChangesCommand() {
 // artifactCanvasApi 由文件末尾初始化（静态 import 的模块，try/catch 兜底）。
 // 数据口径与右栏「产物」区完全一致：deriveThreadFiles 优先、空则 deriveSessionFiles
 // ——画布清单换了数据源，就会出现"右栏点得到、画布里没有"的两张皮。
-let artifactCanvasApi = /** @type {null|{ open:(i:number)=>boolean, close:()=>void, isOpen:()=>boolean, currentIndex:()=>number, element:HTMLElement }} */ (null);
+let artifactCanvasApi = /** @type {null|{ open:(i:number,o?:{full?:boolean})=>boolean, close:()=>void, isOpen:()=>boolean, isExpanded:()=>boolean, setExpanded:(b:boolean)=>void, noteWrites:(p:string[])=>void, currentIndex:()=>number, currentPath:()=>string, element:HTMLElement }} */ (null);
 /** 深链待恢复：选中 run 的 state 可能要等 SSE 流到产物才够数据，先记账，渲染后补开 */
-let pendingArtifact = /** @type {null|{ runId:string, index:number }} */ (null);
+let pendingArtifact = /** @type {null|{ runId:string, index:number, full?:boolean }} */ (null);
 /** 语义同 enteredSettingsFromApp：深链直达时「关闭」回 run 页而不是 history.back */
 let enteredCanvasFromApp = false;
 let unregisterArtifactCommand = /** @type {null|(() => void)} */ (null);
@@ -510,10 +514,10 @@ function openArtifactByPath(runId, path) {
 /** 深链/切换落点：数据够了就开，不够就留着 pending 等下一次渲染 */
 function openPendingArtifact() {
   if (!pendingArtifact) return;
-  const { runId, index } = pendingArtifact;
+  const { runId, index, full } = pendingArtifact;
   if (runId !== selectedRunId) return;
   if (currentRunArtifacts(runId).length === 0) return;
-  if (artifactCanvasApi?.open(index)) pendingArtifact = null;
+  if (artifactCanvasApi?.open(index, { full: Boolean(full) })) pendingArtifact = null;
 }
 
 /** 画布的「关闭」：应用内进入 → 历史后退到来处；深链直达 → 回 run 页 */
@@ -952,7 +956,7 @@ function parseRoute() {
   if (isSchedulesRoute(location.hash || "")) return { kind: "schedules" };
   if (isCommandCenterRoute(location.hash || "")) return { kind: "board" };
   const artifact = parseArtifactRoute(location.hash || "");
-  if (artifact) return { kind: "artifact", runId: artifact.runId, index: artifact.index };
+  if (artifact) return { kind: "artifact", runId: artifact.runId, index: artifact.index, full: artifact.full };
   const m = /^#\/run\/([^/]+)(?:\/([^/?]+))?/.exec(location.hash || "");
   if (!m) return { kind: "home" };
   return { kind: "run", runId: decodeURIComponent(m[1]), tab: normalizeTab(m[2]) };
@@ -1043,10 +1047,11 @@ function applyHash() {
   if (route.kind === "artifact") {
     // 产物画布深链：先确保会话选中（selectRun 的 writeHash 会盖掉深链，随后恢复），
     // 产物清单就位后 openPendingArtifact 补开；state 还没流到产物时挂账等渲染。
-    pendingArtifact = { runId: route.runId, index: route.index };
+    // full 跟随深链（?full = 放大态），刷新后形态不丢。
+    pendingArtifact = { runId: route.runId, index: route.index, full: Boolean(route.full) };
     if (route.runId !== selectedRunId) {
       selectRun(route.runId);
-      const target = encodeArtifactHash(route.runId, route.index);
+      const target = encodeArtifactHash(route.runId, route.index, { full: Boolean(route.full) });
       if (location.hash !== target) {
         suppressHashHandling = true;
         location.hash = target;
@@ -1607,6 +1612,13 @@ const batcher = createBatcher((batches) => {
 
     const next = reduceEvents(state, queue);
     runStates.set(runId, next);
+
+    // 产物画布「运行中自动刷新」（T10 升级）：本批写盘工具碰了正在预览的产物，
+    // 就（模块内 500ms 防抖）重拉一次内容——用户在右侧直接看到 agent 改网站的效果
+    if (selectedRunId === runId && artifactCanvasApi?.isOpen()) {
+      const written = deriveWrittenPaths(state, queue);
+      if (written.length > 0) artifactCanvasApi.noteWrites(written);
+    }
 
     if (selectedRunId === runId) renderDetailWithState(next);
     else if (selectedRunId && ancestorRunIds(runs, selectedRunId).includes(runId)) {
@@ -2505,11 +2517,12 @@ if (fileUpload) {
   });
 }
 
-// ---- 文件预览覆盖层 + 拖拽/粘贴上传（V-35）----
-// 预览覆盖层：附件清单与对话里的本地路径链接共用一个壳；渲染主体在
-// features/artifact-canvas.js（renderPreviewBody），取件走 /api/file-preview
-// （圈禁在服务端）。覆盖层不进 hash 路由——它是瞬态的，刷新不该恢复。
-let filePreviewApi = /** @type {null|{ open:(o:{path:string,url:string})=>boolean, close:()=>void, isOpen:()=>boolean, element:HTMLElement }} */ (null);
+// ---- 文件预览停靠面板 + 拖拽/粘贴上传（V-35，T10 升级为停靠形态）----
+// 预览面板：附件清单与对话里的本地路径链接共用一个壳；渲染主体在
+// features/artifact-canvas.js（renderPreviewBody），外壳在 features/preview-dock.js
+// （覆盖变体），取件走 /api/file-preview（圈禁在服务端）。
+// 面板不进 hash 路由——它是瞬态的，刷新不该恢复。
+let filePreviewApi = /** @type {null|{ open:(o:{path:string,url:string})=>boolean, close:()=>void, isOpen:()=>boolean, isExpanded:()=>boolean, setExpanded:(b:boolean)=>void, element:HTMLElement }} */ (null);
 try {
   filePreviewApi = initFilePreview({
     onAnnounce: (msg) => announceStatus(msg),
@@ -2944,7 +2957,17 @@ try {
     getArtifacts: () => (selectedRunId ? currentRunArtifacts(selectedRunId) : []),
     onClose: () => closeArtifactRoute(),
     onSwitch: (index) => {
-      if (selectedRunId) location.hash = encodeArtifactHash(selectedRunId, index);
+      if (selectedRunId) {
+        location.hash = encodeArtifactHash(selectedRunId, index, {
+          full: artifactCanvasApi?.isExpanded() ?? false,
+        });
+      }
+    },
+    onExpandChange: (full) => {
+      // 放大/还原反映到深链（?full），刷新保持形态；hashchange 绕回来调 open 是幂等的
+      if (!selectedRunId || !artifactCanvasApi) return;
+      const target = encodeArtifactHash(selectedRunId, artifactCanvasApi.currentIndex(), { full });
+      if (location.hash !== target) location.hash = target;
     },
     onReveal: (path) => {
       if (selectedRunId) revealArtifact(selectedRunId, path);

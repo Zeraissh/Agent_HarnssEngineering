@@ -2,8 +2,11 @@
  * features/artifact-canvas — 产物画布（T10）。
  *
  * 零依赖原生 ESM。把右栏「产物」文件列表升级为可预览的工作台：
- * 点产物卡的「预览/打开」后，画布视图盖住主列（与 settings 同一条视图切换
- * 纪律），按类型分派渲染器，hash 深链 `#/run/<id>/artifact/<index>` 可刷新恢复。
+ * 点产物卡的「预览/打开」后，默认在主区右侧拉出**停靠面板**（对话保持可见、
+ * 可继续交互；外壳共用 features/preview-dock.js），顶条「放大」可扩到整个主区；
+ * 按类型分派渲染器，hash 深链 `#/run/<id>/artifact/<index>`（放大态 `?full`）
+ * 可刷新恢复。运行中写盘工具再次触碰当前预览路径时，面板防抖自动刷新——
+ * agent 流式改网站，用户在右侧直接看到效果。
  *
  * 与 command-palette / notifications / memory-panel / settings 同一约定：
  *   1) 纯函数层（类型分派 / CSV 解析 / 路由编解码 / 字节格式化）——可单测；
@@ -28,6 +31,7 @@
 
 import { renderMarkdown } from "../core/markdown.js";
 import { highlight, normalizeLang } from "../core/highlight.js";
+import { createPreviewDock } from "./preview-dock.js";
 
 // ---------------------------------------------------------------
 // 常量
@@ -157,28 +161,36 @@ export function parseCsv(text, opts = {}) {
 }
 
 /**
- * 路由编码：`#/run/<id>/artifact/<index>`。index 是宿主产物清单里的 0 基序号。
+ * 路由编码：`#/run/<id>/artifact/<index>`，放大态追加 `?full`。
+ * index 是宿主产物清单里的 0 基序号。
  * @param {string} runId
  * @param {number} index
+ * @param {{ full?:boolean }} [opts]
  * @returns {string}
  */
-export function encodeArtifactHash(runId, index) {
-  return `#/run/${encodeURIComponent(String(runId ?? ""))}/artifact/${Math.max(0, Math.trunc(index))}`;
+export function encodeArtifactHash(runId, index, opts = {}) {
+  const base = `#/run/${encodeURIComponent(String(runId ?? ""))}/artifact/${Math.max(0, Math.trunc(index))}`;
+  return opts?.full ? `${base}?full` : base;
 }
 
 const ARTIFACT_ROUTE_RE = /^#\/run\/([^/]+)\/artifact\/(\d+)(?:[/?].*)?$/;
 
 /**
  * 路由解码。不匹配返回 null；index 越界不归这里管（清单在宿主手里）。
+ * full：hash 带 `?full` / `&full` 时为 true（放大态深链，刷新保持形态）。
  * @param {string} hash location.hash
- * @returns {{ runId:string, index:number }|null}
+ * @returns {{ runId:string, index:number, full:boolean }|null}
  */
 export function parseArtifactRoute(hash) {
   const m = ARTIFACT_ROUTE_RE.exec(String(hash ?? ""));
   if (!m) return null;
   let runId = m[1];
   try { runId = decodeURIComponent(runId); } catch { /* 非法转义时保留原样 */ }
-  return { runId, index: Number.parseInt(m[2], 10) };
+  return {
+    runId,
+    index: Number.parseInt(m[2], 10),
+    full: /[?&]full(?:&|=|$)/.test(String(hash ?? "")),
+  };
 }
 
 /** @param {string} hash @returns {boolean} */
@@ -212,6 +224,23 @@ export function formatBytes(bytes) {
 export function artifactBasename(path) {
   const s = String(path ?? "").replace(/\\/g, "/");
   return s.split("/").pop() || s;
+}
+
+/** 运行中内容自动刷新的防抖间隔：打字机/批处理节拍下一阵写入只触发一次重拉 */
+export const REFRESH_DEBOUNCE_MS = 500;
+
+/**
+ * 事件流里的写入路径与预览路径是否指同一文件。
+ * 规范化：反斜杠归一、剥掉开头 "./"。不做大小写折叠——产物清单与工具
+ * 入参同源（同一份事件流），过度宽松会把 "out/A.html" 与 "out/a.html" 误判同一件。
+ * @param {string} a @param {string} b
+ * @returns {boolean}
+ */
+export function pathsMatch(a, b) {
+  const norm = (p) => String(p ?? "").replace(/\\/g, "/").replace(/^\.\//, "").trim();
+  const x = norm(a);
+  const y = norm(b);
+  return x !== "" && x === y;
 }
 
 // ---------------------------------------------------------------
@@ -363,6 +392,7 @@ export async function renderPreviewBody(body, opts) {
   }
 }
 
+
 // ---------------------------------------------------------------
 // DOM 层
 // ---------------------------------------------------------------
@@ -372,55 +402,61 @@ const VIEW_ID = "artifact-canvas-view";
 /**
  * 初始化产物画布。幂等：重复调用返回既有节点的薄壳。
  *
+ * 形态（T10 升级）：默认是主区右侧的**停靠面板**——对话主列保持可见、
+ * 可滚动、可继续交互；顶条「放大」扩到整个主区（≈旧的覆盖形态），
+ * Esc 在放大态先还原再关闭。外壳（拖拽调宽/放大还原/窄屏退化/动画）
+ * 共用 features/preview-dock.js——那一份是所有预览面板的唯一 chrome。
+ *
  * host 回调：
  *   getRunId()              → 当前会话 id（画布只预览当前会话的产物）
  *   getArtifacts()          → 当前会话的产物清单 [{ path, ... }]（与右栏同源）
  *   onClose()               → 用户要关掉画布（宿主负责改写 hash）
  *   onSwitch(index)         → 用户要切到第 index 个（宿主写 hash，绕回来调 open）
+ *   onExpandChange(full)    → 放大/还原（宿主改写 hash 的 ?full，绕回来调 open）
  *   onReveal(path)          → 在文件夹中显示（宿主既有 revealArtifact）
  *   onAnnounce(msg)         → aria-live 播报（可选）
  *
- * env（测试注入）：doc / win / fetch
+ * env（测试注入）：doc / win / fetch / storage / isNarrow / refreshDebounceMs /
+ *                 closeAnimMs（后两者透传给 preview-dock）
  *
  * @param {Record<string, Function>} host
- * @param {{ doc?:Document, win?:Window, fetch?:Function }} [env]
+ * @param {{ doc?:Document, win?:Window, fetch?:Function, storage?:Storage|null,
+ *           isNarrow?:()=>boolean, refreshDebounceMs?:number, closeAnimMs?:number }} [env]
  */
 export function initArtifactCanvas(host = {}, env = {}) {
   const doc = env.doc ?? document;
   const win = env.win ?? (doc.defaultView ?? window);
   const fetchImpl = env.fetch ?? (typeof fetch !== "undefined" ? fetch.bind(win) : null);
+  const refreshDebounceMs = env.refreshDebounceMs ?? REFRESH_DEBOUNCE_MS;
 
   const existing = doc.getElementById(VIEW_ID);
   if (existing && existing.__canvasApi) return existing.__canvasApi;
 
+  // ---- 停靠外壳（拖拽/放大/Esc/窄屏/动画的唯一出处）----
+  const dock = createPreviewDock(
+    {
+      id: VIEW_ID,
+      label: "产物画布",
+      extraClass: "artifact-canvas",
+      onClose: () => host.onClose?.(),
+      onExpandChange: (full) => host.onExpandChange?.(full),
+    },
+    env,
+  );
+  const view = dock.root;
+  const body = dock.body;
+
   // ---- 状态 ----
-  let open = false;
   /** @type {{ path:string }[]} */
   let artifacts = [];
   let runId = "";
   let current = -1;
   /** 异步渲染令牌：连按 ▶ 时慢的那次 fetch 回来不许覆盖快的 */
   let renderToken = 0;
-  /** @type {HTMLElement|null} */
-  let restoreFocusTo = null;
+  /** 内容更新自动刷新的防抖计时器（noteWrites） */
+  let refreshTimer = 0;
 
-  // ---- 骨架 ----
-  const view = doc.createElement("div");
-  view.id = VIEW_ID;
-  view.className = "artifact-canvas";
-  view.hidden = true;
-  view.setAttribute("role", "dialog");
-  view.setAttribute("aria-label", "产物画布");
-
-  const head = doc.createElement("header");
-  head.className = "ac-head";
-
-  const closeBtn = doc.createElement("button");
-  closeBtn.type = "button";
-  closeBtn.className = "btn btn--ghost ac-close";
-  closeBtn.innerHTML = '<i class="ph ph-x" aria-hidden="true"></i><span>关闭</span>';
-  closeBtn.setAttribute("aria-label", "关闭产物画布（Esc）");
-
+  // ---- 顶条特征控件（关闭/放大键由外壳提供，这里插中间段）----
   const prevBtn = doc.createElement("button");
   prevBtn.type = "button";
   prevBtn.className = "btn btn--ghost ac-nav";
@@ -460,24 +496,17 @@ export function initArtifactCanvas(host = {}, env = {}) {
   actions.appendChild(downloadLink);
   actions.appendChild(revealBtn);
 
-  head.appendChild(closeBtn);
-  head.appendChild(prevBtn);
-  head.appendChild(nextBtn);
-  head.appendChild(posEl);
-  head.appendChild(titleWrap);
-  head.appendChild(actions);
-
-  const body = doc.createElement("div");
-  body.className = "ac-body";
-
-  view.appendChild(head);
-  view.appendChild(body);
-  // 挂在主区：盖住对话内容与右栏，侧栏仍在（与 settings 同一条纪律）
-  (doc.getElementById("main-panel") ?? doc.body).appendChild(view);
+  dock.insertHeadControl(prevBtn);
+  dock.insertHeadControl(nextBtn);
+  dock.insertHeadControl(posEl);
+  dock.insertHeadControl(titleWrap);
+  dock.insertHeadControl(actions);
 
   // ---- 渲染 ----
-  function artifactUrl(path) {
-    return `/api/runs/${encodeURIComponent(runId)}/artifact?path=${encodeURIComponent(path)}`;
+  function artifactUrl(path, cacheBust = false) {
+    const base = `/api/runs/${encodeURIComponent(runId)}/artifact?path=${encodeURIComponent(path)}`;
+    // 运行中自动刷新时破缓存：同一 URL 的 iframe/img 可能吃到旧缓存
+    return cacheBust ? `${base}&v=${Date.now()}` : base;
   }
 
   function setSize(bytes) {
@@ -485,13 +514,13 @@ export function initArtifactCanvas(host = {}, env = {}) {
     sizeEl.hidden = bytes == null;
   }
 
-  async function renderCurrent() {
+  async function renderCurrent({ cacheBust = false } = {}) {
     const token = ++renderToken;
     const art = artifacts[current];
     if (!art) return;
     const path = String(art.path ?? "");
     const kind = artifactRendererKind(path);
-    const url = artifactUrl(path);
+    const url = artifactUrl(path, cacheBust);
 
     nameEl.textContent = artifactBasename(path);
     nameEl.title = path;
@@ -499,7 +528,7 @@ export function initArtifactCanvas(host = {}, env = {}) {
     posEl.textContent = artifacts.length > 1 ? `${current + 1} / ${artifacts.length}` : "";
     prevBtn.disabled = artifacts.length <= 1;
     nextBtn.disabled = artifacts.length <= 1;
-    downloadLink.href = `${url}&download=1`;
+    downloadLink.href = `${artifactUrl(path)}&download=1`;
     downloadLink.setAttribute("download", artifactBasename(path));
     setSize(null);
 
@@ -518,9 +547,12 @@ export function initArtifactCanvas(host = {}, env = {}) {
    * 打开画布并渲染第 index 件产物。数据当时从宿主取（与右栏同源）。
    * 已开着时复用——hash 切换（◀ ▶ / 前进后退）走同一条入口，不抢焦点。
    * @param {number} index
+   * @param {{ full?:boolean }} [opts]
+   *   full 给布尔值时设置放大/停靠（深链恢复用）；省略时保持现状
+   *   （用户正放大着，◀ ▶ 切产物不该把它缩回去）。
    * @returns {boolean} 是否真打开了（无产物时 false，宿主决定下一步）
    */
-  function openCanvas(index) {
+  function openCanvas(index, opts = {}) {
     const list = Array.isArray(host.getArtifacts?.()) ? host.getArtifacts() : [];
     if (list.length === 0) return false;
     runId = String(host.getRunId?.() ?? "");
@@ -528,35 +560,48 @@ export function initArtifactCanvas(host = {}, env = {}) {
     artifacts = list;
     current = wrapIndex(index, artifacts.length);
     if (current < 0) return false;
-    if (!open) {
-      open = true;
-      restoreFocusTo = /** @type {HTMLElement|null} */ (doc.activeElement);
-      view.hidden = false;
+    if (typeof opts.full === "boolean") dock.setExpanded(opts.full);
+    if (!dock.isOpen()) {
+      dock.open();
       host.onAnnounce?.(`产物画布已打开：${artifactBasename(artifacts[current].path)}`);
     }
     void renderCurrent();
-    if (doc.activeElement == null || !view.contains(doc.activeElement)) closeBtn.focus();
+    if (doc.activeElement == null || !view.contains(doc.activeElement)) dock.closeBtn.focus();
     return true;
   }
 
   function closeCanvas() {
-    if (!open) return;
-    open = false;
+    if (!dock.isOpen()) return;
     renderToken += 1; // 作废在途 fetch
-    view.hidden = true;
-    body.innerHTML = "";
-    if (restoreFocusTo && typeof restoreFocusTo.focus === "function" && doc.contains?.(restoreFocusTo) !== false) {
-      restoreFocusTo.focus();
+    if (refreshTimer) {
+      win.clearTimeout(refreshTimer);
+      refreshTimer = 0;
     }
-    restoreFocusTo = null;
+    dock.close();
   }
 
   function step(delta) {
-    if (!open || artifacts.length <= 1) return;
+    if (!dock.isOpen() || artifacts.length <= 1) return;
     host.onSwitch?.(wrapIndex(current + delta, artifacts.length));
   }
 
-  closeBtn.addEventListener("click", () => host.onClose?.());
+  /**
+   * 运行中内容自动刷新（「agent 直接可以在右边操作」）：宿主在事件节拍里
+   * 把本批写盘工具触碰的路径喂进来；命中当前预览路径时防抖重拉一次，
+   * 用户就能在右侧看到 agent 实时改网站的效果。
+   * @param {string[]} paths
+   */
+  function noteWrites(paths) {
+    if (!dock.isOpen() || !Array.isArray(paths) || paths.length === 0) return;
+    const cur = artifacts[current]?.path;
+    if (!cur || !paths.some((p) => pathsMatch(p, cur))) return;
+    if (refreshTimer) win.clearTimeout(refreshTimer);
+    refreshTimer = win.setTimeout(() => {
+      refreshTimer = 0;
+      if (dock.isOpen()) void renderCurrent({ cacheBust: true });
+    }, refreshDebounceMs);
+  }
+
   prevBtn.addEventListener("click", () => step(-1));
   nextBtn.addEventListener("click", () => step(1));
   revealBtn.addEventListener("click", () => {
@@ -564,14 +609,10 @@ export function initArtifactCanvas(host = {}, env = {}) {
     if (art) host.onReveal?.(art.path);
   });
 
-  // 键盘：Esc 关、←/→ 切。只在画布开着时接管，关掉后这几个键归还给宿主
+  // ←/→ 切产物（Esc 归外壳：放大态先还原、停靠态上报关闭）
   doc.addEventListener("keydown", (event) => {
-    if (!open) return;
-    if (event.key === "Escape") {
-      event.preventDefault();
-      event.stopPropagation();
-      host.onClose?.();
-    } else if (event.key === "ArrowLeft") {
+    if (!dock.isOpen()) return;
+    if (event.key === "ArrowLeft") {
       event.preventDefault();
       step(-1);
     } else if (event.key === "ArrowRight") {
@@ -583,9 +624,14 @@ export function initArtifactCanvas(host = {}, env = {}) {
   const api = {
     open: openCanvas,
     close: closeCanvas,
-    isOpen: () => open,
+    isOpen: () => dock.isOpen(),
+    isExpanded: () => dock.isExpanded(),
+    setExpanded: (b) => dock.setExpanded(b),
+    noteWrites,
     /** 当前序号（测试与诊断用） */
     currentIndex: () => current,
+    /** 当前预览路径（宿主做写入匹配/诊断用） */
+    currentPath: () => (current >= 0 ? String(artifacts[current]?.path ?? "") : ""),
     element: view,
   };
   view.__canvasApi = api;

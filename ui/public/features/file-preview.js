@@ -3,11 +3,12 @@
  *
  * 零依赖原生 ESM。三件事共住一个模块，因为它们共用同一份「这是什么文件、
  * 去哪儿取」的判断：
- *   1) initFilePreview——预览覆盖层：md 渲染排版文档、HTML 进沙箱 iframe、
+ *   1) initFilePreview——预览停靠面板：md 渲染排版文档、HTML 进沙箱 iframe、
  *      图片直显、CSV 成表、代码高亮、二进制降级信息卡。**渲染主体复用
- *      features/artifact-canvas.js 抽出的 renderPreviewBody**，类型分派与
- *      沙箱纪律只有一份；本模块只负责覆盖层外壳（开/关/Esc/ backdrop）与
- *      取件地址（/api/file-preview，圈禁在服务端）。
+ *      features/artifact-canvas.js 抽出的 renderPreviewBody**，外壳复用
+ *      features/preview-dock.js（覆盖变体）——类型分派、沙箱纪律与
+ *      停靠行为都只有一份；本模块只负责取件地址（/api/file-preview，
+ *      圈禁在服务端）。
  *   2) initFileIntake——composer 的拖拽与粘贴：dataTransfer/clipboardData
  *      里有 files 才接管上传；纯文本拖拽/粘贴走浏览器默认行为（插入文字）。
  *   3) 纯函数层（命名、提取、URL 构造）——可单测。
@@ -23,6 +24,7 @@ import {
   formatBytes,
   renderPreviewBody,
 } from "./artifact-canvas.js";
+import { createPreviewDock } from "./preview-dock.js";
 
 // ---------------------------------------------------------------
 // 纯函数层
@@ -106,22 +108,29 @@ export function buildFilePreviewUrl(opts) {
   return `/api/file-preview?${q.toString()}`;
 }
 
+
 // ---------------------------------------------------------------
-// DOM 层：预览覆盖层
+// DOM 层：预览停靠面板
 // ---------------------------------------------------------------
 
 const OVERLAY_ID = "file-preview-overlay";
 
 /**
- * 初始化文件预览覆盖层。幂等：重复调用返回既有节点的薄壳。
+ * 初始化文件预览面板。幂等：重复调用返回既有节点的薄壳。
+ *
+ * 形态（T10 升级）：与产物画布同一只停靠外壳（features/preview-dock.js），
+ * 用覆盖变体（absolute 钉主区右侧、不占 flex 位）——它是瞬态预览，不该把
+ * 对话挤窄；拖拽调宽 / 放大还原 / Esc 两级 / 窄屏退化全部与画布同一行为。
+ * 不再有点遮罩关闭（没有遮罩了）；关闭走顶条按钮或 Esc。
  *
  * host 回调：
  *   onAnnounce(msg) → aria-live 播报（可选）
  *
- * env（测试注入）：doc / win / fetch
+ * env（测试注入）：doc / win / fetch / storage / isNarrow / closeAnimMs
  *
  * @param {Record<string, Function>} [host]
- * @param {{ doc?:Document, win?:Window, fetch?:Function }} [env]
+ * @param {{ doc?:Document, win?:Window, fetch?:Function, storage?:Storage|null,
+ *           isNarrow?:()=>boolean, closeAnimMs?:number }} [env]
  */
 export function initFilePreview(host = {}, env = {}) {
   const doc = env.doc ?? document;
@@ -132,33 +141,24 @@ export function initFilePreview(host = {}, env = {}) {
   if (existing && existing.__filePreviewApi) return existing.__filePreviewApi;
 
   // ---- 状态 ----
-  let open = false;
   /** 异步渲染令牌：连续打开两个文件时，慢的那次 fetch 回来不许覆盖快的 */
   let renderToken = 0;
-  /** @type {HTMLElement|null} */
-  let restoreFocusTo = null;
 
-  // ---- 骨架（内容类名复用 ac-*：渲染纪律与产物画布同一份样式）----
-  const overlay = doc.createElement("div");
-  overlay.id = OVERLAY_ID;
-  overlay.className = "fp-overlay";
-  overlay.hidden = true;
-  overlay.setAttribute("role", "dialog");
-  overlay.setAttribute("aria-modal", "true");
-  overlay.setAttribute("aria-label", "文件预览");
+  // ---- 停靠外壳（与产物画布同一份 chrome；overlay 变体不占 flex 位）----
+  const dock = createPreviewDock(
+    {
+      id: OVERLAY_ID,
+      label: "文件预览",
+      overlay: true,
+      extraClass: "fp-overlay",
+      onClose: () => closePreview(),
+    },
+    env,
+  );
+  const overlay = dock.root;
+  const body = dock.body;
 
-  const panel = doc.createElement("div");
-  panel.className = "fp-panel";
-
-  const head = doc.createElement("header");
-  head.className = "ac-head fp-head";
-
-  const closeBtn = doc.createElement("button");
-  closeBtn.type = "button";
-  closeBtn.className = "btn btn--ghost ac-close";
-  closeBtn.innerHTML = '<i class="ph ph-x" aria-hidden="true"></i><span>关闭</span>';
-  closeBtn.setAttribute("aria-label", "关闭文件预览（Esc）");
-
+  // ---- 顶条特征控件（关闭/放大键由外壳提供，这里插中间段）----
   const titleWrap = doc.createElement("div");
   titleWrap.className = "ac-title";
   const nameEl = doc.createElement("strong");
@@ -178,18 +178,8 @@ export function initFilePreview(host = {}, env = {}) {
   downloadLink.innerHTML = '<i class="ph ph-download-simple" aria-hidden="true"></i><span>下载</span>';
   actions.appendChild(downloadLink);
 
-  head.appendChild(closeBtn);
-  head.appendChild(titleWrap);
-  head.appendChild(actions);
-
-  const body = doc.createElement("div");
-  body.className = "ac-body";
-
-  panel.appendChild(head);
-  panel.appendChild(body);
-  overlay.appendChild(panel);
-  // fixed 定位，挂 body 即可（产物画布挂在 main-panel 是因为它是 absolute 盖主列）
-  (doc.body ?? doc.documentElement).appendChild(overlay);
+  dock.insertHeadControl(titleWrap);
+  dock.insertHeadControl(actions);
 
   function setSize(bytes) {
     sizeEl.textContent = formatBytes(bytes);
@@ -197,7 +187,7 @@ export function initFilePreview(host = {}, env = {}) {
   }
 
   /**
-   * 打开覆盖层并渲染指定文件。
+   * 打开面板并渲染指定文件。
    * @param {{ path:string, url:string }} opts
    *   path 用于类型分派与标题（显示相对路径）；url 是完整取件地址
    *   （/api/file-preview?… 或 /api/runs/:id/artifact?…，由调用方按来源构造）。
@@ -217,10 +207,8 @@ export function initFilePreview(host = {}, env = {}) {
     downloadLink.setAttribute("download", artifactBasename(path));
     setSize(null);
 
-    if (!open) {
-      open = true;
-      restoreFocusTo = /** @type {HTMLElement|null} */ (doc.activeElement);
-      overlay.hidden = false;
+    if (!dock.isOpen()) {
+      dock.open();
       host.onAnnounce?.(`文件预览已打开：${artifactBasename(path)}`);
     }
     void renderPreviewBody(body, {
@@ -231,39 +219,22 @@ export function initFilePreview(host = {}, env = {}) {
     }).then((result) => {
       if (result && token === renderToken) setSize(result.size);
     });
-    if (doc.activeElement == null || !overlay.contains(doc.activeElement)) closeBtn.focus();
+    if (doc.activeElement == null || !overlay.contains(doc.activeElement)) dock.closeBtn.focus();
     return true;
   }
 
   function closePreview() {
-    if (!open) return;
-    open = false;
+    if (!dock.isOpen()) return;
     renderToken += 1; // 作废在途 fetch
-    overlay.hidden = true;
-    body.innerHTML = "";
-    if (restoreFocusTo && typeof restoreFocusTo.focus === "function" && doc.contains?.(restoreFocusTo) !== false) {
-      restoreFocusTo.focus();
-    }
-    restoreFocusTo = null;
+    dock.close();
   }
-
-  closeBtn.addEventListener("click", () => closePreview());
-  // 点遮罩（panel 之外）关闭；点 panel 内部不收
-  overlay.addEventListener("mousedown", (event) => {
-    if (event.target === overlay) closePreview();
-  });
-  // Esc 关闭。只在覆盖层开着时接管，关掉后这个键归还给宿主
-  doc.addEventListener("keydown", (event) => {
-    if (!open || event.key !== "Escape") return;
-    event.preventDefault();
-    event.stopPropagation();
-    closePreview();
-  });
 
   const api = {
     open: openPreview,
     close: closePreview,
-    isOpen: () => open,
+    isOpen: () => dock.isOpen(),
+    isExpanded: () => dock.isExpanded(),
+    setExpanded: (b) => dock.setExpanded(b),
     element: overlay,
   };
   overlay.__filePreviewApi = api;

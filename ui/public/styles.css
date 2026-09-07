@@ -975,6 +975,17 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
   padding: var(--space-lg);
 }
 
+/* 内容区 + 预览停靠面板的横向容器（T10 升级）：dock 打开时对话主列被压缩
+   但仍可见可交互；dock 关闭时 display:none，内容区占满 */
+.center-row {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+.center-row > .content-area {
+  min-width: 0;
+}
+
 /* ===== 窄屏返回栏 ===== */
 
 .back-bar {
@@ -5568,20 +5579,84 @@ button.chg-row-head:focus-visible { outline: 2px solid var(--focus); outline-off
   .schedules-view:not([hidden]) { animation: settings-fade 120ms ease-out; }
 }
 
-/* features/artifact-canvas */
+/* features/artifact-canvas + features/file-preview + features/preview-dock */
 /* ============================================================
-   features/artifact-canvas — 产物画布（T10）
-   视图纪律与 settings-view 相同：绝对定位盖住主列，侧栏仍在。
+   预览停靠面板（T10 升级）：产物画布与文件预览共用同一只外壳。
+   默认停靠在主区右侧（#center-row 的 flex 子项，对话主列被压缩
+   但仍可见可交互）；「放大」切 absolute 盖满整个主区（≈旧覆盖形态）；
+   窄屏（≤900px，与 detail-rail 折叠同一断点）退化为覆盖式。
    ============================================================ */
-.artifact-canvas {
-  position: absolute;
-  inset: 0;
-  z-index: 50;
-  background: var(--surface-0);
+.preview-dock {
+  flex: 0 0 auto;
+  width: 50%; /* 兜底值：JS 按记忆的比例写内联宽度 */
+  min-width: 320px;
   display: flex;
   flex-direction: column;
+  background: var(--surface-0);
+  border-left: 1px solid var(--border-1);
+  position: relative;
+  z-index: 40;
 }
-.artifact-canvas[hidden] { display: none; }
+.preview-dock[hidden] { display: none; }
+
+/* 拖拽柄：面板左缘的一条热区 */
+.pd-handle {
+  position: absolute;
+  left: -3px;
+  top: 0;
+  bottom: 0;
+  width: 7px;
+  cursor: col-resize;
+  z-index: 5;
+}
+.pd-handle:hover,
+.preview-dock--dragging .pd-handle {
+  background: color-mix(in srgb, var(--accent) 35%, transparent);
+}
+.preview-dock--dragging { user-select: none; }
+/* 拖拽经过 iframe 时鼠标事件会被它吞掉——拖拽期间禁掉它的指针事件 */
+.preview-dock--dragging iframe { pointer-events: none; }
+
+.pd-expand { flex-shrink: 0; }
+.pd-body { min-height: 0; }
+
+/* 覆盖变体（文件预览）：absolute 钉在主区右侧，不占 flex 位——
+   瞬态预览不该把对话挤窄。absolute 相对 #main-panel（center-row 不定位） */
+.preview-dock--overlay {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 60;
+  box-shadow: -18px 0 48px color-mix(in srgb, var(--text-1) 18%, transparent);
+}
+
+/* 放大态：盖满整个主区（含提交栏），纪律与旧覆盖式画布相同。
+    specificity 相同，必须排在 --overlay 之后才能盖住它 */
+.preview-dock--expanded {
+  position: absolute;
+  inset: 0;
+  width: auto !important; /* 盖掉拖拽写下的内联宽度 */
+  min-width: 0;
+  z-index: 70;
+  border-left: 0;
+  box-shadow: none;
+}
+
+/* 窄屏退化：dock 在小屏没法用，退回覆盖式；拖拽柄与放大键一并隐藏 */
+@media (max-width: 900px) {
+  .preview-dock {
+    position: absolute;
+    inset: 0;
+    width: auto !important;
+    min-width: 0;
+    z-index: 70;
+    border-left: 0;
+    box-shadow: none;
+  }
+  .preview-dock .pd-handle,
+  .preview-dock .pd-expand { display: none; }
+}
 
 .ac-head {
   display: flex;
@@ -5722,9 +5797,20 @@ button.chg-row-head:focus-visible { outline: 2px solid var(--focus); outline-off
   margin: 0;
 }
 
-/* 动效只在用户没要求减弱时播放（reduced-motion 门禁） */
+/* 动效只在用户没要求减弱时播放（reduced-motion 门禁）：
+   入场滑入 / 收起滑出 / 展开与拖拽外的宽度过渡。拖拽中不过渡（跟手优先） */
 @media (prefers-reduced-motion: no-preference) {
-  .artifact-canvas:not([hidden]) { animation: settings-fade 120ms ease-out; }
+  .preview-dock:not([hidden]):not(.preview-dock--closing) { animation: dock-slide-in 140ms ease-out; }
+  .preview-dock--closing { animation: dock-slide-out 140ms ease-in forwards; }
+  .preview-dock:not(.preview-dock--dragging) { transition: width 160ms ease-out; }
+}
+@keyframes dock-slide-in {
+  from { transform: translateX(32px); opacity: 0; }
+  to { transform: none; opacity: 1; }
+}
+@keyframes dock-slide-out {
+  from { transform: none; opacity: 1; }
+  to { transform: translateX(32px); opacity: 0; }
 }
 
 /* ==================================================================
@@ -6185,41 +6271,9 @@ button.cc-card:hover { border-color: var(--border-2); }
   color: var(--accent);
 }
 
-/* --- 预览覆盖层：fixed 遮罩 + 面板；内容区复用 ac-*（artifact-canvas 同款） --- */
-.fp-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 80;
-  display: flex;
-  align-items: stretch;
-  justify-content: center;
-  padding: var(--space-xl);
-  background: color-mix(in srgb, var(--text-1) 32%, transparent);
-}
-.fp-overlay[hidden] { display: none; }
-.fp-panel {
-  width: min(1080px, 100%);
-  display: flex;
-  flex-direction: column;
-  background: var(--surface-0);
-  border: 1px solid var(--border-1);
-  border-radius: calc(var(--radius) + 4px);
-  box-shadow: 0 18px 48px color-mix(in srgb, var(--text-1) 28%, transparent);
-  overflow: hidden;
-}
-.fp-head { flex-shrink: 0; }
-.fp-panel .ac-body { min-height: 0; }
-
-/* 窄视口：覆盖层去掉留白，全屏利用 */
-@media (max-width: 700px) {
-  .fp-overlay { padding: 0; }
-  .fp-panel { border-radius: 0; border: 0; width: 100%; }
-}
-
-/* 动效只在用户没要求减弱时播放（reduced-motion 门禁） */
-@media (prefers-reduced-motion: no-preference) {
-  .fp-overlay:not([hidden]) { animation: settings-fade 120ms ease-out; }
-}
+/* --- 文件预览（V-35）：T10 升级后与产物画布共用预览停靠外壳，
+       样式归上面的 .preview-dock / .preview-dock--overlay 一族；
+       这里不再有自己的遮罩/面板规则（没有遮罩了） --- */
 
 /* --- 目录选择器浮层（V-29 运行时扩展）：fixed 遮罩 + 面板，纪律同预览覆盖层 --- */
 .wp-overlay {

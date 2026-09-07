@@ -25,6 +25,8 @@ import {
 } from "../ui/public/features/file-preview.js";
 
 const flush = () => new Promise((r) => setTimeout(r, 0));
+/** 收起退出动画播完（140ms + 余量） */
+const settle = () => new Promise((r) => setTimeout(r, 220));
 
 /** jsdom 没有 DragEvent：用普通 cancelable Event + 手工挂 dataTransfer */
 function fakeDragEvent(type, { types = [], files = [] } = {}) {
@@ -116,10 +118,10 @@ describe("buildFilePreviewUrl", () => {
 });
 
 // ---------------------------------------------------------------
-// 预览覆盖层
+// 预览停靠面板
 // ---------------------------------------------------------------
 
-describe("initFilePreview 覆盖层", () => {
+describe("initFilePreview 停靠面板", () => {
   beforeEach(() => {
     document.body.innerHTML = "";
   });
@@ -201,27 +203,43 @@ describe("initFilePreview 覆盖层", () => {
     await flush();
     document.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
     expect(api.isOpen()).toBe(false);
-    expect(api.element.hidden).toBe(true);
     expect(document.activeElement).toBe(trigger);
+    await settle(); // 收起退出动画播完才隐藏
+    expect(api.element.hidden).toBe(true);
     api.open({ path: "b.txt", url: "/api/file-preview?path=b.txt" });
     await flush();
     expect(api.isOpen()).toBe(true);
     expect(api.element.querySelector(".ac-name").textContent).toBe("b.txt");
   });
 
-  it("点遮罩关闭，点面板不收；关闭按钮关闭", async () => {
+  it("没有遮罩了：点面板内部不收，关闭按钮关闭；外壳是覆盖变体停靠", async () => {
     const api = initFilePreview({}, { fetch: okText("x") });
     api.open({ path: "a.txt", url: "/api/file-preview?path=a.txt" });
     await flush();
-    api.element.querySelector(".fp-panel").dispatchEvent(
+    expect(api.element.classList.contains("preview-dock--overlay")).toBe(true);
+    api.element.querySelector(".pd-body").dispatchEvent(
       new window.MouseEvent("mousedown", { bubbles: true, cancelable: true }),
     );
     expect(api.isOpen()).toBe(true);
-    api.element.dispatchEvent(new window.MouseEvent("mousedown", { bubbles: true, cancelable: true }));
-    expect(api.isOpen()).toBe(false);
-
-    api.open({ path: "a.txt", url: "/api/file-preview?path=a.txt" });
     api.element.querySelector(".ac-close").click();
+    expect(api.isOpen()).toBe(false);
+  });
+
+  it("放大/还原与 Esc 两级（与产物画布同一份外壳行为）", async () => {
+    const api = initFilePreview({}, { fetch: okText("x") });
+    api.open({ path: "a.txt", url: "/api/file-preview?path=a.txt" });
+    await flush();
+    const btn = api.element.querySelector(".pd-expand");
+    expect(btn.textContent).toContain("放大");
+    btn.click();
+    expect(api.isExpanded()).toBe(true);
+    expect(api.element.classList.contains("preview-dock--expanded")).toBe(true);
+    // Esc 第一级：还原，不关
+    document.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    expect(api.isExpanded()).toBe(false);
+    expect(api.isOpen()).toBe(true);
+    // Esc 第二级：关闭
+    document.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
     expect(api.isOpen()).toBe(false);
   });
 

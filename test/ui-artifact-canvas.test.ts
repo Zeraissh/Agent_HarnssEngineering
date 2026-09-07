@@ -23,10 +23,14 @@ import {
   wrapIndex,
   formatBytes,
   artifactBasename,
+  pathsMatch,
   initArtifactCanvas,
 } from "../ui/public/features/artifact-canvas.js";
+import { deriveWrittenPaths } from "../ui/public/app.js";
 
 const flush = () => new Promise((r) => setTimeout(r, 0));
+/** 收起退出动画播完（DOCK_CLOSE_ANIM_MS=140 + 余量） */
+const settle = () => new Promise((r) => setTimeout(r, 220));
 
 // ---------------------------------------------------------------
 // 纯函数层
@@ -120,13 +124,22 @@ describe("路由编解码", () => {
   it("往返一致", () => {
     const hash = encodeArtifactHash("run-123", 4);
     expect(hash).toBe("#/run/run-123/artifact/4");
-    expect(parseArtifactRoute(hash)).toEqual({ runId: "run-123", index: 4 });
+    expect(parseArtifactRoute(hash)).toEqual({ runId: "run-123", index: 4, full: false });
+  });
+
+  it("放大态深链：?full 往返，刷新保持形态", () => {
+    const hash = encodeArtifactHash("run-123", 4, { full: true });
+    expect(hash).toBe("#/run/run-123/artifact/4?full");
+    expect(parseArtifactRoute(hash)).toEqual({ runId: "run-123", index: 4, full: true });
+    // 停靠态深链不带 full；&full 形式同样认得
+    expect(parseArtifactRoute("#/run/run-123/artifact/4")?.full).toBe(false);
+    expect(parseArtifactRoute("#/run/run-123/artifact/4?x=1&full")?.full).toBe(true);
   });
 
   it("runId 含特殊字符时先编码再解码", () => {
     const hash = encodeArtifactHash("a b/c", 0);
     expect(hash).not.toContain("a b/c");
-    expect(parseArtifactRoute(hash)).toEqual({ runId: "a b/c", index: 0 });
+    expect(parseArtifactRoute(hash)).toEqual({ runId: "a b/c", index: 0, full: false });
   });
 
   it("拒绝非画布 hash", () => {
@@ -181,6 +194,7 @@ function setupHost(overrides = {}) {
     getArtifacts: () => ARTIFACTS,
     onClose: vi.fn(),
     onSwitch: vi.fn(),
+    onExpandChange: vi.fn(),
     onReveal: vi.fn(),
     onAnnounce: vi.fn(),
     ...overrides,
@@ -351,14 +365,176 @@ describe("initArtifactCanvas — 切换、关闭与键盘", () => {
     expect(host.onClose).toHaveBeenCalled();
   });
 
-  it("close 清空内容并隐藏视图；幂等初始化返回同一实例", () => {
+  it("close 清空内容并隐藏视图（收起动画播完后）；幂等初始化返回同一实例", async () => {
     const host = setupHost();
     const api = initArtifactCanvas(host, { fetch: vi.fn() });
     api.open(1);
     api.close();
+    // 收起先播退出动画再隐藏（jsdom 无 matchMedia → 走动画分支），等它播完
+    await settle();
     expect(document.getElementById("artifact-canvas-view").hidden).toBe(true);
     expect(document.querySelector(".ac-body").innerHTML).toBe("");
     const again = initArtifactCanvas(setupHost(), { fetch: vi.fn() });
     expect(again.element).toBe(api.element);
+  });
+});
+
+// ---------------------------------------------------------------
+// T10 升级：停靠面板形态
+// ---------------------------------------------------------------
+
+describe("initArtifactCanvas — 停靠面板形态", () => {
+  beforeEach(() => {
+    document.body.innerHTML =
+      `<main id="main-panel"><div id="center-row">` +
+      `<div id="main-area" class="content-area"><p>对话主列</p></div>` +
+      `</div></main>`;
+  });
+
+  it("默认停靠在 #center-row：对话主列保持可见，不再是盖住一切的覆盖视图", () => {
+    const api = initArtifactCanvas(setupHost(), { fetch: vi.fn() });
+    api.open(0);
+    const view = document.getElementById("artifact-canvas-view");
+    expect(view.parentElement.id).toBe("center-row");
+    expect(view.classList.contains("preview-dock")).toBe(true);
+    expect(view.classList.contains("preview-dock--expanded")).toBe(false);
+    const main = document.getElementById("main-area");
+    expect(main.hidden).toBe(false); // 对话不被挡住
+    expect(view.hidden).toBe(false);
+  });
+
+  it("放大按钮：扩到整个主区并上报宿主；再点还原；深链 open(full) 恢复形态", () => {
+    const host = setupHost();
+    const api = initArtifactCanvas(host, { fetch: vi.fn() });
+    api.open(0);
+    const btn = document.querySelector("#artifact-canvas-view .pd-expand");
+    expect(btn.textContent).toContain("放大");
+    btn.click();
+    expect(api.isExpanded()).toBe(true);
+    expect(document.getElementById("artifact-canvas-view").classList.contains("preview-dock--expanded")).toBe(true);
+    expect(host.onExpandChange).toHaveBeenCalledWith(true);
+    // 宿主改写 hash 后绕回来 open 同一件：full 省略时保持放大（◀ ▶ 切产物不缩回）
+    api.open(1);
+    expect(api.isExpanded()).toBe(true);
+    // 深链不带 full → 明确回到停靠
+    api.open(1, { full: false });
+    expect(api.isExpanded()).toBe(false);
+    // 深链带 full → 刷新恢复放大态
+    api.open(2, { full: true });
+    expect(api.isExpanded()).toBe(true);
+  });
+
+  it("Esc 两级：放大态先还原（不关），停靠态才上报 onClose", () => {
+    const host = setupHost();
+    const api = initArtifactCanvas(host, { fetch: vi.fn(async () => ({ ok: true, text: async () => "x" })) });
+    api.open(2, { full: true });
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", cancelable: true }));
+    expect(api.isExpanded()).toBe(false);
+    expect(api.isOpen()).toBe(true);
+    expect(host.onClose).not.toHaveBeenCalled();
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", cancelable: true }));
+    expect(host.onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("窄屏退化：放大被忽略，Esc 一级直接上报关闭", () => {
+    const host = setupHost();
+    const api = initArtifactCanvas(host, { fetch: vi.fn(), isNarrow: () => true });
+    api.open(0, { full: true });
+    expect(api.isExpanded()).toBe(false);
+    expect(api.element.classList.contains("preview-dock--narrow")).toBe(true);
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", cancelable: true }));
+    expect(host.onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("拖拽左缘调宽，宽度记进注入的存储", () => {
+    const row = document.getElementById("center-row");
+    row.getBoundingClientRect = () => ({ left: 0, right: 1200, width: 1200, top: 0, bottom: 700, height: 700 });
+    const store = new Map();
+    const storage = {
+      getItem: (k) => (store.has(k) ? store.get(k) : null),
+      setItem: (k, v) => store.set(k, String(v)),
+    };
+    const api = initArtifactCanvas(setupHost(), { fetch: vi.fn(), storage });
+    api.open(0);
+    const handle = document.querySelector("#artifact-canvas-view .pd-handle");
+    expect(handle).toBeTruthy();
+    handle.dispatchEvent(new window.MouseEvent("mousedown", { bubbles: true, cancelable: true, clientX: 600 }));
+    document.dispatchEvent(new window.MouseEvent("mousemove", { bubbles: true, clientX: 480 }));
+    document.dispatchEvent(new window.MouseEvent("mouseup", { bubbles: true, clientX: 480 }));
+    // (1200-480)/1200 = 0.6
+    expect(api.element.style.width).toBe("60%");
+    expect([...store.values()]).toContain("0.6");
+  });
+});
+
+describe("initArtifactCanvas — 运行中内容自动刷新（agent 在右边操作）", () => {
+  beforeEach(() => {
+    document.body.innerHTML = "";
+  });
+
+  it("pathsMatch：反斜杠与 ./ 归一，大小写不折叠，空串不匹配", () => {
+    expect(pathsMatch("out\\index.html", "out/index.html")).toBe(true);
+    expect(pathsMatch("./out/index.html", "out/index.html")).toBe(true);
+    expect(pathsMatch("out/a.html", "out/b.html")).toBe(false);
+    expect(pathsMatch("", "out/a.html")).toBe(false);
+  });
+
+  it("当前预览产物被再次写入：防抖后重拉一次（带破缓存参数）", async () => {
+    const fakeFetch = vi.fn(async () => textRes("# 第一版"));
+    const api = initArtifactCanvas(setupHost(), { fetch: fakeFetch, refreshDebounceMs: 20 });
+    api.open(2); // docs/报告.md
+    await flush();
+    expect(fakeFetch).toHaveBeenCalledTimes(1);
+
+    api.noteWrites(["docs/报告.md"]);
+    api.noteWrites(["docs/报告.md"]); // 一阵写入只触发一次
+    await new Promise((r) => setTimeout(r, 60));
+    expect(fakeFetch).toHaveBeenCalledTimes(2);
+    expect(fakeFetch.mock.calls[1][0]).toContain("&v="); // 破缓存
+  });
+
+  it("写的是别的产物不刷新；画布关着不刷新", async () => {
+    const fakeFetch = vi.fn(async () => textRes("# x"));
+    const api = initArtifactCanvas(setupHost(), { fetch: fakeFetch, refreshDebounceMs: 20 });
+    api.open(2);
+    await flush();
+    api.noteWrites(["out/index.html"]);
+    await new Promise((r) => setTimeout(r, 60));
+    expect(fakeFetch).toHaveBeenCalledTimes(1);
+    api.close();
+    api.noteWrites(["docs/报告.md"]);
+    await new Promise((r) => setTimeout(r, 60));
+    expect(fakeFetch).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("deriveWrittenPaths — 事件流里的写入路径", () => {
+  const call = (id, path, name = "write_file") => ({
+    event: { type: "tool_call", toolUseId: id, name, input: { path } },
+  });
+  const okResult = (id) => ({ event: { type: "tool_result", toolUseId: id, result: { isError: false } } });
+  const errResult = (id) => ({ event: { type: "tool_result", toolUseId: id, result: { isError: true } } });
+
+  it("tool_call 立即计入（结果未到先刷一次），成功结果也计入", () => {
+    expect(deriveWrittenPaths(null, [call("t1", "out/a.html")])).toEqual(["out/a.html"]);
+    expect(deriveWrittenPaths(null, [call("t1", "out/a.html"), okResult("t1")])).toEqual(["out/a.html"]);
+  });
+
+  it("结果落在后面的批次：从历史 timeline 回填路径；失败不计", () => {
+    const state = {
+      timeline: [
+        { type: "tool_call", toolUseId: "t1", name: "write_file", input: { path: "out/a.html" } },
+        { type: "tool_call", toolUseId: "t2", name: "write_file", input: { path: "out/b.html" } },
+      ],
+    };
+    expect(deriveWrittenPaths(state, [okResult("t1")])).toEqual(["out/a.html"]);
+    expect(deriveWrittenPaths(state, [errResult("t2")])).toEqual([]);
+  });
+
+  it("非写盘工具与缺路径的调用不算；去重；裸事件信封也认", () => {
+    expect(deriveWrittenPaths(null, [call("t1", "", "bash")])).toEqual([]);
+    expect(deriveWrittenPaths(null, [{ type: "tool_call", toolUseId: "t9", name: "memory_write", input: { file_path: "m.md" } }])).toEqual(["m.md"]);
+    const batch = [call("t1", "out/a.html"), call("t2", "out/a.html"), okResult("t1")];
+    expect(deriveWrittenPaths(null, batch)).toEqual(["out/a.html"]);
   });
 });

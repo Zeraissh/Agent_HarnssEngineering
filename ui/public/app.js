@@ -6779,6 +6779,48 @@ export function deriveArtifacts(state) {
   return [...byPath.values()].sort((a, b) => a.seq - b.seq);
 }
 
+/**
+ * 本批事件里被写盘工具**成功**触碰的路径——产物画布「运行中自动刷新」的判据。
+ *
+ * tool_call 先记 toolUseId → path（含历史 timeline 里的调用：结果可能落在
+ * 后面的批次），tool_result 成功（result.isError 不为真）才把路径计入。
+ * 同时把本批 tool_call 的路径直接计入——结果还没到时先刷一次（顶多拿到旧
+ * 内容），结果落地的那批再刷一次；防抖在画布侧，这里只如实上报。
+ *
+ * @param {RunState|null|undefined} state 归约前的状态（历史 tool_call 在这里查）
+ * @param {any[]} queue 本批 SSE 信封（{ event } 或裸事件都认）
+ * @returns {string[]} 去重后的路径
+ */
+export function deriveWrittenPaths(state, queue) {
+  /** @type {Map<string, string>} */
+  const pathByCallId = new Map();
+  const collectCall = (e) => {
+    if (!e || e.type !== "tool_call" || !ARTIFACT_TOOLS.has(e.name) || !e.toolUseId) return;
+    const input = e.input && typeof e.input === "object" ? e.input : {};
+    const path = String(input.path ?? input.file_path ?? "").trim();
+    if (path) pathByCallId.set(String(e.toolUseId), path);
+  };
+  for (const e of state?.timeline ?? []) collectCall(e);
+
+  /** @type {Set<string>} */
+  const written = new Set();
+  for (const item of queue ?? []) {
+    const e = item?.event ?? item;
+    if (!e || typeof e !== "object") continue;
+    collectCall(e);
+    if (e.type === "tool_call") {
+      // 结果未到的先计一次（见函数头注释）
+      const path = pathByCallId.get(String(e.toolUseId ?? ""));
+      if (path) written.add(path);
+    } else if (e.type === "tool_result" && e.toolUseId) {
+      const isError = Boolean(e.resultIsError ?? (e.result && typeof e.result === "object" ? e.result.isError : false));
+      const path = pathByCallId.get(String(e.toolUseId));
+      if (path && !isError) written.add(path);
+    }
+  }
+  return [...written];
+}
+
 /** 会引起"换段"的事件类型：turn_start 这类噪声不该产生分界 */
 const CHAT_SOURCED = new Set([
   "user_message", "assistant_text", "assistant_thinking", "tool_call", "approval_request",
