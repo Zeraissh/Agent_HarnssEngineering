@@ -23,36 +23,101 @@ import { highlight, normalizeLang } from "./highlight.js";
 const ESC = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
 const escapeHtml = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ESC[c]);
 
+const LOCAL_PATH_EXT =
+  "html?|css|scss|sass|less|m?js|cjs|jsx|tsx?|json|mdx?|txt|csv|log|ya?ml|toml|ini|env|" +
+  "py|c|h|cc|cpp|cxx|hpp|cs|java|go|rs|sh|ps1|bat|cmd|sln|csproj|vcxproj|xml|" +
+  "pdf|png|jpe?g|gif|webp|svg|docx?|xlsx?|pptx?|zip|7z|tar|gz|elf|hex|bin|map|" +
+  "kicad_(?:pcb|sch|pro)";
+
+/**
+ * 从引用串里抽出真正该探测的路径。
+ *
+ * 模型常写成 `vitest.config.ts：lines 75 / branches 78` 或 `src/app.js:12`：
+ * 全角冒号后的说明、`:12` / `:12:4` 行号都剥掉，留下文件名交给宿主 stat。
+ * 抽不出合法路径时返回 null——不把说明文字当路径。
+ */
+export function extractLocalPathRef(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw || raw.length > 1024 || /[\0\r\n]/.test(raw)) return null;
+  let path = raw;
+  const fullwidth = path.indexOf("：");
+  if (fullwidth > 0) path = path.slice(0, fullwidth);
+  const colonNote = path.search(/:\s/);
+  if (colonNote > 0) path = path.slice(0, colonNote);
+  path = path.split(/[。；，、]/)[0];
+  path = path.replace(/:\d+(?::\d+)?$/, "").trim();
+  if (!isLocalPathToken(path)) return null;
+  return { path, raw };
+}
+
+function isLocalPathToken(s) {
+  if (!s || s.length > 1024 || /[\0\r\n]/.test(s)) return false;
+  if (/^(?:https?|data|javascript|mailto):/i.test(s)) return false;
+  if (/^[.\\/]+$/.test(s)) return false;
+  if (/^[A-Za-z]:[\\/]/.test(s)) return true;
+  if (/^(?:\.{1,2}[\\/]|[\\/]).+/.test(s)) return true;
+  if (/[\\/]/.test(s)) return !/[<>|?*。；，、]/.test(s);
+  if (/^\.[A-Za-z0-9][\w.-]*$/.test(s)) return true;
+  if (/^(?:README|LICENSE|Makefile|Dockerfile|AGENTS)(?:\.[\w.-]+)?$/i.test(s)) {
+    return true;
+  }
+  return new RegExp(`^[^\\/:*?\"<>|]+\\.(?:${LOCAL_PATH_EXT})$`, "i").test(s);
+}
+
 /**
  * 行内代码里哪些值值得交给宿主做“本地路径是否存在”的只读探测。
  *
  * 这里只做低误报的语法初筛，**不决定它真的是路径**：最终是否升级成链接由
  * 服务端按该 run 的 workdir + stat 决定。像 `Math.max`、`npm run test` 仍是普通
- * 代码；目录、带分隔符的路径、常见文件名与常见工程扩展名才进入候选集。
+ * 代码；目录、带分隔符的路径、常见文件名、常见工程扩展名，以及
+ * `file.ts：说明` / `file.ts:12` 这类引用，才进入候选集。
  */
 export function isLocalPathCandidate(value) {
-  const s = String(value ?? "").trim();
-  if (!s || s.length > 1024 || /[\0\r\n]/.test(s)) return false;
-  if (/^(?:https?|data|javascript|mailto):/i.test(s)) return false;
-  if (/^[A-Za-z]:[\\/]/.test(s)) return true;
-  if (/^(?:\.{1,2}[\\/]|[\\/])/.test(s)) return true;
-  if (/[\\/]/.test(s)) return !/[<>|?*]/.test(s);
-  if (/^\.[A-Za-z0-9][\w.-]*$/.test(s)) return true;
-  if (/^(?:README|LICENSE|Makefile|Dockerfile|AGENTS)(?:\.[\w.-]+)?(?::\d+(?::\d+)?)?$/i.test(s)) {
-    return true;
-  }
-  const commonExt =
-    "html?|css|scss|sass|less|m?js|cjs|jsx|tsx?|json|mdx?|txt|csv|log|ya?ml|toml|ini|env|" +
-    "py|c|h|cc|cpp|cxx|hpp|cs|java|go|rs|sh|ps1|bat|cmd|sln|csproj|vcxproj|xml|" +
-    "pdf|png|jpe?g|gif|webp|svg|docx?|xlsx?|pptx?|zip|7z|tar|gz|elf|hex|bin|map|" +
-    "kicad_(?:pcb|sch|pro)";
-  return new RegExp(`^[^\\/:*?\"<>|]+\\.(?:${commonExt})(?::\\d+(?::\\d+)?)?$`, "i").test(s);
+  return extractLocalPathRef(value) != null;
 }
 
 /** 只放行 http/https —— javascript:/data: 等伪协议一律降级为纯文本 */
 function safeHref(url) {
   const u = String(url).trim();
   return /^https?:\/\//i.test(u) ? u : null;
+}
+
+/**
+ * 从已转义正文里拆出裸 URL 与尾标点。
+ * 维基这类路径常带括号，不能一见 `)` 就剥；只剥多出来的右括号。
+ */
+function splitBareUrl(raw) {
+  let url = String(raw);
+  let trail = "";
+  const marks = ".,;:!?。，；：、";
+  while (url.length && marks.includes(url.slice(-1))) {
+    trail = url.slice(-1) + trail;
+    url = url.slice(0, -1);
+  }
+  while (url.endsWith(")") && (url.split("(").length - 1) < (url.split(")").length - 1)) {
+    trail = `)${trail}`;
+    url = url.slice(0, -1);
+  }
+  return { url, trail };
+}
+
+/**
+ * 把正文里的裸 http(s) 网址收成可点链接。
+ * 已有的 `[文字](链接)` / 插图必须先保护，否则会把 href 里的地址再链一次。
+ */
+function linkBareUrls(text) {
+  const held = [];
+  let s = text.replace(/<a\b[^>]*>[\s\S]*?<\/a>|<figure\b[\s\S]*?<\/figure>|<img\b[^>]*\/?>/gi, (m) => {
+    held.push(m);
+    return `A${held.length - 1}`;
+  });
+  s = s.replace(/https?:\/\/(?:[A-Za-z0-9\-._~:/?#\[\]@!$'()*+,;=%]|&amp;)+/gi, (raw) => {
+    const { url, trail } = splitBareUrl(raw);
+    const href = safeHref(url.replace(/&amp;/g, "&"));
+    if (!href) return raw;
+    return `<a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${escapeHtml(href)}</a>${trail}`;
+  });
+  return s.replace(/A(\d+)/g, (_, i) => held[Number(i)]);
 }
 
 /**
@@ -86,9 +151,38 @@ function inline(text) {
    */
   const codes = [];
   s = s.replace(/`([^`\n]+)`/g, (_, code) => {
-    codes.push({ code, pathCandidate: isLocalPathCandidate(code) });
+    codes.push({ code, path: extractLocalPathRef(code)?.path ?? "" });
     return `C${codes.length - 1}`;
   });
+
+  /**
+   * 图片：`![说明](https://img… "https://源页…")`
+   * title 若是 http(s) 则作为源网页链接（咨询插图纪律）；否则退化为图本身。
+   * 必须在普通链接之前匹配（否则 `![…](…)` 会先被链接触掉感叹号）。
+   */
+  s = s.replace(
+    /!\[([^\]\n]*)\]\(([^)\s]+)(?:\s+&quot;([^&]*)&quot;)?\)/g,
+    (whole, alt, url, title) => {
+      const imgHref = safeHref(String(url).replace(/&amp;/g, "&"));
+      if (!imgHref) return alt || whole;
+      const sourceRaw = title ? String(title).replace(/&amp;/g, "&").trim() : "";
+      const sourceHref = sourceRaw ? safeHref(sourceRaw) : null;
+      const linkHref = sourceHref || imgHref;
+      const caption = alt || (sourceHref ? "查看源网页" : "打开图片");
+      return (
+        `<figure class="md-figure">` +
+        `<a class="md-figure-link" href="${escapeHtml(linkHref)}" target="_blank" rel="noopener noreferrer">` +
+        `<img class="md-figure-img" src="${escapeHtml(imgHref)}" alt="${escapeHtml(alt || "")}" loading="lazy" referrerpolicy="no-referrer" />` +
+        `</a>` +
+        `<figcaption class="md-figure-cap">` +
+        `<a href="${escapeHtml(linkHref)}" target="_blank" rel="noopener noreferrer">${caption}</a>` +
+        (sourceHref && sourceHref !== imgHref
+          ? ` · <a href="${escapeHtml(imgHref)}" target="_blank" rel="noopener noreferrer">原图</a>`
+          : "") +
+        `</figcaption></figure>`
+      );
+    },
+  );
 
   // [文字](链接)：协议不合法时退化为纯文字，不产出 a 标签
   s = s.replace(/\[([^\]\n]*)\]\(([^)\s]+)\)/g, (whole, label, url) => {
@@ -98,21 +192,58 @@ function inline(text) {
     return `<a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${label || escapeHtml(href)}</a>`;
   });
 
+  // 模型经常直接甩出 https://…，不包 Markdown 链语法。行内代码已摘走，不会误链。
+  s = linkBarePathCitations(linkBareUrls(s));
+
   s = s.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
   s = s.replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
   s = s.replace(/~~([^~\n]+)~~/g, "<del>$1</del>");
 
   return s.replace(/C(\d+)/g, (_, i) => {
     const item = codes[Number(i)];
-    const attr = item.pathCandidate ? ` data-local-path="${item.code}"` : "";
+    const attr = item.path ? ` data-local-path="${item.path}"` : "";
     return `<code${attr}>${item.code}</code>`;
   });
 }
 
 /**
+ * 正文里没进反引号的文件引用也做成探测候选。
+ * 只认「带目录分隔符」或「文件名 + 冒号说明/行号」——光一个 `index.html`
+ * 不自动变链，避免普通句子误伤。已有的 a / code / 插图先保护。
+ */
+function linkBarePathCitations(text) {
+  const held = [];
+  const marked = String(text).replace(
+    /<a\b[^>]*>[\s\S]*?<\/a>|<figure\b[\s\S]*?<\/figure>|<img\b[^>]*\/?>|<code\b[^>]*>[\s\S]*?<\/code>/gi,
+    (m) => {
+      held.push(m);
+      return `T${held.length - 1}`;
+    },
+  );
+  const linked = marked.replace(/[^\s<>]+/g, (token) => {
+    let t = token;
+    let trail = "";
+    while (t && /[.,;!?。，、；]$/.test(t)) {
+      trail = t.slice(-1) + trail;
+      t = t.slice(0, -1);
+    }
+    const ref = extractLocalPathRef(t);
+    if (!ref) return token;
+    if (ref.path === t && !/[\\/]/.test(t)) return token;
+    if (t.startsWith(ref.path) && t.length > ref.path.length) {
+      return `<code data-local-path="${ref.path}">${ref.path}</code>${t.slice(ref.path.length)}${trail}`;
+    }
+    return `<code data-local-path="${ref.path}">${t}</code>${trail}`;
+  });
+  return linked.replace(/T(\d+)/g, (_, i) => held[Number(i)]);
+}
+
+/**
  * 渲染 Markdown 子集为安全 HTML。
  * 支持：标题、粗体/斜体/删除线、行内代码、围栏代码块、有序/无序列表、
- * 引用、分隔线、**GFM 表格**、段落。**不支持原始 HTML（见上方安全纪律）。**
+ * 引用、分隔线、**GFM 表格**、**图片（含可选源页 title）**、段落、
+ * **裸 http(s) 网址自动成链**、**文件引用（`file.ts：说明` / `src/a.ts:12`）挂探测标记**。
+ * **不支持原始 HTML（见上方安全纪律）。**
  * @param {string} src
  * @returns {string} 可直接 innerHTML 的 HTML 串
  */

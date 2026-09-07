@@ -1813,6 +1813,32 @@ describe("ui-server", () => {
     expect(list[0]).toHaveProperty("pendingApprovals");
   });
 
+  it("DELETE /api/runs/:id 删掉已完成的对话，运行中拒绝", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([textBlock("已经写好站点首页。")], "end_turn"),
+    ]);
+    handle = createUiServer({ modelClient: model, tools: [autoTool("noop")], workdir: process.cwd() });
+    port = await startServer(handle);
+    base = baseUrl(port);
+
+    const created = await (await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "做个网站", verify: false }),
+    })).json() as { runId: string };
+    await waitForDone(base, created.runId);
+
+    const listed = await (await fetch(`${base}/api/runs`)).json() as { runId: string; recap?: string }[];
+    expect(listed.some((r) => r.runId === created.runId)).toBe(true);
+    expect(listed.find((r) => r.runId === created.runId)?.recap).toContain("站点");
+
+    const gone = await fetch(`${base}/api/runs/${created.runId}`, { method: "DELETE" });
+    expect(gone.status).toBe(200);
+    const after = await (await fetch(`${base}/api/runs`)).json() as { runId: string }[];
+    expect(after.some((r) => r.runId === created.runId)).toBe(false);
+    expect((await fetch(`${base}/api/runs/${created.runId}`, { method: "DELETE" })).status).toBe(404);
+  });
+
   // ---- V-15 流式增量不进持久缓冲 ----
   it("v2-11. text_delta 不占 seq、不进事件缓冲（走命名通道）", async () => {
     let deltasEmitted = 0;
@@ -2173,6 +2199,83 @@ describe("ui-server", () => {
     // planGate 只在编排模式下有意义——静默忽略会让界面与实际行为长期不一致
     expect((await post({ task: "t", planGate: true })).status).toBe(400);
     expect((await post({ task: "t", mode: "single", planGate: true })).status).toBe(400);
+  });
+
+  it("多 agent 与谱系预算开关：编排无确认门；run_config 报告 budgets", async () => {
+    handle = createUiServer({
+      modelClient: new FakeModelClient([
+        fakeMessage([textBlock(["```json", JSON.stringify({
+          subtasks: [{ id: "s1", title: "一步", description: "做", acceptance: ["ok"], dependsOn: [] }],
+        }), "```"].join("\n"))], "end_turn"),
+        fakeMessage([textBlock("done")], "end_turn"),
+      ]),
+      tools: [autoTool("noop")],
+      workdir: process.cwd(),
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+
+    const harness = await (await fetch(`${base}/api/harness`)).json() as any;
+    expect(harness.budgets).toMatchObject({ dailyConfigured: false, lineageDefault: false });
+
+    const res = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        task: "并行拆步",
+        multiAgent: true,
+        lineageBudget: false,
+        dailyBudget: false,
+      }),
+    });
+    expect(res.status).toBe(200);
+    const { runId } = await res.json() as { runId: string };
+    await waitForDone(base, runId);
+    const events = await readSSESnapshot(base, runId, 400) as any[];
+    const cfg = events.find((e: any) => e.event?.type === "run_config")?.event;
+    expect(cfg?.budgets).toMatchObject({ lineage: false, daily: false, dailyConfigured: false });
+    const plan = events.find((e: any) => e.event?.type === "plan")?.event;
+    expect(plan, "应走 runPlanned").toBeDefined();
+    expect(plan?.gated).toBeFalsy();
+  });
+
+  it("追问也可当场打开多 agent：第一轮普通执行，第二轮走编排", async () => {
+    handle = createUiServer({
+      modelClient: new FakeModelClient([
+        fakeMessage([textBlock("先做完这一轮")], "end_turn"),
+        fakeMessage([textBlock(["```json", JSON.stringify({
+          subtasks: [{ id: "s1", title: "一步", description: "做", acceptance: ["ok"], dependsOn: [] }],
+        }), "```"].join("\n"))], "end_turn"),
+        fakeMessage([textBlock("编排完成")], "end_turn"),
+      ]),
+      tools: [autoTool("noop")],
+      workdir: process.cwd(),
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+
+    const created = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "先普通做", lineageBudget: false, dailyBudget: false }),
+    });
+    expect(created.status).toBe(200);
+    const { runId } = await created.json() as { runId: string };
+    await waitForDone(base, runId);
+    const first = await readSSESnapshot(base, runId, 400) as any[];
+    expect(first.some((e: any) => e.event?.type === "plan")).toBe(false);
+
+    const follow = await fetch(`${base}/api/runs/${runId}/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "这轮拆开并行", multiAgent: true }),
+    });
+    expect(follow.status).toBe(200);
+    await waitForDone(base, runId);
+    const events = await readSSESnapshot(base, runId, 400) as any[];
+    const plan = events.find((e: any) => e.event?.type === "plan")?.event;
+    expect(plan, "追问勾了多 agent 应走 runPlanned").toBeDefined();
+    expect(plan?.gated).toBeFalsy();
   });
 
   // ---- §5.1 计划确认门 ----
@@ -4249,6 +4352,129 @@ describe("本次对话精确输入放行：省的是重复点击，不是扩大�
    * 事后回看要分得清哪一步是人点的、哪一步是规则放的。
    * 分不清的审计记录比多点几下危险得多。
    */
+  it("autoApprove=true 时执行者工具不进挂起表，事件标 auto-run", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("t1", "danger", { command: "echo hi" })], "tool_use"),
+      fakeMessage([textBlock("done")], "end_turn"),
+    ]);
+    handle = createUiServer({ modelClient: model, tools: [askEvery("danger")], workdir: process.cwd() });
+    base = baseUrl(await startServer(handle));
+    const runId = (await (await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "自动放行", autoApprove: true }),
+    })).json()).runId;
+    await waitForDone(base, runId);
+    const evs = await readSSESnapshot(base, runId) as any[];
+    expect(evs.filter((e: any) => e.event.type === "approval_request")).toHaveLength(1);
+    const resolved = evs.filter((e: any) => e.event.type === "approval_resolved");
+    expect(resolved).toHaveLength(1);
+    expect(resolved[0].event.actor).toBe("auto-run");
+    expect(resolved[0].event.decision).toBe("allow");
+    const created = (await (await fetch(`${base}/api/runs`)).json()).find((x: any) => x.runId === runId);
+    expect(created.autoApprove).toBe(true);
+  });
+
+  it("自动放行后再点同一张卡是 409 已决，不是 404 找不到", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("t1", "danger", { command: "echo hi" })], "tool_use"),
+      fakeMessage([textBlock("done")], "end_turn"),
+    ]);
+    handle = createUiServer({ modelClient: model, tools: [askEvery("danger")], workdir: process.cwd() });
+    base = baseUrl(await startServer(handle));
+    const runId = (await (await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "自动放行后再点", autoApprove: true }),
+    })).json()).runId;
+    await waitForDone(base, runId);
+    const evs = await readSSESnapshot(base, runId);
+    const req = evs.find((e: any) => e.event.type === "approval_request") as any;
+    expect(req).toBeTruthy();
+    const ref = `${req.event.toolUseId}#${req.seq}`;
+    const res = await fetch(`${base}/api/runs/${runId}/approvals/${encodeURIComponent(ref)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: "allow" }),
+    });
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toMatch(/already decided/i);
+  });
+
+  it("追问带 autoApprove 时续跑也不再挂起", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([textBlock("first turn")], "end_turn"),
+      fakeMessage([toolUseBlock("t1", "danger", { command: "echo hi" })], "tool_use"),
+      fakeMessage([textBlock("done")], "end_turn"),
+    ]);
+    handle = createUiServer({ modelClient: model, tools: [askEvery("danger")], workdir: process.cwd() });
+    base = baseUrl(await startServer(handle));
+    const runId = (await (await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "先结束再追问" }),
+    })).json()).runId;
+    await waitForDone(base, runId);
+    const follow = await fetch(`${base}/api/runs/${runId}/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "继续", autoApprove: true }),
+    });
+    expect(follow.status).toBe(200);
+    const nextId = ((await follow.json()) as { runId: string }).runId;
+    await waitForDone(base, nextId);
+    const evs = await readSSESnapshot(base, nextId) as any[];
+    const resolved = evs.filter((e: any) => e.event.type === "approval_resolved");
+    expect(resolved).toHaveLength(1);
+    expect(resolved[0].event.actor).toBe("auto-run");
+    const list = await (await fetch(`${base}/api/runs`)).json();
+    expect(list.find((x: any) => x.runId === nextId).autoApprove).toBe(true);
+  });
+
+  it("追问不带 autoApprove 仍会挂起（API 默认关）", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([textBlock("first turn")], "end_turn"),
+      fakeMessage([toolUseBlock("t1", "danger", { command: "echo hi" })], "tool_use"),
+      fakeMessage([textBlock("done")], "end_turn"),
+    ]);
+    handle = createUiServer({ modelClient: model, tools: [askEvery("danger")], workdir: process.cwd() });
+    base = baseUrl(await startServer(handle));
+    const runId = (await (await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "先结束再追问默认" }),
+    })).json()).runId;
+    await waitForDone(base, runId);
+    const follow = await fetch(`${base}/api/runs/${runId}/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "继续" }),
+    });
+    expect(follow.status).toBe(200);
+    const nextId = ((await follow.json()) as { runId: string }).runId;
+    const ref = await firstPending(nextId);
+    expect(ref).toMatch(/t1#/);
+    const list = await (await fetch(`${base}/api/runs`)).json();
+    expect(list.find((x: any) => x.runId === nextId).autoApprove).toBe(false);
+  });
+
+  it("运行中打开自动放行会收口当前挂起项", async () => {
+    const { runId } = await startRunCallingThrice();
+    await firstPending(runId);
+    const res = await fetch(`${base}/api/runs/${runId}/auto-approve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: true }),
+    });
+    expect(res.status).toBe(200);
+    await waitForDone(base, runId);
+    const evs = await readSSESnapshot(base, runId);
+    const resolved = evs.filter((e: any) => e.event.type === "approval_resolved");
+    expect(resolved.length).toBeGreaterThanOrEqual(1);
+    expect(resolved.every((e: any) => e.event.actor === "auto-run" || e.event.actor === "auto-rule" || e.event.actor === "user")).toBe(true);
+    expect(resolved.some((e: any) => e.event.actor === "auto-run")).toBe(true);
+  });
+
   it("自动放行照样进事件流，且标明不是人点的", async () => {
     const { runId } = await startRunCallingThrice();
     const ref = await firstPending(runId);
@@ -4735,8 +4961,8 @@ describe("本次对话精确输入放行：省的是重复点击，不是扩大�
 
   /**
    * **旧锁有记录退役（会话中心化，2026-09-03）**：此前这条钉「核查 run 不可续跑 → 收尾即
-   * 终止 active grant」。核查 run 现在可以继续对话，"本次对话放行"就该活到 TTL/次数用完；
-   * 收尾即终止只剩一种触发——执行谱系预算耗尽（对话真的续不下去了），见下一条。
+   * 终止 active grant」。核查 run 现在可以继续对话，"本次对话放行"就该活到 TTL/次数用完。
+   * **再退役（2026-09-05）**：谱系额度用尽也不再清 grant——活 run 发送会自动续跑道。
    */
   it("可继续对话的核查 run 收尾时保留 active grant（本次对话放行随对话走）", async () => {
     const model = new FakeModelClient([
@@ -4766,12 +4992,14 @@ describe("本次对话精确输入放行：省的是重复点击，不是扩大�
     expect(events.at(-1)?.event.type).toBe("run_end");
   });
 
-  it("预算耗尽的 run 收尾时终止 active grant：对话真的续不下去了，放行不能悬着", async () => {
+  it("预算耗尽的活 run 仍可续跑：自动续跑道，本次对话放行留下", async () => {
     const model = new FakeModelClient([
       fakeMessage([toolUseBlock("t_budget", "danger", {})], "tool_use"),
       fakeMessage([textBlock("main done")], "end_turn"),
+      fakeMessage([textBlock("续跑也完成")], "end_turn"),
     ]);
-    // 总轮次预算 2：首轮恰好用满（tool_use + end_turn）→ 收尾时 canContinue=false
+    // 总轮次预算 2：首轮恰好用满（tool_use + end_turn）。旧行为 canContinue=false + 409；
+    // 现在列表仍标 budgetExhausted，但发送会自动续一段跑道。
     process.env.AGENT_TOTAL_MAX_TURNS = "2";
     try {
       handle = createUiServer({ modelClient: model, tools: [askEvery("danger")], workdir: process.cwd() });
@@ -4789,21 +5017,23 @@ describe("本次对话精确输入放行：省的是重复点击，不是扩大�
 
       const summary = ((await (await fetch(`${base}/api/runs`)).json()) as any[])
         .find((item) => item.runId === runId);
-      expect(summary.canContinue).toBe(false);
+      expect(summary.canContinue).toBe(true);
+      expect(summary.budgetExhausted).toBe(true);
       expect(summary.continuationBlockReason).toContain("AGENT_TOTAL_MAX_TURNS");
-      expect(summary.approvalGrants.active).toBe(0);
+      expect(summary.approvalGrants.active).toBe(1);
       const events = await readSSESnapshot(base, runId) as any[];
-      const invalidated = events.find(
+      expect(events.some(
         (item) => item.event.type === "approval_grant_invalidated" && item.event.cause === "run_not_continuable",
-      );
-      expect(invalidated).toBeDefined();
-      // 追加也被同一条理由挡住，且文案说清哪个预算、怎么提
+      )).toBe(false);
+
       const res = await fetch(`${base}/api/runs/${runId}/messages`, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text: "再来" }),
       });
-      expect(res.status).toBe(409);
-      expect((await res.json() as any).error).toContain("AGENT_TOTAL_MAX_TURNS");
+      expect(res.status).toBe(200);
+      const followId = ((await res.json()) as { runId: string }).runId;
+      await waitForDone(base, followId);
+      expect(model.requests.length).toBeGreaterThanOrEqual(3);
     } finally {
       delete process.env.AGENT_TOTAL_MAX_TURNS;
     }
@@ -5268,7 +5498,7 @@ describe("B2 · 运行历史落盘", () => {
     }
   });
 
-  it("重启不能移除检查点里的旧上限；子 run 用尽后 live 入口也提前关闭", async () => {
+  it("重启不能移除检查点里的旧上限；活的子 run 用尽后发送会自动续跑道", async () => {
     dir = await mkdtemp(join(tmpdir(), "history-old-budget-"));
     process.env.AGENT_TOTAL_MAX_TURNS = "2";
     try {
@@ -5286,6 +5516,7 @@ describe("B2 · 运行历史落盘", () => {
 
       const resumedModel = new FakeModelClient([
         fakeMessage([textBlock("第二段，正好耗尽旧上限")], "end_turn"),
+        fakeMessage([textBlock("第三段，自动续跑道")], "end_turn"),
       ]);
       await boot({ modelClient: resumedModel, tools: [], workdir: process.cwd(), history: dir });
       const follow = await post(`/api/runs/${runId}/messages`, { text: "继续" });
@@ -5298,13 +5529,14 @@ describe("B2 · 运行历史落盘", () => {
 
       const child = ((await (await fetch(`${base}/api/runs`)).json()) as any[])
         .find((item) => item.runId === childId);
-      expect(child.canContinue).toBe(false);
+      expect(child.canContinue).toBe(true);
+      expect(child.budgetExhausted).toBe(true);
       expect(child.continuationBlockReason).toContain("总轮次预算已用尽");
 
-      const blocked = await post(`/api/runs/${childId}/messages`, { text: "第三段" });
-      expect(blocked.status).toBe(409);
-      expect(((await blocked.json()) as any).error).toContain("总轮次预算已用尽");
-      expect(resumedModel.requests).toHaveLength(1);
+      const continued = await post(`/api/runs/${childId}/messages`, { text: "第三段" });
+      expect(continued.status).toBe(200);
+      await waitForDone(base, ((await continued.json()) as { runId: string }).runId);
+      expect(resumedModel.requests).toHaveLength(2);
     } finally {
       delete process.env.AGENT_TOTAL_MAX_TURNS;
     }

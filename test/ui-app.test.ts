@@ -36,6 +36,9 @@ import {
   deriveRunListItems,
   filterRunsByStatus,
   mergeForkedFollowUp,
+  visibleConversationRuns,
+  conversationTipId,
+  buildFollowUpRequest,
   buildNewRunRequest,
   deriveLoopFace,
   deriveAssemblyBar,
@@ -555,6 +558,16 @@ describe("归档 follow-up 列表切换", () => {
     expect(transition.summary.status).toBe("done");
     expect(transition.summary.finishedAt).toBe(999);
   });
+
+  it("侧栏同一条谱系只露当前这一头，续跑不长出第二个对话", () => {
+    const runs = [
+      { runId: "parent", task: "原任务", continuedFrom: null },
+      { runId: "child", task: "原任务", continuedFrom: "parent" },
+    ];
+    expect(visibleConversationRuns(runs).map((r) => r.runId)).toEqual(["child"]);
+    expect(conversationTipId(runs, "parent")).toBe("child");
+    expect(conversationTipId(runs, "child")).toBe("child");
+  });
 });
 
 // ================================================================
@@ -802,7 +815,10 @@ describe("v2 R1 · stopReason 六值分档 (V-04)", () => {
     // max_turns / error 是 verifier 救不了的两类，界面必须直说
     expect(classifyStopReason("max_turns").tone).toBe("bad");
     expect(classifyStopReason("max_turns").hint).toContain("核查救不了");
-    expect(classifyStopReason("budget_exhausted").tone).toBe("bad");
+    // budget_exhausted 自 2026-09-05 起判 warn 不判 bad：发送会自动续一段跑道，
+    // 额度用尽不再是死路（ui-server「预算耗尽的活 run 仍可续跑」/ui-a11y composer 锁）。
+    // 旧断言 `.toBe("bad")` 与这三处 WIP 规格直接冲突，是改语义时漏改的一处。
+    expect(classifyStopReason("budget_exhausted").tone).toBe("warn");
     expect(classifyStopReason("refusal").tone).toBe("bad");
     expect(classifyStopReason("error").tone).toBe("bad");
     expect(classifyStopReason("partial").tone).toBe("warn");
@@ -1621,10 +1637,41 @@ describe("AC6 无障碍语义 (R-05)", () => {
     expect(html).toContain('["light", "dark", "graphite", "contrast"]');
   });
 
-  it("交互式 Web 默认启用 ask_user，但提示明确 API 仍需显式开启", () => {
+  it("设置面板不再单独解释计划门与需求澄清；提交仍默认带上", () => {
     const html = readFileSync(join(__dirname, "..", "ui", "public", "index.html"), "utf-8");
-    expect(html).toMatch(/id="ask-user-toggle"[^>]*checked/);
-    expect(html).toContain("API 未显式传 askUser 时仍默认关");
+    expect(html).not.toContain("id=\"ask-user-fact\"");
+    expect(html).not.toContain("id=\"plan-gate-fact\"");
+    expect(html).not.toContain("id=\"ask-user-toggle\"");
+    expect(html).not.toContain("id=\"plan-gate-toggle\"");
+    expect(html).not.toContain("id=\"ask-user-label\"");
+    expect(html).not.toContain("id=\"plan-gate-label\"");
+    expect(buildNewRunRequest({ task: "t" })).toMatchObject({ askUser: true, autoApprove: true });
+    expect(buildNewRunRequest({ task: "t", mode: "plan" })).toMatchObject({ planGate: true, askUser: true });
+  });
+
+  it("交互式 Web 默认自动放行工具", () => {
+    const html = readFileSync(join(__dirname, "..", "ui", "public", "index.html"), "utf-8");
+    expect(html).toMatch(/id="auto-approve-toggle"[^>]*checked/);
+    expect(buildNewRunRequest({ task: "t" })).toMatchObject({ askUser: true, autoApprove: true });
+    expect(buildNewRunRequest({ task: "t", mode: "plan" })).toMatchObject({ planGate: true, askUser: true });
+    // 归档续跑 / 追问必须把勾选带上，否则界面开着、派生 run 仍逐条问
+    expect(buildFollowUpRequest({ text: "继续" })).toEqual({ text: "继续" });
+    expect(buildFollowUpRequest({ text: "继续", autoApprove: true })).toEqual({
+      text: "继续",
+      autoApprove: true,
+    });
+    expect(buildFollowUpRequest({ text: "继续", verify: false, autoApprove: false })).toEqual({
+      text: "继续",
+      verify: false,
+      autoApprove: false,
+    });
+    expect(buildFollowUpRequest({ text: "继续", planMode: true, multiAgent: true })).toEqual({
+      text: "继续",
+      planMode: true,
+      multiAgent: true,
+    });
+    expect(html).toContain("syncAutoApprove");
+    expect(html).toMatch(/buildFollowUpRequest\(\{[\s\S]*autoApprove:/);
   });
 
   it("单任务与计划模式都把 ask_user 开关接进真实提交载荷", () => {
@@ -1687,6 +1734,13 @@ describe("AC6 无障碍语义 (R-05)", () => {
     expect(css).toContain(":focus-visible");
     // 至少有一条非空规则
     expect(css).toMatch(/:focus-visible\s*\{[^}]+outline/);
+  });
+
+  it("用户气泡正文左对齐——长句居中会悬在胶囊中间", () => {
+    const css = readFileSync(join(__dirname, "..", "ui", "public", "styles.css"), "utf-8");
+    const blocks = css.match(/\.chat-msg--user[^{]*\{[^}]+\}/g) ?? [];
+    expect(blocks.join("\n")).not.toMatch(/text-align:\s*center/);
+    expect(css).toMatch(/\.chat-msg--user[^{]*\{[^}]*text-align:\s*left/);
   });
 
   // 以下三条由浏览器实测的 ARIA 结构缺陷催生（AC-06 键盘/屏幕阅读器专项）
@@ -1949,9 +2003,8 @@ describe("V-24b 提交栏布局：整行子项必须能换行", () => {
   const css = readFileSync(join(__dirname, "..", "ui", "public", "styles.css"), "utf-8");
 
   /**
-   * 实测抓到的 bug：装配面板是 flex-basis:100% 的整行子项，而 .submit-bar 在
-   * 桌面态没有 flex-wrap（只有窄屏媒体查询里写了）。结果它和输入框挤在同一行，
-   * 把 textarea 压成一条几像素宽的缝——委托方截图里那个"不知道是什么"的小方块。
+   * 实测抓到的 bug：装配面板是 in-flow 整行网格，一点开就把对话区挤成一条缝。
+   * 现改成浮在底栏上方的面板，开合不改变 composer 高度。
    */
   it(".submit-bar 在桌面态就有 flex-wrap，不只靠窄屏媒体查询", () => {
     const block = css.match(/(^|\})\s*\.submit-bar\s*\{([^}]*)\}/);
@@ -1959,8 +2012,14 @@ describe("V-24b 提交栏布局：整行子项必须能换行", () => {
     expect(block![2]).toMatch(/flex-wrap:\s*wrap/);
   });
 
-  it("整行子项确实声明了 flex-basis:100%（换行的前提）", () => {
-    expect(css).toMatch(/\.run-knobs\s*\{[^}]*flex-basis:\s*100%/);
+  it("运行设置是浮层，展开不抢对话高度", () => {
+    const blocks = [...css.matchAll(/\.run-knobs\s*\{([^}]*)\}/g)].map((m) => m[1]);
+    expect(blocks.some((b) => /position:\s*absolute/.test(b))).toBe(true);
+    expect(css).toMatch(/\.run-knobs\[hidden\]\s*\{[^}]*display:\s*none\s*!important/);
+  });
+
+  it("工具过程开关已退役，对话区不再并排一条过程档", () => {
+    expect(css).not.toMatch(/\.chat-process-bar\s*\{/);
   });
 
   it("任务输入框有最小宽度，压不成一条缝", () => {

@@ -51,7 +51,10 @@ function loadSkeleton(): string {
  */
 function openDrawer(): void {
   const d = document.getElementById("detail-drawer") as HTMLDetailsElement | null;
-  if (d) d.open = true;
+  if (d) {
+    d.hidden = false;
+    d.open = true;
+  }
 }
 
 /** 宿主快照替身：护栏、工具面、包与白名单齐全，四决定因素才有东西可渲染 */
@@ -822,11 +825,10 @@ describe("统一 composer：一个框，两种去向", () => {
     expect(m1.mode).toBe("append");
     expect(m1.buttonLabel).toBe("继续对话");
     expect(m1.runId).toBe("run-mt");
-    // 轮次预算每轮重新起算，不说清用户会以为 maxTurns 是整场对话的总额
-    expect(m1.note).toContain("每轮重新起算");
+    expect(m1.note).toBe("");
   });
 
-  it("归档检查点显示为显式派生续跑，不冒充原进程无缝继续", () => {
+  it("归档续跑在底栏也是继续对话，不把内部派生说成新开", () => {
     const mode = deriveComposerMode({
       info: {
         ...CONTINUABLE,
@@ -838,13 +840,11 @@ describe("统一 composer：一个框，两种去向", () => {
     });
     expect(mode.mode).toBe("fork");
     expect(mode.kind).toBe("append");
-    expect(mode.buttonLabel).toBe("从归档继续");
-    expect(mode.note).toContain("派生新运行");
-    expect(mode.note).toContain("当前宿主");
-    expect(mode.note).toContain("总预算");
+    expect(mode.buttonLabel).toBe("继续对话");
+    expect(mode.note).toBe("");
 
     patchComposer(mode);
-    expect(document.getElementById("composer-mode-label")!.textContent).toBe("从归档派生续跑");
+    expect(document.getElementById("composer-mode-block")).toBeNull();
     expect(document.getElementById("submit-form")!.dataset.mode).toBe("fork");
   });
 
@@ -874,21 +874,49 @@ describe("统一 composer：一个框，两种去向", () => {
    * 「开启独立核查的运行不支持追加：追加会绕过已出具的裁决」与「计划编排的运行
    * 不支持追加：没有续跑入口」。两条语义已废：核查 / 编排是逐轮选项不是 run 级
    * 封印（裁决带 judgedTurn 留在对话里、只对它核查的那一轮负责），服务端对这两类
-   * run 报 canContinue=true。剩下的唯一结构性阻断是预算耗尽，文案由服务端给。
+   * run 报 canContinue=true。
+   *
+   * **再退役（2026-09-05）**：活 run 谱系额度用尽也不再把 composer 打成
+   * new-blocked——发送会自动续一段跑道。剩下的结构性阻断是归档边界
+   * （包不存在 / 目录越权 / 归档侧预算），文案仍由服务端给。
    */
-  it("不能追加时说清原因，并明说这一提交会新建一次运行（仅预算耗尽等服务端理由）", () => {
+  it("活 run 额度用尽仍是追加：发送会自动续跑道，不逼人先点按钮", () => {
+    const exhausted = deriveComposerMode({
+      info: {
+        ...CONTINUABLE,
+        canContinue: true,
+        budgetExhausted: true,
+        canExtendBudget: true,
+        continuationBlockReason:
+          "执行谱系的总 token 预算已用尽（500000/500000）。已完成的写入不会回滚。",
+      },
+      localStatus: "done",
+    });
+    expect(exhausted.mode).toBe("append");
+    expect(exhausted.buttonLabel).toBe("继续对话");
+    expect(exhausted.note).toBe("");
+    expect(exhausted.kind).toBe("append");
+    expect(exhausted.canExtendBudget).toBe(false);
+    expect(exhausted.canSubmit).toBe(true);
+  });
+
+  it("不能追加时仍停在当前对话，发送走续跑而不是新建", () => {
     const exhausted = deriveComposerMode({
       info: {
         ...CONTINUABLE,
         canContinue: false,
+        archived: true,
         continuationBlockReason:
-          "执行谱系的总轮次预算已用尽（2/2）。要在这场对话里继续，请提高 AGENT_TOTAL_MAX_TURNS 后重启宿主；或者新建对话",
+          "归档工作目录不在当前宿主白名单内：D:\\old。已完成的写入不会回滚。或「新建对话」在同一工作目录开新会话（产物还在）。",
+        canExtendBudget: false,
+        budgetExhausted: false,
       },
     });
-    expect(exhausted.mode).toBe("new-blocked");
-    expect(exhausted.note).toContain("总轮次预算已用尽");
-    expect(exhausted.note).toContain("AGENT_TOTAL_MAX_TURNS");
-    expect(exhausted.note).toContain("将新建一次运行");
+    expect(exhausted.mode).toBe("blocked");
+    expect(exhausted.kind).toBe("append");
+    expect(exhausted.buttonLabel).toBe("继续对话");
+    expect(exhausted.note).toBe("");
+    expect(exhausted.canExtendBudget).toBe(false);
     expect(exhausted.canSubmit).toBe(true);
 
     // 核查 / 编排本身不再产生任何"不能追加"的文案——服务端说能续就能续
@@ -898,9 +926,8 @@ describe("统一 composer：一个框，两种去向", () => {
       expect(m.note).not.toContain("绕过已出具的裁决");
       expect(m.note).not.toContain("没有续跑入口");
     }
-    // plan 的追加要说清接的是什么：计划摘要开局，不是重跑 DAG
-    expect(deriveComposerMode({ info: { ...CONTINUABLE, mode: "plan" }, localStatus: "done" }).note)
-      .toContain("计划摘要");
+    expect(deriveComposerMode({ info: { ...CONTINUABLE, mode: "plan" }, localStatus: "done" }).kind)
+      .toBe("append");
   });
 
   /**
@@ -982,13 +1009,14 @@ describe("统一 composer：一个框，两种去向", () => {
     expect((q("#submit-btn") as HTMLButtonElement).disabled).toBe(false);
     // 可及名称不能说谎：这一刻它不是「任务描述」
     expect(q('label[for="task-input"]').textContent).toBe("追加指令");
-    expect(q("#composer-note").hidden).toBe(false);
-    expect(q("#task-input").getAttribute("aria-describedby")).toBe("composer-note");
+    expect(q("#composer-note").hidden).toBe(true);
+    expect(q("#task-input").getAttribute("aria-describedby")).toBeNull();
 
     // 续跑复用原运行的装配，这一组构造上无效——禁用而不是藏起来。
-    // 例外是核查开关：核查是每一轮的选项，追加轮它进请求体（见下一条测试；
-    // 旧锁「追加时 #verify-toggle 禁用」于会话中心化时退役）
+    // 例外：核查 / 计划模式 / 多 agent 是每一轮的选项，追加轮仍可选。
     expect((q("#verify-toggle") as HTMLInputElement).disabled).toBe(false);
+    expect((q("#plan-mode-toggle") as HTMLInputElement).disabled).toBe(false);
+    expect((q("#multi-agent-toggle") as HTMLInputElement).disabled).toBe(false);
     expect((q("#rubric-input") as HTMLTextAreaElement).disabled).toBe(true);
     // 但**不动面板的开合**：那是用户状态，后台事件去改它会把焦点踢回 body
     expect(q("#run-knobs").hidden).toBe(true); // 骨架初始就是折叠的，没被动过
@@ -996,17 +1024,15 @@ describe("统一 composer：一个框，两种去向", () => {
     expect((q("#file-upload") as HTMLInputElement).disabled).toBe(false);
   });
 
-  it("运行中：按钮变「停止」，输入框仍可打草稿，原因写在 note 里", () => {
+  it("运行中：按钮变「停止」，输入框仍可打草稿，不再挂一段操作说明", () => {
     patchComposer(deriveComposerMode({
       info: { ...CONTINUABLE, status: "running", canContinue: false }, localStatus: "running",
     }));
-    // 从"灰着的运行任务"改成"可点的停止"：同一个位置，两种状态，不加第二个控件
     expect(q("#submit-btn-label").textContent).toBe("停止");
     expect((q("#submit-btn") as HTMLButtonElement).disabled).toBe(false);
     expect((q("#task-input") as HTMLTextAreaElement).disabled).toBe(false);
-    expect(q("#composer-note").textContent).toContain("等这一轮结束");
-    // disabled 的按钮不可聚焦、不会被读到，原因只能挂在输入框上
-    expect(document.getElementById(q("#task-input").getAttribute("aria-describedby")!)).toBeTruthy();
+    expect(q("#composer-note").hidden).toBe(true);
+    expect(q("#task-input").getAttribute("aria-describedby")).toBeNull();
   });
 
   it("切回新建模式时装配项解禁、说明行收起", () => {
@@ -1100,7 +1126,7 @@ describe("统一 composer：一个框，两种去向", () => {
         // 必须先打补丁再扫：不打的话 axe 看到的永远是那份静态骨架，
         // 「禁用 + aria-describedby + note 可见」这个组合形态一眼都扫不到
         patchComposer(mode);
-        expect(q("#composer-note").hidden, "前置：note 应当可见，否则这条扫描等于没扫").toBe(false);
+        expect(q("#composer-note").hidden).toBe(true);
         const violations = await runAxe();
         expect(violations, `${theme}/${mode.mode}: ${JSON.stringify(violations, null, 2)}`).toEqual([]);
       }
@@ -1176,12 +1202,17 @@ describe("常驻上下文水位", () => {
     expect((document.querySelector(".ctx-gauge") as HTMLElement).hidden).toBe(true);
   });
 
-  it("显示百分比与刻度，无障碍名称说全口径", () => {
+  it("正常水位不占顶栏；越过压缩水位才显示百分比与全口径名称", () => {
     renderRunDetail(stateWithUsage(480), { activeTab: "loop", harness: H });
+    openDrawer();
+    expect((document.querySelector(".ctx-gauge") as HTMLElement).hidden).toBe(true);
+
+    document.body.innerHTML = loadSkeleton();
+    renderRunDetail(stateWithUsage(900), { activeTab: "loop", harness: H });
     openDrawer();
     const g = document.querySelector(".ctx-gauge") as HTMLElement;
     expect(g.hidden).toBe(false);
-    expect(g.textContent).toContain("48%");
+    expect(g.textContent).toContain("90%");
     const label = g.getAttribute("aria-label")!;
     // 光念一个 48% 没有信息量——要说清分子分母是什么。分母叫"预算"：它是压缩策略，不是模型窗口
     //（MEM-01 窗口 / 预算分离）；窗口另报，没有就明说"窗口未知"而不是沉默
@@ -1202,20 +1233,18 @@ describe("常驻上下文水位", () => {
     };
     renderRunDetail(stateWithUsage(480), { activeTab: "loop", harness: H3 });
     openDrawer();
-    const g = document.querySelector(".ctx-gauge") as HTMLElement;
-    expect(g.textContent).toContain("48%");
-    expect(g.textContent).toContain("窗口 5%");
-    expect(g.textContent).not.toContain("下一轮将压缩");
-    const label = g.getAttribute("aria-label") ?? "";
-    expect(label).toContain("窗口 10.0k（learned）占 5%");
+    expect((document.querySelector(".ctx-gauge") as HTMLElement).hidden).toBe(true);
 
     document.body.innerHTML = loadSkeleton();
     renderRunDetail(stateWithUsage(900), { activeTab: "loop", harness: H3 });
     openDrawer();
     const hot = document.querySelector(".ctx-gauge") as HTMLElement;
+    expect(hot.textContent).toContain("90%");
+    expect(hot.textContent).toContain("窗口 9%");
     expect(hot.textContent).toContain("下一轮将压缩");
     expect(hot.classList.contains("ctx-gauge--warn")).toBe(true);
     expect(hot.getAttribute("aria-label")).toContain("下一轮将压缩");
+    expect(hot.getAttribute("aria-label")).toContain("窗口 10.0k（learned）占 9%");
   });
 
   it("越过压缩水位转 warn 语域", () => {
@@ -1242,7 +1271,7 @@ describe("常驻上下文水位", () => {
   it("点击跳到 Context 面——图标是入口不是死数字", () => {
     const seen: string[] = [];
     document.addEventListener("tab-switch", (e) => seen.push((e as CustomEvent).detail.tab));
-    renderRunDetail(stateWithUsage(480), { activeTab: "loop", harness: H });
+    renderRunDetail(stateWithUsage(900), { activeTab: "loop", harness: H });
     openDrawer();
     (document.querySelector(".ctx-gauge") as HTMLElement).click();
     expect(seen).toEqual(["context"]);
@@ -1252,27 +1281,19 @@ describe("常驻上下文水位", () => {
    * 没配上限时不画刻度：五个空格看起来像"0%"，而事实是"不知道"。
    * 用空刻度表达未知就是在说谎——这条和三值裁决里的 unverified 是同一个道理。
    */
-  it("未配置上下文上限时只报绝对值，既不编造百分比也不画空刻度", () => {
+  it("未配置上下文上限且未压缩时不占顶栏", () => {
     renderRunDetail(stateWithUsage(480), {
       activeTab: "loop", harness: { ...FAKE_HARNESS, guardrails: {} },
     });
     openDrawer();
-    const g = document.querySelector(".ctx-gauge")!;
-    expect(g.textContent).not.toContain("%");
-    expect(g.textContent).not.toContain("▯");
-    expect(g.textContent).not.toContain("▮");
-    expect(g.textContent).toContain("上下文");
-    expect(g.getAttribute("aria-label")).toContain("未配置上限");
+    expect((document.querySelector(".ctx-gauge") as HTMLElement).hidden).toBe(true);
   });
 
   it("配了上限时用统一图标 + 百分比报水位，不用文本方块模拟图形", () => {
     const H2 = { ...FAKE_HARNESS, guardrails: { ...FAKE_HARNESS.guardrails, contextTokenLimit: 1000 } };
     renderRunDetail(stateWithUsage(150), { activeTab: "loop", harness: H2 });
     openDrawer();
-    const low = document.querySelector(".ctx-gauge")!;
-    expect(low.querySelector(".ph-gauge")).toBeTruthy();
-    expect(low.textContent).toContain("15%");
-    expect(low.textContent).not.toMatch(/[▮▯]/);
+    expect((document.querySelector(".ctx-gauge") as HTMLElement).hidden).toBe(true);
     document.body.innerHTML = loadSkeleton();
     renderRunDetail(stateWithUsage(950), { activeTab: "loop", harness: H2 });
     openDrawer();
@@ -1375,22 +1396,13 @@ describe("MEM-01 三段上下文水位条与预算控件（渲染面）", () => 
     expect(violations, JSON.stringify(violations, null, 2)).toEqual([]);
   });
 
-  /**
-   * 提交表单的逐 run 预算控件：可及名称由 <label for> 给，区间与忠告由 aria-describedby 关联
-   *（只改文本不关联的话，屏幕阅读器用户听不到"可用 32k..963k"这条唯一的区间说明）。
-   */
-  it("预算控件有可及名称与关联说明，忠告是 role=status", () => {
-    const input = document.getElementById("context-budget-input") as HTMLInputElement;
-    expect(input).toBeTruthy();
-    expect(input.type).toBe("number");
-    const label = document.querySelector('label[for="context-budget-input"]') as HTMLElement;
-    expect(label.textContent).toContain("上下文预算");
-    const described = (input.getAttribute("aria-describedby") ?? "").split(/\s+/).filter(Boolean);
-    expect(described.length).toBeGreaterThan(0);
-    for (const id of described) expect(document.getElementById(id), `aria-describedby 指向的 ${id} 必须存在`).toBeTruthy();
-    expect(document.getElementById("context-budget-advisory")!.getAttribute("role")).toBe("status");
-    // 忠告默认不占位（没到 200k 就不该有一行常驻文案）
-    expect((document.getElementById("context-budget-advisory") as HTMLElement).hidden).toBe(true);
+  it("装配区不再放谱系/日/上下文预算旋钮", () => {
+    expect(document.getElementById("lineage-budget-toggle")).toBeNull();
+    expect(document.getElementById("daily-budget-toggle")).toBeNull();
+    expect(document.getElementById("context-budget-input")).toBeNull();
+    expect(document.getElementById("run-knobs")?.textContent ?? "").not.toContain("谱系预算");
+    expect(document.getElementById("run-knobs")?.textContent ?? "").not.toContain("日预算");
+    expect(document.getElementById("run-knobs")?.textContent ?? "").not.toContain("上下文预算");
   });
 
   it("预算控件所在的装配面板零 violations，且不多出待复核项", async () => {

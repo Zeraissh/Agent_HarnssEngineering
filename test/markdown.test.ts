@@ -10,6 +10,7 @@
  */
 import { describe, expect, it } from "vitest";
 import {
+  extractLocalPathRef,
   isLocalPathCandidate,
   renderMarkdown,
   renderMarkdownInline,
@@ -26,14 +27,20 @@ function mount(html: string): HTMLElement {
  * XSS 的正确判据是【有没有产生可执行的 DOM】，不是 innerHTML 里有没有那串字。
  * 转义过的 `"` 在文本节点里读回来仍是 `"`，所以 `innerHTML.includes("onerror=")`
  * 对纯文本也会命中——初版就是这么写的，白报了两次假失败。
+ *
+ * 安全的 https/http `<img>`（咨询插图）允许；带 on* / javascript: / data: 的仍算注入。
  */
 function hasExecutableInjection(host: HTMLElement): boolean {
-  if (host.querySelector("script, img, iframe, object, embed, svg")) return true;
+  if (host.querySelector("script, iframe, object, embed, svg")) return true;
   for (const el of host.querySelectorAll("*")) {
     for (const attr of Array.from(el.attributes)) {
       if (/^on/i.test(attr.name)) return true;
       if (/^(href|src)$/i.test(attr.name) && /^\s*(javascript|data):/i.test(attr.value)) return true;
     }
+  }
+  for (const img of host.querySelectorAll("img")) {
+    const src = img.getAttribute("src") ?? "";
+    if (!/^https?:\/\//i.test(src)) return true;
   }
   return false;
 }
@@ -53,6 +60,28 @@ describe("Markdown 渲染：模型常用记法", () => {
     expect(host.querySelector("code")!.textContent).toBe("code");
   });
 
+  it("图片直显，title 为源网页时图与说明都链回源页", () => {
+    const host = mount(
+      renderMarkdown('![冷端示意](https://cdn.example.com/a.png "https://nist.gov/note")'),
+    );
+    const img = host.querySelector("img.md-figure-img")!;
+    expect(img.getAttribute("src")).toBe("https://cdn.example.com/a.png");
+    expect(img.getAttribute("alt")).toBe("冷端示意");
+    const links = [...host.querySelectorAll("a")].map((a) => a.getAttribute("href"));
+    expect(links).toContain("https://nist.gov/note");
+    expect(links).toContain("https://cdn.example.com/a.png");
+    expect(hasExecutableInjection(host)).toBe(false);
+  });
+
+  it("图片 title 非法协议时退化为链到图本身，不产出 javascript:", () => {
+    const host = mount(renderMarkdown('![x](https://cdn.example.com/a.png "javascript:alert(1)")'));
+    expect(host.querySelector("img")!.getAttribute("src")).toBe("https://cdn.example.com/a.png");
+    for (const a of host.querySelectorAll("a")) {
+      expect(a.getAttribute("href")).toMatch(/^https:\/\//);
+    }
+    expect(hasExecutableInjection(host)).toBe(false);
+  });
+
   it("路径样式的行内代码只挂候选标记，不在 Markdown 层伪造链接", () => {
     const host = mount(
       renderMarkdown(
@@ -70,16 +99,57 @@ describe("Markdown 渲染：模型常用记法", () => {
     expect([...host.querySelectorAll("code")].at(-1)!.textContent).toBe("Math.max");
   });
 
+  it("反引号里的覆盖率引用只把文件名当探测路径，说明留在可见文本里", () => {
+    const host = mount(
+      renderMarkdown(
+        '`vitest.config.ts：lines 75 / branches 78 / functions 88，锁在实测下方"只许升不许降"`',
+      ),
+    );
+    const code = host.querySelector("code[data-local-path]")!;
+    expect(code.getAttribute("data-local-path")).toBe("vitest.config.ts");
+    expect(code.textContent).toContain("vitest.config.ts");
+    expect(code.textContent).toContain("只许升不许降");
+    expect(host.querySelector("a")).toBeNull();
+  });
+
+  it("正文里没进反引号的文件引用也挂探测标记，光文件名不误伤", () => {
+    const host = mount(
+      renderMarkdown(
+        'vitest.config.ts：lines 75 / branches 78，以及 src/context.ts:205。旁边的 index.html 和 Math.max 不动。',
+      ),
+    );
+    const marked = [...host.querySelectorAll("code[data-local-path]")].map((node) =>
+      node.getAttribute("data-local-path"),
+    );
+    expect(marked).toEqual(["vitest.config.ts", "src/context.ts"]);
+    expect(host.textContent).toContain("lines 75");
+    expect(host.textContent).toContain(":205");
+    expect(host.textContent).toContain("index.html");
+    expect(host.querySelectorAll("code")).toHaveLength(2);
+  });
+
   it.each([
     ["D:\\Work\\demo\\main.ts:12", true],
     ["../docs/readme.md", true],
     ["My Report.docx", true],
     [".env", true],
+    ["vitest.config.ts：lines 75 / branches 78", true],
+    ["/", false],
     ["npm run test", false],
     ["Math.max", false],
     ["https://example.com/a.txt", false],
   ])("本地路径候选初筛：%s → %s", (value, expected) => {
     expect(isLocalPathCandidate(value)).toBe(expected);
+  });
+
+  it("从覆盖率引用里抽出文件名", () => {
+    expect(extractLocalPathRef('vitest.config.ts：lines 75 / branches 78 / functions 88')).toEqual({
+      path: "vitest.config.ts",
+      raw: "vitest.config.ts：lines 75 / branches 78 / functions 88",
+    });
+    expect(extractLocalPathRef("src/app.js:12:4")?.path).toBe("src/app.js");
+    expect(extractLocalPathRef("src/context.ts:205。旁边的")?.path).toBe("src/context.ts");
+    expect(extractLocalPathRef("Math.max")).toBeNull();
   });
 
   it("无序与有序列表", () => {
@@ -151,6 +221,53 @@ describe("Markdown 渲染：安全（模型输出是不可信输入）", () => {
     expect(a.getAttribute("href")).toBe("https://example.com/a?b=1&c=2");
     expect(a.getAttribute("rel")).toContain("noopener");
     expect(a.getAttribute("target")).toBe("_blank");
+  });
+
+  it("裸 http(s) 网址也收成可点链接（模型经常不包 Markdown 链语法）", () => {
+    const host = mount(
+      renderMarkdown(
+        "- 英文：https://en.wikipedia.org/wiki/Resistance_thermometer\n" +
+          "- NIST：https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.250-81.pdf",
+      ),
+    );
+    const hrefs = [...host.querySelectorAll("a")].map((a) => a.getAttribute("href"));
+    expect(hrefs).toContain("https://en.wikipedia.org/wiki/Resistance_thermometer");
+    expect(hrefs).toContain("https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.250-81.pdf");
+    const wiki = host.querySelector('a[href="https://en.wikipedia.org/wiki/Resistance_thermometer"]')!;
+    expect(wiki.getAttribute("target")).toBe("_blank");
+    expect(wiki.getAttribute("rel")).toContain("noopener");
+  });
+
+  it("句末句号不吃进网址；维基路径里的括号要保住", () => {
+    const host = mount(
+      renderMarkdown("见 https://en.wikipedia.org/wiki/Foo_(bar)。以及 https://example.com/a。"),
+    );
+    const hrefs = [...host.querySelectorAll("a")].map((a) => a.getAttribute("href"));
+    expect(hrefs).toContain("https://en.wikipedia.org/wiki/Foo_(bar)");
+    expect(hrefs).toContain("https://example.com/a");
+    expect(host.textContent).toContain("。");
+  });
+
+  it("已经是 [文字](链接) 的不套两层 a", () => {
+    const host = mount(renderMarkdown("看 [文档](https://example.com/a)"));
+    expect(host.querySelectorAll("a")).toHaveLength(1);
+    expect(host.querySelector("a")!.textContent).toBe("文档");
+  });
+
+  it("行内代码和围栏里的网址保持文本，不成链", () => {
+    const host = mount(renderMarkdown("跑 `https://example.com/x`\n\n```\nhttps://example.com/y\n```"));
+    expect(host.querySelector("a")).toBeNull();
+    expect(host.querySelector("code")!.textContent).toBe("https://example.com/x");
+  });
+
+  it("查询串里的 & 还原进 href，不把实体留在协议里", () => {
+    const a = mount(renderMarkdown("https://example.com/a?b=1&c=2")).querySelector("a")!;
+    expect(a.getAttribute("href")).toBe("https://example.com/a?b=1&c=2");
+  });
+
+  it("行内模式同样把裸网址收成链", () => {
+    const a = mount(renderMarkdownInline("来源 https://srdata.nist.gov/its90/main/")).querySelector("a")!;
+    expect(a.getAttribute("href")).toBe("https://srdata.nist.gov/its90/main/");
   });
 
   it("代码块里的 HTML 也不执行", () => {

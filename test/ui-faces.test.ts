@@ -28,6 +28,8 @@ import {
   deriveContextBudgetKnob,
   buildNewRunRequest,
   contextSourceLabel,
+  contextUsageBarScale,
+  contextUsageSegmentPct,
 } from "../ui/public/app.js";
 
 const HARNESS = {
@@ -185,9 +187,11 @@ describe("deriveContextFace", () => {
 
   it("水位分子是最近一轮输入，不是全程累计", () => {
     const f = deriveContextFace(withUsage(), HARNESS);
-    // 第二轮 120+0+600 = 720，而累计是 350+720=1070——按累计会得到 >100% 的假警报
+    // 窗口占用仍含 cache_read：第二轮 120+0+600 = 720（累计 1070 不进分子）
     expect(f.lastInputTokens).toBe(720);
-    expect(f.ratio).toBeCloseTo(0.72);
+    // 压缩水位只看新鲜 token：120 / 1000，不能让 600 的 cache_read 冒充「即将压缩」
+    expect(f.lastFreshTokens).toBe(120);
+    expect(f.ratio).toBeCloseTo(0.12);
     expect(f.nearWatermark).toBe(false);
   });
 
@@ -1291,5 +1295,27 @@ describe("MEM-01 上下文窗口（事实）与预算（策略）分离", () => 
     }
     expect(contextSourceLabel("unknown")).toBe("未知");
     expect(contextSourceLabel(undefined)).toBe("未知");
+  });
+});
+
+describe("上下文分项条相对窗口占宽", () => {
+  it("118.9k / 1048.6k 合计只涂约 11%，不会把已用量画成满条", () => {
+    const parts = [823, 2_900, 595, 9_900, 72_100, 32_500];
+    const used = parts.reduce((n, t) => n + t, 0);
+    const window = 1_048_600;
+    const scale = contextUsageBarScale(used, window);
+    expect(scale).toBe(window);
+    const filled = parts.reduce((n, t) => n + contextUsageSegmentPct(t, scale), 0);
+    expect(filled).toBeCloseTo((used / window) * 100, 5);
+    expect(filled).toBeGreaterThan(10);
+    expect(filled).toBeLessThan(13);
+    // 变异：若分母改成已用量，合计会贴近 100
+    expect(filled).not.toBeCloseTo(100, 0);
+  });
+
+  it("窗口未知时才退回已用量（只能看构成）", () => {
+    expect(contextUsageBarScale(118_900, null)).toBe(118_900);
+    expect(contextUsageBarScale(118_900, 0)).toBe(118_900);
+    expect(contextUsageSegmentPct(0, 1_000)).toBe(0);
   });
 });

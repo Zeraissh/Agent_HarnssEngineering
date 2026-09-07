@@ -38,6 +38,19 @@
         <span>项目与对话</span>
       </span>
     </div>
+    <!-- 通知中心入口（T4）：铃铛 + 待决定未读角标。按钮在静态骨架里，
+         面板与行为由 features/notifications.js 初始化时挂载。 -->
+    <button type="button" class="icon-btn notifications-btn" id="notifications-btn"
+      aria-label="通知中心" aria-haspopup="dialog" aria-expanded="false">
+      <i class="ph ph-bell" aria-hidden="true"></i>
+      <span class="notifications-badge" id="notifications-badge" hidden>0</span>
+    </button>
+    <!-- 记忆面板入口（T5）：按钮在静态骨架里，
+         面板与行为由 features/memory-panel.js 初始化时挂载。 -->
+    <button type="button" class="icon-btn memory-btn" id="memory-btn"
+      aria-label="记忆" aria-haspopup="dialog" aria-expanded="false">
+      <i class="ph ph-brain" aria-hidden="true"></i>
+    </button>
     <div class="theme-picker" id="theme-picker">
       <button type="button" class="theme-toggle icon-btn" id="theme-toggle"
         aria-label="选择配色主题" aria-haspopup="menu" aria-expanded="false">
@@ -73,6 +86,16 @@
     </div>
   </div>
   <div class="sidebar-search">
+    <button type="button" class="palette-open-btn" id="palette-open-btn" aria-label="打开命令面板（Ctrl+K）">
+      <i class="ph ph-command" aria-hidden="true"></i>
+      <span>命令面板</span>
+      <kbd class="palette-kbd" aria-hidden="true">⌘K</kbd>
+    </button>
+    <!-- 指挥中心入口（T11）：点击走 hash 路由 #/board，由 features/command-center.js 绑定 -->
+    <button type="button" class="palette-open-btn" id="board-open-btn" aria-label="打开指挥中心">
+      <i class="ph ph-squares-four" aria-hidden="true"></i>
+      <span>指挥中心</span>
+    </button>
     <button type="button" class="btn btn--primary new-chat-btn" id="new-chat-btn">
       <i class="ph ph-plus" aria-hidden="true"></i>
       <span>新建对话</span>
@@ -98,6 +121,19 @@
        违规——这条是 axe 扫描器上线首跑抓到的（s3d 手工修复引入的新问题） -->
   <div id="run-list" class="run-list">
     <div class="run-list-empty">加载中…</div>
+  </div>
+  <!-- 设置中心入口（T7）：按钮在静态骨架里，视图与行为由 features/settings.js
+       初始化时挂载；点击走 hash 路由 #/settings。
+       定时任务入口（T9）同理：#/schedules。 -->
+  <div class="sidebar-footer">
+    <button type="button" class="settings-open-btn" id="schedules-open-btn" aria-label="打开定时任务">
+      <i class="ph ph-clock" aria-hidden="true"></i>
+      <span>定时任务</span>
+    </button>
+    <button type="button" class="settings-open-btn" id="settings-open-btn" aria-label="打开设置">
+      <i class="ph ph-gear" aria-hidden="true"></i>
+      <span>设置</span>
+    </button>
   </div>
 </aside>
 
@@ -140,13 +176,6 @@
        派生逻辑在 app.js 的 deriveComposerMode / patchComposer 里（因此可测）。 -->
   <form id="submit-form" class="submit-bar" autocomplete="off">
     <div class="composer-scopebar" id="composer-scopebar">
-      <div class="composer-mode-block">
-        <span class="composer-mode-mark" aria-hidden="true"><i class="ph ph-chat-circle-dots"></i></span>
-        <span>
-          <span class="composer-caption">当前操作</span>
-          <strong id="composer-mode-label">新建对话</strong>
-        </span>
-      </div>
       <div class="scope-field scope-field--workdir">
         <i class="ph ph-folder-simple" aria-hidden="true"></i>
         <label for="workdir-select">工作目录</label>
@@ -212,11 +241,41 @@
         <input type="checkbox" id="verify-toggle" />
         <span>独立核查</span>
       </label>
-      <span class="composer-quick-hint"><i class="ph ph-shield-check" aria-hidden="true"></i> 写入仍受审批与工作目录边界约束</span>
+      <label class="checkbox-label auto-approve-label">
+        <input type="checkbox" id="auto-approve-toggle" checked />
+        <span>自动放行工具</span>
+      </label>
+      <label class="effort-field" for="effort-select">
+        <span>思考强度</span>
+        <select id="effort-select" title="控制模型想多深，不是 token 上限">
+          <option value="">默认</option>
+        </select>
+      </label>
+      <span class="composer-quick-hint"><i class="ph ph-shield-check" aria-hidden="true"></i> 写入仍受工作目录边界约束</span>
+      <!-- 上下文圆环：钉在提交栏右下角；面板向上展开，避免被视口裁切 -->
+      <div class="ctx-ring-wrap ctx-ring-wrap--composer" id="ctx-ring-wrap">
+        <button type="button" class="ctx-ring" id="ctx-ring" hidden
+          aria-expanded="false" aria-controls="ctx-usage-panel" title="上下文用量">
+          <svg class="ctx-ring-svg" viewBox="0 0 36 36" aria-hidden="true">
+            <circle class="ctx-ring-track" cx="18" cy="18" r="15.5" fill="none" stroke-width="3" />
+            <circle class="ctx-ring-arc" cx="18" cy="18" r="15.5" fill="none" stroke-width="3"
+              stroke-dasharray="0 100" stroke-linecap="round" transform="rotate(-90 18 18)" />
+          </svg>
+          <span class="sr-only ctx-ring-label">上下文</span>
+        </button>
+        <div class="ctx-usage-panel" id="ctx-usage-panel" hidden></div>
+      </div>
     </div>
     <!-- 模式说明。独立于 #submit-error：后者是 role="alert"，
          "这次提交会去哪儿"不是错误，不该被当成警报播报 -->
     <p id="composer-note" class="composer-note knob-hint" hidden></p>
+    <div id="budget-extend-row" class="budget-extend-row" hidden>
+      <button type="button" id="budget-extend-btn" class="btn btn--ghost">
+        <i class="ph ph-plus-circle" aria-hidden="true"></i>
+        <span>追加预算继续本对话</span>
+      </button>
+      <span class="knob-hint">当场给谱系加一段 token 跑道，不必改环境变量或重启宿主</span>
+    </div>
     <p id="submit-error" class="inline-error" role="alert" hidden></p>
     <ul id="upload-list" class="upload-list" hidden></ul>
 
@@ -228,64 +287,26 @@
         <select id="pack-select">
           <option value="">（不用领域包）</option>
         </select>
-        <span class="knob-hint" id="pack-hint"></span>
       </div>
       <div class="knob">
-        <label for="effort-select">思考预算</label>
-        <select id="effort-select">
-          <option value="">（默认）</option>
-        </select>
-        <span class="knob-hint" id="effort-hint"></span>
-      </div>
-      <div class="knob">
-        <label for="mode-select">编排模式</label>
-        <select id="mode-select">
-          <option value="single">单任务（直接执行）</option>
-          <option value="plan">计划编排（拆解 + 依赖调度）</option>
-        </select>
-        <span class="knob-hint" id="mode-hint">单领域任务上编排是纯开销——它的价值在跨领域交接。</span>
-      </div>
-      <div class="knob">
-        <label for="concurrency-select">并行度</label>
-        <select id="concurrency-select" disabled>
-          <option value="auto">auto（min(3, 层宽)）</option>
-          <option value="1">1（串行）</option>
-          <option value="2">2</option>
-          <option value="3">3</option>
-          <option value="4">4</option>
-        </select>
-        <span class="knob-hint">并行买的是时间不是 token。cap=3 是收益曲线拐点。</span>
-      </div>
-      <div class="knob">
-        <label id="plan-gate-label">计划确认门</label>
-        <label class="checkbox-label">
-          <input type="checkbox" id="plan-gate-toggle" disabled />
-          <span>计划产出后等我签字再开跑</span>
+        <label for="plan-mode-toggle">计划模式</label>
+        <label class="knob-check">
+          <input type="checkbox" id="plan-mode-toggle" />
+          确认门（拆解后等人批）
         </label>
-        <span class="knob-hint">挂起点在第一个子任务发射之前——此时否决零副作用。仅编排模式可用。</span>
+        <span class="knob-hint" id="mode-hint">每一轮都可选。开 = planner 出图后等你批准再跑</span>
       </div>
       <div class="knob">
-        <label id="ask-user-label">需求澄清</label>
-        <label class="checkbox-label">
-          <input type="checkbox" id="ask-user-toggle" checked />
-          <span>遇到岔路口可以问我</span>
+        <label for="multi-agent-toggle">多 agent</label>
+        <label class="knob-check">
+          <input type="checkbox" id="multi-agent-toggle" />
+          并行子任务（auto，最多 3）
         </label>
-        <span class="knob-hint">交互式 Web 默认开；只问猜错会返工的岔路或只有你知道的事实。最多打断 3 次（每次 1~4 题），API 未显式传 askUser 时仍默认关。</span>
-      </div>
-      <!-- MEM-01 窗口 / 预算分离：预算是策略、窗口是事实。区间与窗口由 /api/harness 给，
-           越界由宿主 400 报区间（这里只提示不阻断）；>200k 给成本忠告，无人值守不弹确认 -->
-      <div class="knob">
-        <label for="context-budget-input">上下文预算</label>
-        <input type="number" id="context-budget-input" inputmode="numeric" step="1000" min="32000"
-               aria-describedby="context-budget-hint context-budget-advisory" placeholder="150000（默认）" />
-        <span class="knob-hint" id="context-budget-hint">窗口未知 · 可用 32k..2,000k</span>
-        <!-- 忠告出现在输入之后，屏幕阅读器要能听见它冒出来（role=status 而不是只改文本） -->
-        <span class="knob-hint knob-hint--advisory" id="context-budget-advisory" role="status" hidden></span>
+        <span class="knob-hint">每一轮都可选。与计划模式正交：可只开多 agent（自动批、无确认门）</span>
       </div>
       <div class="knob knob--wide">
         <label for="rubric-input">主观评分表</label>
         <textarea id="rubric-input" rows="2" placeholder="逐条列出评分项，核查者按表评估进 advisory——不影响 passed，也不触发返工"></textarea>
-        <span class="knob-hint">需同时勾选「开启独立核查」才会生效。</span>
       </div>
     </div>
   </form>
@@ -311,16 +332,19 @@ import {
   applyCollapseOverrides,
   nextCollapseOverride,
   deriveRunListItems,
+  deriveThreadFiles,
+  deriveSessionFiles,
+  conversationChainIds,
+  ancestorRunIds,
   filterRunsByStatus,
   filterRunsByQuery,
+  conversationTipId,
   renderRunList,
   renderRunDetail,
   renderEmptyState,
   deriveComposerMode,
   composerSubmitPlan,
   buildNewRunRequest,
-  deriveContextBudgetKnob,
-  normalizeContextConfig,
   buildFollowUpRequest,
   mergeForkedFollowUp,
   patchComposer,
@@ -329,6 +353,32 @@ import {
   paceReveal,
   revealedWindow,
 } from "/app.js";
+import {
+  loadSettings,
+  saveSettings,
+  updateSettings,
+  migrateLegacyPrefs,
+  composerDefaults,
+  applyComposerDefaults,
+  isSettingsRoute,
+  SETTINGS_HASH,
+  initSettingsView,
+} from "/features/settings.js";
+import {
+  isSchedulesRoute,
+  SCHEDULES_HASH,
+  initSchedulesView,
+} from "/features/schedules.js";
+import {
+  parseArtifactRoute,
+  encodeArtifactHash,
+  initArtifactCanvas,
+} from "/features/artifact-canvas.js";
+import {
+  isCommandCenterRoute,
+  COMMAND_CENTER_HASH,
+  initCommandCenterView,
+} from "/features/command-center.js";
 
 // ---- 状态 ----
 /** @type {Map<string, import('/app.js').RunState>} */
@@ -336,6 +386,162 @@ const runStates = new Map();
 let selectedRunId = /** @type {string|null} */ (null);
 let runs = /** @type {{runId:string, task:string, status:string, verify:boolean, createdAt:number, finishedAt:number|null}[]} */ ([]);
 let eventSources = /** @type {Map<string, EventSource>} */ (new Map());
+
+/** 通知中心（T4）实例，由文件末尾的动态 import 赋值；未加载时为 null，所有调用点可选链 */
+let notificationsApi = /** @type {null|{ ingest:(runId:string, sseEvent:any)=>void, syncRuns:()=>void, removeRun:(runId:string)=>void }} */ (null);
+
+/**
+ * 设置中心（T7）。settingsApi 由文件末尾初始化；uiSettings 是「运行默认值」
+ * 与 composer 启动态的同源出处——composer 的三个控件（思考强度/独立核查/
+ * 自动放行）启动时读它，当次改动不回写（除了自动放行，见下方 change 处理器）。
+ */
+let settingsApi = /** @type {null|{ open:()=>void, close:()=>void, isOpen:()=>boolean, refresh:()=>void }} */ (null);
+
+/**
+ * 变更审查（T8）实例，由文件末尾的动态 import 赋值；未加载时为 null，所有调用点可选链。
+ * unregisterChangesCommand 是命令面板「查看本次变更」的注销函数——该命令仅在
+ * 打开会话时可用，选中态变化时随之注册/注销。
+ */
+let changesApi = /** @type {null|{ mount:(el:Element)=>void, setRun:(id:string|null)=>void, reveal:()=>boolean, refresh:()=>Promise<void> }} */ (null);
+let unregisterChangesCommand = /** @type {null|(() => void)} */ (null);
+
+/**
+ * 过程/结论双模式阅读（T12）实例，由文件末尾的动态 import 赋值；未加载时为 null。
+ * 每次 renderDetailWithState 后调 update(backBar, conversation) 做 DOM 后处理。
+ */
+let readingModeApi = /** @type {null|{ update:(backBar:Element|null, conversation:Element|null)=>void, syncFromStorage:()=>void, setMode:(m:string)=>void }} */ (null);
+
+/** 「查看本次变更」只在打开会话时出现在命令面板里 */
+function syncChangesCommand() {
+  if (selectedRunId && changesApi && !unregisterChangesCommand) {
+    import("./features/command-palette.js").then((palette) => {
+      // 再次确认选中态——import 是异步的，期间用户可能已返回列表
+      if (!selectedRunId || unregisterChangesCommand || !changesApi) return;
+      unregisterChangesCommand = palette.registerPaletteCommand({
+        id: "view-changes",
+        label: "查看本次变更",
+        hint: "这次运行触碰了哪些文件（右栏「变更」分区）",
+        icon: "ph-files",
+        run: () => { changesApi?.reveal(); },
+      });
+    }).catch(() => { /* 命令面板注册失败不影响分区本体 */ });
+  } else if (!selectedRunId && unregisterChangesCommand) {
+    unregisterChangesCommand();
+    unregisterChangesCommand = null;
+  }
+}
+
+// ---- 产物画布（T10）----
+// artifactCanvasApi 由文件末尾初始化（静态 import 的模块，try/catch 兜底）。
+// 数据口径与右栏「产物」区完全一致：deriveThreadFiles 优先、空则 deriveSessionFiles
+// ——画布清单换了数据源，就会出现"右栏点得到、画布里没有"的两张皮。
+let artifactCanvasApi = /** @type {null|{ open:(i:number)=>boolean, close:()=>void, isOpen:()=>boolean, currentIndex:()=>number, element:HTMLElement }} */ (null);
+/** 深链待恢复：选中 run 的 state 可能要等 SSE 流到产物才够数据，先记账，渲染后补开 */
+let pendingArtifact = /** @type {null|{ runId:string, index:number }} */ (null);
+/** 语义同 enteredSettingsFromApp：深链直达时「关闭」回 run 页而不是 history.back */
+let enteredCanvasFromApp = false;
+let unregisterArtifactCommand = /** @type {null|(() => void)} */ (null);
+
+/** 当前会话的产物清单——与 patchDetailRail 的文件源同一口径 */
+function currentRunArtifacts(runId) {
+  const state = runStates.get(runId);
+  if (!state) return [];
+  const thread = deriveThreadFiles(runs, runStates, runId);
+  return thread.length ? thread : deriveSessionFiles(state);
+}
+
+/** 打开画布：走 hash 路由，浏览器前进/后退天然可用 */
+function openArtifactByIndex(runId, index) {
+  if (!runId || currentRunArtifacts(runId).length === 0) return;
+  enteredCanvasFromApp = true;
+  const target = encodeArtifactHash(runId, index);
+  if (location.hash === target) {
+    artifactCanvasApi?.open(index);
+    return;
+  }
+  location.hash = target;
+}
+
+/** 产物卡入口：按路径定位到清单序号 */
+function openArtifactByPath(runId, path) {
+  const index = currentRunArtifacts(runId).findIndex((a) => a.path === path);
+  if (index < 0) {
+    announceStatus("找不到该产物");
+    return;
+  }
+  openArtifactByIndex(runId, index);
+}
+
+/** 深链/切换落点：数据够了就开，不够就留着 pending 等下一次渲染 */
+function openPendingArtifact() {
+  if (!pendingArtifact) return;
+  const { runId, index } = pendingArtifact;
+  if (runId !== selectedRunId) return;
+  if (currentRunArtifacts(runId).length === 0) return;
+  if (artifactCanvasApi?.open(index)) pendingArtifact = null;
+}
+
+/** 画布的「关闭」：应用内进入 → 历史后退到来处；深链直达 → 回 run 页 */
+function closeArtifactRoute() {
+  if (enteredCanvasFromApp && history.length > 1) {
+    history.back();
+    return;
+  }
+  const runId = selectedRunId;
+  location.hash = runId ? `#/run/${runId}/${normalizeTab(activeTabs.get(runId))}` : "#/";
+}
+
+/** 「预览最近产物」只在有产物的会话里出现在命令面板（同 syncChangesCommand 纪律） */
+function syncArtifactCommand() {
+  const has = Boolean(selectedRunId) && currentRunArtifacts(selectedRunId).length > 0;
+  if (has && artifactCanvasApi && !unregisterArtifactCommand) {
+    import("./features/command-palette.js").then((palette) => {
+      // 再次确认选中态——import 是异步的，期间用户可能已返回列表
+      if (!selectedRunId || unregisterArtifactCommand) return;
+      unregisterArtifactCommand = palette.registerPaletteCommand({
+        id: "preview-latest-artifact",
+        label: "预览最近产物",
+        hint: "在画布中打开本次运行最近写出的产物（Esc 关闭，←/→ 切换）",
+        icon: "ph-eye",
+        run: () => {
+          const list = selectedRunId ? currentRunArtifacts(selectedRunId) : [];
+          if (list.length > 0) openArtifactByIndex(selectedRunId, list.length - 1);
+        },
+      });
+    }).catch(() => { /* 命令面板注册失败不影响画布本体 */ });
+  } else if (!has && unregisterArtifactCommand) {
+    unregisterArtifactCommand();
+    unregisterArtifactCommand = null;
+  }
+}
+
+/** 记录设置视图是否从应用内进入：深链直达 #/settings 时「返回」回主视图而不是 history.back */
+let enteredSettingsFromApp = false;
+
+/**
+ * 定时任务（T9）。schedulesApi 由文件末尾初始化；路由纪律与设置中心相同。
+ * enteredSchedulesFromApp 语义同 enteredSettingsFromApp。
+ */
+let schedulesApi = /** @type {null|{ open:()=>void, close:()=>void, isOpen:()=>boolean, refresh:()=>void }} */ (null);
+let enteredSchedulesFromApp = false;
+
+/**
+ * 指挥中心（T11）。boardApi 由文件末尾初始化；路由纪律与设置中心相同，
+ * enteredBoardFromApp 语义同 enteredSettingsFromApp。
+ * 数据全部来自宿主既有状态：run 列表、runStates、通知中心 store——模块不建
+ * 第二份账本，也不新建 EventSource；实时性靠 batcher 节拍里的 boardApi.refresh()。
+ */
+let boardApi = /** @type {null|{ open:()=>void, close:()=>void, isOpen:()=>boolean, refresh:()=>void }} */ (null);
+let enteredBoardFromApp = false;
+let uiSettings = (() => {
+  try {
+    const loaded = loadSettings(localStorage);
+    // 旧键 agent-ui-auto-approve 一次性迁入（settings 已显式记录过则以它为准）
+    return migrateLegacyPrefs(localStorage, loaded).settings;
+  } catch {
+    return loadSettings(null);
+  }
+})();
 
 // R-03 标签页状态（每个 run 独立）
 /** @type {Map<string, string>} */
@@ -474,16 +680,12 @@ const runKnobs = /** @type {HTMLElement} */ (document.getElementById("run-knobs"
 const packSelect = /** @type {HTMLSelectElement} */ (document.getElementById("pack-select"));
 const effortSelect = /** @type {HTMLSelectElement} */ (document.getElementById("effort-select"));
 const rubricInput = /** @type {HTMLTextAreaElement} */ (document.getElementById("rubric-input"));
-const modeSelect = /** @type {HTMLSelectElement} */ (document.getElementById("mode-select"));
-const concurrencySelect = /** @type {HTMLSelectElement} */ (document.getElementById("concurrency-select"));
-const planGateToggle = /** @type {HTMLInputElement} */ (document.getElementById("plan-gate-toggle"));
-const askUserToggle = /** @type {HTMLInputElement} */ (document.getElementById("ask-user-toggle"));
+const planModeToggle = /** @type {HTMLInputElement|null} */ (document.getElementById("plan-mode-toggle"));
+const multiAgentToggle = /** @type {HTMLInputElement|null} */ (document.getElementById("multi-agent-toggle"));
+const autoApproveToggle = /** @type {HTMLInputElement} */ (document.getElementById("auto-approve-toggle"));
 const workdirSelect = /** @type {HTMLSelectElement} */ (document.getElementById("workdir-select"));
 const useVerifierModel = /** @type {HTMLInputElement} */ (document.getElementById("use-verifier-model"));
 const usePlannerModel = /** @type {HTMLInputElement} */ (document.getElementById("use-planner-model"));
-const contextBudgetInput = /** @type {HTMLInputElement} */ (document.getElementById("context-budget-input"));
-const contextBudgetHint = /** @type {HTMLElement} */ (document.getElementById("context-budget-hint"));
-const contextBudgetAdvisory = /** @type {HTMLElement} */ (document.getElementById("context-budget-advisory"));
 const sidebar = /** @type {HTMLElement} */ (document.getElementById("sidebar"));
 const mainPanel = /** @type {HTMLElement} */ (document.getElementById("main-panel"));
 const runFilter = /** @type {HTMLSelectElement} */ (document.getElementById("run-filter"));
@@ -522,6 +724,11 @@ function exitDetailMode() {
   selectedRunId = null;
   refreshRunListView();
   renderEmptyState(runs.length > 0);
+  changesApi?.setRun(null); // T8：离开会话，变更分区随之收起
+  syncChangesCommand();
+  artifactCanvasApi?.close(); // T10：离开会话，画布与挂账的深链一并收起
+  pendingArtifact = null;
+  syncArtifactCommand();
 }
 
 function backToList() {
@@ -542,14 +749,41 @@ function getFilteredRuns() {
 }
 
 function refreshRunListView() {
+  if (selectedRunId) {
+    const tip = conversationTipId(runs, selectedRunId);
+    if (tip && tip !== selectedRunId) {
+      selectRun(tip);
+      return;
+    }
+  }
   const filtered = getFilteredRuns();
   const metaMap = deriveRunListItems(filtered, runStates, unreadRuns);
-  renderRunList(filtered, selectedRunId, selectRun, metaMap);
+  renderRunList(filtered, selectedRunId, selectRun, metaMap, deleteConversation);
   if (!selectedRunId) {
     renderEmptyState(runs.length > 0);
   }
   // 选中态、列表内容、run 状态三者任一变了底栏就可能换模式——这里是它们的汇合点
   syncComposer();
+}
+
+async function deleteConversation(runId) {
+  if (!runId) return;
+  const ok = window.confirm("删除这条对话？档案一并去掉，不能恢复。");
+  if (!ok) return;
+  const ids = conversationChainIds(runs, runId);
+  for (const id of ids) {
+    try {
+      const res = await fetch(`/api/runs/${encodeURIComponent(id)}`, { method: "DELETE" });
+      if (!res.ok && res.status !== 404) {
+        const body = await res.json().catch(() => ({}));
+        showSubmitError(body.error ?? `删除失败（HTTP ${res.status}）`);
+        return;
+      }
+    } catch (err) {
+      showSubmitError(`删除失败：${err.message ?? "网络错误"}`);
+      return;
+    }
+  }
 }
 
 async function loadRuns() {
@@ -558,6 +792,11 @@ async function loadRuns() {
     if (!res.ok) return;
     runs = await res.json();
     refreshRunListView();
+    if (selectedRunId) syncAutoApprove(selectedRunId);
+    // 列表是通知中心对历史 run 的对账来源（首次调用只播种，不刷屏）
+    notificationsApi?.syncRuns();
+    // 指挥中心随列表对账一起刷新（运行中/最近完成两栏的数据源就是这份列表）
+    boardApi?.refresh();
   } catch {
     // 服务器未就绪时静默
   }
@@ -589,11 +828,23 @@ function selectRun(runId) {
   const state = ensureState(runId);
   if (!state) return;
   syncConnectionBanner();
+  hydrateThreadAncestors(runId);
   renderDetailWithState(state);
   enterDetailMode();
   writeHash(runId, activeTabs.get(runId));
   announceStatus(`已选择运行：${state.task}`);
   ensureSubscription(runId);
+  syncAutoApprove(runId);
+}
+
+/** 谱系上的父 run 也要有事件流，对话才能按收官形态拼出来。 */
+function hydrateThreadAncestors(tipId) {
+  for (const id of ancestorRunIds(runs, tipId)) {
+    if (id === tipId) continue;
+    const st = ensureState(id);
+    if (!st) continue;
+    if ((st.timeline?.length ?? 0) === 0) ensureSubscription(id);
+  }
 }
 
 function ensureState(runId) {
@@ -631,7 +882,8 @@ document.addEventListener("tab-switch", (e) => {
 });
 
 // ---- hash 路由（V-17）----
-// 深链与刷新不丢位置：#/run/<id>/<face>。零依赖，不引路由库。
+// 深链与刷新不丢位置：#/run/<id>/<face>；设置中心占 #/settings（T7）。
+// 零依赖，不引路由库。
 let suppressHashHandling = false;
 
 function writeHash(runId, tab) {
@@ -639,19 +891,140 @@ function writeHash(runId, tab) {
   if (location.hash === next) return;
   suppressHashHandling = true;
   location.hash = next;
+  // 程序化导航离开设置/定时任务/产物画布/指挥中心视图（writeHash 抑制了 hashchange，applyHash 不会替我们关）
+  settingsApi?.close();
+  schedulesApi?.close();
+  boardApi?.close();
+  artifactCanvasApi?.close();
+  pendingArtifact = null;
   // hashchange 是异步派发的，标志位要等它跑完再清
   setTimeout(() => { suppressHashHandling = false; }, 0);
 }
 
-function parseHash() {
+/**
+ * 六路路由：设置视图 / 定时任务视图 / 指挥中心 / 产物画布 / 会话详情 / 主视图。
+ * 设置路由的判定与 features/settings.js 的 isSettingsRoute 共用一条，不各写一份。
+ * 定时任务路由同理（features/schedules.js 的 isSchedulesRoute）。
+ * 指挥中心同理（features/command-center.js 的 isCommandCenterRoute）。
+ * 产物画布（features/artifact-canvas.js 的 parseArtifactRoute）必须先于通用
+ * `#/run/<id>/<tab>` 判定——否则 "artifact/3" 会被 normalizeTab 吞成 loop。
+ */
+function parseRoute() {
+  if (isSettingsRoute(location.hash || "")) return { kind: "settings" };
+  if (isSchedulesRoute(location.hash || "")) return { kind: "schedules" };
+  if (isCommandCenterRoute(location.hash || "")) return { kind: "board" };
+  const artifact = parseArtifactRoute(location.hash || "");
+  if (artifact) return { kind: "artifact", runId: artifact.runId, index: artifact.index };
   const m = /^#\/run\/([^/]+)(?:\/([^/?]+))?/.exec(location.hash || "");
-  if (!m) return null;
-  return { runId: decodeURIComponent(m[1]), tab: normalizeTab(m[2]) };
+  if (!m) return { kind: "home" };
+  return { kind: "run", runId: decodeURIComponent(m[1]), tab: normalizeTab(m[2]) };
+}
+
+/** 进入设置视图：走 hash，浏览器前进/后退天然可用 */
+function navigateToSettings() {
+  enteredSettingsFromApp = true;
+  if (isSettingsRoute(location.hash || "")) {
+    settingsApi?.open();
+    return;
+  }
+  location.hash = SETTINGS_HASH;
+}
+
+/** 进入定时任务视图：与设置视图同一条 hash 路由纪律 */
+function navigateToSchedules() {
+  enteredSchedulesFromApp = true;
+  if (isSchedulesRoute(location.hash || "")) {
+    schedulesApi?.open();
+    return;
+  }
+  location.hash = SCHEDULES_HASH;
+}
+
+/** 设置视图的「返回」：应用内进入 → 历史后退到来处；深链直达 → 回主视图 */
+function closeSettingsRoute() {
+  if (enteredSettingsFromApp && history.length > 1) {
+    history.back();
+    return;
+  }
+  location.hash = "#/";
+}
+
+/** 定时任务视图的「返回」：同设置视图 */
+function closeSchedulesRoute() {
+  if (enteredSchedulesFromApp && history.length > 1) {
+    history.back();
+    return;
+  }
+  location.hash = "#/";
+}
+
+/** 进入指挥中心视图：与设置视图同一条 hash 路由纪律 */
+function navigateToBoard() {
+  enteredBoardFromApp = true;
+  if (isCommandCenterRoute(location.hash || "")) {
+    boardApi?.open();
+    return;
+  }
+  location.hash = COMMAND_CENTER_HASH;
+}
+
+/** 指挥中心视图的「返回」：同设置视图 */
+function closeBoardRoute() {
+  if (enteredBoardFromApp && history.length > 1) {
+    history.back();
+    return;
+  }
+  location.hash = "#/";
 }
 
 function applyHash() {
-  const route = parseHash();
-  if (!route) {
+  const route = parseRoute();
+  if (route.kind === "settings") {
+    schedulesApi?.close();
+    boardApi?.close();
+    settingsApi?.open();
+    return;
+  }
+  if (route.kind === "schedules") {
+    settingsApi?.close();
+    boardApi?.close();
+    schedulesApi?.open();
+    return;
+  }
+  if (route.kind === "board") {
+    settingsApi?.close();
+    schedulesApi?.close();
+    artifactCanvasApi?.close();
+    pendingArtifact = null;
+    boardApi?.open();
+    return;
+  }
+  settingsApi?.close();
+  schedulesApi?.close();
+  boardApi?.close();
+  if (route.kind === "artifact") {
+    // 产物画布深链：先确保会话选中（selectRun 的 writeHash 会盖掉深链，随后恢复），
+    // 产物清单就位后 openPendingArtifact 补开；state 还没流到产物时挂账等渲染。
+    pendingArtifact = { runId: route.runId, index: route.index };
+    if (route.runId !== selectedRunId) {
+      selectRun(route.runId);
+      const target = encodeArtifactHash(route.runId, route.index);
+      if (location.hash !== target) {
+        suppressHashHandling = true;
+        location.hash = target;
+        setTimeout(() => { suppressHashHandling = false; }, 0);
+      }
+    }
+    openPendingArtifact();
+    return;
+  }
+  artifactCanvasApi?.close();
+  pendingArtifact = null;
+  enteredCanvasFromApp = false;
+  enteredSettingsFromApp = false;
+  enteredSchedulesFromApp = false;
+  enteredBoardFromApp = false;
+  if (route.kind === "home") {
     if (selectedRunId) backToList();
     return;
   }
@@ -717,8 +1090,42 @@ function renderDetailWithState(state) {
     onPlanDecision: (decision) => postPlanDecision(runId, decision),
     onAnswer: (answers) => postAnswer(runId, answers),
     onReveal: (path) => revealArtifact(runId, path),
+    onOpenCanvas: (path) => openArtifactByPath(runId, path),
     inspectPaths: (paths) => inspectRunPaths(runId, paths),
+    unverifiedDismissed: dismissedUnverified.has(runId),
+    onDismissUnverified: () => {
+      dismissedUnverified.add(runId);
+      const next = runStates.get(runId);
+      if (next) renderDetailWithState(next);
+    },
+    onContinue: () => {
+      const text = taskInput.value.trim() || "继续";
+      void submitAppend({ runId, text });
+    },
+    threadFiles: deriveThreadFiles(runs, runStates, runId),
+    runs,
+    runStates,
   });
+  // T8 变更审查：详情骨架换 run 会整体重建，把分区节点搬回新的 rail-body
+  // 并指向当前 run（同一节点 re-parent，加载态与展开态不丢）
+  if (changesApi) {
+    const railBody = document.querySelector("#main-area .rail-body");
+    if (railBody) changesApi.mount(railBody);
+    changesApi.setRun(runId);
+  }
+  syncChangesCommand();
+  // T12 阅读模式：对话渲染落定后做后处理（聚焦模式藏过程元素、插摘要行；
+  // 完整模式即现状）。与 changes-panel 同一挂账时机，骨架重建时开关 re-parent。
+  if (readingModeApi) {
+    readingModeApi.update(
+      document.querySelector("#main-area .back-bar"),
+      document.querySelector("#main-area #conversation"),
+    );
+  }
+  // T10 产物画布：深链直达时 state 可能此刻才流到产物——补开挂账的画布；
+  // 命令随产物有无注册/注销（产物是流式到达的，不能只挂选中态）
+  openPendingArtifact();
+  syncArtifactCommand();
   // 本地 SSE 把状态推到 done 时列表未必同步刷新过——底栏要立刻从「运行中」
   // 变回「继续对话」，否则用户盯着一个死按钮等
   if (runId === selectedRunId) syncComposer();
@@ -765,12 +1172,19 @@ function refreshTranscriptIfWatching(runId) {
  * 服务端算好的 canContinue 仍是权威（V-28：不能让用户点了才吃 409），
  * 只是现在"不能追加"不再表现为"没有输入框"，而是同一个框换个去向 + 说明原因。
  */
+/** 人已经按了停止、run 还没落到 done。用来立刻改按钮，避免「点了像没点」。 */
+const stoppingRuns = new Set();
+/** 本页关掉的待复核条，按 run。刷新后还会再出现——那是新会话该看见的提醒。 */
+const dismissedUnverified = new Set();
+
 function syncComposer() {
   const info = selectedRunId ? runs.find((r) => r.runId === selectedRunId) ?? null : null;
+  if (info?.status === "done" && selectedRunId) stoppingRuns.delete(selectedRunId);
   composerMode = deriveComposerMode({
     info: info ? { ...info, runId: selectedRunId } : null,
     localStatus: selectedRunId ? runStates.get(selectedRunId)?.status ?? null : null,
     submitting,
+    stopping: Boolean(selectedRunId && stoppingRuns.has(selectedRunId)),
     // 错误按 run 隔离：否则 run A 的 409 会原样挂在切过去的 run B 头上
     // 刚发生的错误压过 run 上挂着的旧错；两者都按各自的时机清，
     // 所以切到另一个 run 时不会看见上一个 run 的 409
@@ -786,7 +1200,14 @@ async function postFollowUp(runId, text, verify) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       // verify 是本轮的核查开关（会话中心化：核查逐轮可选，缺省沿用上一轮）
-      body: JSON.stringify(buildFollowUpRequest({ text, verify })),
+      body: JSON.stringify(buildFollowUpRequest({
+        text,
+        verify,
+        autoApprove: autoApproveToggle?.checked !== false,
+        planMode: planModeToggle?.checked === true,
+        multiAgent: multiAgentToggle?.checked === true,
+        effort: effortSelect?.value,
+      })),
     });
     if (!res.ok) {
       let detail = `HTTP ${res.status}`;
@@ -816,7 +1237,7 @@ async function postFollowUp(runId, text, verify) {
       refreshRunListView();
       selectRun(fork.targetRunId);
       ensureSubscription(fork.targetRunId);
-      announceStatus(`已从归档派生新运行：${merged.task}`);
+      announceStatus("对话已接续");
       return;
     }
 
@@ -829,6 +1250,7 @@ async function postFollowUp(runId, text, verify) {
     transcripts.delete(runId);
     refreshRunListView();
     ensureSubscription(runId);
+    syncAutoApprove(runId);
     const cur = runStates.get(runId);
     if (cur) renderDetailWithState(cur);
   } catch (err) {
@@ -926,15 +1348,20 @@ async function loadHarness() {
 const liveTexts = new Map();
 /** 思考增量缓冲。与 liveTexts 同族（不进 RunState），但分开存——正文一来就清掉它 */
 const liveThinking = new Map();
-/** 缓冲上限：只用来显示尾部 80 字，没必要为一次长生成攒下几十 KB */
-const LIVE_TEXT_CAP = 2000;
 /**
- * **单调累计到达字数**（不受上限影响），revealed 就是对它计数的。
- * 没有它就只能拿绝对计数去 slice 一个滑动窗口——撞上限那刻 arrived 停止增长、
- * revealed 随之不变、节拍器的 changed 恒 false，屏幕直接冻住（实测现象：
- * 思考流到约 2000 字停住，本轮结束才整块出现）。换算见 app.js 的 revealedWindow。
- * @type {Map<string, {think:number, text:number}>}
+ * 正文缓冲**不再截尾**（2026-09-04 委托方：超过约 2000 字就丢前面、只剩尾巴）。
+ * 当年 LIVE_TEXT_CAP=2000 是为防长生成占内存；配合 revealedWindow 虽不冻屏，
+ * 但可见内容仍是滑动窗口——正文被活生生砍头。正文全文进缓冲，内存远小于
+ * 一次 run 的事件流；节拍器仍按 liveTotals 匀速放行。
+ *
+ * 思考缓冲仍保留截尾守卫：它是**瞬态**的（正文一开始流就整段丢弃），截尾只影响
+ * 展示中的尾巴，不碰累计计数——totals 永远按 delta 实收累加，不被上限钉死。
+ *（注意与 test/budget-extend.test.ts 的约定：正文截尾常量 LIVE_TEXT_CAP 已退役，
+ * 这里守卫的是思考缓冲，命名分开正是为了不复活那条旧机制。）
  */
+const LIVE_THINKING_CAP = 2000;
+const cap = (s) => (s.length > LIVE_THINKING_CAP ? s.slice(-LIVE_THINKING_CAP) : s);
+/** @type {Map<string, {think:number, text:number}>} */
 const liveTotals = new Map();
 const totalsOf = (runId) => liveTotals.get(runId) ?? { think: 0, text: 0 };
 
@@ -943,7 +1370,6 @@ const totalsOf = (runId) => liveTotals.get(runId) ?? { think: 0, text: 0 };
  * rAF 不触发"那个坑同样适用，所以复用同一个调度器实现而不是自己写节流。
  */
 const deltaBatcher = createBatcher((batches) => {
-  const cap = (s) => (s.length > LIVE_TEXT_CAP ? s.slice(-LIVE_TEXT_CAP) : s);
   for (const [runId, chunks] of batches) {
     const textPart = chunks.filter((c) => c.kind === "text").map((c) => c.text).join("");
     const thinkPart = chunks.filter((c) => c.kind === "thinking").map((c) => c.text).join("");
@@ -953,7 +1379,7 @@ const deltaBatcher = createBatcher((batches) => {
       totals.think += thinkPart.length;
     }
     if (textPart) {
-      liveTexts.set(runId, cap((liveTexts.get(runId) ?? "") + textPart));
+      liveTexts.set(runId, (liveTexts.get(runId) ?? "") + textPart);
       totals.text += textPart.length;
       // 正文一开始流，思考就该让位——它已经想完了。累计也一并归零，
       // 否则正文的放行额度会被一段早已不显示的思考永久占住
@@ -1034,6 +1460,15 @@ const batcher = createBatcher((batches) => {
     const state = runStates.get(runId);
     if (!state) continue;
 
+    // 通知中心（T4）：与 reducer 消费同一份信封，逐条喂给通知归约。
+    // 模块未加载完成时静默跳过——它是增强项，不挡主流程。
+    if (notificationsApi) {
+      for (const item of queue) notificationsApi.ingest(runId, item);
+    }
+    // 指挥中心（T11）：同一节拍末尾刷新——它读的是通知 store 与 run 列表，
+    // 必须在 notifications.ingest 之后调，待决栏才不吃上一节的旧账。
+    boardApi?.refresh();
+
     // 文本阶段的边界：新一轮开始、模型转去调工具、或整段结束——
     // 三者都意味着"正在流入的那段文本"已经不是此刻在发生的事了，让位给
     // 工具标签/最终文本。不在 assistant_text 处清：那条只是把同一段文本
@@ -1053,9 +1488,14 @@ const batcher = createBatcher((batches) => {
     runStates.set(runId, next);
 
     if (selectedRunId === runId) renderDetailWithState(next);
+    else if (selectedRunId && ancestorRunIds(runs, selectedRunId).includes(runId)) {
+      const tip = runStates.get(selectedRunId);
+      if (tip) renderDetailWithState(tip);
+    }
 
     // run_end 是唯一的"可以收工"信号：此时主动 close，浏览器才不会再自动重连
     if (next.status === "done") {
+      stoppingRuns.delete(runId);
       liveTexts.delete(runId); // 运行结束，直播条隐藏，缓冲没有留存意义
       liveThinking.delete(runId);
       liveTotals.delete(runId);
@@ -1090,7 +1530,8 @@ document.addEventListener("visibilitychange", () => {
 function ensureSubscription(runId) {
   if (eventSources.has(runId)) return;
   const state = runStates.get(runId);
-  if (state && state.status === "done") return;
+  // 空时间线的已完成父 run 仍要拉一次快照，否则谱系对话拼不出历史轮。
+  if (state && state.status === "done" && (state.timeline?.length ?? 0) > 0) return;
 
   const es = new EventSource(`/api/runs/${runId}/events`);
   eventSources.set(runId, es);
@@ -1225,8 +1666,18 @@ async function postApproval(runId, approvalId, decision, reason, scope) {
         body: JSON.stringify({ decision, reason, ...(scope ? { scope } : {}) }),
       },
     );
-    if (res.status === 409) return;
-    if (!res.ok) return;
+    if (res.status === 409 || res.status === 404) {
+      // 409：服务端已决。404：自动放行从不进挂起表，卡却还在——同一张过期卡。
+      // 两种都不该弹「审批失败」，按这次点击收口即可。
+    } else if (!res.ok) {
+      let detail = "";
+      try {
+        const body = await res.json();
+        detail = body?.error ? `：${body.error}` : "";
+      } catch { /* 响应体不是 JSON */ }
+      showSubmitError(`审批失败（HTTP ${res.status}）${detail}`);
+      return;
+    }
     // 乐观更新，让点击立刻有反馈；服务端随后会推 approval_resolved，
     // 那条才是权威记录（刷新/换标签页后靠它复原，见 V-02）
     const state = runStates.get(runId);
@@ -1242,9 +1693,67 @@ async function postApproval(runId, approvalId, decision, reason, scope) {
         renderDetailWithState(next);
       }
     }
-  } catch {
-    // 网络错误静默
+  } catch (err) {
+    showSubmitError(`审批失败：${err && err.message ? err.message : err}`);
   }
+}
+
+async function postAutoApprove(runId, enabled) {
+  try {
+    const res = await fetch(`/api/runs/${encodeURIComponent(runId)}/auto-approve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: Boolean(enabled) }),
+    });
+    if (res.ok) {
+      const info = runs.find((r) => r.runId === runId);
+      if (info) info.autoApprove = Boolean(enabled);
+      return;
+    }
+    if (res.status !== 409) {
+      const body = await res.json().catch(() => ({}));
+      showSubmitError(body.error ?? `自动放行设置失败（HTTP ${res.status}）`);
+    }
+  } catch (err) {
+    showSubmitError(`自动放行设置失败：${err && err.message ? err.message : err}`);
+  }
+}
+
+/**
+ * 勾选是偏好，不是 run 上的事实。归档续跑 / 已勾着从不触发 change 时，
+ * 界面开着、服务端关着——必须在选中运行中对话时把两边对齐。
+ */
+function syncAutoApprove(runId) {
+  const info = runs.find((r) => r.runId === runId);
+  if (!info || info.status !== "running") return;
+  const want = autoApproveToggle?.checked !== false;
+  if (Boolean(info.autoApprove) === want) return;
+  void postAutoApprove(runId, want);
+}
+
+/**
+ * 自动放行默认值与设置中心同源（T7）：agent-ui-settings 为准，旧键
+ * agent-ui-auto-approve 已在启动时由 migrateLegacyPrefs 一次性迁入。
+ * 这里（composer 当次改动）与设置页两边都同时写两个键，任一顺序读都一致。
+ */
+const AUTO_APPROVE_PREF = "agent-ui-auto-approve";
+if (autoApproveToggle) {
+  autoApproveToggle.checked = composerDefaults(uiSettings).autoApprove;
+  autoApproveToggle.addEventListener("change", () => {
+    uiSettings = updateSettings(uiSettings, { defaults: { autoApprove: autoApproveToggle.checked } });
+    try {
+      localStorage.setItem(AUTO_APPROVE_PREF, autoApproveToggle.checked ? "1" : "0");
+      saveSettings(localStorage, uiSettings);
+    } catch { /* ignore */ }
+    const run = runs.find((r) => r.runId === selectedRunId);
+    if (run && run.status === "running") {
+      void postAutoApprove(selectedRunId, autoApproveToggle.checked);
+    }
+  });
+}
+// 独立核查默认值同样来自设置中心（此前无持久化，设置页是它的唯一出处）
+if (verifyToggle) {
+  verifyToggle.checked = composerDefaults(uiSettings).verify;
 }
 
 // ---- 提交：一个框，两种去向 ----
@@ -1266,6 +1775,17 @@ submitForm.addEventListener("submit", (e) => {
   if (plan.kind === "stop") void stopRun(plan.runId);
   else if (plan.kind === "append") void submitAppend(plan);
   else void submitNewRun(plan);
+});
+
+/**
+ * 停止走按钮 click，不指望 form submit。
+ * 嵌入预览 / 某些环境下 submit 会被吞，点了像没点；click 是人按下去的那一下。
+ */
+submitBtn.addEventListener("click", (e) => {
+  if (composerMode?.kind !== "stop") return;
+  e.preventDefault();
+  e.stopPropagation();
+  void stopRun(composerMode.runId);
 });
 
 /**
@@ -1295,16 +1815,15 @@ async function submitNewRun({ text: task }) {
         pack: packSelect?.value,
         effort: effortSelect?.value,
         rubric: rubricInput?.value,
-        mode: modeSelect?.value,
-        concurrency: concurrencySelect?.value,
-        // planGate 仍只在编排模式下进入载荷；ask_user 对 single 与 plan 都生效。
-        planGate: planGateToggle?.checked,
-        askUser: askUserToggle?.checked,
+        planMode: planModeToggle?.checked === true,
+        multiAgent: multiAgentToggle?.checked === true,
+        lineageBudget: false,
+        dailyBudget: false,
+        askUser: true,
+        autoApprove: autoApproveToggle?.checked !== false,
         workdir: workdirSelect?.value,
         useVerifierModel: !useVerifierModel || useVerifierModel.checked,
         usePlannerModel: !usePlannerModel || usePlannerModel.checked,
-        // 逐 run 上下文预算：空 = 沿用 env > 包 > 默认；越界由宿主 400 报区间
-        contextTokenLimit: contextBudgetInput?.value,
       })),
     });
     if (!res.ok) {
@@ -1346,20 +1865,30 @@ async function submitNewRun({ text: task }) {
 /**
  * 停止这次运行。
  *
- * 语义要说准：中止只保证**不再往下走**（循环在下一次模型调用之前收手），
- * 已经在飞的那个请求不撤——HTTP 已经发出去、钱已经花了。
- * 把它说成"立刻停"是骗人。
+ * 闸立刻拉下，按钮立刻改成「正在停止…」。当前这一步（在飞的模型请求 /
+ * 工具）要等它自己结束或被 SDK 掐断，然后循环才收尾——不是点下去画面马上空白。
  */
 async function stopRun(runId) {
-  if (!runId) return;
+  if (!runId || stoppingRuns.has(runId)) return;
+  stoppingRuns.add(runId);
+  newRunError = null;
+  syncComposer();
+  announceStatus("正在停止这次运行");
   try {
-    const res = await fetch(`/api/runs/${runId}/stop`, { method: "POST" });
-    if (!res.ok) {
-      const b = await res.json().catch(() => ({}));
-      showSubmitError(b.error ?? `停止失败（HTTP ${res.status}）`);
+    const res = await fetch(`/api/runs/${encodeURIComponent(runId)}/stop`, { method: "POST" });
+    if (res.ok) return;
+    stoppingRuns.delete(runId);
+    const b = await res.json().catch(() => ({}));
+    if (res.status === 409 && /already finished/i.test(String(b.error ?? ""))) {
+      void loadRuns();
+      return;
     }
+    showSubmitError(b.error ?? `停止失败（HTTP ${res.status}）`);
   } catch (err) {
+    stoppingRuns.delete(runId);
     showSubmitError(`停止失败：${err.message ?? "网络错误"}`);
+  } finally {
+    syncComposer();
   }
 }
 
@@ -1425,6 +1954,7 @@ function subscribeLifecycle() {
         runs = runs.filter((run) => run.runId !== payload.runId);
         unreadRuns.delete(payload.runId);
         runStates.delete(payload.runId);
+        notificationsApi?.removeRun(payload.runId);
         const stream = eventSources.get(payload.runId);
         if (stream) stream.close();
         eventSources.delete(payload.runId);
@@ -1445,8 +1975,14 @@ function subscribeLifecycle() {
         }
         if (idx >= 0) runs[idx] = payload.run;
         else runs = [payload.run, ...runs];
+        if (payload.run.status === "done") stoppingRuns.delete(payload.run.runId);
       }
       refreshRunListView();
+      if (selectedRunId) syncAutoApprove(selectedRunId);
+      // 通知中心对账：running→done 跃迁补「运行完成」，已删除/已完成 run 清账
+      notificationsApi?.syncRuns();
+      // 指挥中心随生命周期流一起刷新（待决/运行中/最近完成三栏都依赖这份列表）
+      boardApi?.refresh();
     } catch {
       // 解析失败静默
     }
@@ -1471,35 +2007,21 @@ function populateKnobs(snap) {
     updatePackHint();
   }
   if (effortSelect && Array.isArray(snap.effortLevels)) {
+    const labels = { low: "低", medium: "中", high: "高", xhigh: "很高", max: "最高" };
     for (const lv of snap.effortLevels) {
       const opt = document.createElement("option");
       opt.value = lv;
-      opt.textContent = lv;
+      opt.textContent = labels[lv] ?? lv;
       effortSelect.appendChild(opt);
     }
     if (snap.effort) effortSelect.value = snap.effort;
+    // 设置中心（T7）的思考强度默认值覆盖服务端默认："" = 跟随服务端，不动 select
+    applyComposerDefaults({ effortSelect }, { effort: composerDefaults(uiSettings).effort }, {
+      effortLevels: snap.effortLevels,
+    });
   }
-  const eh = document.getElementById("effort-hint");
-  // compat 端点不认识 output_config.effort——不说清楚，用户会以为自己设的档位生效了
-  if (eh && snap.compat) eh.textContent = "compat 模式下该参数不会发送";
-
-  // MEM-01 窗口 / 预算：区间与窗口来自宿主快照（窗口未知就写"窗口未知"），忠告随输入实时更新
-  if (contextBudgetInput) {
-    const ctx = normalizeContextConfig(snap.context);
-    const refresh = () => {
-      const knob = deriveContextBudgetKnob(ctx, contextBudgetInput.value);
-      contextBudgetInput.min = String(knob.min);
-      contextBudgetInput.max = String(knob.max);
-      contextBudgetInput.placeholder = knob.placeholder;
-      contextBudgetInput.setAttribute("aria-invalid", knob.outOfRange ? "true" : "false");
-      if (contextBudgetHint) contextBudgetHint.textContent = knob.hint;
-      if (contextBudgetAdvisory) {
-        contextBudgetAdvisory.textContent = knob.advisory ?? "";
-        contextBudgetAdvisory.hidden = !knob.advisory;
-      }
-    };
-    refresh();
-    contextBudgetInput.addEventListener("input", refresh);
+  if (effortSelect && snap.compat) {
+    effortSelect.title = "compat 端点不发送思考强度（第三方不认识该参数）";
   }
 
   // V-29 工作目录：只列宿主声明过的，浏览器不给自由输入
@@ -1574,41 +2096,75 @@ function updatePackHint() {
   const hint = document.getElementById("pack-hint");
   if (!hint || !harnessSnapshot?.availablePacks) return;
   const p = harnessSnapshot.availablePacks.find((x) => x.name === packSelect.value);
-  hint.textContent = p
-    ? `核查 ${p.verifyMode ?? "—"}${p.hasRubric ? " · 自带评分表" : ""}`
-    : "用默认 system prompt 与全部内置工具";
+  if (!p) {
+    hint.textContent = "用默认 system prompt 与全部内置工具（含有据咨询纪律）";
+    return;
+  }
+  const bits = [
+    `核查 ${p.verifyMode ?? "—"}`,
+    p.hasRubric ? "自带评分表" : null,
+    p.groundedConsult ? "有据咨询" : null,
+    p.wantsWebSearch
+      ? harnessSnapshot.webSearchConfigured
+        ? "web_search 已配"
+        : "web_search 未配（设 AGENT_TAVILY_API_KEY）"
+      : null,
+  ].filter(Boolean);
+  hint.textContent = bits.join(" · ");
 }
 
 if (packSelect) packSelect.addEventListener("change", updatePackHint);
 
-// 并行度只在编排模式下有意义——单任务模式下禁用而不是藏起来，
-// 让"这个旋钮属于哪个模式"这件事本身可见
-if (modeSelect && concurrencySelect) {
-  modeSelect.addEventListener("change", () => {
-    const isPlan = modeSelect.value === "plan";
-    concurrencySelect.disabled = !isPlan;
-    if (planGateToggle) {
-      planGateToggle.disabled = !isPlan;
-      // 切回单任务时把勾去掉：留着一个"勾了但不生效"的复选框，就是
-      // 界面与实际行为不一致——这个项目为此单独立过一条纪律（V-24）
-      if (!isPlan) planGateToggle.checked = false;
-    }
+// 计划模式 / 多 agent：localStorage 记住偏好
+const PREF_PLAN = "agent.ui.pref.planMode";
+const PREF_MULTI = "agent.ui.pref.multiAgent";
+function readPref(key, fallback) {
+  try {
+    const v = localStorage.getItem(key);
+    if (v === null) return fallback;
+    return v === "1" || v === "true";
+  } catch {
+    return fallback;
+  }
+}
+function writePref(key, on) {
+  try {
+    localStorage.setItem(key, on ? "1" : "0");
+  } catch { /* ignore */ }
+}
+if (planModeToggle) {
+  planModeToggle.checked = readPref(PREF_PLAN, false);
+  planModeToggle.addEventListener("change", () => {
+    writePref(PREF_PLAN, planModeToggle.checked);
     const hint = document.getElementById("mode-hint");
     if (hint) {
-      hint.textContent = isPlan
-        ? "planner 先拆解出带依赖图的子任务，再按就绪顺序调度；每个子任务各自核查。"
-        : "单领域任务上编排是纯开销——它的价值在跨领域交接。";
+      hint.textContent = planModeToggle.checked
+        ? "planner 出图后等人批准；可与多 agent 同时开"
+        : "每一轮都可选。开 = planner 出图后等你批准再跑";
     }
   });
 }
+if (multiAgentToggle) {
+  multiAgentToggle.checked = readPref(PREF_MULTI, false);
+  multiAgentToggle.addEventListener("change", () => writePref(PREF_MULTI, multiAgentToggle.checked));
+}
 
 if (knobsToggle && runKnobs) {
-  knobsToggle.addEventListener("click", () => {
-    const open = runKnobs.hidden;
+  const setKnobsOpen = (open) => {
     runKnobs.hidden = !open;
     knobsToggle.setAttribute("aria-expanded", String(open));
     const caret = knobsToggle.querySelector(".knobs-caret");
     if (caret) caret.className = `ph ${open ? "ph-caret-up" : "ph-caret-down"} knobs-caret`;
+  };
+  knobsToggle.addEventListener("click", () => setKnobsOpen(runKnobs.hidden));
+  document.addEventListener("pointerdown", (event) => {
+    if (runKnobs.hidden) return;
+    const target = /** @type {Node|null} */ (event.target);
+    if (target && (runKnobs.contains(target) || knobsToggle.contains(target))) return;
+    setKnobsOpen(false);
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !runKnobs.hidden) setKnobsOpen(false);
   });
 }
 
@@ -1653,7 +2209,18 @@ function renderUploads() {
   if (!uploadList) return;
   uploadList.hidden = uploaded.length === 0;
   uploadList.innerHTML = uploaded
-    .map((u) => `<li><code>${escapeHtml(u.path)}</code> <span class="knob-hint">${(u.bytes / 1024).toFixed(0)} KB</span></li>`)
+    .map((u) => {
+      const name = escapeHtml(u.path);
+      const size = `<span class="knob-hint">${(u.bytes / 1024).toFixed(0)} KB</span>`;
+      if (u.previewUrl && /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(u.path)) {
+        return (
+          `<li class="upload-item upload-item--image">` +
+          `<img class="upload-thumb" src="${escapeHtml(u.previewUrl)}" alt="" />` +
+          `<div class="upload-meta"><code>${name}</code> ${size}</div></li>`
+        );
+      }
+      return `<li class="upload-item"><code>${name}</code> ${size}</li>`;
+    })
     .join("");
 }
 
@@ -1664,6 +2231,9 @@ function renderUploads() {
  */
 function clearUploads() {
   if (uploaded.length === 0) return;
+  for (const u of uploaded) {
+    if (u.previewUrl) URL.revokeObjectURL(u.previewUrl);
+  }
   uploaded.length = 0;
   renderUploads();
 }
@@ -1717,7 +2287,10 @@ async function uploadFiles(files) {
         showSubmitError(`附件已上传到原来的工作目录（${info.path}），但你已经切换了对话——没有写进输入框。`);
         continue;
       }
-      uploaded.push(info);
+      uploaded.push({
+        ...info,
+        previewUrl: file.type.startsWith("image/") ? URL.createObjectURL(file) : null,
+      });
       // 把路径写进任务描述——模型只有看到路径才知道文件存在
       const line = `附件：${info.path}`;
       taskInput.value = taskInput.value ? `${taskInput.value}
@@ -1733,6 +2306,41 @@ if (fileUpload) {
   fileUpload.addEventListener("change", () => {
     if (fileUpload.files?.length) void uploadFiles([...fileUpload.files]);
     fileUpload.value = "";
+  });
+}
+
+const budgetExtendBtn = /** @type {HTMLButtonElement|null} */ (document.getElementById("budget-extend-btn"));
+if (budgetExtendBtn) {
+  budgetExtendBtn.addEventListener("click", async () => {
+    const runId = selectedRunId;
+    if (!runId) return;
+    budgetExtendBtn.disabled = true;
+    showSubmitError(null);
+    try {
+      const res = await fetch(`/api/runs/${encodeURIComponent(runId)}/extend-budget`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        showSubmitError(body.error ?? `追加预算失败（HTTP ${res.status}）`);
+        return;
+      }
+      followUpErrors.delete(runId);
+      // 刷新列表里的 canContinue / continuationBlockReason
+      await loadRuns?.();
+      syncComposer();
+      announceStatus(
+        body.after?.maxTokens
+          ? `已追加预算：上限现为 ${body.after.maxTokens.toLocaleString()} tokens，可以继续对话`
+          : "已追加预算，可以继续对话",
+      );
+    } catch (err) {
+      showSubmitError(`追加预算失败：${err.message ?? "未知错误"}`);
+    } finally {
+      budgetExtendBtn.disabled = false;
+    }
   });
 }
 
@@ -1769,6 +2377,8 @@ function applyTheme(next) {
   for (const choice of themeChoices) {
     choice.setAttribute("aria-checked", String(choice.getAttribute("data-theme-choice") === theme));
   }
+  // 设置视图若开着，主题 radio 跟着刷新（主题也可从侧栏菜单/命令面板改）
+  settingsApi?.refresh?.();
 }
 
 function setThemeMenuOpen(open, focusSelected = false) {
@@ -1820,6 +2430,244 @@ syncComposer();
 loadHarness();
 loadRuns().then(applyHash);
 subscribeLifecycle();
+
+// ---- 命令面板（T3）----
+// 动态加载，失败不影响主流程。回调全部委托给本控制器已有函数，
+// 模块不反向 import 这里，保持单向依赖。
+import("./features/command-palette.js").then((palette) => {
+  palette.initCommandPalette({
+    getConversations: () => runs.map((r) => ({
+      runId: r.runId,
+      title: r.task,
+      workdir: r.workdir ?? null,
+      status: r.status,
+    })),
+    getCurrentRun: () => {
+      if (!selectedRunId) return null;
+      const info = runs.find((r) => r.runId === selectedRunId);
+      return info ? { runId: info.runId, status: info.status } : null;
+    },
+    getTheme: () => currentTheme(),
+    onOpenConversation: (runId) => selectRun(runId),
+    onNewChat: () => newChatBtn?.click(),
+    onStopRun: () => { if (selectedRunId) void stopRun(selectedRunId); },
+    onContinueRun: () => { taskInput.focus(); },
+    onFocusSearch: () => { runSearch?.focus(); },
+    onSelectTheme: (theme) => applyTheme(theme),
+    onAnnounce: (msg) => announceStatus(msg),
+  });
+}).catch(() => { /* 面板是增强项，加载失败静默降级 */ });
+
+// ---- 通知中心（T4）----
+// 动态加载，失败不影响主流程。事件经 batcher 节拍里的 notificationsApi.ingest
+// 逐条喂入；run 列表刷新（loadRuns / 生命周期流）后调 syncRuns 对账。
+import("./features/notifications.js").then((notifications) => {
+  notificationsApi = notifications.initNotifications({
+    getRuns: () => runs,
+    getRunTitle: (runId) =>
+      runs.find((r) => r.runId === runId)?.task ?? runStates.get(runId)?.task ?? null,
+    onOpenConversation: (runId) => selectRun(runId),
+    // 待决定类直达 action-dock：选中会话后让决定坞闪一下，视线落在该落的地方
+    onRevealDock: (runId) => {
+      selectRun(runId);
+      const dock = document.getElementById("action-dock");
+      if (!dock) return;
+      dock.classList.remove("action-dock--flash");
+      // 强制重排后再加回类名，连续两次点击也能重新播一次高亮
+      void dock.offsetWidth;
+      dock.classList.add("action-dock--flash");
+    },
+    onAnnounce: (msg) => announceStatus(msg),
+  });
+  // 初始化时 run 列表多半已经就位：立刻播种基线（不生成历史条目）
+  notificationsApi.syncRuns();
+}).catch(() => { /* 通知中心是增强项，加载失败静默降级 */ });
+
+// ---- 记忆面板（T5）----
+// 动态加载，失败不影响主流程。同时把「查看记忆」注册进命令面板——
+// 两个 import 命中同一个模块缓存，registerPaletteCommand 是模块级注册表。
+import("./features/memory-panel.js").then((memory) => {
+  const memoryApi = memory.initMemoryPanel({
+    onAnnounce: (msg) => announceStatus(msg),
+  });
+  import("./features/command-palette.js").then((palette) => {
+    palette.registerPaletteCommand({
+      id: "view-memory",
+      label: "查看记忆",
+      hint: "打开记忆面板，审查 Agent 跨会话积累的内容",
+      icon: "ph-brain",
+      run: () => memoryApi.open(),
+    });
+  }).catch(() => { /* 命令面板注册失败不影响面板本体 */ });
+}).catch(() => { /* 记忆面板是增强项，加载失败静默降级 */ });
+
+// ---- 全局搜索（T6）----
+// 动态加载，失败不影响主流程。侧栏搜索框升级为两档：输入即时本地标题过滤
+// （上方既有逻辑），回车/按钮触发正文级全局搜索。同时把「全局搜索」注册进
+// 命令面板——两个 import 命中同一个模块缓存，registerPaletteCommand 是模块级注册表。
+import("./features/global-search.js").then((search) => {
+  const searchApi = search.initGlobalSearch({
+    onOpenConversation: (runId) => selectRun(runId),
+    onAnnounce: (msg) => announceStatus(msg),
+  });
+  import("./features/command-palette.js").then((palette) => {
+    palette.registerPaletteCommand({
+      id: "global-search",
+      label: "全局搜索",
+      hint: "按标题与正文搜索全部历史对话（回车触发）",
+      icon: "ph-magnifying-glass-plus",
+      run: () => searchApi.focusInput(),
+    });
+  }).catch(() => { /* 命令面板注册失败不影响搜索本体 */ });
+}).catch(() => { /* 全局搜索是增强项，加载失败静默降级 */ });
+
+// ---- 设置中心（T7）----
+// 模块是静态 import（composer 默认值启动就要读它），初始化失败不挡主流程。
+// 回调全部委托给本控制器已有函数，模块不反向 import 这里，保持单向依赖。
+try {
+  settingsApi = initSettingsView({
+    getTheme: () => currentTheme(),
+    onSelectTheme: (theme) => applyTheme(theme),
+    getHarnessSnapshot: () => harnessSnapshot,
+    // 设置页改动实时同步 composer 当次控件；只动 patch 里出现的键
+    onApplyComposerDefaults: (patch) => {
+      applyComposerDefaults(
+        { verifyToggle, autoApproveToggle, effortSelect },
+        patch,
+        { effortLevels: harnessSnapshot?.effortLevels ?? null },
+      );
+    },
+    onOpenSettings: () => navigateToSettings(),
+    onCloseSettings: () => closeSettingsRoute(),
+    // 设置页改了阅读模式偏好：详情顶栏的开关与对话后处理立刻对齐（同源键）
+    onReadingModeChange: () => readingModeApi?.syncFromStorage(),
+    onAnnounce: (msg) => announceStatus(msg),
+  });
+  import("./features/command-palette.js").then((palette) => {
+    palette.registerPaletteCommand({
+      id: "open-settings",
+      label: "打开设置",
+      hint: "外观、运行默认值、通知、快捷键与关于",
+      icon: "ph-gear",
+      run: () => navigateToSettings(),
+    });
+  }).catch(() => { /* 命令面板注册失败不影响设置本体 */ });
+} catch { /* 设置中心是增强项，初始化失败静默降级 */ }
+
+// ---- 定时任务（T9）----
+// 与设置中心同一条纪律：回调委托给本控制器已有函数，模块不反向 import 这里。
+try {
+  schedulesApi = initSchedulesView({
+    getHarnessSnapshot: () => harnessSnapshot,
+    onOpenSchedules: () => navigateToSchedules(),
+    onCloseSchedules: () => closeSchedulesRoute(),
+    onOpenRun: (runId) => selectRun(runId),
+    onAnnounce: (msg) => announceStatus(msg),
+  });
+  import("./features/command-palette.js").then((palette) => {
+    palette.registerPaletteCommand({
+      id: "open-schedules",
+      label: "定时任务",
+      hint: "创建与管理定时运行的 Agent 任务",
+      icon: "ph-clock",
+      run: () => navigateToSchedules(),
+    });
+  }).catch(() => { /* 命令面板注册失败不影响定时任务本体 */ });
+} catch { /* 定时任务是增强项，初始化失败静默降级 */ }
+
+// ---- 指挥中心（T11）----
+// 与设置中心同一条纪律：静态 import（路由判定启动就要用 isCommandCenterRoute），
+// 回调全部委托给本控制器已有函数，模块不反向 import 这里，保持单向依赖。
+// 待决数据直读通知中心 store（getStore），不建第二份账本。
+try {
+  boardApi = initCommandCenterView({
+    getRuns: () => runs,
+    getRunState: (runId) => runStates.get(runId) ?? null,
+    getDecisionItems: () => notificationsApi?.getStore?.()?.items ?? [],
+    isStopping: (runId) => stoppingRuns.has(runId),
+    onOpenBoard: () => navigateToBoard(),
+    onCloseBoard: () => closeBoardRoute(),
+    onOpenConversation: (runId) => selectRun(runId),
+    // 待决定卡点击直达 action-dock：与通知中心同一个 reveal 回调
+    onRevealDock: (runId) => {
+      selectRun(runId);
+      const dock = document.getElementById("action-dock");
+      if (!dock) return;
+      dock.classList.remove("action-dock--flash");
+      // 强制重排后再加回类名，连续两次点击也能重新播一次高亮
+      void dock.offsetWidth;
+      dock.classList.add("action-dock--flash");
+    },
+    onStopRun: (runId) => { void stopRun(runId); },
+    onNewChat: () => newChatBtn?.click(),
+    onAnnounce: (msg) => announceStatus(msg),
+  });
+  import("./features/command-palette.js").then((palette) => {
+    palette.registerPaletteCommand({
+      id: "open-board",
+      label: "指挥中心",
+      hint: "按状态总览全部会话：待你决定 / 运行中 / 最近完成",
+      icon: "ph-squares-four",
+      run: () => navigateToBoard(),
+    });
+  }).catch(() => { /* 命令面板注册失败不影响指挥中心本体 */ });
+} catch { /* 指挥中心是增强项，初始化失败静默降级 */ }
+
+// ---- 变更审查（T8）----
+// 动态加载，失败不影响主流程。分区本体挂在对话详情右栏 rail（Progress / 产物
+// 旁边）；「查看本次变更」命令的注册/注销由 syncChangesCommand 随选中态管理。
+import("./features/changes-panel.js").then((changes) => {
+  changesApi = changes.initChangesPanel({
+    onAnnounce: (msg) => announceStatus(msg),
+  });
+  // 模块就绪时可能已有选中会话（深链直达）：立刻补上挂载与命令注册
+  if (selectedRunId) {
+    const railBody = document.querySelector("#main-area .rail-body");
+    if (railBody) changesApi.mount(railBody);
+    changesApi.setRun(selectedRunId);
+  }
+  syncChangesCommand();
+}).catch(() => { /* 变更审查是增强项，加载失败静默降级 */ });
+
+// ---- 阅读模式（T12）----
+// 动态加载，失败不影响主流程。开关挂在对话详情顶栏（back-bar），后处理作用于
+// #conversation；每次 renderDetailWithState 后由上方统一调 update()。
+import("./features/reading-mode.js").then((reading) => {
+  readingModeApi = reading.initReadingMode({
+    onAnnounce: (msg) => announceStatus(msg),
+  });
+  // 模块就绪时可能已有选中会话（深链直达）：立刻补一次挂载与后处理
+  if (selectedRunId) {
+    readingModeApi.update(
+      document.querySelector("#main-area .back-bar"),
+      document.querySelector("#main-area #conversation"),
+    );
+  }
+}).catch(() => { /* 阅读模式是增强项，加载失败静默降级 */ });
+
+// ---- 产物画布（T10）----
+// 模块是静态 import（路由判定启动就要用 parseArtifactRoute），初始化失败不挡主流程。
+// 回调全部委托给本控制器已有函数，模块不反向 import 这里，保持单向依赖。
+// hash 路由归本控制器：画布只报「关闭」「切到第 N 个」，写完 hash 由 applyHash 绕回来。
+// 「预览最近产物」命令不在这里注册——它随产物有无动态注册/注销（syncArtifactCommand）。
+try {
+  artifactCanvasApi = initArtifactCanvas({
+    getRunId: () => selectedRunId,
+    getArtifacts: () => (selectedRunId ? currentRunArtifacts(selectedRunId) : []),
+    onClose: () => closeArtifactRoute(),
+    onSwitch: (index) => {
+      if (selectedRunId) location.hash = encodeArtifactHash(selectedRunId, index);
+    },
+    onReveal: (path) => {
+      if (selectedRunId) revealArtifact(selectedRunId, path);
+    },
+    onAnnounce: (msg) => announceStatus(msg),
+  });
+  // 模块就绪时可能已有挂账的深链（loadRuns().then(applyHash) 在上方已跑过）
+  openPendingArtifact();
+  syncArtifactCommand();
+} catch { /* 产物画布是增强项，初始化失败静默降级 */ }
+
 </script>
 
 </body>

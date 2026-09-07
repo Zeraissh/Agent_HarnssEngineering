@@ -27,14 +27,21 @@ import {
   createBatcher,
   shouldShowReconnecting,
   deriveChatItems,
+  updateLiveNode,
+  renderChatItem,
   toolPeek,
+  toolHeadline,
   foldChain,
   deriveRunListItems,
   deriveRunTitle,
+  deriveConversationRecap,
+  conversationChainIds,
+  deriveThreadFiles,
   renderEmptyState,
   deriveAssemblyBar,
   deriveComposerMode,
   composerSubmitPlan,
+  patchComposer,
   deriveScrollNav,
   paceReveal,
   revealedWindow,
@@ -44,6 +51,20 @@ import {
   nextCollapseOverride,
   buildLocalPathProbePlan,
   toolPathCandidates,
+  classifySessionFile,
+  rankDeliveryArtifacts,
+  inferArtifactIntent,
+  ARTIFACT_PREVIEW_LIMIT,
+  collapsePriorTurns,
+  artifactKindLabel,
+  fileShortPath,
+  deriveThreadChatItems,
+  ancestorRunIds,
+  formatCompletionChatText,
+  pickCompletionChatText,
+  splitCompletionFollowUps,
+  classifyCompletionFollowUp,
+  deriveRunFollowUp,
 } from "../ui/public/app.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -120,6 +141,11 @@ describe("消息正文路径探测计划", () => {
     expect(plan.entries[0]).toEqual({ label: "src/file.ts:12:4", choices: ["src/file.ts"] });
   });
 
+  it("覆盖率引用只探测文件名，不把说明当路径", () => {
+    const plan = buildLocalPathProbePlan(["vitest.config.ts：lines 75 / branches 78"]);
+    expect(plan.entries[0].choices).toEqual(["vitest.config.ts"]);
+  });
+
   it("宿主确认后：文件可打开且可定位，目录可直接打开", async () => {
     let state = createInitialState("run-path", "生成文件", false);
     state = reduceEvents(state, [
@@ -149,6 +175,33 @@ describe("消息正文路径探测计划", () => {
     expect(reveal.getAttribute("aria-label")).toContain("out/report.md");
     reveal.click();
     expect(onReveal).toHaveBeenCalledWith("out/report.md");
+  });
+
+  it("覆盖率引用经宿主确认后，文件名可打开，说明仍在旁边", async () => {
+    let state = createInitialState("run-cite", "覆盖率", false);
+    state = reduceEvents(state, [
+      sse(0, "main", "assistant_text", {
+        text: 'vitest.config.ts：lines 75 / branches 78 / functions 88，锁在实测下方"只许升不许降"',
+      }),
+    ]);
+    renderRunDetail(state, {
+      activeTab: "loop",
+      inspectPaths: async (paths: string[]) => {
+        expect(paths).toContain("vitest.config.ts");
+        expect(paths.some((p) => /lines 75/.test(p))).toBe(false);
+        return paths
+          .filter((input) => input === "vitest.config.ts")
+          .map((input) => ({ input, exists: true, path: input, kind: "file" as const }));
+      },
+    });
+
+    await vi.waitFor(() => {
+      expect(document.querySelector('.local-path-link[href*="artifact"]')).toBeTruthy();
+    });
+    const fileLink = document.querySelector('.local-path-link[href*="artifact"]') as HTMLAnchorElement;
+    expect(decodeURIComponent(fileLink.href)).toContain("path=vitest.config.ts");
+    expect(fileLink.textContent).toContain("vitest.config.ts");
+    expect(document.body.textContent).toContain("只许升不许降");
   });
 
   it("折叠的工具调用日志也显示经宿主确认的文件链接与定位按钮", async () => {
@@ -528,6 +581,14 @@ describe("详情页重渲染下的状态存活 (V-10)", () => {
     expect(button.title).toContain("只允许单次审批");
   });
 
+  it("第一次渲染没接到回调时，补上回调后允许本次仍然可点", () => {
+    const onAllow = vi.fn();
+    renderRunDetail(stateWithPendingApproval(), { activeTab: "overview" });
+    renderRunDetail(stateWithPendingApproval(), { activeTab: "overview", onAllow });
+    (document.querySelector("[data-action='allow']") as HTMLButtonElement).click();
+    expect(onAllow).toHaveBeenCalledWith("tu_w#1");
+  });
+
   it("拒绝理由输入的内容与光标位置在重渲染后保持", () => {
     let s = stateWithPendingApproval();
     renderRunDetail(s, { activeTab: "overview" });
@@ -581,7 +642,7 @@ describe("详情页重渲染下的状态存活 (V-10)", () => {
     expect(cards[0].getAttribute("data-approval-id")).toBe("tu_w#5");
   });
 
-  it("已处理的审批离开待办区，折叠成一行摘要（委托方反馈：堆叠难读难操作）", () => {
+  it("已处理的审批离开待办区，不再占一行摘要", () => {
     let s = stateWithPendingApproval();
     s = reduceEvents(s, [
       sse(2, "host", "approval_resolved", {
@@ -590,37 +651,8 @@ describe("详情页重渲染下的状态存活 (V-10)", () => {
     ]);
     renderRunDetail(s, { activeTab: "overview" });
 
-    // 待办区空了——已决的不再占位
     expect(document.querySelectorAll(".approval-card")).toHaveLength(0);
-    // 但没有凭空消失：折叠摘要给出即时反馈，展开是紧凑列表
-    const done = document.querySelector(".approvals-done");
-    expect(done).toBeTruthy();
-    expect(done!.querySelector("summary")!.textContent).toContain("已处理 1 项");
-    expect(done!.querySelector("summary")!.textContent).toContain("允许 1");
-    expect(done!.querySelectorAll(".approvals-done-list li")).toHaveLength(1);
-    expect(done!.querySelector(".approvals-done-list li")!.textContent).toContain("write_file");
-  });
-
-  it("摘要展开态在重渲染后保持（details 的 open 不能被补丁合上）", () => {
-    let s = stateWithPendingApproval();
-    s = reduceEvents(s, [
-      sse(2, "host", "approval_resolved", { requestSeq: 1, toolUseId: "tu_w", decision: "allow", at: 1 }),
-    ]);
-    renderRunDetail(s, { activeTab: "overview" });
-    const details = document.querySelector(".approvals-done") as HTMLDetailsElement;
-    details.open = true;
-
-    // 再来一条已决项 → 摘要必须重建，但展开态要留着
-    s = reduceEvents(s, [
-      sse(3, "main", "approval_request", { toolUseId: "tu_b", name: "bash", input: { command: "ls" } }),
-      sse(4, "host", "approval_resolved", { requestSeq: 3, toolUseId: "tu_b", decision: "deny", at: 2, reason: "不需要" }),
-    ]);
-    renderRunDetail(s, { activeTab: "overview" });
-
-    const next = document.querySelector(".approvals-done") as HTMLDetailsElement;
-    expect(next.open, "重渲染把用户展开的摘要合上了").toBe(true);
-    expect(next.querySelector("summary")!.textContent).toContain("已处理 2 项");
-    expect(next.textContent).toContain("不需要"); // 拒绝理由留档
+    expect(document.querySelector(".approvals-done")).toBeNull();
   });
 
   it("同一状态连续渲染两次：DOM 不变且节点引用不变（幂等）", () => {
@@ -780,11 +812,14 @@ describe("流式输出直接长在对话里", () => {
     expect(document.querySelector(".chat-msg--live")).toBeTruthy();
   });
 
-  it("思考增量也在对话里，且是可折叠的一块", () => {
+  it("思考增量在对话里收成一条可点开的 Thinking", () => {
     renderRunDetail(runningState(), { activeTab: "loop", liveThinking: "先确认路径在不在工作目录内" });
-    expect(conv()).toContain("先确认路径在不在工作目录内");
-    const d = document.querySelector("details.chat-thinking--live");
-    expect(d, "流式思考应当是一块可折叠的 details").toBeTruthy();
+    expect(conv()).toMatch(/Thinking/);
+    const live = document.querySelector("details.chat-thinking--live");
+    expect(live, "应当是可折叠的 Thinking，不是只有字数行").toBeTruthy();
+    expect(live?.open).toBe(false);
+    expect(live?.textContent).toContain("先确认路径在不在工作目录内");
+    expect(document.querySelector(".chat-thinking-now")).toBeNull();
   });
 
   /**
@@ -857,7 +892,10 @@ describe("流式输出直接长在对话里", () => {
       sse(1, "main", "tool_call", { toolUseId: "t1", name: "read_file", input: { path: "a.ts" } }),
     ]);
     renderRunDetail(s, { activeTab: "loop", liveText: "" });
-    expect(strip(), "没有增量时直播条要说清正在调什么工具").toContain("read_file");
+    expect((document.querySelector(".live-strip") as HTMLElement).hasAttribute("hidden")).toBe(true);
+    expect(conv()).toContain("read");
+    expect(conv()).toContain("a.ts");
+    expect(conv()).not.toContain("read_file");
   });
 
   it("没有任何增量与工具时仍报「等待模型响应…」", () => {
@@ -876,22 +914,48 @@ describe("流式输出直接长在对话里", () => {
     expect((document.querySelector(".live-strip") as HTMLElement).hasAttribute("hidden")).toBe(true);
   });
 
-  /**
-   * 这条是委托方那句话的核心：**点开思考过程就该一直看得见它在流**。
-   * 初版对话用 `innerHTML` 整段重画，流式一开每秒重建几十遍，
-   * 用户刚点开的 details 当场被关上——键控补丁就是为这个上的。
-   */
-  it("流式期间已展开的思考块不会被重画关上", () => {
+  it("流式思考只留一条 Thinking，字数增长不重建节点", () => {
     const s = runningState();
     renderRunDetail(s, { activeTab: "loop", liveThinking: "第一句" });
-    const d = document.querySelector("details.chat-thinking--live") as HTMLDetailsElement;
-    d.open = true;
+    const now = document.querySelector("details.chat-thinking--live") as HTMLDetailsElement;
+    expect(now, "主对话应显示可折叠 Thinking").toBeTruthy();
+    expect(now.textContent).toMatch(/Thinking/);
+    expect(now.querySelector(".chat-live-thinking")?.textContent).toContain("第一句");
 
     renderRunDetail(s, { activeTab: "loop", liveThinking: "第一句，第二句" });
-    const after = document.querySelector("details.chat-thinking--live") as HTMLDetailsElement;
-    expect(after, "思考块被整段重建了").toBe(d);
-    expect(after.open, "用户点开的思考过程被重画关上了").toBe(true);
-    expect(after.textContent).toContain("第二句");
+    expect(document.querySelector("details.chat-thinking--live"), "Thinking 被整段重建了").toBe(now);
+    expect(now.querySelector(".chat-live-thinking")?.textContent).toContain("第一句，第二句");
+  });
+
+  it("已落定的思考过程进主对话，默认折叠，点开能看见正文", () => {
+    const s = reduceEvents(runningState(), [
+      sse(1, "main", "assistant_thinking", { text: "先读文件", redacted: false }),
+      sse(2, "main", "assistant_text", { text: "结论写在下面。" }),
+    ]);
+    renderRunDetail({ ...s, status: "done" }, { activeTab: "loop" });
+    const think = document.querySelector("details.chat-thinking") as HTMLDetailsElement;
+    expect(think).toBeTruthy();
+    expect(think.open).toBe(false);
+    expect(think.querySelector("summary")?.textContent).toBe("Thought Process");
+    expect(think.textContent).toContain("先读文件");
+    expect(document.body.textContent).toContain("结论写在下面");
+    think.querySelector("summary")?.click();
+    expect(think.open).toBe(true);
+    think.querySelector("summary")?.click();
+    expect(think.open).toBe(false);
+  });
+
+  it("进行中不把每段已落定思考铺进对话，只留当前 live Thinking", () => {
+    let s = runningState();
+    s = reduceEvents(s, [
+      sse(1, "planner", "assistant_thinking", { text: "先拆任务" }),
+      sse(2, "main", "assistant_thinking", { text: "先读文件" }),
+      sse(3, "main", "tool_call", { toolUseId: "t", name: "read_file", input: { path: "a.ts" } }),
+      sse(4, "main", "assistant_thinking", { text: "再写结论" }),
+    ]);
+    renderRunDetail(s, { activeTab: "loop", liveThinking: "正在想下一步" });
+    expect(document.querySelectorAll("details.chat-thinking--live")).toHaveLength(1);
+    expect(document.querySelectorAll("details.chat-thinking:not(.chat-thinking--live)")).toHaveLength(0);
   });
 
   it("已落定的条目不因流式而重建（节点同一性）", () => {
@@ -1255,8 +1319,8 @@ describe("R-03 无需展开下钻面即可判断结果", () => {
     const tags = [...document.querySelectorAll(".chat-verdict-turn")];
     expect(tags.map((t) => t.getAttribute("data-judged-turn"))).toEqual(["1", "2"]);
     expect(tags[0]!.textContent).toContain("判第 1 轮对话");
-    // 追加指令旁标出本轮核查与轮号
-    expect(document.querySelector(".conversation")!.textContent).toContain("本轮核查");
+    expect(document.querySelector(".conversation")!.textContent).toContain("再改一点");
+    expect(document.querySelector(".conversation")!.textContent).not.toContain("本轮核查");
   });
 
   /**
@@ -1342,14 +1406,14 @@ describe("deriveChatItems：对话从事件流派生，因此实时", () => {
       sse(1, "main", "tool_call", { toolUseId: "t1", name: "bash", input: { command: "date" } }),
       sse(2, "main", "tool_result", { toolUseId: "t1", result: { content: "2026-08-08", isError: false }, durationMs: 12 }),
     );
-    const tools = deriveChatItems(s).filter((i) => i.kind === "tool");
+    const tools = deriveChatItems(s, null, { showProcess: true }).filter((i) => i.kind === "tool");
     expect(tools).toHaveLength(1);
     expect(tools[0]).toMatchObject({ name: "bash", status: "ok", result: "2026-08-08", durationMs: 12 });
   });
 
   it("还没返回的工具是 running 态——运行中就该看得见它正在做什么", () => {
     const s = run(sse(0, "main", "tool_call", { toolUseId: "t1", name: "bash", input: { command: "sleep 5" } }));
-    expect(deriveChatItems(s).filter((i) => i.kind === "tool")[0]!.status).toBe("running");
+    expect(deriveChatItems(s, null, { showProcess: true }).filter((i) => i.kind === "tool")[0]!.status).toBe("running");
   });
 
   /**
@@ -1361,7 +1425,7 @@ describe("deriveChatItems：对话从事件流派生，因此实时", () => {
       sse(0, "main", "tool_call", { toolUseId: "t1", name: "write_file", input: { path: "a.txt" } }),
       sse(1, "main", "approval_request", { toolUseId: "t1", name: "write_file", input: { path: "a.txt" } }),
     );
-    expect(deriveChatItems(s).find((i) => i.kind === "tool")).toMatchObject({ gated: true });
+    expect(deriveChatItems(s, null, { showProcess: true }).find((i) => i.kind === "tool")).toMatchObject({ gated: true });
   });
 
   it("换来源插一条分界（main → verifier），turn_start 这类噪声不插", () => {
@@ -1369,8 +1433,574 @@ describe("deriveChatItems：对话从事件流派生，因此实时", () => {
       sse(0, "main", "assistant_text", { text: "做完了" }),
       sse(1, "verifier", "assistant_text", { text: "我来复核" }),
     );
-    const kinds = deriveChatItems(s).map((i) => i.kind);
+    const kinds = deriveChatItems(s, null, { showProcess: true }).map((i) => i.kind);
     expect(kinds.filter((k) => k === "boundary")).toHaveLength(2); // main 段 + verifier 段
+  });
+
+  it("默认收起过程：工具不进主对话，运行中只留 activity", () => {
+    const s = run(
+      sse(0, "main", "tool_call", { toolUseId: "t1", name: "bash", input: { command: "date" } }),
+    );
+    const items = deriveChatItems(s, null, { showProcess: false });
+    expect(items.filter((i) => i.kind === "tool")).toHaveLength(0);
+    expect(items.find((i) => i.kind === "activity")).toMatchObject({ name: "bash" });
+  });
+
+  it("默认收起过程：终局只留问答与正文，像总结", () => {
+    let s = run(
+      sse(0, "main", "tool_call", { toolUseId: "t1", name: "bash", input: { command: "date" } }),
+      sse(1, "main", "tool_result", { toolUseId: "t1", result: { content: "ok", isError: false } }),
+      sse(2, "main", "assistant_text", { text: "## 结论\n今天晴。" }),
+    );
+    s = { ...s, status: "done" };
+    const kinds = deriveChatItems(s, null, { showProcess: false }).map((i) => i.kind);
+    expect(kinds).toEqual(["user", "text"]);
+  });
+
+  it("追问进行中：历史轮仍保持收官形态，不把工具和分段思考摊回来", () => {
+    let s = run(
+      sse(0, "main", "assistant_thinking", { text: "先读" }),
+      sse(1, "main", "tool_call", { toolUseId: "t", name: "read_file", input: { path: "a.ts" } }),
+      sse(2, "main", "tool_result", { toolUseId: "t", result: { content: "ok", isError: false } }),
+      sse(3, "main", "assistant_thinking", { text: "再写" }),
+      sse(4, "main", "assistant_text", { text: "改好了。" }),
+    );
+    s = { ...s, status: "done" };
+    expect(deriveChatItems(s).map((i) => i.kind)).toEqual(["user", "thinking", "text"]);
+
+    s = reduceEvents(s, [
+      sse(5, "host", "user_message", { turn: 2, text: "再改一点", continues: "history" }),
+    ]);
+    expect(s.status).toBe("running");
+    const live = deriveChatItems(s, { thinking: "这一轮在想", text: "" });
+    expect(live.map((i) => i.kind)).toEqual(["user", "thinking", "text", "user", "live"]);
+    expect(live.filter((i) => i.kind === "tool" || i.kind === "tools" || i.kind === "activity")).toHaveLength(0);
+    const thinks = live.filter((i) => i.kind === "thinking");
+    expect(thinks).toHaveLength(1);
+    expect(thinks[0].text).toContain("先读");
+    expect(thinks[0].text).toContain("再写");
+    expect(live.find((i) => i.kind === "user" && i.text === "再改一点")).toBeTruthy();
+  });
+
+  it("追问进行中：更早的轮次也保持收官，不只折上一轮", () => {
+    let s = run(
+      sse(0, "main", "assistant_thinking", { text: "第一轮想" }),
+      sse(1, "main", "tool_call", { toolUseId: "t1", name: "bash", input: { command: "ls" } }),
+      sse(2, "main", "tool_result", { toolUseId: "t1", result: { content: "ok", isError: false } }),
+      sse(3, "main", "assistant_text", { text: "第一轮做完。" }),
+    );
+    s = { ...s, status: "done" };
+    s = reduceEvents(s, [
+      sse(4, "host", "user_message", { turn: 2, text: "第二轮" }),
+      sse(5, "main", "assistant_thinking", { text: "第二轮想" }),
+      sse(6, "main", "tool_call", { toolUseId: "t2", name: "read_file", input: { path: "a.ts" } }),
+      sse(7, "main", "tool_result", { toolUseId: "t2", result: { content: "ok", isError: false } }),
+      sse(8, "main", "assistant_text", { text: "第二轮做完。" }),
+    ]);
+    s = { ...s, status: "done" };
+    s = reduceEvents(s, [
+      sse(9, "host", "user_message", { turn: 3, text: "第三轮" }),
+    ]);
+    const items = deriveChatItems(s, { thinking: "第三轮在想", text: "" });
+    expect(items.filter((i) => i.kind === "tool" || i.kind === "tools" || i.kind === "activity")).toHaveLength(0);
+    const users = items.filter((i) => i.kind === "user").map((i) => i.text);
+    expect(users).toEqual(["查一下今天的天气", "第二轮", "第三轮"]);
+    const texts = items.filter((i) => i.kind === "text").map((i) => i.text);
+    expect(texts).toEqual(["第一轮做完。", "第二轮做完。"]);
+    expect(items.filter((i) => i.kind === "thinking")).toHaveLength(2);
+    expect(items.at(-1)?.kind).toBe("live");
+  });
+
+  it("谱系父 run 的过程在子 run 对话里也保持收官", () => {
+    const parent = {
+      ...run(
+        sse(0, "main", "assistant_thinking", { text: "父轮想" }),
+        sse(1, "main", "tool_call", { toolUseId: "tp", name: "bash", input: { command: "pwd" } }),
+        sse(2, "main", "tool_result", { toolUseId: "tp", result: { content: "ok", isError: false } }),
+        sse(3, "main", "assistant_text", { text: "父轮做完。" }),
+      ),
+      status: "done",
+      runId: "parent-run",
+    };
+    let child = createInitialState("child-run", "查一下今天的天气", false);
+    child = reduceEvents(child, [
+      sse(0, "host", "run_forked", { parentRunId: "parent-run", priorRecap: "父轮做完。", priorTurns: 1 }),
+      sse(1, "host", "user_message", { turn: 2, text: "接着改" }),
+    ]);
+    const runList = [
+      { runId: "parent-run", continuedFrom: null },
+      { runId: "child-run", continuedFrom: "parent-run" },
+    ];
+    const states = new Map([["parent-run", parent], ["child-run", child]]);
+    expect(ancestorRunIds(runList, "child-run")).toEqual(["parent-run", "child-run"]);
+    const items = deriveThreadChatItems(runList, states, "child-run", { thinking: "子轮在想", text: "" });
+    expect(items.filter((i) => i.kind === "tool" || i.kind === "tools")).toHaveLength(0);
+    expect(items.some((i) => i.kind === "text" && i.text === "父轮做完。")).toBe(true);
+    expect(items.filter((i) => i.kind === "user").map((i) => i.text)).toEqual([
+      "查一下今天的天气",
+      "接着改",
+    ]);
+    expect(items.filter((i) => i.kind === "recap")).toHaveLength(0);
+    expect(items.at(-1)?.kind).toBe("live");
+  });
+
+  it("追问进行中：上一轮产物卡仍留在历史轮", () => {
+    let s = {
+      ...run(
+        sse(0, "main", "tool_call", { toolUseId: "w", name: "write_file", input: { path: "demo/index.html" } }),
+        sse(1, "main", "tool_result", { toolUseId: "w", result: { content: "ok", isError: false } }),
+        sse(2, "main", "assistant_text", { text: "网站做好了。" }),
+      ),
+      status: "done",
+    };
+    expect(deriveChatItems(s).some((i) => i.kind === "artifacts")).toBe(true);
+    s = reduceEvents(s, [sse(3, "host", "user_message", { turn: 2, text: "再加点动画" })]);
+    const items = deriveChatItems(s);
+    const artAt = items.findIndex((i) => i.kind === "artifacts");
+    const user2 = items.findIndex((i) => i.kind === "user" && i.text === "再加点动画");
+    expect(artAt).toBeGreaterThan(-1);
+    expect(user2).toBeGreaterThan(artAt);
+    expect(collapsePriorTurns(items.filter((i) => i.kind !== "live")).some((i) => i.kind === "artifacts")).toBe(true);
+  });
+
+  it("进行中已落定思考不进主对话，只靠 live 那一条", () => {
+    const s = run(
+      sse(0, "planner", "assistant_thinking", { text: "拆成三步" }),
+      sse(1, "main", "assistant_thinking", { text: "先读" }),
+      sse(2, "main", "tool_call", { toolUseId: "t", name: "read_file", input: { path: "a.ts" } }),
+      sse(3, "main", "assistant_thinking", { text: "再写" }),
+    );
+    expect(deriveChatItems(s).filter((i) => i.kind === "thinking")).toHaveLength(0);
+    const live = deriveChatItems(s, { thinking: "正在想", text: "" });
+    expect(live.filter((i) => i.kind === "thinking")).toHaveLength(0);
+    expect(live.filter((i) => i.kind === "live")).toHaveLength(1);
+  });
+
+  it("收官后一轮只留一条 Thinking，规划者/核查者不占位", () => {
+    const s = {
+      ...run(
+        sse(0, "planner", "assistant_thinking", { text: "拆成三步" }),
+        sse(1, "main", "assistant_thinking", { text: "先读" }),
+        sse(2, "main", "tool_call", { toolUseId: "t", name: "read_file", input: { path: "a.ts" } }),
+        sse(3, "main", "tool_result", { toolUseId: "t", result: { content: "ok", isError: false } }),
+        sse(4, "main", "assistant_thinking", { text: "再写" }),
+        sse(5, "main", "assistant_text", { text: "改好了。" }),
+        sse(6, "verifier", "assistant_thinking", { text: "核对验收" }),
+      ),
+      status: "done",
+    };
+    const items = deriveChatItems(s);
+    const thinks = items.filter((i) => i.kind === "thinking");
+    expect(thinks).toHaveLength(1);
+    expect(thinks[0].text).toContain("先读");
+    expect(thinks[0].text).toContain("再写");
+    expect(thinks[0].text).not.toContain("拆成三步");
+    expect(thinks[0].text).not.toContain("核对验收");
+    expect(items.filter((i) => i.kind === "text").map((i) => i.text)).toEqual(["改好了。"]);
+  });
+
+  it("默认把连续工具收成一组，摘要是正在做的那一步", () => {
+    const s = run(
+      sse(0, "main", "tool_call", { toolUseId: "ok", name: "fetch_url", input: { url: "https://a.example" } }),
+      sse(1, "main", "tool_result", { toolUseId: "ok", result: { content: "html", isError: false } }),
+      sse(2, "main", "tool_call", { toolUseId: "run", name: "bash", input: { command: "sleep 1" } }),
+    );
+    const groups = deriveChatItems(s).filter((i) => i.kind === "tools");
+    expect(groups).toHaveLength(1);
+    expect(groups[0].tools.map((t: any) => t.toolUseId)).toEqual(["ok", "run"]);
+    expect(groups[0].tools.at(-1)).toMatchObject({ name: "bash", status: "running" });
+  });
+
+  it("对话里工具组可展开，没有过程档开关", () => {
+    const s = run(
+      sse(0, "main", "tool_call", { toolUseId: "ok", name: "fetch_url", input: { url: "https://a.example" } }),
+      sse(1, "main", "tool_result", { toolUseId: "ok", result: { content: "html", isError: false } }),
+      sse(2, "main", "assistant_text", { text: "结论：可以校准。" }),
+    );
+    renderRunDetail({ ...s, status: "done" }, { activeTab: "loop" });
+    expect(document.querySelector(".chat-process-bar")).toBeNull();
+    expect(document.querySelectorAll(".chat-tool-group")).toHaveLength(0);
+    const chat = document.querySelector(".conversation")!.textContent ?? "";
+    expect(chat).toContain("可以校准");
+    expect(chat).not.toContain("https://a.example");
+  });
+
+  it("直播工具组摘要是关键字高亮，点开只给当前指令", () => {
+    const s = run(
+      sse(0, "main", "tool_call", {
+        toolUseId: "run",
+        name: "bash",
+        input: { command: 'find . -newermt "2026-09-05 00:00" -type f 2>&1 | grep -v -E \'agent-run-history\'' },
+      }),
+    );
+    renderRunDetail(s, { activeTab: "loop" });
+    const group = document.querySelector(".chat-tool-group--live")!;
+    expect(group).toBeTruthy();
+    const summary = group.querySelector("summary")!.textContent ?? "";
+    expect(summary).toContain("find");
+    expect(summary).toContain(".");
+    expect(summary).toContain("grep");
+    expect(summary).not.toContain("2>&1");
+    expect(summary).not.toContain("-newermt");
+    expect(group.querySelectorAll(".chat-tool")).toHaveLength(0);
+    expect(group.querySelector(".chat-tool-now")?.textContent).toContain("find .");
+    expect(group.querySelector(".live-dot")).toBeNull();
+    expect(group.querySelectorAll(".thinking-shimmer")).toHaveLength(1);
+    expect(group.querySelector(".tool-headline")?.classList.contains("thinking-shimmer")).toBe(true);
+  });
+
+  it("顶栏是对话标题，异常收尾缩成一行原因", () => {
+    let s = createInitialState("run-title", "继续帮我完善目录中的ad7793测量热电偶的电路图绘制", false);
+    s = reduceEvents(s, [
+      sse(0, "host", "run_end", { stopReason: "error", error: "运行异常终止" }),
+    ]);
+    s = { ...s, status: "done", stopReason: "error", error: "运行异常终止" };
+    const seen: string[] = [];
+    renderRunDetail(s, {
+      activeTab: "loop",
+      showBack: true,
+      onBack: () => {},
+      onContinue: () => seen.push("go"),
+    });
+    expect(document.querySelector(".chat-title")!.textContent).toContain("ad7793");
+    expect(document.querySelector(".back-btn")!.textContent).not.toContain("返回列表");
+    const outcome = document.querySelector(".outcome-card") as HTMLElement;
+    expect(outcome.hidden).toBe(false);
+    expect(outcome.textContent).toMatch(/异常终止.*运行异常终止/);
+    expect(outcome.textContent).not.toContain("宿主级失败");
+    expect(outcome.querySelector(".outcome-hint")).toBeNull();
+    const cont = outcome.querySelector(".outcome-continue") as HTMLButtonElement;
+    expect(cont).toBeTruthy();
+    cont.click();
+    expect(seen).toEqual(["go"]);
+  });
+
+  it("压缩与 Thinking/工具轮流：有工具时不占位，结束后不留条", () => {
+    const compact = run(
+      sse(0, "main", "compaction", { droppedBlocks: 3, reactive: false }),
+    );
+    expect(deriveChatItems(compact).filter((i) => i.kind === "notice").map((n) => n.text))
+      .toEqual(["上下文已压缩"]);
+    const withTool = run(
+      sse(0, "main", "compaction", { droppedBlocks: 3, reactive: false }),
+      sse(1, "main", "tool_call", { toolUseId: "t", name: "bash", input: { command: "ls" } }),
+    );
+    expect(deriveChatItems(withTool).filter((i) => i.kind === "notice")).toHaveLength(0);
+    expect(deriveChatItems(compact, { thinking: "先核对字段", text: "" }).filter((i) => i.kind === "notice")).toHaveLength(0);
+    expect(deriveChatItems({ ...compact, status: "done" }).filter((i) => i.kind === "notice")).toHaveLength(0);
+  });
+
+  it("收官后只留每轮最后一段助手正文，中间进度和工具收起", () => {
+    const s = {
+      ...run(
+        sse(0, "main", "assistant_text", { text: "先写一章" }),
+        sse(1, "main", "tool_call", { toolUseId: "w", name: "write_file", input: { path: "a.md" } }),
+        sse(2, "main", "tool_result", { toolUseId: "w", result: { content: "ok", isError: false } }),
+        sse(3, "main", "assistant_text", { text: "七个资产已产出，下面是总结。" }),
+      ),
+      status: "done",
+    };
+    const items = deriveChatItems(s);
+    expect(items.filter((i) => i.kind === "text").map((i) => i.text)).toEqual(["七个资产已产出，下面是总结。"]);
+    expect(items.filter((i) => i.kind === "tools" || i.kind === "tool")).toHaveLength(0);
+    expect(items.find((i) => i.kind === "artifacts")?.files?.map((f: any) => f.path)).toEqual(["a.md"]);
+  });
+
+  it("收官不被核查者短句盖掉执行者总结，产物卡在总结与裁决之间", () => {
+    let s = run(
+      sse(0, "main", "assistant_text", { text: "先搭骨架" }),
+      sse(1, "main", "tool_call", { toolUseId: "w", name: "write_file", input: { path: "demo_sites/index.html" } }),
+      sse(2, "main", "tool_result", { toolUseId: "w", result: { content: "ok", isError: false } }),
+      sse(3, "main", "assistant_text", { text: "液态动效站已写好：入口在 demo_sites/index.html。" }),
+      sse(4, "verifier", "assistant_text", { text: "[verifier] passed=true 全部 9 条验收项符合。" }),
+    );
+    s = reduceEvents(s, [
+      sse(5, "verifier", "verification", {
+        round: 0,
+        verdict: { passed: true, issues: [], unverified: [], advisory: [], summary: "通过" },
+      }),
+    ]);
+    s = { ...s, status: "done" };
+    const items = deriveChatItems(s);
+    expect(items.filter((i) => i.kind === "text").map((i) => i.text)).toEqual([
+      "液态动效站已写好：入口在 demo_sites/index.html。",
+    ]);
+    expect(items.map((i) => i.kind)).toEqual(["user", "text", "artifacts", "verdict"]);
+    expect(items.find((i) => i.kind === "artifacts")?.files?.[0]?.path).toBe("demo_sites/index.html");
+  });
+
+  it("有 finish_task 时对话交付优先用其 summary/artifacts，而不是中间进度句", () => {
+    let s = run(
+      sse(0, "main", "assistant_text", { text: "先写骨架" }),
+      sse(1, "main", "tool_call", { toolUseId: "w", name: "write_file", input: { path: "demo_sites/index.html" } }),
+      sse(2, "main", "tool_result", { toolUseId: "w", result: { content: "ok", isError: false } }),
+      sse(3, "main", "assistant_text", { text: "还在打磨动效…" }),
+      sse(4, "main", "done", {
+        stopReason: "completed",
+        usage: { inputTokens: 1, outputTokens: 1, turns: 1, cacheHitRatio: 0 },
+        completion: {
+          status: "completed",
+          summary: "液态动效站已交付，入口 demo_sites/index.html。",
+          artifacts: ["demo_sites/index.html", "demo_sites/style.css"],
+          verification: ["本地打开首页无报错"],
+          assumptions: [],
+          blockers: [],
+        },
+      }),
+    );
+    s = { ...s, status: "done" };
+    const items = deriveChatItems(s);
+    const text = items.find((i) => i.kind === "text");
+    expect(text?.fromCompletion).toBe(true);
+    expect(text?.text).toContain("液态动效站已交付");
+    expect(text?.text).toContain("本地打开首页无报错");
+    expect(text?.text).not.toContain("还在打磨动效");
+    const paths = items.find((i) => i.kind === "artifacts")?.files?.map((f: any) => f.path) ?? [];
+    expect(paths).toContain("demo_sites/index.html");
+    expect(paths).toContain("demo_sites/style.css");
+  });
+
+  it("没有产物时仍用执行者长正文做气泡，不把总结塞回 Thinking", () => {
+    const essay =
+      "扫描已完成。这是一段超过两百字的中文总结，用来说明工作区里有哪些源文件、".repeat(3)
+      + "它们各自在做什么。";
+    let s = run(
+      sse(0, "main", "assistant_thinking", { text: "先列目录再归纳", redacted: false }),
+      sse(1, "main", "assistant_text", { text: essay }),
+      sse(2, "main", "done", {
+        stopReason: "completed",
+        usage: { inputTokens: 1, outputTokens: 1, turns: 1, cacheHitRatio: 0 },
+        completion: {
+          status: "completed",
+          summary: "已只读扫描并写出一段总结。",
+          artifacts: [],
+          verification: ["glob 数过源文件"],
+          assumptions: [],
+          blockers: [],
+        },
+      }),
+    );
+    s = { ...s, status: "done" };
+    const items = deriveChatItems(s);
+    const text = items.find((i) => i.kind === "text")?.text ?? "";
+    expect(text).toContain("扫描已完成");
+    expect(text).toContain("**验证**");
+    expect(items.some((i) => i.kind === "thinking")).toBe(true);
+    expect(items.find((i) => i.kind === "thinking")?.text).toContain("先列目录");
+    expect(items.find((i) => i.kind === "thinking")?.text).not.toContain("扫描已完成");
+    expect(pickCompletionChatText({
+      status: "completed",
+      summary: "已只读扫描并写出一段总结。",
+      artifacts: [],
+      verification: ["glob 数过源文件"],
+      assumptions: [],
+      blockers: [],
+    }, essay)).toContain("扫描已完成");
+  });
+
+  it("finish_task 为 partial 时正文标明状态并列出 blockers", () => {
+    let s = run(
+      sse(0, "main", "done", {
+        stopReason: "partial",
+        usage: { inputTokens: 1, outputTokens: 1, turns: 1, cacheHitRatio: 0 },
+        completion: {
+          status: "partial",
+          summary: "骨架已出，动效未接。",
+          artifacts: ["a.html"],
+          verification: [],
+          assumptions: [],
+          blockers: ["缺少真实素材图"],
+        },
+      }),
+    );
+    s = { ...s, status: "done" };
+    const text = deriveChatItems(s).find((i) => i.kind === "text")?.text ?? "";
+    expect(text).toContain("部分完成");
+    expect(text).toContain("缺少真实素材图");
+    expect(text).toContain("**阻塞**");
+    expect(text).not.toContain("未完成/阻塞");
+    expect(text).not.toContain("**未完成**");
+    const follow = deriveChatItems(s).find((i) => i.kind === "run-next");
+    expect(follow?.live).toBe(false);
+    expect(follow?.title).toBe("本轮已结束");
+    expect(follow?.text).toMatch(/不会自动继续/);
+  });
+
+  it("finish_task 的未完成与阻塞分开展示，收官后标明不会自动续聊", () => {
+    expect(classifyCompletionFollowUp("Phase 4 布线尚未开始，拟下一回合执行", "partial")).toBe("unfinished");
+    expect(classifyCompletionFollowUp("缺少真实素材图", "partial")).toBe("blocked");
+    expect(splitCompletionFollowUps({
+      status: "partial",
+      blockers: ["Phase 4 尚未开始，拟下一回合执行", "缺少嘉立创账号"],
+    })).toEqual({
+      unfinished: ["Phase 4 尚未开始，拟下一回合执行"],
+      blocked: ["缺少嘉立创账号"],
+    });
+    const text = formatCompletionChatText({
+      status: "partial",
+      summary: "对账已做完。",
+      verification: ["drc 0"],
+      assumptions: [],
+      blockers: ["Phase 4 尚未开始，拟下一回合执行", "缺少嘉立创账号"],
+    });
+    expect(text).toContain("**未完成**");
+    expect(text).toContain("Phase 4 尚未开始");
+    expect(text).toContain("**阻塞**");
+    expect(text).toContain("缺少嘉立创账号");
+    expect(text).not.toContain("未完成/阻塞");
+
+    let s = run(
+      sse(0, "main", "done", {
+        stopReason: "partial",
+        usage: { inputTokens: 1, outputTokens: 1, turns: 1, cacheHitRatio: 0 },
+        completion: {
+          status: "partial",
+          summary: "对账已做完。",
+          artifacts: [],
+          verification: [],
+          assumptions: [],
+          blockers: ["Phase 4 尚未开始，拟下一回合执行"],
+        },
+      }),
+    );
+    s = { ...s, status: "done" };
+    const items = deriveChatItems(s);
+    expect(items.find((i) => i.kind === "text")?.text).toContain("**未完成**");
+    expect(items.find((i) => i.kind === "run-next")?.text).toMatch(/后台没有任务在跑/);
+    expect(deriveRunFollowUp(s).autoContinue).toBe(false);
+  });
+
+  it("核查还在跑时收官卡标明会自动继续，而不是假装已经停了", () => {
+    let s = run(
+      sse(0, "main", "done", {
+        stopReason: "partial",
+        usage: { inputTokens: 1, outputTokens: 1, turns: 1, cacheHitRatio: 0 },
+        completion: {
+          status: "partial",
+          summary: "骨架已出。",
+          artifacts: [],
+          verification: [],
+          assumptions: [],
+          blockers: ["动效未接"],
+        },
+      }),
+      sse(1, "verifier", "assistant_text", { text: "开始复核" }),
+    );
+    s = { ...s, status: "running" };
+    const follow = deriveRunFollowUp(s);
+    expect(follow.live).toBe(true);
+    expect(follow.autoContinue).toBe(true);
+    expect(follow.title).toBe("核查还在跑");
+    expect(deriveChatItems(s).find((i) => i.kind === "run-next")?.title).toBe("核查还在跑");
+  });
+
+  it("右栏文件按类型分组，空类不出现；左侧不再挂本会话文件", () => {
+    expect(classifySessionFile("assets/a.svg")).toBe("image");
+    expect(classifySessionFile("index.html")).toBe("website");
+    expect(classifySessionFile("docs/02.md")).toBe("document");
+    const s = run(
+      sse(0, "main", "tool_call", { toolUseId: "w", name: "write_file", input: { path: "docs/02.md" } }),
+      sse(1, "main", "tool_result", { toolUseId: "w", result: { content: "ok", isError: false } }),
+      sse(2, "main", "tool_call", { toolUseId: "i", name: "write_file", input: { path: "assets/logo.svg" } }),
+      sse(3, "main", "tool_result", { toolUseId: "i", result: { content: "ok", isError: false } }),
+    );
+    renderRunDetail(s, { activeTab: "loop" });
+    const rail = document.getElementById("detail-rail") as HTMLElement;
+    expect(rail.hidden).toBe(false);
+    const railBody = document.getElementById("rail-body") as HTMLElement;
+    const railKids = [...railBody.children].map((n) => n.className);
+    expect(railKids[0]).toContain("progress-panel");
+    expect(railKids[1]).toContain("artifacts");
+    const titles = [...document.querySelectorAll(".rail-section-title")].map((n) => n.textContent ?? "");
+    expect(titles.some((t) => t.includes("文档"))).toBe(true);
+    expect(titles.some((t) => t.includes("图片"))).toBe(true);
+    expect(titles.some((t) => t.includes("网站"))).toBe(false);
+    expect(document.querySelector(".artifacts")!.textContent).toContain("02.md");
+    expect(document.querySelector(".artifact-thumb")).toBeTruthy();
+    expect((document.querySelector(".artifact-thumb") as HTMLImageElement).src).toContain("logo.svg");
+    expect(document.getElementById("session-files")).toBeNull();
+
+    renderRunDetail({ ...s, status: "done" }, { activeTab: "loop" });
+    expect(rail.hidden).toBe(false);
+  });
+
+  it("做网站时入口页权重大于样式和配图", () => {
+    expect(inferArtifactIntent("帮我做一个液态动效网站")).toBe("website");
+    const ranked = rankDeliveryArtifacts([
+      { path: "demo_sites/style.css", kind: "artifact" },
+      { path: "demo_sites/app.js", kind: "artifact" },
+      { path: "demo_sites/notes.md", kind: "artifact" },
+      { path: "demo_sites/preview.png", kind: "artifact" },
+      { path: "demo_sites/index.html", kind: "artifact" },
+      { path: "demo_sites/reset.css", kind: "artifact" },
+    ], { task: "帮我做一个液态动效网站" });
+    expect(ranked[0]?.path).toBe("demo_sites/index.html");
+    expect(ranked.at(-1)?.path).toBe("demo_sites/notes.md");
+    expect(ranked.slice(0, ARTIFACT_PREVIEW_LIMIT).map((f) => f.path)).toContain("demo_sites/index.html");
+    expect(ranked.slice(0, ARTIFACT_PREVIEW_LIMIT).map((f) => f.path)).not.toContain("demo_sites/notes.md");
+  });
+
+  it("产物超过 5 个时默认只露权重最高的，其余可展开", () => {
+    const files = [
+      "demo_sites/index.html",
+      "demo_sites/style.css",
+      "demo_sites/app.js",
+      "demo_sites/about.html",
+      "demo_sites/notes.md",
+      "demo_sites/reset.css",
+      "demo_sites/util.js",
+    ].map((path) => ({ path, kind: "artifact" }));
+    const html = renderChatItem({
+      kind: "artifacts",
+      runId: "run-art",
+      files: rankDeliveryArtifacts(files, { task: "做个网站" }),
+    });
+    expect(html).toContain("显示全部（还有 2 个）");
+    expect(html).toContain("index.html");
+    expect(html).toContain("chat-artifacts-rest");
+    expect(html).toContain("chat-artifact-primary");
+    expect(html).not.toMatch(/<details class="chat-artifacts"/);
+    expect(html).not.toContain("先显示 5 个");
+  });
+
+  it("产物卡是一行：路径 + 类型 + 主操作，不是一排文字链", () => {
+    expect(artifactKindLabel("demo_sites/index.html")).toBe("网站");
+    expect(artifactKindLabel("out/plot.csv")).toBe("表格");
+    expect(artifactKindLabel("hero.png")).toBe("图片");
+    expect(fileShortPath("C:/work/demo_sites/index.html")).toBe("demo_sites/index.html");
+    const html = renderChatItem({
+      kind: "artifacts",
+      runId: "run-art",
+      files: [{ path: "demo_sites/index.html", kind: "artifact" }],
+    });
+    expect(html).toContain("demo_sites/index.html");
+    expect(html).toContain("网站");
+    expect(html).toContain("打开");
+    expect(html).toContain("chat-artifact-kind");
+    expect(html).toContain("在文件夹中显示");
+    expect(html).not.toContain("chat-artifact-actions");
+  });
+
+  it("待复核不占坞，只留在对话末尾的裁决卡", () => {
+    let s = run(sse(0, "main", "assistant_text", { text: "做完了" }));
+    s = reduceEvents(s, [
+      sse(1, "verifier", "verification", {
+        round: 0,
+        verdict: { passed: true, issues: [], unverified: ["脚本不在仓库内"], advisory: [], summary: "待复核" },
+      }),
+    ]);
+    renderRunDetail(s, { activeTab: "loop" });
+    expect((document.querySelector(".unverified-rail") as HTMLElement).hidden).toBe(true);
+    const items = deriveChatItems(s);
+    const v = items.find((i) => i.kind === "verdict");
+    expect(v?.verdict.unverified).toEqual(["脚本不在仓库内"]);
+  });
+
+  it("用量脚注和 Loop 抽屉默认不显示", () => {
+    const s = run(sse(0, "main", "assistant_text", { text: "做完了" }));
+    renderRunDetail(s, { activeTab: "loop" });
+    expect((document.querySelector(".usage-footer") as HTMLElement).hidden).toBe(true);
+    expect((document.getElementById("detail-drawer") as HTMLElement).hidden).toBe(true);
   });
 
   it("裁决作为收尾卡进对话，不再是另一个页面", () => {
@@ -1389,6 +2019,28 @@ describe("deriveChatItems：对话从事件流派生，因此实时", () => {
   it("空文本不产生空气泡", () => {
     const s = run(sse(0, "main", "assistant_text", { text: "   " }));
     expect(deriveChatItems(s).filter((i) => i.kind === "text")).toHaveLength(0);
+  });
+
+  it("流式就地更新必须保持 Markdown，不能冲成纯文本", () => {
+    const host = document.createElement("div");
+    host.innerHTML = renderChatItem({
+      kind: "live",
+      text: "**粗** 开始",
+      thinking: "",
+      role: "main",
+    });
+    expect(host.querySelector("strong")?.textContent).toBe("粗");
+    const ok = updateLiveNode(host, {
+      kind: "live",
+      text: "**粗** 开始，还有 *斜*",
+      thinking: "",
+      role: "main",
+    });
+    expect(ok).toBe(true);
+    expect(host.querySelector("strong")?.textContent).toBe("粗");
+    expect(host.querySelector("em")?.textContent).toBe("斜");
+    // 反例：若仍用 setText，strong 会消失、全文进 textContent
+    expect(host.querySelector(".chat-live-text")?.childElementCount).toBeGreaterThan(0);
   });
 });
 
@@ -1416,6 +2068,23 @@ describe("toolPeek：摘要要一眼认得出在干什么", () => {
   it("空入参返回空串而不是崩", () => {
     expect(toolPeek("x", null)).toBe("");
     expect(toolPeek("x", undefined)).toBe("");
+  });
+});
+
+describe("toolHeadline：摘要只留动词和对象", () => {
+  it("bash 管道拆成 find / grep 关键字，丢掉 2>&1 和长尾巴", () => {
+    const h = toolHeadline("bash", {
+      command: 'find . -newermt "2026-09-05 00:00" -type f 2>&1 | grep -v -E \'agent-run-history\'',
+    });
+    expect(h.stages.map((s) => `${s.verb} ${s.target}`.trim())).toEqual(["find .", "grep agent-run-history"]);
+    expect(h.command).toContain("find .");
+    expect(h.verb).toBe("find");
+  });
+
+  it("read_file 只报文件名", () => {
+    const h = toolHeadline("read_file", { path: "src/tools/bash.ts" });
+    expect(h.verb).toBe("read");
+    expect(h.target).toBe("bash.ts");
   });
 });
 
@@ -1481,6 +2150,38 @@ describe("未读星取代那条「■ 已完成」", () => {
     renderRunList(runs, null, () => {}, deriveRunListItems(runs, new Map(), new Set(["a"])));
     const star = document.querySelector('[data-run-id="a"] .run-item-unread')!;
     expect(star.getAttribute("aria-label")).toContain("尚未查看");
+  });
+});
+
+describe("侧栏运行项：运行中不说谎", () => {
+  it("运行中没有完成勾、没有绿灯，状态字用滑动高亮", () => {
+    const runs = [{ runId: "r1", task: "写网站", status: "running", verify: true, createdAt: 1, finishedAt: null }];
+    const states = new Map([
+      ["r1", { ...createInitialState("r1", "写网站", true), verdict: { passed: true, issues: [], unverified: [], advisory: [], summary: "过" } }],
+    ]);
+    renderRunList(runs, "r1", () => {}, deriveRunListItems(runs, states, new Set()), () => {});
+    const item = document.querySelector('[data-run-id="r1"]')!;
+    expect(item.querySelector(".status-dot")).toBeNull();
+    expect(item.querySelector(".run-item-verdict")).toBeNull();
+    expect((item.querySelector(".run-item-delete") as HTMLElement).hidden).toBe(true);
+    const label = item.querySelector(".run-item-state-label")!;
+    expect(label.textContent).toBe("运行中");
+    expect(label.classList.contains("thinking-shimmer")).toBe(true);
+  });
+
+  it("已完成也不打绿色勾，可以删除", () => {
+    const runs = [{ runId: "r1", task: "写网站", status: "done", verify: true, createdAt: 1, finishedAt: 2 }];
+    const states = new Map([
+      ["r1", { ...createInitialState("r1", "写网站", true), status: "done", verdict: { passed: true, issues: [], unverified: [], advisory: [], summary: "过" } }],
+    ]);
+    let deleted = "";
+    renderRunList(runs, "r1", () => {}, deriveRunListItems(runs, states, new Set()), (id) => { deleted = id; });
+    const item = document.querySelector('[data-run-id="r1"]')!;
+    expect(item.querySelector(".run-item-verdict")).toBeNull();
+    const del = item.querySelector(".run-item-delete") as HTMLButtonElement;
+    expect(del.hidden).toBe(false);
+    del.click();
+    expect(deleted).toBe("r1");
   });
 });
 
@@ -1635,29 +2336,16 @@ describe("装配状态条", () => {
     }
   });
 
-  it("点一下展开说明，再点一下收起", () => {
+  it("详情页不再放装配条——和任务标题一样是重复信息", () => {
     renderRunDetail(configured(), { activeTab: "loop", harness: { model: "m" } });
-    const chips = [...document.querySelectorAll(".assembly-chip")] as HTMLElement[];
-    const why = document.querySelector(".assembly-why") as HTMLElement;
-    expect(why.hidden).toBe(true);
-
-    chips[0].click();
-    expect(why.hidden).toBe(false);
-    expect(chips[0].getAttribute("aria-expanded")).toBe("true");
-    expect(why.textContent!.length).toBeGreaterThan(20);
-
-    chips[0].click();
-    expect(why.hidden, "再点一次应当收起").toBe(true);
+    expect(document.querySelector(".detail-header")).toBeNull();
+    expect(document.querySelector(".assembly-bar")).toBeNull();
+    expect(document.querySelector(".assembly-why")).toBeNull();
   });
 
-  it("同时只展开一项——两句解释叠在一起没人读", () => {
+  it("装配条已从详情页撤下", () => {
     renderRunDetail(configured(), { activeTab: "loop", harness: { model: "m" } });
-    const chips = [...document.querySelectorAll(".assembly-chip")] as HTMLElement[];
-    chips[0].click();
-    chips[1].click();
-    const open = chips.filter((c) => c.getAttribute("aria-expanded") === "true");
-    expect(open).toHaveLength(1);
-    expect(open[0]).toBe(chips[1]);
+    expect(document.querySelectorAll(".assembly-chip")).toHaveLength(0);
   });
 });
 
@@ -1804,39 +2492,34 @@ describe("角色人名（backlog D4：显示层别名，与角色语义并列）
     ]);
   }
 
-  it("段分界带人名，且角色语义并列在同一条分界上——名字不许盖住「全新上下文」", () => {
+  it("主对话是普通气泡，不堆角色署名也不分段", () => {
+    localStorage.removeItem("agent-ui-chat-show-process");
     renderRunDetail(crewState(), { activeTab: "loop" });
-    // 锁必须打在分界元素本身：初版断言整段对话文本，发言署名里的人名会把
-    // "分界丢了人名"的变异救绿（变异测试当场抓出来的教训）
-    const boundaries = [...document.querySelectorAll(".segment-boundary")].map(
-      (n) => n.textContent ?? "",
-    );
-    expect(boundaries.some((b) => b.includes("计明远") && b.includes("只读拆解"))).toBe(true);
-    expect(boundaries.some((b) => b.includes("施敢当") && b.includes("Agent 执行"))).toBe(true);
-    expect(boundaries.some((b) => b.includes("严不苟") && b.includes("全新上下文"))).toBe(true);
+    expect(document.querySelectorAll(".conversation .segment-boundary")).toHaveLength(0);
+    expect(document.querySelectorAll(".chat-msg--assistant .chat-role")).toHaveLength(0);
+    expect(document.body.textContent).toContain("我先拆解任务");
+    expect(document.body.textContent).toContain("开始施工");
   });
 
-  it("发言署名跟角色走：计明远/施敢当各自具名，不再一律「Agent」", () => {
+  it("人名只映射显示层——派生层的 source 仍是结构名", () => {
     renderRunDetail(crewState(), { activeTab: "loop" });
-    const roles = [...document.querySelectorAll(".chat-msg--assistant .chat-role")].map(
-      (n) => n.textContent ?? "",
-    );
-    expect(roles.some((r) => r.includes("计明远"))).toBe(true);
-    expect(roles.some((r) => r.includes("施敢当"))).toBe(true);
+    expect(document.body.textContent).toContain("开始核查");
+    expect(document.querySelector(".chat-msg--assistant .chat-role")).toBeNull();
   });
 
   it("人名只在显示层——事件流与派生层的 source 仍是结构名（改名不漂移记录）", () => {
     const s = crewState();
     expect(s.timeline.every((e: any) => !/计明远|施敢当|严不苟/.test(String(e.source)))).toBe(true);
-    const boundary = deriveChatItems(s, null).find((it: any) => it.kind === "boundary");
+    const boundary = deriveChatItems(s, null, { showProcess: true }).find((it: any) => it.kind === "boundary");
     expect(boundary!.source).toBe("planner");
   });
 
-  it("直播条目署名施敢当（直播只有 main 来源）", () => {
+  it("直播条目是普通气泡，不另署角色名", () => {
     let s = createInitialState("run-crew2", "任务", false);
     s = reduceEvents(s, [sse(0, "main", "turn_start", { turn: 1 })]);
     renderRunDetail(s, { activeTab: "loop", liveText: "正在写……" });
-    expect(document.querySelector(".chat-msg--live .chat-role")!.textContent).toContain("施敢当");
+    expect(document.querySelector(".chat-msg--live")!.textContent).toContain("正在写");
+    expect(document.querySelector(".chat-msg--live .chat-role")).toBeNull();
   });
 });
 
@@ -1916,14 +2599,30 @@ describe("停止按钮：运行中那个位置变成「停止」", () => {
     expect(composerSubmitPlan(running(), "   ")).toEqual({ kind: "stop", runId: "r1", text: "" });
   });
 
-  it("说明里讲清楚它只保证「下一次模型调用之前收手」", () => {
-    expect(running().note).toContain("下一次模型调用之前");
+  it("运行中不再用一段说明占底栏", () => {
+    expect(running().note).toBe("");
   });
 
   it("非运行态不会误发停止", () => {
     const done = deriveComposerMode({ info: { runId: "r1", status: "done", canContinue: true } });
     expect(done.kind).toBe("append");
     expect(composerSubmitPlan(done, "继续")!.kind).toBe("append");
+  });
+
+  it("按过停止立刻改成正在停止，不能再点一次像没点", () => {
+    const m = deriveComposerMode({
+      info: { runId: "r1", status: "running", canContinue: false },
+      localStatus: "running",
+      stopping: true,
+    });
+    expect(m.buttonLabel).toBe("正在停止…");
+    expect(m.canSubmit).toBe(false);
+    expect(m.note).toMatch(/已发出停止/);
+    expect(composerSubmitPlan(m, "")).toBeNull();
+    patchComposer(m);
+    expect(document.querySelector("#submit-btn-label")!.textContent).toBe("正在停止…");
+    expect((document.querySelector("#submit-btn") as HTMLButtonElement).disabled).toBe(true);
+    expect(document.querySelector("#composer-note")!.hidden).toBe(false);
   });
 });
 
@@ -1936,12 +2635,13 @@ describe("B2 · 归档运行在底栏的说法", () => {
     const m = deriveComposerMode({
       info: { runId: "r1", status: "done", canContinue: false, archived: true },
     });
-    expect(m.mode).toBe("new-blocked");
-    expect(m.note).toContain("归档");
-    expect(m.note).not.toContain("失败");
+    expect(m.mode).toBe("blocked");
+    expect(m.kind).toBe("append");
+    expect(m.buttonLabel).toBe("继续对话");
+    expect(m.note).toBe("");
   });
 
-  it("RUN-01 Phase 2：same-run 续跑文案不冒充 fork", () => {
+  it("RUN-01 Phase 2：same-run 续跑在底栏也是继续对话", () => {
     const m = deriveComposerMode({
       info: {
         runId: "r1",
@@ -1954,10 +2654,9 @@ describe("B2 · 归档运行在底栏的说法", () => {
       },
     });
     expect(m.mode).toBe("same-run");
-    expect(m.buttonLabel).toContain("同运行");
-    expect(m.note).toContain("同一 runId");
-    expect(m.note).toContain("interrupted");
-    expect(m.note).not.toContain("派生新运行");
+    expect(m.kind).toBe("append");
+    expect(m.buttonLabel).toBe("继续对话");
+    expect(m.note).toBe("");
   });
 });
 
@@ -2111,6 +2810,62 @@ describe("会话标题：算出来的短句，不是任务原文", () => {
     expect(deriveRunTitle("")).toBe("未命名任务");
     expect(deriveRunTitle("   \n  ")).toBe("未命名任务");
     expect(deriveRunTitle(undefined)).toBe("未命名任务");
+  });
+
+  it("每轮收尾后从执行者最后一段正文抽出摘要", () => {
+    let s = createInitialState("r", "做网站", false);
+    s = reduceEvents(s, [sse(0, "main", "assistant_text", { text: "已经写好 article.html 和联系页。" })]);
+    expect(deriveConversationRecap(s)).toContain("article.html");
+    s = reduceEvents(s, [sse(1, "main", "assistant_text", { text: "移动端也过了，本轮收工。" })]);
+    expect(deriveConversationRecap(s)).toContain("移动端");
+  });
+
+  it("续跑 fort 后对话里先出现此前摘要", () => {
+    let s = createInitialState("child", "请为我生成一个完整的网站设计方案", false);
+    s = reduceEvents(s, [
+      sse(0, "host", "run_forked", {
+        parentRunId: "parent",
+        rootRunId: "parent",
+        priorRecap: "已生成崩坏主题站点，含 article.html。",
+        priorTurns: 5,
+        checkpoint: { conversationTurn: 5 },
+      }),
+      sse(1, "host", "user_message", { text: "这是可浏览的成品吗？", turn: 6 }),
+    ]);
+    const kinds = deriveChatItems(s).map((i) => i.kind);
+    expect(kinds).toContain("recap");
+    const recap = deriveChatItems(s).find((i) => i.kind === "recap");
+    expect(recap.text).toContain("article.html");
+    expect(recap.turns).toBe(5);
+    expect(renderChatItem(recap)).toContain("此前 5 轮");
+  });
+
+  it("删对话时整条谱系一起走", () => {
+    const runs = [
+      { runId: "root", continuedFrom: null },
+      { runId: "mid", continuedFrom: "root" },
+      { runId: "tip", continuedFrom: "mid" },
+      { runId: "other", continuedFrom: null },
+    ];
+    expect(conversationChainIds(runs, "tip").sort()).toEqual(["mid", "root", "tip"]);
+    expect(conversationChainIds(runs, "other")).toEqual(["other"]);
+  });
+
+  it("谱系产物沿 continuedFrom 拼回来", () => {
+    const parent = reduceEvents(createInitialState("parent", "做网站", false), [
+      sse(0, "main", "tool_call", { toolUseId: "w", name: "write_file", input: { path: "article.html" } }),
+      sse(1, "main", "tool_result", { toolUseId: "w", result: { content: "ok", isError: false } }),
+    ]);
+    const child = createInitialState("child", "请为我生成一个完整的网站设计方案", false);
+    const files = deriveThreadFiles(
+      [
+        { runId: "parent", continuedFrom: null },
+        { runId: "child", continuedFrom: "parent" },
+      ],
+      new Map([["parent", parent], ["child", child]]),
+      "child",
+    );
+    expect(files.map((f) => f.path)).toContain("article.html");
   });
 
   it("列表项渲染标题，同时把原文挂 title（鼠标停一下看全）", () => {

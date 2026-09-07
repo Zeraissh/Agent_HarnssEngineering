@@ -139,6 +139,8 @@ export interface ArchivedMeta {
   /** 派生谱系；父档案始终不可变 */
   continuedFrom?: string | null;
   rootRunId?: string | null;
+  /** 本轮收尾摘要；旧档案缺省。列表与续跑 fort 的「此前对话」用它，不另开模型 */
+  recap?: string | null;
   /**
    * 列表列所需的裁决摘要；完整裁决在事件流里，不重复存。
    * judgedTurn = 这份裁决核查的是第几轮对话（会话中心化后核查是逐轮选项，
@@ -497,4 +499,16 @@ export async function pruneHistory(
     }
   }
   return removed;
+}
+
+/** 删一条对话档案：一个 runId 一个目录。非法 id 拒绝，避免把历史根干掉 */
+export async function removeHistoryDir(root: string, runId: string): Promise<boolean> {
+  const id = String(runId ?? "").trim();
+  if (!id || /[\\/]/.test(id) || id === "." || id === "..") return false;
+  try {
+    await rm(join(root, id), { recursive: true, force: true });
+    return true;
+  } catch {
+    return false;
+  }
 }

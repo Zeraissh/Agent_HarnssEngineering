@@ -3,8 +3,9 @@
  * 并支持任务提交与审批应答。Node 内置模块，零第三方依赖。
  */
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
-import { readFile, writeFile, mkdir, stat } from "node:fs/promises";
-import { spawn } from "node:child_process";
+import { readFile, writeFile, mkdir, stat, open, readdir } from "node:fs/promises";
+import { spawn, execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { existsSync, readFileSync } from "node:fs";
 import { join, extname, dirname, delimiter, resolve, basename, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -73,9 +74,9 @@ import {
   validateRunContextBudget,
   type ContextPlan,
 } from "../src/context-window.js";
-import { getPack, selectPackTools, PACKS, RULE_PRECEDENCE_DISCIPLINE, type DomainPack } from "../src/presets.js";
+import { getPack, selectPackTools, PACKS, DEFAULT_HOST_DISCIPLINES, type DomainPack } from "../src/presets.js";
 import { connectMcpServers, loadMcpConfig, type McpRuntime } from "../src/mcp.js";
-import { createWorkdirScopedMemoryTools, MEMORY_TOOL_NAMES } from "../src/memory.js";
+import { createWorkdirScopedMemoryTools, MEMORY_TOOL_NAMES, MemoryStore } from "../src/memory.js";
 import { DEFAULT_VERIFIER_MAX_TURNS, resolveVerifierReadOnlyCommands } from "../src/verifier.js";
 import { resolvePlannerMaxTurns } from "../src/planner.js";
 import type { Plan, SubTask } from "../src/planner.js";
@@ -88,12 +89,14 @@ import {
   withTaskCompletion,
 } from "../src/task-completion.js";
 import { createDescribeImageTool } from "../src/tools/describe-image.js";
+import { createWebSearchTool, isWebSearchConfigured } from "../src/tools/web-search.js";
 import { fetchUrlTool } from "../src/tools/fetch-url.js";
 import { editFileTool } from "../src/tools/edit-file.js";
 import { globTool } from "../src/tools/glob.js";
 import { grepTool } from "../src/tools/grep.js";
 import { readFileTool } from "../src/tools/read-file.js";
 import { writeFileTool } from "../src/tools/write-file.js";
+import { updateProgressTool } from "../src/tools/update-progress.js";
 import { resolveInWorkdir } from "../src/tools/fs-util.js";
 import { DEFAULT_TOOL_RESULT_MAX_CHARS } from "../src/tools/registry.js";
 import {
@@ -118,6 +121,7 @@ import {
   historyRootPath,
   loadArchivedMetas,
   pruneHistory,
+  removeHistoryDir,
   readArchivedEvents,
   readArchivedState,
   readArchivedTranscript,
@@ -126,6 +130,18 @@ import {
   type ArchivedCheckpoint,
   type ArchivedMeta,
 } from "./history.js";
+import {
+  ScheduleRunner,
+  SCHEDULE_TICK_MS,
+  advanceAfterMiss,
+  computeNextRunAt,
+  isMissed,
+  loadSchedules,
+  parseScheduleSpec,
+  saveSchedules,
+  schedulesFilePath,
+  type ScheduleEntry,
+} from "./scheduler.js";
 import {
   canSameRunResume,
   initialRunState,
@@ -397,6 +413,16 @@ interface StoredRun {
   mode?: "single" | "plan";
   concurrency?: number | "auto";
   /**
+   * 谱系 token/轮次硬顶。缺省 true（真实宿主默认 2M / 120）。
+   * false = 本 run 不注入 maxTokensBudget / maxTotalTurns，不会 budget_exhausted。
+   */
+  lineageBudget?: boolean;
+  /**
+   * 日预算门。缺省 true（若宿主配了 AGENT_UI_DAILY_TOKEN_BUDGET）。
+   * false = 本请求与后续追问跳过 dailyBudgetRefusal。
+   */
+  dailyBudget?: boolean;
+  /**
    * V-28 多轮对话：会话正史（执行者谱系 main/rework 最后一段的完整消息）与本轮的
    * loop 实例。会话中心化之后每轮**新建** AgentLoop：预算与 Context 水位从检查点
    * 延续（与归档派生 / 同 run 热恢复同一口径），不再靠"活对象还在"才能续——
@@ -432,6 +458,11 @@ interface StoredRun {
    * 默认开会让无人值守的运行挂死等一个不会来的人。
    */
   askUser?: boolean;
+  /**
+   * 交互式 Web：本 run 自动放行执行者工具。默认关（API / 脚本不能悄悄变成 --yes）。
+   * 工作目录圈禁与只读核查边界仍在。
+   */
+  autoApprove?: boolean;
   /** 当前提问挂起态；计划并发下其它提问进入 questionQueue，不能覆盖这一项。 */
   pendingQuestion?: PendingQuestion;
   /** 多执行者并发调用 ask_user 时的宿主级串行队列。 */
@@ -464,6 +495,8 @@ interface StoredRun {
   /** 派生谱系。continuedFrom 是直接父级，rootRunId 是最初祖先。 */
   continuedFrom?: string;
   rootRunId?: string;
+  /** 本轮收尾摘要（执行者最后一段正文的首句）；列表与 fort 续跑沿用 */
+  conversationRecap?: string;
   /** 仅供刚派生的新 run 装配首轮；完成后 checkpoint 会从真实 done 事件重建。 */
   resumeBudget?: SharedRunBudget;
   initialContextInputTokens?: number;
@@ -628,6 +661,341 @@ function safeDecode(s: string): string {
   } catch {
     return s;
   }
+}
+
+/**
+ * T5 /api/memory/:name 的合法记忆名：仅 [A-Za-z0-9._-]、以 .md 结尾。
+ * 比 MemoryStore.NAME_RE 更窄（不允许子目录）——HTTP 路径参数不含 "/"，
+ * 名单收窄后穿越面为零；列表里出现的嵌套名字（若有）读不到，属有意收窄。
+ */
+const MEMORY_API_NAME_RE = /^[A-Za-z0-9._-]+\.md$/;
+/** T5 单条记忆读取上限：超出截断并在响应里标注 truncated */
+const MEMORY_READ_MAX_BYTES = 256 * 1024;
+
+// ------------------------------------------------------------------
+// T6 全局搜索（/api/search）：标题 + 正文
+// ------------------------------------------------------------------
+
+/** 查询词最短长度：单字符子串匹配信噪比太低（一个汉字几乎命中所有档案） */
+const SEARCH_MIN_QUERY_CHARS = 2;
+/** 结果 run 数默认上限与硬上限 */
+const SEARCH_DEFAULT_LIMIT = 20;
+const SEARCH_MAX_LIMIT = 100;
+/** 扫描 run 数上限：兜底总耗时，超出截断并在响应里标注 truncatedRuns */
+const SEARCH_RUN_SCAN_CAP = 500;
+/** 每个 run 最多返回的正文命中条数 */
+const SEARCH_SNIPPETS_PER_RUN = 3;
+/** 命中片段前后各带的上下文字符数 */
+const SEARCH_SNIPPET_CONTEXT_CHARS = 60;
+/** 单条 transcript 只搜前 10MB：超大档案不拖垮整次搜索 */
+const SEARCH_TRANSCRIPT_MAX_BYTES = 10 * 1024 * 1024;
+
+export interface SearchSnippet {
+  text: string;
+  lineHint: string;
+}
+
+export interface SearchRunResult {
+  runId: string;
+  title: string;
+  workdir: string | null;
+  status: string;
+  updatedAt: number;
+  titleHit: boolean;
+  snippets: SearchSnippet[];
+}
+
+export interface SearchHistoryResponse {
+  query: string;
+  results: SearchRunResult[];
+  truncatedRuns: boolean;
+}
+
+/**
+ * 只读文件前 maxBytes 字节并解码 UTF-8。截断点可能落在多字节字符中间，
+ * toString 会在末尾留下替换符——替换符不可能匹配任何查询词，于搜索无害。
+ * 文件不存在/读失败返回空串（档案坏一条不该拖垮整次搜索，同 loadArchivedMetas 纪律）。
+ */
+async function readFileHeadUtf8(file: string, maxBytes: number): Promise<string> {
+  let handle: Awaited<ReturnType<typeof open>> | null = null;
+  try {
+    handle = await open(file, "r");
+    const size = (await handle.stat()).size;
+    const length = Math.min(size, maxBytes);
+    if (length <= 0) return "";
+    const buf = Buffer.alloc(length);
+    await handle.read(buf, 0, length, 0);
+    return buf.toString("utf8");
+  } catch {
+    return "";
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+/**
+ * 从一行 transcript.jsonl 提取可搜索正文。
+ * 段形状：{ index, source, messages: [{ role, content }] }——content 是字符串
+ * （user）或块数组（assistant 的 text/thinking 块）。坏行返回空串（追加中断
+ * 可能留下半行，同 readJsonLines 的跳行纪律）。
+ */
+function transcriptLineSearchText(line: string): string {
+  let segment: unknown;
+  try {
+    segment = JSON.parse(line);
+  } catch {
+    return "";
+  }
+  if (!segment || typeof segment !== "object") return "";
+  const messages = (segment as { messages?: unknown }).messages;
+  if (!Array.isArray(messages)) return "";
+  const parts: string[] = [];
+  for (const message of messages) {
+    const content = (message as { content?: unknown } | null)?.content;
+    if (typeof content === "string") {
+      parts.push(content);
+    } else if (Array.isArray(content)) {
+      for (const block of content) {
+        const b = block as { text?: unknown; thinking?: unknown } | null;
+        if (typeof b?.text === "string") parts.push(b.text);
+        else if (typeof b?.thinking === "string") parts.push(b.thinking);
+      }
+    }
+  }
+  return parts.join("\n");
+}
+
+/** 在 text 里取一条命中片段：命中词前后各约 CONTEXT 字符，截断处加省略号 */
+function makeSnippet(text: string, hitAt: number, queryLength: number): string {
+  const start = Math.max(0, hitAt - SEARCH_SNIPPET_CONTEXT_CHARS);
+  const end = Math.min(text.length, hitAt + queryLength + SEARCH_SNIPPET_CONTEXT_CHARS);
+  return (start > 0 ? "…" : "") + text.slice(start, end) + (end < text.length ? "…" : "");
+}
+
+/**
+ * T6 全局搜索主体。只读、串行读盘；圈禁在历史根目录**平铺**的 run 目录内——
+ * 目录名来自 readdir 而非客户端输入，且含分隔符/点号的异常条目直接跳过，
+ * 没有任何路径参数能把读取引出 root。
+ */
+async function searchRunHistory(
+  root: string,
+  query: string,
+  limit: number,
+): Promise<SearchHistoryResponse> {
+  const queryLower = query.toLowerCase();
+  let entries: string[];
+  try {
+    entries = await readdir(root);
+  } catch {
+    return { query, results: [], truncatedRuns: false }; // 根目录不存在 = 还没有历史
+  }
+  const truncatedRuns = entries.length > SEARCH_RUN_SCAN_CAP;
+  const results: SearchRunResult[] = [];
+  let scanned = 0;
+  for (const name of entries) {
+    if (scanned >= SEARCH_RUN_SCAN_CAP) break;
+    if (name === "." || name === ".." || name.includes("/") || name.includes("\\")) continue;
+    scanned += 1;
+    const dir = join(root, name);
+    let meta: ArchivedMeta;
+    try {
+      meta = JSON.parse(await readFile(join(dir, "meta.json"), "utf8")) as ArchivedMeta;
+      if (!meta || meta.version !== 1 || typeof meta.runId !== "string" || meta.runId === "") continue;
+    } catch {
+      continue; // 半写目录/损坏 meta/无关文件：逐条跳过
+    }
+    const title = typeof meta.task === "string" ? meta.task : "";
+    const titleHit = title.toLowerCase().includes(queryLower);
+    const snippets: SearchSnippet[] = [];
+    const transcript = await readFileHeadUtf8(join(dir, "transcript.jsonl"), SEARCH_TRANSCRIPT_MAX_BYTES);
+    if (transcript) {
+      const lines = transcript.split("\n");
+      for (let i = 0; i < lines.length && snippets.length < SEARCH_SNIPPETS_PER_RUN; i++) {
+        const line = lines[i]!.trim();
+        if (!line) continue;
+        const text = transcriptLineSearchText(line);
+        const hitAt = text.toLowerCase().indexOf(queryLower);
+        if (hitAt < 0) continue;
+        snippets.push({
+          text: makeSnippet(text, hitAt, query.length),
+          lineHint: `transcript.jsonl 第 ${i + 1} 行`,
+        });
+      }
+    }
+    if (!titleHit && snippets.length === 0) continue;
+    results.push({
+      runId: meta.runId,
+      title,
+      workdir: typeof meta.workdir === "string" ? meta.workdir : null,
+      status: typeof meta.status === "string" ? meta.status : "done",
+      updatedAt:
+        typeof meta.finishedAt === "number"
+          ? meta.finishedAt
+          : typeof meta.createdAt === "number"
+            ? meta.createdAt
+            : 0,
+      titleHit,
+      snippets,
+    });
+  }
+  results.sort((a, b) => b.updatedAt - a.updatedAt);
+  return { query, results: results.slice(0, limit), truncatedRuns };
+}
+
+// ------------------------------------------------------------------
+// T8 变更审查（/api/runs/:id/changes）：这次运行触碰了哪些文件
+// ------------------------------------------------------------------
+
+/**
+ * 能从 tool_call 入参直接读出目标路径的写盘工具 → 操作标签。
+ * 与 src/tools/ 的实际注册名一一对应（write_file / edit_file）。
+ * bash 不在其中：它的写入藏在任意命令串里，从入参读不出路径——
+ * 这与 app.js deriveArtifacts 的口径一致，宁缺勿假。
+ * memory_write 有自己的面板（T5），不混入"工作目录变更"。
+ */
+const CHANGE_TOOL_OPS: Record<string, "write" | "edit"> = {
+  write_file: "write",
+  edit_file: "edit",
+};
+
+/** git 子进程硬上限：不可用/超时一律静默降级为 git: null（Supervisor 视图缺了 diff 也要能开） */
+const GIT_PROBE_TIMEOUT_MS = 3000;
+
+export interface ChangeGitInfo {
+  /** porcelain 归一状态："M" 修改 / "A" 新增（含已暂存）/ "??" 未跟踪 / "D" 已删除 */
+  status: string;
+  /** `git diff --stat HEAD -- <path>` 的增删行数；无 diff（未跟踪/无变化）为 null */
+  added: number | null;
+  deleted: number | null;
+}
+
+export interface RunChangeEntry {
+  /** 相对 run workdir 的正斜杠路径；越界路径保留工具入参原文 */
+  path: string;
+  ops: string[];
+  count: number;
+  /** 最后一次触碰的服务端接收时刻（事件包络 ts），无时间戳为 null */
+  lastAt: number | null;
+  outOfScope: boolean;
+  exists: boolean;
+  sizeBytes: number | null;
+  mtimeMs: number | null;
+  git: ChangeGitInfo | null;
+}
+
+/** 从事件流聚合写盘工具的触碰路径。事件形状见 pushEvent：{ seq, source, ts, event } 包络。 */
+export function collectTouchedPaths(
+  events: unknown[],
+): { input: string; ops: Set<string>; count: number; lastAt: number | null }[] {
+  const groups = new Map<
+    string,
+    { input: string; ops: Set<string>; count: number; lastAt: number | null }
+  >();
+  for (const envelope of events) {
+    const ev = (envelope as { event?: unknown } | null)?.event as
+      | { type?: unknown; name?: unknown; input?: unknown }
+      | undefined;
+    if (!ev || ev.type !== "tool_call" || typeof ev.name !== "string") continue;
+    const op = CHANGE_TOOL_OPS[ev.name];
+    if (!op) continue;
+    const raw = (ev.input as { path?: unknown } | null | undefined)?.path;
+    if (typeof raw !== "string" || !raw.trim()) continue;
+    const input = raw.trim();
+    const ts = (envelope as { ts?: unknown } | null)?.ts;
+    const at = typeof ts === "number" && Number.isFinite(ts) ? ts : null;
+    let group = groups.get(input);
+    if (!group) {
+      group = { input, ops: new Set(), count: 0, lastAt: null };
+      groups.set(input, group);
+    }
+    group.ops.add(op);
+    group.count += 1;
+    if (at !== null) group.lastAt = at;
+  }
+  return [...groups.values()];
+}
+
+/** porcelain 行首两个字符 → 归一状态。优先级：未跟踪 > 删除 > 新增 > 修改 > 其他原样首字符。 */
+export function parseGitPorcelainStatus(line: string): string | null {
+  if (!line || line.length < 2) return null;
+  const xy = line.slice(0, 2);
+  if (xy === "??") return "??";
+  if (xy.includes("D")) return "D";
+  if (xy.includes("A")) return "A";
+  if (xy.includes("M")) return "M";
+  const first = xy.trim().charAt(0);
+  return first || null;
+}
+
+/** 解析 `git diff --stat` 的汇总行：「 1 file changed, 5 insertions(+), 3 deletions(-)」。 */
+export function parseDiffStatSummary(text: string): { added: number | null; deleted: number | null } {
+  const m = /(\d+)\s+files?\s+changed/.exec(text);
+  if (!m) return { added: null, deleted: null };
+  const ins = /(\d+)\s+insertions?\(\+\)/.exec(text);
+  const del = /(\d+)\s+deletions?\(-\)/.exec(text);
+  return {
+    added: ins ? Number(ins[1]) : 0,
+    deleted: del ? Number(del[1]) : 0,
+  };
+}
+
+const execFileAsync = promisify(execFile);
+
+/** 单文件 git 探针：porcelain 状态 + diff 统计。任何失败/超时 → null（静默降级）。 */
+async function probeGitForFile(root: string, relPath: string): Promise<ChangeGitInfo | null> {
+  try {
+    const statusOut = await execFileAsync("git", ["status", "--porcelain", "--", relPath], {
+      cwd: root,
+      timeout: GIT_PROBE_TIMEOUT_MS,
+      maxBuffer: 1024 * 1024,
+      // Windows 上 execFile 不经 shell：参数按数组逐个传递，没有转义面
+      windowsHide: true,
+    });
+    const firstLine = statusOut.stdout.split("\n").find((l) => l.trim().length > 0) ?? "";
+    const status = parseGitPorcelainStatus(firstLine);
+    if (!status) return null; // 干净文件（已提交且无改动）不挂徽章
+    let added: number | null = null;
+    let deleted: number | null = null;
+    if (status !== "??") {
+      // HEAD 口径同时覆盖已暂存与未暂存改动；未跟踪文件无 diff 可言
+      const diffOut = await execFileAsync("git", ["diff", "--stat", "HEAD", "--", relPath], {
+        cwd: root,
+        timeout: GIT_PROBE_TIMEOUT_MS,
+        maxBuffer: 1024 * 1024,
+        windowsHide: true,
+      });
+      ({ added, deleted } = parseDiffStatSummary(diffOut.stdout));
+    }
+    return { status, added, deleted };
+  } catch {
+    return null; // git 不在 PATH、非仓库、超时、被杀——一律降级，视图照样能开
+  }
+}
+
+/** workdir 是否 git 仓库（.git 存在即可，文件或目录都算——worktree 的 .git 是文件）。 */
+async function detectGitRepo(root: string): Promise<boolean> {
+  try {
+    await stat(join(root, ".git"));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 按字节上限截断 UTF-8 文本，回退到完整字符边界——
+ * 直接 Buffer.subarray 会在多字节字符中间下刀，解码出替换符导致结果反而超上限。
+ */
+function utf8SafeHead(text: string, maxBytes: number): string {
+  const buf = Buffer.from(text, "utf8").subarray(0, maxBytes);
+  let end = buf.length;
+  for (let i = Math.max(0, buf.length - 4); i < buf.length; i++) {
+    const b = buf[i]!;
+    const seqLen = b < 0x80 ? 1 : b < 0xc0 ? 0 : b < 0xe0 ? 2 : b < 0xf0 ? 3 : 4;
+    if (seqLen === 0) continue; //  continuation byte：归属前面的序列
+    if (i + seqLen > buf.length) { end = i; break; } // 序列伸出截断点 → 整段丢弃
+  }
+  return buf.subarray(0, end).toString("utf8");
 }
 
 export interface UiServerOptions {
@@ -1139,6 +1507,8 @@ function restoredBudget(
   checkpoint: ArchivedCheckpoint,
   current: Pick<AgentConfig, "maxTotalTurns" | "maxTokensBudget">,
 ): SharedRunBudget {
+  // 检查点里的旧上限必须跟着档案走——重启宿主（甚至不再配 env）不能洗掉旧账。
+  // 旧上限不再是死路：用尽后发送会自动续一段跑道（autoExtendIfExhausted）。
   const maxTurns = stricterLimit(checkpoint.runBudget.maxTurns, current.maxTotalTurns);
   const maxTokens = stricterLimit(checkpoint.runBudget.maxTokens, current.maxTokensBudget);
   return {
@@ -1151,22 +1521,76 @@ function restoredBudget(
 
 /**
  * 预算耗尽是会话唯一会被挡住的结构性原因，所以文案必须说清**哪个预算、怎么提**：
- * 只报"用尽"等于把人晾在那里。两个 env 名与 buildConfig 读的一致。
+ * 只报"用尽"等于把人晾在那里。
+ *
+ * 2026-09-04：主路径改成「追加预算 / 同目录新开对话」——要求改 env 并重启宿主
+ * 对长任务太狠（委托方截图：594k/500k 卡死、只能另起或重启）。env 名仍写出，
+ * 但是作为**抬默认上限**的后手，不是当场续跑的唯一办法。
  */
 export function exhaustedBudgetReason(budget: SharedRunBudget): string | null {
   if (budget.maxTurns !== undefined && budget.usedTurns >= budget.maxTurns) {
     return (
       `执行谱系的总轮次预算已用尽（${budget.usedTurns}/${budget.maxTurns}）。` +
-      "要在这场对话里继续，请提高 AGENT_TOTAL_MAX_TURNS 后重启宿主；或者新建对话"
+      "已完成的写入不会回滚。要继续这场对话请点「追加预算」后再发指令；" +
+      "或「新建对话」在同一工作目录开新会话（产物还在）。" +
+      "若希望默认上限更高，设置 AGENT_TOTAL_MAX_TURNS 后重启宿主"
     );
   }
   if (budget.maxTokens !== undefined && budget.usedTokens >= budget.maxTokens) {
     return (
       `执行谱系的总 token 预算已用尽（${budget.usedTokens}/${budget.maxTokens}）。` +
-      "要在这场对话里继续，请提高 AGENT_TOTAL_TOKEN_BUDGET 后重启宿主；或者新建对话"
+      "已完成的写入不会回滚。要继续这场对话请点「追加预算」后再发指令；" +
+      "或「新建对话」在同一工作目录开新会话（产物还在）。" +
+      "若希望默认上限更高，设置 AGENT_TOTAL_TOKEN_BUDGET 后重启宿主"
     );
   }
   return null;
+}
+
+/**
+ * 给执行谱系**当场**加一段跑道：新上限 = 已用量 + 追加量。
+ * 这样无论当前 max 是否已被 used 超过，追加后一定解除 exhaustedBudgetReason。
+ * 纯函数——服务端接线与单测共用。
+ */
+/**
+ * 续跑时若谱系额度已尽，当场续一段跑道再放行——不要把「发下一条」变成
+ * 先点「追加预算」的两步手续。日预算门仍是跨 run 总闸，这里只解会话卡死。
+ */
+export function autoExtendIfExhausted(
+  budget: SharedRunBudget,
+  defaults: { addTokens: number; addTurns: number },
+): { budget: SharedRunBudget; extended: boolean } {
+  const tokenOut = budget.maxTokens !== undefined && budget.usedTokens >= budget.maxTokens;
+  const turnOut = budget.maxTurns !== undefined && budget.usedTurns >= budget.maxTurns;
+  if (!tokenOut && !turnOut) return { budget, extended: false };
+  return {
+    budget: extendSharedRunBudget(budget, {
+      ...(tokenOut ? { addTokens: defaults.addTokens } : {}),
+      ...(turnOut ? { addTurns: defaults.addTurns } : {}),
+    }),
+    extended: true,
+  };
+}
+
+export function extendSharedRunBudget(
+  budget: SharedRunBudget,
+  opts: { addTokens?: number; addTurns?: number },
+): SharedRunBudget {
+  const next: SharedRunBudget = {
+    usedTurns: budget.usedTurns,
+    usedTokens: budget.usedTokens,
+    ...(budget.maxTurns !== undefined ? { maxTurns: budget.maxTurns } : {}),
+    ...(budget.maxTokens !== undefined ? { maxTokens: budget.maxTokens } : {}),
+  };
+  const addTokens = opts.addTokens ?? 0;
+  const addTurns = opts.addTurns ?? 0;
+  if (addTokens > 0) {
+    next.maxTokens = next.usedTokens + addTokens;
+  }
+  if (addTurns > 0) {
+    next.maxTurns = next.usedTurns + addTurns;
+  }
+  return next;
 }
 
 interface PlanSummarySubtask {
@@ -1366,6 +1790,7 @@ const BUILTIN_POOL: Tool[] = [
   editFileTool,
   globTool,
   grepTool,
+  updateProgressTool,
 ];
 
 /** 上传落点：工作目录下的固定子目录，便于人和 agent 都一眼知道东西在哪 */
@@ -1375,7 +1800,7 @@ const DEFAULT_SYSTEM_PROMPT = `You are a capable autonomous agent operating in a
 Complete the user's task end to end using the available tools.
 Ground every claim of progress in an actual tool result.
 
-You have a persistent memory that survives across sessions. The current memory index is provided in the <context> block of the first message. Consult relevant memories (memory_read) before starting work. When you learn a durable fact, user preference, or lesson worth reusing — a correction you received, a project constant, an approach that worked — save it with memory_write (one fact per file, first line = summary). Update or delete memories that turn out to be wrong. Do not store transient task state or things already recorded in the repository.` + RULE_PRECEDENCE_DISCIPLINE;
+You have a persistent memory that survives across sessions. The current memory index is provided in the <context> block of the first message. Consult relevant memories (memory_read) before starting work. When you learn a durable fact, user preference, or lesson worth reusing — a correction you received, a project constant, an approach that worked — save it with memory_write (one fact per file, first line = summary). Update or delete memories that turn out to be wrong. Do not store transient task state or things already recorded in the repository.` + DEFAULT_HOST_DISCIPLINES;
 
 // ------------------------------------------------------
 // Server factory
@@ -1604,6 +2029,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   );
   const memoryTools = memoryHost.tools;
   const defaultMemoryDir = process.env.AGENT_MEMORY_DIR ?? join(workdir, ".agent-memory");
+  /**
+   * T5 记忆面板的数据源：与 /api/harness 的 memory.dir 同一个目录（默认 workdir
+   * 作用域，AGENT_MEMORY_DIR 可覆盖）。只读——面板起步不提供编辑/删除。
+   */
+  const defaultMemoryStore = new MemoryStore(defaultMemoryDir);
   // modelClient 是 provider 注入口，不是“测试模式”安全开关；用它推断 off 会让
   // 嵌入式真实 client 在 required 配置下静默退回宿主。测试隔离必须显式传 env。
   const executionEnv: NodeJS.ProcessEnv = options.executionEnv ?? process.env;
@@ -1855,10 +2285,15 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         modelName: visionRole.name,
       })
     : null;
+  const webSearchTool = isWebSearchConfigured() ? createWebSearchTool() : null;
   const enabledBuiltinPool = bashEnabled
     ? BUILTIN_POOL
     : BUILTIN_POOL.filter((tool) => tool.name !== bashTool.name);
-  const toolPool: Tool[] = visionTool ? [...enabledBuiltinPool, visionTool] : enabledBuiltinPool;
+  const toolPool: Tool[] = [
+    ...enabledBuiltinPool,
+    ...(webSearchTool ? [webSearchTool] : []),
+    ...(visionTool ? [visionTool] : []),
+  ];
 
   const runs = new Map<string, StoredRun>();
   const startedAt = Date.now();
@@ -2007,6 +2442,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       checkpoint: run.checkpoint ?? null,
       continuedFrom: run.continuedFrom ?? null,
       rootRunId: run.rootRunId ?? null,
+      recap: run.conversationRecap || recapFromRunEvents(run) || null,
       outcome: run.outcome
         ? {
             finalPassed: run.outcome.finalPassed,
@@ -2179,6 +2615,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           ...(typeof a.meta.rootRunId === "string" && a.meta.rootRunId
             ? { rootRunId: a.meta.rootRunId }
             : {}),
+          ...(typeof a.meta.recap === "string" && a.meta.recap
+            ? { conversationRecap: a.meta.recap }
+            : {}),
           ...(durableState ? { durableState } : {}),
           // 崩溃档案（meta 还停在 running）：没人正常收过尾，按宿主级异常归档
           ...(crashed
@@ -2306,7 +2745,33 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    */
   /** 活 run 追加的唯一结构性阻断：执行谱系预算耗尽（检查点里的累计读数） */
   function liveBudgetBlockReasonOf(r: StoredRun): string | null {
+    // 检查点里钉着的上限就是武装状态本身：重启后宿主不再配 env 也不能洗掉旧账
+    //（见「重启不能移除检查点里的旧上限」）。未配预算的 run 检查点里没有上限，
+    // exhaustedBudgetReason 自然返回 null，不需要 lineageBudgetArmed 再挡一道。
+    if (r.lineageBudget === false) return null;
     return r.checkpoint ? exhaustedBudgetReason(r.checkpoint.runBudget) : null;
+  }
+
+  /**
+   * 归档派生只拦「当前宿主上限也挡着」——旧检查点钉着 50 万、宿主已经 200 万
+   * 时不该把整场对话判死。重启把上限收得更严（used ≥ 当前 env）仍拒绝。
+   */
+  function hostBoundExhaustedReason(budget: SharedRunBudget): string | null {
+    if (maxTotalTurns !== undefined && budget.usedTurns >= maxTotalTurns) {
+      return exhaustedBudgetReason({ ...budget, maxTurns: maxTotalTurns });
+    }
+    if (maxTokensBudget !== undefined && budget.usedTokens >= maxTokensBudget) {
+      return exhaustedBudgetReason({ ...budget, maxTokens: maxTokensBudget });
+    }
+    return null;
+  }
+
+  function resumeBudgetForContinuation(checkpoint: NonNullable<StoredRun["checkpoint"]>): SharedRunBudget {
+    const restored = restoredBudget(checkpoint, { maxTotalTurns, maxTokensBudget });
+    return autoExtendIfExhausted(restored, {
+      addTokens: maxTokensBudget ?? 2_000_000,
+      addTurns: maxTotalTurns ?? 40,
+    }).budget;
   }
 
   function archivedForkBlockReason(r: StoredRun): string | null {
@@ -2325,18 +2790,44 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     }
     if (!r.checkpoint) return null; // 无正史的新一轮：预算按当前宿主上限从零起算
     const budget = restoredBudget(r.checkpoint, { maxTotalTurns, maxTokensBudget });
-    return exhaustedBudgetReason(budget);
+    return hostBoundExhaustedReason(budget);
   }
 
   /**
    * 列表项摘要。V-14：元数据由服务端算好，侧栏不再依赖"这个 run 是否被订阅过"
    * ——此前核查结论一列只有打开过的 run 才有值。
    */
+  function clipConversationRecap(text: string, max = 72): string {
+    const cleaned = String(text ?? "")
+      .replace(/```[\s\S]*?```/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!cleaned) return "";
+    const sentence = cleaned.split(/(?<=[。！？.!?])\s+/)[0] ?? cleaned;
+    return sentence.length <= max ? sentence : `${sentence.slice(0, max)}…`;
+  }
+
+  function recapFromRunEvents(run: StoredRun): string {
+    let last = "";
+    for (const item of run.events) {
+      const ev = item.event as Record<string, unknown>;
+      if (ev?.type === "assistant_text" && item.source !== "verifier" && item.source !== "planner") {
+        last = String(ev.text ?? "");
+      }
+    }
+    if (!last) {
+      const summary = run.outcome?.verifications.at(-1)?.verdict?.summary;
+      if (typeof summary === "string") last = summary;
+    }
+    return clipConversationRecap(last);
+  }
+
   function runSummary(r: StoredRun): Record<string, unknown> {
     // 会话中心化：活 run 只要收了尾就能追加——核查 / 编排 / 无正史都不是封印，
     // 唯一的结构性阻断是执行谱系预算耗尽（且文案说清怎么提）。
     const liveBudgetBlockReason = liveBudgetBlockReasonOf(r);
-    const liveCanContinue = !r.archived && r.status === "done" && liveBudgetBlockReason === null;
+    // 活 run 收了尾就能追加。谱系额度用尽不再卡对话——followUp 会自动续一段跑道。
+    const liveCanContinue = !r.archived && r.status === "done";
     const archiveBlockReason = r.archived ? archivedForkBlockReason(r) : null;
     const archiveCanFork = Boolean(r.archived && archiveBlockReason === null);
     // same-run 仅 interrupted（崩溃收口）+ checkpoint；完成态档案仍走 fork
@@ -2387,6 +2878,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         ? { id: r.pendingQuestion.id, questions: r.pendingQuestion.questions }
         : null,
       askUser: Boolean(r.askUser),
+      autoApprove: Boolean(r.autoApprove),
       planDecision: r.planDecision?.decision ?? null,
       verdict: r.outcome?.verifications.at(-1)?.verdict ?? r.archivedOutcome?.verdict ?? null,
       mode: r.mode ?? "single",
@@ -2394,6 +2886,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       // “原进程无缝继续”。continuationMode 是这个环境边界的显式契约。
       ...(r.archived ? { archived: true } : {}),
       conversationTurn: r.conversationTurn,
+      recap: r.conversationRecap || recapFromRunEvents(r) || null,
       continuedFrom: r.continuedFrom ?? null,
       rootRunId: r.rootRunId ?? null,
       // RUN-01 Phase 2：sameRunResume 仅在 interrupted+checkpoint 且边界放行时为 true
@@ -2407,6 +2900,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       // 也就是"这段工作触碰的范围"——它是这个 harness 自己长出来的分组键，
       // 不是从别家侧栏照搬来的层级
       workdir: r.workdir ?? workdir,
+      effort: r.effort ?? null,
       // 能否追加：让界面据此决定要不要显示输入框，而不是点了才报错。
       canContinue: liveCanContinue || archiveCanSameRun || archiveCanFork,
       continuationMode: archiveCanSameRun
@@ -2420,6 +2914,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         !archiveCanSameRun && !archiveCanFork && r.archived
           ? archiveBlockReason
           : liveBudgetBlockReason,
+      // 预算耗尽时可调用 POST .../extend-budget，不必改 env 重启
+      budgetExhausted: Boolean(liveBudgetBlockReason),
+      canExtendBudget: Boolean(
+        !r.archived && r.status === "done" && r.checkpoint?.runBudget && liveBudgetBlockReason,
+      ),
     };
   }
 
@@ -2533,10 +3032,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     }
     return value;
   };
-  // 真实常驻宿主必须有跨 continuation / rework / plan 子任务共享的硬上限；
-  // 注入 fake model 的测试保留原契约，避免用生产默认值改写研究用例。
-  const maxTotalTurns = integerEnv("AGENT_TOTAL_MAX_TURNS", 1) ?? (realHost ? 120 : undefined);
-  const maxTokensBudget = integerEnv("AGENT_TOTAL_TOKEN_BUDGET", 1) ?? (realHost ? 500_000 : undefined);
+  // 谱系硬顶只在 env 显式设置时武装。真实宿主不再默认 120 轮 / 200 万 token——
+  // 长对话会被自己的默认值卡死（184/120），委托方已明确不要这条限定。
+  const maxTotalTurns = integerEnv("AGENT_TOTAL_MAX_TURNS", 1);
+  const maxTokensBudget = integerEnv("AGENT_TOTAL_TOKEN_BUDGET", 1);
+  const lineageBudgetArmed = maxTotalTurns !== undefined || maxTokensBudget !== undefined;
   const compactSummaryMaxTokens = integerEnv("AGENT_COMPACT_SUMMARY_MAX_TOKENS", 64);
   // 单个 tool_result 入口截断上限（MEM-01 Phase C，口径同 CLI）；缺省 40k
   const toolResultMaxChars = integerEnv("AGENT_TOOL_RESULT_MAX_CHARS", 1000);
@@ -2701,8 +3201,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       ...((run?.packName ? runPack?.guardrails?.maxTurns : maxTurns) !== undefined
         ? { maxTurns: (run?.packName ? runPack?.guardrails?.maxTurns : maxTurns) as number }
         : {}),
-      ...(maxTotalTurns !== undefined ? { maxTotalTurns } : {}),
-      ...(maxTokensBudget !== undefined ? { maxTokensBudget } : {}),
+      // 谱系预算可关：关则不注入硬顶，不会走到 budget_exhausted
+      ...(run?.lineageBudget !== false && maxTotalTurns !== undefined ? { maxTotalTurns } : {}),
+      ...(run?.lineageBudget !== false && maxTokensBudget !== undefined ? { maxTokensBudget } : {}),
       ...(toolResultMaxChars !== undefined ? { toolResultMaxChars } : {}),
       ...(compactSummaryOn && realHost
         ? {
@@ -3179,8 +3680,29 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
        * 与最大使用次数。任何一项失配都删除 active grant 并重新挂起。
        */
       let autoApproved = false;
+      const rememberAutoDecision = (decision: "allow" | "deny") => {
+        // 自动放行从不进 pending 表。不记 responded 的话，界面那张卡再点一次
+        // 会走「Approval not found」404，而不是已决的 409。
+        const key = approvalId(event.toolUseId, seq);
+        run.respondedApprovals.set(key, { decision, at: Date.now() });
+        run.respondedToolUseIds.add(event.toolUseId);
+      };
+      if (run.autoApprove) {
+        event.respond("allow");
+        autoApproved = true;
+        rememberAutoDecision("allow");
+        deferredHostEvents.push({
+          type: "approval_resolved",
+          requestSeq: seq,
+          toolUseId: event.toolUseId,
+          name: event.name,
+          decision: "allow",
+          actor: "auto-run",
+          at: Date.now(),
+        });
+      }
       const grant = run.autoAllow?.get(ruleKey);
-      if (grant) {
+      if (!autoApproved && grant) {
         const at = approvalClock();
         const failure = approvalGrantFailure(
           run,
@@ -3199,6 +3721,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           if (remainingUses === 0) run.autoAllow!.delete(ruleKey);
           event.respond("allow");
           autoApproved = true;
+          rememberAutoDecision("allow");
           deferredHostEvents.push({
             type: "approval_resolved",
             requestSeq: seq,
@@ -3419,27 +3942,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
     run.status = "done";
     run.finishedAt = Date.now();
-    // 会话中心化：只要这场对话还能继续（预算未耗尽），本次对话的放行规则就
-    // 留在 TTL 内——核查 / 编排 / 无正史都不再是"不可续跑"的理由
-    const liveGrantCanContinue = liveBudgetBlockReasonOf(run) === null;
-    if (!liveGrantCanContinue && run.autoAllow?.size) {
-      const at = approvalClock();
-      for (const grant of run.autoAllow.values()) {
-        pushSyntheticEvent(run, "host", {
-          type: "approval_grant_invalidated",
-          grantId: grant.grantId,
-          boundRunId: grant.boundRunId,
-          name: grant.name,
-          inputScope: grant.inputScope,
-          inputHash: grant.inputHash,
-          expiresAt: grant.expiresAt,
-          cause: "run_not_continuable",
-          actor: "system",
-          at,
-        });
-      }
-      run.autoAllow.clear();
-    }
+    // 活 run 收尾后对话还能续（谱系额度尽了 followUp 会自动续一段跑道），
+    // 本次对话放行跟着对话走，不再因预算清掉。归档 / 关停另清。
     // 独占资源随收尾释放（release 按 holder 幂等；追问续跑会重新占用）。
     // 释放后清掉字段：留着旧数组会让它的语义从"当前持有"漂成"最后一次持有"，
     // 后续把它当持有状态读的代码会拿到假数据（评审 de6ddef）
@@ -3634,6 +4138,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     // B2：收尾状态整写进档案，然后修剪（判据③）。在跑的 run 受保护不删。
     // 修剪排在本 run 的写入链上：直接 fire-and-forget 会与自己的 meta 写赛跑，
     // 读盘时档案未成形、计数不足就漏剪
+    run.conversationRecap = recapFromRunEvents(run);
     finalizeDurableState(run, endInfo);
     persistMeta(run);
     if (historyRoot && run.archiveWriter) {
@@ -3757,7 +4262,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   async function startConversationTurn(
     run: StoredRun,
     feedback: string,
-    turn: { verify: boolean },
+    turn: {
+      verify: boolean;
+      orchestrate?: boolean;
+      planGate?: boolean;
+      concurrency?: number | "auto";
+    },
   ): Promise<void> {
     const previousTurn = run.conversationTurn;
     const history = run.history?.length ? run.history : undefined;
@@ -3767,6 +4277,16 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     run.conversationTurn += 1;
     run.turnExecutorTurns = 0; // 台账 turns 按对话轮计，新一轮从零累计
     run.verify = turn.verify;
+    const previousMode = run.mode;
+    if (turn.orchestrate) {
+      run.mode = "plan";
+      run.concurrency = turn.concurrency ?? (turn.planGate ? 1 : "auto");
+      run.planGate = Boolean(turn.planGate);
+    } else {
+      delete run.mode;
+      delete run.concurrency;
+      delete run.planGate;
+    }
     // 上一轮按了停止的话 abort 位还立着；新一轮是新的决定，要新的闸
     const abort = new AbortController();
     run.abort = abort;
@@ -3789,20 +4309,28 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       turn: run.conversationTurn,
       text: feedback,
       verify: turn.verify,
-      continues: history ? "history" : run.mode === "plan" ? "plan-summary" : "fresh",
+      continues: turn.orchestrate ? "fresh" : history ? "history" : previousMode === "plan" ? "plan-summary" : "fresh",
       at: Date.now(),
     });
     broadcastLifecycle("run_updated", run);
 
-    // 预算与水位从检查点延续（旧上限与当前上限取更严格者——续跑不能成为洗掉总账的办法）
+    // 预算与水位从检查点延续。本请求若已自动续过跑道（或点过「追加预算」），
+    // resumeBudget 已经是新上限——再用 restoredBudget 按宿主默认夹回去，
+    // 「发送即续」等于没续。归档派生仍走 restoredBudget，重启不能洗掉旧账。
     if (run.checkpoint) {
-      run.resumeBudget = restoredBudget(run.checkpoint, { maxTotalTurns, maxTokensBudget });
+      run.resumeBudget =
+        run.resumeBudget ?? restoredBudget(run.checkpoint, { maxTotalTurns, maxTokensBudget });
       run.initialContextInputTokens = run.checkpoint.contextInputTokens;
+    }
+    const executorFeedback = composeTurnFeedback(run, feedback, previousTurn, history);
+    if (turn.orchestrate) {
+      await startPlannedRun(run, executorFeedback);
+      return;
     }
     await executeTurn(run, {
       history,
       feedback,
-      executorFeedback: composeTurnFeedback(run, feedback, previousTurn, history),
+      executorFeedback,
       verify: turn.verify,
       signal: abort.signal,
     });
@@ -4006,10 +4534,16 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
     // 第一条 durable 事件就是环境边界；即使 MCP 连接很慢，人也能立刻看懂
     // 这是从哪里来的、继承了什么、哪些权限状态已清零。
+    const parentForRecap = run.continuedFrom ? runs.get(run.continuedFrom) : undefined;
+    const priorRecap = parentForRecap
+      ? (parentForRecap.conversationRecap || recapFromRunEvents(parentForRecap))
+      : "";
     pushSyntheticEvent(run, "host", {
       type: "run_forked",
       parentRunId: run.continuedFrom,
       rootRunId: run.rootRunId ?? run.continuedFrom,
+      priorRecap,
+      priorTurns: parentForRecap?.conversationTurn ?? 0,
       boundary: history
         ? "从归档检查点派生新运行；会话正史与累计预算延续，模型、工具和策略使用当前宿主，父档案保持只读。"
         : "从无检查点的归档派生新运行：没有可续的执行正史，本轮从头开始（以原任务/计划摘要为背景）；预算按当前宿主上限从零起算，父档案保持只读。",
@@ -4080,7 +4614,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    *   ③ onPlan / 结果合成事件：计划与调度结果不进 TurnEvent 流，
    *      不显式发出来前端就永远看不到 DAG 与并行收益。
    */
-  async function startPlannedRun(run: StoredRun): Promise<void> {
+  async function startPlannedRun(run: StoredRun, taskText = run.task): Promise<void> {
     await ensureMcp();
     if (!(await pushRunConfig(run))) {
       finalizeRun(run, {
@@ -4101,7 +4635,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
     try {
       const usePlanner = run.usePlannerModel ?? true;
-      const outcome = await runPlanned(baseCfg, modelClient, run.task, {
+      const outcome = await runPlanned(baseCfg, modelClient, taskText, {
         packs: Object.values(PACKS),
         concurrency,
         ...(run.abort ? { signal: run.abort.signal } : {}),
@@ -4614,6 +5148,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         approvalPolicy: approvalGrantPolicyFor(run, tool.name, tool).policy,
         origin: toolOrigin(tool.name),
       })),
+      // 谱系 / 日预算装配：界面按本次真实装配画，不按 env 撒谎
+      budgets: {
+        lineage: run.lineageBudget !== false,
+        daily: run.dailyBudget !== false,
+        dailyConfigured: dailyTokenBudget !== undefined,
+      },
     });
   }
 
@@ -4701,6 +5241,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         maxTokensBudget: maxTokensBudget ?? null,
         toolResultMaxChars: toolResultMaxChars ?? DEFAULT_TOOL_RESULT_MAX_CHARS,
       },
+      budgets: {
+        lineageDefault: maxTokensBudget !== undefined || maxTotalTurns !== undefined,
+        dailyConfigured: dailyTokenBudget !== undefined,
+        dailyTokenBudget: dailyTokenBudget ?? null,
+      },
       /**
        * 窗口 / 预算（MEM-01）：进程级默认包的解析结果，**每次快照时重算**——上一个 run 撞 400
        * 学到窗口后，下一次刷新页面就该看到 learned。提交表单的逐 run 预算控件用 maxBudget
@@ -4725,7 +5270,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         description: p.description,
         verifyMode: p.verify.mode ?? null,
         hasRubric: Boolean(p.verify.rubric),
+        // 装配诚实：consult 需要检索时，没配 key 要能在选包提示里看见
+        groundedConsult: name === "consult",
+        wantsWebSearch: Array.isArray(p.builtinTools) && p.builtinTools.includes("web_search"),
       })),
+      webSearchConfigured: isWebSearchConfigured(),
       effortLevels: [...EFFORT_LEVELS],
       // V-29：合法工作目录集合由宿主声明，浏览器只在其中选
       availableWorkdirs: allowedWorkdirs,
@@ -4800,10 +5349,15 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   function rejectAtCapacity(res: ServerResponse): void {
     metrics.capacityRejected += 1;
     res.setHeader("Retry-After", "1");
-    json(res, 429, {
+    json(res, 429, capacityRejectionPayload());
+  }
+
+  /** 容量拒绝的响应体（T9：调度器内部发起 run 走同一条准入门，但没有 res 可写） */
+  function capacityRejectionPayload(): { error: string; activeRuns: number } {
+    return {
       error: `Active run limit reached (${maxActiveRuns})`,
       activeRuns: activeRunCount(),
-    });
+    };
   }
 
   /**
@@ -4823,27 +5377,37 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   }
 
   /**
-   * 独占资源准入（single/verified 模式）：包声明的资源被别的 run 持有 → 429
+   * 独占资源准入（single/verified 模式）：包声明的资源被别的 run 持有 → 拒绝
    * 附持有者；全部空闲 → 以 runId 为 holder 整体占用。plan 模式不走这里。
-   * 返回 null 表示已占用成功（或无资源要占）。
+   * 返回 "acquired" 表示已占用成功（或无资源要占）。
+   * 纯判定 + 占用副作用分离出来：T9 调度器内部发起 run 走同一条门，但没有 res 可写。
    */
-  function acquireRunResources(
-    res: ServerResponse,
+  function tryAcquireRunResources(
     runId: string,
     tags: string[],
-  ): "acquired" | "refused" {
+  ): "acquired" | { conflict: string; heldBy: string | undefined } {
     if (tags.length === 0 || hostResources.tryAcquire(tags, runId)) return "acquired";
     const conflict = tags.find((t) => {
       const h = hostResources.holderOf(t);
       return h !== undefined && h !== runId;
     })!;
+    return { conflict, heldBy: hostResources.holderOf(conflict) };
+  }
+
+  function acquireRunResources(
+    res: ServerResponse,
+    runId: string,
+    tags: string[],
+  ): "acquired" | "refused" {
+    const outcome = tryAcquireRunResources(runId, tags);
+    if (outcome === "acquired") return "acquired";
     metrics.resourceRejected += 1;
     json(res, 429, {
       error:
-        `Exclusive resource "${conflict}" is held by run ${hostResources.holderOf(conflict)}. ` +
+        `Exclusive resource "${outcome.conflict}" is held by run ${outcome.heldBy}. ` +
         "Wait for that run to finish (or stop it), then retry.",
-      resource: conflict,
-      heldBy: hostResources.holderOf(conflict),
+      resource: outcome.conflict,
+      heldBy: outcome.heldBy,
     });
     return "refused";
   }
@@ -4858,6 +5422,26 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     return undefined;
   }
 
+  /**
+   * 同 workdir 并发判定：exclusive 时返回冲突 runId（调用方负责 409），
+   * 否则告警放行返回 null。判定与响应分离：T9 调度器内部发起 run 没有 res 可写。
+   */
+  function sharedWorkdirRejection(
+    runId: string,
+    targetWorkdir: string,
+    excludeRunId?: string,
+  ): { conflictRunId: string } | null {
+    const conflict = runningWorkdirConflict(targetWorkdir, excludeRunId);
+    if (!conflict) return null;
+    if (exclusiveWorkdir) return { conflictRunId: conflict.id };
+    operationalLog("warn", "workdir_shared", {
+      runId,
+      conflictRunId: conflict.id,
+      workdir: resolve(targetWorkdir),
+    });
+    return null;
+  }
+
   /** 同 workdir 并发：exclusive 时 409 拒绝（返回 true 表示已拒），否则告警放行 */
   function refuseOrWarnSharedWorkdir(
     res: ServerResponse,
@@ -4865,39 +5449,42 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     targetWorkdir: string,
     excludeRunId?: string,
   ): boolean {
-    const conflict = runningWorkdirConflict(targetWorkdir, excludeRunId);
-    if (!conflict) return false;
-    if (exclusiveWorkdir) {
-      metrics.workdirRejected += 1;
-      json(res, 409, {
-        error:
-          `Workdir is in use by running run ${conflict.id}. Concurrent runs sharing a workdir ` +
-          "can silently overwrite each other's artifacts; give each run its own workdir " +
-          "(AGENT_UI_WORKDIRS) or wait for the other run.",
-        conflictRunId: conflict.id,
-      });
-      return true;
-    }
-    operationalLog("warn", "workdir_shared", {
-      runId,
-      conflictRunId: conflict.id,
-      workdir: resolve(targetWorkdir),
+    const rejection = sharedWorkdirRejection(runId, targetWorkdir, excludeRunId);
+    if (!rejection) return false;
+    metrics.workdirRejected += 1;
+    json(res, 409, {
+      error:
+        `Workdir is in use by running run ${rejection.conflictRunId}. Concurrent runs sharing a workdir ` +
+        "can silently overwrite each other's artifacts; give each run its own workdir " +
+        "(AGENT_UI_WORKDIRS) or wait for the other run.",
+      conflictRunId: rejection.conflictRunId,
     });
-    return false;
+    return true;
+  }
+
+  /** 日预算拒绝的响应体 + Retry-After 秒数（与 rejectAtDailyBudget 同一份数据，T9 调度器复用） */
+  function dailyBudgetRejection(info: { used: number; budget: number; now: Date }): {
+    retryAfterSeconds: number;
+    payload: { error: string; dailyTokensUsed: number; dailyTokenBudget: number };
+  } {
+    const midnight = new Date(info.now.getFullYear(), info.now.getMonth(), info.now.getDate() + 1);
+    return {
+      retryAfterSeconds: Math.max(1, Math.ceil((midnight.getTime() - info.now.getTime()) / 1000)),
+      payload: {
+        error:
+          `Daily token budget exhausted: ${info.used} of ${info.budget} non-cache-read tokens used today. ` +
+          "Running tasks are unaffected; admission reopens tomorrow, or raise AGENT_UI_DAILY_TOKEN_BUDGET and restart.",
+        dailyTokensUsed: info.used,
+        dailyTokenBudget: info.budget,
+      },
+    };
   }
 
   function rejectAtDailyBudget(res: ServerResponse, info: { used: number; budget: number; now: Date }): void {
     metrics.budgetRejected += 1;
-    const now = info.now;
-    const midnight = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
-    res.setHeader("Retry-After", String(Math.max(1, Math.ceil((midnight.getTime() - now.getTime()) / 1000))));
-    json(res, 429, {
-      error:
-        `Daily token budget exhausted: ${info.used} of ${info.budget} non-cache-read tokens used today. ` +
-        "Running tasks are unaffected; admission reopens tomorrow, or raise AGENT_UI_DAILY_TOKEN_BUDGET and restart.",
-      dailyTokensUsed: info.used,
-      dailyTokenBudget: info.budget,
-    });
+    const rejection = dailyBudgetRejection(info);
+    res.setHeader("Retry-After", String(rejection.retryAfterSeconds));
+    json(res, 429, rejection.payload);
   }
 
   function mutationRetryAfter(req: IncomingMessage): number | null {
@@ -5071,6 +5658,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     | { type: "ready" }
     | { type: "metrics" }
     | { type: "harness" }
+    | { type: "memoryList" }
+    | { type: "memoryRead"; name: string }
+    | { type: "searchRuns"; query: string; limit: string | null }
+    | { type: "runChanges"; runId: string }
     | { type: "runsList" }
     | { type: "lifecycleStream" }
     | { type: "transcript"; runId: string }
@@ -5079,11 +5670,19 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     | { type: "artifact"; runId: string; path: string; download: boolean }
     | { type: "reveal"; runId: string }
     | { type: "stop"; runId: string }
+    | { type: "deleteRun"; runId: string }
     | { type: "followUp"; runId: string }
+    | { type: "extendBudget"; runId: string }
     | { type: "upload" }
     | { type: "createRun" }
+    | { type: "schedulesList" }
+    | { type: "scheduleCreate" }
+    | { type: "scheduleUpdate"; scheduleId: string }
+    | { type: "scheduleDelete"; scheduleId: string }
+    | { type: "scheduleRun"; scheduleId: string }
     | { type: "events"; runId: string }
     | { type: "approval"; runId: string; toolUseId: string }
+    | { type: "autoApprove"; runId: string }
     | { type: "planApproval"; runId: string }
     | { type: "answer"; runId: string }
     | { type: "malformed" } {
@@ -5101,6 +5700,41 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
     if (method === "GET" && url === "/api/harness") {
       return { type: "harness" };
+    }
+
+    /**
+     * T5 记忆面板（L5 可审查化）：只读暴露默认 workdir 作用域的 .agent-memory/。
+     * name 严格圈禁：只允许 [A-Za-z0-9._-] 且以 .md 结尾——字符集里根本没有
+     * "/" 与 ".."，路径穿越在路由层就无路可走（与 MemoryStore.resolvePath 双保险）。
+     * 注意顺序：/:name 必须先于精确匹配之后判断，/api/memory 本体是列表端点。
+     */
+    if (method === "GET" && url === "/api/memory") {
+      return { type: "memoryList" };
+    }
+    const memoryReadMatch = method === "GET" && url.match(/^\/api\/memory\/([^/?#]+)$/);
+    if (memoryReadMatch) {
+      const name = safeDecode(memoryReadMatch[1]!);
+      if (!MEMORY_API_NAME_RE.test(name)) return { type: "malformed" };
+      return { type: "memoryRead", name };
+    }
+
+    /**
+     * T6 全局搜索：q/limit 经查询串传入，具体校验（最短长度/上限钳位）在
+     * 处理器里做——路由层只管形状，不管语义（与 /api/runs/:id/artifact 同模式）。
+     */
+    const searchMatch = method === "GET" && url.match(/^\/api\/search(?:\?(.*))?$/);
+    if (searchMatch) {
+      const params = new URLSearchParams(searchMatch[1] ?? "");
+      return { type: "searchRuns", query: params.get("q") ?? "", limit: params.get("limit") };
+    }
+
+    /**
+     * T8 变更审查：聚合一个 run 的写盘工具触碰。路由层只管形状；
+     * 圈禁（resolveInWorkdir）与 git 降级都在处理器里。
+     */
+    const changesMatch = method === "GET" && url.match(/^\/api\/runs\/([^/]+)\/changes$/);
+    if (changesMatch) {
+      return { type: "runChanges", runId: changesMatch[1]! };
     }
 
     if (method === "GET" && url === "/api/runs") {
@@ -5155,6 +5789,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       return { type: "stop", runId: stopMatch[1]! };
     }
 
+    const deleteMatch = method === "DELETE" && url.match(/^\/api\/runs\/([^/]+)$/);
+    if (deleteMatch) {
+      return { type: "deleteRun", runId: deleteMatch[1]! };
+    }
+
     if (method === "POST" && url === "/api/upload") {
       return { type: "upload" };
     }
@@ -5164,8 +5803,37 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       return { type: "followUp", runId: followUpMatch[1]! };
     }
 
+    const extendBudgetMatch = method === "POST" && url.match(/^\/api\/runs\/([^/]+)\/extend-budget$/);
+    if (extendBudgetMatch) {
+      return { type: "extendBudget", runId: extendBudgetMatch[1]! };
+    }
+
     if (method === "POST" && url === "/api/runs") {
       return { type: "createRun" };
+    }
+
+    /**
+     * T9 定时任务：/api/schedules CRUD + 手动触发。路由层只管形状；
+     * 校验（task 非空 / workdir 白名单 / schedule 合法）都在处理器里，
+     * 与 /api/runs 的"路由管形状、处理器管语义"同模式。
+     */
+    if (method === "GET" && url === "/api/schedules") {
+      return { type: "schedulesList" };
+    }
+    if (method === "POST" && url === "/api/schedules") {
+      return { type: "scheduleCreate" };
+    }
+    const scheduleRunMatch = method === "POST" && url.match(/^\/api\/schedules\/([^/]+)\/run$/);
+    if (scheduleRunMatch) {
+      return { type: "scheduleRun", scheduleId: scheduleRunMatch[1]! };
+    }
+    const schedulePatchMatch = method === "PATCH" && url.match(/^\/api\/schedules\/([^/]+)$/);
+    if (schedulePatchMatch) {
+      return { type: "scheduleUpdate", scheduleId: schedulePatchMatch[1]! };
+    }
+    const scheduleDeleteMatch = method === "DELETE" && url.match(/^\/api\/schedules\/([^/]+)$/);
+    if (scheduleDeleteMatch) {
+      return { type: "scheduleDelete", scheduleId: scheduleDeleteMatch[1]! };
     }
 
     const eventsMatch = method === "GET" && url.match(/^\/api\/runs\/([^/]+)\/events$/);
@@ -5184,6 +5852,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       return { type: "answer", runId: answerMatch[1]! };
     }
 
+    const autoApproveMatch = method === "POST" && url.match(/^\/api\/runs\/([^/]+)\/auto-approve$/);
+    if (autoApproveMatch) {
+      return { type: "autoApprove", runId: autoApproveMatch[1]! };
+    }
+
     const approvalMatch = method === "POST" && url.match(/^\/api\/runs\/([^/]+)\/approvals\/([^/]+)$/);
     if (approvalMatch) {
       // approvalId 形如 `toolUseId#seq`；`#` 在 URL 里是片段分隔符，客户端必须
@@ -5196,6 +5869,352 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     }
 
     return { type: "malformed" };
+  }
+
+  // ------------------------------------------------------
+  // T9 定时任务：createRun 的统一内部入口 + 调度器
+  // ------------------------------------------------------
+
+  /** POST /api/runs 的请求体形状（HTTP 层只负责 JSON 解析，语义校验全在 createRunFromBody） */
+  interface RunCreateBody {
+    task?: string; verify?: boolean; pack?: string; effort?: string; rubric?: string;
+    mode?: string; concurrency?: number | string;
+    workdir?: string; useVerifierModel?: boolean; usePlannerModel?: boolean;
+    planGate?: boolean; askUser?: boolean; autoApprove?: boolean; contextTokenLimit?: number | string;
+    multiAgent?: boolean;
+    lineageBudget?: boolean; dailyBudget?: boolean;
+  }
+
+  /** 准入结果：HTTP 处理器把它写成响应；调度器把非 200 记成 lastTrigger=error */
+  interface RunAdmissionOutcome {
+    status: number;
+    payload: unknown;
+    headers?: Record<string, string>;
+  }
+
+  /**
+   * 新建 run 的完整准入 + 发起流程（原 case "createRun" 的全部语义）。
+   *
+   * T9 调度器到期触发时构造 { task, workdir, verify } 走这同一个函数——
+   * 校验、白名单、容量/资源/日预算门、建档、启动（startPlainRun 等）一处不改。
+   * 注意：隔离健康重探（refreshExecutionHealth）不在本函数内——HTTP 路径必须在
+   * readBody **之前**完成它（SAFE-05 慢 body 测试依赖这个顺序）；调度器路径的
+   * launch 回调自己做同一道门。
+   */
+  async function createRunFromBody(parsed: RunCreateBody): Promise<RunAdmissionOutcome> {
+    if (!parsed.task || typeof parsed.task !== "string") {
+      return { status: 400, payload: { error: 'Missing or invalid "task" field' } };
+    }
+    // V-24：外部输入一律当场校验拒绝，不静默降级——静默降级会让"我明明选了
+    // python-coding"与实际行为长期不一致，查起来很贵（口径同 src/cli.ts 对
+    // AGENT_EFFORT 的处理）
+    if (parsed.pack !== undefined && parsed.pack !== "" && !getPack(parsed.pack)) {
+      return { status: 400, payload: { error: `未知领域包 "${parsed.pack}"。可选：${Object.keys(PACKS).join(" | ")}` } };
+    }
+    /**
+     * 逐 run 上下文预算（MEM-01 窗口 / 预算分离）：区间 [32k, 窗口 − maxTokens − 边际]
+     * （窗口未知时上限取硬顶）。越界 **400 并报出区间**，不静默夹紧——夹紧是对 env / 包这类
+     * 操作员配置的处置；请求体是这一次的显式意图，填了 900k 却被悄悄改成 60k 就是界面说谎。
+     * 校验用的窗口 / maxTokens 按本 run 的包算（包可改 maxTokens），与 buildConfig 同一口径。
+     */
+    let runContextTokenLimit: number | undefined;
+    if (parsed.contextTokenLimit !== undefined && parsed.contextTokenLimit !== "" && parsed.contextTokenLimit !== null) {
+      const admissionPackForContext = parsed.pack ? getPack(parsed.pack) : pack;
+      const plan = contextPlanFor(admissionPackForContext);
+      const checked = validateRunContextBudget(parsed.contextTokenLimit, plan.maxBudget);
+      if (!checked.ok) {
+        return {
+          status: 400,
+          payload: {
+            error: checked.error,
+            contextTokenLimit: { min: checked.min, max: checked.max, window: plan.window, windowSource: plan.windowSource, maxTokens: plan.maxTokens },
+          },
+        };
+      }
+      runContextTokenLimit = checked.value;
+    }
+    if (
+      parsed.effort !== undefined && parsed.effort !== "" &&
+      !(EFFORT_LEVELS as readonly string[]).includes(parsed.effort)
+    ) {
+      return { status: 400, payload: { error: `effort "${parsed.effort}" 无效。可选：${EFFORT_LEVELS.join(" | ")}` } };
+    }
+
+    if (parsed.mode !== undefined && parsed.mode !== "single" && parsed.mode !== "plan") {
+      return { status: 400, payload: { error: `mode "${parsed.mode}" 无效。可选：single | plan` } };
+    }
+    // 多 agent 与计划确认门正交。planGate 必须配 mode=plan 或 multiAgent，
+    // 单独传 planGate 拒绝——静默忽略会让界面与实际行为长期不一致。
+    const multiAgent = parsed.multiAgent === true;
+    const planGateRequested = parsed.planGate === true;
+    const wantsOrchestrate = multiAgent || parsed.mode === "plan";
+    if (planGateRequested && !wantsOrchestrate) {
+      return { status: 400, payload: { error: "planGate 仅在编排（mode=plan 或 multiAgent）下有意义：单跑模式没有计划这一步" } };
+    }
+    let concurrency: number | "auto" | undefined;
+    if (parsed.concurrency !== undefined && parsed.concurrency !== "") {
+      if (parsed.concurrency === "auto") concurrency = "auto";
+      else {
+        const n = Number(parsed.concurrency);
+        if (!Number.isInteger(n) || n < 1 || n > 8) {
+          return { status: 400, payload: { error: `concurrency "${parsed.concurrency}" 无效。可选：auto 或 1..8` } };
+        }
+        concurrency = n;
+      }
+    } else if (wantsOrchestrate) {
+      // 多 agent 开 → auto；仅计划门 / 串行编排 → 1
+      concurrency = multiAgent ? "auto" : 1;
+    }
+
+    const lineageBudget = parsed.lineageBudget !== false;
+    const dailyBudget = parsed.dailyBudget !== false;
+
+    // V-29：工作目录必须命中白名单。规范化后逐条比对绝对路径——
+    // 只做字符串前缀判断会被 `..` 穿出去，而这是工具的写入边界
+    let runWorkdir: string | undefined;
+    if (parsed.workdir !== undefined && parsed.workdir !== "") {
+      const asked = resolve(parsed.workdir);
+      if (!allowedWorkdirs.includes(asked)) {
+        return {
+          status: 400,
+          payload: { error: `工作目录不在白名单内。可选：${allowedWorkdirs.join(" | ")}（用 AGENT_UI_WORKDIRS 声明）` },
+        };
+      }
+      runWorkdir = asked;
+    }
+
+    const verify = parsed.verify === true;
+    // §5.2 决定 1：默认关，逐 run 显式开
+    const askUser = parsed.askUser === true;
+    if (dailyBudget) {
+      const budgetRefusal = dailyBudgetRefusal();
+      if (budgetRefusal) {
+        metrics.budgetRejected += 1;
+        const rejection = dailyBudgetRejection(budgetRefusal);
+        return { status: 429, payload: rejection.payload, headers: { "Retry-After": String(rejection.retryAfterSeconds) } };
+      }
+    }
+    const id = randomUUID();
+    // 跨 run 独占资源：single/verified 按包声明在准入时整体占用；
+    // plan 模式由调度器经同一张宿主表按子任务粒度管理，此处不占
+    const admissionPack = parsed.pack ? getPack(parsed.pack) : pack;
+    const packResources = wantsOrchestrate ? [] : (admissionPack?.resources ?? []);
+    const resourceOutcome = tryAcquireRunResources(id, packResources);
+    if (resourceOutcome !== "acquired") {
+      metrics.resourceRejected += 1;
+      return {
+        status: 429,
+        payload: {
+          error:
+            `Exclusive resource "${resourceOutcome.conflict}" is held by run ${resourceOutcome.heldBy}. ` +
+            "Wait for that run to finish (or stop it), then retry.",
+          resource: resourceOutcome.conflict,
+          heldBy: resourceOutcome.heldBy,
+        },
+      };
+    }
+    const workdirRejection = sharedWorkdirRejection(id, runWorkdir ?? workdir);
+    if (workdirRejection) {
+      hostResources.release(packResources, id);
+      metrics.workdirRejected += 1;
+      return {
+        status: 409,
+        payload: {
+          error:
+            `Workdir is in use by running run ${workdirRejection.conflictRunId}. Concurrent runs sharing a workdir ` +
+            "can silently overwrite each other's artifacts; give each run its own workdir " +
+            "(AGENT_UI_WORKDIRS) or wait for the other run.",
+          conflictRunId: workdirRejection.conflictRunId,
+        },
+      };
+    }
+    const releaseAdmission = acquireRunAdmission();
+    if (!releaseAdmission) {
+      hostResources.release(packResources, id);
+      metrics.capacityRejected += 1;
+      return { status: 429, payload: capacityRejectionPayload(), headers: { "Retry-After": "1" } };
+    }
+    const run: StoredRun = {
+      id,
+      task: parsed.task,
+      status: "running",
+      verify,
+      createdAt: Date.now(),
+      events: [],
+      pendingApprovals: new Map(),
+      respondedApprovals: new Map(),
+      respondedToolUseIds: new Set(),
+      sseClients: new Set(),
+      segmentIndex: 0,
+      transcript: [],
+      conversationTurn: 1,
+      toolTally: {},
+      abort: new AbortController(),
+      ...(parsed.pack ? { packName: parsed.pack } : {}),
+      ...(parsed.effort ? { effort: parsed.effort as Effort } : {}),
+      ...(parsed.rubric ? { rubric: parsed.rubric } : {}),
+      ...(wantsOrchestrate ? { mode: "plan" as const } : {}),
+      ...(concurrency !== undefined ? { concurrency } : {}),
+      ...(runWorkdir ? { workdir: runWorkdir } : {}),
+      ...(parsed.useVerifierModel === false ? { useVerifierModel: false } : {}),
+      ...(parsed.usePlannerModel === false ? { usePlannerModel: false } : {}),
+      ...(planGateRequested ? { planGate: true } : {}),
+      ...(askUser ? { askUser: true } : {}),
+      ...(parsed.autoApprove === true ? { autoApprove: true } : {}),
+      ...(runContextTokenLimit !== undefined ? { contextTokenLimit: runContextTokenLimit } : {}),
+      ...(packResources.length ? { heldResources: packResources } : {}),
+      ...(lineageBudget ? {} : { lineageBudget: false }),
+      ...(dailyBudget ? {} : { dailyBudget: false }),
+    };
+    // B2：建档要在第一条事件之前——writer 的写入链从 mkdir 开始保序
+    if (historyRoot) {
+      run.archiveWriter = createArchiveWriter(id);
+      persistMeta(run);
+      seedDurableState(run);
+      // OBS-01：run 根 span + 版本指纹（commit/model/pack/tool schema）
+      try {
+        const toolsForHash = [
+          { name: bashTool.name, inputSchema: bashTool.inputSchema },
+          { name: readFileTool.name, inputSchema: readFileTool.inputSchema },
+          { name: writeFileTool.name, inputSchema: writeFileTool.inputSchema },
+        ];
+        // 窗口 / 预算随 trace 根 span 走：事后回放"这次在窗口的几分之几处压缩"不必再翻台账
+        const tracePlan = contextPlanFor(run.packName ? getPack(run.packName) : pack, run.contextTokenLimit);
+        const root = startSpan({
+          kind: "run",
+          name: "run",
+          runId: id,
+          ts: run.createdAt,
+          attrs: {
+            harnessVersion: HARNESS_VERSION,
+            gitCommit: resolveGitCommit(),
+            packName: run.packName ?? pack?.name ?? null,
+            model: process.env.AGENT_MODEL ?? null,
+            toolSchemaHash: hashToolSchemas(toolsForHash),
+            mode: run.mode ?? "single",
+            verify,
+            contextWindow: tracePlan.window,
+            contextWindowSource: tracePlan.windowSource,
+            contextBudget: tracePlan.budget,
+            contextBudgetSource: tracePlan.budgetSource,
+          },
+        });
+        run.traceRunSpanId = root.spanId;
+        run.openToolSpans = new Map();
+        run.archiveWriter?.appendTraceSpan(root);
+      } catch {
+        // ignore
+      }
+    } else {
+      seedDurableState(run);
+    }
+    runs.set(id, run);
+    releaseAdmission();
+    metrics.runsStarted += 1;
+    if (realHost) {
+      operationalLog("info", "run_started", {
+        runId: id,
+        mode: run.mode ?? "single",
+        verify,
+        continuation: null,
+      });
+    }
+    broadcastLifecycle("run_created", run);
+
+    if (run.mode === "plan") {
+      void withFallbackAttribution(run, () => startPlannedRun(run));
+    } else if (verify) {
+      void withFallbackAttribution(run, () => startVerifiedRun(run));
+    } else {
+      void withFallbackAttribution(run, () => startPlainRun(run));
+    }
+
+    return { status: 200, payload: { runId: id } };
+  }
+
+  /**
+   * T9 调度器装配：
+   * - 状态一份：scheduleEntries 数组由 REST 处理器与 ScheduleRunner 共享（不设副本）；
+   * - 发起 run 走 createRunFromBody——与 POST /api/runs 完全相同的内部入口；
+   * - 落盘串行链：REST 变更与 tick 的 onChange 都排进同一条链，写盘不互相踩；
+   * - 持久化文件 <workdir>/.agent-schedules.json（AGENT_SCHEDULES_FILE 可覆盖，
+   *   测试隔离用）；启动容错：坏文件备份 .bak 后空表（scheduler.ts 判据①）。
+   */
+  const schedulesFile = schedulesFilePath(process.env, workdir);
+  const scheduleEntries: ScheduleEntry[] = [];
+  let schedulePersistChain: Promise<void> = Promise.resolve();
+  const persistSchedules = (): void => {
+    schedulePersistChain = schedulePersistChain
+      .then(() => saveSchedules(schedulesFile, scheduleEntries))
+      .catch((error: unknown) => {
+        if (realHost) {
+          operationalLog("warn", "schedules_persist_failed", {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      });
+  };
+  const scheduleRunner = new ScheduleRunner({
+    entries: scheduleEntries,
+    launch: async (entry) => {
+      // 与 HTTP 路径同一道隔离健康门（scheduler.ts 判据⑤：失败记 error 并顺推）
+      await refreshExecutionHealth(true);
+      if (!executionHealthy) {
+        return {
+          ok: false,
+          error: `Required command isolation is unavailable: ${processExecutionStatus.probe.reason ?? "backend probe failed"}`,
+        };
+      }
+      const outcome = await createRunFromBody({
+        task: entry.task,
+        workdir: entry.workdir,
+        verify: entry.verify,
+      });
+      if (outcome.status === 200) {
+        return { ok: true, runId: (outcome.payload as { runId: string }).runId };
+      }
+      const message = (outcome.payload as { error?: unknown } | null)?.error;
+      return {
+        ok: false,
+        error: typeof message === "string" ? message : `准入失败（HTTP ${outcome.status}）`,
+      };
+    },
+    isRunActive: (runId) => runs.get(runId)?.status === "running",
+    onChange: persistSchedules,
+  });
+  const schedulesReady: Promise<void> = (async () => {
+    const loaded = await loadSchedules(schedulesFile);
+    scheduleEntries.push(...loaded.entries);
+    if (loaded.recovered && realHost) {
+      operationalLog("warn", "schedules_recovered", { file: schedulesFile });
+    }
+    // 启动处置（scheduler.ts 判据③）：补算缺失的 nextRunAt；
+    // 停机期间错过超过 24h 的 once/daily 标 missed 不补跑
+    const now = Date.now();
+    let changed = loaded.recovered;
+    for (const entry of scheduleEntries) {
+      if (entry.enabled && entry.nextRunAt === null) {
+        entry.nextRunAt = computeNextRunAt(entry.schedule, now, entry.lastRunAt ?? entry.createdAt);
+        changed = true;
+      }
+      if (isMissed(entry, now)) {
+        entry.lastTrigger = { at: now, outcome: "missed", runId: null, note: "宿主停机期间错过触发超过 24 小时，未补跑" };
+        advanceAfterMiss(entry, now);
+        changed = true;
+      }
+    }
+    if (changed) persistSchedules();
+  })();
+  const scheduleTimer = setInterval(() => {
+    void scheduleRunner.tick();
+  }, SCHEDULE_TICK_MS);
+  // 不挡进程退出（测试宿主 close 前进程就该能走）；首轮 tick 等加载完成后立刻跑
+  scheduleTimer.unref?.();
+  void schedulesReady.then(() => scheduleRunner.tick());
+
+  /** 列表端点的 DTO：原样透出 + 服务端当前时刻（前端倒计时以它为锚，不赌客户端时钟） */
+  function scheduleListPayload(): { schedules: ScheduleEntry[]; serverTime: number } {
+    return { schedules: scheduleEntries, serverTime: Date.now() };
   }
 
   // ------------------------------------------------------
@@ -5290,9 +6309,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         "inspectPaths",
         "reveal",
         "createRun",
+        "scheduleCreate",
         "planApproval",
         "answer",
         "approval",
+        "autoApprove",
       ]).has(route.type);
       const contentType = String(req.headers["content-type"] ?? "").toLowerCase();
       if (jsonRoute && !/^application\/(?:[\w.-]+\+)?json(?:\s*;|$)/.test(contentType)) {
@@ -5329,6 +6350,132 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       case "harness":
         return json(res, 200, harnessSnapshot());
 
+      case "memoryList": {
+        /**
+         * T5 记忆面板：默认 workdir 作用域的 .agent-memory/ 列表。
+         * 目录不存在 = 还没有记忆，返回空列表而不是报错（与 MemoryStore.list 同口径）。
+         */
+        const entries = await defaultMemoryStore.list();
+        const withMtime = await Promise.all(
+          entries.map(async (entry) => {
+            let mtimeMs: number | null = null;
+            try {
+              mtimeMs = (await stat(join(defaultMemoryDir, entry.name))).mtimeMs;
+            } catch { /* 列出后被并发删掉：mtime 降级为 null，不拖垮整个列表 */ }
+            return { ...entry, mtimeMs };
+          }),
+        );
+        return json(res, 200, { dir: defaultMemoryDir, entries: withMtime });
+      }
+
+      case "memoryRead": {
+        /**
+         * T5 单条记忆全文（只读）。名字已在路由层被 MEMORY_API_NAME_RE 收窄到
+         * [A-Za-z0-9._-]+.md；MemoryStore.resolvePath 再做一次逃逸校验（双保险）。
+         */
+        let content: string;
+        try {
+          content = await defaultMemoryStore.read(route.name);
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException | null)?.code;
+          if (code === "ENOENT") return notFound(res, `Memory not found: ${route.name}`);
+          return badRequest(res, error instanceof Error ? error.message : String(error));
+        }
+        const sizeBytes = Buffer.byteLength(content, "utf8");
+        let truncated = false;
+        if (sizeBytes > MEMORY_READ_MAX_BYTES) {
+          content = utf8SafeHead(content, MEMORY_READ_MAX_BYTES);
+          truncated = true;
+        }
+        return json(res, 200, { name: route.name, content, sizeBytes, truncated });
+      }
+
+      case "searchRuns": {
+        /**
+         * T6 全局搜索：历史档案的标题（meta.task）+ 正文（transcript.jsonl）
+         * 大小写不敏感子串匹配。只读；无历史根（注入 modelClient 的测试宿主
+         * 缺省不落盘）时返回空结果而不是报错，与 memoryList 同口径。
+         */
+        const query = route.query.trim();
+        if (query.length < SEARCH_MIN_QUERY_CHARS) {
+          return badRequest(res, `Query must be at least ${SEARCH_MIN_QUERY_CHARS} characters`);
+        }
+        if (!historyRoot) {
+          return json(res, 200, { query, results: [], truncatedRuns: false });
+        }
+        let limit = SEARCH_DEFAULT_LIMIT;
+        if (route.limit !== null) {
+          const parsed = Number(route.limit);
+          if (Number.isInteger(parsed) && parsed >= 1) {
+            limit = Math.min(parsed, SEARCH_MAX_LIMIT);
+          }
+        }
+        return json(res, 200, await searchRunHistory(historyRoot, query, limit));
+      }
+
+      /**
+       * T8 变更审查：这次运行触碰了哪些文件。
+       *
+       * 数据源是 run 的事件流（在飞 run 的内存缓冲 / 归档 run 的 events.jsonl，
+       * hydrateArchive 统一成同一份），只聚合 write_file / edit_file 的 tool_call
+       * 入参路径——bash 写盘从入参读不出路径，宁缺勿假。
+       *
+       * 圈禁与产物取件同一条纪律：路径按**该 run 自己的 workdir** 用
+       * resolveInWorkdir 解析；越界路径（含 workdir 已被删导致无法校验）标
+       * outOfScope: true，不 stat、不提供 git 信息，前端因此不给预览。
+       * git 是增强不是门槛：非仓库 / git 不可用 / 单文件探针超 3 秒，一律
+       * 静默降级为 git: null。
+       */
+      case "runChanges": {
+        const run = runs.get(route.runId);
+        if (!run) return notFound(res, `Run not found: ${route.runId}`);
+        await hydrateArchive(run); // 归档 run 的事件在磁盘上，首次访问才读
+        const root = run.workdir ?? workdir;
+        const isRepo = await detectGitRepo(root);
+        const resolvedRoot = resolve(root);
+        const touched = collectTouchedPaths(run.events);
+        const changes: RunChangeEntry[] = await Promise.all(
+          touched.map(async (t) => {
+            let abs: string | null = null;
+            try {
+              abs = resolveInWorkdir(root, t.input);
+            } catch { /* 越界：不 stat、不探 git，只如实回报入参原文 */ }
+            const outOfScope = abs === null;
+            const relPath = abs
+              ? relative(resolvedRoot, abs).split(sep).join("/") || "."
+              : t.input;
+            let exists = false;
+            let sizeBytes: number | null = null;
+            let mtimeMs: number | null = null;
+            if (abs) {
+              try {
+                const st = await stat(abs);
+                if (st.isFile()) {
+                  exists = true;
+                  sizeBytes = st.size;
+                  mtimeMs = st.mtimeMs;
+                }
+              } catch { /* 写完又被删：exists=false 也是事实 */ }
+            }
+            const git = isRepo && abs ? await probeGitForFile(root, relPath) : null;
+            return {
+              path: relPath,
+              ops: [...t.ops],
+              count: t.count,
+              lastAt: t.lastAt,
+              outOfScope,
+              exists,
+              sizeBytes,
+              mtimeMs,
+              git,
+            };
+          }),
+        );
+        // 最近触碰的排最前：审查视线先看"最后动了什么"
+        changes.sort((a, b) => (b.lastAt ?? 0) - (a.lastAt ?? 0));
+        return json(res, 200, { runId: run.id, workdir: root, git: isRepo, changes });
+      }
+
       case "runsList": {
         // V-13：按 createdAt 降序。此前是插入顺序（最旧在上），而客户端提交后把
         // 新任务 unshift 到顶——3 秒后一轮询它就从顶跳到底。
@@ -5336,6 +6483,184 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           .sort((a, b) => b.createdAt - a.createdAt)
           .map(runSummary);
         return json(res, 200, list);
+      }
+
+      /**
+       * T9 定时任务端点。持久化 <workdir>/.agent-schedules.json（原子写）；
+       * 到期触发与手动触发都走 createRunFromBody——与 POST /api/runs 同一条
+       * 准入链（白名单 / 容量 / 日预算 / 隔离健康），没有第二份逻辑。
+       */
+      case "schedulesList": {
+        await schedulesReady;
+        return json(res, 200, scheduleListPayload());
+      }
+
+      case "scheduleCreate": {
+        await schedulesReady;
+        let body: string;
+        try {
+          body = await readBody(req, requestBodyMaxBytes);
+        } catch (error) {
+          return requestBodyFailure(res, error);
+        }
+        let parsed: {
+          name?: string; task?: string; workdir?: string; verify?: boolean;
+          enabled?: boolean; schedule?: unknown;
+        };
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          return badRequest(res, "Invalid JSON body");
+        }
+        if (!parsed.task || typeof parsed.task !== "string" || !parsed.task.trim()) {
+          return badRequest(res, '任务描述（task）不能为空');
+        }
+        if (parsed.name !== undefined && typeof parsed.name !== "string") {
+          return badRequest(res, '名称（name）必须是字符串');
+        }
+        // 工作目录与 /api/runs 同一条白名单（V-29）：resolve 后精确比对
+        let scheduleWorkdir = workdir;
+        if (parsed.workdir !== undefined && parsed.workdir !== "") {
+          const asked = resolve(parsed.workdir);
+          if (!allowedWorkdirs.includes(asked)) {
+            return badRequest(
+              res,
+              `工作目录不在白名单内。可选：${allowedWorkdirs.join(" | ")}（用 AGENT_UI_WORKDIRS 声明）`,
+            );
+          }
+          scheduleWorkdir = asked;
+        }
+        const schedule = parseScheduleSpec(parsed.schedule);
+        if (!schedule) {
+          return badRequest(
+            res,
+            '调度规则（schedule）不合法。支持：{kind:"once",at} / {kind:"daily",hhmm:"HH:MM"} / {kind:"interval",everyMs≥60000}',
+          );
+        }
+        const now = Date.now();
+        if (schedule.kind === "once" && schedule.at <= now) {
+          return badRequest(res, "一次性任务的触发时间已过——请选一个未来的时刻");
+        }
+        const entry: ScheduleEntry = {
+          id: randomUUID(),
+          name: (parsed.name ?? "").trim() || parsed.task.trim().slice(0, 24),
+          task: parsed.task.trim(),
+          workdir: scheduleWorkdir,
+          verify: parsed.verify === true,
+          schedule,
+          enabled: parsed.enabled !== false,
+          createdAt: now,
+          lastRunAt: null,
+          lastRunId: null,
+          nextRunAt: null,
+          lastTrigger: null,
+        };
+        if (entry.enabled) {
+          entry.nextRunAt = computeNextRunAt(entry.schedule, now, null);
+        }
+        scheduleEntries.push(entry);
+        persistSchedules();
+        if (realHost) {
+          operationalLog("info", "schedule_created", { scheduleId: entry.id, kind: schedule.kind });
+        }
+        return json(res, 201, { schedule: entry });
+      }
+
+      case "scheduleUpdate": {
+        await schedulesReady;
+        const entry = scheduleEntries.find((e) => e.id === route.scheduleId);
+        if (!entry) return notFound(res, `Schedule not found: ${route.scheduleId}`);
+        let body: string;
+        try {
+          body = await readBody(req, requestBodyMaxBytes);
+        } catch (error) {
+          return requestBodyFailure(res, error);
+        }
+        let parsed: { name?: unknown; task?: unknown; enabled?: unknown; schedule?: unknown };
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          return badRequest(res, "Invalid JSON body");
+        }
+        let reschedule = false;
+        if (parsed.name !== undefined) {
+          if (typeof parsed.name !== "string" || !parsed.name.trim()) {
+            return badRequest(res, '名称（name）不能为空字符串');
+          }
+          entry.name = parsed.name.trim();
+        }
+        if (parsed.task !== undefined) {
+          if (typeof parsed.task !== "string" || !parsed.task.trim()) {
+            return badRequest(res, '任务描述（task）不能为空');
+          }
+          entry.task = parsed.task.trim();
+        }
+        if (parsed.schedule !== undefined) {
+          const schedule = parseScheduleSpec(parsed.schedule);
+          if (!schedule) {
+            return badRequest(res, "调度规则（schedule）不合法");
+          }
+          if (schedule.kind === "once" && schedule.at <= Date.now()) {
+            return badRequest(res, "一次性任务的触发时间已过——请选一个未来的时刻");
+          }
+          entry.schedule = schedule;
+          reschedule = true;
+        }
+        if (parsed.enabled !== undefined) {
+          if (typeof parsed.enabled !== "boolean") {
+            return badRequest(res, 'enabled 必须是布尔值');
+          }
+          if (entry.enabled !== parsed.enabled) {
+            entry.enabled = parsed.enabled;
+            reschedule = true;
+          }
+        }
+        if (reschedule) {
+          // 改时间 / 重新启用都按当下重排：禁用过久的 daily 不会从旧 nextRunAt 补跑
+          const now = Date.now();
+          entry.nextRunAt = entry.enabled
+            ? computeNextRunAt(entry.schedule, now, entry.lastRunAt ?? entry.createdAt)
+            : null;
+        }
+        persistSchedules();
+        return json(res, 200, { schedule: entry });
+      }
+
+      case "scheduleDelete": {
+        await schedulesReady;
+        const index = scheduleEntries.findIndex((e) => e.id === route.scheduleId);
+        if (index < 0) return notFound(res, `Schedule not found: ${route.scheduleId}`);
+        scheduleEntries.splice(index, 1);
+        persistSchedules();
+        if (realHost) {
+          operationalLog("info", "schedule_deleted", { scheduleId: route.scheduleId });
+        }
+        return json(res, 200, { deleted: true });
+      }
+
+      case "scheduleRun": {
+        await schedulesReady;
+        const entry = scheduleEntries.find((e) => e.id === route.scheduleId);
+        if (!entry) return notFound(res, `Schedule not found: ${route.scheduleId}`);
+        const outcome = await scheduleRunner.triggerNow(entry);
+        if (outcome === "skipped") {
+          return json(res, 409, {
+            error: "上一次运行仍在进行，本次跳过",
+            outcome,
+            runId: entry.lastRunId,
+          });
+        }
+        if (outcome === "missed") {
+          // 已终结的一次性任务（已跑过/已错过）：没有"下一次"可顺推，拒绝重放
+          return json(res, 409, { error: "一次性任务已终结，不能再次手动触发", outcome });
+        }
+        if (outcome === "error") {
+          return json(res, 502, {
+            error: entry.lastTrigger?.note ?? "启动失败",
+            outcome,
+          });
+        }
+        return json(res, 200, { runId: entry.lastRunId, outcome });
       }
 
       case "upload": {
@@ -5411,6 +6736,77 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         });
       }
 
+      case "extendBudget": {
+        /**
+         * 当场给执行谱系加一段 token/轮次跑道——不改 env、不重启宿主。
+         * 委托方痛点：长任务撞 AGENT_TOTAL_TOKEN_BUDGET 后只能「重启或另起」，
+         * 已写产物与正史都还在，却被文案逼去改环境变量。
+         */
+        const run = runs.get(route.runId);
+        if (!run) return notFound(res, `Run not found: ${route.runId}`);
+        if (run.archived) {
+          return json(res, 409, { error: "归档运行不能追加预算；请新建对话或从归档派生续跑" });
+        }
+        if (run.status === "running") {
+          return json(res, 409, { error: "运行进行中，请等这一轮结束再追加预算" });
+        }
+        if (!run.checkpoint?.runBudget) {
+          return json(res, 409, { error: "这次运行没有可追加的谱系预算（无检查点）" });
+        }
+        let body = "";
+        try {
+          body = await readBody(req, requestBodyMaxBytes);
+        } catch (error) {
+          return requestBodyFailure(res, error);
+        }
+        let parsed: { addTokens?: unknown; addTurns?: unknown } = {};
+        if (body.trim()) {
+          try {
+            parsed = JSON.parse(body);
+          } catch {
+            return badRequest(res, "Invalid JSON body");
+          }
+        }
+        const defaultAdd = maxTokensBudget ?? 2_000_000;
+        const addTokens =
+          typeof parsed.addTokens === "number" && Number.isFinite(parsed.addTokens) && parsed.addTokens > 0
+            ? Math.floor(parsed.addTokens)
+            : defaultAdd;
+        const addTurns =
+          typeof parsed.addTurns === "number" && Number.isFinite(parsed.addTurns) && parsed.addTurns > 0
+            ? Math.floor(parsed.addTurns)
+            : undefined;
+        // 单次追加上限：宿主默认的 5 倍，防误触一次加到天文数字
+        const tokenCap = defaultAdd * 5;
+        if (addTokens > tokenCap) {
+          return badRequest(res, `单次追加 token 不得超过 ${tokenCap}（宿主默认的 5 倍）`);
+        }
+        if (addTurns !== undefined && addTurns > 500) {
+          return badRequest(res, "单次追加轮次不得超过 500");
+        }
+        const before = { ...run.checkpoint.runBudget };
+        const after = extendSharedRunBudget(before, {
+          addTokens,
+          ...(addTurns !== undefined ? { addTurns } : {}),
+        });
+        run.checkpoint = { ...run.checkpoint, runBudget: after };
+        if (run.durableState?.budget) {
+          run.durableState = {
+            ...run.durableState,
+            budget: { ...after } as typeof run.durableState.budget,
+          };
+        }
+        // 下一轮装配会读 resumeBudget；没有也写一份，避免仍用旧上限
+        run.resumeBudget = { ...after };
+        return json(res, 200, {
+          runId: run.id,
+          before,
+          after,
+          continuationBlockReason: liveBudgetBlockReasonOf(run),
+          canContinue: liveBudgetBlockReasonOf(run) === null && run.status === "done",
+        });
+      }
+
       case "followUp": {
         const run = runs.get(route.runId);
         if (!run) return notFound(res, `Run not found: ${route.runId}`);
@@ -5427,8 +6823,40 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           if (run.status === "running") {
             return json(res, 409, { error: "运行进行中，请等它这一轮结束再追加指令" });
           }
-          const budgetBlockReason = liveBudgetBlockReasonOf(run);
-          if (budgetBlockReason) return json(res, 409, { error: budgetBlockReason });
+          if (run.checkpoint?.runBudget) {
+            if (run.lineageBudget === false) {
+              // 逐 run 显式关掉谱系预算：只留账（used），不带上限
+              const stripped = {
+                usedTurns: run.checkpoint.runBudget.usedTurns,
+                usedTokens: run.checkpoint.runBudget.usedTokens,
+              };
+              run.checkpoint = { ...run.checkpoint, runBudget: stripped };
+              if (run.durableState?.budget) {
+                run.durableState = {
+                  ...run.durableState,
+                  budget: { ...stripped } as typeof run.durableState.budget,
+                };
+              }
+              run.resumeBudget = { ...stripped };
+            } else {
+              // 额度已尽就当场续一段跑道再放行——重启没配 env 也洗掉不旧上限，
+              // 耗尽不再是死路（autoExtendIfExhausted）
+              const slice = autoExtendIfExhausted(run.checkpoint.runBudget, {
+                addTokens: maxTokensBudget ?? 2_000_000,
+                addTurns: maxTotalTurns ?? 40,
+              });
+              if (slice.extended) {
+                run.checkpoint = { ...run.checkpoint, runBudget: slice.budget };
+                if (run.durableState?.budget) {
+                  run.durableState = {
+                    ...run.durableState,
+                    budget: { ...slice.budget } as typeof run.durableState.budget,
+                  };
+                }
+                run.resumeBudget = { ...slice.budget };
+              }
+            }
+          }
         }
 
         let body: string;
@@ -5437,7 +6865,15 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         } catch (error) {
           return requestBodyFailure(res, error);
         }
-        let parsed: { text?: string; verify?: unknown };
+        let parsed: {
+          text?: string;
+          verify?: unknown;
+          autoApprove?: unknown;
+          planMode?: unknown;
+          multiAgent?: unknown;
+          planGate?: unknown;
+          mode?: unknown;
+        };
         try {
           parsed = JSON.parse(body);
         } catch {
@@ -5450,8 +6886,31 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         if (parsed.verify !== undefined && typeof parsed.verify !== "boolean") {
           return badRequest(res, '"verify" 必须是布尔值');
         }
+        if (parsed.autoApprove !== undefined && typeof parsed.autoApprove !== "boolean") {
+          return badRequest(res, '"autoApprove" 必须是布尔值');
+        }
+        if (parsed.planMode !== undefined && typeof parsed.planMode !== "boolean") {
+          return badRequest(res, '"planMode" 必须是布尔值');
+        }
+        if (parsed.multiAgent !== undefined && typeof parsed.multiAgent !== "boolean") {
+          return badRequest(res, '"multiAgent" 必须是布尔值');
+        }
+        const turnOrchestrate = parsed.multiAgent === true || parsed.planMode === true || parsed.mode === "plan";
+        const turnPlanGate = parsed.planMode === true || parsed.planGate === true;
+        if (turnPlanGate && !turnOrchestrate) {
+          return badRequest(res, "planGate 仅在编排（planMode 或 multiAgent）下有意义");
+        }
+        const turnConcurrency: number | "auto" | undefined = parsed.multiAgent === true
+          ? "auto"
+          : turnOrchestrate
+            ? 1
+            : undefined;
         const feedback = parsed.text.trim();
         const turnVerify = typeof parsed.verify === "boolean" ? parsed.verify : run.verify;
+        // 勾选是本轮意图，不是父档案遗产。不设的话归档派生会看起来"开着自动放行"却仍逐条问。
+        const applyTurnAutoApprove = (target: StoredRun) => {
+          if (typeof parsed.autoApprove === "boolean") target.autoApprove = parsed.autoApprove;
+        };
         // 状态门在 readBody 之前查过一次——await 期间另一条并发 followUp 可能
         // 已把 run 置回 running。不复查的话同一 AgentLoop 会被两条 continuation
         // 并发驱动（资源门因同 holder 幂等恰好拦不住），先收尾的一段还会把
@@ -5469,8 +6928,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           });
         }
         // 追问/归档派生同属新的执行准入：日预算门先于并发门（拒因更具体）
-        const budgetRefusal = dailyBudgetRefusal();
-        if (budgetRefusal) return rejectAtDailyBudget(res, budgetRefusal);
+        if (run.dailyBudget !== false) {
+          const budgetRefusal = dailyBudgetRefusal();
+          if (budgetRefusal) return rejectAtDailyBudget(res, budgetRefusal);
+        }
         const releaseAdmission = acquireRunAdmission();
         if (!releaseAdmission) return rejectAtCapacity(res);
 
@@ -5515,9 +6976,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
               run.status = "running";
               delete run.finishedAt;
               run.verify = turnVerify;
+              applyTurnAutoApprove(run);
               run.abort = new AbortController();
               run.history = history;
-              run.resumeBudget = restoredBudget(checkpoint, { maxTotalTurns, maxTokensBudget });
+              run.resumeBudget = resumeBudgetForContinuation(checkpoint);
               run.initialContextInputTokens = checkpoint.contextInputTokens;
               run.conversationTurn = checkpoint.conversationTurn + 1;
               run.segmentIndex = run.transcript.length;
@@ -5585,7 +7047,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
               // 有检查点：正史/预算/水位延续；无检查点：无正史新一轮，预算按当前上限从零起算
               ...(checkpoint
                 ? {
-                    resumeBudget: restoredBudget(checkpoint, { maxTotalTurns, maxTokensBudget }),
+                    resumeBudget: resumeBudgetForContinuation(checkpoint),
                     initialContextInputTokens: checkpoint.contextInputTokens,
                   }
                 : {}),
@@ -5597,6 +7059,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
               ...(run.rubric ? { rubric: run.rubric } : {}),
               ...(run.workdir ? { workdir: resolve(run.workdir) } : { workdir }),
               ...(run.askUser ? { askUser: true } : {}),
+              ...(parsed.autoApprove === true ? { autoApprove: true } : {}),
               // 逐 run 预算随对话走；buildConfig 会按当前窗口重新夹紧（窗口可能在父 run 之后学到）
               ...(run.contextTokenLimit !== undefined ? { contextTokenLimit: run.contextTokenLimit } : {}),
               ...(childResources.length ? { heldResources: childResources } : {}),
@@ -5642,10 +7105,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         }
 
         // 追问续跑重启执行：finalize 时已释放的资源要重新占——否则另一个持有
-        // 同资源的 run 与本次续跑会同时上探针。plan run 的后续轮按单执行者跑，
-        // 资源也按包声明整占（不再是调度器按子任务粒度管）
+        // 同资源的 run 与本次续跑会同时上探针。本轮若开编排，资源改回调度器
+        // 按子任务粒度管，这里不整占（与 createRun 同口径）。
         const resumePack = run.packName ? getPack(run.packName) : pack;
-        const resumeResources = resumePack?.resources ?? [];
+        const resumeResources = turnOrchestrate ? [] : (resumePack?.resources ?? []);
         if (acquireRunResources(res, run.id, resumeResources) === "refused") {
           releaseAdmission();
           return;
@@ -5656,6 +7119,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           return;
         }
         if (resumeResources.length) run.heldResources = resumeResources;
+        applyTurnAutoApprove(run);
         if (realHost) {
           operationalLog("info", "run_started", {
             runId: run.id,
@@ -5665,7 +7129,16 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           });
         }
         // startConversationTurn 在第一个 await 之前就把轮数加过了，这里不能再 +1
-        void withFallbackAttribution(run, () => startConversationTurn(run, feedback, { verify: turnVerify }));
+        void withFallbackAttribution(run, () => startConversationTurn(run, feedback, {
+          verify: turnVerify,
+          ...(turnOrchestrate
+            ? {
+                orchestrate: true,
+                planGate: turnPlanGate,
+                ...(turnConcurrency !== undefined ? { concurrency: turnConcurrency } : {}),
+              }
+            : {}),
+        }));
         releaseAdmission();
         return json(res, 200, {
           runId: run.id,
@@ -5886,6 +7359,27 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         return json(res, 200, { stopping: true });
       }
 
+      case "deleteRun": {
+        const run = runs.get(route.runId);
+        if (!run) return notFound(res, `Run not found: ${route.runId}`);
+        if (run.status === "running") {
+          return json(res, 409, { error: "运行进行中，请先停止再删除" });
+        }
+        if (run.archiveWriter) {
+          const flush = run.archiveWriter.flush();
+          detachedArchiveFlushes.add(flush);
+          void flush.finally(() => detachedArchiveFlushes.delete(flush));
+        }
+        detachAndDisposeExecutionBroker(run);
+        runs.delete(run.id);
+        const dirRoot = historyRoot ?? (run.archiveDir ? dirname(run.archiveDir) : null);
+        if (dirRoot) {
+          void removeHistoryDir(dirRoot, run.id);
+        }
+        broadcastLifecycleRemoval(run.id);
+        return json(res, 200, { deleted: true, runId: run.id });
+      }
+
       case "lifecycleStream": {
         res.writeHead(200, {
           "Content-Type": "text/event-stream",
@@ -5906,7 +7400,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       }
 
       case "createRun": {
-        // 先在 admission 重新探测，daemon/image/profile 启动后失效时模型调用必须为 0。
+        /**
+         * 语义全在 createRunFromBody（T9 起与调度器共用同一内部入口）；
+         * 这里只剩 HTTP 外壳。顺序纪律：隔离健康重探必须在 readBody **之前**——
+         * SAFE-05 的慢 body 测试只发请求头不发体，靠的就是先过 admission 再
+         * 确定性停在 readBody；调换顺序会让该探测永远等不到。
+         */
         await refreshExecutionHealth(true);
         if (!executionHealthy) {
           return json(res, 503, {
@@ -5921,199 +7420,19 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         } catch (error) {
           return requestBodyFailure(res, error);
         }
-        let parsed: {
-          task?: string; verify?: boolean; pack?: string; effort?: string; rubric?: string;
-          mode?: string; concurrency?: number | string;
-          workdir?: string; useVerifierModel?: boolean; usePlannerModel?: boolean;
-          planGate?: boolean; askUser?: boolean; contextTokenLimit?: number | string;
-        };
+        let parsed: RunCreateBody;
         try {
           parsed = JSON.parse(body);
         } catch {
           return badRequest(res, "Invalid JSON body");
         }
-        if (!parsed.task || typeof parsed.task !== "string") {
-          return badRequest(res, 'Missing or invalid "task" field');
-        }
-        // V-24：外部输入一律当场校验拒绝，不静默降级——静默降级会让"我明明选了
-        // python-coding"与实际行为长期不一致，查起来很贵（口径同 src/cli.ts 对
-        // AGENT_EFFORT 的处理）
-        if (parsed.pack !== undefined && parsed.pack !== "" && !getPack(parsed.pack)) {
-          return badRequest(res, `未知领域包 "${parsed.pack}"。可选：${Object.keys(PACKS).join(" | ")}`);
-        }
-        /**
-         * 逐 run 上下文预算（MEM-01 窗口 / 预算分离）：区间 [32k, 窗口 − maxTokens − 边际]
-         * （窗口未知时上限取硬顶）。越界 **400 并报出区间**，不静默夹紧——夹紧是对 env / 包这类
-         * 操作员配置的处置；请求体是这一次的显式意图，填了 900k 却被悄悄改成 60k 就是界面说谎。
-         * 校验用的窗口 / maxTokens 按本 run 的包算（包可改 maxTokens），与 buildConfig 同一口径。
-         */
-        let runContextTokenLimit: number | undefined;
-        if (parsed.contextTokenLimit !== undefined && parsed.contextTokenLimit !== "" && parsed.contextTokenLimit !== null) {
-          const admissionPackForContext = parsed.pack ? getPack(parsed.pack) : pack;
-          const plan = contextPlanFor(admissionPackForContext);
-          const checked = validateRunContextBudget(parsed.contextTokenLimit, plan.maxBudget);
-          if (!checked.ok) {
-            return json(res, 400, {
-              error: checked.error,
-              contextTokenLimit: { min: checked.min, max: checked.max, window: plan.window, windowSource: plan.windowSource, maxTokens: plan.maxTokens },
-            });
-          }
-          runContextTokenLimit = checked.value;
-        }
-        if (
-          parsed.effort !== undefined && parsed.effort !== "" &&
-          !(EFFORT_LEVELS as readonly string[]).includes(parsed.effort)
-        ) {
-          return badRequest(res, `effort "${parsed.effort}" 无效。可选：${EFFORT_LEVELS.join(" | ")}`);
-        }
-
-        if (parsed.mode !== undefined && parsed.mode !== "single" && parsed.mode !== "plan") {
-          return badRequest(res, `mode "${parsed.mode}" 无效。可选：single | plan`);
-        }
-        // 计划门只在编排模式下有意义（单跑没有计划这一步）。不静默忽略——
-        // 静默会让"我明明勾了确认门"与实际行为长期不一致（口径同 V-24）
-        if (parsed.planGate === true && parsed.mode !== "plan") {
-          return badRequest(res, "planGate 仅在 mode=plan 下有意义：单跑模式没有计划这一步");
-        }
-        let concurrency: number | "auto" | undefined;
-        if (parsed.concurrency !== undefined && parsed.concurrency !== "") {
-          if (parsed.concurrency === "auto") concurrency = "auto";
-          else {
-            const n = Number(parsed.concurrency);
-            if (!Number.isInteger(n) || n < 1 || n > 8) {
-              return badRequest(res, `concurrency "${parsed.concurrency}" 无效。可选：auto 或 1..8`);
-            }
-            concurrency = n;
+        const outcome = await createRunFromBody(parsed);
+        if (outcome.headers) {
+          for (const [name, value] of Object.entries(outcome.headers)) {
+            res.setHeader(name, value);
           }
         }
-
-        // V-29：工作目录必须命中白名单。规范化后逐条比对绝对路径——
-        // 只做字符串前缀判断会被 `..` 穿出去，而这是工具的写入边界
-        let runWorkdir: string | undefined;
-        if (parsed.workdir !== undefined && parsed.workdir !== "") {
-          const asked = resolve(parsed.workdir);
-          if (!allowedWorkdirs.includes(asked)) {
-            return badRequest(
-              res,
-              `工作目录不在白名单内。可选：${allowedWorkdirs.join(" | ")}（用 AGENT_UI_WORKDIRS 声明）`,
-            );
-          }
-          runWorkdir = asked;
-        }
-
-        const verify = parsed.verify === true;
-        // §5.2 决定 1：默认关，逐 run 显式开
-        const askUser = parsed.askUser === true;
-        const budgetRefusal = dailyBudgetRefusal();
-        if (budgetRefusal) return rejectAtDailyBudget(res, budgetRefusal);
-        const id = randomUUID();
-        // 跨 run 独占资源：single/verified 按包声明在准入时整体占用；
-        // plan 模式由调度器经同一张宿主表按子任务粒度管理，此处不占
-        const admissionPack = parsed.pack ? getPack(parsed.pack) : pack;
-        const packResources = parsed.mode === "plan" ? [] : (admissionPack?.resources ?? []);
-        if (acquireRunResources(res, id, packResources) === "refused") return;
-        if (refuseOrWarnSharedWorkdir(res, id, runWorkdir ?? workdir)) {
-          hostResources.release(packResources, id);
-          return;
-        }
-        const releaseAdmission = acquireRunAdmission();
-        if (!releaseAdmission) {
-          hostResources.release(packResources, id);
-          return rejectAtCapacity(res);
-        }
-        const run: StoredRun = {
-          id,
-          task: parsed.task,
-          status: "running",
-          verify,
-          createdAt: Date.now(),
-          events: [],
-          pendingApprovals: new Map(),
-          respondedApprovals: new Map(),
-          respondedToolUseIds: new Set(),
-          sseClients: new Set(),
-          segmentIndex: 0,
-          transcript: [],
-          conversationTurn: 1,
-          toolTally: {},
-          abort: new AbortController(),
-          ...(parsed.pack ? { packName: parsed.pack } : {}),
-          ...(parsed.effort ? { effort: parsed.effort as Effort } : {}),
-          ...(parsed.rubric ? { rubric: parsed.rubric } : {}),
-          ...(parsed.mode === "plan" ? { mode: "plan" as const } : {}),
-          ...(concurrency !== undefined ? { concurrency } : {}),
-          ...(runWorkdir ? { workdir: runWorkdir } : {}),
-          ...(parsed.useVerifierModel === false ? { useVerifierModel: false } : {}),
-          ...(parsed.usePlannerModel === false ? { usePlannerModel: false } : {}),
-          ...(parsed.planGate === true ? { planGate: true } : {}),
-          ...(askUser ? { askUser: true } : {}),
-          ...(runContextTokenLimit !== undefined ? { contextTokenLimit: runContextTokenLimit } : {}),
-          ...(packResources.length ? { heldResources: packResources } : {}),
-        };
-        // B2：建档要在第一条事件之前——writer 的写入链从 mkdir 开始保序
-        if (historyRoot) {
-          run.archiveWriter = createArchiveWriter(id);
-          persistMeta(run);
-          seedDurableState(run);
-          // OBS-01：run 根 span + 版本指纹（commit/model/pack/tool schema）
-          try {
-            const toolsForHash = [
-              { name: bashTool.name, inputSchema: bashTool.inputSchema },
-              { name: readFileTool.name, inputSchema: readFileTool.inputSchema },
-              { name: writeFileTool.name, inputSchema: writeFileTool.inputSchema },
-            ];
-            // 窗口 / 预算随 trace 根 span 走：事后回放"这次在窗口的几分之几处压缩"不必再翻台账
-            const tracePlan = contextPlanFor(run.packName ? getPack(run.packName) : pack, run.contextTokenLimit);
-            const root = startSpan({
-              kind: "run",
-              name: "run",
-              runId: id,
-              ts: run.createdAt,
-              attrs: {
-                harnessVersion: HARNESS_VERSION,
-                gitCommit: resolveGitCommit(),
-                packName: run.packName ?? pack?.name ?? null,
-                model: process.env.AGENT_MODEL ?? null,
-                toolSchemaHash: hashToolSchemas(toolsForHash),
-                mode: run.mode ?? "single",
-                verify,
-                contextWindow: tracePlan.window,
-                contextWindowSource: tracePlan.windowSource,
-                contextBudget: tracePlan.budget,
-                contextBudgetSource: tracePlan.budgetSource,
-              },
-            });
-            run.traceRunSpanId = root.spanId;
-            run.openToolSpans = new Map();
-            run.archiveWriter?.appendTraceSpan(root);
-          } catch {
-            // ignore
-          }
-        } else {
-          seedDurableState(run);
-        }
-        runs.set(id, run);
-        releaseAdmission();
-        metrics.runsStarted += 1;
-        if (realHost) {
-          operationalLog("info", "run_started", {
-            runId: id,
-            mode: run.mode ?? "single",
-            verify,
-            continuation: null,
-          });
-        }
-        broadcastLifecycle("run_created", run);
-
-        if (run.mode === "plan") {
-          void withFallbackAttribution(run, () => startPlannedRun(run));
-        } else if (verify) {
-          void withFallbackAttribution(run, () => startVerifiedRun(run));
-        } else {
-          void withFallbackAttribution(run, () => startPlainRun(run));
-        }
-
-        return json(res, 200, { runId: id });
+        return json(res, outcome.status, outcome.payload);
       }
 
       case "events": {
@@ -6155,7 +7474,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         // 日预算门（评审：签字位是零副作用停点——批准即并行发射全部子任务，
         // 却曾是唯一不过预算门的执行入口）。只拦 approve：拒绝不花钱，永远可拒。
         // 429 时计划保持挂起——预算说的是"今天不行"，不是"这个计划不行"。
-        if (parsed.decision === "approve") {
+        if (parsed.decision === "approve" && run.dailyBudget !== false) {
           const budgetRefusal = dailyBudgetRefusal();
           if (budgetRefusal) return rejectAtDailyBudget(res, budgetRefusal);
         }
@@ -6189,6 +7508,52 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
        * §5.2 澄清答复。状态门口径同计划门（R-01）：没有挂起的问题就 409，
        * 不是静默成功——"我到底答没答"必须有确定答案。
        */
+      case "autoApprove": {
+        const run = runs.get(route.runId);
+        if (!run) return notFound(res, `Run not found: ${route.runId}`);
+        if (run.archived) return json(res, 409, { error: "归档运行不能改自动放行" });
+        if (run.status !== "running") return json(res, 409, { error: "只有运行中的对话能改自动放行" });
+        let body: string;
+        try {
+          body = await readBody(req, requestBodyMaxBytes);
+        } catch (error) {
+          return requestBodyFailure(res, error);
+        }
+        let parsed: { enabled?: unknown };
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          return badRequest(res, "Invalid JSON body");
+        }
+        if (typeof parsed.enabled !== "boolean") {
+          return badRequest(res, 'enabled must be a boolean');
+        }
+        run.autoApprove = parsed.enabled;
+        if (parsed.enabled) {
+          const at = Date.now();
+          for (const [key, pending] of [...run.pendingApprovals]) {
+            observeWaitSeconds("approval", at - pending.at);
+            pending.respond("allow");
+            run.respondedApprovals.set(key, { decision: "allow", at });
+            run.respondedToolUseIds.add(pending.toolUseId);
+            run.pendingApprovals.delete(key);
+            pushSyntheticEvent(run, "host", {
+              type: "approval_resolved",
+              requestSeq: pending.requestSeq,
+              toolUseId: pending.toolUseId,
+              name: pending.name,
+              decision: "allow",
+              actor: "auto-run",
+              at,
+            });
+            applyDurableTransition(run, { type: "approval_resolved", approvalId: key }, at);
+          }
+        }
+        broadcastLifecycle("run_updated", run);
+        persistMeta(run);
+        return json(res, 200, { acknowledged: true, autoApprove: run.autoApprove });
+      }
+
       case "answer": {
         const run = runs.get(route.runId);
         if (!run) return notFound(res, `Run not found: ${route.runId}`);
@@ -6458,6 +7823,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       shuttingDown = true;
       closePromise = (async () => {
         if (realHost) operationalLog("info", "host_shutdown_started", { activeRuns: activeRunCount() });
+        // T9：先停调度器 tick 并等已排队的落盘走完，再进入 run 收尾——
+        // 关停中途又触发一个新 run 是自相矛盾的
+        clearInterval(scheduleTimer);
+        await schedulePersistChain.catch(() => {});
         // 走正规的 finalizeRun 而不是直接掀桌：宿主关停时仍挂起的审批要被
         // 显式宣告过期、run_end 要落进事件流。否则在线客户端只会看到连接莫名断掉，
         // 而它按设计是会自动重连的——语义上就成了"运行还在，只是连不上"。

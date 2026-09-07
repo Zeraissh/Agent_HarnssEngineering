@@ -1,0 +1,482 @@
+// @vitest-environment jsdom
+// @ts-nocheck
+/**
+ * 设置中心（features/settings.js）的回归锁——T7。
+ *
+ * 分层覆盖：
+ *   纯函数层：设置读写 / 容错解析 / 旧键迁移 / composer 默认值派生与注入 /
+ *             思考强度校验 / 路由判定 / 授权状态文案 / 快捷键表同源
+ *   DOM 层  ：jsdom 里真实初始化，验证视图开关与焦点、主题 radio 派发、
+ *             默认值持久化与 composer 同步、通知授权、角标开关、关于分组
+ */
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import {
+  SETTINGS_STORAGE_KEY,
+  SETTINGS_SCHEMA_VERSION,
+  LEGACY_AUTO_APPROVE_KEY,
+  FALLBACK_VERSION,
+  SETTINGS_HASH,
+  THEME_CHOICES,
+  SETTINGS_SECTIONS,
+  defaultSettings,
+  parseSettings,
+  loadSettings,
+  saveSettings,
+  updateSettings,
+  migrateLegacyPrefs,
+  composerDefaults,
+  isValidEffort,
+  applyComposerDefaults,
+  badgeEnabled,
+  isSettingsRoute,
+  permissionStateLabel,
+  shortcutRows,
+  initSettingsView,
+} from "../ui/public/features/settings.js";
+import { SHORTCUTS } from "../ui/public/features/command-palette.js";
+import { PROMPT_STORAGE_KEY } from "../ui/public/features/notifications.js";
+
+/** Map  backed 假 Storage（抛错注入比改 jsdom localStorage 更可控） */
+function fakeStorage(initial = {}) {
+  const map = new Map(Object.entries(initial));
+  return {
+    getItem: (k) => (map.has(k) ? map.get(k) : null),
+    setItem: (k, v) => map.set(k, String(v)),
+    removeItem: (k) => map.delete(k),
+    _map: map,
+  };
+}
+
+// ---------------------------------------------------------------
+// 读写与容错
+// ---------------------------------------------------------------
+describe("设置读写与容错", () => {
+  it("defaultSettings 形状完整", () => {
+    const s = defaultSettings();
+    expect(s.version).toBe(SETTINGS_SCHEMA_VERSION);
+    expect(s.defaults).toEqual({ effort: "", verify: false, autoApprove: true });
+    expect(s.badge).toBe(true);
+  });
+
+  it("parseSettings 合法 JSON 往返", () => {
+    const s = updateSettings(defaultSettings(), {
+      defaults: { effort: "high", verify: true, autoApprove: false },
+      badge: false,
+    });
+    expect(parseSettings(JSON.stringify(s))).toEqual(s);
+  });
+
+  it("坏 JSON / 非对象 / null → null（回默认）", () => {
+    expect(parseSettings("{oops")).toBeNull();
+    expect(parseSettings('"字符串"')).toBeNull();
+    expect(parseSettings("42")).toBeNull();
+    expect(parseSettings(null)).toBeNull();
+    expect(parseSettings(undefined)).toBeNull();
+  });
+
+  it("schema 版本不符 → null", () => {
+    const s = { ...defaultSettings(), version: 999 };
+    expect(parseSettings(JSON.stringify(s))).toBeNull();
+  });
+
+  it("字段逐个校验：类型不对的字段回默认，合法字段保留", () => {
+    const raw = JSON.stringify({
+      version: SETTINGS_SCHEMA_VERSION,
+      defaults: { effort: "low", verify: "是", autoApprove: false },
+      badge: "no",
+    });
+    const s = parseSettings(raw);
+    expect(s.defaults.effort).toBe("low");
+    expect(s.defaults.verify).toBe(false); // 字符串被丢弃
+    expect(s.defaults.autoApprove).toBe(false);
+    expect(s.badge).toBe(true); // 非 boolean 被丢弃
+  });
+
+  it("loadSettings：无记录 / 损坏内容 / storage 不可用都回默认", () => {
+    expect(loadSettings(fakeStorage())).toEqual(defaultSettings());
+    expect(loadSettings(fakeStorage({ [SETTINGS_STORAGE_KEY]: "{bad" }))).toEqual(defaultSettings());
+    expect(loadSettings(null)).toEqual(defaultSettings());
+    const throwing = { getItem: () => { throw new Error("隐私模式"); }, setItem: () => {} };
+    expect(loadSettings(throwing)).toEqual(defaultSettings());
+  });
+
+  it("saveSettings：正常落盘；写入抛错返回 false 不炸", () => {
+    const st = fakeStorage();
+    const s = updateSettings(defaultSettings(), { badge: false });
+    expect(saveSettings(st, s)).toBe(true);
+    expect(parseSettings(st.getItem(SETTINGS_STORAGE_KEY))).toEqual(s);
+    const throwing = { getItem: () => null, setItem: () => { throw new Error("满"); } };
+    expect(saveSettings(throwing, s)).toBe(false);
+    expect(saveSettings(null, s)).toBe(false);
+  });
+
+  it("updateSettings 不可变合并：原对象不动，defaults 深一层合并", () => {
+    const base = defaultSettings();
+    const next = updateSettings(base, { defaults: { verify: true } });
+    expect(base.defaults.verify).toBe(false);
+    expect(next.defaults.verify).toBe(true);
+    expect(next.defaults.autoApprove).toBe(true); // 其余键保留
+  });
+});
+
+// ---------------------------------------------------------------
+// 旧键迁移与 composer 默认值
+// ---------------------------------------------------------------
+describe("旧键迁移与 composer 默认值派生", () => {
+  it("settings 未显式记录 autoApprove 时，旧键 0/1 播种并落盘", () => {
+    const st = fakeStorage({ [LEGACY_AUTO_APPROVE_KEY]: "0" });
+    const { settings, migrated } = migrateLegacyPrefs(st, loadSettings(st));
+    expect(migrated).toBe(true);
+    expect(settings.defaults.autoApprove).toBe(false);
+    // 已落盘：下次读直接拿到
+    expect(loadSettings(st).defaults.autoApprove).toBe(false);
+  });
+
+  it("settings 已显式记录 → 以 settings 为准，不被旧键覆盖", () => {
+    const explicit = updateSettings(defaultSettings(), { defaults: { autoApprove: true } });
+    const st = fakeStorage({
+      [SETTINGS_STORAGE_KEY]: JSON.stringify(explicit),
+      [LEGACY_AUTO_APPROVE_KEY]: "0",
+    });
+    const { settings, migrated } = migrateLegacyPrefs(st, loadSettings(st));
+    expect(migrated).toBe(false);
+    expect(settings.defaults.autoApprove).toBe(true);
+  });
+
+  it("旧键缺失 / 值非法 / storage 为 null → 不迁移", () => {
+    expect(migrateLegacyPrefs(fakeStorage(), defaultSettings()).migrated).toBe(false);
+    expect(migrateLegacyPrefs(fakeStorage({ [LEGACY_AUTO_APPROVE_KEY]: "是" }), defaultSettings()).migrated).toBe(false);
+    expect(migrateLegacyPrefs(null, defaultSettings()).migrated).toBe(false);
+  });
+
+  it("composerDefaults 派生三项默认值", () => {
+    const s = updateSettings(defaultSettings(), {
+      defaults: { effort: "medium", verify: true, autoApprove: false },
+    });
+    expect(composerDefaults(s)).toEqual({ effort: "medium", verify: true, autoApprove: false });
+    expect(composerDefaults(defaultSettings())).toEqual({ effort: "", verify: false, autoApprove: true });
+  });
+
+  it("isValidEffort：空串恒合法；档位必须在服务端声明集合里", () => {
+    expect(isValidEffort("", null)).toBe(true);
+    expect(isValidEffort("high", ["low", "medium", "high"])).toBe(true);
+    expect(isValidEffort("high", ["low"])).toBe(false);
+    expect(isValidEffort("high", null)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------
+// composer 默认值注入（纯函数化的 DOM 触碰）
+// ---------------------------------------------------------------
+describe("applyComposerDefaults 注入 composer", () => {
+  function makeControls() {
+    document.body.innerHTML = `
+      <input type="checkbox" id="verify-toggle" />
+      <input type="checkbox" id="auto-approve-toggle" checked />
+      <select id="effort-select">
+        <option value="">默认</option>
+        <option value="low">低</option>
+        <option value="high">高</option>
+      </select>`;
+    return {
+      verifyToggle: document.getElementById("verify-toggle"),
+      autoApproveToggle: document.getElementById("auto-approve-toggle"),
+      effortSelect: document.getElementById("effort-select"),
+    };
+  }
+
+  it("三项默认值注入对应控件", () => {
+    const c = makeControls();
+    const applied = applyComposerDefaults(c, { effort: "high", verify: true, autoApprove: false });
+    expect(applied).toEqual({ effort: true, verify: true, autoApprove: true });
+    expect(c.verifyToggle.checked).toBe(true);
+    expect(c.autoApproveToggle.checked).toBe(false);
+    expect(c.effortSelect.value).toBe("high");
+  });
+
+  it("effort 为空串 = 跟随服务端默认，不动 select", () => {
+    const c = makeControls();
+    c.effortSelect.value = "low"; // 服务端默认档
+    const applied = applyComposerDefaults(c, { effort: "" });
+    expect(applied.effort).toBe(false);
+    expect(c.effortSelect.value).toBe("low");
+  });
+
+  it("非法档位被忽略（设置里是服务端没有的档）", () => {
+    const c = makeControls();
+    const applied = applyComposerDefaults(c, { effort: "xhigh" }, { effortLevels: ["low", "high"] });
+    expect(applied.effort).toBe(false);
+    expect(c.effortSelect.value).toBe(""); // 保持原位
+  });
+
+  it("只应用 patch 里出现的键：用户在 composer 的当次改动不被无关项覆盖", () => {
+    const c = makeControls();
+    c.verifyToggle.checked = true; // 用户当次勾的
+    const applied = applyComposerDefaults(c, { autoApprove: false });
+    expect(applied.verify).toBe(false);
+    expect(c.verifyToggle.checked).toBe(true); // 没被动
+    expect(c.autoApproveToggle.checked).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------
+// 路由判定 / 文案 / 快捷键表
+// ---------------------------------------------------------------
+describe("路由判定与静态数据", () => {
+  it("isSettingsRoute 只认 #/settings", () => {
+    expect(isSettingsRoute(SETTINGS_HASH)).toBe(true);
+    expect(isSettingsRoute("#/")).toBe(false);
+    expect(isSettingsRoute("#/run/abc/loop")).toBe(false);
+    expect(isSettingsRoute("")).toBe(false);
+    expect(isSettingsRoute(null)).toBe(false);
+  });
+
+  it("permissionStateLabel 覆盖四种状态", () => {
+    expect(permissionStateLabel("granted")).toContain("已授权");
+    expect(permissionStateLabel("denied")).toContain("已被浏览器拒绝");
+    expect(permissionStateLabel("default")).toContain("未决定");
+    expect(permissionStateLabel(null)).toContain("不支持");
+  });
+
+  it("快捷键一览与命令面板帮助同源（同一份 SHORTCUTS）", () => {
+    const rows = shortcutRows();
+    expect(rows).toHaveLength(SHORTCUTS.length);
+    expect(rows.map((r) => r.keys)).toEqual(SHORTCUTS.map((s) => s.keys));
+    expect(rows.some((r) => r.keys.includes("K"))).toBe(true); // Ctrl+K 在列
+    expect(rows.some((r) => r.keys.includes("Enter"))).toBe(true); // Ctrl+Enter 在列
+  });
+
+  it("badgeEnabled：缺省 true，显式 false 才关", () => {
+    expect(badgeEnabled(defaultSettings())).toBe(true);
+    expect(badgeEnabled(updateSettings(defaultSettings(), { badge: false }))).toBe(false);
+    expect(badgeEnabled(null)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------
+// DOM 层
+// ---------------------------------------------------------------
+describe("initSettingsView 视图行为", () => {
+  const LEVELS = ["low", "medium", "high"];
+  const SNAP = {
+    version: "9.9.9-test",
+    workdir: "D:\\repo",
+    effortLevels: LEVELS,
+  };
+
+  function makeHost(overrides = {}) {
+    return {
+      getTheme: vi.fn(() => "dark"),
+      onSelectTheme: vi.fn(),
+      getHarnessSnapshot: vi.fn(() => SNAP),
+      onApplyComposerDefaults: vi.fn(),
+      onOpenSettings: vi.fn(),
+      onCloseSettings: vi.fn(),
+      onAnnounce: vi.fn(),
+      ...overrides,
+    };
+  }
+
+  function makeEnv(overrides = {}) {
+    return {
+      doc: document,
+      win: window,
+      storage: fakeStorage(),
+      Notification: {
+        permission: "default",
+        requestPermission: vi.fn((cb) => {
+          cb("granted");
+          return Promise.resolve("granted");
+        }),
+      },
+      ...overrides,
+    };
+  }
+
+  beforeEach(() => {
+    document.body.innerHTML = `
+      <aside class="sidebar">
+        <button type="button" id="settings-open-btn" aria-label="打开设置"><i class="ph ph-gear"></i><span>设置</span></button>
+      </aside>
+      <main id="main-panel"></main>`;
+    document.body.classList.remove("settings-badge-off");
+  });
+
+  it("初始化挂出隐藏视图（进 #main-panel），重复初始化幂等", () => {
+    const api = initSettingsView(makeHost(), makeEnv());
+    const view = document.getElementById("settings-view");
+    expect(view).not.toBeNull();
+    expect(view.hidden).toBe(true);
+    expect(view.parentElement.id).toBe("main-panel");
+    const again = initSettingsView(makeHost(), makeEnv());
+    expect(again.element).toBe(view);
+  });
+
+  it("侧栏齿轮点击 → host.onOpenSettings（宿主写 hash 路由）", () => {
+    const host = makeHost();
+    initSettingsView(host, makeEnv());
+    document.getElementById("settings-open-btn").click();
+    expect(host.onOpenSettings).toHaveBeenCalledTimes(1);
+  });
+
+  it("open/close：显隐 + 焦点管理（开时焦点进视图，关时还原到来处）", () => {
+    const host = makeHost();
+    const api = initSettingsView(host, makeEnv());
+    const gear = document.getElementById("settings-open-btn");
+    gear.focus();
+    api.open();
+    expect(api.isOpen()).toBe(true);
+    expect(api.element.hidden).toBe(false);
+    expect(api.element.contains(document.activeElement)).toBe(true);
+    api.close();
+    expect(api.isOpen()).toBe(false);
+    expect(api.element.hidden).toBe(true);
+    expect(document.activeElement).toBe(gear);
+  });
+
+  it("「返回」按钮 → host.onCloseSettings（由来处/深链的策略在宿主）", () => {
+    const host = makeHost();
+    const api = initSettingsView(host, makeEnv());
+    api.open();
+    api.element.querySelector(".settings-back").click();
+    expect(host.onCloseSettings).toHaveBeenCalledTimes(1);
+  });
+
+  it("外观：radio 反映当前主题，改动派发给 host.onSelectTheme", () => {
+    const host = makeHost();
+    const api = initSettingsView(host, makeEnv());
+    api.open();
+    const radios = [...api.element.querySelectorAll('input[name="settings-theme"]')];
+    expect(radios).toHaveLength(THEME_CHOICES.length);
+    expect(radios.find((r) => r.value === "dark").checked).toBe(true);
+    const light = radios.find((r) => r.value === "light");
+    light.checked = true;
+    light.dispatchEvent(new Event("change", { bubbles: true }));
+    expect(host.onSelectTheme).toHaveBeenCalledWith("light");
+  });
+
+  it("运行默认值：改动持久化到 agent-ui-settings 并实时同步 composer", () => {
+    const env = makeEnv();
+    const host = makeHost();
+    const api = initSettingsView(host, env);
+    api.open();
+
+    const verify = api.element.querySelector("#settings-verify");
+    verify.checked = true;
+    verify.dispatchEvent(new Event("change", { bubbles: true }));
+    expect(host.onApplyComposerDefaults).toHaveBeenCalledWith({ verify: true });
+    const stored = parseSettings(env.storage.getItem(SETTINGS_STORAGE_KEY));
+    expect(stored.defaults.verify).toBe(true);
+
+    // 思考强度：档位由快照声明，第一档是「跟随服务端默认」
+    const effort = api.element.querySelector("#settings-effort");
+    expect(effort.options[0].value).toBe("");
+    expect([...effort.options].map((o) => o.value)).toEqual(["", ...LEVELS]);
+    effort.value = "medium";
+    effort.dispatchEvent(new Event("change", { bubbles: true }));
+    expect(host.onApplyComposerDefaults).toHaveBeenCalledWith({ effort: "medium" });
+    expect(parseSettings(env.storage.getItem(SETTINGS_STORAGE_KEY)).defaults.effort).toBe("medium");
+  });
+
+  it("自动放行默认值：settings 与旧键一起写（同源）", () => {
+    const env = makeEnv();
+    const host = makeHost();
+    const api = initSettingsView(host, env);
+    api.open();
+    const toggle = api.element.querySelector("#settings-auto-approve");
+    expect(toggle.checked).toBe(true); // 默认开
+    toggle.checked = false;
+    toggle.dispatchEvent(new Event("change", { bubbles: true }));
+    expect(parseSettings(env.storage.getItem(SETTINGS_STORAGE_KEY)).defaults.autoApprove).toBe(false);
+    expect(env.storage.getItem(LEGACY_AUTO_APPROVE_KEY)).toBe("0");
+    expect(host.onApplyComposerDefaults).toHaveBeenCalledWith({ autoApprove: false });
+  });
+
+  it("通知：展示授权状态；点请求授权走 Notification 并与 notifications.js 同源落 prompt 键", () => {
+    const env = makeEnv();
+    const api = initSettingsView(makeHost(), env);
+    api.open();
+    const state = api.element.querySelector("#settings-notify-state");
+    expect(state.textContent).toContain("未决定");
+    const btn = api.element.querySelector("#settings-notify-request");
+    expect(btn.hidden).toBe(false);
+    btn.click();
+    expect(env.Notification.requestPermission).toHaveBeenCalledTimes(1);
+    expect(env.storage.getItem(PROMPT_STORAGE_KEY)).toBe("granted");
+  });
+
+  it("通知：已被浏览器拒绝时不给请求按钮，如实提示", () => {
+    const env = makeEnv({ Notification: { permission: "denied" } });
+    const api = initSettingsView(makeHost(), env);
+    api.open();
+    expect(api.element.querySelector("#settings-notify-state").textContent).toContain("已被浏览器拒绝");
+    expect(api.element.querySelector("#settings-notify-request").hidden).toBe(true);
+  });
+
+  it("通知：浏览器不支持时如实展示，不弹按钮", () => {
+    const env = makeEnv({ Notification: null });
+    const api = initSettingsView(makeHost(), env);
+    api.open();
+    expect(api.element.querySelector("#settings-notify-state").textContent).toContain("不支持");
+    expect(api.element.querySelector("#settings-notify-request").hidden).toBe(true);
+  });
+
+  it("应用内角标：关掉即加 body 类并持久化，启动时（未开视图）也生效", () => {
+    const env = makeEnv();
+    const api = initSettingsView(makeHost(), env);
+    // 初始化即应用偏好（默认开 → 无类）
+    expect(document.body.classList.contains("settings-badge-off")).toBe(false);
+    api.open();
+    const toggle = api.element.querySelector("#settings-badge");
+    toggle.checked = false;
+    toggle.dispatchEvent(new Event("change", { bubbles: true }));
+    expect(document.body.classList.contains("settings-badge-off")).toBe(true);
+    expect(parseSettings(env.storage.getItem(SETTINGS_STORAGE_KEY)).badge).toBe(false);
+  });
+
+  it("快捷键分组：行数与 SHORTCUTS 一致", () => {
+    const api = initSettingsView(makeHost(), makeEnv());
+    api.open();
+    const rows = api.element.querySelectorAll(".settings-shortcut-row");
+    expect(rows).toHaveLength(SHORTCUTS.length);
+  });
+
+  it("关于：快照有版本与工作目录就用快照，没有则版本兜底 1.3.0", () => {
+    const api = initSettingsView(makeHost(), makeEnv());
+    api.open();
+    expect(api.element.querySelector("#settings-about-name").textContent).toBe("Agent Harness");
+    expect(api.element.querySelector("#settings-about-version").textContent).toBe("9.9.9-test");
+    expect(api.element.querySelector("#settings-about-workdir").textContent).toBe("D:\\repo");
+
+    // 无快照：版本回落 FALLBACK_VERSION，工作目录如实「未获取」
+    document.body.innerHTML = `<main id="main-panel"></main>`;
+    const api2 = initSettingsView(makeHost({ getHarnessSnapshot: () => null }), makeEnv());
+    api2.open();
+    expect(api2.element.querySelector("#settings-about-version").textContent).toBe(FALLBACK_VERSION);
+    expect(api2.element.querySelector("#settings-about-workdir").textContent).toBe("未获取");
+  });
+
+  it("锚点导航：五个分组按钮齐全，点击把焦点交给目标分组", () => {
+    const api = initSettingsView(makeHost(), makeEnv());
+    api.open();
+    const navBtns = [...api.element.querySelectorAll(".settings-nav-btn")];
+    expect(navBtns.map((b) => b.getAttribute("data-section"))).toEqual(
+      SETTINGS_SECTIONS.map((s) => s.id),
+    );
+    navBtns[1].click();
+    const target = document.getElementById("settings-defaults");
+    expect(document.activeElement).toBe(target);
+  });
+
+  it("open 时从存储重读：外部（composer）刚写过的值立刻反映到控件", () => {
+    const env = makeEnv();
+    const api = initSettingsView(makeHost(), env);
+    // 模拟 composer 侧改动落了盘
+    env.storage.setItem(
+      SETTINGS_STORAGE_KEY,
+      JSON.stringify(updateSettings(defaultSettings(), { defaults: { verify: true } })),
+    );
+    api.open();
+    expect(api.element.querySelector("#settings-verify").checked).toBe(true);
+  });
+});
