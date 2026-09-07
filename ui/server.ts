@@ -83,7 +83,7 @@ import type { Plan, SubTask } from "../src/planner.js";
 import { resolveRecoveryPolicy } from "../src/recovery.js";
 import type Anthropic from "@anthropic-ai/sdk";
 import { bashTool, SHELL_DESC } from "../src/tools/bash.js";
-import { ASK_USER_TOOL_NAME, createAskUserTool } from "../src/tools/ask-user.js";
+import { ASK_USER_TOOL_NAME, createAskUserTool, type UserQuestion } from "../src/tools/ask-user.js";
 import {
   FINISH_TASK_TOOL_NAME,
   withTaskCompletion,
@@ -529,7 +529,7 @@ interface PendingQuestion {
   requestSeq: number;
   at: number;
   /** 一次打断里的一组问题（决定 6）——贵的是打断人，不是问题本身 */
-  questions: { question: string; options: string[]; fallback: string }[];
+  questions: UserQuestion[];
   /**
    * 逐题答复，与 questions 对齐；整体 null = 这次打断没得到任何应答。
    * **都不是错误**——见 ask-user.ts 决定 4。
@@ -3537,7 +3537,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   function makeAskUserTool(run: StoredRun): Tool {
     return createAskUserTool({
       ...(maxAskRounds !== undefined ? { maxRounds: maxAskRounds } : {}),
-      ask: (req: { questions: { question: string; options: string[]; fallback: string }[] }) =>
+      ask: (req: { questions: UserQuestion[] }) =>
         new Promise<(string | null)[] | null>((resolve) => {
           (run.questionQueue ??= []).push({ questions: req.questions, resolve });
           pumpQuestionQueue(run);

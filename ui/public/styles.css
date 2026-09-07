@@ -1131,6 +1131,17 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
   cursor: pointer;
 }
 .question-opt:hover { background: var(--bg3); }
+/* 推荐徽标：结构化标记（recommended 字段），不是选项文字的一部分。
+   accent 色系胶囊，与 verify-badge 同族但语义是「建议选这个」。 */
+.question-badge {
+  font-size: var(--font-xs);
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--on-accent);
+  font-weight: 600;
+  white-space: nowrap;
+}
 .question-free-label {
   display: block;
   font-size: var(--font-sm);

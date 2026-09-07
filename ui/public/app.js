@@ -571,11 +571,18 @@ export function reduceEvent(state, sseEvent) {
         id: String(event.id ?? seq),
         seq,
         // 一次打断一组问题（决定 6）
-        questions: (Array.isArray(event.questions) ? event.questions : []).map((q) => ({
-          question: String(q.question ?? ""),
-          options: Array.isArray(q.options) ? q.options.map(String) : [],
-          fallback: String(q.fallback ?? ""),
-        })),
+        questions: (Array.isArray(event.questions) ? event.questions : []).map((q) => {
+          const options = Array.isArray(q.options) ? q.options.map(String) : [];
+          // 推荐徽标是结构化字段，不是选项文字的一部分——非法值静默丢弃（同工具侧口径）
+          const rec = q.recommended;
+          const ok = typeof rec === "number" && Number.isInteger(rec) && rec >= 1 && rec <= options.length;
+          return {
+            question: String(q.question ?? ""),
+            options,
+            fallback: String(q.fallback ?? ""),
+            ...(ok ? { recommended: rec } : {}),
+          };
+        }),
         at: Number(event.at ?? 0),
       },
     };
@@ -3993,7 +4000,10 @@ function patchUserQuestion(parts, faces, callbacks) {
     parts.userQuestion.innerHTML = "";
     return;
   }
-  const sig = signature([q.id, q.questions.map((x) => x.question + x.options.join("|")).join("§")]);
+  const sig = signature([
+    q.id,
+    q.questions.map((x) => `${x.question}${x.options.join("|")}#${x.recommended ?? ""}`).join("§"),
+  ]);
   if (parts.sig.userQuestion === sig) return;
   parts.sig.userQuestion = sig;
   setAttr(parts.userQuestion, "hidden", null);
@@ -4007,11 +4017,16 @@ function patchUserQuestion(parts, faces, callbacks) {
   const blocks = q.questions
     .map((item, i) => {
       const opts = item.options
-        .map(
-          (o, j) =>
+        .map((o, j) => {
+          // 推荐是结构化徽标，不是选项文字的一部分——radio 的 value 保持干净文字，
+          // 回传给模型的答案才永远不带「（推荐）」这类装饰词
+          const badge =
+            item.recommended === j + 1 ? '<span class="question-badge">推荐</span>' : "";
+          return (
             `<label class="question-opt"><input type="radio" name="q-${i}" value="${esc(o)}" />` +
-            `<span>${esc(o)}</span></label>`,
-        )
+            `<span>${esc(o)}</span>${badge}</label>`
+          );
+        })
         .join("");
       return (
         `<fieldset class="question-item">` +

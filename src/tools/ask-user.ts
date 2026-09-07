@@ -58,6 +58,31 @@ export interface UserQuestion {
   options: string[];
   /** 模型自陈：拿不到答案时它打算怎么办——没有它，委托方无从判断这题值不值得答 */
   fallback: string;
+  /**
+   * 推荐项序号（1-based，1~options.length），可选。
+   * 界面把命中的选项标上「推荐」徽标；**选项文字本身保持干净**——
+   * 装饰词（「（推荐）」之类）在入参归一时已被剥掉，答案回传永远不带它。
+   */
+  recommended?: number;
+}
+
+/**
+ * 历史遗留兼容：模型曾把「（推荐）」写进选项文字来标记推荐项——
+ * 装饰词成了答案的一部分，回传时带着重复词语。现在统一在这里剥掉：
+ * 干净文字进 options，推荐意图改由 recommended 字段表达。
+ */
+const RECOMMEND_DECORATOR = /\s*(?:（推荐）|\(推荐\)|【推荐】)\s*$/;
+
+/** 剥掉选项文字尾部的推荐装饰词；返回干净文字与「是否带装饰词」 */
+function stripRecommendDecorator(option: string): { text: string; marked: boolean } {
+  let text = option;
+  let marked = false;
+  // 模型偶尔会叠着写两遍（「…（推荐）（推荐）」），循环剥到干净为止
+  while (RECOMMEND_DECORATOR.test(text)) {
+    marked = true;
+    text = text.replace(RECOMMEND_DECORATOR, "");
+  }
+  return { text, marked };
 }
 
 /** 一次打断里提交的一组问题（决定 6） */
@@ -170,7 +195,10 @@ export function validateQuestions(input: unknown): { questions: UserQuestion[] }
      * 「schema 声明了」与「schema 被执行了」是两回事，不变量要自己守（P6）。
      */
     const options = Array.isArray(item?.options)
-      ? (item.options as unknown[]).map(String).filter((s) => s.trim() !== "")
+      ? (item.options as unknown[])
+          .map(String)
+          .map((s) => stripRecommendDecorator(s))
+          .filter((s) => s.text.trim() !== "")
       : [];
     if (options.length < MIN_OPTIONS) {
       return {
@@ -180,7 +208,28 @@ export function validateQuestions(input: unknown): { questions: UserQuestion[] }
       };
     }
     // 多给的截掉而不是拒绝：想太细不是无效，拒绝会白烧一次打断
-    questions.push({ question, fallback, options: options.slice(0, MAX_OPTIONS) });
+    const clean = options.slice(0, MAX_OPTIONS);
+    /**
+     * 推荐项归一，三条规则：
+     *  ① 字段优先——模型显式给了 recommended 就以它为准；
+     *  ② 没给字段但选项文字带装饰词 → 从装饰词派生（取第一个被标记的）；
+     *  ③ 字段非法（非整数 / 越界）→ **静默丢弃**，不报错——
+     *     模型把可选字段写错了不值得烧一次打断（V-04 同族：那不是委托方的问题）。
+     */
+    let recommended: number | undefined;
+    const raw = item?.recommended;
+    if (typeof raw === "number" && Number.isInteger(raw) && raw >= 1 && raw <= clean.length) {
+      recommended = raw;
+    } else if (raw === undefined || raw === null) {
+      const marked = clean.findIndex((s) => s.marked);
+      if (marked >= 0) recommended = marked + 1;
+    }
+    questions.push({
+      question,
+      fallback,
+      options: clean.map((s) => s.text),
+      ...(recommended !== undefined ? { recommended } : {}),
+    });
   }
   return { questions };
 }
@@ -236,13 +285,22 @@ export function createAskUserTool(opts: AskUserOptions): Tool {
                 description:
                   `${MIN_OPTIONS}~${MAX_OPTIONS} 个互斥的候选答案，**必填**。` +
                   "委托方点一下就能答，比让他写一段话更可能得到回复；" +
-                  "而且逼你先想清到底有哪几条路。（对方仍可自由输入别的答案）",
+                  "而且逼你先想清到底有哪几条路。（对方仍可自由输入别的答案）\n" +
+                  "**不要在选项文字里写（推荐）之类的装饰词**——用 recommended 字段标记推荐项，" +
+                  "界面会把它标出来；写进文字会污染回传的答案。",
               },
               fallback: {
                 type: "string",
                 description:
                   "这一题拿不到答复时你打算怎么做。**必填**——它让委托方能判断" +
                   "这题值不值得答，也逼你先想清默认路线",
+              },
+              recommended: {
+                type: "integer",
+                minimum: 1,
+                description:
+                  "推荐项的序号（1-based，1~options.length），可选。" +
+                  "界面会把推荐项标上「推荐」徽标，帮委托方更快决定",
               },
             },
             required: ["question", "options", "fallback"],

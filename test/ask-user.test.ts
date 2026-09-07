@@ -407,3 +407,112 @@ describe("renderAnswers：写给模型看的回填格式", () => {
     expect(out).toContain("按你写的默认执行：默认沿用");
   });
 });
+
+/**
+ * 推荐徽标（委托方需求 2026-05）：推荐项是**结构化字段** recommended，
+ * 不再是选项文字里的「（推荐）」装饰词——装饰词会污染回传的答案。
+ * 三条归一规则各有锁：字段优先 / 装饰词剥离并派生 / 非法字段静默丢弃。
+ */
+describe("recommended 推荐徽标：结构化字段取代选项文字里的装饰词", () => {
+  const q = (extra: Record<string, unknown>) => ({
+    questions: [
+      {
+        question: "桌面端用哪个框架？",
+        options: ["Electron", "Tauri"],
+        fallback: "默认 Tauri",
+        ...extra,
+      },
+    ],
+  });
+
+  it("合法 recommended 透传（1-based，界面对应第几个选项）", () => {
+    const r = validateQuestions(q({ recommended: 2 }));
+    expect("questions" in r && r.questions[0]!.recommended).toBe(2);
+  });
+
+  it.each([0, 3, 99, 1.5, Number.NaN, "2", true])(
+    "非法值 %s 静默丢弃——可选字段写错了不值得烧一次打断",
+    (bad) => {
+      const r = validateQuestions(q({ recommended: bad }));
+      expect("error" in r, `${JSON.stringify(bad)} 不该让整个提问被拒`).toBe(false);
+      if ("questions" in r) expect(r.questions[0]!.recommended).toBeUndefined();
+    },
+  );
+
+  it("recommended 落在被截掉的选项上同样丢弃（截到 4 个后 5 号位不存在了）", () => {
+    const r = validateQuestions({
+      questions: [
+        { question: "q", options: ["a", "b", "c", "d", "e"], fallback: "f", recommended: 5 },
+      ],
+    });
+    expect("questions" in r && r.questions[0]!.options).toEqual(["a", "b", "c", "d"]);
+    expect("questions" in r && r.questions[0]!.recommended).toBeUndefined();
+  });
+
+  it.each(["（推荐）", "(推荐)", "【推荐】"])(
+    "选项文字以 %s 结尾 → 剥掉装饰词并派生 recommended（旧写法兼容归一）",
+    (decorator) => {
+      const r = validateQuestions(
+        q({ options: ["Electron", `Tauri${decorator}`] }),
+      );
+      if (!("questions" in r)) throw new Error("不应报错");
+      expect(r.questions[0]!.options, "装饰词不得留在选项文字里").toEqual(["Electron", "Tauri"]);
+      expect(r.questions[0]!.recommended).toBe(2);
+    },
+  );
+
+  it("装饰词叠写两遍也剥到干净为止", () => {
+    const r = validateQuestions(q({ options: ["a", "b（推荐）(推荐)"] }));
+    expect("questions" in r && r.questions[0]!.options).toEqual(["a", "b"]);
+    expect("questions" in r && r.questions[0]!.recommended).toBe(2);
+  });
+
+  it("字段与装饰词同时存在时以字段为准——显式字段是模型的真实意图", () => {
+    const r = validateQuestions(q({ options: ["Electron", "Tauri（推荐）"], recommended: 1 }));
+    if (!("questions" in r)) throw new Error("不应报错");
+    expect(r.questions[0]!.recommended).toBe(1);
+    // 装饰词无论是否被字段采纳都要剥掉——它从来不是选项文字的一部分
+    expect(r.questions[0]!.options).toEqual(["Electron", "Tauri"]);
+  });
+
+  it("装饰词写在选项中间不剥——只认结尾标记，不误伤正文", () => {
+    const r = validateQuestions(q({ options: ["（推荐）这种说法本身", "b"] }));
+    expect("questions" in r && r.questions[0]!.options[0]).toBe("（推荐）这种说法本身");
+    expect("questions" in r && r.questions[0]!.recommended).toBeUndefined();
+  });
+
+  it("多个选项都带装饰词时取第一个——推荐项只有一个，多了是模型写岔了", () => {
+    const r = validateQuestions(q({ options: ["a（推荐）", "b（推荐）"] }));
+    expect("questions" in r && r.questions[0]!.recommended).toBe(1);
+  });
+
+  it("剥完只剩装饰词的空选项被滤掉，不凑数", () => {
+    const r = validateQuestions(q({ options: ["（推荐）", "Tauri", "Electron"] }));
+    expect("questions" in r && r.questions[0]!.options).toEqual(["Tauri", "Electron"]);
+  });
+
+  it("答案链路全程不见装饰词：宿主拿到的 options 是干净文字", async () => {
+    const seen: { questions: { options: string[] }[] }[] = [];
+    const tool = createAskUserTool({
+      ask: async (req) => {
+        seen.push(req);
+        // 宿主回的是选项原文（radio value）——干净文字回传，答案不带装饰词
+        return [req.questions[0]!.options[1]!];
+      },
+    });
+    const r = await tool.execute(q({ options: ["Electron", "Tauri（推荐）"] }), ctx());
+    expect(seen[0]!.questions[0]!.options).toEqual(["Electron", "Tauri"]);
+    expect(r.content).toContain("→ Tauri");
+    expect(r.content).not.toContain("推荐");
+  });
+
+  it("schema 与工具描述都写下这条纪律——模型从工具面上就知道别往文字里塞装饰词", () => {
+    const tool = createAskUserTool({ ask: async () => null });
+    const items = (tool.inputSchema as any).properties.questions.items;
+    expect(items.properties.recommended.type).toBe("integer");
+    expect(items.properties.recommended.minimum).toBe(1);
+    const optionsDesc: string = items.properties.options.description;
+    expect(optionsDesc).toContain("不要在选项文字里写（推荐）");
+    expect(optionsDesc).toContain("recommended");
+  });
+});
