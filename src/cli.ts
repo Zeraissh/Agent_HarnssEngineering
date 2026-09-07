@@ -107,7 +107,7 @@ import { connectMcpServers, loadMcpConfig } from "./mcp.js";
 import { createMemoryTools, MemoryStore } from "./memory.js";
 import { AUTO_CONCURRENCY_CAP, plannedStopReason, planParallelWidth, runPlanned, runVerified } from "./orchestrate.js";
 import { resolveVerifierReadOnlyCommands, type VerifyOutcome } from "./verifier.js";
-import { getPack, PACKS, RULE_PRECEDENCE_DISCIPLINE, selectPackTools, type DomainPack } from "./presets.js";
+import { getPack, PACKS, DEFAULT_HOST_DISCIPLINES, selectPackTools, type DomainPack } from "./presets.js";
 import { resolveRecoveryPolicy } from "./recovery.js";
 import { routeToPack } from "./router.js";
 import { createFallbackClientIfConfigured, createRoleFallbackClient, executorBackupEndpoints, FallbackModelClient, sharedBreakerRegistry } from "./model-fallback.js";
@@ -119,12 +119,14 @@ import {
 } from "./task-completion.js";
 import { bashTool, SHELL_DESC } from "./tools/bash.js";
 import { createDescribeImageTool } from "./tools/describe-image.js";
+import { createWebSearchTool, isWebSearchConfigured } from "./tools/web-search.js";
 import { fetchUrlTool } from "./tools/fetch-url.js";
 import { editFileTool } from "./tools/edit-file.js";
 import { globTool } from "./tools/glob.js";
 import { grepTool } from "./tools/grep.js";
 import { readFileTool } from "./tools/read-file.js";
 import { writeFileTool } from "./tools/write-file.js";
+import { updateProgressTool } from "./tools/update-progress.js";
 import {
   appendRunLedger,
   buildLedgerEntry,
@@ -173,7 +175,7 @@ Complete the user's task end to end using the available tools.
 Ground every claim of progress in an actual tool result. When the task is done, summarize what you did in one or two sentences.
 Keep file outputs clean and well-structured. Respond in the language the user used.
 
-You have a persistent memory that survives across sessions. The current memory index is provided in the <context> block of the first message. Consult relevant memories (memory_read) before starting work. When you learn a durable fact, user preference, or lesson worth reusing — a correction you received, a project constant, an approach that worked — save it with memory_write (one fact per file, first line = summary). Update or delete memories that turn out to be wrong. Do not store transient task state or things already recorded in the repository.` + RULE_PRECEDENCE_DISCIPLINE;
+You have a persistent memory that survives across sessions. The current memory index is provided in the <context> block of the first message. Consult relevant memories (memory_read) before starting work. When you learn a durable fact, user preference, or lesson worth reusing — a correction you received, a project constant, an approach that worked — save it with memory_write (one fact per file, first line = summary). Update or delete memories that turn out to be wrong. Do not store transient task state or things already recorded in the repository.` + DEFAULT_HOST_DISCIPLINES;
 
 async function main(): Promise<void> {
   // 参数与静态 doctor 必须先于 provider/MCP/execution broker。doctor 的契约是
@@ -567,6 +569,8 @@ async function main(): Promise<void> {
   const visionTool = visionClient
     ? createDescribeImageTool({ client: visionClient, modelName: visionModelName! })
     : undefined;
+  const webSearchTool = isWebSearchConfigured() ? createWebSearchTool() : undefined;
+  if (webSearchTool) console.log(c.dim("web_search: Tavily configured"));
 
   // 内置工具按包名单装配（缺省全带）——领域包只带用得上的，减少触发面噪声
   const builtinByName = new Map(
@@ -578,6 +582,8 @@ async function main(): Promise<void> {
       editFileTool,
       globTool,
       grepTool,
+      updateProgressTool,
+      ...(webSearchTool ? [webSearchTool] : []),
       ...(visionTool ? [visionTool] : []),
     ].map((t) => [t.name, t]),
   );
@@ -589,8 +595,10 @@ async function main(): Promise<void> {
    * describe_image 而未配 AGENT_VISION_MODEL，启动即炸——省略才是正确语义
    * （plan 模式的 selectPackTools 本就静默过滤，两条装配路径的语义要一致）。
    */
-  const CONDITIONAL_BUILTINS = new Set(["describe_image"]);
-  const builtins = builtinNames.flatMap((n) => {
+  const CONDITIONAL_BUILTINS = new Set(["describe_image", "web_search"]);
+  const ALWAYS_ON = new Set(["update_progress"]);
+  const namesForPool = [...new Set([...builtinNames, ...ALWAYS_ON])];
+  const builtins = namesForPool.flatMap((n) => {
     const t = builtinByName.get(n);
     if (t) return [t];
     if (CONDITIONAL_BUILTINS.has(n)) {
@@ -908,6 +916,8 @@ async function main(): Promise<void> {
       editFileTool,
       globTool,
       grepTool,
+      updateProgressTool,
+      ...(webSearchTool ? [webSearchTool] : []),
       ...(visionTool ? [visionTool] : []),
     ];
     const mcpPool = mcp?.tools ?? [];
@@ -954,6 +964,13 @@ async function main(): Promise<void> {
         case "compaction":
           console.log(c.yellow(`${tag} ${describeCompaction(event)}`));
           break;
+        case "progress": {
+          const done = event.items.filter((i) => i.status === "done").length;
+          console.log(
+            c.dim(`${tag} ▣ Progress ${done}/${event.items.length}`),
+          );
+          break;
+        }
         case "api_retry":
           console.log(
             c.yellow(`${tag} ⟳ API 瞬时错误，同轮重试 #${event.attempt}（等待 ${event.backoffMs}ms）`),
@@ -1322,6 +1339,11 @@ async function main(): Promise<void> {
           ),
         );
         break;
+      case "progress": {
+        const done = event.items.filter((i) => i.status === "done").length;
+        console.log(c.dim(`  ▣ Progress ${done}/${event.items.length}`));
+        break;
+      }
       case "api_retry":
         endStreamLine();
         console.log(

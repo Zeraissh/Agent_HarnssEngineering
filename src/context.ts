@@ -101,9 +101,9 @@ export const REACTIVE_PROTECT_RECENT = 2;
 /**
  * tier 1 节省量的 token 估算系数（字符/token）。只用于判断"置换之后估计还在水位上吗"
  * ——真实水位下一轮 noteUsage 才知道；估得偏保守（英文约 4、中文更低）即可，
- * 错判的代价只是多折叠一轮旧对话。
+ * 错判的代价只是多折叠一轮旧对话。上下文分项估算复用同一系数。
  */
-const CHARS_PER_TOKEN_ESTIMATE = 4;
+export const CHARS_PER_TOKEN_ESTIMATE = 4;
 /** 折叠块里每条摘要行的字符上限 */
 const COLLAPSE_LINE_CHARS = 160;
 
@@ -116,8 +116,15 @@ export class DefaultContextManager {
   private readonly protectRecent: number;
   private readonly summaryClient: ModelClient | undefined;
   private readonly summaryMaxTokens: number;
-  /** 上一轮的实际输入规模（input + cacheW + cacheR），是"上下文有多大"的唯一可靠信号 */
+  /** 上一轮窗口占用（input + cacheW + cacheR）：模型实际看见多少。给 UI / 检查点。 */
   private lastInputTokens = 0;
+  /**
+   * 上一轮相对预算的压缩判据（input + cacheW，**不含 cache_read**）。
+   * 谱系预算 `turnTokenCost` 已经这样计：cache_read 是重读已缓存前缀，长对话
+   * 每一轮都接近窗口；拿它去撞默认 150k 预算，缓存一热就每轮压缩，前缀拆掉
+   * 反而更贵。窗口真装不下仍走反应式 400。
+   */
+  private lastCompactTokens = 0;
 
   constructor(cfg: ContextConfig) {
     // 构造时冻结（P3）：此后任何路径都不得修改 system prompt
@@ -128,16 +135,18 @@ export class DefaultContextManager {
     this.contextTokenLimit = cfg.contextTokenLimit ?? 150_000;
     this.protectRecent = cfg.protectRecent ?? 6;
     this.lastInputTokens = Math.max(0, Math.floor(cfg.initialInputTokens ?? 0));
+    this.lastCompactTokens = this.lastInputTokens;
     this.summaryClient = cfg.summaryClient;
     this.summaryMaxTokens = cfg.summaryMaxTokens ?? DEFAULT_COMPACT_SUMMARY_MAX_TOKENS;
   }
 
   /** loop 每轮调用，喂入实际 usage —— compact 的触发依据 */
   noteUsage(usage: Anthropic.Usage): void {
-    this.lastInputTokens =
-      usage.input_tokens +
-      (usage.cache_creation_input_tokens ?? 0) +
-      (usage.cache_read_input_tokens ?? 0);
+    const input = Math.max(0, usage.input_tokens);
+    const cacheW = Math.max(0, usage.cache_creation_input_tokens ?? 0);
+    const cacheR = Math.max(0, usage.cache_read_input_tokens ?? 0);
+    this.lastInputTokens = input + cacheW + cacheR;
+    this.lastCompactTokens = input + cacheW;
   }
 
   /** 持久化检查点只需要这个水位，不暴露其余内部策略状态。 */
@@ -202,7 +211,7 @@ export class DefaultContextManager {
       collapsedTurns: 0,
       changed: false,
     });
-    if (!force && this.lastInputTokens < this.contextTokenLimit * COMPACT_WATERMARK) {
+    if (!force && this.lastCompactTokens < this.contextTokenLimit * COMPACT_WATERMARK) {
       return unchanged([...messages]);
     }
 
@@ -245,7 +254,7 @@ export class DefaultContextManager {
     });
 
     // ---- tier 2：置换之后估计仍在水位上（或无可置换）→ 折叠旧轮 ----
-    const estimatedAfter = this.lastInputTokens - savedChars / CHARS_PER_TOKEN_ESTIMATE;
+    const estimatedAfter = this.lastCompactTokens - savedChars / CHARS_PER_TOKEN_ESTIMATE;
     const needTier2 =
       force || dropped === 0 || estimatedAfter >= this.contextTokenLimit * COMPACT_WATERMARK;
     let collapsedTurns = 0;
@@ -311,6 +320,107 @@ export class DefaultContextManager {
       return base;
     }
   }
+}
+
+/** 上下文分项估算（字符 / CHARS_PER_TOKEN_ESTIMATE）；API 不给官方分项时的诚实近似 */
+export interface ContextBreakdown {
+  system: number;
+  toolsBuiltin: number;
+  toolsMcp: number;
+  memory: number;
+  summarized: number;
+  conversation: number;
+  /** API 实测 input 总量 − 估算合计；可正可负，标明估算误差 */
+  unallocated: number;
+  estimated: true;
+}
+
+function estimateCharsToTokens(chars: number): number {
+  return Math.max(0, Math.ceil(chars / CHARS_PER_TOKEN_ESTIMATE));
+}
+
+function breakdownContentChars(content: Anthropic.MessageParam["content"] | Anthropic.TextBlockParam[]): number {
+  if (typeof content === "string") return content.length;
+  let n = 0;
+  for (const b of content) {
+    if (!b || typeof b !== "object") continue;
+    if ("text" in b && typeof b.text === "string") n += b.text.length;
+    else if ("content" in b && typeof (b as { content?: unknown }).content === "string") {
+      n += ((b as { content: string }).content).length;
+    } else if ("input" in b) {
+      try {
+        n += JSON.stringify((b as { input: unknown }).input).length;
+      } catch {
+        /* ignore */
+      }
+    } else {
+      try {
+        n += JSON.stringify(b).length;
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+  return n;
+}
+
+/**
+ * 按请求结构估算上下文分项。`apiInputTokens` 为上一轮 API 实测（含 cache）；
+ * 缺省时 unallocated=0。
+ */
+export function estimateContextBreakdown(
+  req: Pick<ModelRequest, "system" | "messages" | "tools">,
+  apiInputTokens?: number,
+): ContextBreakdown {
+  const systemChars = breakdownContentChars(req.system);
+  let toolsBuiltinChars = 0;
+  let toolsMcpChars = 0;
+  for (const t of req.tools ?? []) {
+    const blob = JSON.stringify(t);
+    if (t.name.includes("__")) toolsMcpChars += blob.length;
+    else toolsBuiltinChars += blob.length;
+  }
+  let memoryChars = 0;
+  let summarizedChars = 0;
+  let conversationChars = 0;
+  for (const m of req.messages ?? []) {
+    const texts = typeof m.content === "string"
+      ? [m.content]
+      : (m.content ?? [])
+          .filter((b): b is Anthropic.TextBlockParam => Boolean(b) && typeof b === "object" && "text" in b)
+          .map((b) => b.text);
+    const joined = texts.join("\n");
+    const isMemory =
+      joined.includes("<context>") &&
+      (joined.includes("memory_index") || joined.includes("memory:"));
+    const isSummarized =
+      joined.includes(COMPACT_LEDGER_MARKER) || joined.startsWith(COMPACTED_TURNS_MARKER);
+    const chars = breakdownContentChars(m.content);
+    if (isMemory) memoryChars += chars;
+    else if (isSummarized) summarizedChars += chars;
+    else conversationChars += chars;
+  }
+  const system = estimateCharsToTokens(systemChars);
+  const toolsBuiltin = estimateCharsToTokens(toolsBuiltinChars);
+  const toolsMcp = estimateCharsToTokens(toolsMcpChars);
+  const memory = estimateCharsToTokens(memoryChars);
+  const summarized = estimateCharsToTokens(summarizedChars);
+  const conversation = estimateCharsToTokens(conversationChars);
+  const sum = system + toolsBuiltin + toolsMcp + memory + summarized + conversation;
+  const api =
+    typeof apiInputTokens === "number" && Number.isFinite(apiInputTokens)
+      ? Math.max(0, Math.floor(apiInputTokens))
+      : sum;
+  return {
+    system,
+    toolsBuiltin,
+    toolsMcp,
+    memory,
+    summarized,
+    conversation,
+    unallocated: api - sum,
+    estimated: true,
+  };
 }
 
 // ---------------------------------------------------------------- tier 2：折叠旧轮

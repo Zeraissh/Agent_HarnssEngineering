@@ -283,6 +283,34 @@ describe("AgentLoop", () => {
     expect(result.stopReason).toBe("budget_exhausted");
     expect(model.requests.length).toBeLessThanOrEqual(2);
   });
+
+  it("谱系预算不计 cache_read：单靠缓存命中不会打断对话", async () => {
+    const cached = () =>
+      fakeMessage([toolUseBlock(`tu_${Math.random()}`, "alpha", {})], "tool_use", {
+        input_tokens: 80,
+        output_tokens: 20,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 80_000,
+      });
+    const model = new FakeModelClient([
+      cached(),
+      cached(),
+      fakeMessage([textBlock("done")], "end_turn", {
+        input_tokens: 80,
+        output_tokens: 20,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 80_000,
+      }),
+    ]);
+    const loop = new AgentLoop(
+      { ...baseConfig, tools: [makeTool({ name: "alpha" })], maxTokensBudget: 1500 },
+      model,
+    );
+    const { result } = await collect(loop.run("go"));
+    expect(result.stopReason).not.toBe("budget_exhausted");
+    expect(result.usage.cacheReadTokens).toBe(240_000);
+    expect(result.usage.inputTokens + result.usage.outputTokens).toBeLessThan(1500);
+  });
 });
 
 describe("瞬时 API 错误的同轮重试", () => {

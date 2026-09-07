@@ -27,6 +27,19 @@ describe("domain packs", () => {
     expect(p!.systemPrompt).toContain("不要自建 OpenOCD/GDB");
   });
 
+  it("consult 包：有据咨询 + fetch_url/web_search + rubric 核查 + 禁装饰 emoji", () => {
+    const p = getPack("consult");
+    expect(p).toBeDefined();
+    expect(p!.builtinTools).toEqual(
+      expect.arrayContaining(["web_search", "fetch_url", "read_file"]),
+    );
+    expect(p!.mcp).toBe(false);
+    expect(p!.verify.mode).toBe("rubric");
+    expect(p!.systemPrompt).toMatch(/未核实/);
+    expect(p!.systemPrompt).toMatch(/emoji/i);
+    expect(p!.systemPrompt).toMatch(/!\[/);
+  });
+
   it("stm32-coding 包：固件工程纪律 + 构建验收 + 不接 MCP（编程阶段不碰硬件）", () => {
     const p = getPack("stm32-coding");
     expect(p).toBeDefined();

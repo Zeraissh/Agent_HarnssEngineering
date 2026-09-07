@@ -143,6 +143,65 @@ Rule-precedence discipline:
 - When the task states an explicit convention (a regex, a line-prefix rule, "lines starting with X", a mapping rule), apply it LITERALLY. The stated convention IS the ground truth — even when your semantic understanding suggests a "more complete" or "more correct" answer.
 - Do not improve upon the rule. If the letter of the rule appears to miss real cases (e.g., multi-line constructs whose continuation lines don't match a line-prefix rule), follow the letter anyway; you may note the discrepancy in your final summary, but the artifact must follow the stated rule.`;
 
+/**
+ * 有据咨询：事实主张必须挂一手出处，否则标「未核实」。
+ * 与核查侧 unverified 同构——查不到就别装权威（热电偶校准允差一类数字尤其危险）。
+ */
+export const GROUNDED_CONSULTATION_DISCIPLINE = `
+
+Grounded-consultation discipline (factual / standards / how-to answers):
+- First-hand only: before stating a hard fact (standard number, tolerance, procedure step, numeric limit), obtain it via tools in this turn — web_search and/or fetch_url on a real HTTPS page, or read_file on a local document the user supplied. Memory and training recall are NOT first-hand.
+- Cite inline: every first-hand claim names the source (document title + HTTPS URL, or local path). Prefer quoting the table/section you actually read.
+- Mark gaps: if you could not fetch a source, write **未核实** next to the claim. Never invent URLs, standard clause numbers, or "according to IEC/NIST…" when you did not open that text.
+- Images the user asked for: only emit Markdown images whose URLs came from tools this turn:
+  \`![brief caption](https://…image… "https://…source-page…")\`
+  The optional title MUST be the source webpage (not a restatement of the caption). The UI shows the image and links to that page. If you only have the image CDN URL, still put the originating article URL in the title when known; otherwise put the image URL and say **未核实来源页**.
+- Search is not reading: web_search snippets are leads — fetch_url (or open the local file) before treating content as evidence.`;
+
+/**
+ * 呈现纪律：排印符可以，装饰性 emoji 不要。
+ * 与 UI entryIcon 同口径——emoji 不跟主题色，只会变成噪声。
+ */
+export const PRESENTATION_DISCIPLINE = `
+
+Presentation discipline:
+- Do not use emoji or emoticon decorations (no ✅❌⚠️🚀💡 etc.) in answers, headings, or lists. Prefer plain prose, Markdown structure, and ASCII/typography markers when a bullet needs emphasis.
+- Keep answers scannable: short paragraphs, real headings, tables when comparing numbers — not icon rows.`;
+
+/**
+ * 进度清单纪律：让执行者在动手前写出步骤并边做边勾。
+ * 不跑 planner 时，右栏 Progress 全靠这把工具——缺一句提示模型就忘。
+ */
+export const PROGRESS_DISCIPLINE = `
+
+Progress checklist:
+- Before real file/command work, call update_progress with a short step list (id + title, status pending/running).
+- When a step finishes or you skip it, call update_progress again with the full table (whole replace) and mark done/skipped.
+- Do not use update_progress instead of doing the work — it only updates the visible checklist.`;
+
+/** 默认宿主（无领域包）与咨询包共用的呈现 + 有据条款。 */
+export const DEFAULT_HOST_DISCIPLINES =
+  RULE_PRECEDENCE_DISCIPLINE +
+  GROUNDED_CONSULTATION_DISCIPLINE +
+  PRESENTATION_DISCIPLINE +
+  PROGRESS_DISCIPLINE;
+
+const CONSULT_SYSTEM = `你是有据可查的技术咨询 agent：回答标准、校准、选型、原理与操作步骤时，以本轮工具取到的一手资料为准。
+
+工作顺序：
+1. 不清楚 URL 时先 web_search（若在场）；已有 URL 或本地文件则直接 fetch_url / read_file。
+2. 打开来源、摘录与任务相关的段落/表格，再组织回答。
+3. 硬数字与标准条款必须带出处链接；做不到就标 **未核实**，不要用训练记忆冒充标准正文。
+4. 用户要图时：只用工具返回的图片 URL，并按 Markdown \`![说明](图片URL "源网页URL")\` 写出，便于界面内嵌显示且可点回源页。
+
+不要输出装饰性 emoji。`;
+
+const CONSULT_VERIFY_RUBRIC = `主观评分（advisory，不影响 passed）：
+1. 出处可追溯：关键事实是否标明本轮打开过的 HTTPS/本地来源？缺出处却写得像权威 → 低分。
+2. 未核实诚实：拉不到的内容是否标了「未核实」，而非编造条款号/URL？
+3. 图文同源：若回答含图，图片 URL 是否像工具结果、是否带源页标题链接？
+4. 呈现：是否避免了无意义 emoji 堆砌？`;
+
 // ————————————————————————— stm32-debug —————————————————————————
 
 const STM32_DEBUG_SYSTEM = `你是一个自主的嵌入式调试 agent，通过 MCP 工具（stm32-gdb-mcp：GDB + OpenOCD/ST-Link）操作真实的 STM32 硬件。
@@ -386,7 +445,7 @@ export const PACKS: Record<string, DomainPack> = {
   "stm32-debug": {
     name: "stm32-debug",
     description: "STM32 真机烧录与调试：ST-Link/OpenOCD 上电、烧录 ELF、断点/变量/故障现场取证",
-    systemPrompt: STM32_DEBUG_SYSTEM + RULE_PRECEDENCE_DISCIPLINE,
+    systemPrompt: STM32_DEBUG_SYSTEM + RULE_PRECEDENCE_DISCIPLINE + PROGRESS_DISCIPLINE,
     // 不给 bash：v1.0 演示实证——给了 bash，执行者会绕开 MCP 自建 openocd/gdb
     // 调试栈,还会 taskkill "清理"时扫死共享的 MCP server。调试动作全走 MCP,
     // 报告用 write_file,读产物用 read_file,足够。
@@ -449,7 +508,7 @@ export const PACKS: Record<string, DomainPack> = {
   "stm32-coding": {
     name: "stm32-coding",
     description: "STM32 固件编程：读写 C 源码、CMake 交叉编译、产出可烧录 ELF（交接给 stm32-debug）",
-    systemPrompt: STM32_CODING_SYSTEM + RULE_PRECEDENCE_DISCIPLINE,
+    systemPrompt: STM32_CODING_SYSTEM + RULE_PRECEDENCE_DISCIPLINE + PROGRESS_DISCIPLINE,
     builtinTools: ["bash", "read_file", "write_file", "glob", "grep"],
     mcp: false, // 编程阶段不碰硬件——需要真机时切 stm32-debug 包
     verify: {
@@ -475,7 +534,7 @@ export const PACKS: Record<string, DomainPack> = {
   "python-coding": {
     name: "python-coding",
     description: "Python 工程：读写源码、pytest/ruff/mypy 质量门禁、交付带测试的变更（不接硬件/MCP）",
-    systemPrompt: PYTHON_CODING_SYSTEM + RULE_PRECEDENCE_DISCIPLINE,
+    systemPrompt: PYTHON_CODING_SYSTEM + RULE_PRECEDENCE_DISCIPLINE + PROGRESS_DISCIPLINE,
     builtinTools: ["bash", "read_file", "write_file", "glob", "grep"],
     mcp: false, // 纯代码域——需要真机时切 stm32-debug 包
     verify: {
@@ -516,7 +575,7 @@ export const PACKS: Record<string, DomainPack> = {
 6. 每个进度声明都要能对应到一条真实的工具返回结果;没核实的就明说,不要编。
 7. 禁止 git 写命令(add/commit/push)——提交由委托方决定。
 
-把结论落到用户要求的产出,并用一两句话总结。用用户使用的语言回答。` + RULE_PRECEDENCE_DISCIPLINE,
+把结论落到用户要求的产出,并用一两句话总结。用用户使用的语言回答。` + RULE_PRECEDENCE_DISCIPLINE + PROGRESS_DISCIPLINE,
     builtinTools: ["bash", "read_file", "write_file", "glob", "grep"],
     mcp: false,
     verify: {
@@ -547,10 +606,37 @@ export const PACKS: Record<string, DomainPack> = {
     guardrails: { maxTurns: 40 },
   },
 
+  consult: {
+    name: "consult",
+    description:
+      "有据技术咨询：web_search + fetch_url 取一手资料；硬数字须引用或标未核实；回答禁装饰 emoji；插图可内嵌并链回源页",
+    systemPrompt: CONSULT_SYSTEM + DEFAULT_HOST_DISCIPLINES,
+    // web_search 与 describe_image 同属条件性内置：无 AGENT_TAVILY_API_KEY 时宿主省略。
+    builtinTools: [
+      "web_search",
+      "fetch_url",
+      "read_file",
+      "write_file",
+      "bash",
+      "glob",
+      "grep",
+    ],
+    mcp: false,
+    verify: {
+      enabled: true,
+      mode: "rubric",
+      rubric: CONSULT_VERIFY_RUBRIC,
+      // 咨询核查以读回答 + 抽查 fetch 痕迹为主，不需要重型构建白名单
+      readOnlyCommands: ["ls", "head", "tail", "wc", "grep", "rg"],
+      maxTurns: 20,
+    },
+    guardrails: { maxTurns: 30 },
+  },
+
   kicad: {
     name: "kicad",
     description: "KiCad EDA 文件工程：直写原理图/PCB s-expression + kicad-cli ERC/DRC 程序化验收（不碰 GUI/MCP）",
-    systemPrompt: KICAD_SYSTEM + RULE_PRECEDENCE_DISCIPLINE,
+    systemPrompt: KICAD_SYSTEM + RULE_PRECEDENCE_DISCIPLINE + PROGRESS_DISCIPLINE,
     // describe_image：配置了 AGENT_VISION_MODEL 时才真实在场（宿主按池过滤，
     // 没配就干净缺席）。给执行者与核查者同一双眼睛——文本盲是本包全部三条
     // 几何缝（布网/布线/排版，案例 #9）的共同根因
@@ -600,6 +686,9 @@ export function getPack(name: string): DomainPack | undefined {
  * 好处：MCP 只需按 mcp.json 连接一次，按包换工具面是纯内存过滤（三角编排
  * 的子任务切包不用重连 server）。
  */
+/** 进度工具始终挂上——包的 builtinTools 白名单不得把它滤掉（右栏 Progress 依赖） */
+export const ALWAYS_ON_BUILTIN_TOOLS = new Set(["update_progress"]);
+
 export function selectPackTools(
   pack: DomainPack | undefined,
   builtinPool: Tool[],
@@ -608,7 +697,10 @@ export function selectPackTools(
   const rawMcpName = (tool: Tool): string =>
     originalMcpToolName(tool) ?? tool.name.split("__").slice(1).join("__");
   const builtinNames = pack?.builtinTools ?? builtinPool.map((t) => t.name);
-  const builtins = builtinPool.filter((t) => builtinNames.includes(t.name));
+  const named = new Set(builtinNames);
+  const builtins = builtinPool.filter(
+    (t) => named.has(t.name) || ALWAYS_ON_BUILTIN_TOOLS.has(t.name),
+  );
 
   let mcp: Tool[];
   if (pack?.mcp === false) {

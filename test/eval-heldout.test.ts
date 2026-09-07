@@ -72,9 +72,18 @@ describe("EVAL-01 held-out suite", () => {
     expect(release.minPassRate).toBeGreaterThanOrEqual(nightly.minPassRate);
   });
 
+  it("includes A1 c2 edit_file adoption probe", () => {
+    const c = heldoutCases.find((x) => x.id === "ho-edit-inplace");
+    expect(c).toBeDefined();
+    expect(c!.task).toMatch(/edit_file/);
+    expect(c!.task).toMatch(/PLACEHOLDER_OLD/);
+    expect(typeof c!.setup).toBe("function");
+  });
+
   it("covers required surfaces (edit/multi/recovery/permission/mcp-absent)", () => {
     const blob = heldoutCases.map((c) => `${c.id} ${c.covers} ${c.task}`).join("\n");
     expect(blob).toMatch(/ho-write-/);
+    expect(blob).toMatch(/ho-edit-inplace/);
     expect(blob).toMatch(/ho-multi-|two-titles|alpha\.txt/);
     expect(blob).toMatch(/fallback|missing/);
     expect(blob).toMatch(/escape|圈禁|workdir/);

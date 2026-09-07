@@ -488,7 +488,24 @@ export type TurnEvent =
       /** 宿主必须调用 respond 才能让 loop 继续；deny 时可附给模型的理由 */
       respond: (decision: "allow" | "deny", reason?: string) => void;
     }
-  | { type: "usage"; turn: number; usage: Anthropic.Usage }
+  | { type: "usage"; turn: number; usage: Anthropic.Usage; breakdown?: {
+      system: number;
+      toolsBuiltin: number;
+      toolsMcp: number;
+      memory: number;
+      summarized: number;
+      conversation: number;
+      unallocated: number;
+      estimated: true;
+    } }
+  /**
+   * 执行者进度清单（update_progress 工具成功后发射）。
+   * 整表替换；宿主右栏 Progress 据此直播。source 由宿主 pushEvent 挂上。
+   */
+  | {
+      type: "progress";
+      items: Array<{ id: string; title: string; status: "pending" | "running" | "done" | "skipped" }>;
+    }
   /**
    * 上下文压缩。droppedBlocks = 被置换的 tool_result 数（tier 1）；
    * ledgerEntries = MEM-01 结构化账本中的事实条数（约束/决策/失败/证据/副作用）；

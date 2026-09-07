@@ -33,6 +33,21 @@ function mgr(limit = 1000, protect = 2) {
 }
 
 describe("DefaultContextManager.compact（v0.3 真实实现）", () => {
+  it("cache_read 不触发预算压缩：重读已缓存前缀不是该压的信号", () => {
+    const m = mgr(1000);
+    m.noteUsage({
+      input_tokens: 100,
+      output_tokens: 10,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 900,
+    } as Anthropic.Usage);
+    const messages = [bigToolResultMsg("tu_1"), { role: "user" as const, content: "hi" }];
+    const out = m.compact(messages);
+    expect(out.changed).toBe(false);
+    expect(out.droppedBlocks).toBe(0);
+    expect(out.messages).toEqual(messages);
+  });
+
   it("低于水位线：直通不压缩", () => {
     const m = mgr(1000);
     m.noteUsage(usage(100)); // 100 < 800 水位

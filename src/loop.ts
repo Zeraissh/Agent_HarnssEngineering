@@ -6,7 +6,7 @@
  * approval_request 事件挂起循环直到宿主调用 respond；最后一个事件恒为 done。
  */
 import type Anthropic from "@anthropic-ai/sdk";
-import { DefaultContextManager, REACTIVE_PROTECT_RECENT, userMessageWithContext } from "./context.js";
+import { DefaultContextManager, REACTIVE_PROTECT_RECENT, estimateContextBreakdown, userMessageWithContext } from "./context.js";
 import { createHash } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { countModelError, countModelRetry, observeToolSeconds } from "./metrics.js";
@@ -15,6 +15,7 @@ import { apiErrorClass, classifyApiError, isContextOverflowError, isTransientApi
 import { decideRecovery } from "./recovery.js";
 import { type DurableToolTx, type ToolTxController } from "./tool-tx.js";
 import { ToolExecutor, ToolRegistry } from "./tools/registry.js";
+import { parseProgressItems } from "./tools/update-progress.js";
 import type {
   AgentConfig,
   AgentRunResult,
@@ -96,12 +97,17 @@ async function acquireTokenBudgetSlot(budget: SharedRunBudget): Promise<() => vo
   };
 }
 
-function turnTokenCost(usage: Anthropic.Usage): number {
+/**
+ * 执行谱系预算口径：与日预算 / `billableTokens` 相同，**不含 cache_read**。
+ * cache_read 是重读已缓存上下文，长对话每一轮都会接近窗口大小；把它算进
+ * AGENT_TOTAL_TOKEN_BUDGET 会让默认额度在三五轮续跑后就被打断——
+ * 委托方说的「根本用不了」就是这个。用量事件与 result.usage 仍四档分列。
+ */
+export function turnTokenCost(usage: Anthropic.Usage): number {
   return (
-    usage.input_tokens +
-    (usage.cache_creation_input_tokens ?? 0) +
-    (usage.cache_read_input_tokens ?? 0) +
-    usage.output_tokens
+    Math.max(0, usage.input_tokens) +
+    Math.max(0, usage.cache_creation_input_tokens ?? 0) +
+    Math.max(0, usage.output_tokens)
   );
 }
 
@@ -549,6 +555,7 @@ export class AgentLoop {
       }
 
       let modelTurn;
+      let lastRequest: ReturnType<DefaultContextManager["render"]> | undefined;
       const releaseTokenBudget =
         this.runBudget.maxTokens !== undefined
           ? await acquireTokenBudgetSlot(this.runBudget)
@@ -602,6 +609,7 @@ export class AgentLoop {
           return req;
         };
         let request = buildRequest();
+        lastRequest = request;
         // 反应式压缩每轮最多一次：第二次仍超长就是真的装不下了，如实报错
         let reactiveCompactionUsed = false;
 
@@ -669,6 +677,7 @@ export class AgentLoop {
                   ...(learnedWindow !== null ? { learnedWindow } : {}),
                 });
                 request = buildRequest();
+                lastRequest = request;
                 attempt -= 1; // 不占瞬时重试额度
                 continue;
               }
@@ -706,7 +715,21 @@ export class AgentLoop {
       } finally {
         releaseTokenBudget?.();
       }
-      q.push({ type: "usage", turn, usage: modelTurn.usage });
+      q.push({
+        type: "usage",
+        turn,
+        usage: modelTurn.usage,
+        ...(lastRequest
+          ? {
+              breakdown: estimateContextBreakdown(
+                lastRequest,
+                modelTurn.usage.input_tokens +
+                  (modelTurn.usage.cache_creation_input_tokens ?? 0) +
+                  (modelTurn.usage.cache_read_input_tokens ?? 0),
+              ),
+            }
+          : {}),
+      });
 
       // 完整 push assistant content（契约 1）：丢块会导致 400 或行为退化
       messages.push({ role: "assistant", content: modelTurn.message.content });
@@ -946,7 +969,8 @@ export class AgentLoop {
             (executed) => {
               // OBS-02：工具延迟。名字只从**本轮的 blocks** 取——`ExecutedTool`
               // 不带名字（V-12 同一个缺口），拿 toolUseId 当标签会让基数爆炸
-              const name = blocks.find((b) => b.id === executed.toolUseId)?.name;
+              const block = blocks.find((b) => b.id === executed.toolUseId);
+              const name = block?.name;
               if (name) observeToolSeconds(name, executed.durationMs);
               q.push({
                 type: "tool_result",
@@ -954,6 +978,13 @@ export class AgentLoop {
                 result: executed.result,
                 durationMs: executed.durationMs,
               });
+              // 进度清单：成功执行后另发 progress，宿主右栏不靠解析 tool_call
+              if (name === "update_progress" && !executed.result.isError) {
+                const parsed = parseProgressItems(block?.input);
+                if (parsed.ok) {
+                  q.push({ type: "progress", items: parsed.items });
+                }
+              }
             },
           );
 

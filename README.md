@@ -110,7 +110,7 @@ Release tag 门（`.github/workflows/release.yml` `gate`）在确定性场景门
 
 ```powershell
 $env:AGENT_TOTAL_MAX_TURNS = "120"          # continuation/返工共用，不会每段重置
-$env:AGENT_TOTAL_TOKEN_BUDGET = "500000"    # 执行谱系（main/返工/续跑）的 token 总账
+$env:AGENT_TOTAL_TOKEN_BUDGET = "2000000"   # 执行谱系（main/返工/续跑）的 token 总账；不含 cache_read
 $env:AGENT_PROGRESS_EXTENSION_TURNS = "8"   # 仍有新证据时最多一次有界续跑（0 = 关）
 $env:AGENT_STAGNATION_WINDOW = "3"          # 连续相同调用+结果后要求换策略
 $env:AGENT_MAX_STAGNATION_RECOVERIES = "1"  # 换策略几次后仍停滞就强制收口
@@ -120,8 +120,10 @@ $env:AGENT_MAX_ASK_ROUNDS = "3"             # 打断次数；每次可集中问 
 恢复三参数逐字段按 **env > 领域包 `recovery` > 默认** 解析（同核查 / planner 预算的口径）；
 CLI 启动行与 Web 的 `run_config` / `/api/harness` 都报出生效值与来源。
 
-显式 token 总账按完整模型调用结算：单次在途响应可能自然越过剩余额度；并行子任务会在
-同一总账上串行取得调用资格，避免多条轨基于旧余额同时起跑、按并发数放大超支。
+显式 token 总账按完整模型调用结算，但**不含 cache_read**（与日预算 / 成本告警同口径）：
+长对话每轮重读缓存上下文不再把谱系额度吃光。单次在途响应可能自然越过剩余额度；
+并行子任务会在同一总账上串行取得调用资格，避免多条轨基于旧余额同时起跑、按并发数放大超支。
+Web 真实宿主缺省 200 万；续跑时若仍用尽会自动再续一段，不必先点「追加预算」。
 **口径要点**：这份总账只约束执行谱系——verifier / planner 各自另建等额的独立预算，
 不从此账扣（隔离是有意的：核查断粮会引入新失效形态），且**每轮核查各计一份**：
 带返工时名义总消耗可超 3 倍，计划编排下随子任务数×核查轮数继续放大。Web 宿主

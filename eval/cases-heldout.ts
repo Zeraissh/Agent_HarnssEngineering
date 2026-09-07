@@ -8,9 +8,25 @@
  * 覆盖：编辑、多文件、澄清式条件分支、权限/圈禁、恢复、结构化抽取、
  * 失败形态、MCP 工具缺失降级（无活 MCP 时仍可跑——期望写明缺工具并完成旁路产物）。
  */
-import { access, readdir, readFile, stat, unlink } from "node:fs/promises";
+import { access, mkdir, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { EvalCase } from "./cases.js";
+
+/** A1 c2 仪器：已存在文件里唯一可替换标记（setup 与 check 同口径）。 */
+const HO_EDIT_INPLACE_BEFORE = "PLACEHOLDER_OLD";
+const HO_EDIT_INPLACE_AFTER = "PLACEHOLDER_NEW";
+const HO_EDIT_INPLACE_BODY = [
+  "# held-out inplace edit target — surrounding lines must stay byte-identical",
+  "alpha: keep-me-1",
+  `beta: ${HO_EDIT_INPLACE_BEFORE}`,
+  "gamma: keep-me-2",
+  "delta: keep-me-3",
+  "",
+].join("\n");
+const HO_EDIT_INPLACE_EXPECTED = HO_EDIT_INPLACE_BODY.replace(
+  HO_EDIT_INPLACE_BEFORE,
+  HO_EDIT_INPLACE_AFTER,
+);
 
 async function readOut(workdir: string, rel: string): Promise<string | undefined> {
   try {
@@ -286,6 +302,33 @@ export const heldoutCases: EvalCase[] = [
       return text.trim() === "CORRECT"
         ? { pass: true, note: "最终为 CORRECT" }
         : { pass: false, note: `最终内容: ${JSON.stringify(text.slice(0, 40))}` };
+    },
+  },
+  {
+    // A1 判据 c2 仪器：扩集测「edit_file 能否被真实模型调用并成功」，
+    // 不参与 v1.3.0 的 25 用例对照矩阵（对照仍钉 heldout-v1.3.0.json）。
+    id: "ho-edit-inplace",
+    covers: "held-out: 已存在文件局部替换（edit_file）",
+    task:
+      `eval-out/inplace-target.txt 已存在。用 edit_file 把其中唯一的 ${HO_EDIT_INPLACE_BEFORE} ` +
+      `替换为 ${HO_EDIT_INPLACE_AFTER}；其余字节一字不变。不要用 write_file 整文件重写。`,
+    async setup(workdir) {
+      await mkdir(path.join(workdir, "eval-out"), { recursive: true });
+      await writeFile(path.join(workdir, "eval-out", "inplace-target.txt"), HO_EDIT_INPLACE_BODY, "utf8");
+    },
+    async check(workdir) {
+      const text = await readOut(workdir, "eval-out/inplace-target.txt");
+      if (text === undefined) return { pass: false, note: "inplace-target.txt 缺失" };
+      if (text === HO_EDIT_INPLACE_EXPECTED) {
+        return { pass: true, note: "局部替换精确、周围字节未动" };
+      }
+      if (text.includes(HO_EDIT_INPLACE_BEFORE) && !text.includes(HO_EDIT_INPLACE_AFTER)) {
+        return { pass: false, note: "标记未替换" };
+      }
+      return {
+        pass: false,
+        note: `字节不符（len=${text.length}，期望 ${HO_EDIT_INPLACE_EXPECTED.length}）`,
+      };
     },
   },
 

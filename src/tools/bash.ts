@@ -8,6 +8,7 @@ import {
 } from "../execution-broker.js";
 import type { ExecutionBroker, ShellExecutionResult, Tool } from "../types.js";
 import { truncate } from "./fs-util.js";
+import { confineShellCommand } from "./shell-confine.js";
 
 const TIMEOUT_MS = 120_000;
 const MAX_BUFFER = 10 * 1024 * 1024;
@@ -154,6 +155,12 @@ export function createBashTool(options: {
         content: 'Invalid input: expected {"command": string}.',
         isError: true,
       };
+    }
+    // report-only 宿主直跑没有 OS 圈禁；先拦可静态判定的圈外重定向 / 外 cd，
+    // 与 write_file 的 resolveInWorkdir 同向。漏网面见 shell-confine.ts 头注。
+    const confine = confineShellCommand(command, ctx.workdir);
+    if (!confine.ok) {
+      return { content: confine.reason, isError: true };
     }
     // Web/CLI 正常路径逐 run 注入；公开 Tool.execute 的旧调用仍走一个明确标为
     // legacy-unbound 的 broker，而不是绕过 SAFE-05 重新直调 child_process。

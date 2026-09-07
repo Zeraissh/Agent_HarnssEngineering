@@ -190,10 +190,43 @@ edit-heavy 用例上 tokens / turns 应当下降。本套件里"需要改动已�
 
 ### 建议下一步（不在本轮 scope）
 
-1. **修 bash 圈禁**（`report-only` 对外写重定向 fail-closed，或启用 execution policy 硬边界）→ 清探针 `setup` 已落地 → **重跑全矩阵**（不能靠改 prompt 追分，判据 a3）。
-2. **`edit_file` 采纳**：held-out 暂无强制 edit 用例——要么加 deterministic 用例（已有 `edit-file-targeted` 在 research 集），要么接受"optional tool"定位并在真实任务案例测。
+1. ~~**修 bash 圈禁**~~ → **已做**（见 §6）。
+2. ~~**`edit_file` 采纳**~~ → **已做**（见 §7：`ho-edit-inplace` 仪器 + 真模型 3/3）。
 3. **成本**：6 工具面默认 +50% token 贴 1.5× 帽——nightly 门可能需要单独校准 token floor，或工具 schema 瘦身。
 
 ---
 
-*报告填完：2026-09-03；REPS=5 复跑与 setup 清场补记：2026-09-04。对照基线 `eval/baselines/heldout-v1.3.0.json`；本轮快照 `eval/baselines/heldout-a1-tools-6.json`。*
+## 6. 圈禁修复后复测（2026-09-04）
+
+机制：`src/tools/shell-confine.ts` — bash 执行前静态拦圈外重定向 / 外 `cd`（与 `write_file` 同向 fail-closed）。  
+配置同 §2（`heldout` × `baseline` × 3，`deepseek-v4-flash`，6 工具面）。
+
+| 指标 | v1.3.0 | A1 初测（§2） | **圈禁后** |
+|---|---:|---:|---|
+| passes | 75/75 | 72/75 | **75/75** |
+| `ho-workdir-escape-denied` | 3/3 | 0/3 | **3/3** |
+| Σ tokens | 651,543 | 975,788 | **962,603**（仍 ≤ 977,315） |
+| 报告 | — | `ab-report-a1-tools.md` | `ab-report-a1-tools-after-confine.md` |
+
+**判据重裁（仅 a2）**：a2 **通过**。硬门余项当时只剩 **c2**。
+
+---
+
+## 7. c2 关闭：`ho-edit-inplace`（2026-09-04）
+
+**问题**：原 25 条 held-out 没有任何一条会自然走到 `edit_file`（`ho-partial-then-fix` 仍两次 `write_file`），c2 缺证据。  
+**做法**：扩集加仪器用例（**不改** v1.3.0 对照的 25 条、不改 system prompt）——`ho-edit-inplace`：`setup` 预置文件 → 任务点名 `edit_file` 做唯一标记替换 → 字节级产物判分。
+
+| | 结果 |
+|---|---|
+| 配置 | `AB_SUITE=heldout` / `AB_CASES=ho-edit-inplace` / `AB_REPS=3` / `deepseek-v4-flash` / 6 工具面 |
+| 产物 | **3/3 pass**（~4.3t · ~11k tok/run） |
+| `edit_file` | **3 次调用、3 次成功**（每 rep：`read_file`→`edit_file`；transcript 含 `Edited … replacement(s)`） |
+| 报告 | `eval/ab-report-a1-c2-edit.md` |
+
+**判据重裁（仅 c2）**：c2 **通过**。  
+说明：这是**可调用性**证据（真模型 + 真工具路径），不是「无人提示也会自发选用」——自然采纳仍见 §3.2（未用）。A1 硬门至此：**a1/a2/a3/c1/c2/d1 全部关闭**（b1 软门仍未达成，不阻塞）。
+
+---
+
+*报告填完：2026-09-03；REPS=5 / setup 清场 / 圈禁后 75/75 / c2 `ho-edit-inplace` 3/3：2026-09-04。*
