@@ -404,6 +404,12 @@ import {
   buildFilePreviewUrl,
 } from "/features/file-preview.js";
 import {
+  WORKDIR_ADD_VALUE,
+  renderWorkdirOptions,
+  wireWorkdirSelect,
+  initWorkdirPicker,
+} from "/features/workdir-picker.js";
+import {
   isCommandCenterRoute,
   COMMAND_CENTER_HASH,
   initCommandCenterView,
@@ -1943,7 +1949,9 @@ async function submitNewRun({ text: task }) {
         dailyBudget: false,
         askUser: true,
         autoApprove: autoApproveToggle?.checked !== false,
-        workdir: workdirSelect?.value,
+        workdir: workdirSelect?.value && workdirSelect.value !== WORKDIR_ADD_VALUE
+          ? workdirSelect.value
+          : undefined,
         useVerifierModel: !useVerifierModel || useVerifierModel.checked,
         usePlannerModel: !usePlannerModel || usePlannerModel.checked,
       })),
@@ -2165,23 +2173,14 @@ function populateKnobs(snap) {
     effortSelect.title = "compat 端点不发送思考强度（第三方不认识该参数）";
   }
 
-  // V-29 工作目录：只列宿主声明过的，浏览器不给自由输入
+  // V-29 工作目录：列宿主声明过的集合，末项恒为「＋ 添加目录…」（哨兵值，
+  // 选中即打开目录选择器浮层——见 features/workdir-picker.js）
   if (workdirSelect && Array.isArray(snap.availableWorkdirs)) {
-    for (const d of snap.availableWorkdirs) {
-      const opt = document.createElement("option");
-      opt.value = d;
-      opt.textContent = d.split(/[\\/]/).filter(Boolean).pop() ?? d;
-      opt.title = d;
-      workdirSelect.appendChild(opt);
-    }
-    if (snap.workdir) workdirSelect.value = snap.workdir;
-    workdirSelect.title = workdirSelect.value;
-    const fixedWorkdir = snap.availableWorkdirs.length <= 1;
-    workdirSelect.disabled = fixedWorkdir;
-    workdirSelect.dataset.fixed = String(fixedWorkdir);
-    workdirSelect.addEventListener("change", () => {
-      workdirSelect.title = workdirSelect.value;
-    });
+    renderWorkdirOptions(workdirSelect, snap.availableWorkdirs, { selected: snap.workdir });
+    // 有了「＋ 添加目录…」就永远有得选：不再因为只有一个目录而锁死下拉。
+    // 运行中/追加模式的禁用走 patchComposer 的 optionsEnabled，语义不变。
+    workdirSelect.disabled = false;
+    workdirSelect.dataset.fixed = "false";
   }
 
   // V-30/V-31：四个角色都常驻可见。独立模型没配时明确写「跟随执行」或
@@ -2506,6 +2505,27 @@ if (submitForm) {
       onAnnounce: (msg) => announceStatus(msg),
     });
   } catch { /* 拖拽/粘贴上传是增强项 */ }
+}
+
+// ---- 目录选择器浮层（V-29 运行时扩展）----
+// 下拉末项「＋ 添加目录…」选中即开浮层；加成功后重建选项并选中新目录。
+// 浮层不进 hash 路由——它是瞬态的，刷新不该恢复。
+let workdirPickerApi = /** @type {null|{ open:(p?:string|null)=>void, close:()=>void, isOpen:()=>boolean }} */ (null);
+if (workdirSelect) {
+  try {
+    workdirPickerApi = initWorkdirPicker({
+      onAnnounce: (msg) => announceStatus(msg),
+      onAdded: (path, payload) => {
+        // 服务端应答带着最新合法集合；以它为准重建下拉并选中新目录
+        const list = Array.isArray(payload?.workdirs) ? payload.workdirs : [path];
+        renderWorkdirOptions(workdirSelect, list, { selected: path });
+        workdirSelect.dispatchEvent(new Event("change"));
+      },
+    });
+    wireWorkdirSelect(workdirSelect, {
+      onAddRequest: () => workdirPickerApi?.open(workdirSelect.value || null),
+    });
+  } catch { /* 目录选择器是增强项，初始化失败静默降级 */ }
 }
 
 const budgetExtendBtn = /** @type {HTMLButtonElement|null} */ (document.getElementById("budget-extend-btn"));

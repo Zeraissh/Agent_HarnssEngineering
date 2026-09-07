@@ -24,7 +24,8 @@
  *   AGENT_UI_WORKDIR       默认工作目录（工具圈禁根），默认 process.cwd()
  *   AGENT_UI_WORKDIRS      逐 run 可选的工作目录白名单（路径分隔符分隔）。
  *                          workdir 同时是工具的写入圈禁边界,所以合法集合由宿主
- *                          在这里声明,浏览器只能在其中选——不给自由输入框
+ *                          声明,浏览器只能在其中选。运行时也可在本机 UI 下拉里
+ *                          「＋ 添加目录…」即时扩展（仅 loopback，落 .agent-workdirs.json）
  *   AGENT_VERIFIER_MODEL   可选,独立核查模型（+ _PROVIDER / _BASE_URL / _API_KEY）
  *   AGENT_PLANNER_MODEL    可选,独立 planner 模型（同上一组后缀）
  *                          密钥只在服务端解析,不下发浏览器

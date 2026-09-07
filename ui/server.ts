@@ -3,7 +3,7 @@
  * 并支持任务提交与审批应答。Node 内置模块，零第三方依赖。
  */
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
-import { readFile, writeFile, mkdir, stat, open, readdir } from "node:fs/promises";
+import { readFile, writeFile, mkdir, stat, open, readdir, realpath, access } from "node:fs/promises";
 import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, readFileSync } from "node:fs";
@@ -45,6 +45,12 @@ import {
   type ModelEntry,
   type ModelStore,
 } from "./model-config.js";
+import {
+  WORKDIRS_FILENAME,
+  WORKDIRS_SCHEMA_VERSION,
+  loadWorkdirStore,
+  saveWorkdirStore,
+} from "./workdirs.js";
 import {
   instrumentModelClient,
   obsRegistry,
@@ -1033,8 +1039,13 @@ export interface UiServerOptions {
    *
    * 为什么是白名单而不是自由输入：workdir 同时是**工具的写入圈禁边界**
    * （ToolExecutor 拿它当根）。让浏览器随意指定等于让任何能访问 UI 的人
-   * 往任意目录写文件。按 P6「护栏是宿主的责任」，合法集合由宿主在启动时
-   * 声明，浏览器只在其中选。缺省 = 只有 workdir 一个。
+   * 往任意目录写文件。按 P6「护栏是宿主的责任」，合法集合由宿主声明，
+   * 浏览器只在其中选。缺省 = 只有 workdir 一个。
+   *
+   * 声明有两个时刻：启动时（本参数 / AGENT_UI_WORKDIRS env）与运行时
+   * （用户经本机 UI 的「添加目录」显式加入，loopback 门后落
+   * .agent-workdirs.json，重启后仍在）。后者同样是宿主级声明——它只是把
+   * 「宿主表态」从命令行挪到了本机界面上。
    */
   workdirs?: string[];
   packName?: string;
@@ -1138,6 +1149,13 @@ export interface UiServerOptions {
    * 显式传路径可在测试里验证持久化与重装配。
    */
   modelStoreFile?: string | null;
+  /**
+   * 运行时工作目录清单文件（V-29 扩展，.agent-workdirs.json）落点。缺省：真实宿主
+   * `<workdir>/.agent-workdirs.json`；**注入了 modelClient 的宿主缺省 null**
+   * （不落盘、不读残留，仪器纪律同 modelStoreFile）。显式传路径可在测试里验证
+   * 运行时添加目录的持久化与 round-trip。
+   */
+  workdirStoreFile?: string | null;
   /** 只在宿主确实位于可信反向代理之后时读取 X-Forwarded-Proto/Host。 */
   trustProxy?: boolean;
   /**
@@ -2145,7 +2163,44 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   // 三处必须是同一个字符串形态。`D:/a/b` 与 `D:` 指同一个目录，
   // 但字符串不等——不在源头 resolve 的话，默认路径会过不了自己的白名单
   const workdir = resolve(options.workdir ?? process.cwd());
-  const allowedWorkdirs = [...new Set([workdir, ...(options.workdirs ?? [])].map((d) => resolve(d)))];
+  /**
+   * V-29 白名单的活集合。env 声明（宿主 workdir + options.workdirs）与运行时
+   * 添加（本机 UI 显式加入，持久化在 .agent-workdirs.json）分两本账——删除
+   * 只允许动运行时那本，env 那本归宿主启动纪律管。两个 Set 都是 resolve
+   * 归一化口径；`allowedWorkdirs` 是它们的并集视图，所有校验点只读它。
+   */
+  const workdirStoreFile = options.workdirStoreFile !== undefined
+    ? options.workdirStoreFile
+    : realHost
+      ? join(workdir, WORKDIRS_FILENAME)
+      : null;
+  const envWorkdirs = new Set([workdir, ...(options.workdirs ?? [])].map((d) => resolve(d)));
+  const runtimeWorkdirs = new Set<string>();
+  if (workdirStoreFile) {
+    const loaded = loadWorkdirStore(workdirStoreFile);
+    if (loaded.recoveredFromCorrupt) {
+      operationalLog("warn", "workdir_store_recovered", { file: workdirStoreFile });
+    }
+    for (const d of loaded.store?.workdirs ?? []) runtimeWorkdirs.add(d);
+  }
+  const allowedWorkdirs = new Set<string>([...envWorkdirs, ...runtimeWorkdirs]);
+
+  /** 运行时清单落盘（原子写）。workdirStoreFile 为 null 的注入宿主是 no-op。 */
+  function persistRuntimeWorkdirs(): void {
+    if (!workdirStoreFile) return;
+    saveWorkdirStore(workdirStoreFile, {
+      schemaVersion: WORKDIRS_SCHEMA_VERSION,
+      workdirs: [...runtimeWorkdirs],
+    });
+  }
+
+  /** 在飞 run（status === "running"）有没有正用着这个目录——删除保护用。 */
+  function workdirInFlight(target: string): boolean {
+    for (const r of runs.values()) {
+      if (r.status === "running" && resolve(r.workdir ?? workdir) === target) return true;
+    }
+    return false;
+  }
   const memoryHost = createWorkdirScopedMemoryTools(
     (runWorkdir) => process.env.AGENT_MEMORY_DIR ?? join(runWorkdir, ".agent-memory"),
   );
@@ -2907,7 +2962,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     } catch {
       return "归档工作目录无效，不能交给当前宿主执行";
     }
-    if (!allowedWorkdirs.includes(target)) {
+    if (!allowedWorkdirs.has(target)) {
       return `归档工作目录不在当前宿主白名单内：${target}`;
     }
     if (!r.checkpoint) return null; // 无正史的新一轮：预算按当前宿主上限从零起算
@@ -5620,8 +5675,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       })),
       webSearchConfigured: isWebSearchConfigured(),
       effortLevels: [...EFFORT_LEVELS],
-      // V-29：合法工作目录集合由宿主声明，浏览器只在其中选
-      availableWorkdirs: allowedWorkdirs,
+      // V-29：合法工作目录集合由宿主声明，浏览器只在其中选（运行时经
+      // 本机 UI 添加的也在这个集合里——集合是活的，快照时铺平）
+      availableWorkdirs: [...allowedWorkdirs],
       roleModels: roleModelsView(),
       // MODEL-01a：进程级降级链快照（逐 run 的同名字段走 run_config）。
       // null = 未配置这条防线，与"链上只有主端点"不是一回事
@@ -5990,6 +6046,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     | { type: "modelsGet" }
     | { type: "modelsPut" }
     | { type: "modelsTest" }
+    | { type: "workdirsList" }
+    | { type: "workdirAdd" }
+    | { type: "workdirRemove" }
+    | { type: "fsList"; path: string | null }
     | { type: "memoryList" }
     | { type: "memoryRead"; name: string }
     | { type: "searchRuns"; query: string; limit: string | null }
@@ -6049,6 +6109,32 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     }
     if (method === "POST" && url === "/api/models/test") {
       return { type: "modelsTest" };
+    }
+
+    /**
+     * V-29 运行时白名单扩展（委托方："工作目录切换只能重启宿主，很麻烦——
+     * 新建对话的时候就开始选目录"）。路由层只管形状；校验（绝对路径 / 存在 /
+     * 是目录 / env 声明不可删 / 在飞保护）与 loopback 门都在处理器里——
+     * 与 /api/models 的"路由管形状、处理器管语义"同模式。
+     */
+    if (method === "GET" && url === "/api/workdirs") {
+      return { type: "workdirsList" };
+    }
+    if (method === "POST" && url === "/api/workdirs") {
+      return { type: "workdirAdd" };
+    }
+    if (method === "DELETE" && url === "/api/workdirs") {
+      return { type: "workdirRemove" };
+    }
+
+    /**
+     * 目录浏览（给「添加目录」浮层供数）。只列目录不列文件，隐藏目录（.开头）
+     * 不列；path 省略时给常用起点。读权限问题与符号链接归一都在处理器里。
+     */
+    const fsListMatch = method === "GET" && url.match(/^\/api\/fs\/list(?:\?(.*))?$/);
+    if (fsListMatch) {
+      const params = new URLSearchParams(fsListMatch[1] ?? "");
+      return { type: "fsList", path: params.get("path") };
     }
 
     /**
@@ -6347,10 +6433,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     let runWorkdir: string | undefined;
     if (parsed.workdir !== undefined && parsed.workdir !== "") {
       const asked = resolve(parsed.workdir);
-      if (!allowedWorkdirs.includes(asked)) {
+      if (!allowedWorkdirs.has(asked)) {
         return {
           status: 400,
-          payload: { error: `工作目录不在白名单内。可选：${allowedWorkdirs.join(" | ")}（用 AGENT_UI_WORKDIRS 声明）` },
+          payload: { error: `工作目录不在白名单内。可选：${[...allowedWorkdirs].join(" | ")}（可点工作目录下拉的「＋ 添加目录…」即时加入）` },
         };
       }
       runWorkdir = asked;
@@ -6669,7 +6755,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       }
     }
 
-    if (method === "POST" || method === "PUT") {
+    if (method === "POST" || method === "PUT" || (method === "DELETE" && route.type === "workdirRemove")) {
       const retryAfter = mutationRetryAfter(req);
       if (retryAfter !== null) {
         metrics.rateRejected += 1;
@@ -6689,6 +6775,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         "autoApprove",
         "modelsPut",
         "modelsTest",
+        "workdirAdd",
+        "workdirRemove",
       ]).has(route.type);
       const contentType = String(req.headers["content-type"] ?? "").toLowerCase();
       if (jsonRoute && !/^application\/(?:[\w.-]+\+)?json(?:\s*;|$)/.test(contentType)) {
@@ -6830,6 +6918,223 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           timeoutMs: 10_000,
         });
         return json(res, 200, testResult);
+      }
+
+      /**
+       * V-29 运行时白名单扩展。工作目录是工具写入圈禁根，这组端点等于在改
+       * 圈禁边界——所以**仅 loopback 可用**：能摸到这个端点 = 坐在宿主机器前，
+       * 与「宿主声明」同一信任级。非 loopback 一律 403（host 白名单放行的
+       * 远程来源也不行，这条线与 origin 边界相互独立）。
+       */
+      case "workdirsList": {
+        if (!hostname || !isLoopbackHostname(hostname)) {
+          return json(res, 403, { error: "工作目录管理仅本机（loopback）可用" });
+        }
+        return json(res, 200, {
+          workdirs: [...allowedWorkdirs],
+          source: { env: [...envWorkdirs], stored: [...runtimeWorkdirs] },
+        });
+      }
+
+      case "workdirAdd": {
+        if (!hostname || !isLoopbackHostname(hostname)) {
+          return json(res, 403, { error: "工作目录管理仅本机（loopback）可用" });
+        }
+        let body: string;
+        try {
+          body = await readBody(req, requestBodyMaxBytes);
+        } catch (error) {
+          return requestBodyFailure(res, error);
+        }
+        let parsed: { path?: unknown };
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          return badRequest(res, "Invalid JSON body");
+        }
+        if (typeof parsed.path !== "string" || !parsed.path.trim()) {
+          return badRequest(res, '缺少目录路径（path）');
+        }
+        const raw = parsed.path.trim();
+        if (!isAbsolute(raw)) {
+          return badRequest(res, `需要绝对路径：${raw}`);
+        }
+        const asked = resolve(raw);
+        let st;
+        try {
+          st = await stat(asked);
+        } catch {
+          return notFound(res, `目录不存在：${asked}`);
+        }
+        if (!st.isDirectory()) {
+          return badRequest(res, `不是目录：${asked}`);
+        }
+        // 软链接/junction 归一：落进集合的必须是真实路径形态，否则同一个
+        // 目录能以两个名字各占一条白名单（比对口径是字符串精确相等）
+        let canonical: string;
+        try {
+          canonical = resolve(await realpath(asked));
+        } catch {
+          canonical = asked;
+        }
+        if (allowedWorkdirs.has(canonical)) {
+          return json(res, 200, {
+            added: false,
+            workdir: canonical,
+            workdirs: [...allowedWorkdirs],
+            source: { env: [...envWorkdirs], stored: [...runtimeWorkdirs] },
+          });
+        }
+        runtimeWorkdirs.add(canonical);
+        allowedWorkdirs.add(canonical);
+        try {
+          persistRuntimeWorkdirs();
+        } catch (error) {
+          // 落盘失败就回滚内存态——否则界面以为加成功了，重启后又消失
+          runtimeWorkdirs.delete(canonical);
+          allowedWorkdirs.delete(canonical);
+          return json(res, 500, {
+            error: `工作目录清单写盘失败：${error instanceof Error ? error.message : String(error)}`,
+          });
+        }
+        if (realHost) {
+          operationalLog("info", "workdir_added", { workdir: canonical });
+        }
+        return json(res, 200, {
+          added: true,
+          workdir: canonical,
+          workdirs: [...allowedWorkdirs],
+          source: { env: [...envWorkdirs], stored: [...runtimeWorkdirs] },
+        });
+      }
+
+      case "workdirRemove": {
+        if (!hostname || !isLoopbackHostname(hostname)) {
+          return json(res, 403, { error: "工作目录管理仅本机（loopback）可用" });
+        }
+        let body: string;
+        try {
+          body = await readBody(req, requestBodyMaxBytes);
+        } catch (error) {
+          return requestBodyFailure(res, error);
+        }
+        let parsed: { path?: unknown };
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          return badRequest(res, "Invalid JSON body");
+        }
+        if (typeof parsed.path !== "string" || !parsed.path.trim()) {
+          return badRequest(res, '缺少目录路径（path）');
+        }
+        const target = resolve(parsed.path.trim());
+        if (envWorkdirs.has(target)) {
+          return json(res, 403, {
+            error: "该目录由宿主启动时声明（默认工作目录或 AGENT_UI_WORKDIRS），不能从界面删除；要移除请改启动配置",
+          });
+        }
+        if (!runtimeWorkdirs.has(target)) {
+          return notFound(res, `不在运行时添加的目录列表里：${target}`);
+        }
+        if (workdirInFlight(target)) {
+          return json(res, 409, { error: `有正在运行的对话在使用该目录，不能删除：${target}` });
+        }
+        runtimeWorkdirs.delete(target);
+        allowedWorkdirs.delete(target);
+        try {
+          persistRuntimeWorkdirs();
+        } catch (error) {
+          runtimeWorkdirs.add(target);
+          allowedWorkdirs.add(target);
+          return json(res, 500, {
+            error: `工作目录清单写盘失败：${error instanceof Error ? error.message : String(error)}`,
+          });
+        }
+        if (realHost) {
+          operationalLog("info", "workdir_removed", { workdir: target });
+        }
+        return json(res, 200, {
+          removed: true,
+          workdir: target,
+          workdirs: [...allowedWorkdirs],
+          source: { env: [...envWorkdirs], stored: [...runtimeWorkdirs] },
+        });
+      }
+
+      case "fsList": {
+        if (!hostname || !isLoopbackHostname(hostname)) {
+          return json(res, 403, { error: "目录浏览仅本机（loopback）可用" });
+        }
+        /**
+         * 目录浏览只给「添加目录」浮层供数：只列目录不列文件；.开头的隐藏目录
+         * 不列；读不了的跳过而不是让整个列表失败。path 省略 = 给常用起点
+         * （宿主 workdir + 现有白名单 + 系统盘符/根）。
+         */
+        if (route.path === null || route.path.trim() === "") {
+          const roots: { name: string; path: string }[] = [];
+          const seenRoots = new Set<string>();
+          const pushRoot = (p: string, name: string) => {
+            const key = resolve(p);
+            if (seenRoots.has(key)) return;
+            seenRoots.add(key);
+            roots.push({ name, path: key });
+          };
+          pushRoot(workdir, "宿主工作目录");
+          for (const d of allowedWorkdirs) {
+            if (d !== workdir) pushRoot(d, "白名单目录");
+          }
+          if (process.platform === "win32") {
+            for (const letter of "CDEFGHIJKLMNOPQRSTUVWXYZ") {
+              const drive = `${letter}:\\`;
+              try {
+                await access(drive);
+                pushRoot(drive, `${letter}: 盘`);
+              } catch { /* 盘符不存在，跳过 */ }
+            }
+          } else {
+            pushRoot("/", "根目录");
+          }
+          return json(res, 200, { path: null, parent: null, dirs: roots, separator: sep });
+        }
+        const asked = resolve(route.path.trim());
+        let st;
+        try {
+          st = await stat(asked);
+        } catch {
+          return notFound(res, `目录不存在或读不了：${asked}`);
+        }
+        if (!st.isDirectory()) {
+          return badRequest(res, `不是目录：${asked}`);
+        }
+        let entries;
+        try {
+          entries = await readdir(asked, { withFileTypes: true });
+        } catch {
+          return json(res, 403, { error: `没有权限读取该目录：${asked}` });
+        }
+        const dirs: { name: string; path: string }[] = [];
+        for (const entry of entries) {
+          if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+          if (entry.name.startsWith(".")) continue;
+          const abs = join(asked, entry.name);
+          try {
+            // realpath 一石三鸟：解符号链接（点进去落在真实位置）、
+            // 顺带验证子目录真实存在且可读、过滤 dangling link
+            const real = resolve(await realpath(abs));
+            const sub = await stat(real);
+            if (!sub.isDirectory()) continue;
+            await access(real);
+            dirs.push({ name: entry.name, path: real });
+          } catch { /* 读不了/断链的目录跳过 */ }
+        }
+        dirs.sort((a, b) => a.name.localeCompare(b.name));
+        const parent = dirname(asked);
+        return json(res, 200, {
+          path: asked,
+          parent: parent === asked ? null : parent,
+          dirs,
+          separator: sep,
+        });
       }
 
       case "memoryList": {
@@ -7004,10 +7309,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         let scheduleWorkdir = workdir;
         if (parsed.workdir !== undefined && parsed.workdir !== "") {
           const asked = resolve(parsed.workdir);
-          if (!allowedWorkdirs.includes(asked)) {
+          if (!allowedWorkdirs.has(asked)) {
             return badRequest(
               res,
-              `工作目录不在白名单内。可选：${allowedWorkdirs.join(" | ")}（用 AGENT_UI_WORKDIRS 声明）`,
+              `工作目录不在白名单内。可选：${[...allowedWorkdirs].join(" | ")}（可点工作目录下拉的「＋ 添加目录…」即时加入）`,
             );
           }
           scheduleWorkdir = asked;
@@ -7175,7 +7480,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         // 默认路径会过不了自己的白名单（实测踩到，单测因为 mkdtemp 本来就
         // 返回规范化路径而没抓到）
         const target = resolve(parsed.workdir || workdir);
-        if (!allowedWorkdirs.includes(target)) {
+        if (!allowedWorkdirs.has(target)) {
           return badRequest(res, `工作目录不在白名单内：${target}`);
         }
 
@@ -7841,7 +8146,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           // 与上传同一教训（v2-33）：白名单存的是 resolve() 后的规范化路径，
           // 比较前必须归一，否则默认路径会过不了自己的白名单
           const root = resolve(route.workdir || workdir);
-          if (!allowedWorkdirs.includes(root)) {
+          if (!allowedWorkdirs.has(root)) {
             return json(res, 403, { error: `工作目录不在白名单内：${root}` });
           }
           try {

@@ -32,3 +32,6 @@ __pycache__/
 # MODEL-02 模型库：含 API key 的本地配置，绝不进仓
 .agent-models.json
 .agent-models.json.bak
+# V-29 运行时工作目录清单：本机目录偏好，不进仓
+.agent-workdirs.json
+.agent-workdirs.json.bak

@@ -6198,6 +6198,121 @@ button.cc-card:hover { border-color: var(--border-2); }
   .fp-overlay:not([hidden]) { animation: settings-fade 120ms ease-out; }
 }
 
+/* --- 目录选择器浮层（V-29 运行时扩展）：fixed 遮罩 + 面板，纪律同预览覆盖层 --- */
+.wp-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: flex;
+  align-items: stretch;
+  justify-content: center;
+  padding: var(--space-xl);
+  background: color-mix(in srgb, var(--text-1) 32%, transparent);
+}
+.wp-overlay[hidden] { display: none; }
+.wp-panel {
+  width: min(720px, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+  padding: var(--space-md);
+  background: var(--surface-0);
+  border: 1px solid var(--border-1);
+  border-radius: calc(var(--radius) + 4px);
+  box-shadow: 0 18px 48px color-mix(in srgb, var(--text-1) 28%, transparent);
+  overflow: hidden;
+}
+.wp-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  flex-shrink: 0;
+}
+.wp-title { font-size: var(--font-xl); color: var(--text-1); }
+.wp-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  flex-shrink: 0;
+}
+.wp-current {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: var(--font-md);
+  color: var(--text-2);
+}
+.wp-manual {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  flex-shrink: 0;
+}
+.wp-path-input {
+  flex: 1;
+  min-width: 0;
+  padding: 6px var(--space-sm);
+  border: 1px solid var(--border-1);
+  border-radius: var(--radius);
+  background: var(--surface-1);
+  color: var(--text-1);
+  font-family: var(--font-mono);
+  font-size: var(--font-md);
+}
+.wp-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  border: 1px solid var(--border-1);
+  border-radius: var(--radius);
+  padding: var(--space-sm);
+  background: var(--surface-1);
+}
+.wp-dir {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: 6px var(--space-sm);
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--text-1);
+  font-size: var(--font-md);
+  text-align: left;
+  cursor: pointer;
+}
+.wp-dir:hover { background: var(--surface-2); border-color: var(--border-1); }
+.wp-dir .ph { color: var(--accent); }
+.wp-empty {
+  margin: var(--space-lg) 0;
+  text-align: center;
+  color: var(--text-3);
+  font-size: var(--font-md);
+}
+.wp-status {
+  margin: 0;
+  flex-shrink: 0;
+  font-size: var(--font-md);
+  color: var(--text-3);
+}
+.wp-status[data-tone="error"] { color: var(--status-bad); }
+
+/* 窄视口：覆盖层去掉留白，全屏利用 */
+@media (max-width: 700px) {
+  .wp-overlay { padding: 0; }
+  .wp-panel { border-radius: 0; border: 0; width: 100%; }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .wp-overlay:not([hidden]) { animation: settings-fade 120ms ease-out; }
+}
+
 /* ---- MODEL-02 模型库 + 角色分配（设置中心「模型」分组）---- */
 .settings-models-list {
   display: flex;
