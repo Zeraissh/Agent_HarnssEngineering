@@ -2348,12 +2348,12 @@ describe("直播条：arrived 必须取自累计计数，不是缓冲长度", ()
     expect(m![1]).toContain("totals.text");
   });
 
-  it("累计随 delta 增长且不受上限影响（cap 只作用在缓冲上）", () => {
+  it("缓冲与累计都随 delta 全文增长——截尾机制已整体退役（2026-09-07 委托方）", () => {
     expect(htmlSrc).toContain("totals.think += thinkPart.length");
     expect(htmlSrc).toContain("totals.text += textPart.length");
-    // cap 只包缓冲，不包累计
-    expect(htmlSrc).toMatch(/liveThinking\.set\(runId, cap\(/);
-    expect(htmlSrc).not.toMatch(/totals\.(think|text) = cap\(/);
+    // 正文与思考两个缓冲都不许砍头：点开思考读到一半开头被删掉就是这条没守住
+    expect(htmlSrc).not.toMatch(/const\s+LIVE_(TEXT|THINKING)_CAP\s*=/);
+    expect(htmlSrc).not.toMatch(/slice\(\s*-\s*LIVE/);
   });
 
   it("正文接管时思考累计归零——否则正文额度被一段不再显示的思考永久占住", () => {

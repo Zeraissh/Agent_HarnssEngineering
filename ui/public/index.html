@@ -1444,13 +1444,11 @@ const liveThinking = new Map();
  * 但可见内容仍是滑动窗口——正文被活生生砍头。正文全文进缓冲，内存远小于
  * 一次 run 的事件流；节拍器仍按 liveTotals 匀速放行。
  *
- * 思考缓冲仍保留截尾守卫：它是**瞬态**的（正文一开始流就整段丢弃），截尾只影响
- * 展示中的尾巴，不碰累计计数——totals 永远按 delta 实收累加，不被上限钉死。
- *（注意与 test/budget-extend.test.ts 的约定：正文截尾常量 LIVE_TEXT_CAP 已退役，
- * 这里守卫的是思考缓冲，命名分开正是为了不复活那条旧机制。）
+ * 思考缓冲同样**不截尾**（2026-09-07 委托方：点开思考后开头被删掉、只剩新文字）。
+ * 「思考是瞬态所以可以砍头」的判断是错的——直播期间人正在读它。思考与正文
+ * 两个缓冲都全文累加；截尾常量机制（LIVE_TEXT_CAP / LIVE_THINKING_CAP）整体退役。
+ *（注意与 test/budget-extend.test.ts 的约定：正文截尾常量 LIVE_TEXT_CAP 已退役。）
  */
-const LIVE_THINKING_CAP = 2000;
-const cap = (s) => (s.length > LIVE_THINKING_CAP ? s.slice(-LIVE_THINKING_CAP) : s);
 /** @type {Map<string, {think:number, text:number}>} */
 const liveTotals = new Map();
 const totalsOf = (runId) => liveTotals.get(runId) ?? { think: 0, text: 0 };
@@ -1465,7 +1463,7 @@ const deltaBatcher = createBatcher((batches) => {
     const thinkPart = chunks.filter((c) => c.kind === "thinking").map((c) => c.text).join("");
     const totals = { ...totalsOf(runId) };
     if (thinkPart) {
-      liveThinking.set(runId, cap((liveThinking.get(runId) ?? "") + thinkPart));
+      liveThinking.set(runId, (liveThinking.get(runId) ?? "") + thinkPart);
       totals.think += thinkPart.length;
     }
     if (textPart) {
