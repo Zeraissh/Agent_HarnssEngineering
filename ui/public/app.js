@@ -1,6 +1,7 @@
 import { createBatcher } from "./core/batch.js";
 import { diffKeyed, signature } from "./core/diff.js";
 import { extractLocalPathRef, isLocalPathCandidate, renderMarkdown, renderMarkdownInline } from "./core/markdown.js";
+import { artifactRendererKind } from "./features/artifact-canvas.js";
 import {
   patchList,
   appendOnly,
@@ -3243,6 +3244,7 @@ function updateRunItem(el, r, metaMap, selectedRunId, onDelete) {
  *   onToggleEntry?:(seq:number)=>void,
  *   onReveal?:(path:string)=>void,
  *   onOpenCanvas?:(path:string)=>void,
+ *   onPreviewPath?:(path:string)=>void,
  *   inspectPaths?:(paths:string[])=>Promise<any[]>
  * }} callbacks
  */
@@ -4484,7 +4486,7 @@ function makePathIcon(name) {
   return icon;
 }
 
-function decorateLocalPathCode(code, hit, runId) {
+function decorateLocalPathCode(code, hit, runId, callbacks) {
   if (!code?.parentNode || !hit?.path || !hit?.kind) return;
   const shell = document.createElement("span");
   shell.className = `local-path-ref local-path-ref--${hit.kind}`;
@@ -4503,6 +4505,20 @@ function decorateLocalPathCode(code, hit, runId) {
     code.parentNode.insertBefore(shell, code);
     link.append(code, makePathIcon("arrow-square-out"));
     shell.append(link);
+
+    // V-35：可预览类型（md/html/图片/csv/代码/文本）在链接旁给一个小预览钮，
+    // 点开应用内覆盖层；二进制不给（预览层也只能画降级信息卡，没意义）。
+    // 原「在文件夹中显示」保留为旁边的次级操作，两处互不抢。
+    if (typeof callbacks?.onPreviewPath === "function" && artifactRendererKind(hit.path) !== "binary") {
+      const preview = document.createElement("button");
+      preview.type = "button";
+      preview.className = "local-path-preview";
+      preview.dataset.pathPreview = hit.path;
+      preview.title = "预览文件";
+      preview.setAttribute("aria-label", `预览 ${hit.path}`);
+      preview.append(makePathIcon("eye"));
+      shell.append(preview);
+    }
 
     const reveal = document.createElement("button");
     reveal.type = "button";
@@ -4529,15 +4545,18 @@ function decorateLocalPathCode(code, hit, runId) {
 function bindLocalPathActions(host, callbacks) {
   if (!host) return;
   host.__pathReveal = callbacks?.onReveal;
+  host.__pathPreview = callbacks?.onPreviewPath;
   if (host.__pathActionBound) return;
   host.__pathActionBound = true;
   host.addEventListener("click", (event) => {
     const target = event.target instanceof Element
-      ? event.target.closest("[data-path-reveal]")
+      ? event.target.closest("[data-path-preview], [data-path-reveal]")
       : null;
     if (!target) return;
     event.preventDefault();
-    host.__pathReveal?.(target.getAttribute("data-path-reveal"));
+    const previewPath = target.getAttribute("data-path-preview");
+    if (previewPath) host.__pathPreview?.(previewPath);
+    else host.__pathReveal?.(target.getAttribute("data-path-reveal"));
   });
 }
 
@@ -4573,7 +4592,7 @@ async function hydrateLocalPathLinks(host, state, callbacks) {
     if (!host.contains(node) || node.getAttribute("data-path-state") !== "checking") continue;
     const label = node.getAttribute("data-local-path") ?? "";
     const hit = choiceByLabel.get(label);
-    if (hit) decorateLocalPathCode(node, hit, state.runId);
+    if (hit) decorateLocalPathCode(node, hit, state.runId, callbacks);
     else node.setAttribute("data-path-state", "plain");
   }
 }

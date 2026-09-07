@@ -6098,3 +6098,93 @@ button.cc-card:hover { border-color: var(--border-2); }
   color: var(--status-warn);
   margin-bottom: var(--space-xs);
 }
+
+/* ============================================================
+   features/file-preview — 预览覆盖层 + composer 拖拽/粘贴上传（V-35）
+   只用设计令牌；遮罩用 color-mix 从文本令牌派生（与命令面板同一手法）。
+   ============================================================ */
+
+/* --- 拖拽高亮：提示层由 initFileIntake 动态挂进 .submit-bar（已 relative） --- */
+.drop-hint {
+  position: absolute;
+  inset: var(--space-xs);
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-sm);
+  border: 2px dashed var(--accent);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--surface-1) 88%, transparent);
+  color: var(--accent);
+  font-size: var(--font-md);
+  font-weight: 600;
+  pointer-events: none; /* 提示层不抢 drop——事件要落到 composer 上 */
+}
+.drop-hint[hidden] { display: none; }
+.submit-bar--drop-target {
+  border-color: var(--accent);
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+/* --- 附件清单的预览钮 --- */
+.upload-preview {
+  margin-left: auto;
+  padding: 2px var(--space-sm);
+  font-size: var(--font-xs);
+  flex: 0 0 auto;
+}
+
+/* --- 对话正文路径链接旁的预览钮（夹在链接与「文件夹中显示」之间的中段） --- */
+.local-path-preview {
+  display: inline-grid;
+  width: 26px;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-left: 0;
+  background: var(--bg);
+  color: var(--text-2);
+  cursor: pointer;
+}
+.local-path-preview:hover {
+  border-color: var(--accent);
+  background: var(--surface-2);
+  color: var(--accent);
+}
+
+/* --- 预览覆盖层：fixed 遮罩 + 面板；内容区复用 ac-*（artifact-canvas 同款） --- */
+.fp-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: flex;
+  align-items: stretch;
+  justify-content: center;
+  padding: var(--space-xl);
+  background: color-mix(in srgb, var(--text-1) 32%, transparent);
+}
+.fp-overlay[hidden] { display: none; }
+.fp-panel {
+  width: min(1080px, 100%);
+  display: flex;
+  flex-direction: column;
+  background: var(--surface-0);
+  border: 1px solid var(--border-1);
+  border-radius: calc(var(--radius) + 4px);
+  box-shadow: 0 18px 48px color-mix(in srgb, var(--text-1) 28%, transparent);
+  overflow: hidden;
+}
+.fp-head { flex-shrink: 0; }
+.fp-panel .ac-body { min-height: 0; }
+
+/* 窄视口：覆盖层去掉留白，全屏利用 */
+@media (max-width: 700px) {
+  .fp-overlay { padding: 0; }
+  .fp-panel { border-radius: 0; border: 0; width: 100%; }
+}
+
+/* 动效只在用户没要求减弱时播放（reduced-motion 门禁） */
+@media (prefers-reduced-motion: no-preference) {
+  .fp-overlay:not([hidden]) { animation: settings-fade 120ms ease-out; }
+}

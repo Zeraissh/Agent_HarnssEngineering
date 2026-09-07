@@ -390,6 +390,11 @@ import {
   initArtifactCanvas,
 } from "/features/artifact-canvas.js";
 import {
+  initFilePreview,
+  initFileIntake,
+  buildFilePreviewUrl,
+} from "/features/file-preview.js";
+import {
   isCommandCenterRoute,
   COMMAND_CENTER_HASH,
   initCommandCenterView,
@@ -1109,6 +1114,7 @@ function renderDetailWithState(state) {
     onAnswer: (answers) => postAnswer(runId, answers),
     onReveal: (path) => revealArtifact(runId, path),
     onOpenCanvas: (path) => openArtifactByPath(runId, path),
+    onPreviewPath: (path) => previewLocalPath(runId, path),
     inspectPaths: (paths) => inspectRunPaths(runId, paths),
     unverifiedDismissed: dismissedUnverified.has(runId),
     onDismissUnverified: () => {
@@ -2297,17 +2303,22 @@ function renderUploads() {
   if (!uploadList) return;
   uploadList.hidden = uploaded.length === 0;
   uploadList.innerHTML = uploaded
-    .map((u) => {
+    .map((u, i) => {
       const name = escapeHtml(u.path);
       const size = `<span class="knob-hint">${(u.bytes / 1024).toFixed(0)} KB</span>`;
+      // 预览按钮：上传返回的 absolutePath 直接喂 /api/file-preview（圈禁在服务端）
+      const previewBtn =
+        `<button type="button" class="btn btn--ghost upload-preview" data-upload-preview="${i}" ` +
+        `title="预览" aria-label="预览 ${name}">` +
+        `<i class="ph ph-eye" aria-hidden="true"></i><span>预览</span></button>`;
       if (u.previewUrl && /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(u.path)) {
         return (
           `<li class="upload-item upload-item--image">` +
           `<img class="upload-thumb" src="${escapeHtml(u.previewUrl)}" alt="" />` +
-          `<div class="upload-meta"><code>${name}</code> ${size}</div></li>`
+          `<div class="upload-meta"><code>${name}</code> ${size}</div>${previewBtn}</li>`
         );
       }
-      return `<li class="upload-item"><code>${name}</code> ${size}</li>`;
+      return `<li class="upload-item"><code>${name}</code> ${size} ${previewBtn}</li>`;
     })
     .join("");
 }
@@ -2395,6 +2406,59 @@ if (fileUpload) {
     if (fileUpload.files?.length) void uploadFiles([...fileUpload.files]);
     fileUpload.value = "";
   });
+}
+
+// ---- 文件预览覆盖层 + 拖拽/粘贴上传（V-35）----
+// 预览覆盖层：附件清单与对话里的本地路径链接共用一个壳；渲染主体在
+// features/artifact-canvas.js（renderPreviewBody），取件走 /api/file-preview
+// （圈禁在服务端）。覆盖层不进 hash 路由——它是瞬态的，刷新不该恢复。
+let filePreviewApi = /** @type {null|{ open:(o:{path:string,url:string})=>boolean, close:()=>void, isOpen:()=>boolean, element:HTMLElement }} */ (null);
+try {
+  filePreviewApi = initFilePreview({
+    onAnnounce: (msg) => announceStatus(msg),
+  });
+} catch { /* 文件预览是增强项，初始化失败静默降级 */ }
+
+/** 附件清单的「预览」：上传响应里的 absolutePath 直接做取件路径（白名单内的绝对路径） */
+function previewUploadedFile(u) {
+  if (!filePreviewApi || !u) return;
+  const url = buildFilePreviewUrl({ path: u.absolutePath ?? u.path });
+  filePreviewApi.open({ path: u.path, url });
+}
+
+/**
+ * 对话正文里本地路径链接的「预览」：hit.path 是**相对该 run 工作目录**的路径，
+ * 取件时把 run 的 workdir 一起带上（圈禁判定在服务端）。
+ */
+function previewLocalPath(runId, path) {
+  if (!filePreviewApi || !path) return;
+  const run = runs.find((r) => r.runId === runId);
+  const url = buildFilePreviewUrl({ path, workdir: run?.workdir ?? null });
+  filePreviewApi.open({ path, url });
+}
+
+// 附件清单的预览按钮（清单每次重画，逐个绑会漏也会重——事件委托）
+if (uploadList) {
+  uploadList.addEventListener("click", (e) => {
+    const btn = e.target instanceof Element ? e.target.closest("[data-upload-preview]") : null;
+    if (!btn) return;
+    const u = uploaded[Number(btn.getAttribute("data-upload-preview"))];
+    if (u) previewUploadedFile(u);
+  });
+}
+
+// 拖拽/粘贴：只有真文件才接管上传；纯文本拖拽/粘贴还给浏览器默认行为。
+// 拖拽落哪个工作目录、粘贴怎么命名——判定分别在 uploadFiles 与
+// features/file-preview.js 里，这里只接线。
+if (submitForm) {
+  try {
+    initFileIntake({
+      zone: submitForm,
+      input: taskInput,
+      onFiles: (files) => void uploadFiles(files),
+      onAnnounce: (msg) => announceStatus(msg),
+    });
+  } catch { /* 拖拽/粘贴上传是增强项 */ }
 }
 
 const budgetExtendBtn = /** @type {HTMLButtonElement|null} */ (document.getElementById("budget-extend-btn"));

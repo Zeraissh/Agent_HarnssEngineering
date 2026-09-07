@@ -7,7 +7,7 @@ import { readFile, writeFile, mkdir, stat, open, readdir } from "node:fs/promise
 import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, readFileSync } from "node:fs";
-import { join, extname, dirname, delimiter, resolve, basename, relative, sep } from "node:path";
+import { join, extname, dirname, delimiter, resolve, basename, relative, sep, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -1826,6 +1826,8 @@ const BUILTIN_POOL: Tool[] = [
 /** 上传落点：工作目录下的固定子目录，便于人和 agent 都一眼知道东西在哪 */
 const UPLOAD_SUBDIR = "uploads";
 const UPLOAD_MAX_BYTES = 20_000_000;
+/** 文件预览取件上限：超出直接 413——预览不是下载通道，超大文件走「在文件夹中显示」 */
+const FILE_PREVIEW_MAX_BYTES = 10_000_000;
 const DEFAULT_SYSTEM_PROMPT = `You are a capable autonomous agent operating in a local working directory.
 Complete the user's task end to end using the available tools.
 Ground every claim of progress in an actual tool result.
@@ -5869,6 +5871,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     | { type: "trace"; runId: string }
     | { type: "inspectPaths"; runId: string }
     | { type: "artifact"; runId: string; path: string; download: boolean }
+    | { type: "filePreview"; path: string; workdir: string | null; download: boolean }
     | { type: "reveal"; runId: string }
     | { type: "stop"; runId: string }
     | { type: "deleteRun"; runId: string }
@@ -5977,6 +5980,24 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         type: "artifact",
         runId: artifactMatch[1]!,
         path: wanted,
+        download: q.get("download") === "1",
+      };
+    }
+
+    /**
+     * V-35 文件预览：不绑定 run 的只读取件——上传完还没有 run、或要看的
+     * 文件不属于当前会话时走这里。圈禁口径与上传同一条线（白名单工作目录），
+     * 具体校验在处理器里——路由层只管形状，与 artifact 同模式。
+     */
+    const filePreviewMatch = method === "GET" && url.match(/^\/api\/file-preview\?(.*)$/);
+    if (filePreviewMatch) {
+      const q = new URLSearchParams(filePreviewMatch[1]!);
+      const wanted = q.get("path");
+      if (!wanted) return { type: "malformed" };
+      return {
+        type: "filePreview",
+        path: wanted,
+        workdir: q.get("workdir"),
         download: q.get("download") === "1",
       };
     }
@@ -7534,6 +7555,73 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           return;
         } catch {
           return notFound(res, `Artifact not found: ${route.path}`);
+        }
+      }
+
+      /**
+       * V-35 文件预览取件：不绑定 run 的只读预览/下载。
+       *
+       * 圈禁口径与上传同一条线（白名单工作目录），判据与 artifact 同一把尺：
+       *   ① 相对路径按 `workdir` 参数（缺省 = 宿主默认工作目录）解析，
+       *      该目录必须在白名单内，否则 403；
+       *   ② 绝对路径必须落在**某个**白名单工作目录之内——逐一试
+       *      `resolveInWorkdir`（与写类工具共用圈禁函数，含 symlink/junction
+       *      真实路径校验），全部拒绝即 403；
+       *   ③ 只回文件，目录一律 404——否则等于开了目录浏览；
+       *   ④ 超过 FILE_PREVIEW_MAX_BYTES 一律 413——预览不是下载通道。
+       * 响应头纪律照搬 artifact：CSP 禁脚本与外链 + nosniff + no-store。
+       */
+      case "filePreview": {
+        const wanted = localPathTarget(route.path);
+        let abs = "";
+        if (isAbsolute(wanted)) {
+          for (const root of allowedWorkdirs) {
+            try {
+              abs = resolveInWorkdir(root, wanted);
+              break;
+            } catch { /* 不在这个白名单目录里，试下一个 */ }
+          }
+          if (!abs) {
+            return json(res, 403, { error: `路径不在任何白名单工作目录内：${wanted}` });
+          }
+        } else {
+          // 与上传同一教训（v2-33）：白名单存的是 resolve() 后的规范化路径，
+          // 比较前必须归一，否则默认路径会过不了自己的白名单
+          const root = resolve(route.workdir || workdir);
+          if (!allowedWorkdirs.includes(root)) {
+            return json(res, 403, { error: `工作目录不在白名单内：${root}` });
+          }
+          try {
+            abs = resolveInWorkdir(root, wanted);
+          } catch (err) {
+            return json(res, 403, { error: (err as Error).message });
+          }
+        }
+        try {
+          const st = await stat(abs);
+          if (!st.isFile()) return notFound(res, "Not a file");
+          if (st.size > FILE_PREVIEW_MAX_BYTES) {
+            return json(res, 413, {
+              error: `文件过大：${(st.size / 1_000_000).toFixed(1)}MB 超过 ${(FILE_PREVIEW_MAX_BYTES / 1_000_000).toFixed(0)}MB 预览上限`,
+            });
+          }
+          const body = await readFile(abs);
+          const name = basename(abs);
+          res.writeHead(200, {
+            "Content-Type": contentTypeOf(name),
+            "Content-Length": String(body.length),
+            "Content-Disposition": `${route.download ? "attachment" : "inline"}; filename*=UTF-8''${encodeURIComponent(name)}`,
+            "Cache-Control": "no-store",
+            // 预览的可能是模型生成的 HTML——**不可信内容**。禁掉脚本与外链，
+            // 否则等于让它在宿主同源下执行任意 JS（能读同源的 /api/*）
+            "Content-Security-Policy":
+              "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; font-src data:",
+            "X-Content-Type-Options": "nosniff",
+          });
+          res.end(body);
+          return;
+        } catch {
+          return notFound(res, `File not found: ${route.path}`);
         }
       }
 

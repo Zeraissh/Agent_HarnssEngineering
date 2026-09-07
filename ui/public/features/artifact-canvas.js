@@ -215,14 +215,159 @@ export function artifactBasename(path) {
 }
 
 // ---------------------------------------------------------------
-// DOM 层
+// 渲染层（产物画布与文件预览覆盖层共用——分派/截断/沙箱/转义纪律只有一份）
 // ---------------------------------------------------------------
-
-const VIEW_ID = "artifact-canvas-view";
 
 const ESC = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
 /** 模块内转义：与 core/markdown.js 入口同一纪律——产物原文绝不直接进 innerHTML */
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ESC[c]);
+
+/** 文本读入后的公共截断：超大文件只画头部，标注出来 */
+function clipPreviewText(text) {
+  const t = String(text ?? "");
+  if (t.length <= TEXT_MAX_CHARS) return { text: t, clipped: false };
+  return { text: t.slice(0, TEXT_MAX_CHARS), clipped: true };
+}
+
+function renderPreviewErrorCard(body, message) {
+  body.innerHTML =
+    `<div class="ac-fallback">` +
+    `<i class="ph ph-warning-circle ac-fallback-icon" aria-hidden="true"></i>` +
+    `<p class="ac-fallback-text">${esc(message)}</p>` +
+    `</div>`;
+}
+
+/**
+ * 按类型把容器渲染成对应预览。产物画布（run 产物）与文件预览覆盖层
+ * （任意白名单内本地文件）共用这一段——类型分派、超大截断、iframe 沙箱、
+ * 「先转义再变换」纪律只有一份，不会两处漂移。
+ *
+ * @param {HTMLElement} body 渲染容器
+ * @param {{ path:string, url:string, fetch:Function|null, isStale?:()=>boolean }} opts
+ *   path 只做类型分派与标题；url 是取件地址（圈禁在服务端端点做）；
+ *   isStale 返回 true 表示调用方已切走，放弃渲染并返回 null。
+ * @returns {Promise<{ size:number|null }|null>}
+ *   读到的字节数（不可得/未读取为 null）；isStale 中途成立时整体返回 null。
+ */
+export async function renderPreviewBody(body, opts) {
+  const path = String(opts?.path ?? "");
+  const url = String(opts?.url ?? "");
+  const fetchImpl = opts?.fetch ?? null;
+  const isStale = typeof opts?.isStale === "function" ? opts.isStale : () => false;
+  const kind = artifactRendererKind(path);
+  const name = artifactBasename(path);
+
+  /** @returns {Promise<string|null>} 失败或已切走回 null（调用方用 isStale 区分） */
+  const fetchText = async () => {
+    if (!fetchImpl) return null;
+    try {
+      const res = await fetchImpl(url);
+      if (isStale()) return null;
+      if (!res || res.ok === false) return null;
+      return await res.text();
+    } catch {
+      return null;
+    }
+  };
+
+  switch (kind) {
+    case "html": {
+      // 沙箱纪律见文件头注释：allow-scripts 但不给 allow-same-origin
+      body.innerHTML =
+        `<iframe class="ac-frame" sandbox="allow-scripts" referrerpolicy="no-referrer" ` +
+        `src="${esc(url)}" title="${esc(name)}"></iframe>` +
+        `<p class="ac-note">HTML 产物在隔离沙箱中渲染；其内部的相对资源引用可能失效，属预期。</p>`;
+      return { size: null };
+    }
+    case "image": {
+      body.innerHTML =
+        `<div class="ac-image-wrap"><img class="ac-image" src="${esc(url)}" ` +
+        `alt="${esc(name)}" /></div>`;
+      return { size: null };
+    }
+    case "markdown": {
+      body.innerHTML = '<p class="ac-note">正在读取…</p>';
+      const raw = await fetchText();
+      if (isStale()) return null;
+      if (raw == null) { renderPreviewErrorCard(body, "读取失败——文件可能已被移动或删除。"); return { size: null }; }
+      const { text, clipped } = clipPreviewText(raw);
+      body.innerHTML =
+        `<div class="md ac-doc">${renderMarkdown(text)}</div>` +
+        (clipped ? `<p class="ac-note">内容过长，仅显示前 ${TEXT_MAX_CHARS} 字符。</p>` : "");
+      return { size: new TextEncoder().encode(raw).length };
+    }
+    case "code":
+    case "text": {
+      body.innerHTML = '<p class="ac-note">正在读取…</p>';
+      const raw = await fetchText();
+      if (isStale()) return null;
+      if (raw == null) { renderPreviewErrorCard(body, "读取失败——文件可能已被移动或删除。"); return { size: null }; }
+      const { text, clipped } = clipPreviewText(raw);
+      if (kind === "code") {
+        const lang = artifactCodeLang(path);
+        const key = normalizeLang(lang);
+        body.innerHTML =
+          `<pre class="md-code ac-code${key ? ` md-code--${key}` : ""}">` +
+          `<code>${highlight(esc(text), lang)}</code></pre>` +
+          (clipped ? `<p class="ac-note">内容过长，仅显示前 ${TEXT_MAX_CHARS} 字符。</p>` : "");
+      } else {
+        body.innerHTML =
+          `<pre class="ac-text">${esc(text)}</pre>` +
+          (clipped ? `<p class="ac-note">内容过长，仅显示前 ${TEXT_MAX_CHARS} 字符。</p>` : "");
+      }
+      return { size: new TextEncoder().encode(raw).length };
+    }
+    case "csv": {
+      body.innerHTML = '<p class="ac-note">正在读取…</p>';
+      const raw = await fetchText();
+      if (isStale()) return null;
+      if (raw == null) { renderPreviewErrorCard(body, "读取失败——文件可能已被移动或删除。"); return { size: null }; }
+      const { rows, truncated, totalRows } = parseCsv(raw);
+      if (rows.length === 0) { renderPreviewErrorCard(body, "空表格——没有可显示的行。"); return { size: new TextEncoder().encode(raw).length }; }
+      const [headRow, ...dataRows] = rows;
+      const cell = (v, tag) => `<${tag}>${esc(v)}</${tag}>`;
+      body.innerHTML =
+        `<div class="md-table-wrap ac-table-wrap"><table class="md-table ac-table">` +
+        `<thead><tr>${headRow.map((v) => cell(v, "th")).join("")}</tr></thead>` +
+        `<tbody>${dataRows.map((r) => `<tr>${r.map((v) => cell(v, "td")).join("")}</tr>`).join("")}</tbody>` +
+        `</table></div>` +
+        (truncated
+          ? `<p class="ac-note">仅显示前 ${CSV_MAX_ROWS} 行（共 ${totalRows} 行），完整内容请下载。</p>`
+          : "");
+      return { size: new TextEncoder().encode(raw).length };
+    }
+    default: {
+      // 二进制/未知：降级信息卡。大小仍需一次取件——读完即弃，只留字节数
+      let size = null;
+      if (fetchImpl) {
+        try {
+          const res = await fetchImpl(url);
+          if (isStale()) return null;
+          if (res && res.ok !== false) {
+            const buf = await res.arrayBuffer();
+            if (isStale()) return null;
+            size = buf.byteLength;
+          }
+        } catch { /* 大小不可得就留 null */ }
+      }
+      body.innerHTML =
+        `<div class="ac-fallback">` +
+        `<i class="ph ph-file ac-fallback-icon" aria-hidden="true"></i>` +
+        `<p class="ac-fallback-name">${esc(name)}</p>` +
+        `<p class="ac-fallback-text">类型：${esc(rendererKindLabel(kind))} · 大小：${esc(formatBytes(size))}</p>` +
+        `<p class="ac-fallback-text">此类型暂不支持预览，请下载后查看。</p>` +
+        `<a class="btn btn--ghost" href="${esc(url)}&download=1">下载</a>` +
+        `</div>`;
+      return { size };
+    }
+  }
+}
+
+// ---------------------------------------------------------------
+// DOM 层
+// ---------------------------------------------------------------
+
+const VIEW_ID = "artifact-canvas-view";
 
 /**
  * 初始化产物画布。幂等：重复调用返回既有节点的薄壳。
@@ -340,34 +485,6 @@ export function initArtifactCanvas(host = {}, env = {}) {
     sizeEl.hidden = bytes == null;
   }
 
-  /** @param {string} url @returns {Promise<string|null>} 失败回 null（调用方画错误卡） */
-  async function fetchText(url, token) {
-    if (!fetchImpl) return null;
-    try {
-      const res = await fetchImpl(url);
-      if (token !== renderToken) return null; // 已切走，丢弃
-      if (!res || res.ok === false) return null;
-      return await res.text();
-    } catch {
-      return null;
-    }
-  }
-
-  function renderErrorCard(message) {
-    body.innerHTML =
-      `<div class="ac-fallback">` +
-      `<i class="ph ph-warning-circle ac-fallback-icon" aria-hidden="true"></i>` +
-      `<p class="ac-fallback-text">${esc(message)}</p>` +
-      `</div>`;
-  }
-
-  /** 文本读入后的公共截断：超大文件只画头部，标注出来 */
-  function clipText(text) {
-    const t = String(text ?? "");
-    if (t.length <= TEXT_MAX_CHARS) return { text: t, clipped: false };
-    return { text: t.slice(0, TEXT_MAX_CHARS), clipped: true };
-  }
-
   async function renderCurrent() {
     const token = ++renderToken;
     const art = artifacts[current];
@@ -386,101 +503,14 @@ export function initArtifactCanvas(host = {}, env = {}) {
     downloadLink.setAttribute("download", artifactBasename(path));
     setSize(null);
 
-    switch (kind) {
-      case "html": {
-        // 沙箱纪律见文件头注释：allow-scripts 但不给 allow-same-origin
-        body.innerHTML =
-          `<iframe class="ac-frame" sandbox="allow-scripts" referrerpolicy="no-referrer" ` +
-          `src="${esc(url)}" title="${esc(artifactBasename(path))}"></iframe>` +
-          `<p class="ac-note">HTML 产物在隔离沙箱中渲染；其内部的相对资源引用可能失效，属预期。</p>`;
-        break;
-      }
-      case "image": {
-        body.innerHTML =
-          `<div class="ac-image-wrap"><img class="ac-image" src="${esc(url)}" ` +
-          `alt="${esc(artifactBasename(path))}" /></div>`;
-        break;
-      }
-      case "markdown": {
-        body.innerHTML = '<p class="ac-note">正在读取…</p>';
-        const raw = await fetchText(url, token);
-        if (token !== renderToken) return;
-        if (raw == null) { renderErrorCard("读取失败——文件可能已被移动或删除。"); return; }
-        const { text, clipped } = clipText(raw);
-        setSize(new TextEncoder().encode(raw).length);
-        body.innerHTML =
-          `<div class="md ac-doc">${renderMarkdown(text)}</div>` +
-          (clipped ? `<p class="ac-note">内容过长，仅显示前 ${TEXT_MAX_CHARS} 字符。</p>` : "");
-        break;
-      }
-      case "code":
-      case "text": {
-        body.innerHTML = '<p class="ac-note">正在读取…</p>';
-        const raw = await fetchText(url, token);
-        if (token !== renderToken) return;
-        if (raw == null) { renderErrorCard("读取失败——文件可能已被移动或删除。"); return; }
-        const { text, clipped } = clipText(raw);
-        setSize(new TextEncoder().encode(raw).length);
-        if (kind === "code") {
-          const lang = artifactCodeLang(path);
-          const key = normalizeLang(lang);
-          body.innerHTML =
-            `<pre class="md-code ac-code${key ? ` md-code--${key}` : ""}">` +
-            `<code>${highlight(esc(text), lang)}</code></pre>` +
-            (clipped ? `<p class="ac-note">内容过长，仅显示前 ${TEXT_MAX_CHARS} 字符。</p>` : "");
-        } else {
-          body.innerHTML =
-            `<pre class="ac-text">${esc(text)}</pre>` +
-            (clipped ? `<p class="ac-note">内容过长，仅显示前 ${TEXT_MAX_CHARS} 字符。</p>` : "");
-        }
-        break;
-      }
-      case "csv": {
-        body.innerHTML = '<p class="ac-note">正在读取…</p>';
-        const raw = await fetchText(url, token);
-        if (token !== renderToken) return;
-        if (raw == null) { renderErrorCard("读取失败——文件可能已被移动或删除。"); return; }
-        setSize(new TextEncoder().encode(raw).length);
-        const { rows, truncated, totalRows } = parseCsv(raw);
-        if (rows.length === 0) { renderErrorCard("空表格——没有可显示的行。"); return; }
-        const [headRow, ...dataRows] = rows;
-        const cell = (v, tag) => `<${tag}>${esc(v)}</${tag}>`;
-        body.innerHTML =
-          `<div class="md-table-wrap ac-table-wrap"><table class="md-table ac-table">` +
-          `<thead><tr>${headRow.map((v) => cell(v, "th")).join("")}</tr></thead>` +
-          `<tbody>${dataRows.map((r) => `<tr>${r.map((v) => cell(v, "td")).join("")}</tr>`).join("")}</tbody>` +
-          `</table></div>` +
-          (truncated
-            ? `<p class="ac-note">仅显示前 ${CSV_MAX_ROWS} 行（共 ${totalRows} 行），完整内容请下载。</p>`
-            : "");
-        break;
-      }
-      default: {
-        // 二进制/未知：降级信息卡。大小仍需一次取件——读完即弃，只留字节数
-        let size = null;
-        if (fetchImpl) {
-          try {
-            const res = await fetchImpl(url);
-            if (token !== renderToken) return;
-            if (res && res.ok !== false) {
-              const buf = await res.arrayBuffer();
-              if (token !== renderToken) return;
-              size = buf.byteLength;
-            }
-          } catch { /* 大小不可得就留 "—" */ }
-        }
-        setSize(size);
-        body.innerHTML =
-          `<div class="ac-fallback">` +
-          `<i class="ph ph-file ac-fallback-icon" aria-hidden="true"></i>` +
-          `<p class="ac-fallback-name">${esc(artifactBasename(path))}</p>` +
-          `<p class="ac-fallback-text">类型：${esc(rendererKindLabel(kind))} · 大小：${esc(formatBytes(size))}</p>` +
-          `<p class="ac-fallback-text">此类型暂不支持预览，请下载后查看。</p>` +
-          `<a class="btn btn--ghost" href="${esc(url)}&download=1">下载</a>` +
-          `</div>`;
-        break;
-      }
-    }
+    // 渲染主体与文件预览覆盖层共用（renderPreviewBody）——纪律只有一份
+    const result = await renderPreviewBody(body, {
+      path,
+      url,
+      fetch: fetchImpl,
+      isStale: () => token !== renderToken,
+    });
+    if (result && token === renderToken) setSize(result.size);
   }
 
   // ---- 开关与切换 ----
