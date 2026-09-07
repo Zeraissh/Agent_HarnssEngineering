@@ -5,3 +5,9 @@ dist-electron/
 *.local
 android/app/src/main/assets/public/
 android/app/src/main/assets/capacitor.config.json
+# UI 静态副本由 scripts/sync-ui.mjs 从 ../ui/public 同步生成（dev/build/test 前自动执行），不进 git
+/index.html
+/app.js
+/styles.css
+/core/
+/dom/

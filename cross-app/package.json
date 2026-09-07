@@ -6,9 +6,13 @@
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
+    "sync:ui": "node scripts/sync-ui.mjs",
+    "predev": "npm run sync:ui",
     "dev": "vite",
+    "prebuild": "npm run sync:ui",
     "build": "vite build",
     "preview": "vite preview",
+    "pretest": "npm run sync:ui",
     "test": "vitest run",
     "desktop": "electron .",
     "host:stage": "node scripts/stage-host-runtime.mjs",
