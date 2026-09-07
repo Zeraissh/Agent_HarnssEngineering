@@ -354,6 +354,14 @@ export interface AgentConfig {
    * SAFE-06：宿主事务控制器（查表 + prepared 落盘）。Web 注入；CLI Phase 1 可省略持久化。
    */
   toolTx?: import("./tool-tx.js").ToolTxController;
+  /**
+   * 信息队列·插队指令注入口：宿主推入、loop 在**每次模型调用前** drain。
+   * 每条经 appendControlMessage 并入末条 user 消息（避免连续两条 user 的兼容性问题），
+   * 并逐条发射 `steering` 事件——事件流必须如实记录"人在运行中改了指令"。
+   * 与 abort 的语义分界：abort 是收手，steering 是带着新指令继续思考。
+   * drain 必须是**取空**语义（读后即清）；没赶上的由宿主在收尾时并入追加轮。
+   */
+  steering?: { drain(): string[] };
 }
 
 export interface AggregateUsage {
@@ -579,4 +587,10 @@ export type TurnEvent =
    * 于是运行过程中完全看不见。redacted = 服务端加密的思考，内容取不到但事实要可见。
    */
   | { type: "assistant_thinking"; turn: number; text: string; redacted: boolean }
+  /**
+   * 信息队列·插队指令已注入正史。loop 在模型调用前 drain 宿主 steering 队列时
+   * 逐条发射，text 是委托方原话。它在事件流里的位置 = 指令生效的位置
+   * （下一轮模型调用之前），UI 据此把它画成带「插队指令」标注的用户气泡。
+   */
+  | { type: "steering"; text: string }
   | { type: "done"; result: AgentRunResult };

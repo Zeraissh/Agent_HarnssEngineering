@@ -572,6 +572,21 @@ export class AgentLoop {
           return finish("budget_exhausted");
         }
 
+        /**
+         * 信息队列·插队：宿主在运行中推入的指令，在这里（下一轮模型请求构建之前）
+         * 并入正史——agent 带着新指令重新思考。位置刻意排在所有"本轮不再发请求"
+         * 的出口（abort / 预算 / 轮次收口）之后：drain 是取空语义，先取后被收口
+         * 截断的话，这条指令就只进了正史却永远没交给模型，宿主那边还以为已注入。
+         * 没排到这个点的余量留在宿主队列里，收尾时并入追加轮——消息不丢。
+         */
+        const steered = this.cfg.steering?.drain();
+        if (steered?.length) {
+          for (const text of steered) {
+            appendControlMessage(text);
+            q.push({ type: "steering", text });
+          }
+        }
+
         turn += 1;
         q.push({ type: "turn_start", turn });
 

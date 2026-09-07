@@ -217,6 +217,10 @@
         <i class="ph ph-caret-down knobs-caret" aria-hidden="true"></i>
       </button>
     </div>
+    <!-- 信息队列：运行中收到的排队消息以 chips 呈现在输入行上方；
+         内容全部由 message_queued / message_queue_updated 事件重放长出（renderQueueChips）。
+         不能放进 .composer-input-row——它是 flex 行，chips 会被挤成内联一员 -->
+    <div id="queue-chips" class="queue-chips" hidden></div>
     <div class="composer-input-row">
     <!-- 文案由 patchComposer 按模式改写（「任务描述」↔「追加指令」）。
          for/id 不许动：整页 axe 与文案闸门都钉着这一对。 -->
@@ -231,6 +235,16 @@
       <i class="ph ph-paperclip" aria-hidden="true"></i>
       <span>附件</span>
     </label>
+    <!-- 信息队列：运行中亮出的两个动作（patchComposer 按模式显隐）。
+         主按钮此时是「停止」——三个键各司其职，互不兼任。 -->
+    <button type="button" class="btn btn--ghost queue-action" id="steer-btn" hidden>
+      <i class="ph ph-lightning" aria-hidden="true"></i>
+      <span>插队重想</span>
+    </button>
+    <button type="button" class="btn btn--ghost queue-action" id="queue-btn" hidden>
+      <i class="ph ph-queue" aria-hidden="true"></i>
+      <span>排队等待</span>
+    </button>
     <button type="submit" class="btn btn--primary submit-btn" id="submit-btn">
       <span id="submit-btn-label">运行任务</span>
       <i class="ph ph-paper-plane-right" aria-hidden="true"></i>
@@ -348,6 +362,7 @@ import {
   buildFollowUpRequest,
   mergeForkedFollowUp,
   patchComposer,
+  renderQueueChips,
   shouldShowReconnecting,
   deriveScrollNav,
   paceReveal,
@@ -670,6 +685,9 @@ const submitForm = /** @type {HTMLFormElement} */ (document.getElementById("subm
 const taskInput = /** @type {HTMLTextAreaElement} */ (document.getElementById("task-input"));
 const verifyToggle = /** @type {HTMLInputElement} */ (document.getElementById("verify-toggle"));
 const submitBtn = /** @type {HTMLButtonElement} */ (document.getElementById("submit-btn"));
+const steerBtn = /** @type {HTMLButtonElement} */ (document.getElementById("steer-btn"));
+const queueBtn = /** @type {HTMLButtonElement} */ (document.getElementById("queue-btn"));
+const queueChips = /** @type {HTMLElement} */ (document.getElementById("queue-chips"));
 const submitError = /** @type {HTMLElement} */ (document.getElementById("submit-error"));
 const themeToggle = /** @type {HTMLButtonElement} */ (document.getElementById("theme-toggle"));
 const themePicker = /** @type {HTMLElement} */ (document.getElementById("theme-picker"));
@@ -1191,6 +1209,78 @@ function syncComposer() {
     error: newRunError ?? (selectedRunId ? followUpErrors.get(selectedRunId) ?? null : null),
   });
   patchComposer(composerMode);
+  syncQueueChips();
+}
+
+// ---- 信息队列（运行中插队 / 排队）----
+/**
+ * 排队 chips 与事件重放同步。数据唯一来源是 runStates 里的 queuedMessages
+ * （由 message_queued / message_queue_updated 长出）——这里不做任何本地增删，
+ * 取消成功也以服务端推回的 message_queue_updated 为准，两处事实永不打架。
+ */
+function syncQueueChips() {
+  const state = selectedRunId ? runStates.get(selectedRunId) : null;
+  const html = renderQueueChips(state?.queuedMessages ?? []);
+  queueChips.innerHTML = html;
+  queueChips.hidden = !html;
+}
+
+/**
+ * 运行中发消息：插队（下一轮模型调用前注入正史）或排队（本轮结束自动续跑）。
+ * 服务端 202 = 已受理；消息何时生效由随后推来的 steering / user_message 事件宣告。
+ */
+async function postRunningMessage(qMode) {
+  const runId = composerMode?.runId;
+  const text = taskInput.value.trim();
+  if (!runId) return;
+  if (!text) {
+    announceStatus("先输入指令内容再发送");
+    return;
+  }
+  try {
+    const res = await fetch(`/api/runs/${encodeURIComponent(runId)}/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, mode: qMode }),
+    });
+    if (!res.ok) {
+      const b = await res.json().catch(() => ({}));
+      showSubmitError(b.error ?? `发送失败（HTTP ${res.status}）`);
+      return;
+    }
+    taskInput.value = "";
+    clearUploads();
+    announceStatus(qMode === "steer" ? "已插队，将在下一轮模型调用前生效" : "已排队，本轮结束后自动发送");
+  } catch (err) {
+    showSubmitError(`发送失败：${err.message ?? "网络错误"}`);
+  }
+}
+
+steerBtn.addEventListener("click", () => void postRunningMessage("steer"));
+queueBtn.addEventListener("click", () => void postRunningMessage("queue"));
+
+/** chips 的 ✕：取消单条排队消息（事件委托，chip 每次同步都会重建） */
+queueChips.addEventListener("click", (e) => {
+  const btn = /** @type {HTMLElement|null} */ (e.target)?.closest?.(".queue-chip-cancel");
+  if (!btn || !selectedRunId) return;
+  void cancelQueuedMessage(selectedRunId, Number(btn.dataset.index));
+});
+
+async function cancelQueuedMessage(runId, index) {
+  try {
+    const res = await fetch(`/api/runs/${encodeURIComponent(runId)}/queue`, {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ index }),
+    });
+    if (!res.ok) {
+      const b = await res.json().catch(() => ({}));
+      showSubmitError(b.error ?? `取消失败（HTTP ${res.status}）`);
+    }
+    // 成功路径不本地改 chips：等服务端 message_queue_updated 推回来（唯一事实源）
+  } catch (err) {
+    showSubmitError(`取消失败：${err.message ?? "网络错误"}`);
+  }
 }
 
 async function postFollowUp(runId, text, verify) {

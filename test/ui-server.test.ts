@@ -7094,10 +7094,12 @@ describe("监控闭环：outcome 分档指标与告警文件一致性", () => {
     }
   });
 
-  it("并发双 followUp：readBody 期间 run 被另一条置回 running → 复查 409", async () => {
+  it("并发双 followUp：readBody 期间 run 被另一条置回 running → 复查入队 202（信息队列）", async () => {
     // 评审双镜头独立抓出的 real-bug：状态门在 await readBody 之前查过一次，
     // await 期间另一条 followUp 把 run 置回 running——不复查的话同一 AgentLoop
     // 会被两条 continuation 并发驱动，且资源门因同 holder 幂等拦不住。
+    // 信息队列之后，复查点不再是 409：与主门同口径按 queue 入队（202），
+    // 消息落 message_queued 事件等本轮结束自动续跑——绝不并发驱动，也绝不丢。
     // 竞态窗口用 chunked POST 确定性构造：B 先送请求头（预检通过、停在
     // readBody 等 body）→ A 完整发出且续跑挂在审批上（status=running）→
     // 再补 B 的 body——复查点必然看到 running。
@@ -7126,10 +7128,15 @@ describe("监控闭环：outcome 分档指标与告警文件一致性", () => {
         method: "POST",
         headers: { "Content-Type": "application/json", "Transfer-Encoding": "chunked" },
       });
-      const slowResponse = new Promise<number>((resolveStatus, reject) => {
+      const slowResponse = new Promise<{ status: number; body: any }>((resolveResp, reject) => {
         slow.on("response", (r) => {
-          r.resume();
-          resolveStatus(r.statusCode!);
+          let raw = "";
+          r.on("data", (c) => (raw += c));
+          r.on("end", () => {
+            let body: any = null;
+            try { body = JSON.parse(raw); } catch { /* 非 JSON 也接受 */ }
+            resolveResp({ status: r.statusCode!, body });
+          });
         });
         slow.on("error", reject);
       });
@@ -7144,9 +7151,17 @@ describe("监控闭环：outcome 分档指标与告警文件一致性", () => {
       });
       expect(a.status).toBe(200);
 
-      // 补 B 的 body：readBody 返回后复查必须抓到 running
+      // 补 B 的 body：readBody 返回后复查抓到 running → 入队而不是 409、而不是并发续跑
       slow.end(JSON.stringify({ text: "后到的一条" }));
-      expect(await slowResponse).toBe(409);
+      const bResp = await slowResponse;
+      expect(bResp.status).toBe(202);
+      expect(bResp.body).toMatchObject({ runId, mode: "queue", queued: 1 });
+
+      // 队列事件进了 durable 流；A 的续跑仍挂审批（没有被第二条并发驱动）
+      const events = await readSSESnapshot(base, runId);
+      const queued = events.filter((e: any) => e.event.type === "message_queued");
+      expect(queued.map((e: any) => e.event.text)).toEqual(["后到的一条"]);
+      expect(events.some((e: any) => e.event.type === "approval_request")).toBe(true);
     } finally {
       await handle.close();
       await rm(dir, { recursive: true, force: true });

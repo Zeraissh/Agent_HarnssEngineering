@@ -430,6 +430,17 @@ interface StoredRun {
    */
   loop?: AgentLoop;
   history?: Anthropic.MessageParam[];
+  /**
+   * 信息队列·排队指令（委托方："等队列结束后再发送"）。运行中收到、本轮结束后
+   * 由宿主拼成一条自动续跑（见 finalizeRun 尾部的 flushQueuedMessagesAfterDone）。
+   * 崩溃恢复由 events.jsonl 里的 message_queued / message_queue_updated 重放重建。
+   */
+  messageQueue?: string[];
+  /**
+   * 信息队列·插队指令（"插队重新让 agent 思考"）。loop 在下一次模型调用前
+   * drain 进正史；本轮没赶上的余量在收尾时并入自动续跑——消息不丢。
+   */
+  steeringQueue?: string[];
   /** 已进行的对话轮数（第 1 轮 = 建 run 时那次提交） */
   conversationTurn: number;
   /** V-29：本次运行的工作目录（工具写入圈禁根），必来自白名单 */
@@ -1724,6 +1735,25 @@ function serializeEvent(
 }
 
 /**
+ * 信息队列的崩溃恢复重建：message_queued(mode:"queue") 追加、
+ * message_queue_updated 整表替换（含自动续跑成功后的清空）——重放结束的
+ * pending 就是崩溃那一刻仍排队的消息。steer 已注入正史的不可撤，不在此重建。
+ */
+export function rebuildMessageQueue(events: ReadonlyArray<{ event: unknown }>): string[] {
+  const pending: string[] = [];
+  for (const e of events) {
+    const ev = e.event as { type?: string; mode?: string; text?: unknown; pending?: unknown } | undefined;
+    if (ev?.type === "message_queued" && ev.mode === "queue" && typeof ev.text === "string") {
+      pending.push(ev.text);
+    } else if (ev?.type === "message_queue_updated" && Array.isArray(ev.pending)) {
+      pending.length = 0;
+      pending.push(...ev.pending.map(String));
+    }
+  }
+  return pending;
+}
+
+/**
  * 产物预览的 MIME。只列真的会被生成出来的那几类；认不出的一律
  * `application/octet-stream` + nosniff —— 让浏览器下载而不是猜着执行。
  */
@@ -2676,6 +2706,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           },
         });
       }
+      // 信息队列重建：message_queued(mode:queue) 追加、message_queue_updated 整表
+      // 替换——重放结束时的 pending 就是崩溃时刻仍排队的消息，刷新后 chips 不丢。
+      run.messageQueue = rebuildMessageQueue(run.events);
     })().catch(() => {
       // 读盘失败：events/transcript 留空，列表元数据仍可用
     });
@@ -3905,6 +3938,152 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   }
 
   /**
+   * 信息队列·运行中入口（followUp 路由的主门与 readBody 后的复查共用）。
+   * steer = 插队（loop 下一轮模型调用前 drain 进正史）；queue = 排队（本轮
+   * 结束后自动续跑）。两条都落 message_queued durable 事件——刷新 / 崩溃
+   * 重放后队列状态不丢。202：已受理，本轮内不作为独立对话轮执行。
+   */
+  function enqueueRunningMessage(
+    res: ServerResponse,
+    run: StoredRun,
+    text: string,
+    qMode: "steer" | "queue",
+  ): void {
+    const queue = qMode === "steer" ? (run.steeringQueue ??= []) : (run.messageQueue ??= []);
+    queue.push(text);
+    pushSyntheticEvent(run, "host", { type: "message_queued", mode: qMode, text, at: Date.now() });
+    json(res, 202, { runId: run.id, mode: qMode, queued: queue.length });
+  }
+
+  /**
+   * 续跑前的谱系预算处置——followUp 路由与"排队自动续跑"共用同一口径：
+   * 逐 run 显式关掉谱系预算的只留账（used）；额度已尽的当场续一段跑道再放行
+   * （重启没配 env 也洗不掉旧上限，耗尽不再是死路）。
+   */
+  function prepareLineageBudgetForContinuation(run: StoredRun): void {
+    if (!run.checkpoint?.runBudget) return;
+    if (run.lineageBudget === false) {
+      // 逐 run 显式关掉谱系预算：只留账（used），不带上限
+      const stripped = {
+        usedTurns: run.checkpoint.runBudget.usedTurns,
+        usedTokens: run.checkpoint.runBudget.usedTokens,
+      };
+      run.checkpoint = { ...run.checkpoint, runBudget: stripped };
+      if (run.durableState?.budget) {
+        run.durableState = {
+          ...run.durableState,
+          budget: { ...stripped } as typeof run.durableState.budget,
+        };
+      }
+      run.resumeBudget = { ...stripped };
+      return;
+    }
+    const slice = autoExtendIfExhausted(run.checkpoint.runBudget, {
+      addTokens: maxTokensBudget ?? 2_000_000,
+      addTurns: maxTotalTurns ?? 40,
+    });
+    if (slice.extended) {
+      run.checkpoint = { ...run.checkpoint, runBudget: slice.budget };
+      if (run.durableState?.budget) {
+        run.durableState = {
+          ...run.durableState,
+          budget: { ...slice.budget } as typeof run.durableState.budget,
+        };
+      }
+      run.resumeBudget = { ...slice.budget };
+    }
+  }
+
+  /**
+   * 排队消息的自动续跑内部入口（T9 同款纪律：与 followUp 路由的活 run 分支
+   * 共用全部闸门语义——预算续跑道 / 执行健康 / 日预算 / 并发准入 / 独占资源 /
+   * workdir 冲突），差别只是没有 res 可写：拒绝以返回值告知调用方，由它把
+   * 消息放回队列（不丢）。核查 / 编排沿用该 run 上一轮自己的设置（run.verify），
+   * 与缺省 followUp（不带逐轮开关）同口径。
+   */
+  async function followUpLiveRunInternal(
+    run: StoredRun,
+    text: string,
+  ): Promise<{ ok: true } | { ok: false; error: string }> {
+    if (run.archived || run.status !== "done") {
+      return { ok: false, error: "run 不在可续跑状态（已归档或仍在运行）" };
+    }
+    prepareLineageBudgetForContinuation(run);
+    // 与路由同序：执行健康先于日预算，日预算先于并发准入（拒因更具体的先说）
+    await refreshExecutionHealth(true);
+    if (!executionHealthy) {
+      return {
+        ok: false,
+        error: `Required command isolation is unavailable: ${processExecutionStatus.probe.reason ?? "backend probe failed"}`,
+      };
+    }
+    if (run.dailyBudget !== false) {
+      const budgetRefusal = dailyBudgetRefusal();
+      if (budgetRefusal) {
+        return { ok: false, error: `日 token 预算已用尽（${budgetRefusal.used}/${budgetRefusal.budget}）` };
+      }
+    }
+    const releaseAdmission = acquireRunAdmission();
+    if (!releaseAdmission) return { ok: false, error: "并发容量已满" };
+    try {
+      const resumePack = run.packName ? getPack(run.packName) : pack;
+      const resumeResources = resumePack?.resources ?? [];
+      const resourceOutcome = tryAcquireRunResources(run.id, resumeResources);
+      if (resourceOutcome !== "acquired") {
+        return {
+          ok: false,
+          error: `Exclusive resource "${resourceOutcome.conflict}" is held by run ${resourceOutcome.heldBy}`,
+        };
+      }
+      const workdirRejection = sharedWorkdirRejection(run.id, run.workdir ?? workdir);
+      if (workdirRejection) {
+        hostResources.release(resumeResources, run.id);
+        return { ok: false, error: `Workdir is in use by running run ${workdirRejection.conflictRunId}` };
+      }
+      if (resumeResources.length) run.heldResources = resumeResources;
+      if (realHost) {
+        operationalLog("info", "run_started", {
+          runId: run.id,
+          mode: run.mode ?? "single",
+          verify: run.verify,
+          continuation: "queued",
+        });
+      }
+      void withFallbackAttribution(run, () =>
+        startConversationTurn(run, text, { verify: run.verify }),
+      );
+      return { ok: true };
+    } finally {
+      releaseAdmission();
+    }
+  }
+
+  /**
+   * 信息队列收尾（finalizeRun 的唯一自动续跑挂钩）：本轮结束后把排队指令
+   * 拼成一条（'\n\n' 连接）自动续跑；steeringQueue 里没来得及注入的余量
+   * 也并入——**消息不许丢**。续跑被闸门拒绝时消息放回队列并发
+   * message_queue_updated，界面上的排队 chips 原样回来，人再决定重发或取消。
+   */
+  async function flushQueuedMessagesAfterDone(run: StoredRun): Promise<void> {
+    const queued = (run.messageQueue ?? []).splice(0);
+    const steerLeftover = (run.steeringQueue ?? []).splice(0);
+    const parts = [...queued, ...steerLeftover];
+    if (!parts.length) return;
+    const result = await followUpLiveRunInternal(run, parts.join("\n\n"));
+    if (result.ok) {
+      pushSyntheticEvent(run, "host", { type: "message_queue_updated", pending: [], at: Date.now() });
+      return;
+    }
+    run.messageQueue = parts;
+    pushSyntheticEvent(run, "host", {
+      type: "message_queue_updated",
+      pending: [...parts],
+      sendError: result.error,
+      at: Date.now(),
+    });
+  }
+
+  /**
    * 标记 run 完成并关闭所有 SSE 连接。
    *
    * 顺序是契约的一部分：先把仍挂起的审批逐条宣告过期，再发 run_end，最后才断流。
@@ -4148,6 +4327,21 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       run.archiveWriter.schedule(() => pruneHistory(historyRoot, historyKeep, running));
     }
     pruneStoredRuns();
+
+    /**
+     * 信息队列：本轮正常收尾后把排队指令自动续跑（steer 余量一并并入）。
+     * closed（宿主关停）不续——那不是 run 自己跑完，是进程要没了。
+     * 放在收尾**最后**：flush 内部会把 run 重新置回 running 并开启新一轮，
+     * 上面的台账 / 档案修剪都必须还按"这一轮已结束"的口径记。
+     */
+    if (endInfo.outcome !== "closed") {
+      void flushQueuedMessagesAfterDone(run).catch((error) => {
+        operationalLog("warn", "queue_flush_failed", {
+          runId: run.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }
   }
 
   /** 启动一次不带核查的运行 */
@@ -4163,6 +4357,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     }
     applyDurableTransition(run, { type: "start" });
     const cfg = await buildRunConfig(run);
+    // 信息队列·插队：drain 直接读 run 上的队列（取空语义），loop 在每次模型调用前取
+    cfg.steering = { drain: () => (run.steeringQueue ?? []).splice(0) };
     // V-28：实例留给后续对话轮复用——重建的话 ContextManager 的 lastInputTokens
     // 归零，续跑第一轮的压缩判据会失准
     const loop = new AgentLoop(cfg, modelClient);
@@ -4366,6 +4562,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       return;
     }
     const cfg = await buildRunConfig(run);
+    // 信息队列·插队：drain 直接读 run 上的队列（取空语义）；核查轮由
+    // runVerifiedTurn 自己挂（核查者的配置必须在 orchestrate 里剥掉它）
+    cfg.steering = { drain: () => (run.steeringQueue ?? []).splice(0) };
 
     if (turn.verify) {
       // 核查者核查的是本轮指令（原任务只作背景）；执行者在正史上续跑或从头开一轮
@@ -4886,6 +5085,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     }
     applyDurableTransition(run, { type: "start" });
     const cfg = await buildRunConfig(run);
+    // 信息队列·插队（核查轮同口径；核查者的配置在 orchestrate 里被剥掉这个钩子）
+    cfg.steering = { drain: () => (run.steeringQueue ?? []).splice(0) };
     await runVerifiedTurn(run, cfg, run.task);
   }
 
@@ -5672,6 +5873,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     | { type: "stop"; runId: string }
     | { type: "deleteRun"; runId: string }
     | { type: "followUp"; runId: string }
+    | { type: "messageQueue"; runId: string }
     | { type: "extendBudget"; runId: string }
     | { type: "upload" }
     | { type: "createRun" }
@@ -5801,6 +6003,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     const followUpMatch = method === "POST" && url.match(/^\/api\/runs\/([^/]+)\/messages$/);
     if (followUpMatch) {
       return { type: "followUp", runId: followUpMatch[1]! };
+    }
+
+    // 信息队列：取消排队中的消息。body 可带 { index } 取消单条；空 body = 清空整队
+    const queueMatch = method === "DELETE" && url.match(/^\/api\/runs\/([^/]+)\/queue$/);
+    if (queueMatch) {
+      return { type: "messageQueue", runId: queueMatch[1]! };
     }
 
     const extendBudgetMatch = method === "POST" && url.match(/^\/api\/runs\/([^/]+)\/extend-budget$/);
@@ -6811,8 +7019,40 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         const run = runs.get(route.runId);
         if (!run) return notFound(res, `Run not found: ${route.runId}`);
 
+        /**
+         * 信息队列（委托方："可以选择插队重新让 agent 重新思考，或者等待队列结束后再发送"）：
+         * 运行中**不再 409**——按请求体 mode 二选一：
+         *   · "steer"：进 steeringQueue，loop 在下一次模型调用前注入正史（插队重想）；
+         *   · "queue"（缺省）：进 messageQueue，本轮结束后由宿主拼成一条自动续跑。
+         * 两条都落 message_queued durable 事件——刷新 / 崩溃重放后队列状态不丢。
+         * 编排类选项（planMode / multiAgent / mode:"plan"）只能开启新的一轮，
+         * 运行中塞不进去，当场 400 说清楚，不静默降级成普通排队。
+         */
+        if (!run.archived && run.status === "running") {
+          let earlyBody: string;
+          try {
+            earlyBody = await readBody(req, requestBodyMaxBytes);
+          } catch (error) {
+            return requestBodyFailure(res, error);
+          }
+          let earlyParsed: { text?: unknown; mode?: unknown };
+          try {
+            earlyParsed = JSON.parse(earlyBody);
+          } catch {
+            return badRequest(res, "Invalid JSON body");
+          }
+          if (typeof earlyParsed.text !== "string" || !earlyParsed.text.trim()) {
+            return badRequest(res, 'Missing or invalid "text" field');
+          }
+          const earlyMode = earlyParsed.mode ?? "queue";
+          if (earlyMode !== "steer" && earlyMode !== "queue") {
+            return badRequest(res, '运行中 mode 只接受 "steer"（插队重想）或 "queue"（排队等待，缺省）；编排模式的追加请等本轮结束');
+          }
+          return enqueueRunningMessage(res, run, earlyParsed.text.trim(), earlyMode);
+        }
+
         // 会话中心化（委托方："对话一出错就只能新开，为什么不能一直用"）：
-        // 一场对话只会被两件事挡住——**这一轮还在跑**，或**执行谱系预算耗尽**
+        // 一场对话只会被两件事挡住——**这一轮还在跑**（上方已转为入队），或**执行谱系预算耗尽**
         // （文案说清哪个预算、怎么提）。核查 / 编排 / 执行阶段就失败 / 归档无
         // 检查点，都不再是 409：封的是裁决的适用范围（裁决带 judgedTurn 只对它
         // 核查的那一轮负责），不是对话本身。归档仍受宿主边界约束（包 / 白名单 / 预算）。
@@ -6820,43 +7060,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           const blockReason = archivedForkBlockReason(run);
           if (blockReason) return json(res, 409, { error: blockReason });
         } else {
-          if (run.status === "running") {
-            return json(res, 409, { error: "运行进行中，请等它这一轮结束再追加指令" });
-          }
-          if (run.checkpoint?.runBudget) {
-            if (run.lineageBudget === false) {
-              // 逐 run 显式关掉谱系预算：只留账（used），不带上限
-              const stripped = {
-                usedTurns: run.checkpoint.runBudget.usedTurns,
-                usedTokens: run.checkpoint.runBudget.usedTokens,
-              };
-              run.checkpoint = { ...run.checkpoint, runBudget: stripped };
-              if (run.durableState?.budget) {
-                run.durableState = {
-                  ...run.durableState,
-                  budget: { ...stripped } as typeof run.durableState.budget,
-                };
-              }
-              run.resumeBudget = { ...stripped };
-            } else {
-              // 额度已尽就当场续一段跑道再放行——重启没配 env 也洗掉不旧上限，
-              // 耗尽不再是死路（autoExtendIfExhausted）
-              const slice = autoExtendIfExhausted(run.checkpoint.runBudget, {
-                addTokens: maxTokensBudget ?? 2_000_000,
-                addTurns: maxTotalTurns ?? 40,
-              });
-              if (slice.extended) {
-                run.checkpoint = { ...run.checkpoint, runBudget: slice.budget };
-                if (run.durableState?.budget) {
-                  run.durableState = {
-                    ...run.durableState,
-                    budget: { ...slice.budget } as typeof run.durableState.budget,
-                  };
-                }
-                run.resumeBudget = { ...slice.budget };
-              }
-            }
-          }
+          prepareLineageBudgetForContinuation(run);
         }
 
         let body: string;
@@ -6914,9 +7118,16 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         // 状态门在 readBody 之前查过一次——await 期间另一条并发 followUp 可能
         // 已把 run 置回 running。不复查的话同一 AgentLoop 会被两条 continuation
         // 并发驱动（资源门因同 holder 幂等恰好拦不住），先收尾的一段还会把
-        // 在用探针提前释放（评审 de6ddef 双镜头各自独立抓出的 real-bug）
+        // 在用探针提前释放（评审 de6ddef 双镜头各自独立抓出的 real-bug）。
+        // 信息队列之后这里也不再 409：与主门同口径按 mode 入队（编排类选项
+        // 塞不进在跑的一轮，那条路径在 readBody 前的 400 已经说清了——能走到
+        // 这儿的编排请求同样拒绝，不静默降级）。
         if (!run.archived && run.status === "running") {
-          return json(res, 409, { error: "运行进行中，请等它这一轮结束再追加指令" });
+          if (turnOrchestrate) {
+            return json(res, 409, { error: "运行进行中，编排模式的追加请等本轮结束（或改用排队/插队）" });
+          }
+          const raceMode = parsed.mode === "steer" ? "steer" : "queue";
+          return enqueueRunningMessage(res, run, feedback, raceMode);
         }
         // 续跑也是新的执行 segment：绕过 createRun 路由不等于绕过隔离准入。
         await refreshExecutionHealth(true);
@@ -7147,6 +7358,53 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           continuationMode: "same",
           run: runSummary(run),
         });
+      }
+
+      /**
+       * 信息队列：取消排队中的消息。body 带 { index } 取消单条，空 body = 清空整队。
+       * 只管 messageQueue——steer 已注入的不可撤（它可能已进正史并发射了 steering
+       * 事件，假装能撤就是界面说谎）。变更落 message_queue_updated durable 事件，
+       * 刷新 / 重放后排队的终态由最后一条整表替换决定。
+       */
+      case "messageQueue": {
+        const run = runs.get(route.runId);
+        if (!run) return notFound(res, `Run not found: ${route.runId}`);
+        let rawBody = "";
+        try {
+          rawBody = await readBody(req, requestBodyMaxBytes);
+        } catch (error) {
+          return requestBodyFailure(res, error);
+        }
+        let index: number | undefined;
+        if (rawBody.trim()) {
+          let parsedQueue: { index?: unknown };
+          try {
+            parsedQueue = JSON.parse(rawBody);
+          } catch {
+            return badRequest(res, "Invalid JSON body");
+          }
+          if (parsedQueue.index !== undefined) {
+            if (!Number.isInteger(parsedQueue.index)) {
+              return badRequest(res, '"index" 必须是整数');
+            }
+            index = parsedQueue.index as number;
+          }
+        }
+        const queue = (run.messageQueue ??= []);
+        if (index !== undefined) {
+          if (index < 0 || index >= queue.length) {
+            return badRequest(res, `index ${index} 超出排队范围（当前 ${queue.length} 条）`);
+          }
+          queue.splice(index, 1);
+        } else {
+          queue.length = 0;
+        }
+        pushSyntheticEvent(run, "host", {
+          type: "message_queue_updated",
+          pending: [...queue],
+          at: Date.now(),
+        });
+        return json(res, 200, { runId: run.id, pending: [...queue] });
       }
 
       case "transcript": {

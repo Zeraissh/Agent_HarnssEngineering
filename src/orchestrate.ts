@@ -306,8 +306,11 @@ async function runVerifierWithEvents(
         // 独立核查模型 = 另一个端点：它撞的 400 说的是它自己的窗口，不能记到执行者身上
         ...withoutContextWindowLearner(cfg),
         ...(opts.verifierModel.compat !== undefined ? { compat: opts.verifierModel.compat } : {}),
+        // 插队指令只属于执行者谱系：核查者是全新上下文的独立复核，若它触发 drain，
+        // 人的指令会被写进核查正史——核查对象里没有它，执行者反而永远收不到。
+        steering: undefined,
       }
-    : cfg;
+    : { ...cfg, steering: undefined };
   // verifier 的过程事件（工具调用/复核）经 onEvent 下沉透出，宿主可见其独立核查过程；
   // 但压掉 verifier 的最终 assistant_text（裁决 JSON 是内部契约，不直接展示给用户）。
   const outcome = await runVerifier(

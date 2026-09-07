@@ -179,6 +179,11 @@ export function createInitialState(runId, task, verify, metadata = {}) {
     conversationTurn: 1,
     /** 执行者 update_progress 整表；null = 还没拆过步 */
     progressItems: null,
+    /**
+     * 信息队列·排队中的消息（来自 message_queued / message_queue_updated 事件重放）。
+     * composer 上方的 chips 唯一数据源；插队（steer）不可撤，不进这里。
+     */
+    queuedMessages: [],
   };
 }
 
@@ -537,6 +542,37 @@ export function reduceEvent(state, sseEvent) {
         // 门开着时这份计划还在等签字，界面不能显得像已经在跑
         gated: Boolean(event.gated),
       },
+    };
+  }
+  // ---- 信息队列（运行中插队 / 排队）。三条都是 durable 合成事件，重连重放即复原 ----
+  if (type === "message_queued") {
+    const mode = event.mode === "steer" ? "steer" : "queue";
+    const text = String(event.text ?? "");
+    return {
+      ...state,
+      // 排队消息进 chips（可取消）；插队不进——它可能下一瞬就注入正史，不可撤
+      queuedMessages: mode === "queue" && text ? [...state.queuedMessages, text] : state.queuedMessages,
+      timeline: [...state.timeline, { seq, source, type: "message_queued", mode, text }],
+    };
+  }
+  if (type === "message_queue_updated") {
+    // 整表替换是队列终态的唯一权威（取消 / 自动续跑成功后的清空 / 被拒后的还原），
+    // 比逐条增删幂等——重放两遍长出同一份状态
+    const sendError = typeof event.sendError === "string" ? event.sendError : null;
+    return {
+      ...state,
+      queuedMessages: Array.isArray(event.pending) ? event.pending.map(String) : [],
+      timeline: sendError
+        ? [...state.timeline, { seq, source, type: "message_queue_updated", sendError }]
+        : state.timeline,
+    };
+  }
+  if (type === "steering") {
+    // loop 把插队指令并入正史时发射；事件位置 = 指令生效位置（下一轮模型调用之前）。
+    // 画成带「插队指令」标注的用户气泡，与普通追加指令区分（渲染分支认 type）
+    return {
+      ...state,
+      timeline: [...state.timeline, { seq, source, type: "steering", text: String(event.text ?? "") }],
     };
   }
   // ---- 计划确认门（§5.1）。三条事件都是 durable 合成事件，重连重放即复原 ----
@@ -2194,6 +2230,16 @@ export function patchComposer(mode, root = document) {
     btnIcon.className = `ph ${icon}${stopping || mode.mode === "submitting" ? " is-spinning" : ""}`;
     setAttr(btn, "aria-busy", stopping ? "true" : null);
   }
+  /**
+   * 信息队列（委托方："可以选择插队重新让 agent 重新思考，或者等待队列结束后再发送"）：
+   * 运行中且未在停止中（kind === "stop"）时亮出「插队重想 / 排队等待」两个按钮，
+   * 输入框保持可用（placeholder 本来就邀请"先把下一条指令打好"）。其余模式藏起来——
+   * 非运行态这两个动作没有语义（追加走主按钮），留着只会画出两个必 409 的键。
+   */
+  const queueActionsOn = mode.mode === "running" && mode.kind === "stop";
+  for (const actionBtn of [q("#steer-btn"), q("#queue-btn")]) {
+    if (actionBtn) setAttr(actionBtn, "hidden", queueActionsOn ? null : "");
+  }
   if (modeLabel) {
     const text = {
       new: "新建对话",
@@ -2296,6 +2342,30 @@ export function patchComposer(mode, root = document) {
       delete form.dataset.effortRun;
     }
   }
+}
+
+/**
+ * 排队消息 chips（信息队列）。数据从事件重放长出（state.queuedMessages），
+ * 这里只画：每条一个 chip，带 ✕ 取消（DELETE /api/runs/:id/queue，body {index}）。
+ * 纯函数返回 HTML 字符串；事件绑定在控制器（index.html）用事件委托挂一次。
+ * @param {unknown} queuedMessages
+ * @returns {string} 空串 = 没有排队消息（调用方据此隐藏容器）
+ */
+export function renderQueueChips(queuedMessages) {
+  const items = Array.isArray(queuedMessages) ? queuedMessages.map(String).filter((t) => t.trim()) : [];
+  if (!items.length) return "";
+  return (
+    `<span class="queue-chips-label">排队中 · 本轮结束后自动发送</span>` +
+    items
+      .map(
+        (text, i) =>
+          `<span class="queue-chip" title="${esc(text)}">` +
+          `<span class="queue-chip-text">${esc(truncate(text, 40))}</span>` +
+          `<button type="button" class="queue-chip-cancel" data-index="${i}" aria-label="取消这条排队消息">✕</button>` +
+          `</span>`,
+      )
+      .join("")
+  );
 }
 
 /**
@@ -2438,6 +2508,8 @@ function defaultCollapsed(entry) {
   if (entry.type === "run_resumed") return false;
   // 上下文压缩 → 展开
   if (entry.type === "compaction") return false;
+  // 信息队列：人发出的插队/排队指令 → 展开（这是"我做了什么"，折起来等于藏了变量）
+  if (entry.type === "steering" || entry.type === "message_queued") return false;
   // 其余（turn_start、tool_call、成功 tool_result、assistant_text）→ 折叠
   return true;
 }
@@ -5893,6 +5965,35 @@ export function deriveChatItems(state, live, opts = {}) {
           ...(e.continues ? { continues: e.continues } : {}),
         });
         break;
+      case "steering":
+        // 插队指令：用户气泡 + 「插队指令」标注（renderChatItem 认 steering 位）
+        if (String(e.text ?? "").trim()) {
+          items.push({ kind: "user", text: e.text, seq: e.seq, runId: state.runId ?? null, steering: true });
+        }
+        break;
+      case "message_queued":
+        // 轻提示行：排队的会说"结束后自动发送"，插队的会说"下一轮前生效"
+        items.push({
+          kind: "notice",
+          tone: "queue",
+          text: e.mode === "steer"
+            ? "插队指令已受理，将在下一轮模型调用前生效"
+            : "已排队 · 本轮结束后自动发送",
+          peek: truncate(String(e.text ?? ""), 72),
+          seq: e.seq,
+        });
+        break;
+      case "message_queue_updated":
+        // 队列增减由 chips 呈现；只有"自动续跑被拒"值得在对话里留一行
+        if (e.sendError) {
+          items.push({
+            kind: "notice",
+            tone: "queue",
+            text: `排队消息未能自动发出：${e.sendError}`,
+            seq: e.seq,
+          });
+        }
+        break;
       case "assistant_thinking": {
         // Cursor 式：当前轮进行中只靠 live Thinking；历史轮的思考仍保留。
         // 规划者 / 核查者不进主对话。
@@ -6688,6 +6789,8 @@ export function renderChatItem(it, thinkingOpen = false) {
           .join("");
         html +=
           `<div class="chat-msg chat-msg--user">` +
+          // 信息队列：运行中插队进来的指令，与正常追加区分开——它是"打断当前的思考"
+          (it.steering ? `<div class="chat-msg-tag">插队指令</div>` : "") +
           (thumbs ? `<div class="chat-attach-row">${thumbs}</div>` : "") +
           `<div class="chat-body chat-body--text md">${renderMarkdown(body)}</div></div>`;
         break;
@@ -7507,6 +7610,10 @@ function entryIcon(type, isError) {
     // 与普通警告共用符号会让人对它脱敏
     case "compaction": return "⊟";
     case "user_message": return "✎";
+    // 信息队列：插队是"插到正在想的这一轮前面"，排队是"排在这一轮后面"
+    case "steering": return "⇢";
+    case "message_queued": return "◷";
+    case "message_queue_updated": return "◷";
     default: return "·";
   }
 }
@@ -7547,6 +7654,10 @@ function entryActionLabel(e) {
     case "usage": return "本轮用量";
     case "user_message":
       return `追加指令（第 ${e.turn ?? "?"} 轮对话${e.verify === true ? "，本轮核查" : e.verify === false ? "，本轮不核查" : ""}）`;
+    case "steering": return "插队指令（已注入正在运行的思考）";
+    case "message_queued":
+      return e.mode === "steer" ? "插队指令已受理（下一轮模型调用前生效）" : "指令已排队（本轮结束后自动发送）";
+    case "message_queue_updated": return "排队消息更新";
     default: return e.type;
   }
 }
@@ -7594,6 +7705,12 @@ function entryDetail(e) {
       return e.boundary ?? "";
     case "user_message":
       return truncate(e.text ?? "", 80);
+    case "steering":
+      return truncate(e.text ?? "", 80);
+    case "message_queued":
+      return truncate(e.text ?? "", 60);
+    case "message_queue_updated":
+      return e.sendError ?? "";
     default:
       return "";
   }
