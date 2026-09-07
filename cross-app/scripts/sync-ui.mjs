@@ -17,7 +17,7 @@ const crossRoot = resolve(here, '..');
 const source = resolve(crossRoot, '..', 'ui', 'public');
 
 // 同步清单：ui/public 里 Web UI 的全部静态入口（文件 + 整目录）。
-const ENTRIES = ['index.html', 'app.js', 'styles.css', 'core', 'dom'];
+const ENTRIES = ['index.html', 'app.js', 'styles.css', 'core', 'dom', 'features'];
 
 if (!existsSync(source)) {
   throw new Error(`找不到 UI 事实源目录：${source}（应在仓库根下 ui/public）`);

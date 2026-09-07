@@ -25,6 +25,7 @@ runNpm(['ci', '--omit=dev', '--ignore-scripts'], appRoot);
 const required = [
   'dist/ui/serve.js',
   'dist/ui/history-backup.js',
+  'dist/ui/scheduler.js',
   'node_modules/@anthropic-ai/sdk/package.json',
   'node_modules/openai/package.json',
 ];
