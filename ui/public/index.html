@@ -290,7 +290,15 @@
       </button>
       <span class="knob-hint">当场给谱系加一段 token 跑道，不必改环境变量或重启宿主</span>
     </div>
-    <p id="submit-error" class="inline-error" role="alert" hidden></p>
+    <!-- 瞬态操作错误：当前这次操作失败的反馈，可关闭；
+         它只是控制器状态（newRunError/followUpErrors），不进事件流，
+         历史重放不会让它复活 -->
+    <p id="submit-error" class="inline-error" role="alert" hidden>
+      <span id="submit-error-text" class="inline-error-text"></span>
+      <button type="button" id="submit-error-close" class="btn btn--ghost inline-error-close" aria-label="关闭提示">
+        <i class="ph ph-x" aria-hidden="true"></i>
+      </button>
+    </p>
     <ul id="upload-list" class="upload-list" hidden></ul>
 
     <!-- V-24：harness 的旋钮此前只能靠重启换环境变量。默认折叠，不打扰
@@ -367,6 +375,7 @@ import {
   deriveScrollNav,
   paceReveal,
   revealedWindow,
+  foldLiveDelta,
 } from "/app.js";
 import {
   loadSettings,
@@ -1465,22 +1474,30 @@ const totalsOf = (runId) => liveTotals.get(runId) ?? { think: 0, text: 0 };
  */
 const deltaBatcher = createBatcher((batches) => {
   for (const [runId, chunks] of batches) {
-    const textPart = chunks.filter((c) => c.kind === "text").map((c) => c.text).join("");
-    const thinkPart = chunks.filter((c) => c.kind === "thinking").map((c) => c.text).join("");
-    const totals = { ...totalsOf(runId) };
-    if (thinkPart) {
-      liveThinking.set(runId, (liveThinking.get(runId) ?? "") + thinkPart);
-      totals.think += thinkPart.length;
+    // 逐条按到达顺序折叠（reset 语义在 foldLiveDelta 里，判据只有一份）：
+    // 同一批里 "半截增量 → reset → 重流增量" 也必须折出正确结果，不能按 kind 分组。
+    let acc = {
+      text: liveTexts.get(runId) ?? "",
+      thinking: liveThinking.get(runId) ?? "",
+      thinkTotal: totalsOf(runId).think,
+      textTotal: totalsOf(runId).text,
+    };
+    let resetSeen = false;
+    for (const chunk of chunks) {
+      const next = foldLiveDelta(acc, chunk);
+      resetSeen = resetSeen || next.reset;
+      acc = { text: next.text, thinking: next.thinking, thinkTotal: next.thinkTotal, textTotal: next.textTotal };
     }
-    if (textPart) {
-      liveTexts.set(runId, (liveTexts.get(runId) ?? "") + textPart);
-      totals.text += textPart.length;
-      // 正文一开始流，思考就该让位——它已经想完了。累计也一并归零，
-      // 否则正文的放行额度会被一段早已不显示的思考永久占住
-      liveThinking.delete(runId);
-      totals.think = 0;
+    if (acc.text) liveTexts.set(runId, acc.text); else liveTexts.delete(runId);
+    if (acc.thinking) liveThinking.set(runId, acc.thinking); else liveThinking.delete(runId);
+    liveTotals.set(runId, { think: acc.thinkTotal, text: acc.textTotal });
+    if (resetSeen) {
+      // 重流从第一个字重新开始：放行计数器跟着归零，并立刻重渲染一次——
+      // 失败那次尝试的半截文字不能挂到下一帧（下一条 delta 要等一个重试退避）。
+      revealed.delete(runId);
+      const state = runStates.get(runId);
+      if (state && selectedRunId === runId) renderDetailWithState(state);
     }
-    liveTotals.set(runId, totals);
     if (selectedRunId !== runId) continue;
     startRevealTicker(runId);
   }
@@ -1567,9 +1584,13 @@ const batcher = createBatcher((batches) => {
     // 三者都意味着"正在流入的那段文本"已经不是此刻在发生的事了，让位给
     // 工具标签/最终文本。不在 assistant_text 处清：那条只是把同一段文本
     // 完整地又给了一遍，清了会让直播条闪一下。
+    //
+    // api_retry / model_fallback 也在此清一次：reset 帧（delta 通道）是瞬态的，
+    // 断线重连补缺口时它已经丢了，但这两条 durable 事件会随重放到达——
+    // 不断线期残留在缓冲里的半截文字，全靠这一次清掉才不会和重流拼接。
     for (const item of queue) {
       const t = item?.event?.type;
-      if (t === "turn_start" || t === "tool_call" || t === "done") {
+      if (t === "turn_start" || t === "tool_call" || t === "done" || t === "api_retry" || t === "model_fallback") {
         liveTexts.delete(runId);
         liveThinking.delete(runId);
         liveTotals.delete(runId);
@@ -1643,7 +1664,14 @@ function ensureSubscription(runId) {
   es.addEventListener("delta", (msg) => {
     try {
       const { source, kind, text } = JSON.parse(msg.data);
-      if (source !== "main" || typeof text !== "string" || text === "") return;
+      if (source !== "main") return;
+      // reset：同轮重流（断流重试 / 换端点）前服务端宣告"清缓冲"——
+      // 失败那次尝试流出的半截文字作废，否则重流全文会接在它后面反复生成
+      if (kind === "reset") {
+        deltaBatcher.push(runId, { kind: "reset", text: "" });
+        return;
+      }
+      if (typeof text !== "string" || text === "") return;
       // 思考与正文分两路：混进一条直播条会前言不搭后语
       deltaBatcher.push(runId, { kind: kind === "thinking" ? "thinking" : "text", text });
     } catch {
@@ -2017,6 +2045,25 @@ function showSubmitError(message) {
   newRunError = message || null;
   syncComposer();
 }
+
+/**
+ * 行内错误的关闭按钮（委托方：红字错误出现后无法关闭，一直在原位）。
+ *
+ * 这个显示位共享给两本账：与 run 无关的提交错误（newRunError）和挂在当前
+ * 选中 run 上的追加错误（followUpErrors）——关掉时两本都清，否则关掉一本
+ * 另一本立刻顶上来，等于没关。
+ *
+ * 这些都是**当前操作失败**的瞬态提示：它们只是控制器状态，不进 SSE 事件流，
+ * 刷新/重放不会复活——与事件流里的历史错误记录（tool_result isError 等）
+ * 是两回事，后者是历史事实，不提供关闭。
+ */
+submitError.querySelector("#submit-error-close")?.addEventListener("click", () => {
+  newRunError = null;
+  if (selectedRunId) followUpErrors.delete(selectedRunId);
+  syncComposer();
+  // 按钮随容器一起 hidden 后焦点不能掉回 body——交还输入框（本仓既有纪律）
+  taskInput.focus();
+});
 
 // ---- 全局生命周期流（V-10：取代 3 秒轮询）----
 // 轮询本身不是问题，"每 3 秒整体重建侧栏"才是——实测焦点停在运行项上 3.6 秒后

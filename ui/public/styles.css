@@ -2337,6 +2337,14 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
   font-size: var(--font-md);
   color: var(--red);
 }
+/* 文本占满余宽，关闭按钮钉在行尾；按钮本身复用 .btn--ghost 的令牌配色 */
+.inline-error-text { flex: 1 1 auto; }
+.inline-error-close {
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding: 2px 8px;
+  line-height: 1;
+}
 
 @media (max-width: 700px) {
   body {
@@ -3716,13 +3724,14 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
 /* 整项轻微提亮，扫视时不必逐个找那颗星 */
 .run-item--unread .run-item-task { font-weight: 600; }
 
-/* 流式条目：正在长出来的那一段。虚线左边框表示"还没定稿" */
+/* 流式条目：正在长出来的那一段。
+ * 委托方（2026-11）：去掉虚线左边框——直播态的可区分性由打字机光标
+ * （.chat-live-text::after）承担，不再叠加第二条视觉记号。 */
 .chat-msg--live .chat-body,
 .chat-thinking--live .chat-body {
   white-space: pre-wrap;
   word-break: break-word;
 }
-.chat-msg--live { border-left: 2px dashed var(--accent); padding-left: var(--space-sm); }
 .chat-thinking--live > summary { color: var(--text-2); }
 
 .chat-thinking-now {

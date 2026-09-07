@@ -43,6 +43,7 @@ import {
   deriveLoopFace,
   deriveAssemblyBar,
   deriveCostFace,
+  foldLiveDelta,
 } from "../ui/public/app.js";
 import { plannedStopReason } from "../src/orchestrate.js";
 import { STOP_REASONS } from "../src/types.js";
@@ -2349,15 +2350,29 @@ describe("直播条：arrived 必须取自累计计数，不是缓冲长度", ()
   });
 
   it("缓冲与累计都随 delta 全文增长——截尾机制已整体退役（2026-09-07 委托方）", () => {
-    expect(htmlSrc).toContain("totals.think += thinkPart.length");
-    expect(htmlSrc).toContain("totals.text += textPart.length");
+    // 折叠逻辑已收进 app.js 的 foldLiveDelta（判据只有一份，壳里不再各写一份）；
+    // 这里锁的是壳确实走那条纯函数，以及截尾常量没有偷偷复活
+    expect(htmlSrc).toContain("foldLiveDelta(acc, chunk)");
+    expect(htmlSrc).toMatch(/import\s*\{[^}]*foldLiveDelta[^}]*\}\s*from\s*"\/app\.js"/s);
     // 正文与思考两个缓冲都不许砍头：点开思考读到一半开头被删掉就是这条没守住
     expect(htmlSrc).not.toMatch(/const\s+LIVE_(TEXT|THINKING)_CAP\s*=/);
     expect(htmlSrc).not.toMatch(/slice\(\s*-\s*LIVE/);
   });
 
-  it("正文接管时思考累计归零——否则正文额度被一段不再显示的思考永久占住", () => {
-    expect(htmlSrc).toContain("totals.think = 0");
+  it("delta 通道的 reset 帧确实进了折叠队列（断流重试的清缓冲信号）", () => {
+    // 服务端在 api_retry / model_fallback 前广播 kind:"reset"（ui-server 测试锁），
+    // 壳这里若把它当坏帧丢掉，直播条照样鬼畜重复——这层接线也要锁住
+    expect(htmlSrc).toContain('kind === "reset"');
+    expect(htmlSrc).toContain('deltaBatcher.push(runId, { kind: "reset"');
+  });
+
+  it("durable 的 api_retry / model_fallback 也清直播缓冲——断线期 reset 帧丢失的兜底", () => {
+    // reset 是瞬态帧，断线重连补缺口时它已经丢了；但这两条 durable 事件会随
+    // 重放到达，是清掉断线期残留半截文字的唯一机会
+    const m = htmlSrc.match(/if \(t === "turn_start"[^)]+\)/);
+    expect(m, "找不到文本阶段边界的清缓冲分支").toBeTruthy();
+    expect(m![0]).toContain('"api_retry"');
+    expect(m![0]).toContain('"model_fallback"');
   });
 
   it("窗口换算走 app.js 的纯函数，不在壳里重写一遍（缺陷分布线）", () => {
@@ -2384,9 +2399,92 @@ describe("直播条：arrived 必须取自累计计数，不是缓冲长度", ()
 });
 
 // ================================================================
-// MODEL-01a · 端点降级事件的投影与派生
+// 直播缓冲折叠（foldLiveDelta）：断流重试重放同一段文字的修复核心
 // ================================================================
 
+describe("foldLiveDelta：直播增量按序折叠", () => {
+  const empty = { text: "", thinking: "", thinkTotal: 0, textTotal: 0 };
+
+  it("思考与正文各自累加，计数跟着走", () => {
+    let acc = foldLiveDelta(empty, { kind: "thinking", text: "想一想" });
+    expect(acc).toMatchObject({ thinking: "想一想", thinkTotal: 3, textTotal: 0 });
+    acc = foldLiveDelta(acc, { kind: "text", text: "正文" });
+    expect(acc).toMatchObject({ text: "正文", textTotal: 2 });
+  });
+
+  it("正文接管时思考让位且累计归零——否则正文额度被不再显示的思考永久占住", () => {
+    let acc = foldLiveDelta(empty, { kind: "thinking", text: "很长的思考" });
+    acc = foldLiveDelta(acc, { kind: "text", text: "正文开始" });
+    expect(acc.thinking).toBe("");
+    expect(acc.thinkTotal).toBe(0);
+    expect(acc.text).toBe("正文开始");
+  });
+
+  it("reset：失败那次尝试流出的半截文字整体作废", () => {
+    // 委托方截图的「鬼畜一直生成」：断流重试把同一段文字再流一遍。
+    // 没有 reset 时折出来是 前半截+前半截后半截；有了它必须是干净的重流起点
+    let acc = foldLiveDelta(empty, { kind: "text", text: "前半截" });
+    acc = foldLiveDelta(acc, { kind: "reset" });
+    expect(acc).toMatchObject({ text: "", thinking: "", thinkTotal: 0, textTotal: 0, reset: true });
+    acc = foldLiveDelta(acc, { kind: "text", text: "前半截" });
+    acc = foldLiveDelta(acc, { kind: "text", text: "后半截" });
+    expect(acc.text).toBe("前半截后半截");
+    expect(acc.textTotal).toBe(6);
+  });
+
+  it("同一批里 半截→reset→重流 按到达顺序折叠也是干净结果", () => {
+    let acc = empty;
+    for (const chunk of [
+      { kind: "text", text: "前半截" },
+      { kind: "reset" },
+      { kind: "text", text: "前半截后半截" },
+    ]) {
+      acc = foldLiveDelta(acc, chunk);
+    }
+    expect(acc.text).toBe("前半截后半截");
+  });
+
+  it("坏帧（空串/未知 kind）不炸、不弄脏缓冲", () => {
+    const acc = foldLiveDelta(empty, { kind: "text", text: "" });
+    expect(acc.text).toBe("");
+    expect(foldLiveDelta(empty, { kind: "mystery" }).text).toBe("");
+    expect(foldLiveDelta(empty, undefined).text).toBe("");
+  });
+});
+
+/**
+ * 行内错误可关闭的**壳侧**接线锁（DOM 侧断言在 ui-a11y）。
+ * 点击处理器住在 index.html 这只壳里，只能抠源码——照 B1 那条口径。
+ */
+describe("行内错误的关闭按钮：壳侧接线", () => {
+  const htmlSrc = readFileSync(join(__dirname, "..", "ui", "public", "index.html"), "utf-8");
+
+  it("按钮在标记里常驻，带 aria-label「关闭提示」", () => {
+    expect(htmlSrc).toContain('id="submit-error-close"');
+    expect(htmlSrc).toContain('aria-label="关闭提示"');
+    expect(htmlSrc).toContain('id="submit-error-text"');
+  });
+
+  it("点击清的是 controller 状态（两本账都清），不是只藏 DOM", () => {
+    // 只 hidden 掉节点的话，下一次 syncComposer 会把它原样写回来——假关闭
+    expect(htmlSrc).toMatch(/querySelector\("#submit-error-close"\)\?\.addEventListener\("click"[\s\S]*?newRunError = null/);
+    expect(htmlSrc).toContain("followUpErrors.delete(selectedRunId)");
+  });
+});
+
+describe("直播条目的视觉记号", () => {
+  const css = readFileSync(join(__dirname, "..", "ui", "public", "styles.css"), "utf-8");
+
+  it("不再用虚线左边框区分直播态（委托方要求去掉），直播态由打字机光标承担", () => {
+    expect(css).not.toMatch(/\.chat-msg--live\s*\{[^}]*border-left/);
+    // 去掉边框后直播消息与普通消息的可区分性只靠它——光标没了这条就得重新设计
+    expect(css).toContain(".chat-live-text > :last-child::after");
+  });
+});
+
+// ================================================================
+// MODEL-01a · 端点降级事件的投影与派生
+// ================================================================
 describe("MODEL-01a 端点降级", () => {
   /**
    * `buildTimelineEntry` 是**逐字段白名单**：没有专门的 case，事件只会留下

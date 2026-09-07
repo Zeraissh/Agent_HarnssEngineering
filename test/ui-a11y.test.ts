@@ -1074,6 +1074,25 @@ describe("统一 composer：一个框，两种去向", () => {
     expect(q("#submit-error").hidden).toBe(true);
   });
 
+  it("行内错误带关闭按钮：错误写进内层文本节点，按钮不被覆写抹掉", () => {
+    // 委托方实证：红字错误（如 Artifact not found）出现后无法关闭、一直在原位。
+    // 修法 = 容器里常驻一颗 ✕；patchComposer 只能写内层 .inline-error-text——
+    // 对整个容器塞 textContent 会把按钮一起抹掉，那是这条测试要钉住的退化。
+    patchComposer(deriveComposerMode({ info: CONTINUABLE, localStatus: "done", error: "Artifact not found: a.kicad_sch" }));
+    const err = q("#submit-error");
+    expect(err.hidden).toBe(false);
+    expect(q("#submit-error-text").textContent).toContain("Artifact not found");
+    const close = q("#submit-error-close");
+    expect(close, "缺少关闭按钮").not.toBeNull();
+    expect(close.getAttribute("aria-label")).toBe("关闭提示");
+    // 再写一次错误：按钮必须还活着（文本更新不重建容器）
+    patchComposer(deriveComposerMode({ info: CONTINUABLE, localStatus: "done", error: "另一条错误" }));
+    expect(q("#submit-error-close")).not.toBeNull();
+    expect(q("#submit-error-text").textContent).toContain("另一条错误");
+    patchComposer(deriveComposerMode({ info: null }));
+    expect(err.hidden).toBe(true);
+  });
+
   it("整页只有一个输入框、一个 role=alert，且不留任何旧的追加框残迹", () => {
     patchComposer(deriveComposerMode({ info: CONTINUABLE, localStatus: "done" }));
     renderRunDetail(doneState(), {

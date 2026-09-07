@@ -2270,7 +2270,11 @@ export function patchComposer(mode, root = document) {
     setAttr(budgetRow, "hidden", mode.canExtendBudget ? null : "");
   }
   if (err) {
-    setText(err, mode.error ?? "");
+    // 错误文本写进内层 span：外层容器带着常驻的关闭按钮（#submit-error-close），
+    // 对整个 #submit-error 塞 textContent 会把那颗按钮一起抹掉。
+    // 找不到内层节点（测试里的精简骨架）时退回直接写容器。
+    const errText = err.querySelector?.(".inline-error-text") ?? err;
+    setText(errText, mode.error ?? "");
     setAttr(err, "hidden", mode.error ? null : "");
   }
 
@@ -3600,6 +3604,49 @@ const REVEAL_DRAIN_SEC = 0.12;
 const REVEAL_MIN_CPS = 40;
 /** 收尾闸：剩这么多字就一次放完，不留一条慢慢爬的尾巴 */
 const REVEAL_SNAP = 12;
+
+/**
+ * 直播增量缓冲的折叠（纯函数——index.html 里那层壳测试够不着，
+ * 这类"少清一次就鬼畜"的逻辑必须住在测试够得着的地方）。
+ *
+ * 每条 delta 按到达顺序折叠进 acc：
+ *   - thinking：追加进思考缓冲，累计 think 字数；
+ *   - text：追加进正文缓冲，同时**思考让位**（正文一开始流，思考就是想完了——
+ *     缓冲清空、累计归零，否则正文的放行额度会被早已不显示的思考永久占住）；
+ *   - reset：同一轮即将重流（断流重试 api_retry / 换端点 model_fallback，
+ *     服务端在 durable 事件落流之前于 delta 通道广播的瞬态帧）。失败那次尝试
+ *     流出的半截文字整体作废——没有它，重流的全文会接在半截后面，直播条
+ *     看起来就是同一段文字"鬼畜地一直生成"（委托方截图实证，机制刻画见
+ *     test/loop.test.ts「断流重试」一条）。
+ *
+ * @param {{ text:string, thinking:string, thinkTotal:number, textTotal:number }} acc
+ * @param {{ kind:"text"|"thinking"|"reset", text?:string }} chunk
+ * @returns {{ text:string, thinking:string, thinkTotal:number, textTotal:number, reset:boolean }}
+ *   reset=true 表示这一路折叠里出现过 reset——调用方据此重置放行计数器。
+ */
+export function foldLiveDelta(acc, chunk) {
+  if (chunk?.kind === "reset") {
+    return { text: "", thinking: "", thinkTotal: 0, textTotal: 0, reset: true };
+  }
+  if (chunk?.kind === "thinking" && typeof chunk.text === "string" && chunk.text !== "") {
+    return {
+      ...acc,
+      thinking: acc.thinking + chunk.text,
+      thinkTotal: acc.thinkTotal + chunk.text.length,
+      reset: false,
+    };
+  }
+  if (chunk?.kind === "text" && typeof chunk.text === "string" && chunk.text !== "") {
+    return {
+      text: acc.text + chunk.text,
+      thinking: "",
+      thinkTotal: 0,
+      textTotal: acc.textTotal + chunk.text.length,
+      reset: false,
+    };
+  }
+  return { ...acc, reset: false };
+}
 
 /**
  * 两个跳转箭头该不该出现。

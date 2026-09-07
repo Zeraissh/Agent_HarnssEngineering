@@ -11,7 +11,7 @@ import {
   FINISH_TASK_TOOL_NAME,
   withTaskCompletion,
 } from "../src/task-completion.js";
-import type { AgentRunResult, ModelClient, ModelRequest, ModelTurn, TurnEvent } from "../src/types.js";
+import type { AgentRunResult, ModelClient, ModelRequest, ModelTurn, StreamDelta, TurnEvent } from "../src/types.js";
 import { FakeModelClient, fakeMessage, makeTool, textBlock, toolUseBlock } from "./helpers.js";
 
 async function collect(events: AsyncIterable<TurnEvent>): Promise<{
@@ -421,6 +421,62 @@ describe("退避抖动（V-27 并行编排引入的触发条件）", () => {
 
   it("backoffMs=0 仍然是 0（既有测试靠这条零延迟跑）", () => {
     expect(backoffWithJitter(0, 3, () => 0.9)).toBe(0);
+  });
+});
+
+describe("流式中途失败后的同轮重试（直播条「鬼畜重复生成」的根因刻画）", () => {
+  /**
+   * 委托方截图：运行中的直播消息文字不停生成、反复重打，像永远打不完。
+   *
+   * 机制：text_delta 是瞬态事件（不占 seq、不进缓冲、重连不重放），
+   * 前端只能把到达的增量**追加**进直播缓冲。而流式中途断流被判定为瞬时错误后，
+   * loop 会**重发同一请求**——模型从头再写一遍，于是同一段文字的增量
+   * 在事件流里出现两次（失败那次的半截 + 重试那次的全文）。重试多次就翻多倍，
+   * 放行节拍器的 arrived 计数随缓冲无限增长，正是"永远打不完"。
+   *
+   * 这条测试锁住两件事：
+   *   ① 重试确实会让 delta 重复出现（没有这条，UI 侧的 reset 修复就是无的放矢）；
+   *   ② 两次增量流之间一定有 api_retry 事件作分界——UI/服务端靠它发重置信号。
+   */
+  it("断流重试：半截增量与重流全文都进事件流，api_retry 是二者之间的分界", async () => {
+    class CutThenOkClient implements ModelClient {
+      calls = 0;
+      async send(
+        _req: ModelRequest,
+        onDelta?: (delta: StreamDelta) => void,
+      ): Promise<ModelTurn> {
+        this.calls += 1;
+        if (this.calls === 1) {
+          // 第一次尝试：流了一半，连接被掐（cut_stream 的形态）
+          onDelta?.({ kind: "text", text: "前半截" });
+          throw Object.assign(new Error("stream cut mid-flight"), { status: 503 });
+        }
+        // 重试：模型从头再写——同一请求幂等重发，正文必然从第一个字重新流
+        onDelta?.({ kind: "text", text: "前半截" });
+        onDelta?.({ kind: "text", text: "后半截" });
+        const message = fakeMessage([textBlock("前半截后半截")], "end_turn");
+        return { message, stopReason: message.stop_reason, usage: message.usage };
+      }
+    }
+    const model = new CutThenOkClient();
+    const loop = new AgentLoop({ ...baseConfig, tools: [], errorRetryBackoffMs: 0 }, model);
+    const { events, result } = await collect(loop.run("t"));
+
+    expect(result.stopReason).toBe("completed");
+    expect(model.calls).toBe(2);
+
+    const deltas = events.filter((e) => e.type === "text_delta");
+    // 拼起来就是直播缓冲看到的内容："前半截"出现了两次——重复生成的实锤
+    expect(deltas.map((d) => (d as Extract<TurnEvent, { type: "text_delta" }>).text).join(""))
+      .toBe("前半截前半截后半截");
+
+    // 分界信号：api_retry 必须落在两股增量流之间，UI 才有可靠的清缓冲时机
+    const kinds = events.map((e) => e.type);
+    const firstDelta = kinds.indexOf("text_delta");
+    const retryAt = kinds.indexOf("api_retry");
+    const lastDelta = kinds.lastIndexOf("text_delta");
+    expect(retryAt).toBeGreaterThan(firstDelta);
+    expect(retryAt).toBeLessThan(lastDelta);
   });
 });
 

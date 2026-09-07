@@ -270,6 +270,46 @@ async function readSSESnapshot(
 }
 
 /**
+ * 原始 SSE 帧读取（含命名通道）。
+ *
+ * readSSE 系列**故意跳过** `event: delta` 命名帧——那是 durable 事件流的视角。
+ * 但 delta 通道本身的行为（断流重试时的 reset 帧）也要有测试够得着，
+ * 所以这里保留每一帧的 event 名与 data 原文。
+ */
+async function readSSEFrames(
+  response: Response,
+): Promise<{ event: string; data: string }[]> {
+  const reader = response.body!.getReader();
+  const decoder = new TextDecoder();
+  const frames: { event: string; data: string }[] = [];
+  let buffer = "";
+  try {
+    // 连续读、不设轮询竞态：run 收尾时服务端会主动 end 这条流（finalizeRun），
+    // 外圈测试超时是唯一的兜底——中途并发 read() 会让数据被废弃的挂起读吞掉。
+    while (true) {
+      const { done, value } = await reader.read();
+      if (value) buffer += decoder.decode(value, { stream: !done });
+      let idx: number;
+      while ((idx = buffer.indexOf("\n\n")) !== -1) {
+        const block = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        const dataLines: string[] = [];
+        let eventName = "message";
+        for (const line of block.split("\n")) {
+          if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+          else if (line.startsWith("event:")) eventName = line.slice(6).trim();
+        }
+        if (dataLines.length > 0) frames.push({ event: eventName, data: dataLines.join("\n") });
+      }
+      if (done) break;
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+  return frames;
+}
+
+/**
  * 等待 run 变为 done。截止线 15s 而非固定 50 次轮询：旧预算 ~2.5s 在
  * 满载 CI 跑道上会把慢跑误伤成失败（2026-08-24 CI 实测一例，本地与
  * 重跑均绿）；真卡死的 run 仍然会在截止线处红。
@@ -1872,6 +1912,68 @@ describe("ui-server", () => {
     expect(events.find((e: any) => e.event.type === "text_delta")).toBeUndefined();
     // seq 仍然连续（delta 不占号）
     events.forEach((e: any, i: number) => expect(e.seq).toBe(i));
+  });
+
+  // ---- 断流重试：delta 通道在两股增量之间发 reset（直播条清缓冲信号）----
+  it("流式中途失败重试时，delta 通道先广播 reset 再放重流的增量", { timeout: 20000 }, async () => {
+    /**
+     * 委托方截图的「直播文字鬼畜地一直生成」：断流重试让同一段文字的增量
+     * 流两遍（见 test/loop.test.ts 的刻画测试），而 delta 是瞬态事件、前端
+     * 只能追加——没有一个"清掉失败那次的半截"的信号，缓冲就无限增长。
+     * 这里锁修复契约：api_retry 落 durable 流的同时，delta 通道必须先广播
+     * 一帧 kind:"reset"，且严格排在两股增量流之间。
+     */
+    let releaseStream!: () => void;
+    const gate = new Promise<void>((r) => { releaseStream = r; });
+    let calls = 0;
+    const model: ModelClient = {
+      async send(_req: ModelRequest, onDelta?: (delta: StreamDelta) => void): Promise<ModelTurn> {
+        calls += 1;
+        // delta 不进缓冲——订阅就位前流的增量测试根本收不到，必须等订阅先挂上
+        await gate;
+        if (calls === 1) {
+          onDelta?.({ kind: "text", text: "前半截" });
+          throw Object.assign(new Error("stream cut mid-flight"), { status: 503 });
+        }
+        onDelta?.({ kind: "text", text: "前半截" });
+        onDelta?.({ kind: "text", text: "后半截" });
+        const message = fakeMessage([textBlock("前半截后半截")], "end_turn");
+        return { message, stopReason: message.stop_reason, usage: message.usage };
+      },
+    };
+    handle = createUiServer({ modelClient: model, tools: [autoTool("noop")], workdir: process.cwd() });
+    port = await startServer(handle);
+    base = baseUrl(port);
+
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "cut stream", verify: false }),
+    })).json() as { runId: string };
+
+    // fetch 解析出响应头时，服务端已把这条连接登记进 sseClients
+    const sseRes = await fetch(`${base}/api/runs/${runId}/events`);
+    releaseStream();
+    const frames = await readSSEFrames(sseRes);
+    await waitForDone(base, runId);
+
+    const deltas = frames
+      .filter((f) => f.event === "delta")
+      .map((f) => JSON.parse(f.data) as { source?: string; kind?: string; text?: string });
+    // 两股增量都在场（重试重流确实发生了，否则这条测试是假绿）
+    const texts = deltas.filter((d) => d.kind === "text").map((d) => d.text);
+    expect(texts).toEqual(["前半截", "前半截", "后半截"]);
+
+    // reset 帧：source 归 main（前端只消费 main 的直播流），且落在两股流之间
+    const resetIdx = deltas.findIndex((d) => d.kind === "reset");
+    expect(resetIdx, "delta 通道缺少 reset 帧").toBeGreaterThan(-1);
+    expect(deltas[resetIdx]!.source).toBe("main");
+    expect(resetIdx).toBeGreaterThan(deltas.findIndex((d) => d.kind === "text"));
+    expect(resetIdx).toBeLessThan(deltas.map((d) => d.kind).lastIndexOf("text"));
+
+    // durable 流一侧：api_retry 照常落盘（重放时前端凭它清掉断线期的残留缓冲）
+    const durable = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+    expect(durable.some((e: any) => e.event.type === "api_retry")).toBe(true);
   });
 
   // ---- V-23 会话正史按需拉 ----

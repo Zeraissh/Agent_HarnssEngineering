@@ -3708,6 +3708,17 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     return `id: ${sseEvent.seq}\ndata: ${JSON.stringify(sseEvent)}\n\n`;
   }
 
+  /**
+   * 在 delta 命名通道上广播一帧 `kind:"reset"`：同一轮即将重流（重试 / 换端点），
+   * 失败那次尝试流出的半截增量作废。与 text/thinking 增量同通道、同 source 口径——
+   * 前端只消费 main 的直播流，verifier/planner 的重试不该清主对话的缓冲。
+   * reset 同样是瞬态帧（不占 seq、不进缓冲）：断线期间的 reset 丢了没关系，
+   * durable 流里那条 api_retry / model_fallback 重放时前端会再清一次。
+   */
+  function broadcastDeltaReset(run: StoredRun, source: string): void {
+    broadcastSSE(run, `event: delta\ndata: ${JSON.stringify({ source, kind: "reset" })}\n\n`);
+  }
+
   /** 推送一条 TurnEvent 到 run 的缓冲与在线 SSE 客户端（不负责完成/关闭逻辑） */
   function pushEvent(run: StoredRun, source: string, event: TurnEvent): number {
     // V-15：流式增量走命名通道，不占 seq、不进 run.events。
@@ -3727,6 +3738,13 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       );
       return -1;
     }
+
+    // 同轮重试（api_retry）= 同一请求即将幂等重发，模型会**从头再流一遍**正文。
+    // delta 是瞬态追加语义，失败那次流出来的半截文字前端无法自己识别——
+    // 必须在重流开始之前显式宣告"清缓冲"，否则直播条会把同一段文字再播一遍
+    // （委托方截图：直播文字鬼畜地一直生成）。reset 帧走在 durable 帧之前，
+    // TCP 保序，前端收到的次序就是"旧增量 → reset → 重流增量"。
+    if (event.type === "api_retry") broadcastDeltaReset(run, source);
 
     const seq = run.events.length;
     const sseEvent: SSEEvent = {
@@ -4018,6 +4036,14 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
   /** 推送合成事件（如 verdict / approval_resolved / run_end）到缓冲与在线客户端 */
   function pushSyntheticEvent(run: StoredRun, source: string, event: Record<string, unknown>): number {
+    // 端点降级（model_fallback）与 api_retry 同型：换一个端点重发同一请求，
+    // 上一个端点流出来的半截正文作废。这条事件的 source 是 "model"（L0 层的事实），
+    // 而 delta 通道按**角色**归属——role 缺省即主执行者，与 loop 推 delta 时的
+    // source="main" 是同一个直播缓冲。
+    if (event.type === "model_fallback") {
+      const role = typeof event.role === "string" && event.role ? event.role : "main";
+      broadcastDeltaReset(run, role);
+    }
     const seq = run.events.length;
     const sseEvent: SSEEvent = { seq, source, ts: Date.now(), event };
     run.events.push(sseEvent);
