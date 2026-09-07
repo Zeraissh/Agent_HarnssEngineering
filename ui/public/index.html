@@ -2691,6 +2691,8 @@ try {
     },
     onOpenSettings: () => navigateToSettings(),
     onCloseSettings: () => closeSettingsRoute(),
+    // 模型配置保存成功：重拉 /api/harness，composer 的角色 pill 立刻对齐新装配
+    onModelsSaved: () => loadHarness(),
     // 设置页改了阅读模式偏好：详情顶栏的开关与对话后处理立刻对齐（同源键）
     onReadingModeChange: () => readingModeApi?.syncFromStorage(),
     onAnnounce: (msg) => announceStatus(msg),
@@ -2702,6 +2704,17 @@ try {
       hint: "外观、运行默认值、通知、快捷键与关于",
       icon: "ph-gear",
       run: () => navigateToSettings(),
+    });
+    palette.registerPaletteCommand({
+      id: "open-model-settings",
+      label: "模型设置",
+      hint: "模型库与角色分配（执行 / 规划 / 核查 / 识图）",
+      icon: "ph-cpu",
+      run: () => {
+        navigateToSettings();
+        // hash 变化异步触发 open；显式再开一次并直达分组（已开时只换焦点）
+        settingsApi?.open("settings-models");
+      },
     });
   }).catch(() => { /* 命令面板注册失败不影响设置本体 */ });
 } catch { /* 设置中心是增强项，初始化失败静默降级 */ }

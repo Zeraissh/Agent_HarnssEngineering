@@ -1,8 +1,8 @@
 /**
  * features/settings — 设置中心（T7）。
  *
- * 零依赖原生 ESM。独立视图（hash 路由 #/settings），分五组：
- *   外观 / 运行默认值 / 通知 / 快捷键 / 关于。
+ * 零依赖原生 ESM。独立视图（hash 路由 #/settings），分六组：
+ *   外观 / 模型 / 运行默认值 / 通知 / 快捷键 / 关于。
  *
  * 与 command-palette / notifications / memory-panel 同一约定：
  *   1) 纯函数层（设置读写 / 容错解析 / 旧键迁移 / composer 默认值派生 /
@@ -55,11 +55,182 @@ export const THEME_CHOICES = [
 /** 分组锚点导航。id 即视图内 section 的 id。 */
 export const SETTINGS_SECTIONS = [
   { id: "settings-appearance", label: "外观", icon: "ph-palette" },
+  { id: "settings-models", label: "模型", icon: "ph-cpu" },
   { id: "settings-defaults", label: "运行默认值", icon: "ph-sliders-horizontal" },
   { id: "settings-notifications", label: "通知", icon: "ph-bell" },
   { id: "settings-shortcuts", label: "快捷键", icon: "ph-keyboard" },
   { id: "settings-about", label: "关于", icon: "ph-info" },
 ];
+
+// ---------------------------------------------------------------
+// 模型库（MODEL-02）：常量与纯函数层
+// ---------------------------------------------------------------
+
+export const MODELS_API_URL = "/api/models";
+export const MODELS_TEST_API_URL = "/api/models/test";
+
+export const MODEL_PROVIDER_CHOICES = [
+  { id: "anthropic", label: "Anthropic / Claude 兼容" },
+  { id: "openai", label: "OpenAI 兼容（DeepSeek / Kimi / 本地网关）" },
+];
+
+/** model 输入框的 datalist 建议——只是提示，不拦任何合法输入。 */
+export const MODEL_NAME_SUGGESTIONS = {
+  anthropic: ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"],
+  openai: ["deepseek-v4-flash", "deepseek-v4-pro", "kimi-k2-thinking", "moonshot-v1-8k-vision-preview"],
+};
+
+/**
+ * 四个角色：executor 必选（没有执行者整个宿主就没有出发点）；
+ * planner/verifier 的空值 = 跟随执行；vision 的空值 = 不配置。
+ */
+export const MODEL_ROLE_META = [
+  { key: "executor", label: "执行", allowEmpty: false, emptyLabel: "", hint: "实际干活的模型——拆任务、调工具、写代码" },
+  { key: "planner", label: "规划", allowEmpty: true, emptyLabel: "跟随执行", hint: "复杂任务的框架设计与拆分；跟随执行 = 与执行者同一个模型" },
+  { key: "verifier", label: "核查", allowEmpty: true, emptyLabel: "跟随执行", hint: "审查与复查检查——可以把这一步交给更强的模型" },
+  { key: "vision", label: "识图", allowEmpty: true, emptyLabel: "不配置", hint: "图片理解（describe_image 工具）；不配置 = 不提供该工具" },
+];
+
+/**
+ * GET /api/models 应答的容错解析：形状不对 → null；条目逐条过滤，
+ * roles 的悬空引用收编为 null（与服务端 parseModelStore 同一条纪律）。
+ */
+export function parseModelsPayload(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  if (!Array.isArray(raw.models)) return null;
+  const models = [];
+  const seen = new Set();
+  for (const m of raw.models) {
+    if (!m || typeof m !== "object") continue;
+    if (typeof m.id !== "string" || !m.id || seen.has(m.id)) continue;
+    if (m.provider !== "anthropic" && m.provider !== "openai") continue;
+    if (typeof m.model !== "string" || !m.model) continue;
+    seen.add(m.id);
+    models.push({
+      id: m.id,
+      label: typeof m.label === "string" && m.label ? m.label : m.model,
+      provider: m.provider,
+      model: m.model,
+      baseUrl: typeof m.baseUrl === "string" ? m.baseUrl : "",
+      hasApiKey: m.hasApiKey === true,
+    });
+  }
+  const roles = { executor: null, planner: null, verifier: null, vision: null };
+  const rawRoles = raw.roles && typeof raw.roles === "object" ? raw.roles : {};
+  for (const key of Object.keys(roles)) {
+    const id = rawRoles[key];
+    roles[key] = typeof id === "string" && seen.has(id) ? id : null;
+  }
+  return { models, roles, source: raw.source === "store" ? "store" : "env" };
+}
+
+/** 客户端侧条目 id（服务端校验规则 [A-Za-z0-9:_-]{1,64}，冲突时服务端兜底重发）。 */
+export function newModelId() {
+  return `m-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+export function modelOptionLabel(m) {
+  return `${m.label}（${m.provider} · ${m.model}）`;
+}
+
+/** 角色下拉选项：允许空的角色首项是「跟随执行 / 不配置」。 */
+export function roleOptionsFor(roleKey, models) {
+  const meta = MODEL_ROLE_META.find((r) => r.key === roleKey);
+  const opts = [];
+  if (meta?.allowEmpty) opts.push({ value: "", label: meta.emptyLabel });
+  for (const m of models) opts.push({ value: m.id, label: modelOptionLabel(m) });
+  return opts;
+}
+
+/** 角色现状一行字：「核查 · Claude Opus」/「核查 · 跟随执行」。 */
+export function roleCurrentLabel(roleKey, models, roles) {
+  const meta = MODEL_ROLE_META.find((r) => r.key === roleKey);
+  const id = roles?.[roleKey];
+  const entry = id ? models.find((m) => m.id === id) : null;
+  if (!entry) return `${meta?.label ?? roleKey} · ${meta?.emptyLabel ?? "未配置"}`;
+  return `${meta?.label ?? roleKey} · ${entry.label}（${entry.model}）`;
+}
+
+/** 本机回环判定（与服务端 normalizeBaseUrl 同口径的最小集）。 */
+function isLoopbackHost(hostname) {
+  const h = String(hostname ?? "").toLowerCase();
+  return h === "localhost" || h === "::1" || h === "[::1]" || h.startsWith("127.");
+}
+
+/** 添加/编辑表单的前置校验（服务端仍会全量复核——这里只为当场反馈）。 */
+export function validateModelDraft(draft) {
+  const errors = [];
+  if (!draft || typeof draft !== "object") return ["表单为空"];
+  if (draft.provider !== "anthropic" && draft.provider !== "openai") errors.push("请选择 Provider");
+  const model = String(draft.model ?? "");
+  if (!model || model !== model.trim() || model.length > 200) {
+    errors.push("模型名无效：不能为空、不带首尾空白、最长 200 字符");
+  }
+  const baseUrl = String(draft.baseUrl ?? "").trim();
+  if (baseUrl) {
+    let u = null;
+    try {
+      u = new URL(baseUrl);
+    } catch {
+      errors.push("Base URL 不是有效 URL");
+    }
+    if (u) {
+      if (u.username || u.password) errors.push("Base URL 不能包含用户名或密码");
+      if (u.protocol !== "https:" && !(u.protocol === "http:" && isLoopbackHost(u.hostname))) {
+        errors.push("远程 Base URL 必须使用 HTTPS；HTTP 只允许本机回环地址");
+      }
+    }
+  }
+  return errors;
+}
+
+/**
+ * 删除条目：被执行者引用 → 拒绝（执行者不可降级）；被其他角色引用 →
+ * 该角色重置为空值（跟随执行 / 不配置）并在 warnings 里说明。
+ */
+export function applyModelDelete(models, roles, id) {
+  if (roles.executor === id) {
+    return {
+      models, roles, warnings: [],
+      error: "执行者正在使用这个模型——请先在下方「角色分配」里把执行改派给别的模型",
+    };
+  }
+  const warnings = [];
+  const nextRoles = { ...roles };
+  for (const meta of MODEL_ROLE_META) {
+    if (meta.key !== "executor" && nextRoles[meta.key] === id) {
+      nextRoles[meta.key] = null;
+      warnings.push(`「${meta.label}」已重置为${meta.emptyLabel}`);
+    }
+  }
+  return { models: models.filter((m) => m.id !== id), roles: nextRoles, error: null, warnings };
+}
+
+/**
+ * PUT 请求体组装。apiKey 三态纪律：只有用户在表单里碰过 apiKey 的条目
+ * （pendingApiKeys 里有记录）才带这个字段——含 ""（= 清除，改走环境变量）；
+ * 没碰过的一律省略（= 保持不变）。apiKey 原文永不出栈，所以不能用
+ * hasApiKey 反推。
+ */
+export function buildModelsPutBody(models, roles, pendingApiKeys) {
+  return {
+    models: models.map((m) => ({
+      id: m.id,
+      label: m.label,
+      provider: m.provider,
+      model: m.model,
+      baseUrl: m.baseUrl,
+      ...(pendingApiKeys && pendingApiKeys.has(m.id) ? { apiKey: pendingApiKeys.get(m.id) } : {}),
+    })),
+    roles: { ...roles },
+  };
+}
+
+export function modelsSourceLabel(source) {
+  return source === "store"
+    ? "当前来源：模型库文件（.agent-models.json）"
+    : "当前来源：环境变量（首次保存后转为模型库文件）";
+}
 
 const EFFORT_LABELS = { low: "低", medium: "中", high: "高", xhigh: "很高", max: "最高" };
 
@@ -297,11 +468,13 @@ const VIEW_ID = "settings-view";
  *   onSelectTheme(id)           → 切换主题（宿主 applyTheme，负责持久化）
  *   getHarnessSnapshot()        → /api/harness 快照或 null（档位、版本、工作目录）
  *   onApplyComposerDefaults(p)  → 设置页改动实时同步 composer 控件
+ *   onModelsSaved()             → 模型配置保存成功（宿主刷新 /api/harness 快照，composer pill 同步）
  *   onOpenSettings()            → 侧栏齿轮点击（宿主写 hash 路由）
  *   onCloseSettings()           → 返回上一视图（宿主决定 history.back 或回 "#/")
  *   onAnnounce(msg)             → aria-live 播报（可选）
  *
- * env（测试注入）：doc / win / storage / Notification
+ * env（测试注入）：doc / win / storage / Notification / fetchImpl（模型库读写；
+ * 缺省用全局 fetch）
  *
  * @param {Record<string, Function>} host
  * @param {{ doc?:Document, win?:Window, storage?:Storage|null, Notification?:any }} [env]
@@ -484,7 +657,479 @@ export function initSettingsView(host = {}, env = {}) {
     );
   });
 
-  // ---- 分组二：运行默认值 ----
+  // ---- 分组二：模型（MODEL-02 模型库 + 角色分配）----
+  // 数据在服务端（.agent-models.json），本视图只做读写中转；apiKey 只进不出——
+  // GET 拿不到原文，保存时只有用户碰过 apiKey 的条目才带这个字段。
+  const modelsSection = addSection("settings-models", "模型");
+  const fetcher = env.fetchImpl ?? (typeof fetch !== "undefined" ? fetch.bind(globalThis) : null);
+
+  const modelsNote = doc.createElement("p");
+  modelsNote.className = "settings-card-note";
+  modelsNote.textContent = "模型库与角色分配保存在服务端。配置对新任务生效；进行中的任务不受影响。";
+  modelsSection.appendChild(modelsNote);
+
+  const modelsSource = doc.createElement("p");
+  modelsSource.className = "settings-field-hint";
+  modelsSource.id = "settings-models-source";
+  modelsSection.appendChild(modelsSource);
+
+  // 模型库列表
+  const modelsList = doc.createElement("div");
+  modelsList.className = "settings-models-list";
+  modelsList.id = "settings-models-list";
+  modelsSection.appendChild(modelsList);
+
+  // 添加 / 编辑表单
+  const modelForm = doc.createElement("fieldset");
+  modelForm.className = "settings-model-form";
+  const modelFormLegend = doc.createElement("legend");
+  modelFormLegend.className = "settings-model-form-legend";
+  modelFormLegend.id = "settings-model-form-legend";
+  modelFormLegend.textContent = "添加模型";
+  modelForm.appendChild(modelFormLegend);
+
+  /** 小工具：带 label 的输入行 */
+  const buildInputRow = (id, labelText, input) => {
+    const row = doc.createElement("div");
+    row.className = "settings-field";
+    const label = doc.createElement("label");
+    label.setAttribute("for", id);
+    label.textContent = labelText;
+    input.id = id;
+    row.appendChild(label);
+    row.appendChild(input);
+    modelForm.appendChild(row);
+    return input;
+  };
+  const modelLabelInput = buildInputRow("settings-model-label", "名称（给自己看的备注）", doc.createElement("input"));
+  modelLabelInput.type = "text";
+  modelLabelInput.placeholder = "例如：Claude Opus（强模型）";
+  modelLabelInput.maxLength = 80;
+
+  const modelProviderSelect = buildInputRow("settings-model-provider", "Provider", doc.createElement("select"));
+  for (const p of MODEL_PROVIDER_CHOICES) {
+    const opt = doc.createElement("option");
+    opt.value = p.id;
+    opt.textContent = p.label;
+    modelProviderSelect.appendChild(opt);
+  }
+
+  const modelNameInput = buildInputRow("settings-model-name", "模型名", doc.createElement("input"));
+  modelNameInput.type = "text";
+  modelNameInput.placeholder = "例如：claude-opus-4-8";
+  modelNameInput.setAttribute("list", "settings-model-suggestions");
+  const modelSuggestions = doc.createElement("datalist");
+  modelSuggestions.id = "settings-model-suggestions";
+  modelForm.appendChild(modelSuggestions);
+  const renderSuggestions = () => {
+    modelSuggestions.innerHTML = "";
+    for (const name of MODEL_NAME_SUGGESTIONS[modelProviderSelect.value] ?? []) {
+      const opt = doc.createElement("option");
+      opt.value = name;
+      modelSuggestions.appendChild(opt);
+    }
+  };
+  modelProviderSelect.addEventListener("change", renderSuggestions);
+  renderSuggestions();
+
+  const modelBaseUrlInput = buildInputRow("settings-model-baseurl", "Base URL（留空 = 官方端点）", doc.createElement("input"));
+  modelBaseUrlInput.type = "text";
+  modelBaseUrlInput.placeholder = "https://api.example.com（远程必须 HTTPS）";
+
+  const modelApiKeyInput = buildInputRow("settings-model-apikey", "API Key", doc.createElement("input"));
+  modelApiKeyInput.type = "password";
+  modelApiKeyInput.autocomplete = "off";
+  // 三态语义的界面表达：不碰 = 保持不变；清空 = 改用环境变量；输入 = 更新
+  modelApiKeyInput.dataset.touched = "0";
+  modelApiKeyInput.addEventListener("input", () => { modelApiKeyInput.dataset.touched = "1"; });
+
+  const apiKeyHint = doc.createElement("p");
+  apiKeyHint.className = "settings-field-hint";
+  apiKeyHint.id = "settings-model-apikey-hint";
+  apiKeyHint.textContent = "留空 = 使用环境变量（ANTHROPIC_API_KEY / OPENAI_API_KEY）。Key 只保存在服务端，永不下发浏览器。";
+  modelForm.appendChild(apiKeyHint);
+
+  const modelFormActions = doc.createElement("div");
+  modelFormActions.className = "settings-model-form-actions";
+  const modelTestBtn = doc.createElement("button");
+  modelTestBtn.type = "button";
+  modelTestBtn.className = "btn btn--ghost";
+  modelTestBtn.id = "settings-model-test";
+  modelTestBtn.textContent = "测试连接";
+  const modelSubmitBtn = doc.createElement("button");
+  modelSubmitBtn.type = "button";
+  modelSubmitBtn.className = "btn btn--primary";
+  modelSubmitBtn.id = "settings-model-submit";
+  modelSubmitBtn.textContent = "添加到模型库";
+  const modelCancelBtn = doc.createElement("button");
+  modelCancelBtn.type = "button";
+  modelCancelBtn.className = "btn btn--ghost";
+  modelCancelBtn.id = "settings-model-cancel";
+  modelCancelBtn.textContent = "取消编辑";
+  modelCancelBtn.hidden = true;
+  modelFormActions.appendChild(modelTestBtn);
+  modelFormActions.appendChild(modelSubmitBtn);
+  modelFormActions.appendChild(modelCancelBtn);
+  modelForm.appendChild(modelFormActions);
+
+  const modelFormStatus = doc.createElement("p");
+  modelFormStatus.className = "settings-field-hint";
+  modelFormStatus.id = "settings-model-form-status";
+  modelFormStatus.setAttribute("role", "status");
+  modelForm.appendChild(modelFormStatus);
+  modelsSection.appendChild(modelForm);
+
+  // 角色分配
+  const rolesHeading = doc.createElement("h4");
+  rolesHeading.className = "settings-models-subhead";
+  rolesHeading.textContent = "角色分配";
+  modelsSection.appendChild(rolesHeading);
+  /** @type {Record<string, HTMLSelectElement>} */
+  const roleSelects = {};
+  /** @type {Record<string, HTMLElement>} */
+  const roleCurrentLines = {};
+  for (const meta of MODEL_ROLE_META) {
+    const row = doc.createElement("div");
+    row.className = "settings-field";
+    const label = doc.createElement("label");
+    label.setAttribute("for", `settings-role-${meta.key}`);
+    label.textContent = meta.label;
+    const select = doc.createElement("select");
+    select.id = `settings-role-${meta.key}`;
+    const hint = doc.createElement("p");
+    hint.className = "settings-field-hint";
+    hint.textContent = meta.hint;
+    const current = doc.createElement("p");
+    current.className = "settings-role-current";
+    current.id = `settings-role-${meta.key}-current`;
+    row.appendChild(label);
+    row.appendChild(select);
+    row.appendChild(hint);
+    row.appendChild(current);
+    modelsSection.appendChild(row);
+    roleSelects[meta.key] = select;
+    roleCurrentLines[meta.key] = current;
+  }
+
+  // 保存行
+  const modelsSaveRow = doc.createElement("div");
+  modelsSaveRow.className = "settings-model-form-actions";
+  const modelsSaveBtn = doc.createElement("button");
+  modelsSaveBtn.type = "button";
+  modelsSaveBtn.className = "btn btn--primary";
+  modelsSaveBtn.id = "settings-models-save";
+  modelsSaveBtn.textContent = "保存模型配置";
+  modelsSaveRow.appendChild(modelsSaveBtn);
+  modelsSection.appendChild(modelsSaveRow);
+  const modelsStatus = doc.createElement("p");
+  modelsStatus.className = "settings-field-hint";
+  modelsStatus.id = "settings-models-status";
+  modelsStatus.setAttribute("role", "status");
+  modelsSection.appendChild(modelsStatus);
+
+  /** @type {{ models:any[], roles:Record<string,string|null>, source:string }|null} */
+  let modelsState = null;
+  /** 用户碰过 apiKey 的条目：保存时才带 apiKey 字段（含 "" = 清除） */
+  const pendingApiKeys = new Map();
+  let modelsDirty = false;
+  /** 编辑目标 id；null = 添加模式 */
+  let editingModelId = null;
+
+  function setModelsStatus(msg, isError = false) {
+    modelsStatus.textContent = msg;
+    modelsStatus.classList.toggle("settings-status--error", isError);
+  }
+  function setFormStatus(msg, isError = false) {
+    modelFormStatus.textContent = msg;
+    modelFormStatus.classList.toggle("settings-status--error", isError);
+  }
+
+  function renderModelsList() {
+    modelsList.innerHTML = "";
+    const models = modelsState?.models ?? [];
+    if (!models.length) {
+      const empty = doc.createElement("p");
+      empty.className = "settings-field-hint";
+      empty.textContent = "模型库为空——先在下方添加一个模型。";
+      modelsList.appendChild(empty);
+      return;
+    }
+    for (const m of models) {
+      const row = doc.createElement("div");
+      row.className = "settings-model-row";
+      const copy = doc.createElement("div");
+      copy.className = "settings-model-copy";
+      const name = doc.createElement("strong");
+      name.textContent = m.label;
+      const detail = doc.createElement("small");
+      detail.textContent = `${m.provider} · ${m.model}${m.baseUrl ? ` · ${m.baseUrl}` : ""}`;
+      copy.appendChild(name);
+      copy.appendChild(detail);
+      const keyBadge = doc.createElement("span");
+      keyBadge.className = m.hasApiKey ? "settings-badge settings-badge--ok" : "settings-badge";
+      keyBadge.textContent = m.hasApiKey ? "已存 Key" : "环境变量 Key";
+      copy.appendChild(keyBadge);
+      row.appendChild(copy);
+      const actions = doc.createElement("div");
+      actions.className = "settings-model-actions";
+      const editBtn = doc.createElement("button");
+      editBtn.type = "button";
+      editBtn.className = "btn btn--ghost";
+      editBtn.textContent = "编辑";
+      editBtn.addEventListener("click", () => startEditModel(m.id));
+      const delBtn = doc.createElement("button");
+      delBtn.type = "button";
+      delBtn.className = "btn btn--ghost";
+      delBtn.textContent = "删除";
+      delBtn.addEventListener("click", () => deleteModel(m.id));
+      actions.appendChild(editBtn);
+      actions.appendChild(delBtn);
+      row.appendChild(actions);
+      modelsList.appendChild(row);
+    }
+  }
+
+  function renderRoleSelects() {
+    if (!modelsState) return;
+    for (const meta of MODEL_ROLE_META) {
+      const select = roleSelects[meta.key];
+      select.innerHTML = "";
+      for (const opt of roleOptionsFor(meta.key, modelsState.models)) {
+        const el = doc.createElement("option");
+        el.value = opt.value;
+        el.textContent = opt.label;
+        select.appendChild(el);
+      }
+      select.value = modelsState.roles[meta.key] ?? "";
+      roleCurrentLines[meta.key].textContent = `当前：${roleCurrentLabel(meta.key, modelsState.models, modelsState.roles)}`;
+    }
+  }
+
+  function renderModelsSource() {
+    modelsSource.textContent = modelsState ? modelsSourceLabel(modelsState.source) : "";
+  }
+
+  function renderModelsAll() {
+    renderModelsSource();
+    renderModelsList();
+    renderRoleSelects();
+    modelsSaveBtn.disabled = !modelsState;
+  }
+
+  function resetModelForm() {
+    editingModelId = null;
+    modelLabelInput.value = "";
+    modelNameInput.value = "";
+    modelBaseUrlInput.value = "";
+    modelApiKeyInput.value = "";
+    modelApiKeyInput.dataset.touched = "0";
+    modelApiKeyInput.placeholder = "留空 = 使用环境变量";
+    modelFormLegend.textContent = "添加模型";
+    modelSubmitBtn.textContent = "添加到模型库";
+    modelCancelBtn.hidden = true;
+  }
+
+  function startEditModel(id) {
+    const m = modelsState?.models.find((x) => x.id === id);
+    if (!m) return;
+    editingModelId = id;
+    modelLabelInput.value = m.label;
+    modelProviderSelect.value = m.provider;
+    renderSuggestions();
+    modelNameInput.value = m.model;
+    modelBaseUrlInput.value = m.baseUrl;
+    modelApiKeyInput.value = "";
+    modelApiKeyInput.dataset.touched = "0";
+    modelApiKeyInput.placeholder = m.hasApiKey ? "已保存（输入以替换；清空并保存 = 改用环境变量）" : "留空 = 使用环境变量";
+    modelFormLegend.textContent = "编辑模型";
+    modelSubmitBtn.textContent = "保存修改";
+    modelCancelBtn.hidden = false;
+    setFormStatus("");
+  }
+
+  function deleteModel(id) {
+    if (!modelsState) return;
+    const result = applyModelDelete(modelsState.models, modelsState.roles, id);
+    if (result.error) {
+      setModelsStatus(result.error, true);
+      host.onAnnounce?.(result.error);
+      return;
+    }
+    modelsState = { ...modelsState, models: result.models, roles: result.roles };
+    pendingApiKeys.delete(id);
+    if (editingModelId === id) resetModelForm();
+    modelsDirty = true;
+    renderModelsAll();
+    const msg = ["已删除模型（保存后生效）", ...result.warnings].join("；");
+    setModelsStatus(msg);
+    host.onAnnounce?.(msg);
+  }
+
+  function upsertModelFromForm() {
+    if (!modelsState) {
+      setFormStatus("模型库还没加载完成，请稍候", true);
+      return;
+    }
+    const draft = {
+      label: modelLabelInput.value.trim(),
+      provider: modelProviderSelect.value,
+      model: modelNameInput.value,
+      baseUrl: modelBaseUrlInput.value.trim(),
+    };
+    const errors = validateModelDraft(draft);
+    if (errors.length) {
+      setFormStatus(errors.join("；"), true);
+      return;
+    }
+    const id = editingModelId ?? newModelId();
+    const next = {
+      id,
+      label: draft.label || draft.model,
+      provider: draft.provider,
+      model: draft.model,
+      baseUrl: draft.baseUrl,
+      hasApiKey: modelApiKeyInput.dataset.touched === "1"
+        ? modelApiKeyInput.value !== ""
+        : (modelsState.models.find((x) => x.id === id)?.hasApiKey ?? false),
+    };
+    if (modelApiKeyInput.dataset.touched === "1") {
+      pendingApiKeys.set(id, modelApiKeyInput.value);
+    }
+    const index = modelsState.models.findIndex((x) => x.id === id);
+    const models = [...modelsState.models];
+    if (index >= 0) models[index] = next;
+    else models.push(next);
+    modelsState = { ...modelsState, models };
+    // 添加的第一个模型自动派给执行者（executor 必选，替用户少点一下）
+    if (!modelsState.roles.executor) {
+      modelsState.roles = { ...modelsState.roles, executor: id };
+    }
+    modelsDirty = true;
+    resetModelForm();
+    renderModelsAll();
+    setFormStatus("");
+    setModelsStatus("模型库已更新（保存后生效）");
+  }
+
+  async function testModelFromForm() {
+    if (!fetcher) return;
+    const draft = {
+      provider: modelProviderSelect.value,
+      model: modelNameInput.value,
+      baseUrl: modelBaseUrlInput.value.trim(),
+    };
+    const errors = validateModelDraft(draft);
+    if (errors.length) {
+      setFormStatus(errors.join("；"), true);
+      return;
+    }
+    modelTestBtn.disabled = true;
+    setFormStatus("正在测试连接…");
+    try {
+      const res = await fetcher(MODELS_TEST_API_URL, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          provider: draft.provider,
+          model: draft.model,
+          baseUrl: draft.baseUrl,
+          // 编辑已存 Key 的条目且没碰过 apiKey 时，测试走服务端环境变量/已存语义
+          ...(modelApiKeyInput.dataset.touched === "1" && modelApiKeyInput.value
+            ? { apiKey: modelApiKeyInput.value }
+            : {}),
+        }),
+      });
+      const data = await res.json().catch(() => null);
+      if (data?.ok) {
+        setFormStatus("连接成功——端点、Key 与模型名都可用");
+      } else {
+        setFormStatus(data?.error ?? `测试失败（HTTP ${res.status}）`, true);
+      }
+    } catch {
+      setFormStatus("测试请求未能发出——请检查网络或服务端状态", true);
+    } finally {
+      modelTestBtn.disabled = false;
+    }
+  }
+
+  async function loadModels() {
+    if (!fetcher) {
+      setModelsStatus("当前环境无法连接服务端", true);
+      return;
+    }
+    try {
+      const res = await fetcher(MODELS_API_URL);
+      if (!res.ok) {
+        setModelsStatus(`模型配置加载失败（HTTP ${res.status}）`, true);
+        return;
+      }
+      const parsed = parseModelsPayload(await res.json());
+      if (!parsed) {
+        setModelsStatus("模型配置应答无法解析", true);
+        return;
+      }
+      modelsState = parsed;
+      pendingApiKeys.clear();
+      modelsDirty = false;
+      resetModelForm();
+      renderModelsAll();
+      setModelsStatus("");
+    } catch {
+      setModelsStatus("模型配置加载失败——请检查服务端状态", true);
+    }
+  }
+
+  async function saveModels() {
+    if (!fetcher || !modelsState) return;
+    if (!modelsState.roles.executor) {
+      setModelsStatus("请先在「角色分配」里为执行选择一个模型", true);
+      return;
+    }
+    modelsSaveBtn.disabled = true;
+    setModelsStatus("正在保存…");
+    try {
+      const res = await fetcher(MODELS_API_URL, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(buildModelsPutBody(modelsState.models, modelsState.roles, pendingApiKeys)),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        setModelsStatus(data?.error ?? `保存失败（HTTP ${res.status}）`, true);
+        return;
+      }
+      const parsed = parseModelsPayload(data);
+      if (parsed) modelsState = parsed;
+      pendingApiKeys.clear();
+      modelsDirty = false;
+      resetModelForm();
+      renderModelsAll();
+      setModelsStatus("已保存——对新任务生效；进行中的任务不受影响");
+      host.onAnnounce?.("模型配置已保存，对新任务生效");
+      // composer 的角色 pill 读 /api/harness：保存成功后立刻刷新快照
+      host.onModelsSaved?.();
+    } catch {
+      setModelsStatus("保存请求未能发出——请检查网络或服务端状态", true);
+    } finally {
+      modelsSaveBtn.disabled = false;
+    }
+  }
+
+  modelSubmitBtn.addEventListener("click", upsertModelFromForm);
+  modelCancelBtn.addEventListener("click", () => { resetModelForm(); setFormStatus(""); });
+  modelTestBtn.addEventListener("click", () => { void testModelFromForm(); });
+  modelsSaveBtn.addEventListener("click", () => { void saveModels(); });
+  for (const meta of MODEL_ROLE_META) {
+    roleSelects[meta.key].addEventListener("change", () => {
+      if (!modelsState) return;
+      modelsState.roles = { ...modelsState.roles, [meta.key]: roleSelects[meta.key].value || null };
+      modelsDirty = true;
+      renderRoleSelects();
+      setModelsStatus("角色分配已修改（保存后生效）");
+    });
+  }
+
+  // ---- 分组三：运行默认值 ----
   const defaultsSection = addSection("settings-defaults", "运行默认值");
   const defaultsNote = doc.createElement("p");
   defaultsNote.className = "settings-card-note";
@@ -549,7 +1194,7 @@ export function initSettingsView(host = {}, env = {}) {
     host.onAnnounce?.(autoApproveInput.checked ? "新对话将默认自动放行工具" : "新对话默认逐条审批工具");
   });
 
-  // ---- 分组三：通知 ----
+  // ---- 分组四：通知 ----
   const notifSection = addSection("settings-notifications", "通知");
 
   const permRow = doc.createElement("div");
@@ -628,7 +1273,7 @@ export function initSettingsView(host = {}, env = {}) {
     host.onAnnounce?.(badgeInput.checked ? "已开启应用内角标" : "已关闭应用内角标");
   });
 
-  // ---- 分组四：快捷键（静态一览，数据源与命令面板帮助同源）----
+  // ---- 分组五：快捷键（静态一览，数据源与命令面板帮助同源）----
   const shortcutSection = addSection("settings-shortcuts", "快捷键");
   const scList = doc.createElement("dl");
   scList.className = "settings-shortcut-list";
@@ -648,7 +1293,7 @@ export function initSettingsView(host = {}, env = {}) {
   }
   shortcutSection.appendChild(scList);
 
-  // ---- 分组五：关于 ----
+  // ---- 分组六：关于 ----
   const aboutSection = addSection("settings-about", "关于");
   const aboutList = doc.createElement("dl");
   aboutList.className = "settings-about-list";
@@ -729,18 +1374,33 @@ export function initSettingsView(host = {}, env = {}) {
 
     renderPermission();
     renderAbout();
+    // 模型库数据在服务端：每次打开都拉一次最新（外部可能刚 PUT 过）
+    void loadModels();
+  }
+
+  /** 焦点移交某个分组（命令面板「模型设置」直达用） */
+  function focusSection(sectionId) {
+    const target = sectionId ? doc.getElementById(sectionId) : null;
+    if (!target) return;
+    try { target.scrollIntoView({ block: "start" }); } catch { /* jsdom 等无布局环境 */ }
+    target.focus({ preventScroll: true });
   }
 
   // ---- 开关 ----
-  function openView() {
-    if (open) return;
+  function openView(sectionId) {
+    if (open) {
+      // 已打开时重复调用 = 只换焦点（命令面板直达分组的路径）
+      if (sectionId) focusSection(sectionId);
+      return;
+    }
     open = true;
     restoreFocusTo = /** @type {HTMLElement|null} */ (doc.activeElement);
     settings = loadSettings(storage); // 外部（composer）可能刚写过
     applyBadgePref();
     refresh();
     view.hidden = false;
-    backBtn.focus();
+    if (sectionId && doc.getElementById(sectionId)) focusSection(sectionId);
+    else backBtn.focus();
     host.onAnnounce?.("设置已打开");
   }
 

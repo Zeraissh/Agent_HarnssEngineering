@@ -456,14 +456,14 @@ describe("initSettingsView 视图行为", () => {
     expect(api2.element.querySelector("#settings-about-workdir").textContent).toBe("未获取");
   });
 
-  it("锚点导航：五个分组按钮齐全，点击把焦点交给目标分组", () => {
+  it("锚点导航：六个分组按钮齐全，点击把焦点交给目标分组", () => {
     const api = initSettingsView(makeHost(), makeEnv());
     api.open();
     const navBtns = [...api.element.querySelectorAll(".settings-nav-btn")];
     expect(navBtns.map((b) => b.getAttribute("data-section"))).toEqual(
       SETTINGS_SECTIONS.map((s) => s.id),
     );
-    navBtns[1].click();
+    navBtns[2].click();
     const target = document.getElementById("settings-defaults");
     expect(document.activeElement).toBe(target);
   });

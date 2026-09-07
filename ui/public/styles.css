@@ -6188,3 +6188,84 @@ button.cc-card:hover { border-color: var(--border-2); }
 @media (prefers-reduced-motion: no-preference) {
   .fp-overlay:not([hidden]) { animation: settings-fade 120ms ease-out; }
 }
+
+/* ---- MODEL-02 模型库 + 角色分配（设置中心「模型」分组）---- */
+.settings-models-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  margin: 0 0 var(--space-md);
+}
+.settings-model-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-md);
+  padding: var(--space-sm) var(--space-md);
+  border: 1px solid var(--border-1);
+  border-radius: var(--radius);
+  background: var(--surface-0);
+}
+.settings-model-copy {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  min-width: 0;
+}
+.settings-model-copy strong { font-size: var(--font-md); font-weight: 600; color: var(--text-1); }
+.settings-model-copy small { font-size: var(--font-xs); color: var(--text-3); word-break: break-all; }
+.settings-model-actions { display: flex; gap: var(--space-xs); flex-shrink: 0; }
+.settings-badge {
+  align-self: flex-start;
+  font-size: var(--font-xs);
+  color: var(--text-3);
+  border: 1px solid var(--border-1);
+  border-radius: var(--radius-sm);
+  padding: 0 var(--space-sm);
+}
+.settings-badge--ok {
+  color: var(--status-ok);
+  background: var(--status-ok-surface);
+  border-color: var(--status-ok);
+}
+.settings-model-form {
+  border: 1px solid var(--border-1);
+  border-radius: var(--radius);
+  padding: var(--space-md);
+  margin: 0 0 var(--space-md);
+  background: var(--surface-0);
+}
+.settings-model-form-legend {
+  font-size: var(--font-md);
+  font-weight: 600;
+  color: var(--text-1);
+  padding: 0 var(--space-xs);
+}
+.settings-model-form input[type="text"],
+.settings-model-form input[type="password"] {
+  max-width: 360px;
+  padding: var(--space-xs) var(--space-sm);
+  border: 1px solid var(--border-1);
+  border-radius: var(--radius-sm);
+  background: var(--surface-1);
+  color: var(--text-1);
+  font-size: var(--font-lg);
+  font-family: var(--font-ui);
+}
+.settings-model-form-actions {
+  display: flex;
+  gap: var(--space-sm);
+  margin: var(--space-sm) 0;
+}
+.settings-models-subhead {
+  margin: var(--space-md) 0 var(--space-xs);
+  font-size: var(--font-lg);
+  font-weight: 600;
+  color: var(--text-1);
+}
+.settings-role-current {
+  margin: 0;
+  font-size: var(--font-sm);
+  color: var(--text-2);
+}
+.settings-status--error { color: var(--status-bad); }

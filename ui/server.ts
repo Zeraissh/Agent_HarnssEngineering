@@ -31,6 +31,21 @@ import {
 } from "../src/orchestrate.js";
 import { createModelClientFromEnv, type ResolvedProvider } from "../src/provider.js";
 import {
+  MODEL_STORE_FILENAME,
+  isValidModelName,
+  loadModelStore,
+  normalizeBaseUrl,
+  redactStore,
+  roleEntryOf,
+  saveModelStore,
+  synthesizeStoreFromEnv,
+  testModelEndpoint,
+  validateModelConfig,
+  type ModelConfigInput,
+  type ModelEntry,
+  type ModelStore,
+} from "./model-config.js";
+import {
   instrumentModelClient,
   obsRegistry,
   observeWaitSeconds,
@@ -55,6 +70,7 @@ import {
   FallbackModelClient,
   readFallbackEnv,
   sharedBreakerRegistry,
+  type FallbackEndpoint,
   type FallbackInfo,
   type FallbackRouting,
 } from "../src/model-fallback.js";
@@ -1115,6 +1131,13 @@ export interface UiServerOptions {
    * 要在测试里验证角色模型装配，显式传一份自己的 env。
    */
   roleEnv?: NodeJS.ProcessEnv;
+  /**
+   * 模型库文件（MODEL-02，.agent-models.json）落点。缺省：真实宿主
+   * `<workdir>/.agent-models.json`；**注入了 modelClient 的宿主缺省 null**
+   * （纯内存库，仪器纪律同 roleEnv——假模型宿主不该被开发机残留的库文件武装）。
+   * 显式传路径可在测试里验证持久化与重装配。
+   */
+  modelStoreFile?: string | null;
   /** 只在宿主确实位于可信反向代理之后时读取 X-Forwarded-Proto/Host。 */
   trustProxy?: boolean;
   /**
@@ -1938,10 +1961,6 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   const trustProxy = options.trustProxy ?? (realHost && process.env.AGENT_UI_TRUST_PROXY === "1");
   const crashAfterToolPrepared = options.crashAfterToolPrepared;
 
-  // F1: 缺省模型从环境变量读取，compat 取自 createModelClientFromEnv 返回值
-  // MODEL-01b：Web 启动保持同步装配（createUiServer 契约）；compat 仍可名称猜测，
-  // 粘性探针在下方异步填充供 prefer_healthy。CLI 走 createModelClientWithProbe。
-  const resolved = createModelClientFromEnv(process.env.AGENT_MODEL ?? "claude-opus-4-8");
   /**
    * 可选装备（角色模型 / 降级链 / 能力探针）的 env 来源。真实宿主读 process.env；
    * 注入了 modelClient 的宿主缺省读空 env——见 UiServerOptions.roleEnv 的仪器纪律。
@@ -1951,6 +1970,35 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   const fallbackEnv = options.fallbackEnv ?? armamentEnv;
   const roleEnv = options.roleEnv ?? armamentEnv;
   const routingPolicy: FallbackRouting = readFallbackEnv(fallbackEnv).routing;
+
+  /**
+   * MODEL-02 模型库（默认 <workdir>/.agent-models.json）。生效优先级：运行时库 > env——
+   * 库文件在且 executor 有效就以库为准；否则把 env 现状合成一份初始库
+   * （AGENT_MODEL 与 AGENT_<ROLE>_* 都经 synthesizeStoreFromEnv 桥接，语义与旧
+   * resolveRole 逐条一致）。注入 modelClient 的宿主默认不落盘（modelStoreFile=null），
+   * 仪器纪律同 roleEnv：假模型宿主不该被开发机残留的库文件武装。
+   */
+  const modelStoreFile = options.modelStoreFile !== undefined
+    ? options.modelStoreFile
+    : realHost
+      ? join(resolve(options.workdir ?? process.cwd()), MODEL_STORE_FILENAME)
+      : null;
+  let modelStoreState: { store: ModelStore; source: "store" | "env" } = (() => {
+    if (modelStoreFile) {
+      const loaded = loadModelStore(modelStoreFile);
+      if (loaded.store?.roles.executor) {
+        if (loaded.recoveredFromCorrupt) {
+          operationalLog("warn", "model_store_recovered", { file: modelStoreFile });
+        }
+        return { store: loaded.store, source: "store" as const };
+      }
+    }
+    return { store: synthesizeStoreFromEnv(process.env, roleEnv), source: "env" as const };
+  })();
+
+  // F1: 缺省模型从模型库（或 env 合成库）读取，compat 取自 createModelClientFromEnv 返回值
+  // MODEL-01b：Web 启动保持同步装配（createUiServer 契约）；compat 仍可名称猜测，
+  // 粘性探针在下方异步填充供 prefer_healthy。CLI 走 createModelClientWithProbe。
   let executorCapabilities: EndpointCapabilities | null = null;
   /**
    * 端点降级链（MODEL-01a/b）。执行者 AGENT_FALLBACK_*；角色可 own / inherit。
@@ -1961,46 +2009,88 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    */
   const fallbackSink = new AsyncLocalStorage<(info: FallbackInfo) => void>();
   const onFallback = (info: FallbackInfo) => fallbackSink.getStore()?.(info);
-  const executorModelName = process.env.AGENT_MODEL ?? "claude-opus-4-8";
+
   /**
-   * 执行者端点身份（provider|model|origin，不含 key）：降级链熔断、探针粘性、学到的上下文窗口
-   * 都按它做键。三处此前各拼一份，这里收成一个。
+   * 执行者当前装配（MODEL-02 可重入）。PUT /api/models 成功后 assembleExecutor
+   * 重建本组变量；进行中的 run 手持旧 client 引用继续跑完——配置只对新任务生效。
+   * 注入了 modelClient 的宿主锁定执行者（假模型的语义由注入方掌控，不被库改写）。
+   *
+   * 执行者端点身份（provider|model|origin，不含 key）：降级链熔断、探针粘性、
+   * 学到的上下文窗口都按它做键。
    */
-  const executorIdentity: EndpointIdentity = {
-    provider: resolved.provider,
-    model: executorModelName,
-    ...(process.env.ANTHROPIC_BASE_URL || process.env.OPENAI_BASE_URL
-      ? {
-          baseURL:
-            resolved.provider === "openai"
-              ? process.env.OPENAI_BASE_URL
-              : process.env.ANTHROPIC_BASE_URL,
-        }
-      : {}),
-  };
-  const fallbackClient = createFallbackClientIfConfigured(
-    {
-      name: executorModelName,
-      client: options.modelClient ?? resolved.client,
+  let executorModelName = "";
+  let resolved!: ResolvedProvider;
+  let executorIdentity!: EndpointIdentity;
+  let fallbackChain: string[] | null = null;
+  let executorBackups: FallbackEndpoint[] = [];
+  let modelClient!: ModelClient;
+  let envCompat = true;
+
+  function assembleExecutor(entry: ModelEntry | null): void {
+    executorModelName = entry?.model ?? process.env.AGENT_MODEL ?? "claude-opus-4-8";
+    resolved = entry
+      ? createModelClientFromEnv(entry.model, {
+          provider: entry.provider,
+          ...(entry.baseUrl ? { baseURL: entry.baseUrl } : {}),
+          ...(entry.apiKey ? { apiKey: entry.apiKey } : {}),
+        })
+      : createModelClientFromEnv(executorModelName);
+    envCompat = resolved.compat;
+    const envBaseURL = process.env.ANTHROPIC_BASE_URL || process.env.OPENAI_BASE_URL
+      ? resolved.provider === "openai"
+        ? process.env.OPENAI_BASE_URL
+        : process.env.ANTHROPIC_BASE_URL
+      : undefined;
+    const identityBaseURL = entry?.baseUrl || envBaseURL;
+    executorIdentity = {
+      provider: resolved.provider,
+      model: executorModelName,
+      ...(identityBaseURL ? { baseURL: identityBaseURL } : {}),
+    };
+    const fallbackClient = createFallbackClientIfConfigured(
+      {
+        name: executorModelName,
+        client: options.modelClient ?? resolved.client,
+        identity: executorIdentity,
+      },
+      fallbackEnv,
+      onFallback,
+      { role: "executor", breakerRegistry: sharedBreakerRegistry },
+    );
+    fallbackChain = fallbackClient instanceof FallbackModelClient ? fallbackClient.chain() : null;
+    executorBackups = executorBackupEndpoints(fallbackClient);
+    // 日账本逐调用实时计量（评审 b62f6a5：段粒度落账让预算门的 TOCTOU 窗口有
+    // 整段宽——最坏 4 条 lineage 在账本过线前全部准入；跨午夜大段还会整段挤占
+    // 新日额度）。metrics.tokens 的 role 记账仍走事件路径（每段独立 usage、归属
+    // 清晰），这层只喂日账本——两本账职责分开，互不双计。
+    // 计量包在降级之**外**：哪个端点应答的都要计进日额度，账本关心的是花了多少钱。
+    // OBS-02 的延迟仪表再包一层，位置同理：TTFT 要量的是**委托方等了多久**，
+    // 中途换了端点也照样算在这一次调用头上。
+    modelClient = instrumentModelClient(
+      meterModelClient(fallbackClient, (u) => bumpDaily(u)),
+      { role: "execution", model: executorModelName },
+    );
+  }
+  assembleExecutor(roleEntryOf(modelStoreState.store, "executor"));
+
+  /** 异步粘性探针（不挡 createUiServer）：填充 prefer_healthy 用的健康位。重装配后重探。 */
+  function probeExecutorEndpoint(entry: ModelEntry | null): void {
+    if (options.modelClient) return;
+    const envApiKey = resolved.provider === "openai" ? process.env.OPENAI_API_KEY : process.env.ANTHROPIC_API_KEY;
+    const apiKey = entry?.apiKey || envApiKey;
+    void probeEndpointCapabilities({
       identity: executorIdentity,
-    },
-    fallbackEnv,
-    onFallback,
-    { role: "executor", breakerRegistry: sharedBreakerRegistry },
-  );
-  const fallbackChain = fallbackClient instanceof FallbackModelClient ? fallbackClient.chain() : null;
-  const executorBackups = executorBackupEndpoints(fallbackClient);
-  // 日账本逐调用实时计量（评审 b62f6a5：段粒度落账让预算门的 TOCTOU 窗口有
-  // 整段宽——最坏 4 条 lineage 在账本过线前全部准入；跨午夜大段还会整段挤占
-  // 新日额度）。metrics.tokens 的 role 记账仍走事件路径（每段独立 usage、归属
-  // 清晰），这层只喂日账本——两本账职责分开，互不双计。
-  // 计量包在降级之**外**：哪个端点应答的都要计进日额度，账本关心的是花了多少钱。
-  // OBS-02 的延迟仪表再包一层，位置同理：TTFT 要量的是**委托方等了多久**，
-  // 中途换了端点也照样算在这一次调用头上。
-  const modelClient = instrumentModelClient(
-    meterModelClient(fallbackClient, (u) => bumpDaily(u)),
-    { role: "execution", model: executorModelName },
-  );
+      ...(apiKey ? { apiKey } : {}),
+      env: fallbackEnv,
+    })
+      .then((caps) => {
+        executorCapabilities = caps;
+      })
+      .catch(() => {
+        /* 探针失败不影响宿主启动——fail-open */
+      });
+  }
+  probeExecutorEndpoint(roleEntryOf(modelStoreState.store, "executor"));
   const taskCompletionEnabled =
     options.taskCompletion ?? (options.modelClient ? false : process.env.AGENT_REQUIRE_FINISH_TASK !== "0");
   /**
@@ -2050,7 +2140,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   const maxStoredRuns = positiveInteger(options.maxStoredRuns, "maxStoredRuns")
     ?? positiveIntegerEnv("AGENT_UI_MAX_STORED_RUNS")
     ?? (realHost ? Math.max(100, historyKeep) : Number.MAX_SAFE_INTEGER);
-  const envCompat = resolved.compat;
+  // envCompat 已由 assembleExecutor 维护（MODEL-02：随执行者重装配更新）
   // 在源头就归一：workdir 参与白名单比对、侧栏分组键、工具圈禁根三处，
   // 三处必须是同一个字符串形态。`D:/a/b` 与 `D:` 指同一个目录，
   // 但字符串不等——不在源头 resolve 的话，默认路径会过不了自己的白名单
@@ -2169,7 +2259,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   const injectedTools = options.tools;
 
   /**
-   * V-30 角色模型：verifier / planner 各自可用独立端点（口径与 src/cli.ts 一致）。
+   * V-30 角色模型（MODEL-02 起由模型库驱动）：verifier / planner / vision 各自
+   * 可指向库中任意条目；roles 里 null = 跟随执行（vision 的 null = 不配置）。
    *
    * 密钥只在服务端解析，**绝不下发浏览器**——快照里只报模型名与 provider。
    * 浏览器能做的是"这次用不用独立角色模型"，不是"用哪个 key 连哪个端点"。
@@ -2177,30 +2268,22 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    * 值得配的依据是实测而非直觉：D2 —— 强 verifier 的确定优势是核查效率
    * （约 1/3 成本）。反过来 B3 已经证伪了"更强 planner 能稳住拆分摇摆"，
    * 所以 planner 这一路留给实验，界面不该暗示它更好。
+   *
+   * 整组变量由 assembleRoles 重建（PUT /api/models 触发）；进行中的 run 手持
+   * 旧 client 引用继续跑完——配置只对新任务生效。
    */
-  function resolveRole(prefix: string): { name: string; provider: ResolvedProvider } | null {
-    const name = roleEnv[`AGENT_${prefix}_MODEL`];
-    if (!name) return null;
-    const pv = roleEnv[`AGENT_${prefix}_PROVIDER`];
-    const baseURL = roleEnv[`AGENT_${prefix}_BASE_URL`];
-    const apiKey = roleEnv[`AGENT_${prefix}_API_KEY`];
-    return {
-      name,
-      provider: createModelClientFromEnv(name, {
-        ...(pv ? { provider: pv as "anthropic" | "openai" } : {}),
-        ...(baseURL ? { baseURL } : {}),
-        ...(apiKey ? { apiKey } : {}),
-      }),
-    };
+  interface ResolvedRole {
+    name: string;
+    provider: ResolvedProvider;
+    baseURL?: string;
   }
-
-  const verifierRole = resolveRole("VERIFIER");
-  const plannerRole = resolveRole("PLANNER");
-  /**
-   * 视觉模型是第四个角色（V-31）。配了才有 describe_image 工具——
-   * 没配就不该在工具面上摆一个一调用就报错的工具，那是在骗模型。
-   */
-  const visionRole = resolveRole("VISION");
+  let verifierRole: ResolvedRole | null = null;
+  let plannerRole: ResolvedRole | null = null;
+  let visionRole: ResolvedRole | null = null;
+  let verifierClient: ModelClient | null = null;
+  let plannerClient: ModelClient | null = null;
+  let visionClient: ModelClient | null = null;
+  let visionTool: Tool | null = null;
 
   /** 降级链的角色名 → 指标口径的角色名（verifier 与 verification 是同一个东西） */
   const METRIC_ROLE_OF: Record<"verifier" | "planner" | "vision", MetricRole> = {
@@ -2211,7 +2294,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
   function wrapRoleClient(
     role: "verifier" | "planner" | "vision",
-    resolvedRole: { name: string; provider: ResolvedProvider },
+    resolvedRole: ResolvedRole,
     baseURL: string | undefined,
   ): ModelClient {
     return instrumentModelClient(
@@ -2235,97 +2318,101 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     );
   }
 
-  const verifierClient = verifierRole
-    ? wrapRoleClient("verifier", verifierRole, roleEnv.AGENT_VERIFIER_BASE_URL)
-    : null;
-  const plannerClient = plannerRole
-    ? wrapRoleClient("planner", plannerRole, roleEnv.AGENT_PLANNER_BASE_URL)
-    : null;
-  const visionClient = visionRole
-    ? wrapRoleClient("vision", visionRole, roleEnv.AGENT_VISION_BASE_URL)
-    : null;
-
   /**
-   * OBS-02 首抓盲区：被告警引用的直方图必须在开机时就有 0 值序列，否则
-   * `histogram_quantile(rate(...))` 在第一次观测之前匹配不到任何向量，
-   * 而第一次观测又以非零值出生——那一段增量永远看不见（5xx 序列同一条结论）。
-   * 只铺**这台宿主真的装配了**的角色，不铺笛卡尔积。
+   * 库条目 → 角色解析。env 底座已在启动时合成进库（source="env" 时条目即
+   * env 现状的镜像），所以这里只看库，不再单独读 AGENT_<ROLE>_*。
    */
-  preregisterObservability([
-    { role: "execution" as const, model: executorModelName },
-    ...(verifierRole ? [{ role: "verification" as const, model: verifierRole.name }] : []),
-    ...(plannerRole ? [{ role: "planner" as const, model: plannerRole.name }] : []),
-    ...(visionRole ? [{ role: "vision" as const, model: visionRole.name }] : []),
-  ]);
-
-  const roleFallbackChains = {
-    executor: fallbackChain,
-    verifier: verifierClient instanceof FallbackModelClient ? verifierClient.chain() : null,
-    planner: plannerClient instanceof FallbackModelClient ? plannerClient.chain() : null,
-    vision: visionClient instanceof FallbackModelClient ? visionClient.chain() : null,
-  };
-  const anyRoleFallback = Boolean(
-    roleFallbackChains.verifier || roleFallbackChains.planner || roleFallbackChains.vision,
-  );
-  const fallbackScope = fallbackChain || anyRoleFallback
-    ? anyRoleFallback
-      ? "roles"
-      : "executor"
-    : null;
-
-  // 异步粘性探针（不挡 createUiServer）：填充 prefer_healthy 用的健康位
-  if (!options.modelClient) {
-    void probeEndpointCapabilities({
-      identity: {
-        provider: resolved.provider,
-        model: executorModelName,
-        ...(process.env.ANTHROPIC_BASE_URL || process.env.OPENAI_BASE_URL
-          ? {
-              baseURL:
-                resolved.provider === "openai"
-                  ? process.env.OPENAI_BASE_URL
-                  : process.env.ANTHROPIC_BASE_URL,
-            }
-          : {}),
-      },
-      ...(process.env.ANTHROPIC_API_KEY || process.env.OPENAI_API_KEY
-        ? {
-            apiKey:
-              resolved.provider === "openai"
-                ? process.env.OPENAI_API_KEY
-                : process.env.ANTHROPIC_API_KEY,
-          }
-        : {}),
-      env: fallbackEnv,
-    })
-      .then((caps) => {
-        executorCapabilities = caps;
-      })
-      .catch(() => {
-        /* 探针失败不影响宿主启动——fail-open */
-      });
+  function resolveRoleFromLibrary(role: "verifier" | "planner" | "vision"): ResolvedRole | null {
+    const entry = roleEntryOf(modelStoreState.store, role);
+    if (!entry) return null;
+    return {
+      name: entry.model,
+      provider: createModelClientFromEnv(entry.model, {
+        provider: entry.provider,
+        ...(entry.baseUrl ? { baseURL: entry.baseUrl } : {}),
+        ...(entry.apiKey ? { apiKey: entry.apiKey } : {}),
+      }),
+      ...(entry.baseUrl ? { baseURL: entry.baseUrl } : {}),
+    };
   }
 
-  const visionTool = visionRole && visionClient
-    ? createDescribeImageTool({
-        // 计量包裹：视觉调用不经 done/verification 记账路径，只能在客户端边界抓。
-        // 视觉是独立 client（不在主 modelClient 的日账包裹之内），日账本也在这里喂
-        client: meterModelClient(visionClient, (u) => {
-          growTokens("vision", u);
-          bumpDaily(u);
-        }),
-        modelName: visionRole.name,
-      })
-    : null;
   const webSearchTool = isWebSearchConfigured() ? createWebSearchTool() : null;
   const enabledBuiltinPool = bashEnabled
     ? BUILTIN_POOL
     : BUILTIN_POOL.filter((tool) => tool.name !== bashTool.name);
-  const toolPool: Tool[] = [
-    ...enabledBuiltinPool,
-    ...(webSearchTool ? [webSearchTool] : []),
-    ...(visionTool ? [visionTool] : []),
-  ];
+  /** 工具面随角色装配重建：vision 配了才有 describe_image（V-31 的诚实工具面纪律） */
+  let toolPool: Tool[] = [];
+
+  function assembleRoles(): void {
+    verifierRole = resolveRoleFromLibrary("verifier");
+    plannerRole = resolveRoleFromLibrary("planner");
+    visionRole = resolveRoleFromLibrary("vision");
+    verifierClient = verifierRole ? wrapRoleClient("verifier", verifierRole, verifierRole.baseURL) : null;
+    plannerClient = plannerRole ? wrapRoleClient("planner", plannerRole, plannerRole.baseURL) : null;
+    visionClient = visionRole ? wrapRoleClient("vision", visionRole, visionRole.baseURL) : null;
+
+    /**
+     * OBS-02 首抓盲区：被告警引用的直方图必须在开机时就有 0 值序列，否则
+     * `histogram_quantile(rate(...))` 在第一次观测之前匹配不到任何向量，
+     * 而第一次观测又以非零值出生——那一段增量永远看不见（5xx 序列同一条结论）。
+     * 只铺**这台宿主真的装配了**的角色，不铺笛卡尔积。重装配时增量登记新角色即可。
+     */
+    preregisterObservability([
+      { role: "execution" as const, model: executorModelName },
+      ...(verifierRole ? [{ role: "verification" as const, model: verifierRole.name }] : []),
+      ...(plannerRole ? [{ role: "planner" as const, model: plannerRole.name }] : []),
+      ...(visionRole ? [{ role: "vision" as const, model: visionRole.name }] : []),
+    ]);
+
+    visionTool = visionRole && visionClient
+      ? createDescribeImageTool({
+          // 计量包裹：视觉调用不经 done/verification 记账路径，只能在客户端边界抓。
+          // 视觉是独立 client（不在主 modelClient 的日账包裹之内），日账本也在这里喂
+          client: meterModelClient(visionClient, (u) => {
+            growTokens("vision", u);
+            bumpDaily(u);
+          }),
+          modelName: visionRole.name,
+        })
+      : null;
+    toolPool = [
+      ...enabledBuiltinPool,
+      ...(webSearchTool ? [webSearchTool] : []),
+      ...(visionTool ? [visionTool] : []),
+    ];
+  }
+  assembleRoles();
+
+  /**
+   * 降级链快照全部现算（MODEL-02：PUT /api/models 后旧常量会撒谎）。
+   * 未配置时 **null 而不是空数组**："没有这条防线"与"链上零个备用端点"
+   * 在界面上必须能分开。只报名字——链上第二家的 baseURL / key 绝不下发。
+   */
+  function roleFallbackChainsView(): {
+    executor: string[] | null;
+    verifier: string[] | null;
+    planner: string[] | null;
+    vision: string[] | null;
+  } {
+    return {
+      executor: fallbackChain,
+      verifier: verifierClient instanceof FallbackModelClient ? verifierClient.chain() : null,
+      planner: plannerClient instanceof FallbackModelClient ? plannerClient.chain() : null,
+      vision: visionClient instanceof FallbackModelClient ? visionClient.chain() : null,
+    };
+  }
+  function anyRoleFallbackNow(): boolean {
+    const chains = roleFallbackChainsView();
+    return Boolean(chains.verifier || chains.planner || chains.vision);
+  }
+  /** 有任一角色链时 scope=roles；仅执行者 = executor；未配 = null */
+  function fallbackScopeNow(): "roles" | "executor" | null {
+    return fallbackChain || anyRoleFallbackNow()
+      ? anyRoleFallbackNow()
+        ? "roles"
+        : "executor"
+      : null;
+  }
 
   const runs = new Map<string, StoredRun>();
   const startedAt = Date.now();
@@ -3912,7 +3999,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    * 未配降级链时不建域——不为一条没启用的防线给每个 run 加一层 ALS 上下文。
    */
   function withFallbackAttribution<T>(run: StoredRun, body: () => Promise<T>): Promise<T> {
-    if (!fallbackChain && !anyRoleFallback) return body();
+    if (!fallbackChain && !anyRoleFallbackNow()) return body();
     return fallbackSink.run((info) => {
       run.fallbacks = (run.fallbacks ?? 0) + 1;
       // 来源记 "model"：它既不是模型说的话（main），也不是宿主的决定（host），
@@ -5311,7 +5398,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       workdir: cfg.workdir,
       executionIsolation: executionBoundary,
       roleModels: {
-        executor: process.env.AGENT_MODEL ?? "claude-opus-4-8",
+        executor: executorModelName,
         // 报的是本 run 实际用了什么，而不是配了什么——两者可以不同
         verifier: verifierRole && (run.useVerifierModel ?? true) ? verifierRole.name : null,
         planner: plannerRole && (run.usePlannerModel ?? true) ? plannerRole.name : null,
@@ -5323,10 +5410,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
        * 只报名字——链上第二家的 baseURL / key 与角色模型同规格，绝不下发。
        */
       fallbackChain,
-      fallbackChains: roleFallbackChains,
+      fallbackChains: roleFallbackChainsView(),
       // 有任一角色链时 scope=roles；仅执行者 = executor；未配 = null
-      fallbackScope,
-      fallbackRouting: fallbackChain || anyRoleFallback ? routingPolicy : null,
+      fallbackScope: fallbackScopeNow(),
+      fallbackRouting: fallbackChain || anyRoleFallbackNow() ? routingPolicy : null,
       compatSource: executorCapabilities?.source ?? "name",
       guardrails: {
         maxTurns: cfg.maxTurns ?? null,
@@ -5409,11 +5496,39 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     return true;
   }
 
+  /**
+   * V-30 角色模型快照（/api/harness 与 /api/models 共用一份视图，两处口径永不漂移）。
+   * **只报模型名与 provider，绝不下发密钥或 baseURL** ——浏览器能决定的是
+   * "这次用不用独立角色模型"，不是"用哪个 key 连哪个端点"。
+   */
+  function roleModelsView(): Record<string, unknown> {
+    return {
+      executor: { model: executorModelName, provider: resolved.provider },
+      verifier: verifierRole
+        ? { model: verifierRole.name, provider: verifierRole.provider.provider, configured: true }
+        : { configured: false },
+      planner: plannerRole
+        ? { model: plannerRole.name, provider: plannerRole.provider.provider, configured: true }
+        : { configured: false },
+      vision: visionRole
+        ? { model: visionRole.name, provider: visionRole.provider.provider, configured: true }
+        : { configured: false },
+    };
+  }
+
+  /** GET /api/models 出栈：库脱敏视图 + 当前装配的角色快照。 */
+  function modelsApiPayload(): Record<string, unknown> {
+    return {
+      ...redactStore(modelStoreState.store, modelStoreState.source),
+      roleModels: roleModelsView(),
+    };
+  }
+
   function harnessSnapshot(): Record<string, unknown> {
     const tools = buildConfig().tools;
     return {
-      model: process.env.AGENT_MODEL ?? "claude-opus-4-8",
-      provider: process.env.AGENT_PROVIDER ?? "anthropic",
+      model: executorModelName,
+      provider: resolved.provider,
       compat: envCompat,
       // compat 模式下第三方端点不认识 output_config.effort，harness 不会发送它——
       // 界面必须说清楚，否则用户以为自己设的档位生效了
@@ -5481,28 +5596,13 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       effortLevels: [...EFFORT_LEVELS],
       // V-29：合法工作目录集合由宿主声明，浏览器只在其中选
       availableWorkdirs: allowedWorkdirs,
-      /**
-       * V-30 角色模型。**只报模型名与 provider，绝不下发密钥或 baseURL** ——
-       * 浏览器能决定的是"这次用不用独立角色模型"，不是"用哪个 key 连哪个端点"。
-       */
-      roleModels: {
-        executor: { model: process.env.AGENT_MODEL ?? "claude-opus-4-8", provider: process.env.AGENT_PROVIDER ?? "anthropic" },
-        verifier: verifierRole
-          ? { model: verifierRole.name, provider: verifierRole.provider.provider, configured: true }
-          : { configured: false },
-        planner: plannerRole
-          ? { model: plannerRole.name, provider: plannerRole.provider.provider, configured: true }
-          : { configured: false },
-        vision: visionRole
-          ? { model: visionRole.name, provider: visionRole.provider.provider, configured: true }
-          : { configured: false },
-      },
+      roleModels: roleModelsView(),
       // MODEL-01a：进程级降级链快照（逐 run 的同名字段走 run_config）。
       // null = 未配置这条防线，与"链上只有主端点"不是一回事
       fallbackChain,
-      fallbackChains: roleFallbackChains,
-      fallbackScope,
-      fallbackRouting: fallbackChain || anyRoleFallback ? routingPolicy : null,
+      fallbackChains: roleFallbackChainsView(),
+      fallbackScope: fallbackScopeNow(),
+      fallbackRouting: fallbackChain || anyRoleFallbackNow() ? routingPolicy : null,
       compatSource: executorCapabilities?.source ?? "name",
       // 核查预算与执行者解耦，但**不是常数**（9.1）：领域包可用 verify.maxTurns
       // 覆盖。这里报进程级默认包的值；逐 run 的真实值走 run_config
@@ -5861,6 +5961,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     | { type: "ready" }
     | { type: "metrics" }
     | { type: "harness" }
+    | { type: "modelsGet" }
+    | { type: "modelsPut" }
+    | { type: "modelsTest" }
     | { type: "memoryList" }
     | { type: "memoryRead"; name: string }
     | { type: "searchRuns"; query: string; limit: string | null }
@@ -5905,6 +6008,21 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
     if (method === "GET" && url === "/api/harness") {
       return { type: "harness" };
+    }
+
+    /**
+     * MODEL-02 模型库端点。路由层只管形状；校验（provider 枚举 / 模型名 /
+     * baseUrl 白名单 / roles 引用完整性）全部在 model-config.ts 的
+     * validateModelConfig —— 与 schedules 的"路由管形状、处理器管语义"同模式。
+     */
+    if (method === "GET" && url === "/api/models") {
+      return { type: "modelsGet" };
+    }
+    if (method === "PUT" && url === "/api/models") {
+      return { type: "modelsPut" };
+    }
+    if (method === "POST" && url === "/api/models/test") {
+      return { type: "modelsTest" };
     }
 
     /**
@@ -6525,7 +6643,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       }
     }
 
-    if (method === "POST") {
+    if (method === "POST" || method === "PUT") {
       const retryAfter = mutationRetryAfter(req);
       if (retryAfter !== null) {
         metrics.rateRejected += 1;
@@ -6543,6 +6661,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         "answer",
         "approval",
         "autoApprove",
+        "modelsPut",
+        "modelsTest",
       ]).has(route.type);
       const contentType = String(req.headers["content-type"] ?? "").toLowerCase();
       if (jsonRoute && !/^application\/(?:[\w.-]+\+)?json(?:\s*;|$)/.test(contentType)) {
@@ -6578,6 +6698,113 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
       case "harness":
         return json(res, 200, harnessSnapshot());
+
+      /**
+       * MODEL-02 模型库端点。
+       *
+       * GET：整库脱敏出栈（apiKey 只进不出，只回 hasApiKey）+ 当前角色装配快照。
+       * PUT：整表替换。校验全过 → 先落盘（原子写）→ 再重装配；任何一步失败都
+       * 不动在跑的配置。apiKey 三态：省略 = 保持不变；"" = 清除（走环境变量）；
+       * 非空 = 更新。重装配只影响**新** run——进行中的 run 手持旧 client 引用。
+       * POST /test：1 token 的最小请求验证 端点/key/模型名 三元组，10s 超时。
+       */
+      case "modelsGet":
+        return json(res, 200, modelsApiPayload());
+
+      case "modelsPut": {
+        let body: string;
+        try {
+          body = await readBody(req, requestBodyMaxBytes);
+        } catch (error) {
+          return requestBodyFailure(res, error);
+        }
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          return badRequest(res, "Invalid JSON body");
+        }
+        const result = validateModelConfig(parsed as ModelConfigInput, modelStoreState.store);
+        if (!result.ok) {
+          return json(res, 400, { error: result.errors[0], errors: result.errors });
+        }
+        if (modelStoreFile) {
+          try {
+            saveModelStore(modelStoreFile, result.store);
+          } catch (error) {
+            return json(res, 500, {
+              error: `模型库写盘失败：${error instanceof Error ? error.message : String(error)}`,
+            });
+          }
+        }
+        modelStoreState = { store: result.store, source: modelStoreFile ? "store" : "env" };
+        try {
+          // 注入 modelClient 的宿主锁定执行者（假模型语义由注入方掌控）；
+          // 角色（verifier/planner/vision）始终可重装配。
+          if (!options.modelClient) {
+            const entry = roleEntryOf(result.store, "executor");
+            assembleExecutor(entry);
+            probeExecutorEndpoint(entry);
+          }
+          assembleRoles();
+        } catch (error) {
+          return json(res, 500, {
+            error: `模型装配失败：${error instanceof Error ? error.message : String(error)}`,
+          });
+        }
+        if (realHost) {
+          operationalLog("info", "models_updated", {
+            source: modelStoreState.source,
+            modelCount: result.store.models.length,
+          });
+        }
+        return json(res, 200, modelsApiPayload());
+      }
+
+      case "modelsTest": {
+        let body: string;
+        try {
+          body = await readBody(req, requestBodyMaxBytes);
+        } catch (error) {
+          return requestBodyFailure(res, error);
+        }
+        let parsed: Record<string, unknown>;
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          return badRequest(res, "Invalid JSON body");
+        }
+        if (parsed.provider !== "anthropic" && parsed.provider !== "openai") {
+          return badRequest(res, 'provider 只能是 "anthropic" 或 "openai"');
+        }
+        if (typeof parsed.model !== "string" || !isValidModelName(parsed.model)) {
+          return badRequest(res, "model 无效：不能为空、不能带首尾空白或控制字符，且最长 200 字符");
+        }
+        let baseUrl = "";
+        try {
+          baseUrl = normalizeBaseUrl(parsed.baseUrl);
+        } catch (error) {
+          return badRequest(res, error instanceof Error ? error.message : String(error));
+        }
+        // key 解析顺序：表单显式值 > 该 provider 的环境变量；都没有就当场说清楚，
+        // 不发一个注定 401 的请求
+        const envKey = parsed.provider === "openai" ? process.env.OPENAI_API_KEY : process.env.ANTHROPIC_API_KEY;
+        const apiKey = (typeof parsed.apiKey === "string" && parsed.apiKey) || envKey || "";
+        if (!apiKey) {
+          return json(res, 200, {
+            ok: false,
+            error: `缺少 API Key：请在表单中填写，或配置环境变量 ${parsed.provider === "openai" ? "OPENAI_API_KEY" : "ANTHROPIC_API_KEY"}`,
+          });
+        }
+        const testResult = await testModelEndpoint({
+          provider: parsed.provider,
+          model: parsed.model,
+          baseUrl,
+          apiKey,
+          timeoutMs: 10_000,
+        });
+        return json(res, 200, testResult);
+      }
 
       case "memoryList": {
         /**
