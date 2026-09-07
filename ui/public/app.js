@@ -6446,7 +6446,7 @@ export function formatCompletionChatText(completion) {
     for (const item of arr) lines.push(`- ${String(item)}`);
   };
   pushGroup("验证", completion.verification);
-  pushGroup("假设", completion.assumptions);
+  pushGroup("假设与前提", completion.assumptions);
   pushGroup("未完成", unfinished);
   pushGroup("阻塞", blocked);
   return lines.join("\n");
@@ -6463,7 +6463,7 @@ export function formatCompletionExtras(completion) {
     for (const item of arr) lines.push(`- ${String(item)}`);
   };
   pushGroup("验证", completion.verification);
-  pushGroup("假设", completion.assumptions);
+  pushGroup("假设与前提", completion.assumptions);
   pushGroup("未完成", unfinished);
   pushGroup("阻塞", blocked);
   return lines.join("\n");
@@ -7393,7 +7393,7 @@ function renderOverviewTab(overview, state) {
     const groups = [
       ["产物", overview.completion.artifacts],
       ["验证", overview.completion.verification],
-      ["关键假设", overview.completion.assumptions],
+      ["假设与前提", overview.completion.assumptions],
     ].filter(([, items]) => Array.isArray(items) && items.length > 0);
     if (groups.length > 0) {
       html += `<div class="overview-section"><h3 class="overview-section-title">结构化交付</h3>`;

@@ -86,7 +86,9 @@ export function createFinishTaskTool(): Tool {
         assumptions: {
           type: "array",
           items: { type: "string" },
-          description: "因未获答复而采用的关键假设；没有则 []",
+          description:
+            "按其为真推进、但未独立验证的前提与假设（含环境限制、未获答复时的取值）；" +
+            "已经验证过的结论与证据放 verification，不要写在这里；没有则 []",
         },
         blockers: {
           type: "array",
