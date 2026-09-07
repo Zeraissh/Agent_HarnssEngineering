@@ -274,7 +274,7 @@ export function executeItem(item, host) {
 /** 快捷键 cheatsheet 内容（帮助浮层与测试共用同一份数据）。 */
 export const SHORTCUTS = [
   { keys: "Ctrl / ⌘ + K", desc: "打开命令面板" },
-  { keys: "Ctrl / ⌘ + Enter", desc: "发送任务 / 追加指令" },
+  { keys: "Enter", desc: "发送任务 / 追加指令（输入框内；Shift + Enter 换行）" },
   { keys: "↑ ↓", desc: "在面板内移动选择" },
   { keys: "Enter", desc: "执行选中项" },
   { keys: "Esc", desc: "关闭面板 / 菜单" },

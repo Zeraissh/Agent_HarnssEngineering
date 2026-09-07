@@ -2472,6 +2472,79 @@ describe("行内错误的关闭按钮：壳侧接线", () => {
   });
 });
 
+/**
+ * 附件可删除（壳侧接线）：清单项有 ✕、删输入框里的「附件：」行、
+ * revoke 预览 objectURL、调 DELETE /api/upload 删盘上的文件。
+ * 处理器住在 index.html 这只壳里，只能抠源码——照 B1 那条口径。
+ */
+describe("附件清单可删除（壳侧接线）", () => {
+  const htmlSrc = readFileSync(join(__dirname, "..", "ui", "public", "index.html"), "utf-8");
+
+  it("每项渲染删除按钮（Phosphor 图标 + 中文 aria-label）", () => {
+    expect(htmlSrc).toContain("data-upload-remove");
+    expect(htmlSrc).toContain('aria-label="删除附件');
+    expect(htmlSrc).toContain("ph-x");
+  });
+
+  it("删除做三件事：清单移除、输入框「附件：」行删掉、objectURL revoke", () => {
+    const fn = htmlSrc.match(/async function removeUploadedFile[\s\S]*?\n\}/);
+    expect(fn).not.toBeNull();
+    const body = fn[0];
+    expect(body).toContain("uploaded.splice(index, 1)");
+    expect(body).toContain("URL.revokeObjectURL(u.previewUrl)");
+    expect(body).toContain("附件：${u.path}");
+  });
+
+  it("删盘走 DELETE /api/upload；失败只移清单并在状态条说明取舍", () => {
+    const fn = htmlSrc.match(/async function removeUploadedFile[\s\S]*?\n\}/);
+    expect(fn).not.toBeNull();
+    const body = fn[0];
+    expect(body).toContain('"/api/upload"');
+    expect(body).toContain('method: "DELETE"');
+    expect(body).toContain("已从清单移除");
+  });
+
+  it("删除按钮走 uploadList 的事件委托（清单每次重画，逐个绑会漏）", () => {
+    expect(htmlSrc).toMatch(/uploadList\.addEventListener\("click"[\s\S]*?data-upload-remove/);
+  });
+});
+
+/**
+ * 发送快捷键：Enter 发送、Shift+Enter 换行（主流聊天产品惯例）。
+ * 处理器住在 index.html 这只壳里，只能抠源码——照 B1 那条口径。
+ */
+describe("发送快捷键：Enter 发送（壳侧接线）", () => {
+  const htmlSrc = readFileSync(join(__dirname, "..", "ui", "public", "index.html"), "utf-8");
+  const appSrc = readFileSync(join(__dirname, "..", "ui", "public", "app.js"), "utf-8");
+  const paletteSrc = readFileSync(join(__dirname, "..", "ui", "public", "features", "command-palette.js"), "utf-8");
+
+  it("Enter 即提交，Shift+Enter 留给换行", () => {
+    const handler = htmlSrc.match(/taskInput\.addEventListener\("keydown"[\s\S]*?\n\}\);/);
+    expect(handler).not.toBeNull();
+    const body = handler[0];
+    expect(body).toContain('e.key !== "Enter"');
+    expect(body).toMatch(/if \(e\.shiftKey\) return/);
+    expect(body).toContain("requestSubmit");
+    // 不再要求 Ctrl/Cmd——发送就是裸 Enter
+    expect(body).not.toMatch(/ctrlKey \|\| e\.metaKey/);
+  });
+
+  it("中文输入法组词期间 Enter 不触发发送（IME 防护）", () => {
+    const handler = htmlSrc.match(/taskInput\.addEventListener\("keydown"[\s\S]*?\n\}\);/);
+    expect(handler).not.toBeNull();
+    expect(handler[0]).toMatch(/e\.isComposing \|\| e\.keyCode === 229/);
+  });
+
+  it("placeholder 与快捷键一览同步改成 Enter 发送", () => {
+    expect(htmlSrc).toContain("Enter 发送，Shift+Enter 换行");
+    expect(htmlSrc).not.toContain("Ctrl+Enter 发送");
+    expect(appSrc).not.toContain("Ctrl+Enter 发送");
+    expect(appSrc.match(/Enter 发送，Shift\+Enter 换行/g)?.length).toBeGreaterThanOrEqual(5);
+    expect(paletteSrc).not.toContain("Ctrl / ⌘ + Enter");
+    expect(paletteSrc).toMatch(/keys: "Enter", desc: "发送任务 \/ 追加指令/);
+  });
+});
+
 describe("直播条目的视觉记号", () => {
   const css = readFileSync(join(__dirname, "..", "ui", "public", "styles.css"), "utf-8");
 

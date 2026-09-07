@@ -3,7 +3,7 @@
  * 并支持任务提交与审批应答。Node 内置模块，零第三方依赖。
  */
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
-import { readFile, writeFile, mkdir, stat, open, readdir, realpath, access } from "node:fs/promises";
+import { readFile, writeFile, mkdir, stat, open, readdir, realpath, access, rm } from "node:fs/promises";
 import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, readFileSync } from "node:fs";
@@ -6068,6 +6068,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     | { type: "messageQueue"; runId: string }
     | { type: "extendBudget"; runId: string }
     | { type: "upload" }
+    | { type: "uploadDelete" }
     | { type: "createRun" }
     | { type: "schedulesList" }
     | { type: "scheduleCreate" }
@@ -6249,6 +6250,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
     if (method === "POST" && url === "/api/upload") {
       return { type: "upload" };
+    }
+
+    // 附件清单的删除：与上传同一条圈禁线，且只许碰 uploads/ 子目录内的文件
+    if (method === "DELETE" && url === "/api/upload") {
+      return { type: "uploadDelete" };
     }
 
     const followUpMatch = method === "POST" && url.match(/^\/api\/runs\/([^/]+)\/messages$/);
@@ -6755,7 +6761,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       }
     }
 
-    if (method === "POST" || method === "PUT" || (method === "DELETE" && route.type === "workdirRemove")) {
+    if (method === "POST" || method === "PUT"
+      || (method === "DELETE" && (route.type === "workdirRemove" || route.type === "uploadDelete"))) {
       const retryAfter = mutationRetryAfter(req);
       if (retryAfter !== null) {
         metrics.rateRejected += 1;
@@ -6764,6 +6771,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       }
       const jsonRoute = new Set([
         "upload",
+        "uploadDelete",
         "followUp",
         "inspectPaths",
         "reveal",
@@ -7521,6 +7529,87 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           absolutePath: dest,
           bytes: bytes.length,
         });
+      }
+
+      case "uploadDelete": {
+        /**
+         * 附件清单里那一下 ✕：把还没发出去的附件从盘上删掉。
+         *
+         * 这不是一个任意删文件的端点，两道闸缺一不可：
+         *   ① 目标必须落在**白名单工作目录**之内（绝对路径逐一试
+         *      `resolveInWorkdir`，相对路径按 workdir 参数解析并验白名单，
+         *      与 filePreview 同一把尺）；
+         *   ② 解析结果必须落在该工作目录的 `uploads/` 子目录之内——
+         *      只许删上传落进去的东西，别的一个字节都不碰。
+         * 已被某次提交用掉的文件客户端不会再调这里；真撞上了（404/409）
+         * 客户端只做清单移除，盘上的留着。
+         */
+        let body: string;
+        try {
+          body = await readBody(req, requestBodyMaxBytes);
+        } catch (error) {
+          return requestBodyFailure(res, error);
+        }
+        let parsed: { path?: unknown; workdir?: unknown };
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          return badRequest(res, "Invalid JSON body");
+        }
+        if (typeof parsed.path !== "string" || !parsed.path.trim()) {
+          return badRequest(res, '缺少文件路径（path）');
+        }
+        const wanted = localPathTarget(parsed.path.trim());
+
+        let abs = "";
+        let uploadsRoot = "";
+        if (isAbsolute(wanted)) {
+          for (const root of allowedWorkdirs) {
+            try {
+              const candidate = resolveInWorkdir(root, wanted);
+              abs = candidate;
+              uploadsRoot = join(resolve(root), UPLOAD_SUBDIR);
+              break;
+            } catch { /* 不在这个白名单目录里，试下一个 */ }
+          }
+          if (!abs) {
+            return json(res, 403, { error: `路径不在任何白名单工作目录内：${wanted}` });
+          }
+        } else {
+          const root = resolve(
+            typeof parsed.workdir === "string" && parsed.workdir.trim() ? parsed.workdir : workdir,
+          );
+          if (!allowedWorkdirs.has(root)) {
+            return json(res, 403, { error: `工作目录不在白名单内：${root}` });
+          }
+          try {
+            abs = resolveInWorkdir(root, wanted);
+          } catch (err) {
+            return json(res, 403, { error: (err as Error).message });
+          }
+          uploadsRoot = join(root, UPLOAD_SUBDIR);
+        }
+
+        // 第二道闸：落点必须在 uploads/ 子目录之内（含 symlink 真实路径校验，
+        // resolveInWorkdir 已做；这里再按前缀复验一次子目录边界）
+        const resolvedUploads = resolve(uploadsRoot);
+        if (!resolve(abs).startsWith(resolvedUploads + sep)) {
+          return json(res, 403, { error: `只允许删除 ${UPLOAD_SUBDIR}/ 子目录内的文件` });
+        }
+        try {
+          const st = await stat(abs);
+          if (!st.isFile()) {
+            return json(res, 400, { error: "只删文件，不删目录" });
+          }
+        } catch {
+          return notFound(res, `File not found: ${wanted}`);
+        }
+        try {
+          await rm(abs);
+        } catch (err) {
+          return json(res, 500, { error: `删除失败：${err instanceof Error ? err.message : String(err)}` });
+        }
+        return json(res, 200, { deleted: true, path: relative(resolvedUploads, abs).split(sep).join("/") });
       }
 
       case "extendBudget": {

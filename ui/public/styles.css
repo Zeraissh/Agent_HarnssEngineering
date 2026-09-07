@@ -3552,6 +3552,20 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
   border-radius: 10px;
   background: var(--surface-1);
 }
+/* stat 验证不过的产物卡：降级为纯信息，不给可点操作 */
+.chat-artifact--missing,
+.artifact--missing { opacity: 0.72; border-style: dashed; }
+.chat-artifact--missing .chat-artifact-name,
+.artifact--missing .artifact-name { color: var(--text-3); text-decoration: line-through; cursor: default; }
+.chat-artifact--missing .chat-artifact-thumb img { filter: grayscale(1); }
+.artifact-missing-note {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-3);
+  font-size: var(--font-sm);
+  white-space: nowrap;
+}
 .chat-artifact-icon {
   flex: 0 0 auto;
   width: 36px;
@@ -6144,6 +6158,15 @@ button.cc-card:hover { border-color: var(--border-2); }
   font-size: var(--font-xs);
   flex: 0 0 auto;
 }
+
+/* --- 附件清单的删除钮（与预览钮成对，仅图标） --- */
+.upload-remove {
+  padding: 2px var(--space-sm);
+  font-size: var(--font-xs);
+  flex: 0 0 auto;
+  color: var(--text-3);
+}
+.upload-remove:hover { color: var(--red); }
 
 /* --- 对话正文路径链接旁的预览钮（夹在链接与「文件夹中显示」之间的中段） --- */
 .local-path-preview {

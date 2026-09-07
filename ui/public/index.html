@@ -225,7 +225,7 @@
     <!-- 文案由 patchComposer 按模式改写（「任务描述」↔「追加指令」）。
          for/id 不许动：整页 axe 与文案闸门都钉着这一对。 -->
     <label for="task-input" class="task-label">任务描述</label>
-    <textarea id="task-input" placeholder="输入新任务描述…（Ctrl+Enter 发送）" rows="1"></textarea>
+    <textarea id="task-input" placeholder="输入新任务描述…（Enter 发送，Shift+Enter 换行）" rows="1"></textarea>
     <!-- input **排在 label 之前**：它是 sr-only（宽高 1px + clip），焦点环会被
          整个裁掉，键盘用户 Tab 到附件时屏幕上没有任何反应。把它放前面，
          就能用最朴素的相邻兄弟选择器把环画到那个可见的 label 上
@@ -1917,12 +1917,17 @@ submitBtn.addEventListener("click", (e) => {
 });
 
 /**
- * Ctrl/Cmd+Enter 发送。**只绑在 textarea 上，不绑在 form 上**——
- * `#rubric-input` 也在这个 form 里，绑 form 的话在评分表里按 Ctrl+Enter
- * 会带着半截 rubric 直接发车。单独 Enter 留给换行，多行指令是常态。
+ * Enter 发送、Shift+Enter 换行（主流聊天产品惯例）。**只绑在 textarea 上，
+ * 不绑在 form 上**——`#rubric-input` 也在这个 form 里，绑 form 的话在评分表
+ * 里按 Enter 会带着半截 rubric 直接发车。Ctrl/Cmd+Enter 照旧也算发送。
+ *
+ * 中文输入法硬规矩：IME 组词期间（isComposing / keyCode 229）按 Enter 是
+ * 选词上屏，绝不许触发发送。
  */
 taskInput.addEventListener("keydown", (e) => {
-  if (e.key !== "Enter" || !(e.ctrlKey || e.metaKey)) return;
+  if (e.key !== "Enter") return;
+  if (e.isComposing || e.keyCode === 229) return;
+  if (e.shiftKey) return; // Shift+Enter 留给换行
   e.preventDefault();
   if (typeof submitForm.requestSubmit === "function") submitForm.requestSubmit();
   else submitForm.dispatchEvent(new Event("submit", { cancelable: true, bubbles: true }));
@@ -2357,14 +2362,19 @@ function renderUploads() {
         `<button type="button" class="btn btn--ghost upload-preview" data-upload-preview="${i}" ` +
         `title="预览" aria-label="预览 ${name}">` +
         `<i class="ph ph-eye" aria-hidden="true"></i><span>预览</span></button>`;
+      // 删除按钮：从清单移除 + 从输入框删掉对应「附件：」行 + 删盘上的文件
+      const removeBtn =
+        `<button type="button" class="btn btn--ghost upload-remove" data-upload-remove="${i}" ` +
+        `title="删除附件" aria-label="删除附件 ${name}">` +
+        `<i class="ph ph-x" aria-hidden="true"></i></button>`;
       if (u.previewUrl && /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(u.path)) {
         return (
           `<li class="upload-item upload-item--image">` +
           `<img class="upload-thumb" src="${escapeHtml(u.previewUrl)}" alt="" />` +
-          `<div class="upload-meta"><code>${name}</code> ${size}</div>${previewBtn}</li>`
+          `<div class="upload-meta"><code>${name}</code> ${size}</div>${previewBtn}${removeBtn}</li>`
         );
       }
-      return `<li class="upload-item"><code>${name}</code> ${size} ${previewBtn}</li>`;
+      return `<li class="upload-item"><code>${name}</code> ${size} ${previewBtn}${removeBtn}</li>`;
     })
     .join("");
 }
@@ -2381,6 +2391,45 @@ function clearUploads() {
   }
   uploaded.length = 0;
   renderUploads();
+}
+
+/**
+ * 删除一个还没发出去的附件：清单移除 + 输入框里那行「附件：<path>」删掉 +
+ * 盘上的文件删掉（DELETE /api/upload，服务端圈禁在白名单工作目录的 uploads/ 内）。
+ *
+ * 取舍：删除失败（例如文件已被某次提交用掉、或盘上已不在）时**只从清单移除、
+ * 盘上保留**，并把情况说给用户——清单语义是"这次要附的东西"，盘上文件的
+ * 去留不该让一次失败的删除把两边弄得不一致还说不出为什么。
+ */
+async function removeUploadedFile(index) {
+  const u = uploaded[index];
+  if (!u) return;
+  uploaded.splice(index, 1);
+  if (u.previewUrl) URL.revokeObjectURL(u.previewUrl);
+  // 输入框里上传时追加的那行「附件：<path>」一并删掉，模型才不会看到已删文件
+  taskInput.value = taskInput.value
+    .split(/\r?\n/)
+    .filter((line) => line.trim() !== `附件：${u.path}`)
+    .join("\n");
+  renderUploads();
+  try {
+    const res = await fetch("/api/upload", {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        path: u.absolutePath ?? u.path,
+        ...(u.workdir ? { workdir: u.workdir } : {}),
+      }),
+    });
+    if (!res.ok) {
+      const b = await res.json().catch(() => ({}));
+      announceStatus(`已从清单移除，但盘上文件保留：${b.error ?? `HTTP ${res.status}`}`);
+    } else {
+      announceStatus(`已删除附件 ${u.path}`);
+    }
+  } catch {
+    announceStatus("已从清单移除；删除盘上文件失败（宿主不可达），文件保留");
+  }
 }
 
 function escapeHtml(s) {
@@ -2434,6 +2483,8 @@ async function uploadFiles(files) {
       }
       uploaded.push({
         ...info,
+        // 记住落在哪个工作目录——删除时服务端要按同一个目录验白名单
+        workdir: targetWorkdir ?? undefined,
         previewUrl: file.type.startsWith("image/") ? URL.createObjectURL(file) : null,
       });
       // 把路径写进任务描述——模型只有看到路径才知道文件存在
@@ -2483,9 +2534,14 @@ function previewLocalPath(runId, path) {
   filePreviewApi.open({ path, url });
 }
 
-// 附件清单的预览按钮（清单每次重画，逐个绑会漏也会重——事件委托）
+// 附件清单的预览/删除按钮（清单每次重画，逐个绑会漏也会重——事件委托）
 if (uploadList) {
   uploadList.addEventListener("click", (e) => {
+    const removeBtn = e.target instanceof Element ? e.target.closest("[data-upload-remove]") : null;
+    if (removeBtn) {
+      void removeUploadedFile(Number(removeBtn.getAttribute("data-upload-remove")));
+      return;
+    }
     const btn = e.target instanceof Element ? e.target.closest("[data-upload-preview]") : null;
     if (!btn) return;
     const u = uploaded[Number(btn.getAttribute("data-upload-preview"))];

@@ -4014,6 +4014,93 @@ describe("ui-server", () => {
     }
   });
 
+  // ---- 附件删除（DELETE /api/upload）----
+  it("删除附件：uploads/ 内的文件被删掉，返回 deleted:true", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "upload-del-"));
+    try {
+      handle = createUiServer({ modelClient: new FakeModelClient([]), tools: [], workdir: dir });
+      port = await startServer(handle);
+      base = baseUrl(port);
+
+      const up = await fetch(`${base}/api/upload`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: "shot.png", data: Buffer.from("hello").toString("base64") }),
+      });
+      const info = await up.json() as any;
+      expect(existsSync(join(dir, "uploads", "shot.png"))).toBe(true);
+
+      // 相对路径（客户端清单里存的形式）
+      const del = await fetch(`${base}/api/upload`, {
+        method: "DELETE", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: info.path }),
+      });
+      expect(del.status, await del.text()).toBe(200);
+      expect(existsSync(join(dir, "uploads", "shot.png"))).toBe(false);
+
+      // 绝对路径（上传响应里的 absolutePath 形式）同样可删
+      await fetch(`${base}/api/upload`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: "b.png", data: "eA==" }),
+      });
+      const abs = join(dir, "uploads", "b.png");
+      const del2 = await fetch(`${base}/api/upload`, {
+        method: "DELETE", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: abs }),
+      });
+      expect(del2.status, await del2.text()).toBe(200);
+      expect(existsSync(abs)).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("删除附件不是任意删文件：uploads/ 之外一律 403", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "upload-del-"));
+    try {
+      handle = createUiServer({ modelClient: new FakeModelClient([]), tools: [], workdir: dir });
+      port = await startServer(handle);
+      base = baseUrl(port);
+      await writeFile(join(dir, "keep.txt"), "precious");
+
+      const del = (path: string) => fetch(`${base}/api/upload`, {
+        method: "DELETE", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path }),
+      });
+      // 工作目录里的普通文件
+      expect((await del("keep.txt")).status).toBe(403);
+      // 穿越：解析后在 uploads/ 之外
+      expect((await del("uploads/../keep.txt")).status).toBe(403);
+      // 白名单外的绝对路径
+      expect((await del(join(tmpdir(), "outside.txt"))).status).toBe(403);
+      // 一个都还在
+      expect(await readFile(join(dir, "keep.txt"), "utf8")).toBe("precious");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("删除附件：不存在的文件 404，目录 400，非白名单 workdir 403", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "upload-del-"));
+    try {
+      handle = createUiServer({ modelClient: new FakeModelClient([]), tools: [], workdir: dir });
+      port = await startServer(handle);
+      base = baseUrl(port);
+      const del = (body: unknown) => fetch(`${base}/api/upload`, {
+        method: "DELETE", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+
+      expect((await del({ path: "uploads/ghost.txt" })).status).toBe(404);
+      expect((await del({ path: "uploads" })).status).toBe(403); // uploads 根目录本身在子目录边界外
+      await mkdir(join(dir, "uploads", "sub"), { recursive: true });
+      expect((await del({ path: "uploads/sub" })).status).toBe(400); // 目录不删
+      expect((await del({ path: "uploads/x.txt", workdir: tmpdir() })).status).toBe(403);
+      expect((await del({})).status).toBe(400); // 缺 path
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   // ---- V-10 全局生命周期流（取代 3 秒轮询）----
   it("v2-12. /api/stream 先发快照，再推 run_created / run_finished", async () => {
     handle = createUiServer({

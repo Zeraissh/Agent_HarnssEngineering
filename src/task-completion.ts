@@ -76,7 +76,10 @@ export function createFinishTaskTool(): Tool {
         artifacts: {
           type: "array",
           items: { type: "string" },
-          description: "本轮实际创建或修改的产物；没有则 []",
+          description:
+            "本轮实际创建或修改的产物；没有则 []。" +
+            "每项只写一条真实路径——不要夹注释、括号说明或 'memory:' 之类前缀，" +
+            "多个文件拆成多条；说明性文字写进 summary，不要写在这里",
         },
         verification: {
           type: "array",

@@ -65,6 +65,8 @@ import {
   splitCompletionFollowUps,
   classifyCompletionFollowUp,
   deriveRunFollowUp,
+  extractArtifactPaths,
+  mergeCompletionArtifactFiles,
 } from "../ui/public/app.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -238,6 +240,137 @@ describe("消息正文路径探测计划", () => {
     expect(reveal.getAttribute("aria-label")).toContain("out/report.md");
     reveal.click();
     expect(onReveal).toHaveBeenCalledWith("out/report.md");
+  });
+});
+
+// ================================================================
+// 产物路径提取（finish_task.artifacts 自由文本 → 真实路径）+ stat 降级
+// ================================================================
+
+describe("extractArtifactPaths / 产物卡降级", () => {
+  it("剥尾部括号注释（英文括号，内含逗号也不裂）", () => {
+    expect(extractArtifactPaths(
+      "ad7793_board.kicad_pcb(回填 AD7793 终板,铺铜+缝合+mitre,DRC parity 0)",
+    )).toEqual(["ad7793_board.kicad_pcb"]);
+  });
+
+  it("剥中文括号注释", () => {
+    expect(extractArtifactPaths(
+      ".tmp_search/rtd_wiki.txt（英文维基 Resistance thermometer 原始文本，31.5 KB，本轮抓取落盘）",
+    )).toEqual([".tmp_search/rtd_wiki.txt"]);
+  });
+
+  it("剥 memory: 前缀并按带空格的 ' / ' 拆并列路径", () => {
+    expect(extractArtifactPaths("memory: ad7793-pinout.md / kicad-host-kit-lessons.md"))
+      .toEqual(["ad7793-pinout.md", "kicad-host-kit-lessons.md"]);
+  });
+
+  it("一条多路径 + 尾部注释：拆成两条干净路径", () => {
+    expect(extractArtifactPaths("设计说明_ad7793_tc.md / 设计说明_ad7793_board.md(重写为 AD7793 终态)"))
+      .toEqual(["设计说明_ad7793_tc.md", "设计说明_ad7793_board.md"]);
+  });
+
+  it("目录条目：剥注释后保留目录本身", () => {
+    expect(extractArtifactPaths("gerber/(Gerber 8 层 + 钻孔 .drl)")).toEqual(["gerber/"]);
+  });
+
+  it("Windows 盘符不是标签前缀，不许剥", () => {
+    expect(extractArtifactPaths("D:\\work\\out.txt")).toEqual(["D:\\work\\out.txt"]);
+    expect(extractArtifactPaths("C:/work/out.txt")).toEqual(["C:/work/out.txt"]);
+  });
+
+  it("文件名自带的括号不在尾部时不误伤", () => {
+    expect(extractArtifactPaths("报告(终稿).md")).toEqual(["报告(终稿).md"]);
+  });
+
+  it("剥完为空 / 空输入整条丢弃", () => {
+    expect(extractArtifactPaths("（只有注释）")).toEqual([]);
+    expect(extractArtifactPaths("")).toEqual([]);
+    expect(extractArtifactPaths(null)).toEqual([]);
+  });
+
+  it("mergeCompletionArtifactFiles：带注释的声明能匹配上工具写出的真文件", () => {
+    const session = [{ path: "board/ad7793_board.kicad_pcb", kind: "artifact", seq: 3 }];
+    const merged = mergeCompletionArtifactFiles(
+      ["ad7793_board.kicad_pcb(回填 AD7793 终板,DRC parity 0)"],
+      session,
+    );
+    expect(merged.map((f) => f.path)).toEqual(["board/ad7793_board.kicad_pcb"]);
+  });
+
+  it("mergeCompletionArtifactFiles：一条多路径拆成多张卡", () => {
+    const merged = mergeCompletionArtifactFiles(
+      ["memory: a.md / b.md（本轮新增）"],
+      [],
+    );
+    expect(merged.map((f) => f.path)).toEqual(["a.md", "b.md"]);
+  });
+
+  it("stat 验证不过的产物卡降级：标「未找到」、摘掉可点操作", async () => {
+    let state = createInitialState("run-missing-art", "生成板子文件", false);
+    state = reduceEvents(state, [
+      sse(0, "main", "assistant_text", { text: "已交付。" }),
+      sse(1, "main", "done", {
+        stopReason: "completed",
+        completion: {
+          status: "completed",
+          summary: "完成",
+          artifacts: ["ghost/missing.md（本轮声明但没落盘）"],
+          verification: [],
+          assumptions: [],
+          blockers: [],
+        },
+      }),
+    ]);
+    renderRunDetail(state, {
+      activeTab: "loop",
+      inspectPaths: async (paths: string[]) => paths.map((input) => ({
+        input, exists: false,
+      })),
+    });
+
+    await vi.waitFor(() => {
+      expect(document.querySelector(".chat-artifact--missing")).toBeTruthy();
+    });
+    const card = document.querySelector(".chat-artifact--missing") as HTMLElement;
+    // 卡片标题是提取后的干净路径，不再是整条注释串
+    expect(card.textContent).toContain("missing.md");
+    expect(card.textContent).not.toContain("本轮声明但没落盘");
+    expect(card.textContent).toContain("未找到");
+    expect(card.querySelector("a[href]")).toBeNull();
+    for (const b of card.querySelectorAll("button")) {
+      expect((b as HTMLButtonElement).disabled).toBe(true);
+    }
+  });
+
+  it("stat 验证通过的产物卡保持可点", async () => {
+    let state = createInitialState("run-ok-art", "生成报告", false);
+    state = reduceEvents(state, [
+      sse(0, "main", "assistant_text", { text: "已交付。" }),
+      sse(1, "main", "done", {
+        stopReason: "completed",
+        completion: {
+          status: "completed",
+          summary: "完成",
+          artifacts: ["out/report.md"],
+          verification: [],
+          assumptions: [],
+          blockers: [],
+        },
+      }),
+    ]);
+    renderRunDetail(state, {
+      activeTab: "loop",
+      inspectPaths: async (paths: string[]) => paths.map((input) => ({
+        input, exists: true, path: input, kind: "file" as const,
+      })),
+    });
+
+    await vi.waitFor(() => {
+      expect(document.querySelector('[data-artifact-state="ok"]')).toBeTruthy();
+    });
+    expect(document.querySelector(".chat-artifact--missing")).toBeNull();
+    expect(document.querySelector('.chat-artifact a[href*="artifact"]')).toBeTruthy();
   });
 });
 

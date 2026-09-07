@@ -1872,7 +1872,7 @@ export function deriveComposerMode({ info, localStatus, submitting, error, stopp
       kind: "new",
       buttonLabel: "运行任务",
       labelText: "任务描述",
-      placeholder: "输入新任务描述…（Ctrl+Enter 发送）",
+      placeholder: "输入新任务描述…（Enter 发送，Shift+Enter 换行）",
       note: "",
       canSubmit: true,
     };
@@ -1941,7 +1941,7 @@ export function deriveComposerMode({ info, localStatus, submitting, error, stopp
         kind: "append",
         buttonLabel: "继续对话",
         labelText: "追加指令",
-        placeholder: "接着说…（Ctrl+Enter 发送）",
+        placeholder: "接着说…（Enter 发送，Shift+Enter 换行）",
         note: "",
         canSubmit: true,
         optionsEnabled: false,
@@ -1955,7 +1955,7 @@ export function deriveComposerMode({ info, localStatus, submitting, error, stopp
         kind: "append",
         buttonLabel: "继续对话",
         labelText: "追加指令",
-        placeholder: "接着说…（Ctrl+Enter 发送）",
+        placeholder: "接着说…（Enter 发送，Shift+Enter 换行）",
         note: "",
         canSubmit: true,
         optionsEnabled: false,
@@ -1968,7 +1968,7 @@ export function deriveComposerMode({ info, localStatus, submitting, error, stopp
       kind: "append",
       buttonLabel: "继续对话",
       labelText: "追加指令",
-      placeholder: "接着说…（Ctrl+Enter 发送）",
+      placeholder: "接着说…（Enter 发送，Shift+Enter 换行）",
       note: "",
       canSubmit: true,
       optionsEnabled: false,
@@ -1986,7 +1986,7 @@ export function deriveComposerMode({ info, localStatus, submitting, error, stopp
     kind: "append",
     buttonLabel: "继续对话",
     labelText: "追加指令",
-    placeholder: "接着说…（Ctrl+Enter 发送）",
+    placeholder: "接着说…（Enter 发送，Shift+Enter 换行）",
     note: "",
     canSubmit: true,
     optionsEnabled: false,
@@ -2735,6 +2735,41 @@ export function inferArtifactIntent(task, files = []) {
     return "website";
   }
   return "general";
+}
+
+/**
+ * 从 finish_task.artifacts 的自由文本条目里提取真实路径（可能零个或多个）。
+ *
+ * 背景（委托方实证）：模型把注释写进了同一条目——
+ *   "ad7793_board.kicad_pcb(回填 AD7793 终板,铺铜+缝合+mitre,DRC parity 0)"
+ *   "memory: ad7793-pinout.md / kicad-host-kit-lessons.md"
+ *   "gerber/(Gerber 8 层 + 钻孔 .drl)"
+ * 整条字符串被当成文件路径，产物卡点了必报 Artifact not found。
+ *
+ * 提取规则，按序执行：
+ *   ① 剥 `memory:` 这类标签前缀——要求 ≥2 个字符 + 冒号后空白，
+ *      Windows 盘符（`D:\…`、`C:/…`）天然不满足，不会误剥；
+ *   ② 反复剥尾部成对括号注释（中英括号皆可；未闭合的括号不动，
+ *      文件名里真有括号也不误伤）；
+ *   ③ 按**带空格的** " / " 拆并列路径——裸 "/" 是路径分隔符，拆不得；
+ *   ④ 去首尾空白，空段丢弃。
+ * 展示层清洗，不回写事件流——审计面一字不动。
+ */
+export function extractArtifactPaths(entry) {
+  let s = String(entry ?? "").trim();
+  if (!s) return [];
+  s = s.replace(/^[A-Za-z][\w-]+:\s+/, "");
+  const out = [];
+  for (const seg of s.split(/\s+\/\s+/)) {
+    let p = seg.trim();
+    for (;;) {
+      const stripped = p.replace(/\s*[（(][^（）()]*[)）]\s*$/, "");
+      if (stripped === p) break;
+      p = stripped.trim();
+    }
+    if (p) out.push(p);
+  }
+  return out;
 }
 
 function declaredArtifactIndex(declared, path) {
@@ -4645,6 +4680,52 @@ async function hydrateLocalPathLinks(host, state, callbacks) {
 }
 
 /**
+ * 产物卡的 stat 验证：卡片按声明/工具记录先画出来，再异步确认文件还在不在。
+ *
+ * 模型声明的产物可能从未落盘（或被后来的步骤删掉）。验证不过的卡**降级显示**：
+ * 标注「未找到」、摘掉一切可点操作——不是点了才弹 Artifact not found。
+ * 与 hydrateLocalPathLinks 同一份 inspectPaths 渐进增强：宿主不可达时卡片
+ * 维持原样可点，不会因为一次网络抖动把真文件标成未找到。
+ */
+async function hydrateArtifactCards(host, state, callbacks) {
+  if (!host || typeof callbacks?.inspectPaths !== "function") return;
+  const nodes = [...host.querySelectorAll("[data-artifact-path]:not([data-artifact-state])")];
+  if (nodes.length === 0) return;
+  for (const node of nodes) node.setAttribute("data-artifact-state", "checking");
+  const paths = [...new Set(nodes.map((n) => n.getAttribute("data-artifact-path") ?? "").filter(Boolean))];
+  let inspected = [];
+  try {
+    inspected = await callbacks.inspectPaths(paths.slice(0, 64));
+  } catch {
+    for (const node of nodes) node.removeAttribute("data-artifact-state");
+    return;
+  }
+  const byInput = new Map(
+    (Array.isArray(inspected) ? inspected : [])
+      .filter((item) => item && item.input)
+      .map((item) => [String(item.input), item]),
+  );
+  for (const node of nodes) {
+    if (!host.contains(node) || node.getAttribute("data-artifact-state") !== "checking") continue;
+    const path = node.getAttribute("data-artifact-path") ?? "";
+    const hit = byInput.get(path);
+    if (hit && hit.exists) {
+      node.setAttribute("data-artifact-state", "ok");
+      continue;
+    }
+    node.setAttribute("data-artifact-state", "missing");
+    node.classList.add("chat-artifact--missing", "artifact--missing");
+    // 摘掉可点操作：链接去 href、按钮禁用，统一换成「未找到」标注
+    for (const a of node.querySelectorAll("a")) a.removeAttribute("href");
+    for (const b of node.querySelectorAll("button")) b.disabled = true;
+    const cta = node.querySelector(".chat-artifact-cta, .artifact-actions");
+    if (cta) {
+      cta.innerHTML = `<span class="artifact-missing-note"><i class="ph ph-warning" aria-hidden="true"></i> 未找到</span>`;
+    }
+  }
+}
+
+/**
  * 对话主干的补丁。
  *
  * 签名只看 `lastSeq` 与条目数：事件流单调追加，这两个数不变就没有新内容。
@@ -4735,6 +4816,7 @@ function patchConversation(parts, state, live, callbacks) {
     });
   }
   void hydrateLocalPathLinks(host, state, callbacks);
+  void hydrateArtifactCards(host, state, callbacks);
 }
 
 /**
@@ -5047,7 +5129,7 @@ function patchArtifacts(parts, files, runId, callbacks) {
         `<img class="artifact-thumb" src="${esc(href)}" alt="${esc(fileBasename(f.path))}" loading="lazy" /></a>`
       : "";
     return (
-      `<div class="artifact${image ? " artifact--image" : ""}">` +
+      `<div class="artifact${image ? " artifact--image" : ""}" data-artifact-path="${esc(f.path)}">` +
       thumb +
       '<div class="artifact-body">' +
       `<a class="artifact-name" href="${esc(href)}" target="_blank" rel="noopener noreferrer" title="${esc(f.path)}">${esc(fileBasename(f.path))}</a>` +
@@ -5081,6 +5163,8 @@ function patchArtifacts(parts, files, runId, callbacks) {
       if (btn) callbacks.onReveal?.(btn.getAttribute("data-reveal"));
     });
   }
+  // 右栏产物卡同样做 stat 验证——声明了但没落盘的，标「未找到」而不是点了才报错
+  void hydrateArtifactCards(host, { runId }, callbacks);
 }
 
 function patchOutcomeCard(parts, state, overview, faces, callbacks = {}) {
@@ -6545,22 +6629,27 @@ export function mergeCompletionArtifactFiles(declared, sessionFiles) {
   const used = new Set();
 
   for (const raw of declared ?? []) {
-    const path = norm(raw);
-    if (!path) continue;
-    let hit = byNorm.get(path);
-    if (!hit) {
-      const base = fileBasename(path);
-      hit = session.find((f) => {
-        const fp = norm(f.path);
-        return fp === path || fp.endsWith("/" + path) || path.endsWith("/" + fp)
-          || fileBasename(fp) === base;
-      });
-    }
-    if (hit) {
-      out.push(hit);
-      used.add(norm(hit.path));
-    } else {
-      out.push({ path, kind: "artifact", seq: 0 });
+    // 模型写的是自由文本：先提取真实路径（剥前缀/注释、拆并列），
+    // 一条多路径拆成多张卡——实现成本低于一卡多操作，且每张卡的操作不变
+    for (const extracted of extractArtifactPaths(raw)) {
+      const path = norm(extracted);
+      if (!path) continue;
+      let hit = byNorm.get(path);
+      if (!hit) {
+        const base = fileBasename(path);
+        hit = session.find((f) => {
+          const fp = norm(f.path);
+          return fp === path || fp.endsWith("/" + path) || path.endsWith("/" + fp)
+            || fileBasename(fp) === base;
+        });
+      }
+      if (hit) {
+        if (used.has(norm(hit.path))) continue;
+        out.push(hit);
+        used.add(norm(hit.path));
+      } else {
+        out.push({ path, kind: "artifact", seq: 0 });
+      }
     }
   }
   for (const f of session) {
@@ -6628,10 +6717,12 @@ export function applyStructuredDelivery(items, state, sessionFiles) {
   }
 
   const declared = Array.isArray(completion?.artifacts) ? completion.artifacts : [];
+  // 排序用的声明清单同样先提取干净路径——带注释的原文连 basename 都对不上
+  const declaredClean = declared.flatMap((d) => extractArtifactPaths(d));
   const files = completion
     ? mergeCompletionArtifactFiles(declared, sessionFiles)
     : (sessionFiles ?? []).filter((f) => f && f.kind !== "upload");
-  const ranked = rankDeliveryArtifacts(files, { task: state?.task ?? "", declared });
+  const ranked = rankDeliveryArtifacts(files, { task: state?.task ?? "", declared: declaredClean });
   return weaveDeliveryArtifacts(out, ranked, state?.runId ?? null);
 }
 
@@ -6765,7 +6856,7 @@ function renderArtifactCard(f, runId) {
     primaryOpen ? `<button type="button" data-reveal="${esc(f.path)}">在文件夹中显示</button>` : "",
   ].filter(Boolean).join("");
   return (
-    `<div class="chat-artifact">` +
+    `<div class="chat-artifact" data-artifact-path="${esc(f.path)}">` +
     thumb +
     `<div class="chat-artifact-body">` +
     `<a class="chat-artifact-name" href="${esc(href)}" target="_blank" rel="noopener noreferrer" title="${esc(f.path)}">${esc(short)}</a>` +
