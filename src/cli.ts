@@ -1378,6 +1378,14 @@ async function main(): Promise<void> {
       case "tool_aborted":
         console.log(c.yellow(`⬡ aborted ${event.name}`));
         break;
+      case "mid_tool_replay": {
+        endStreamLine();
+        const summary = event.items
+          .map((item) => `${item.action}:${item.name}`)
+          .join(" · ");
+        console.log(c.yellow(`↻ mid-tool 重放：${summary || "（空）"}`));
+        break;
+      }
       case "tool_result": {
         const head = event.result.content.split("\n")[0] ?? "";
         const preview = head.length > 120 ? `${head.slice(0, 120)}…` : head;

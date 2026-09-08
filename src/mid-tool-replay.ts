@@ -115,3 +115,70 @@ export function extractPendingToolUses(
   }
   return out;
 }
+
+/**
+ * 从 ToolTxController.get 种子化 pending 相关的事务表。
+ * 只读工具无记录 → 不进表（由调用方退回 ABORTED 合成或另行执行）。
+ */
+export function collectPendingToolTx(
+  runId: string,
+  pending: Array<{ id: string }>,
+  get: (key: string) => DurableToolTx | undefined,
+): DurableToolTx[] {
+  const out: DurableToolTx[] = [];
+  for (const block of pending) {
+    const tx = get(toolIdempotencyKey(runId, block.id));
+    if (tx) out.push(tx);
+  }
+  return out;
+}
+
+/**
+ * 把 mid-tool 计划与已执行结果合成 tool_result 块（顺序与 pending 一致）。
+ * pending 中未出现在计划里的 id 用 fallback（通常是 ABORTED_TOOL_RESULT）。
+ */
+export function assembleMidToolResults(input: {
+  pendingToolUses: Array<{ id: string; name: string; input: unknown }>;
+  plan: MidToolReplayItem[];
+  /** replay 项执行后的回执；key = toolUseId */
+  executed: ReadonlyMap<string, { content: string; isError?: boolean }>;
+  fallbackContent: string;
+}): Anthropic.ToolResultBlockParam[] {
+  const byId = new Map<string, Anthropic.ToolResultBlockParam>();
+  for (const item of input.plan) {
+    if (item.action === "replay") {
+      const got = input.executed.get(item.toolUseId);
+      byId.set(item.toolUseId, {
+        type: "tool_result",
+        tool_use_id: item.toolUseId,
+        content: got?.content ?? input.fallbackContent,
+        ...((got?.isError ?? !got) ? { is_error: true } : {}),
+      });
+      continue;
+    }
+    byId.set(item.toolUseId, {
+      type: "tool_result",
+      tool_use_id: item.toolUseId,
+      content: item.content,
+      ...(item.action === "synthesize_error" || item.isError ? { is_error: true } : {}),
+    });
+  }
+  return input.pendingToolUses.map((block) => {
+    const existing = byId.get(block.id);
+    if (existing) return existing;
+    return {
+      type: "tool_result",
+      tool_use_id: block.id,
+      content: input.fallbackContent,
+      is_error: true,
+    };
+  });
+}
+
+/** 是否值得走 mid-tool 路径（有悬空 tool_use 且至少一条副作用事务）。 */
+export function shouldAttemptMidToolReplay(
+  pending: Array<{ id: string }>,
+  toolTx: readonly DurableToolTx[],
+): boolean {
+  return pending.length > 0 && toolTx.length > 0;
+}

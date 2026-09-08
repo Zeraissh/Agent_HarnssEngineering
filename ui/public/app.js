@@ -721,6 +721,15 @@ export function reduceEvent(state, sseEvent) {
         // 上下文窗口（事实）/ 预算（策略）各带来源（MEM-01 窗口 / 预算分离）——三段水位条的唯一数据源
         context: normalizeContextConfig(event.context),
         tools: Array.isArray(event.tools) ? event.tools : [],
+        permission: event.permission && typeof event.permission === "object"
+          ? {
+              mode: event.permission.mode == null ? null : String(event.permission.mode),
+              approvalDefault: event.permission.approvalDefault === "auto" ? "auto" : "ask",
+              planMode: event.permission.planMode === true,
+              planGate: event.permission.planGate === true,
+              autoYes: event.permission.autoYes === true,
+            }
+          : null,
         packRoute: event.packRoute && typeof event.packRoute === "object"
           ? {
               pack: event.packRoute.pack == null ? null : String(event.packRoute.pack),
@@ -952,6 +961,18 @@ function buildTimelineEntry(seq, source, type, event) {
         ...(typeof event.inputHash === "string" ? { inputHash: event.inputHash } : {}),
         ...(event.skipped === true ? { skipped: true } : {}),
         ...(typeof event.reason === "string" ? { reason: event.reason } : {}),
+      };
+    case "mid_tool_replay":
+      return {
+        ...base,
+        runId: String(event.runId ?? ""),
+        items: Array.isArray(event.items)
+          ? event.items.map((item) => ({
+              action: String(item?.action ?? ""),
+              toolUseId: String(item?.toolUseId ?? ""),
+              name: String(item?.name ?? ""),
+            }))
+          : [],
       };
     case "tool_result":
       return {
@@ -2052,9 +2073,63 @@ export function composerSubmitPlan(mode, rawText) {
 }
 
 /**
+ * D3 权限三档对照表（事实源：`src/permission-mode.ts`）。
+ * 前端只捆既有旋钮；装配条必须显示展开后的开关值。
+ */
+export const PERMISSION_MODE_TABLE = Object.freeze({
+  manual: Object.freeze({
+    approvalDefault: "ask",
+    planMode: false,
+    planGate: false,
+    autoYes: false,
+  }),
+  plan: Object.freeze({
+    approvalDefault: "ask",
+    planMode: true,
+    planGate: true,
+    autoYes: false,
+  }),
+  auto: Object.freeze({
+    approvalDefault: "auto",
+    planMode: false,
+    planGate: false,
+    autoYes: true,
+  }),
+});
+
+export function permissionModeSwitches(mode) {
+  const key = String(mode ?? "manual");
+  const row = PERMISSION_MODE_TABLE[key] ?? PERMISSION_MODE_TABLE.manual;
+  return { mode: PERMISSION_MODE_TABLE[key] ? key : "manual", ...row };
+}
+
+/**
+ * 从展开开关反推档位；对不上任何预设 → null（自定义组合，界面照实说）。
+ */
+export function matchPermissionMode(switches) {
+  const approvalDefault = switches?.approvalDefault === "auto" ? "auto" : "ask";
+  const planMode = Boolean(switches?.planMode);
+  const planGate = Boolean(switches?.planGate);
+  const autoYes = Boolean(switches?.autoYes);
+  for (const mode of Object.keys(PERMISSION_MODE_TABLE)) {
+    const row = PERMISSION_MODE_TABLE[mode];
+    if (
+      row.approvalDefault === approvalDefault
+      && row.planMode === planMode
+      && row.planGate === planGate
+      && row.autoYes === autoYes
+    ) {
+      return mode;
+    }
+  }
+  return null;
+}
+
+/**
  * 新建运行的网络载荷。保持为纯函数，避免某个 UI 开关只在特定分支里“看起来接上”。
  * `askUser` 是执行方式，不是 plan 专属能力：single 任务遇到地点、环境或交付边界
  * 不明确时同样需要先问人。
+ * `permissionMode` 若给出，会覆盖 planMode/planGate/autoApprove 为该档预设值。
  */
 export function buildNewRunRequest({
   task,
@@ -2076,6 +2151,7 @@ export function buildNewRunRequest({
   usePlannerModel = true,
   contextTokenLimit,
   autoPack = false,
+  permissionMode,
 } = {}) {
   const trimmedRubric = String(rubric ?? "").trim();
   // 逐 run 上下文预算：空 / 非数字不传（沿用 env > 包 > 默认）；填了就原样交给宿主校验区间——
@@ -2083,12 +2159,21 @@ export function buildNewRunRequest({
   const budget = contextTokenLimit === undefined || contextTokenLimit === null || String(contextTokenLimit).trim() === ""
     ? undefined
     : Number(contextTokenLimit);
+  const preset =
+    permissionMode && PERMISSION_MODE_TABLE[permissionMode]
+      ? permissionModeSwitches(permissionMode)
+      : null;
+  const effectivePlanMode = preset ? preset.planMode : planMode;
+  const effectivePlanGate = preset ? preset.planGate : planGate;
+  const effectiveAutoApprove = preset
+    ? preset.autoYes || preset.approvalDefault === "auto"
+    : autoApprove;
   // 正交旋钮：计划模式 = 确认门；多 agent = DAG 并行。任一为真即编排。
   // 兼容旧契约：只传 mode=plan 且未显式 planGate:false → 仍开确认门。
   const wantPlanGate =
-    planMode === true ||
-    planGate === true ||
-    (mode === "plan" && planGate !== false && planMode === undefined);
+    effectivePlanMode === true ||
+    effectivePlanGate === true ||
+    (mode === "plan" && effectivePlanGate !== false && effectivePlanMode === undefined);
   const wantMulti = multiAgent === true;
   const orchestrate = mode === "plan" || wantPlanGate || wantMulti;
   const effectiveConcurrency =
@@ -2107,6 +2192,7 @@ export function buildNewRunRequest({
     ...(effort ? { effort } : {}),
     ...(trimmedRubric ? { rubric: trimmedRubric } : {}),
     ...(budget !== undefined && Number.isFinite(budget) ? { contextTokenLimit: budget } : {}),
+    ...(preset ? { permissionMode: preset.mode } : {}),
     ...(orchestrate
       ? {
           mode: "plan",
@@ -2118,7 +2204,7 @@ export function buildNewRunRequest({
     ...(lineageBudget === false ? { lineageBudget: false } : {}),
     ...(dailyBudget === false ? { dailyBudget: false } : {}),
     ...(askUser ? { askUser: true } : {}),
-    ...(autoApprove ? { autoApprove: true } : {}),
+    ...(effectiveAutoApprove ? { autoApprove: true } : {}),
     ...(workdir ? { workdir } : {}),
     // 与宿主既有契约一致：角色模型默认启用，只有显式关闭才传 false。
     ...(!useVerifierModel ? { useVerifierModel: false } : {}),
@@ -3824,6 +3910,24 @@ export function deriveAssemblyBar(state, harness) {
       "烧光预算却什么也没查出来。",
   );
 
+  // D3：装配条展开真实开关——模式名不得替代它们
+  const perm = cfg.permission && typeof cfg.permission === "object" ? cfg.permission : null;
+  if (perm) {
+    const modeLabel = perm.mode ? `档 ${perm.mode}` : "档 自定义";
+    const bits = [
+      `审批缺省 ${perm.approvalDefault === "auto" ? "auto" : "ask"}`,
+      perm.planMode ? "计划编排开" : "计划编排关",
+      perm.planGate ? "确认门开" : "确认门关",
+      perm.autoYes ? "autoYes 开" : "autoYes 关",
+    ];
+    push(
+      "permission",
+      `${modeLabel} · ${bits.join(" · ")}`,
+      "D3 三档只是既有开关的预设（manual/plan/auto）。条上展开的才是本 run 真实装配；" +
+        "`permission: deny`、圈禁与 SSRF 硬拒不受三档与 --yes 影响——见 docs/permission-modes.md。",
+    );
+  }
+
   // 护栏：轮数与 token 是硬边界，撞上了核查救不了
   // maxTokens 未设时**不写它**：`?? 0` 会渲成「0k」，那是在说"上限为零"——
   // 一个没设过的护栏被画成最严格的护栏，正是这条状态条最该避免的那种谎话
@@ -3890,8 +3994,8 @@ export function deriveAssemblyBar(state, harness) {
       "durable",
       "同 run 热恢复",
       "本会话从 state.json 的 interrupted 相 + 已提交检查点在同一 runId 上续跑；" +
-        "未恢复 active grant / 原 AbortController；SAFE-06 toolTx 从 state 种子化（同 key 不重复 commit），" +
-        "不自动重放未完成 mid-tool 轮。",
+        "未恢复 active grant / 原 AbortController；SAFE-06 toolTx 从 state 种子化（同 key 不重复 commit）；" +
+        "若正史末条悬空 tool_use，loop 按 mid-tool 计划幂等重放 / bash fail-closed。",
     );
   }
 
@@ -7795,6 +7899,13 @@ function renderLogEntryBody(e) {
       }${e.reason ? `<br>${esc(e.reason)}` : ""}${
         e.inputHash ? `<br>inputHash=<code>${esc(String(e.inputHash).slice(0, 16))}…</code>` : ""
       }</div>`;
+    case "mid_tool_replay": {
+      const items = Array.isArray(e.items) ? e.items : [];
+      const summary = items
+        .map((item) => `${item.action}:${item.name || item.toolUseId}`)
+        .join(" · ");
+      return `<div class="log-entry-body">SAFE-06 mid-tool · ${esc(summary || "（空计划）")}</div>`;
+    }
     case "tool_result":
       return `<pre class="log-entry-body">${esc(e.resultContent ?? "")}</pre>`;
     case "assistant_text":
@@ -7880,6 +7991,7 @@ function entryIcon(type, isError) {
     case "tool_committed": return "⬡";
     case "tool_failed": return "⬡";
     case "tool_aborted": return "⬡";
+    case "mid_tool_replay": return "↻";
     case "tool_result": return isError ? "✗" : "✓"; // cli.ts:530-531
     case "assistant_text": return "¶";   // CLI 直接流式打印无标记，列表里需要一个
     case "assistant_thinking": return "✽"; // 与对话视图同款，自成语域
@@ -7914,6 +8026,8 @@ function entryActionLabel(e) {
       return `${e.name ?? ""} committed${e.skipped ? " (skipped)" : ""}`;
     case "tool_failed": return `${e.name ?? ""} tx failed`;
     case "tool_aborted": return `${e.name ?? ""} tx aborted`;
+    case "mid_tool_replay":
+      return `mid-tool 重放（${Array.isArray(e.items) ? e.items.length : 0}）`;
     // name 由 deriveLogEntries 按 toolUseId 回填；真取不到才退回 id（V-12）
     case "tool_result": return `${e.name ?? e.toolUseId ?? ""} ${e.resultIsError ? "失败" : "成功"}`;
     case "assistant_text": return "助手消息";

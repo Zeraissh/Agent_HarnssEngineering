@@ -114,6 +114,12 @@ import { DEFAULT_VERIFIER_MAX_TURNS, resolveVerifierReadOnlyCommands } from "../
 import { resolvePlannerMaxTurns } from "../src/planner.js";
 import type { Plan, SubTask } from "../src/planner.js";
 import { resolveRecoveryPolicy } from "../src/recovery.js";
+import {
+  matchPermissionMode,
+  permissionModeSwitches,
+  PERMISSION_MODES,
+  type PermissionMode,
+} from "../src/permission-mode.js";
 import type Anthropic from "@anthropic-ai/sdk";
 import { bashTool, SHELL_DESC } from "../src/tools/bash.js";
 import { ASK_USER_TOOL_NAME, createAskUserTool, type UserQuestion } from "../src/tools/ask-user.js";
@@ -513,6 +519,11 @@ interface StoredRun {
    * 工作目录圈禁与只读核查边界仍在。
    */
   autoApprove?: boolean;
+  /**
+   * D3：若请求带了 permissionMode，记下档名；装配条仍展开真实开关。
+   * 未带模式、或开关与预设不符时为 undefined（自定义）。
+   */
+  permissionMode?: "manual" | "plan" | "auto";
   /** 当前提问挂起态；计划并发下其它提问进入 questionQueue，不能覆盖这一项。 */
   pendingQuestion?: PendingQuestion;
   /** 多执行者并发调用 ask_user 时的宿主级串行队列。 */
@@ -4925,8 +4936,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       rootRunId: run.rootRunId ?? run.id,
       boundary:
         "同 run 热恢复：从最后提交的 main 检查点续跑；不恢复原进程 loop/审批回调/active grant；" +
-        "SAFE-06 toolTx 从 state.json 种子化（同 key 不重复 commit）；续跑入口仍是 checkpoint 段号，" +
-        "不自动重放未完成的 mid-tool assistant 轮。",
+        "SAFE-06 toolTx 从 state.json 种子化（同 key 不重复 commit）；续跑入口仍是 checkpoint 段号；" +
+        "若正史末条悬空 tool_use，AgentLoop 按 mid-tool 计划幂等重放 / bash fail-closed。",
       checkpoint: {
         conversationTurn: run.conversationTurn - 1,
         contextInputTokens: run.initialContextInputTokens ?? 0,
@@ -5654,6 +5665,22 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         daily: run.dailyBudget !== false,
         dailyConfigured: dailyTokenBudget !== undefined,
       },
+      // D3：展开真实开关；mode 对得上预设才报档名，否则 null（自定义）
+      permission: (() => {
+        const switches = {
+          approvalDefault: run.autoApprove ? ("auto" as const) : ("ask" as const),
+          planMode: run.mode === "plan",
+          planGate: Boolean(run.planGate),
+          autoYes: Boolean(run.autoApprove),
+        };
+        const matched =
+          run.permissionMode
+          ?? matchPermissionMode(switches);
+        return {
+          mode: matched,
+          ...switches,
+        };
+      })(),
       ...(run.packRoute ? { packRoute: run.packRoute } : {}),
     });
   }
@@ -6502,6 +6529,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     multiAgent?: boolean;
     autoPack?: boolean;
     lineageBudget?: boolean; dailyBudget?: boolean;
+    /** D3：manual | plan | auto；给出则覆盖 plan/autoApprove 为预设开关 */
+    permissionMode?: string;
   }
 
   /** 准入结果：HTTP 处理器把它写成响应；调度器把非 200 记成 lastTrigger=error */
@@ -6561,6 +6590,22 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
     if (parsed.mode !== undefined && parsed.mode !== "single" && parsed.mode !== "plan") {
       return { status: 400, payload: { error: `mode "${parsed.mode}" 无效。可选：single | plan` } };
+    }
+    let permissionMode: PermissionMode | undefined;
+    if (parsed.permissionMode !== undefined && parsed.permissionMode !== "") {
+      if (!(PERMISSION_MODES as readonly string[]).includes(String(parsed.permissionMode))) {
+        return {
+          status: 400,
+          payload: { error: `permissionMode "${parsed.permissionMode}" 无效。可选：${PERMISSION_MODES.join(" | ")}` },
+        };
+      }
+      permissionMode = parsed.permissionMode as PermissionMode;
+      const switches = permissionModeSwitches(permissionMode);
+      // 预设覆盖显式开关——否则界面选了 plan 档却仍按 body 旧 checkbox 跑
+      if (switches.planMode) parsed.mode = "plan";
+      else if (parsed.mode === "plan" && !switches.planMode) parsed.mode = "single";
+      parsed.planGate = switches.planGate;
+      parsed.autoApprove = switches.autoYes || switches.approvalDefault === "auto";
     }
     // 多 agent 与计划确认门正交。planGate 必须配 mode=plan 或 multiAgent，
     // 单独传 planGate 拒绝——静默忽略会让界面与实际行为长期不一致。
@@ -6703,6 +6748,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       ...(planGateRequested ? { planGate: true } : {}),
       ...(askUser ? { askUser: true } : {}),
       ...(parsed.autoApprove === true ? { autoApprove: true } : {}),
+      ...(permissionMode ? { permissionMode } : {}),
       ...(runContextTokenLimit !== undefined ? { contextTokenLimit: runContextTokenLimit } : {}),
       ...(packResources.length ? { heldResources: packResources } : {}),
       ...(lineageBudget ? {} : { lineageBudget: false }),

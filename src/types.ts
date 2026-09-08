@@ -585,6 +585,20 @@ export type TurnEvent =
    */
   | { type: "segment_resume"; attempt: number; reason: string; priorTurns: number }
   /**
+   * SAFE-06 mid-tool：续跑正史末条是悬空 tool_use 时，按 toolTx 计划补齐回执
+   * （幂等重放 / bash fail-closed / 已提交跳过）。在真正执行或合成回执之前发射，
+   * 宿主不得假装"什么都没发生"。
+   */
+  | {
+      type: "mid_tool_replay";
+      runId: string;
+      items: Array<{
+        action: "replay" | "synthesize_error" | "skip_committed";
+        toolUseId: string;
+        name: string;
+      }>;
+    }
+  /**
    * 模型的思考块（turn 级整块）。与 `thinking_delta`（逐字）**互补，不是替代**：
    * 这条是事后回看的完整记录并进日志，那条是运行中的直播、不占 seq。
    * 数据一直在 message.content 里，但此前只进会话正史，而正史每段结束才落盘，

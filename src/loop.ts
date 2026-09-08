@@ -13,6 +13,13 @@ import { countModelError, countModelRetry, observeToolSeconds } from "./metrics.
 import { parseContextWindowFromOverflowError } from "./model-capability.js";
 import { apiErrorClass, classifyApiError, isContextOverflowError, isTransientApiError } from "./model-client.js";
 import { decideRecovery } from "./recovery.js";
+import {
+  assembleMidToolResults,
+  collectPendingToolTx,
+  extractPendingToolUses,
+  planMidToolReplay,
+  shouldAttemptMidToolReplay,
+} from "./mid-tool-replay.js";
 import { type DurableToolTx, type ToolTxController } from "./tool-tx.js";
 import { ToolExecutor, ToolRegistry } from "./tools/registry.js";
 import { parseProgressItems } from "./tools/update-progress.js";
@@ -354,6 +361,133 @@ export class AgentLoop {
   }
 
   /**
+   * 续跑正史修复入口（SAFE-06 mid-tool + P6）。
+   *
+   * 有悬空 tool_use 且 toolTx 有副作用记录 → 按计划重放/合成回执；
+   * 否则退回 repairHistoryForContinuation（全员 ABORTED）。
+   */
+  private async resolveHistoryForContinuation(
+    history: Anthropic.MessageParam[],
+    signal: AbortSignal,
+    q: AsyncEventQueue<TurnEvent>,
+  ): Promise<Anthropic.MessageParam[]> {
+    const pending = extractPendingToolUses(history.at(-1));
+    const runId = this.cfg.runId;
+    if (
+      pending.length === 0
+      || !runId
+      || !this.toolTxCtrl
+    ) {
+      return repairHistoryForContinuation(history);
+    }
+
+    const toolTx = collectPendingToolTx(runId, pending, (key) => this.toolTxCtrl!.get(key));
+    if (!shouldAttemptMidToolReplay(pending, toolTx)) {
+      return repairHistoryForContinuation(history);
+    }
+
+    const plan = planMidToolReplay({
+      runId,
+      pendingToolUses: pending,
+      toolTx,
+    });
+    q.push({
+      type: "mid_tool_replay",
+      runId,
+      items: plan.map((item) => ({
+        action: item.action,
+        toolUseId: item.toolUseId,
+        name: item.name,
+      })),
+    });
+
+    const executed = new Map<string, { content: string; isError?: boolean }>();
+    const replayBlocks: Anthropic.ToolUseBlock[] = plan
+      .filter((item): item is Extract<typeof item, { action: "replay" }> => item.action === "replay")
+      .map(
+        (item) =>
+          ({
+            type: "tool_use",
+            id: item.toolUseId,
+            name: item.name,
+            input: item.input,
+          }) as Anthropic.ToolUseBlock,
+      );
+
+    if (replayBlocks.length > 0) {
+      for (const b of replayBlocks) {
+        q.push({ type: "tool_call", toolUseId: b.id, name: b.name, input: b.input });
+      }
+      await this.executor.executeAll(
+        replayBlocks,
+        signal,
+        (block) =>
+          new Promise((resolve) => {
+            q.push({
+              type: "approval_request",
+              toolUseId: block.id,
+              name: block.name,
+              input: block.input,
+              respond: (decision, reason) => resolve({ decision, reason }),
+            });
+          }),
+        (exec) => {
+          executed.set(exec.toolUseId, {
+            content: exec.result.content,
+            ...(exec.result.isError ? { isError: true } : {}),
+          });
+          q.push({
+            type: "tool_result",
+            toolUseId: exec.toolUseId,
+            result: exec.result,
+            durationMs: exec.durationMs,
+          });
+        },
+      );
+    }
+
+    // 只剥末尾空 assistant；悬空 tool_use 由 mid-tool 结果收口，不走全员 ABORTED。
+    let base = history;
+    while (base.length > 0) {
+      const last = base.at(-1)!;
+      const empty =
+        last.role === "assistant" &&
+        (last.content === "" || (Array.isArray(last.content) && last.content.length === 0));
+      if (!empty) break;
+      base = base.slice(0, -1);
+    }
+    const results = assembleMidToolResults({
+      pendingToolUses: pending,
+      plan,
+      executed,
+      fallbackContent: ABORTED_TOOL_RESULT,
+    });
+    for (const item of plan) {
+      if (item.action === "replay") continue;
+      q.push({
+        type: "tool_result",
+        toolUseId: item.toolUseId,
+        result: {
+          content: item.content,
+          ...(item.action === "synthesize_error" || item.isError ? { isError: true } : {}),
+        },
+        durationMs: 0,
+      });
+    }
+    // 未进计划的悬空（只读）也要有可见回执事件
+    for (const block of pending) {
+      if (plan.some((p) => p.toolUseId === block.id)) continue;
+      q.push({
+        type: "tool_result",
+        toolUseId: block.id,
+        result: { content: ABORTED_TOOL_RESULT, isError: true },
+        durationMs: 0,
+      });
+    }
+    return [...base, { role: "user", content: results }];
+  }
+
+  /**
    * 续跑：在已有会话正史之上追加一条 user 反馈继续执行。
    * 当前段的 maxTurns 重新起算；runBudget 的总轮次/token 账不会重置。
    * 用途：返工继承上下文——agent 保留此前的探索/工具结果，不必从零重烧
@@ -419,9 +553,11 @@ export class AgentLoop {
         q.push(event);
       });
     }
-    // 续跑正史先修复（P6）：末条若是悬空 tool_use 的 assistant，补 is_error 回执——
-    // 否则下一次请求被端点整条拒绝，对话就此"宕机"。修完末条必为 user 或纯文本 assistant。
-    if (history) history = repairHistoryForContinuation(history);
+    // 续跑正史：有 toolTx 种子时走 mid-tool 计划（幂等重放 / bash fail-closed）；
+    // 否则 P6 全员合成 ABORTED——否则下一次请求被端点整条拒绝。
+    if (history) {
+      history = await this.resolveHistoryForContinuation(history, signal, q);
+    }
     // 续跑且正史末条是 user（如 max_turns 停在 tool_result 后）：反馈合并进同一条
     // user 消息，避免连续两条 user——Anthropic 官方允许，但第三方兼容端点未必。
     if (history && history.at(-1)?.role === "user") {

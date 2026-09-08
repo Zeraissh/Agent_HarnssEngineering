@@ -9,7 +9,7 @@
  *   old_string 已不在文件里，重放只会得到 0 命中的报错而非二次修改。
  * - bash：fail_closed_no_retry（prepared/running 残留禁止重跑；无 undo）
  *
- * 残余：CLI 对等 durable、mid-tool 自动重放未完成 assistant 轮、bash compensation。
+ * 残余：MCP 写工具未进 SIDE_EFFECT 集合、bash compensation。
  */
 import { createHash } from "node:crypto";
 import type { ToolResult } from "./types.js";

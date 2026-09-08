@@ -13,6 +13,16 @@ import {
 } from "../src/task-completion.js";
 import type { AgentRunResult, ModelClient, ModelRequest, ModelTurn, StreamDelta, TurnEvent } from "../src/types.js";
 import { FakeModelClient, fakeMessage, makeTool, textBlock, toolUseBlock } from "./helpers.js";
+import { createBashTool } from "../src/tools/bash.js";
+import { writeFileTool } from "../src/tools/write-file.js";
+import {
+  canonicalInputHash,
+  type DurableToolTx,
+  type ToolTxController,
+} from "../src/tool-tx.js";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 
 async function collect(events: AsyncIterable<TurnEvent>): Promise<{
   events: TurnEvent[];
@@ -1077,5 +1087,91 @@ describe("续跑正史修复（repairHistoryForContinuation）", () => {
     const blocks = Array.isArray(sent[2]!.content) ? sent[2]!.content : [{ type: "text", text: sent[2]!.content }];
     expect(blocks.filter((b) => b.type === "tool_result")).toHaveLength(0);
     expect(blocks.some((b) => b.type === "text" && b.text === "继续")).toBe(true);
+  });
+});
+
+describe("SAFE-06 mid-tool 挂进 loop 续跑", () => {
+  it("prepared write_file 幂等重放；bash fail-closed；发 mid_tool_replay 事件", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "mid-tool-loop-"));
+    try {
+      const writeInput = { path: "out.txt", content: "hello-mid" };
+      const bashInput = { command: "echo should-not-run" };
+      const seed: DurableToolTx[] = [
+        {
+          idempotencyKey: "mid-run:tu_w",
+          toolUseId: "tu_w",
+          name: "write_file",
+          inputHash: canonicalInputHash(writeInput),
+          status: "prepared",
+          retryPolicy: "idempotent_retry",
+          preparedAt: 1,
+          updatedAt: 1,
+        },
+        {
+          idempotencyKey: "mid-run:tu_b",
+          toolUseId: "tu_b",
+          name: "bash",
+          inputHash: canonicalInputHash(bashInput),
+          status: "running",
+          retryPolicy: "fail_closed_no_retry",
+          preparedAt: 1,
+          updatedAt: 2,
+        },
+      ];
+      const store = new Map(seed.map((t) => [t.idempotencyKey, t]));
+      const toolTx: ToolTxController = {
+        runId: "mid-run",
+        get: (key) => store.get(key),
+        notify: (_phase, tx) => {
+          store.set(tx.idempotencyKey, { ...tx });
+        },
+      };
+
+      const history: Anthropic.MessageParam[] = [
+        { role: "user", content: "写文件" },
+        {
+          role: "assistant",
+          content: [
+            textBlock("动手"),
+            toolUseBlock("tu_w", "write_file", writeInput),
+            toolUseBlock("tu_b", "bash", bashInput),
+          ],
+        },
+      ];
+
+      const model = new FakeModelClient([fakeMessage([textBlock("收口")], "end_turn")]);
+      const loop = new AgentLoop(
+        {
+          ...baseConfig,
+          workdir: dir,
+          runId: "mid-run",
+          tools: [writeFileTool, createBashTool()],
+          toolTx,
+        },
+        model,
+      );
+      const { events, result } = await collect(loop.runContinuation(history, "继续"));
+
+      expect(events.some((e) => e.type === "mid_tool_replay")).toBe(true);
+      const planEvt = events.find((e) => e.type === "mid_tool_replay");
+      expect(planEvt?.type === "mid_tool_replay" && planEvt.items).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ action: "replay", toolUseId: "tu_w" }),
+          expect.objectContaining({ action: "synthesize_error", toolUseId: "tu_b" }),
+        ]),
+      );
+
+      expect(await readFile(path.join(dir, "out.txt"), "utf8")).toBe("hello-mid");
+      expect(result.stopReason).toBe("completed");
+      const sent = model.requests[0]!.messages;
+      const merged = sent.at(-1)!.content as Anthropic.ContentBlockParam[];
+      const bashResult = merged.find(
+        (b) => b.type === "tool_result" && b.tool_use_id === "tu_b",
+      ) as Anthropic.ToolResultBlockParam;
+      expect(bashResult.is_error).toBe(true);
+      expect(String(bashResult.content)).toMatch(/fail-closed|must not be retried/i);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

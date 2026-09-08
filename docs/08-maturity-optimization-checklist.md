@@ -33,7 +33,7 @@
 | [x] | SAFE-03 | `fetch_url` SSRF/重定向防护 | 5/5/3 | 30 | 仅 HTTPS；拒绝本机/私网/link-local/保留地址；每次重定向重新验证；限制跳转；测试覆盖 DNS 与重定向路径 |
 | [~] | SAFE-04 | 参数级审批授权 | 5/5/4 | 20 | approval grant 绑定 run、tool、规范化 input hash、scope 与 expiry；不同 bash/path/device 参数不能复用旧授权；审批可恢复、可审计 |
 | [~] | SAFE-05 | OS/容器执行隔离 | 5/5/5 | 10 Gate | **WSL2 运输层已落地（2026-09-08）**：`AGENT_EXECUTION_BACKEND=wsl2`；Windows↔`/mnt` 路径映射（`src/wsl-path.ts`）+ WSL 内 Docker 信任探针（`src/wsl2-runtime.ts`）；`required` 失败绝不 host fallback（平台锁）；同一份 13 canary 在 win32 上改走 `wsl2`。**残余**：本机需 WSL 内已有 digest 镜像才能 skip=0；每 run worktree/UID、MCP managed worker、全平台隔离完成定义仍开 |
-| [~] | SAFE-06 | 工具副作用事务层 | 5/5/5 | 10 Gate | **Phase 1 + CLI durable + mid-tool 计划（2026-09-08）**：既有 write_file/bash 事务；CLI 默认落 `.agent-run-history/<runId>/state.json`（`AGENT_CLI_DURABLE=0` 可关）；`planMidToolReplay` 对 prepared/running 的 idempotent 工具重放、bash fail-closed。**残余**：loop 自动挂接 mid-tool 重放入口、MCP 写工具、bash compensation |
+| [~] | SAFE-06 | 工具副作用事务层 | 5/5/5 | 10 Gate | **Phase 1 + CLI durable + mid-tool 挂 loop（2026-09-08）**：既有 write_file/bash 事务；CLI 默认落 `.agent-run-history/<runId>/state.json`；`planMidToolReplay` + `AgentLoop` 续跑入口自动幂等重放 / bash fail-closed / 已提交跳过（`mid_tool_replay` 事件）。**残余**：MCP 写工具、bash compensation |
 
 ### Phase 0 验收命令
 
