@@ -9,6 +9,7 @@ import type Anthropic from "@anthropic-ai/sdk";
 import {
   canonicalInputHash,
   decideToolTxReplay,
+  isSideEffectTool,
   retryPolicyForTool,
   toolIdempotencyKey,
   type DurableToolTx,
@@ -62,6 +63,9 @@ describe("SAFE-06 tool-tx pure helpers", () => {
   it("write_file retries prepared; bash fail-closes", () => {
     expect(retryPolicyForTool("write_file")).toBe("idempotent_retry");
     expect(retryPolicyForTool("bash")).toBe("fail_closed_no_retry");
+    expect(isSideEffectTool("stm32__flash_firmware")).toBe(true);
+    expect(retryPolicyForTool("stm32__flash_firmware")).toBe("fail_closed_no_retry");
+    expect(isSideEffectTool("update_progress")).toBe(false);
     const preparedBash: DurableToolTx = {
       idempotencyKey: "r:t",
       toolUseId: "t",

@@ -1,20 +1,28 @@
 /**
  * SAFE-06 Phase 1 — 工具副作用事务层（纯函数 + 执行器钩子）。
  *
- * 范围：write_file / edit_file / bash / generate_image 四个副作用内置工具。
+ * 范围：内置 write_file / edit_file / bash / generate_image，以及名字命中
+ * MCP 写类启发式（flash_firmware / write_memory 等）的工具。
  * - idempotencyKey = runId:toolUseId（inputHash 只作审计与同 id 异参 fail-closed）
  * - 生命周期：prepared → running → committed | failed | aborted
  * - write_file：idempotent_retry（prepared 可重入；committed 跳过）
  * - edit_file：idempotent_retry。字符串替换**不可能重复施加**——上一次若已写入，
  *   old_string 已不在文件里，重放只会得到 0 命中的报错而非二次修改。
- * - bash：fail_closed_no_retry（prepared/running 残留禁止重跑；无 undo）
+ * - bash / MCP 启发式写类：fail_closed_no_retry（不知可否幂等；无 undo）
  *
- * 残余：MCP 写工具未进 SIDE_EFFECT 集合、bash compensation。
+ * 残余：bash compensation；MCP 启发式漏检（认不出的写工具仍无事务）。
  */
 import { createHash } from "node:crypto";
 import type { ToolResult } from "./types.js";
 
 export const SIDE_EFFECT_TOOL_NAMES = new Set(["write_file", "edit_file", "bash", "generate_image"]);
+
+/**
+ * MCP 写类启发式（与 compact-ledger 同族，故意收窄）：
+ * 只认明确写盘/烧录形态，避免误伤 `update_progress` 等。
+ */
+const MCP_SIDE_EFFECT_RE =
+  /(?:^|__)(?:write_file|edit_file|write_memory|flash_firmware|flash_and_run|program_device)$/i;
 
 export const TOOL_TX_STATUSES = [
   "prepared",
@@ -42,12 +50,16 @@ export interface DurableToolTx {
 }
 
 export function isSideEffectTool(name: string): boolean {
-  return SIDE_EFFECT_TOOL_NAMES.has(name);
+  if (SIDE_EFFECT_TOOL_NAMES.has(name)) return true;
+  return MCP_SIDE_EFFECT_RE.test(name);
 }
 
 export function retryPolicyForTool(name: string): ToolTxRetryPolicy {
-  // bash 任意命令不可安全重试；write_file 同内容写入可幂等
-  return name === "bash" ? "fail_closed_no_retry" : "idempotent_retry";
+  // bash / 未知 MCP 写类：不可安全重试；内置 write/edit/image 可幂等
+  if (name === "bash") return "fail_closed_no_retry";
+  if (SIDE_EFFECT_TOOL_NAMES.has(name)) return "idempotent_retry";
+  if (MCP_SIDE_EFFECT_RE.test(name)) return "fail_closed_no_retry";
+  return "idempotent_retry";
 }
 
 export function toolIdempotencyKey(runId: string, toolUseId: string): string {

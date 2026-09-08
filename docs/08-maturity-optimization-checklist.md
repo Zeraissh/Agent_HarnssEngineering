@@ -33,7 +33,7 @@
 | [x] | SAFE-03 | `fetch_url` SSRF/重定向防护 | 5/5/3 | 30 | 仅 HTTPS；拒绝本机/私网/link-local/保留地址；每次重定向重新验证；限制跳转；测试覆盖 DNS 与重定向路径 |
 | [~] | SAFE-04 | 参数级审批授权 | 5/5/4 | 20 | approval grant 绑定 run、tool、规范化 input hash、scope 与 expiry；不同 bash/path/device 参数不能复用旧授权；审批可恢复、可审计 |
 | [~] | SAFE-05 | OS/容器执行隔离 | 5/5/5 | 10 Gate | **WSL2 运输层已落地（2026-09-08）**：`AGENT_EXECUTION_BACKEND=wsl2`；Windows↔`/mnt` 路径映射（`src/wsl-path.ts`）+ WSL 内 Docker 信任探针（`src/wsl2-runtime.ts`）；`required` 失败绝不 host fallback（平台锁）；同一份 13 canary 在 win32 上改走 `wsl2`。**残余**：本机需 WSL 内已有 digest 镜像才能 skip=0；每 run worktree/UID、MCP managed worker、全平台隔离完成定义仍开 |
-| [~] | SAFE-06 | 工具副作用事务层 | 5/5/5 | 10 Gate | **Phase 1 + CLI durable + mid-tool 挂 loop（2026-09-08）**：既有 write_file/bash 事务；CLI 默认落 `.agent-run-history/<runId>/state.json`；`planMidToolReplay` + `AgentLoop` 续跑入口自动幂等重放 / bash fail-closed / 已提交跳过（`mid_tool_replay` 事件）。**残余**：MCP 写工具、bash compensation |
+| [~] | SAFE-06 | 工具副作用事务层 | 5/5/5 | 10 Gate | **Phase 1 + CLI durable + mid-tool 挂 loop + MCP 写类启发式（2026-09-08）**：内置 write/edit/bash/image 事务；MCP 名命中 flash_firmware/write_memory 等进 fail-closed 事务；CLI durable；mid-tool 续跑自动重放。**残余**：bash compensation；MCP 启发式漏检 |
 
 ### Phase 0 验收命令
 
@@ -102,7 +102,7 @@ OCI 逃逸 canary 由 Linux CI container job 承担（run #33461119575 全绿）
 | 状态 | ID | 优化项 | I/R/E | 优先分 | 完成定义 |
 |---|---|---|---:|---:|---|
 | [~] | RUN-01 | Durable RunState | 5/5/5 | 10 Gate | 持久化 plan DAG、segment、审批/提问、verifier/rework、预算与 tool transaction；进程重启从明确状态恢复。**Phase 1+2 已落地（2026-09-03）**：`state.json` + Web 迁移；崩溃→interrupted；**同 run 热恢复**（`sameRunResume` / `run_resumed`，idempotency=checkpoint 段边界）；预算与 grantAudit 进 state；UI 文案同提交。**SAFE-06 Phase 1**：`toolTx[]` 已进 state。**会话中心化（2026-09-03）**：`reopen` 迁移（终态→executing）取代"可追问的 completed 保持 executing"；检查点从执行者谱系（main+rework）取；`meta.outcome.judgedTurn`。**仍开**：CLI 对等 durable、mid-tool 自动重放 |
-| [~] | RUN-02 | 恢复与故障注入 | 5/5/4 | 20 | 在 model call、tool prepared/committed、审批等待和历史写入各点注入崩溃；不丢状态、不重复副作用、可安全 fork。**已落地（2026-09-03）**：原套件 + **SAFE-06**：`tool_prepared` 后崩溃 → 同 key 恢复不双写；write_file 事件与 state.toolTx 契约锁。**残余**：mid-tool 自动重放；真实 SIGKILL 子进程；CLI durable |
+| [~] | RUN-02 | 恢复与故障注入 | 5/5/4 | 20 | 在 model call、tool prepared/committed、审批等待和历史写入各点注入崩溃；不丢状态、不重复副作用、可安全 fork。**已落地（2026-09-03）**：原套件 + **SAFE-06**：`tool_prepared` 后崩溃 → 同 key 恢复不双写；write_file 事件与 state.toolTx 契约锁。**2026-09-08**：CLI durable + mid-tool 自动重放已挂 loop。**残余**：真实 SIGKILL 子进程 |
 | [~] | OBS-01 | 端到端 trace | 5/4/4 | 18 | run→segment→model/tool spans；记录 commit、模型、工具/schema/pack 版本与输入输出哈希；支持脱敏导出和离线 playback。**已落地（2026-09-02）**：`src/trace.ts` + `trace.jsonl` 旁路（扩展 history，无 OTel）；Web `GET /api/runs/:id/trace` 脱敏导出 + playback 摘要；事件投影 tool/model/segment。**仍开**：CLI 同等接线、完整 model span 起止（非 done 摘要）、跨进程统一 collector |
 | [~] | OBS-02 | 成本、延迟与 SLO | 4/4/3 | 24 | TTFT、模型/工具延迟、排队/审批等待、重试/错误、USD 成本和 provider/model/pack 归因；持久预算账与 p50/p95/p99 仪表盘。**延迟面已落地（a9ab8aa）**；**成本归因部分落地（2026-09-03）**：单价表 + Web/台账/metrics，未登记→null 纪律。**仍开**：持久日预算账、p50/p95/p99 视图、SLO 告警 |
 | [ ] | OPS-01 | 备份、恢复与升级演练 | 5/4/4 | 18 | 定义并验证 RPO/RTO；完成异地加密备份恢复、版本迁移、回滚及在途任务升级演练 |
@@ -189,7 +189,8 @@ npx tsc --noEmit                            passed
 
 | MEM-01 窗口 / 预算分离 | `contextTokenLimit` 一个数此前兼任"模型能装多少"与"我们在多少处压"，Phase C 的真端点复核把这笔债照了出来（窗口 1,048,576 而预算 150k = 在 11% 处压；128k 的模型则永远到不了主动压缩，只能白吃一次 400）。**窗口**（事实）`src/context-window.ts` 四级来源 env `AGENT_CONTEXT_WINDOW` > learned（`model-capability.ts`：撞 400 时 `parseContextWindowFromOverflowError` 只认两种见过的措辞，按 `provider|model|origin` 记，粘性 + TTL 30 天，落 `.agent-capabilities.json`，只存身份键与数字）> registry（`model-windows.ts`，每条带出处，**不认识就不猜**）> unknown；**预算**（策略）三级覆盖 run（Web 逐 run）> env > 包 > 默认 150k，再夹进 `maxBudget = window − maxTokens − margin`（`margin = max(4k, 2%)`），夹紧发告警且原值可见。loop 撞 400 先学窗口再硬压缩（`onContextWindowLearned` 钩子归宿主；编排层给独立 verifier / planner 剥掉——它们的 400 说的是自己的窗口）。两个宿主如实报数：CLI 启动行「预算 / 窗口（来源）」+ 夹紧 ⚠ 行 + 压缩行「学到窗口 …（下次运行生效）」；Web `run_config` / `/api/harness` 的 `context` 九字段投影、三段水位条（已用 / 预算 / 窗口，未知不画那一段）、到预算 80% 的「下一轮将压缩」、逐 run 预算控件（区间 `[32k, maxBudget]`，越界 **400 报区间**而非静默夹紧；>200k 成本忠告不阻断），逐 run 值随档案 meta 与派生 run 走；台账 `context { window, windowSource, budget, budgetSource }` + `npm run ledger` 来源直方图 / 预算分桶。测试：`test/context-window.test.ts` 21 条 + compact-tier2 / ledger / mock-provider 各若干 + Web 侧 9 条服务端契约 + 7 条渲染 / axe + 23 条派生与投影锁；确定性场景 `context-window-learned-across-runs`（二进程：第一跑学到 → 落盘 → 第二跑启动行报 learned）；变异 `context-budget-clamp-dropped` / `context-window-learn-dropped` + Web 侧 5 处（逐 run 校验 / 投影字段 / 80% 提示 / 水位边界 `>=`→`>` / 启动期 env 校验）全部 killed | **窗口只在撞过 400 或在登记表里时才知道**——首次跑一个陌生模型必然是"未知"，此时预算不夹紧，仍可能白吃一次 400（这一次的成本换来往后都知道）。登记表要人工维护，厂商升窗口后旧条目会过期（learned 优先于它可自愈，TTL 30 天）。夹紧只按 `maxTokens` 与固定边际算，**不读真实 token 计数**（token 是端点算的，我们只有上一轮读数）；预算**不随窗口自动抬高**是有意的策略选择，代价是大窗口模型上默认仍在 150k 处压。逐 run 预算不进台账的独立字段（只体现为 `budgetSource=run` + 生效数）。学到的窗口按端点身份记，同一模型换 baseURL 要重新学 |
 
-当前执行顺序（2026-09-08 单操作员产品化）：
-`SAFE-05 WSL2[~] → D3 权限三档[~] → CLI durable + mid-tool 计划[~] → Electron pack smoke / OPS-01 drill`。
+当前执行顺序（2026-09-08 单操作员产品化，本波已收）：
+`SAFE-05 WSL2[~] → D3[~] → CLI durable + mid-tool→loop → GhostApproval 真实路径 → MCP 写类启发式`。
+仍开：WSL2 digest canary skip=0、Electron 升级/卸载 CI、OPS-01 异地加密全套、bash compensation。
 对照表见 `docs/permission-modes.md`；WSL2 fixture：`npm run wsl2:oci-fixture`。
 GOV-* 与 SAFE-05 Phase 2B（每 run UID/worktree）本波默认跳过。
