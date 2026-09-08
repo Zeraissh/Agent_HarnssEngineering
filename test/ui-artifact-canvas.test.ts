@@ -23,9 +23,11 @@ import {
   wrapIndex,
   formatBytes,
   artifactBasename,
+  siteArtifactUrl,
   pathsMatch,
   initArtifactCanvas,
 } from "../ui/public/features/artifact-canvas.js";
+import { DECK_READY_MESSAGE_TYPE, DECK_GOTO_MESSAGE_TYPE } from "../ui/public/features/review-mode.js";
 import { deriveWrittenPaths } from "../ui/public/app.js";
 
 const flush = () => new Promise((r) => setTimeout(r, 0));
@@ -171,6 +173,16 @@ describe("wrapIndex / formatBytes / artifactBasename", () => {
     expect(artifactBasename("C:\\work\\out\\报告.md")).toBe("报告.md");
     expect(artifactBasename("out/a.csv")).toBe("a.csv");
   });
+
+  it("整站 URL 按段编码，相对资源才能解析到同目录", () => {
+    expect(siteArtifactUrl("run-1", "out/index.html")).toBe("/api/runs/run-1/site/out/index.html");
+    expect(siteArtifactUrl("run-1", "demos\\liquid\\index.html")).toBe(
+      "/api/runs/run-1/site/demos/liquid/index.html",
+    );
+    expect(siteArtifactUrl("a/b", "x y/z.html")).toBe(
+      "/api/runs/a%2Fb/site/x%20y/z.html",
+    );
+  });
 });
 
 // ---------------------------------------------------------------
@@ -207,7 +219,7 @@ describe("initArtifactCanvas — 打开与 chrome", () => {
     document.body.innerHTML = "";
   });
 
-  it("HTML 产物：iframe 沙箱不允许 same-origin，且不发 fetch", async () => {
+  it("HTML 产物：整站预览，iframe 沙箱不允许 same-origin，且不发 fetch", async () => {
     const fakeFetch = vi.fn();
     const api = initArtifactCanvas(setupHost(), { fetch: fakeFetch });
     expect(api.open(0)).toBe(true);
@@ -215,9 +227,13 @@ describe("initArtifactCanvas — 打开与 chrome", () => {
     const frame = document.querySelector("iframe.ac-frame");
     expect(frame).toBeTruthy();
     expect(frame.getAttribute("sandbox")).toBe("allow-scripts");
-    expect(frame.getAttribute("src")).toContain("/api/runs/run-1/artifact?path=out%2Findex.html");
-    // 相对资源失效的预期要标注出来
-    expect(document.querySelector(".ac-note")?.textContent).toContain("相对资源");
+    expect(frame.getAttribute("sandbox")).not.toContain("allow-same-origin");
+    expect(frame.getAttribute("src")).toBe("/api/runs/run-1/site/out/index.html?deck=1");
+    expect(document.querySelector(".ac-note")?.textContent).toContain("整站预览");
+    expect(document.querySelector("#ac-site")).toBeNull();
+    expect(document.querySelector("#ac-zip")?.hidden).toBe(false);
+    expect(document.querySelector("#ac-print")?.hidden).toBe(false);
+    expect((document.querySelector("#ac-print") as HTMLAnchorElement).href).toContain("print=1");
     expect(fakeFetch).not.toHaveBeenCalled();
     // chrome：名称 + 徽章 + 位置
     expect(document.querySelector(".ac-name")?.textContent).toBe("index.html");
@@ -225,6 +241,55 @@ describe("initArtifactCanvas — 打开与 chrome", () => {
     expect(document.querySelector(".ac-pos")?.textContent).toBe("1 / 6");
     expect(document.querySelector("#ac-inspect")?.hidden).toBe(false);
     expect(document.querySelector("#ac-annotate")?.hidden).toBe(true);
+  });
+
+  it("点评模式仍走整站 URL，只加 inspect=1，不 fetch、不用 srcdoc", async () => {
+    const fakeFetch = vi.fn();
+    const api = initArtifactCanvas(setupHost(), { fetch: fakeFetch });
+    api.open(0);
+    expect(fakeFetch).not.toHaveBeenCalled();
+    document.querySelector("#ac-inspect").click();
+    await flush();
+    expect(fakeFetch).not.toHaveBeenCalled();
+    const frame = document.querySelector("iframe.ac-frame");
+    expect(frame.getAttribute("sandbox")).toBe("allow-scripts");
+    expect(frame.getAttribute("sandbox")).not.toContain("allow-same-origin");
+    expect(frame.getAttribute("src")).toBe("/api/runs/run-1/site/out/index.html?deck=1&inspect=1");
+    expect(frame.getAttribute("srcdoc")).toBeNull();
+    expect(document.querySelector(".ac-note")?.textContent).toContain("点评模式");
+  });
+
+  it("幻灯报到后显示翻页条；裸方向键翻页，Alt+方向键切产物", async () => {
+    const host = setupHost();
+    const api = initArtifactCanvas(host, { fetch: vi.fn() });
+    api.open(0);
+    const frame = document.querySelector("iframe.ac-frame");
+    const cw = {};
+    Object.defineProperty(frame, "contentWindow", { value: cw, configurable: true });
+    const posts = [];
+    cw.postMessage = (msg) => posts.push(msg);
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        data: {
+          type: DECK_READY_MESSAGE_TYPE,
+          total: 3,
+          index: 0,
+          slide: "1",
+          slides: ["1", "2", "3"],
+        },
+        source: cw,
+      }),
+    );
+    await flush();
+    expect(document.querySelector("#ac-deck-bar")?.hidden).toBe(false);
+    expect(document.querySelector(".ac-badge")?.textContent).toBe("幻灯");
+    expect(document.querySelector(".ac-deck-pos")?.textContent).toContain("1 / 3");
+    host.onSwitch.mockClear();
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight" }));
+    expect(posts.some((p) => p?.type === DECK_GOTO_MESSAGE_TYPE && p.delta === 1)).toBe(true);
+    expect(host.onSwitch).not.toHaveBeenCalled();
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", altKey: true }));
+    expect(host.onSwitch).toHaveBeenCalledWith(1);
   });
 
   it("图片产物：标注钮可见；打开后叠画布，不发 fetch", async () => {
@@ -239,23 +304,6 @@ describe("initArtifactCanvas — 打开与 chrome", () => {
     expect(document.querySelector("canvas.ac-annotate-canvas")).toBeTruthy();
     expect(document.querySelector("#ac-annotate-bar")).toBeTruthy();
     expect(fakeFetch).not.toHaveBeenCalled();
-  });
-
-  it("点评模式才 fetch HTML，srcdoc 注入钩子且沙箱仍无 same-origin", async () => {
-    const fakeFetch = vi.fn(async () => textRes("<html><body><h1>Hi</h1><script>alert(1)</script></body></html>"));
-    const onAppendReview = vi.fn();
-    const api = initArtifactCanvas(setupHost({ onAppendReview }), { fetch: fakeFetch });
-    api.open(0);
-    expect(fakeFetch).not.toHaveBeenCalled();
-    document.querySelector("#ac-inspect").click();
-    await flush();
-    expect(fakeFetch).toHaveBeenCalled();
-    const frame = document.querySelector("iframe.ac-frame");
-    expect(frame.getAttribute("sandbox")).toBe("allow-scripts");
-    expect(frame.getAttribute("sandbox")).not.toContain("allow-same-origin");
-    expect(frame.getAttribute("src")).toBeNull();
-    expect(frame.srcdoc).toContain("agent-inspect-pick");
-    expect(frame.srcdoc).not.toContain("alert(1)");
   });
 
   it("图片产物：img 直显", () => {

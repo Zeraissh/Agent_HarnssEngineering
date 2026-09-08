@@ -27,6 +27,10 @@ import { fileURLToPath } from "node:url";
 import {
   createUiServer,
   contentTypeOf,
+  siteContentTypeOf,
+  sitePreviewUrl,
+  decodeSitePreviewPath,
+  SITE_PREVIEW_CSP,
   localPathTarget,
   planGateStopReason,
   meterModelClient,
@@ -4341,6 +4345,139 @@ describe("产物取件：圈禁比功能更要紧", () => {
   });
 });
 
+describe("整站预览：相对资源可解析，但仍无同源身份", () => {
+  let handle: Awaited<ReturnType<typeof createUiServer>>;
+  let base: string;
+  let dir: string;
+  let runId: string;
+
+  beforeAll(async () => {
+    dir = await mkdtemp(join(tmpdir(), "site-preview-"));
+    await mkdir(join(dir, "demos", "liquid"), { recursive: true });
+    await writeFile(
+      join(dir, "demos", "liquid", "index.html"),
+      '<!doctype html><link rel="stylesheet" href="style.css"><script src="app.js"></script><h1>site</h1>',
+      "utf8",
+    );
+    await writeFile(join(dir, "demos", "liquid", "style.css"), "h1{color:tomato}", "utf8");
+    await writeFile(join(dir, "demos", "liquid", "app.js"), "window.__site=1", "utf8");
+
+    handle = createUiServer({
+      modelClient: new FakeModelClient([fakeMessage([textBlock("done")], "end_turn")]),
+      workdir: dir,
+    });
+    const port = await startServer(handle);
+    base = baseUrl(port);
+    const res = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "整站" }),
+    });
+    runId = (await res.json()).runId;
+  }, 30_000);
+
+  afterAll(async () => {
+    await handle.close();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const getSite = (rel: string) =>
+    fetch(`${base}/api/runs/${runId}/site/${rel.split("/").map(encodeURIComponent).join("/")}`);
+
+  it("按路径取回 HTML，且 CSP 允许同源脚本（单文件 artifact 仍禁）", async () => {
+    const res = await getSite("demos/liquid/index.html");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/html");
+    const csp = res.headers.get("content-security-policy") ?? "";
+    expect(csp).toContain("script-src 'self'");
+    expect(csp).toContain("default-src 'self'");
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(await res.text()).toContain("style.css");
+  });
+
+  it(".js 以 javascript MIME 提供，相对同目录可取", async () => {
+    const css = await getSite("demos/liquid/style.css");
+    expect(css.status).toBe(200);
+    expect(css.headers.get("content-type")).toContain("text/css");
+    const js = await getSite("demos/liquid/app.js");
+    expect(js.status).toBe(200);
+    expect(js.headers.get("content-type")).toContain("javascript");
+    expect(await js.text()).toContain("__site");
+  });
+
+  it("目录回落到 index.html", async () => {
+    const res = await getSite("demos/liquid");
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("<h1>site</h1>");
+  });
+
+  it("自动刷新查询串不进路径", async () => {
+    const res = await fetch(
+      `${base}/api/runs/${runId}/site/demos/liquid/style.css?v=123`,
+    );
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("tomato");
+  });
+
+  it("?inspect=1 给 HTML 注入点选钩子，且保留页面脚本；CSS 不加钩", async () => {
+    const res = await fetch(
+      `${base}/api/runs/${runId}/site/demos/liquid/index.html?inspect=1`,
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("agent-inspect-pick");
+    expect(html).toContain('src="app.js"');
+    expect(html).toContain("parent.postMessage");
+    const css = await fetch(
+      `${base}/api/runs/${runId}/site/demos/liquid/style.css?inspect=1`,
+    );
+    expect(await css.text()).toBe("h1{color:tomato}");
+  });
+
+  it("含 .slide 的 HTML 自动注入 deck runtime；ZIP 打包同目录", async () => {
+    await mkdir(join(dir, "deck"), { recursive: true });
+    await writeFile(
+      join(dir, "deck", "index.html"),
+      '<section class="slide" data-slide="1">A</section><section class="slide" data-slide="2">B</section>',
+      "utf8",
+    );
+    await writeFile(join(dir, "deck", "style.css"), "x{}", "utf8");
+    const htmlRes = await getSite("deck/index.html");
+    expect(htmlRes.status).toBe(200);
+    const html = await htmlRes.text();
+    expect(html).toContain("agent-deck-ready");
+    const zipRes = await fetch(
+      `${base}/api/runs/${runId}/site-zip?path=${encodeURIComponent("deck/index.html")}`,
+    );
+    expect(zipRes.status).toBe(200);
+    expect(zipRes.headers.get("content-type")).toContain("application/zip");
+    const buf = Buffer.from(await zipRes.arrayBuffer());
+    expect(buf.subarray(0, 2).toString("utf8")).toBe("PK");
+    expect(buf.includes(Buffer.from("style.css", "utf8"))).toBe(true);
+  });
+
+  it("?print=1 注入 window.print 钩子", async () => {
+    const res = await fetch(
+      `${base}/api/runs/${runId}/site/demos/liquid/index.html?print=1`,
+    );
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("window.print");
+  });
+
+  it.each([
+    ["../outside.txt", "上跳"],
+    ["demos/liquid/../../outside.txt", "绕圈上跳"],
+    ["demos/%2e%2e/outside.txt", "编码上跳"],
+  ])("拒绝逃出：%s", async (rel) => {
+    const res = await fetch(`${base}/api/runs/${runId}/site/${rel}`);
+    expect([400, 404]).toContain(res.status);
+  });
+
+  it("未知 run 404", async () => {
+    expect((await fetch(`${base}/api/runs/nope/site/demos/liquid/index.html`)).status).toBe(404);
+  });
+});
+
 describe("在文件夹中显示：从网页请求启动本机进程，圈禁只能更严", () => {
   let handle: Awaited<ReturnType<typeof createUiServer>>;
   let base: string;
@@ -4451,6 +4588,23 @@ describe("在文件夹中显示：从网页请求启动本机进程，圈禁只�
     expect(contentTypeOf("x.bin")).toContain("application/octet-stream");
     // 大小写不敏感
     expect(contentTypeOf("X.PNG")).toContain("image/png");
+  });
+
+  it("整站 MIME：.js 可执行；单文件 contentTypeOf 仍把 .js 当纯文本", () => {
+    expect(contentTypeOf("app.js")).toContain("text/plain");
+    expect(siteContentTypeOf("app.js")).toContain("javascript");
+    expect(siteContentTypeOf("style.css")).toContain("text/css");
+    expect(SITE_PREVIEW_CSP).toContain("script-src 'self'");
+  });
+
+  it("sitePreviewUrl / decodeSitePreviewPath 往返，拒绝 ..", () => {
+    expect(sitePreviewUrl("r1", "demos/a/index.html")).toBe(
+      "/api/runs/r1/site/demos/a/index.html",
+    );
+    expect(decodeSitePreviewPath("demos/a/index.html")).toBe("demos/a/index.html");
+    expect(decodeSitePreviewPath("x%20y/z.html")).toBe("x y/z.html");
+    expect(() => decodeSitePreviewPath("a/../b")).toThrow();
+    expect(() => decodeSitePreviewPath("%2e%2e/x")).toThrow();
   });
 });
 

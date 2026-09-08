@@ -5797,6 +5797,39 @@ button.chg-row-head:focus-visible { outline: 2px solid var(--focus); outline-off
   color: var(--text-3);
   margin: var(--space-sm) 0 0;
 }
+.ac-deck-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: var(--space-sm) var(--space-lg) 0;
+  flex-shrink: 0;
+}
+.ac-deck-bar[hidden] { display: none !important; }
+.ac-deck-pos {
+  font-size: var(--font-sm);
+  color: var(--text-2);
+  min-width: 6rem;
+  text-align: center;
+}
+.ac-review-list {
+  flex-shrink: 0;
+  max-height: 8rem;
+  overflow: auto;
+  padding: var(--space-sm) var(--space-lg) var(--space-md);
+  border-top: 1px solid var(--border-1);
+  font-size: var(--font-xs);
+  color: var(--text-2);
+}
+.ac-review-list[hidden] { display: none !important; }
+.ac-review-list-title {
+  margin: 0 0 var(--space-xs);
+  font-weight: 600;
+  color: var(--text-1);
+}
+.ac-review-list ul {
+  margin: 0;
+  padding-left: 1.1rem;
+}
 .ac-image-wrap {
   flex: 1;
   display: flex;

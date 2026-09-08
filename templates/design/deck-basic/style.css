@@ -1,0 +1,43 @@
+:root {
+  --bg: #0f1419;
+  --fg: #f4f1ea;
+  --muted: #a8a29a;
+  --accent: #3b82f6;
+  --pad: clamp(1.5rem, 4vw, 3rem);
+  font-family: "Segoe UI", "PingFang SC", "Noto Sans SC", system-ui, sans-serif;
+}
+
+* { box-sizing: border-box; }
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+.slide {
+  display: none;
+  min-height: 100%;
+  padding: var(--pad);
+  flex-direction: column;
+  justify-content: center;
+  gap: 1rem;
+}
+.slide.is-active { display: flex; }
+
+.kicker {
+  margin: 0;
+  color: var(--accent);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-size: 0.85rem;
+}
+.hero { margin: 0; font-size: clamp(2rem, 6vw, 3.2rem); line-height: 1.15; }
+h2 { margin: 0; font-size: clamp(1.6rem, 4vw, 2.4rem); }
+.lede { margin: 0; color: var(--muted); max-width: 36rem; font-size: 1.15rem; line-height: 1.5; }
+.bullets { margin: 0; padding-left: 1.2rem; font-size: 1.1rem; line-height: 1.7; color: var(--fg); }
+
+@media print {
+  .slide { display: flex !important; page-break-after: always; min-height: 100vh; }
+  .slide:last-child { page-break-after: auto; }
+}

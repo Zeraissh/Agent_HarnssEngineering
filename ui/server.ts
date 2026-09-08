@@ -101,6 +101,8 @@ import { getPack, selectPackTools, PACKS, DEFAULT_HOST_DISCIPLINES, type DomainP
 import { routeToPack } from "../src/router.js";
 import { connectMcpServers, loadMcpConfig, type McpRuntime } from "../src/mcp.js";
 import { sanitizeGeneratedTitle, summarizeTitle, TITLE_SYSTEM } from "./title.js";
+import { appendSiteHooks } from "./public/features/review-mode.js";
+import { buildStoreZip, zipEntryName } from "./zip.js";
 import { aggregateUsage, parseLedgerLines } from "./usage.js";
 import { envUpdatesFromStore, upsertEnvKeys } from "./env-sync.js";
 import {
@@ -1856,6 +1858,74 @@ export function contentTypeOf(name: string): string {
     return "text/plain; charset=utf-8";
   }
   return "application/octet-stream";
+}
+
+/**
+ * 整站预览 MIME：`.js` 必须是可执行脚本类型，不能走 contentTypeOf 的 text/plain。
+ * 仅用于 `/site/*`；单文件 artifact 预览仍用 contentTypeOf（禁脚本 CSP）。
+ */
+export function siteContentTypeOf(name: string): string {
+  const ext = extname(name).toLowerCase();
+  if (ext === ".js" || ext === ".mjs" || ext === ".cjs") {
+    return "text/javascript; charset=utf-8";
+  }
+  if (ext === ".wasm") return "application/wasm";
+  if (CONTENT_TYPES[ext]) return CONTENT_TYPES[ext]!;
+  if (/\.(map)$/i.test(name)) return "application/json; charset=utf-8";
+  return contentTypeOf(name);
+}
+
+/** 整站预览 CSP：允许同源脚本/样式/资源；仍禁外链与 form。配合 iframe 无 allow-same-origin。 */
+export const SITE_PREVIEW_CSP = [
+  "default-src 'self'",
+  "script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data: blob:",
+  "font-src 'self' data:",
+  "connect-src 'self'",
+  "media-src 'self' blob:",
+  "worker-src 'self' blob:",
+  "frame-ancestors 'self'",
+  "base-uri 'none'",
+  "form-action 'none'",
+  "object-src 'none'",
+].join("; ");
+
+/**
+ * 把 workdir 相对路径编成整站预览 URL（路径段编码，相对引用才能解析）。
+ * `demos/a/index.html` → `/api/runs/<id>/site/demos/a/index.html`
+ */
+export function sitePreviewUrl(runId: string, relativePath: string): string {
+  const normalized = String(relativePath ?? "")
+    .replace(/\\/g, "/")
+    .replace(/^\/+/, "")
+    .replace(/\/+/g, "/");
+  if (!normalized) throw new Error("site preview path is empty");
+  const segments = normalized.split("/").map((seg) => encodeURIComponent(seg)).join("/");
+  return `/api/runs/${encodeURIComponent(runId)}/site/${segments}`;
+}
+
+/** 解码 `/site/` 后的路径段；拒绝空段与 `.`/`..`（圈禁前先挡一层）。 */
+export function decodeSitePreviewPath(encodedPath: string): string {
+  const raw = String(encodedPath ?? "").replace(/^\/+/, "");
+  if (!raw) throw new Error("site preview path is empty");
+  const parts = raw.split("/");
+  const out: string[] = [];
+  for (const part of parts) {
+    if (!part) continue;
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(part);
+    } catch {
+      throw new Error("site preview path is not valid URI encoding");
+    }
+    if (decoded === "." || decoded === ".." || decoded.includes("\0") || /[\\/]/.test(decoded)) {
+      throw new Error("site preview path contains illegal segment");
+    }
+    out.push(decoded);
+  }
+  if (out.length === 0) throw new Error("site preview path is empty");
+  return out.join("/");
 }
 
 /**
@@ -6225,6 +6295,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     | { type: "trace"; runId: string }
     | { type: "inspectPaths"; runId: string }
     | { type: "artifact"; runId: string; path: string; download: boolean }
+    | { type: "site"; runId: string; path: string; inspect: boolean; deck: boolean; print: boolean }
+    | { type: "siteZip"; runId: string; path: string }
     | { type: "filePreview"; path: string; workdir: string | null; download: boolean }
     | { type: "reveal"; runId: string }
     | { type: "stop"; runId: string }
@@ -6393,6 +6465,37 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         path: wanted,
         download: q.get("download") === "1",
       };
+    }
+
+    /**
+     * 整站预览：路径式取件，使 HTML 内相对 CSS/JS 能解析到同目录资源。
+     * 仍圈在 run workdir；CSP 允许同源脚本，但 iframe 故意无 allow-same-origin。
+     * 查询串（?v=、?inspect=1、?deck=1）必须先剥掉再解码路径。
+     */
+    const siteQ = url.includes("?") ? url.slice(url.indexOf("?") + 1) : "";
+    const sitePathOnly = url.split("?", 1)[0]!;
+    const siteZipMatch = method === "GET" && sitePathOnly.match(/^\/api\/runs\/([^/]+)\/site-zip$/);
+    if (siteZipMatch) {
+      const qs = new URLSearchParams(siteQ);
+      const wanted = qs.get("path");
+      if (!wanted) return { type: "malformed" };
+      return { type: "siteZip", runId: siteZipMatch[1]!, path: wanted };
+    }
+    const siteMatch = method === "GET" && sitePathOnly.match(/^\/api\/runs\/([^/]+)\/site\/(.+)$/);
+    if (siteMatch) {
+      try {
+        const qs = new URLSearchParams(siteQ);
+        return {
+          type: "site",
+          runId: siteMatch[1]!,
+          path: decodeSitePreviewPath(siteMatch[2]!),
+          inspect: qs.get("inspect") === "1",
+          deck: qs.get("deck") === "1",
+          print: qs.get("print") === "1",
+        };
+      } catch {
+        return { type: "malformed" };
+      }
     }
 
     /**
@@ -8561,6 +8664,130 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           return;
         } catch {
           return notFound(res, `Artifact not found: ${route.path}`);
+        }
+      }
+
+      /**
+       * 整站预览取件：相对路径按 run workdir 圈禁；目录则回 index.html。
+       * MIME 用 siteContentTypeOf（.js 可执行）；CSP 允许同源脚本/样式。
+       * `?inspect=1` 仅对 HTML 注入点选钩子（保留页面脚本），相对资源仍同源可取。
+       */
+      case "site": {
+        const run = runs.get(route.runId);
+        if (!run) return notFound(res, `Run not found: ${route.runId}`);
+        const root = run.workdir ?? workdir;
+        let abs: string;
+        try {
+          abs = resolveInWorkdir(root, route.path);
+        } catch (err) {
+          return json(res, 400, { error: (err as Error).message });
+        }
+        try {
+          let st = await stat(abs);
+          if (st.isDirectory()) {
+            abs = resolveInWorkdir(root, route.path.replace(/\/?$/, "/") + "index.html");
+            st = await stat(abs);
+          }
+          if (!st.isFile()) return notFound(res, "Not a file");
+          if (st.size > FILE_PREVIEW_MAX_BYTES) {
+            return json(res, 413, {
+              error: `文件过大：${(st.size / 1_000_000).toFixed(1)}MB 超过 ${(FILE_PREVIEW_MAX_BYTES / 1_000_000).toFixed(0)}MB 预览上限`,
+            });
+          }
+          let body = await readFile(abs);
+          const name = basename(abs);
+          const type = siteContentTypeOf(name);
+          if (type.startsWith("text/html")) {
+            const text = body.toString("utf8");
+            const looksLikeDeck = /\bslide\b[\s\S]{0,120}data-slide|data-slide[\s\S]{0,80}\bslide\b/i.test(text);
+            body = Buffer.from(
+              appendSiteHooks(text, {
+                deck: route.deck || looksLikeDeck,
+                inspect: route.inspect,
+                print: route.print,
+              }),
+              "utf8",
+            );
+          }
+          res.writeHead(200, {
+            "Content-Type": type,
+            "Content-Length": String(body.length),
+            "Content-Disposition": `inline; filename*=UTF-8''${encodeURIComponent(name)}`,
+            "Cache-Control": "no-store",
+            "Content-Security-Policy": SITE_PREVIEW_CSP,
+            "X-Content-Type-Options": "nosniff",
+          });
+          res.end(body);
+          return;
+        } catch {
+          return notFound(res, `Site asset not found: ${route.path}`);
+        }
+      }
+
+      /**
+       * 整站 ZIP：以入口 HTML 所在目录为根打包（圈禁 run workdir）。
+       */
+      case "siteZip": {
+        const run = runs.get(route.runId);
+        if (!run) return notFound(res, `Run not found: ${route.runId}`);
+        const root = run.workdir ?? workdir;
+        let abs: string;
+        try {
+          abs = resolveInWorkdir(root, route.path);
+        } catch (err) {
+          return json(res, 400, { error: (err as Error).message });
+        }
+        try {
+          let st = await stat(abs);
+          if (st.isDirectory()) {
+            abs = resolveInWorkdir(root, route.path.replace(/\/?$/, "/") + "index.html");
+            st = await stat(abs);
+          }
+          if (!st.isFile()) return notFound(res, "Not a file");
+          const dir = dirname(abs);
+          const entries: { name: string; data: Buffer }[] = [];
+          let total = 0;
+          const maxFiles = 200;
+          const maxBytes = 20_000_000;
+
+          async function walk(current: string, prefix: string): Promise<void> {
+            const kids = await readdir(current, { withFileTypes: true });
+            for (const kid of kids) {
+              if (entries.length >= maxFiles) throw new Error("too many files");
+              const childAbs = join(current, kid.name);
+              const childName = prefix ? `${prefix}/${kid.name}` : kid.name;
+              if (kid.isDirectory()) {
+                if (kid.name === "node_modules" || kid.name === ".git") continue;
+                await walk(childAbs, childName);
+                continue;
+              }
+              if (!kid.isFile()) continue;
+              const data = await readFile(childAbs);
+              total += data.length;
+              if (total > maxBytes) throw new Error("archive too large");
+              entries.push({ name: zipEntryName(childName), data });
+            }
+          }
+
+          await walk(dir, "");
+          if (entries.length === 0) return notFound(res, "Empty site directory");
+          const zip = buildStoreZip(entries);
+          const zipName = `${basename(dir) || "site"}.zip`;
+          res.writeHead(200, {
+            "Content-Type": "application/zip",
+            "Content-Length": String(zip.length),
+            "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(zipName)}`,
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+          });
+          res.end(zip);
+          return;
+        } catch (err) {
+          const msg = (err as Error).message ?? "";
+          if (msg === "too many files" || msg === "archive too large") {
+            return json(res, 413, { error: msg });
+          }
+          return notFound(res, `Site zip failed: ${route.path}`);
         }
       }
 

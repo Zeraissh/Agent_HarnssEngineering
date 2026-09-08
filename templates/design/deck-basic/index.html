@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Deck basic</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!--
+    幻灯契约（design 包）：
+    - 每一页是 section.slide[data-slide]
+    - data-slide 用稳定短 id（1、2、title…），点评会引用它
+    - 宿主可注入翻页 runtime；本模板自带最小键盘翻页作离线兜底
+  -->
+  <section class="slide is-active" data-slide="1" aria-label="封面">
+    <p class="kicker">Deck basic</p>
+    <h1 class="hero">一页一个主张</h1>
+    <p class="lede">复制本模板，改文案与色板；保持 .slide[data-slide] 结构。</p>
+  </section>
+  <section class="slide" data-slide="2" aria-label="要点">
+    <h2>三点结构</h2>
+    <ul class="bullets">
+      <li>入口必须是可预览的 HTML（相对 CSS/JS）</li>
+      <li>色板写进 DESIGN.md，不要硬编码漂移</li>
+      <li>需要 PPTX 时另交付或后导出——创作源是 HTML</li>
+    </ul>
+  </section>
+  <section class="slide" data-slide="3" aria-label="收束">
+    <h2>收束</h2>
+    <p class="lede">委托方在画布里翻页、点评；你按点评改同一份 HTML。</p>
+  </section>
+  <script src="deck.js"></script>
+</body>
+</html>

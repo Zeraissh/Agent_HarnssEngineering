@@ -1,0 +1,21 @@
+# DESIGN.md（可选品牌契约）
+
+放在任务工作目录根。`design` 包执行者应先读此文件再写 HTML。
+
+## 色板
+
+- background:
+- foreground:
+- muted:
+- accent:
+
+## 字体
+
+- display:
+- body:
+
+## 反模式（不要做）
+
+- 装饰性 emoji 堆砌
+- 外链 CDN 字体/脚本（预览 CSP 会拦；交付应自包含）
+- 把 `.pptx` 当创作源——创作源是 HTML

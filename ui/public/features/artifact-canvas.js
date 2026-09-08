@@ -17,13 +17,12 @@
  *
  * ================= 安全边界（本模块最重要的一段注释） =================
  * 产物是模型生成的**不可信内容**，防线分两层：
- *   - 服务端（ui/server.ts /api/runs/:id/artifact）：CSP
- *     `default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'` +
- *     nosniff——脚本与外链在 HTTP 层已被禁；
- *   - 本模块的 iframe 再加一道 `sandbox="allow-scripts"`：**故意不给
- *     `allow-same-origin`**。给了它，产物脚本就能读宿主的 localStorage、
- *     调同源 /api/*；不给，iframe 是无源（opaque origin）文档，脚本即使
- *     绕过了上面的 CSP 也碰不到宿主。两层独立，各自失效时另一层仍在。
+ *   - 单文件扫一眼（/api/runs/:id/artifact）：CSP 禁脚本；下载仍走此通道；
+ *   - HTML 预览一律整站（/api/runs/:id/site/*）：路径式取件让相对 CSS/JS 可解析，
+ *     CSP 允许同源脚本；点评用 `?inspect=1` 由服务端注入点选钩子（不剥页面脚本）；
+ *   - iframe `sandbox="allow-scripts"`：**故意不给 allow-same-origin**。给了它，
+ *     产物脚本就能读宿主 localStorage、调同源 /api/*；不给则是无源文档，脚本
+ *     即使绕过 CSP 也碰不到宿主。两层独立，各自失效时另一层仍在。
  * 文本类产物（Markdown / 代码 / CSV）一律经 core/markdown.js 与
  * core/highlight.js 渲染——它们遵守「先整体转义，再做变换」纪律，本模块
  * 绝不把产物原文直接塞进 innerHTML。
@@ -36,8 +35,10 @@ import {
   attachImageAnnotator,
   formatImageReview,
   formatReviewComment,
-  injectInspectHook,
   isInspectPick,
+  DECK_READY_MESSAGE_TYPE,
+  DECK_GOTO_MESSAGE_TYPE,
+  DECK_STATE_MESSAGE_TYPE,
 } from "./review-mode.js";
 
 // ---------------------------------------------------------------
@@ -91,7 +92,8 @@ export function artifactRendererKind(path) {
 }
 
 /** 画布顶条的类型徽章文案（与 app.js artifactKindLabel 同族但按渲染器归并） */
-export function rendererKindLabel(kind) {
+export function rendererKindLabel(kind, { deck = false } = {}) {
+  if (kind === "html" && deck) return "幻灯";
   switch (kind) {
     case "html": return "网站";
     case "image": return "图片";
@@ -233,6 +235,20 @@ export function artifactBasename(path) {
   return s.split("/").pop() || s;
 }
 
+/**
+ * 整站预览 URL：路径段编码，保证 HTML 内 `./style.css` 解析到同目录资源。
+ * 与服务端 `sitePreviewUrl` 同口径（前端自包含，不 import 宿主）。
+ */
+export function siteArtifactUrl(runId, path) {
+  const normalized = String(path ?? "")
+    .replace(/\\/g, "/")
+    .replace(/^\/+/, "")
+    .replace(/\/+/g, "/");
+  if (!normalized) return "";
+  const segments = normalized.split("/").map((seg) => encodeURIComponent(seg)).join("/");
+  return `/api/runs/${encodeURIComponent(runId)}/site/${segments}`;
+}
+
 /** 运行中内容自动刷新的防抖间隔：打字机/批处理节拍下一阵写入只触发一次重拉 */
 export const REFRESH_DEBOUNCE_MS = 500;
 
@@ -279,10 +295,10 @@ function renderPreviewErrorCard(body, message) {
  * 「先转义再变换」纪律只有一份，不会两处漂移。
  *
  * @param {HTMLElement} body 渲染容器
- * @param {{ path:string, url:string, fetch:Function|null, isStale?:()=>boolean, inspect?:boolean }} opts
- *   path 只做类型分派与标题；url 是取件地址（圈禁在服务端端点做）；
+ * @param {{ path:string, url:string, siteUrl?:string, fetch:Function|null, isStale?:()=>boolean, inspect?:boolean }} opts
+ *   path 只做类型分派与标题；url 是单文件取件（图/文/下载）；HTML 预览用 siteUrl。
  *   isStale 返回 true 表示调用方已切走，放弃渲染并返回 null。
- *   inspect 仅 HTML：取文本、剥 script、注入点选钩子，用 srcdoc 打开。关着时仍走 src= URL，不 fetch。
+ *   inspect 仅 HTML：同一整站 URL 加 ?inspect=1，由服务端注入点选钩子。
  * @returns {Promise<{ size:number|null }|null>}
  *   读到的字节数（不可得/未读取为 null）；isStale 中途成立时整体返回 null。
  */
@@ -309,36 +325,16 @@ export async function renderPreviewBody(body, opts) {
 
   switch (kind) {
     case "html": {
-      // 沙箱纪律见文件头注释：allow-scripts 但不给 allow-same-origin
-      const note =
-        `<p class="ac-note">HTML 产物在隔离沙箱中渲染；其内部的相对资源引用可能失效，属预期。</p>`;
-      if (!opts.inspect) {
-        body.innerHTML =
-          `<iframe class="ac-frame" sandbox="allow-scripts" referrerpolicy="no-referrer" ` +
-          `src="${esc(url)}" title="${esc(name)}"></iframe>` +
-          note;
-        return { size: null };
-      }
-      body.innerHTML = '<p class="ac-note">正在准备点评模式…</p>';
-      const raw = await fetchText();
-      if (isStale()) return null;
-      if (raw == null) {
-        renderPreviewErrorCard(body, "读取失败——无法进入点评模式。");
-        return { size: null };
-      }
-      const doc = body.ownerDocument ?? document;
-      const iframe = doc.createElement("iframe");
-      iframe.className = "ac-frame";
-      iframe.setAttribute("sandbox", "allow-scripts");
-      iframe.setAttribute("referrerpolicy", "no-referrer");
-      iframe.title = name;
-      // srcdoc 走属性赋值，不进 innerHTML——避免父页解析钩子脚本。
-      iframe.srcdoc = injectInspectHook(raw);
-      const noteEl = doc.createElement("p");
-      noteEl.className = "ac-note";
-      noteEl.textContent = "点评模式：点页面元素后填写意见，会写进输入框。沙箱不含 same-origin。";
-      body.replaceChildren(iframe, noteEl);
-      return { size: new TextEncoder().encode(raw).length };
+      // 一律整站 /site/*；点评只加 ?inspect=1。沙箱纪律见文件头。
+      const frameSrc = opts.siteUrl || url;
+      const note = opts.inspect
+        ? `<p class="ac-note">点评模式：点页面元素后填写意见，会写进输入框。整站资源仍可用；沙箱不含 same-origin。</p>`
+        : `<p class="ac-note">整站预览：相对 CSS/JS 按目录解析。若有 .slide 可翻页。沙箱不含 same-origin。</p>`;
+      body.innerHTML =
+        `<iframe class="ac-frame" sandbox="allow-scripts" referrerpolicy="no-referrer" ` +
+        `src="${esc(frameSrc)}" title="${esc(name)}"></iframe>` +
+        note;
+      return { size: null };
     }
     case "image": {
       body.innerHTML =
@@ -487,12 +483,19 @@ export function initArtifactCanvas(host = {}, env = {}) {
   let renderToken = 0;
   /** 内容更新自动刷新的防抖计时器（noteWrites） */
   let refreshTimer = 0;
-  /** HTML 点评：关着时 iframe 仍走 src=，不 fetch */
+  /** HTML 点评：同一整站 URL 加 ?inspect=1 */
   let inspectOn = false;
   /** 图片画圈：叠一层 canvas，坐标写进输入框 */
   let annotateOn = false;
   /** @type {ReturnType<typeof attachImageAnnotator>|null} */
   let annotator = null;
+  /** 幻灯：iframe 报到后启用翻页 chrome */
+  let deckActive = false;
+  let deckIndex = 0;
+  let deckTotal = 0;
+  let deckSlideId = "";
+  /** @type {{ line:string, slide?:string }[]} */
+  let reviewNotes = [];
 
   // ---- 顶条特征控件（关闭/放大键由外壳提供，这里插中间段）----
   const prevBtn = doc.createElement("button");
@@ -531,6 +534,20 @@ export function initArtifactCanvas(host = {}, env = {}) {
   revealBtn.type = "button";
   revealBtn.className = "btn btn--ghost ac-reveal";
   revealBtn.innerHTML = '<i class="ph ph-folder-open" aria-hidden="true"></i><span>在文件夹中显示</span>';
+  const zipLink = doc.createElement("a");
+  zipLink.className = "btn btn--ghost ac-zip";
+  zipLink.id = "ac-zip";
+  zipLink.hidden = true;
+  zipLink.innerHTML = '<i class="ph ph-file-zip" aria-hidden="true"></i><span>ZIP</span>';
+  zipLink.title = "打包入口 HTML 所在目录";
+  const printLink = doc.createElement("a");
+  printLink.className = "btn btn--ghost ac-print";
+  printLink.id = "ac-print";
+  printLink.hidden = true;
+  printLink.target = "_blank";
+  printLink.rel = "noopener noreferrer";
+  printLink.innerHTML = '<i class="ph ph-printer" aria-hidden="true"></i><span>打印</span>';
+  printLink.title = "新窗口打开并调起打印（可另存为 PDF）";
   const inspectBtn = doc.createElement("button");
   inspectBtn.type = "button";
   inspectBtn.id = "ac-inspect";
@@ -546,9 +563,34 @@ export function initArtifactCanvas(host = {}, env = {}) {
   annotateBtn.setAttribute("aria-pressed", "false");
   annotateBtn.innerHTML = '<i class="ph ph-pencil-simple" aria-hidden="true"></i><span>标注</span>';
   actions.appendChild(downloadLink);
+  actions.appendChild(zipLink);
+  actions.appendChild(printLink);
   actions.appendChild(revealBtn);
   actions.appendChild(inspectBtn);
   actions.appendChild(annotateBtn);
+
+  const deckBar = doc.createElement("div");
+  deckBar.className = "ac-deck-bar";
+  deckBar.id = "ac-deck-bar";
+  deckBar.hidden = true;
+  const deckPrev = doc.createElement("button");
+  deckPrev.type = "button";
+  deckPrev.className = "btn btn--ghost";
+  deckPrev.textContent = "上一页";
+  const deckPos = doc.createElement("span");
+  deckPos.className = "ac-deck-pos";
+  const deckNext = doc.createElement("button");
+  deckNext.type = "button";
+  deckNext.className = "btn btn--ghost";
+  deckNext.textContent = "下一页";
+  deckBar.appendChild(deckPrev);
+  deckBar.appendChild(deckPos);
+  deckBar.appendChild(deckNext);
+
+  const reviewList = doc.createElement("div");
+  reviewList.className = "ac-review-list";
+  reviewList.id = "ac-review-list";
+  reviewList.hidden = true;
 
   function hideReviewPopover() {
     body.querySelector("#ac-review-pop")?.remove();
@@ -564,13 +606,60 @@ export function initArtifactCanvas(host = {}, env = {}) {
     const html = kind === "html";
     const image = kind === "image";
     inspectBtn.hidden = !html;
+    zipLink.hidden = !html;
+    printLink.hidden = !html;
     annotateBtn.hidden = !image;
-    if (!html) inspectOn = false;
+    if (!html) {
+      inspectOn = false;
+      resetDeck();
+    }
     if (!image) annotateOn = false;
     inspectBtn.setAttribute("aria-pressed", inspectOn ? "true" : "false");
     inspectBtn.classList.toggle("is-active", inspectOn);
     annotateBtn.setAttribute("aria-pressed", annotateOn ? "true" : "false");
     annotateBtn.classList.toggle("is-active", annotateOn);
+    paintDeckChrome();
+    paintReviewList();
+  }
+
+  function resetDeck() {
+    deckActive = false;
+    deckIndex = 0;
+    deckTotal = 0;
+    deckSlideId = "";
+    paintDeckChrome();
+  }
+
+  function paintDeckChrome() {
+    deckBar.hidden = !deckActive || deckTotal < 2;
+    if (!deckActive) return;
+    deckPos.textContent = `${deckIndex + 1} / ${deckTotal}${deckSlideId ? ` · ${deckSlideId}` : ""}`;
+    deckPrev.disabled = deckTotal < 2;
+    deckNext.disabled = deckTotal < 2;
+  }
+
+  function paintReviewList() {
+    const visible = reviewNotes.length > 0 && dock.isOpen();
+    reviewList.hidden = !visible;
+    reviewList.replaceChildren();
+    if (!visible) return;
+    const title = doc.createElement("p");
+    title.className = "ac-review-list-title";
+    title.textContent = `本会话点评（${reviewNotes.length}）`;
+    reviewList.appendChild(title);
+    const ul = doc.createElement("ul");
+    for (const note of reviewNotes.slice(-12)) {
+      const li = doc.createElement("li");
+      li.textContent = note.line;
+      ul.appendChild(li);
+    }
+    reviewList.appendChild(ul);
+  }
+
+  function postDeckGoto(payload) {
+    const iframe = body.querySelector("iframe.ac-frame");
+    if (!iframe?.contentWindow) return;
+    iframe.contentWindow.postMessage({ type: DECK_GOTO_MESSAGE_TYPE, ...payload }, "*");
   }
 
   function mountImageAnnotator() {
@@ -653,7 +742,9 @@ export function initArtifactCanvas(host = {}, env = {}) {
     cancel.addEventListener("click", () => hideReviewPopover());
     pop.addEventListener("submit", (event) => {
       event.preventDefault();
-      const line = formatReviewComment(pick.selector, comment.value);
+      const line = formatReviewComment(pick.selector, comment.value, pick.slide);
+      reviewNotes.push({ line, slide: pick.slide ? String(pick.slide) : undefined });
+      paintReviewList();
       host.onAppendReview?.(line);
       hideReviewPopover();
       host.onAnnounce?.("点评已写入输入框");
@@ -667,12 +758,29 @@ export function initArtifactCanvas(host = {}, env = {}) {
   dock.insertHeadControl(posEl);
   dock.insertHeadControl(titleWrap);
   dock.insertHeadControl(actions);
+  // 幻灯条与点评列表挂在 body 上方：用 dock 的 body 父级插在 body 前
+  body.parentElement?.insertBefore(deckBar, body);
+  body.parentElement?.appendChild(reviewList);
 
   // ---- 渲染 ----
   function artifactUrl(path, cacheBust = false) {
     const base = `/api/runs/${encodeURIComponent(runId)}/artifact?path=${encodeURIComponent(path)}`;
     // 运行中自动刷新时破缓存：同一 URL 的 iframe/img 可能吃到旧缓存
     return cacheBust ? `${base}&v=${Date.now()}` : base;
+  }
+
+  function siteUrlFor(path, { cacheBust = false, inspect = false, print = false } = {}) {
+    const base = siteArtifactUrl(runId, path);
+    const q = new URLSearchParams();
+    q.set("deck", "1");
+    if (inspect) q.set("inspect", "1");
+    if (print) q.set("print", "1");
+    if (cacheBust) q.set("v", String(Date.now()));
+    return `${base}?${q.toString()}`;
+  }
+
+  function siteZipUrl(path) {
+    return `/api/runs/${encodeURIComponent(runId)}/site-zip?path=${encodeURIComponent(path)}`;
   }
 
   function setSize(bytes) {
@@ -688,23 +796,27 @@ export function initArtifactCanvas(host = {}, env = {}) {
     const kind = artifactRendererKind(path);
     const url = artifactUrl(path, cacheBust);
 
+    resetDeck();
     nameEl.textContent = artifactBasename(path);
     nameEl.title = path;
-    badgeEl.textContent = rendererKindLabel(kind);
+    badgeEl.textContent = rendererKindLabel(kind, { deck: false });
     posEl.textContent = artifacts.length > 1 ? `${current + 1} / ${artifacts.length}` : "";
     prevBtn.disabled = artifacts.length <= 1;
     nextBtn.disabled = artifacts.length <= 1;
     downloadLink.href = `${artifactUrl(path)}&download=1`;
     downloadLink.setAttribute("download", artifactBasename(path));
+    zipLink.href = siteZipUrl(path);
+    zipLink.setAttribute("download", `${artifactBasename(path).replace(/\.html?$/i, "") || "site"}.zip`);
+    printLink.href = siteUrlFor(path, { print: true });
     setSize(null);
     paintReviewChrome(kind);
     hideReviewPopover();
     dropAnnotator();
 
-    // 渲染主体与文件预览覆盖层共用（renderPreviewBody）——纪律只有一份
     const result = await renderPreviewBody(body, {
       path,
       url,
+      siteUrl: kind === "html" ? siteUrlFor(path, { cacheBust, inspect: inspectOn }) : undefined,
       fetch: fetchImpl,
       isStale: () => token !== renderToken,
       inspect: inspectOn && kind === "html",
@@ -750,6 +862,9 @@ export function initArtifactCanvas(host = {}, env = {}) {
     }
     inspectOn = false;
     annotateOn = false;
+    reviewNotes = [];
+    resetDeck();
+    paintReviewList();
     hideReviewPopover();
     dropAnnotator();
     dock.close();
@@ -779,6 +894,8 @@ export function initArtifactCanvas(host = {}, env = {}) {
 
   prevBtn.addEventListener("click", () => step(-1));
   nextBtn.addEventListener("click", () => step(1));
+  deckPrev.addEventListener("click", () => postDeckGoto({ delta: -1 }));
+  deckNext.addEventListener("click", () => postDeckGoto({ delta: 1 }));
   revealBtn.addEventListener("click", () => {
     const art = artifacts[current];
     if (art) host.onReveal?.(art.path);
@@ -794,23 +911,46 @@ export function initArtifactCanvas(host = {}, env = {}) {
     void renderCurrent();
   });
   win.addEventListener("message", (event) => {
-    if (!inspectOn || !dock.isOpen()) return;
+    if (!dock.isOpen()) return;
     const iframe = body.querySelector("iframe.ac-frame");
     if (!iframe || event.source !== iframe.contentWindow) return;
-    if (!isInspectPick(event.data)) return;
-    showReviewPopover(event.data);
+    const data = event.data;
+    if (data && typeof data === "object" && data.type === DECK_READY_MESSAGE_TYPE) {
+      deckActive = Number(data.total) > 0;
+      deckTotal = Math.max(0, Number(data.total) || 0);
+      deckIndex = Math.max(0, Number(data.index) || 0);
+      deckSlideId = String(data.slide ?? "");
+      badgeEl.textContent = rendererKindLabel("html", { deck: deckActive && deckTotal > 1 });
+      paintDeckChrome();
+      return;
+    }
+    if (data && typeof data === "object" && data.type === DECK_STATE_MESSAGE_TYPE) {
+      deckIndex = Math.max(0, Number(data.index) || 0);
+      deckTotal = Math.max(deckTotal, Number(data.total) || 0);
+      deckSlideId = String(data.slide ?? "");
+      paintDeckChrome();
+      return;
+    }
+    if (!inspectOn) return;
+    if (!isInspectPick(data)) return;
+    showReviewPopover(data);
   });
 
-  // ←/→ 切产物（Esc 归外壳：放大态先还原、停靠态上报关闭）
+  // Alt+←/→ 切产物；裸 ←/→ 在幻灯激活时翻页，否则切产物
   doc.addEventListener("keydown", (event) => {
     if (!dock.isOpen()) return;
-    if (event.key === "ArrowLeft") {
-      event.preventDefault();
-      step(-1);
-    } else if (event.key === "ArrowRight") {
-      event.preventDefault();
-      step(1);
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+    event.preventDefault();
+    const delta = event.key === "ArrowLeft" ? -1 : 1;
+    if (event.altKey) {
+      step(delta);
+      return;
     }
+    if (deckActive && deckTotal > 1) {
+      postDeckGoto({ delta });
+      return;
+    }
+    step(delta);
   });
 
   const api = {

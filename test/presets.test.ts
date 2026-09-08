@@ -40,6 +40,20 @@ describe("domain packs", () => {
     expect(p!.systemPrompt).toMatch(/!\[/);
   });
 
+  it("design 包：HTML 设计台契约 + rubric + 幻灯结构 + 不接 MCP", () => {
+    const p = getPack("design");
+    expect(p).toBeDefined();
+    expect(p!.mcp).toBe(false);
+    expect(p!.verify.mode).toBe("rubric");
+    expect(p!.systemPrompt).toContain(".slide[data-slide");
+    expect(p!.systemPrompt).toContain("DESIGN.md");
+    expect(p!.systemPrompt).toContain("templates/design/deck-basic");
+    expect(p!.systemPrompt).toMatch(/pptx/i);
+    expect(p!.builtinTools).toEqual(
+      expect.arrayContaining(["read_file", "write_file", "bash"]),
+    );
+  });
+
   it("stm32-coding 包：固件工程纪律 + 构建验收 + 不接 MCP（编程阶段不碰硬件）", () => {
     const p = getPack("stm32-coding");
     expect(p).toBeDefined();

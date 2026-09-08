@@ -441,6 +441,33 @@ const KICAD_VERIFY_INSTRUCTIONS = `这是一次【KiCad 设计文件交付】的
 只要有任何一项对不上(违例数与声明不符、网络拓扑与验收不符、库件几何被改),判 passed=false
 并在 issues 里写明:期望什么、实际什么、用什么命令得到。`;
 
+// ————————————————————————— design（OpenDesign 路线） —————————————————————————
+
+const DESIGN_SYSTEM = `你是 HTML 设计台 agent（OpenDesign 路线）：产出真实、可 diff 的 HTML/CSS（可选少量 JS），在委托方宿主里整站预览与点评。
+
+硬契约：
+1. 交付必须有可预览入口：工作目录下的 index.html，或 deck/index.html / docs/index.html 等——但 finish_task.artifacts 必须点名那个入口 HTML。
+2. 资源一律相对路径（./style.css、./deck.js）。禁止依赖外链 CDN 字体/脚本（预览 CSP 会拦，交付也不自包含）。
+3. 动手前先读工作目录根的 DESIGN.md（若存在）：色板、字体、反模式按它执行。没有则用克制的默认色板，并可用 templates/design/DESIGN.md.example 作结构参考。
+4. 多页幻灯必须用 section.slide[data-slide="…"]（data-slide 稳定短 id）。单文件多页优先；参考仓库 templates/design/deck-basic/。落地页参考 templates/design/landing-basic/。
+5. 创作源是 HTML，不是 .pptx/.docx。需要 PowerPoint 时：交付 HTML，并在 summary 说明「PPTX 需后导出」；不要假装生成了可编辑 Office 二进制。
+6. 文件修改用 write_file 整文件写回——工具面没有 edit_file。
+7. 禁止 git 写命令。
+
+把结论落到入口 HTML，并用一两句话总结。用用户使用的语言回答。`;
+
+const DESIGN_VERIFY_INSTRUCTIONS = `这是一次【HTML 设计交付】的核查：
+1. 确认 finish_task / 报告声明的入口 HTML 真实存在；用 ls/glob 核对相对 CSS/JS 是否同目录可解析（不要假设 CDN）。
+2. 若声称是幻灯：抽查是否存在 .slide[data-slide]；缺结构则客观 issues。
+3. 打开 DESIGN.md（若有）与 HTML/CSS：明显违背成文色板/反模式的，写进 issues 或 advisory（主观观感进 advisory）。
+4. 只读核查，不要改文件。`;
+
+const DESIGN_VERIFY_RUBRIC = `主观评分（advisory，不影响 passed）：
+1. 层次：标题/正文/次要信息是否一眼可分？
+2. 自包含：相对资源、无外链刚需？
+3. 品牌：若有 DESIGN.md，观感是否贴合？
+4. 幻灯节奏：每页是否一个主张，而非墙字？`;
+
 export const PACKS: Record<string, DomainPack> = {
   "stm32-debug": {
     name: "stm32-debug",
@@ -672,6 +699,24 @@ export const PACKS: Record<string, DomainPack> = {
      * 与核查/计划预算的关系不变（verify 15、plan 20 均远低于它）。
      */
     guardrails: { maxTurns: 70 },
+  },
+
+  design: {
+    name: "design",
+    description:
+      "HTML 设计台（OpenDesign 路线）：落地页 / 多页幻灯等真实 HTML+CSS，沙箱整站预览与点评；不接 Office 二进制编辑器",
+    systemPrompt: DESIGN_SYSTEM + RULE_PRECEDENCE_DISCIPLINE + PRESENTATION_DISCIPLINE + PROGRESS_DISCIPLINE,
+    builtinTools: ["bash", "read_file", "write_file", "glob", "grep", "generate_image"],
+    mcp: false,
+    verify: {
+      enabled: true,
+      mode: "rubric",
+      instructions: DESIGN_VERIFY_INSTRUCTIONS,
+      rubric: DESIGN_VERIFY_RUBRIC,
+      readOnlyCommands: ["ls", "find", "grep", "rg", "wc", "head", "file"],
+      maxTurns: 20,
+    },
+    guardrails: { maxTurns: 40 },
   },
 };
 

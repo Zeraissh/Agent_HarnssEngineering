@@ -2,11 +2,16 @@
 import { describe, expect, it } from "vitest";
 import {
   INSPECT_MESSAGE_TYPE,
+  INSPECT_HOOK_SOURCE,
+  DECK_READY_MESSAGE_TYPE,
+  PRINT_HOOK_SOURCE,
   appendReviewToInput,
   buildCssSelector,
   formatReviewComment,
   formatImageReview,
   injectInspectHook,
+  appendInspectHook,
+  appendSiteHooks,
   isInspectPick,
   pathLength,
   pct,
@@ -21,8 +26,9 @@ describe("buildCssSelector / formatReviewComment", () => {
     expect(buildCssSelector({ tag: "li", nth: 2, parent: "ul.nav" })).toBe("ul.nav > li:nth-of-type(2)");
   });
 
-  it("点评行是纯文本，可接到已有输入后面", () => {
+  it("点评行是纯文本，可接到已有输入后面；可带 slide", () => {
     expect(formatReviewComment("h1.hero", "对比度不够")).toBe("[点评] h1.hero: 对比度不够");
+    expect(formatReviewComment("h1.hero", "对比度不够", "3")).toBe("[点评][slide:3] h1.hero: 对比度不够");
     expect(formatReviewComment("  ", "")).toBe("[点评] (未识别)");
     expect(appendReviewToInput("先改首页", "[点评] h1: 太大")).toBe("先改首页\n[点评] h1: 太大");
     expect(appendReviewToInput("", "[点评] h1: 太大")).toBe("[点评] h1: 太大");
@@ -30,7 +36,7 @@ describe("buildCssSelector / formatReviewComment", () => {
 });
 
 describe("inspect hook 注入", () => {
-  it("剥掉原页面 script，再注入点选钩子", () => {
+  it("injectInspectHook：剥掉原页面 script，再注入点选钩子", () => {
     const html = "<html><body><h1>Hi</h1><script>alert(1)</script></body></html>";
     expect(stripScripts(html)).not.toContain("<script>alert");
     const hooked = injectInspectHook(html);
@@ -38,6 +44,35 @@ describe("inspect hook 注入", () => {
     expect(hooked).toContain(INSPECT_MESSAGE_TYPE);
     expect(hooked).toContain("parent.postMessage");
     expect(hooked).toMatch(/<\/script><\/body>/i);
+  });
+
+  it("appendInspectHook：保留页面脚本（整站点评）", () => {
+    const html = "<html><body><h1>Hi</h1><script>window.__keep=1</script></body></html>";
+    const hooked = appendInspectHook(html);
+    expect(hooked).toContain("window.__keep=1");
+    expect(hooked).toContain(INSPECT_MESSAGE_TYPE);
+  });
+
+  it("appendSiteHooks：可叠 deck + inspect", () => {
+    const html = "<html><body><section class=\"slide\" data-slide=\"1\">A</section></body></html>";
+    const hooked = appendSiteHooks(html, { deck: true, inspect: true });
+    expect(hooked).toContain(DECK_READY_MESSAGE_TYPE);
+    expect(hooked).toContain(INSPECT_MESSAGE_TYPE);
+    expect(hooked).toContain("closest");
+  });
+
+  it("点评钩子含悬停外描边；点击后短暂固定（pinUntil）", () => {
+    expect(INSPECT_HOOK_SOURCE).toContain("agent-inspect-ring");
+    expect(INSPECT_HOOK_SOURCE).toContain("getBoundingClientRect");
+    expect(INSPECT_HOOK_SOURCE).toContain("mousemove");
+    expect(INSPECT_HOOK_SOURCE).toContain("pointer-events:none");
+    expect(INSPECT_HOOK_SOURCE).toContain("pinUntil");
+  });
+
+  it("print 钩子调起 window.print", () => {
+    expect(PRINT_HOOK_SOURCE).toContain("window.print");
+    const hooked = appendSiteHooks("<html><body>x</body></html>", { print: true });
+    expect(hooked).toContain("window.print");
   });
 
   it("只认本协议的 postMessage", () => {
