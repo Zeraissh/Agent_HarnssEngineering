@@ -1,0 +1,247 @@
+---
+description: 'Agent_Design 真实任务案例待办队列 + 实战纪律 + 方向——跨会话交接用,开工前必读' (Claude Code memory)
+alwaysApply: true
+---
+
+<!-- Synced from Claude Code memory on 2026-09-01 -->
+
+---
+name: real-task-backlog
+description: "Agent_Design 真实任务案例待办队列 + 实战纪律 + 方向——跨会话交接用,开工前必读"
+metadata: 
+  node_type: memory
+  type: project
+  originSessionId: f3aaa253-c0e9-4a8d-987d-52bf8013b3ce
+  modified: 2026-08-10T01:03:14.272Z
+---
+
+# 真实任务案例待办（2026-08-06 更新,按优先级）
+
+1. ~~stm32-gdb-mcp 需求 #2(ST-Link 垃圾读数观察项)~~ **已结案(2026-08-06,真机取证)**
+   ——**根因与并发无关,是 ELF↔板上固件错配**:板跑用户 Keil 版 telemetry,agent 加载
+   我方 arm-gcc ELF 符号(两者前 460B 中 402B 不同=87.4%,向量表 SP/reset 全异),
+   于是按我方符号解析到 0x20000004 读出 0x00000000,而期望 TELM=0x54454C4D
+   → verifier 据此判"未编程"。逐条排除:①halted 读数逐字节稳定(flash/RAM 各 3 次全同);
+   ②运行态读内存被 GDB **硬拒绝**(不返回垃圾);③同探针二次会话在 USB 层干净失败。
+   **需求 #3 已实施并发布**(PR #49 已合并,含在 v0.8.1 里):
+   新增非抛出的 compare_sections_report(){checked,mismatched,reason,records};
+   load_symbols 响应加 symbols_match(true/false/null)+mismatched_sections,不匹配
+   给显著告警并建议 flash_firmware/verify_flash,但【调用仍成功】(给未烧录的板加载
+   符号是合法用法);autoload_symbols 无响应载体故记 WARNING 日志;verify_flash 复用
+   同一解析、抛出语义不变、并保留比对记录作证据。923 passed(+7)/ruff/mypy 全绿。
+   **真机验证就在案发现场完成**(L151 跑 Keil 构建 + 加载 arm-gcc ELF):
+   .isr_vector 与 .text 两段全部 MIS-MATCHED 被标出,load_symbols 仍成功返回。
+   分工:harness(python-coding 包)出实现+4 测试;委托方审出两处缺口并补齐——
+   verify_flash 重构后丢了 compare 记录(证据从 raw_response 消失)、缺解析器直测。
+   **发布缺口已关闭**:探针锁与符号校验此前都只在 main 上未发布(v0.8.0 之后合并);
+   已发 **v0.8.1**(2026-08-06,tag+GitHub release 均已创建,线上 Latest;插件版本
+   0.4.0→0.4.1)。历史注记:v0.8.0 曾合并进 main 但从未打 tag/发 release,其内容已含在
+   0.8.1 中,按用户决定不补历史 tag。**用户仍需 `claude plugin update
+   stm32-debug-kit@zeraissh-stm32` 并重开会话,这两项才在 Claude Code 侧生效**。
+   (~/.codex/runtimes/stm32-gdb-mcp-0.6.0 的几十个进程是 **Codex CLI 的**,父进程
+   codex.exe,与 Claude Code 无关;顺带:那是个僵尸农场,可择日清理。)**锁是协作式的**:实测"带锁进程 vs 不带锁持有者"→ 检测不到冲突照常取锁
+   → 撞到 OpenOCD 的 LIBUSB_ERROR_ACCESS,退化成 probe_busy(retryable=true,重试
+   3 次),正是案例 #3 的原始形态。
+2. **弱模型核查研究**:等用户在 eval/lab-profiles.json 的 qwen-cloud 填 key
+   (SiliconFlow openai 协议,模型名待确认)即可复活;rubric-verifier 落地后
+   可加"弱执行者+rubric 核查"新臂。
+3. **UI v2 重做进行中(案例 #7 续,任务书源 ui/remediation-v2.md,关闭表
+   ui/remediation-v2-status.md)**:v1 整改(R-01~R-08 / AC-01~AC-10)全部关闭
+   且在 v2 中持续有效(回退即 v2 不通过);仅剩 NVDA 真实听感人工过一遍,非阻断。
+   **v2 已完成 R0-R2**(4cc3367 正确性 / 9f08c9f 数据面,225→256 测试):
+   段终止与 run 终止分离修返工死锁、审批决策进事件流、stopReason 六值、
+   SSE 断点续传、pack 核查三件套装配、executionUsage 成本口径、逐轮裁决。
+   **待办 R3 细粒度渲染 → R4 四决定因素新 IA → R5 视觉语言(Claude 风格温暖
+   纸面+双主题,陶土须用 #B0522F,#C15F3C 过不了 4.5:1) → R6 收尾**。
+   **依赖漏洞已全部清零(0243232 + 7c8ae75)**:先 npm audit fix 非破坏性修
+   2 high + 4 moderate(fast-uri/ip-address 来自 mcp-sdk 树);再做
+   @anthropic-ai/sdk 0.90→0.115 大版本升级关闭最后一条 moderate。
+   **npm audit 现为 total 0**。
+4. **主观领域案例可继续**:rubric-verifier(f0a307e)已实战两轮;UI 整改证明
+   "委托方正式报告当判据"比 rubric 更强——可给 python-coding/kicad 包补
+   rubric 维度,或找纯主观任务(文案/README)再试。
+5. (远期)华秋 KiCad 构建更新后,凭档案复测 MCP 创作面是否修复;
+   真实板子需求可随时开新案例(#9 起,kicad 包已可产)。
+
+6. **案例 #8 已完成(2026-08-07,docs/cases/case-08-crc-selfcheck-hil.md)**:
+   STM32L151 镜像自校验固件,真机跨域(stm32-coding→stm32-debug),
+   Web 宿主 mode=plan + **计划确认门首次用于真实高风险交付**。
+   **s1 通过/s2 未通过**:6 条验收 4 过、AC5 CRC 读出 0 失败、AC6 连带失败。
+   **根因(真机取证 + 受控实验证实)**:`RCC_AHBENR_CRCEN (1u<<6)` 是 STM32F1
+   的位号,**STM32L1 的 CRCEN 在 bit 12**;L1 上 bit6 未实现,写入被硬件丢弃
+   (RCC_AHBENR 读回 0x00008000 只有 FLITFEN 可证),CRC 外设无时钟 →
+   CRC->DR 恒读 0。只改这一个位号重烧 → 设备算出 0x7189AAB5,与委托方独立
+   参考实现分毫不差 → **agent 的 CRC 设计整体正确,唯一缺陷是芯片系列常量**。
+   **板上现为受控实验版固件(CRC 正常)**;实验前备份在
+   D:\Work\scratch\case08-backup-20260807(双转储 SHA256 一致 + RESTORE.md)。
+   交付物 D:\Work\scratch\case08-crc-selfcheck(原样未修)、
+   受控实验 case08-confirm-bitfix、独立 CRC 参考 case08-crc-selfcheck-ref。
+   **产出需求见 docs/06-backlog.md 第九节**,最高优先是 9.1 核查预算不可按
+   领域覆盖(VERIFIER_MAX_TURNS=15 写死;硬件域装不下,两轮 verifier 都跑满
+   15 轮从未写出裁决 → fail-closed;而它当时已经嗅到真缺陷正在追查)。
+
+7. **案例 #9 已交付(2026-08-10,L151 调试底板,十三发实弹)**:
+   ERC 0/DRC+parity 0/网表≡验收基线,板框 53×33mm,gerbers+preview 齐备。
+   交付区 D:\Work\scratch\case09-l151-debug-carrier-20260809(未入 git,处置归用户);
+   快照 case09-snapshot-schfixed-20260810;各败局归档 case09-attempt{3,4,6}-archive。
+   **核心发现全记录在 docs/06-backlog.md D5 系列**:三条几何缝(布网/布线/排版,
+   前两条已用"按名成网"与"曼哈顿分层"规则化,已进或待进 kicad 包)、判据可博弈
+   两面(severity 操纵做绿/自设中间标准判死)、verifier 凭记忆断基线+采信自首、
+   GUI 观测改写工程文件(正解:preview 随交付走)、网表不变性判据抓电气漂移。
+   **待办:case-09 文档、kicad 包三条新纪律提名、委托方终审 preview/。**
+8. **案例 #10 已交付(2026-08-09,Juice Breakout 面试 demo 级打砖块)**:
+   30 轮一发过 + 键盘仲裁返工一发过;输入仲裁纯状态机进 core;26 测试;
+   交付区 D:\Work\scratch\case10-juice-breakout-20260809。快判官(node:test 秒级)
+   vs 粗判官(ERC 不管布网)的对照写照。待办:委托方复验手感、后续打磨轮。
+
+10. **案例 #11 已交付(2026-08-10~17,L151 最小系统→蓝药丸式开发板,三提交入仓)**:
+   交付区 D:\Work\scratch\case11-l151-minsys-20260810(v6 PCB + JLC gerber + preview/),
+   快照 case11-snapshot-s1-accepted。**KiCad PCB 工作一律从 `eval/kicad-host-kit` 起步**
+   (README 三条硬纪律:拆/算/落板分进程;拆线前想 GND 缝合 via;判据先写)。
+   环境:freerouting 2.3.0 在 D:\Work\tools\freerouting(JRE 25 便携,userdata\freerouting.json
+   headless 配置;同目录 .rules 会弹窗)。快照/交接**必须 pcb+pro+sch 三件**——规则活在 .kicad_pro。
+   待办:kit 收成包内 agent 工具;委托方决定是否继续压 via(81→80)/孤岛。
+
+9. **视觉核查暂由宿主(Claude)代行(2026-08-10 委托方指定,VLM 就绪前有效)**:
+   verifier 侧接线已完成(describe_image 进 kicad 包+审批门口子,808 单测),
+   但 DeepSeek 端点实测不认图、kimi 被代理挡——激活前,**每次 kicad 跑后
+   宿主必做视觉复核**:`.\eval\host-visual-review.ps1 <工作目录> <工程名>`
+   一键出双判官+原理图 PDF+3D 渲染,宿主亲读(Read 工具读得了 PDF/PNG),
+   按包核查方法第 6 条的证据等级出结论(可数事实→缺陷,观感→建议)。
+   端点就绪后跑 `node eval/probe-vision.mjs <baseURL> <model> <key>` 判定
+   (模型答出"红"才算真看见),然后 AGENT_VISION_MODEL 三件套激活,宿主退位。
+
+# KiCad 环境档案(案例 #5 沉淀,复测/续作用)
+
+- KiCad 10.0.1 华秋定制构建 @ D:\KiCad;kicad-cli/eeschema/pcbnew 在 bin;
+  官方库 D:\KiCad\share\kicad\{symbols,footprints,demos}。
+- **MCP 创作路线判死(2026-08-05)**:落盘矩阵=drawMultiWire ✔,place/create 族
+  全部"ok 但文档不变",查询族返回空;登录(token 4→371B)/DLL api 名齐全/窗口激活+
+  用户肉眼三嫌疑全证伪。kicad-mcp 源码 D:\KiCad\bin\kicad-mcp(.venv),协议
+  pynng ipc://kicad_sdk_pair-<pid>-<editor>。用户 ~/.claude.json 注册已修复。
+- **文件路线已验证可产**:kicad 领域包(cc0a4dd)+AGENT_READ_ROOTS=D:\KiCad\share\kicad;
+  判官 kicad-cli sch erc / pcb drc --schematic-parity --exit-code-violations;
+  格式硬结构=lib_symbols 嵌入+符号实例 (instances) 段(缺则网表空),任务书必须带
+  结构契约+demo 范本指针(ecc83-pp.kicad_sch/.kicad_pcb)。
+- 交付物:D:\Work\scratch\kicad-swd-adapter-20260805(SWD 转接板全套+HANDOFF+gerbers,
+  可直接打样,未入 git,处置归用户)。
+
+已完成:案例 #4 探针锁——PR #48 **用户已审并合并**(stm32-gdb-mcp main@1e2ec81,
+本地已同步、特性分支已删;HANDOFF-PROBE-LOCK.md 使命已尽可删,案例 #1 的 examples/
+仍留本地待用户处置);裁决 summary 浮出宿主(c1a7144);案例 #5 KiCad SWD 转接板
+(b6c60d1);案例 #6 研究总结 docs/05-findings.md(e00b7e7,418 行八主题);
+案例 #7 Web 宿主 UI 全案闭环(3013eb3,建设两阶段+整改五轮+依赖归零)。
+
+# 实战纪律（血泪浓缩,真机操作前默诵）
+
+- **备份-实验-恢复三段式**:实验前双转储比对 SHA256;恢复用 openocd `program`
+  命令(该构建的 `flash write_image` 会静默中断);恢复后全片重转储对哈希。
+  (案例 #4 类不碰 Flash 的 HIL 可免备份,但事后必须零残留:进程+锁文件双查。)
+- **开会话必关**:自己手工开的调试会话(如取证用)用完立即 stop——案例 #3 轮3
+  就是我遗留的 hypo 会话攥着探针害的。停后台任务必验证进程死透(taskkill /T)。
+- **硬件不可达先查嫌疑人顺序**:①占用进程(openocd/Keil/别的 MCP 实例)
+  ②僵尸(见 [[windows-taskstop-node-zombie]]) ③物理线(SWDIO/SWCLK/GND)。
+  Keil 开着工程就独占 ST-Link。**探针锁落地后**:先看错误里的 "held by PID x"。
+- **探针/板配置(交接时)**:A 板←ST-Link(interface/stlink.cfg),B 板←DAPLink
+  (interface/cmsis-dap.cfg,Horco 序列号 132765404453),均 STM32L151 Cat.3
+  (dev_id 0x427)。板上现为用户 Keil 自编译 telemetry。备份区
+  D:\Work\scratch\dual-probe-20260804\backup。MCP 命名会话+自动端口分配可靠。
+- **SDK 升级纪律(2026-08-06 立)**:@anthropic-ai/sdk 已在 0.115(跨大版本零代码
+  改动)。单测全用 FakeModelClient**不碰真实 wire**,故升 SDK 后必须跑三条真机
+  冒烟:①Anthropic wire+compat(DeepSeek 主路径)②OpenAI wire ③verifier 三值裁决;
+  MCP SDK 变动另加活连通冒烟(拉起 server 列工具)。**未覆盖项**:原生 Anthropic
+  非 compat 路径(thinking adaptive + output_config.effort 真实发送)本机无 key
+  无法验,拿到 key 后应优先冒烟。effort 'max' 档已加(3013eb3),配 AGENT_EFFORT
+  旋钮(非法值退出码 1,compat 下给提示);同 commit 补了 test/anthropic-client.test.ts
+  ——此前 220 测试全用 FakeModelClient,**L0 请求构造契约(compat 剥离/非 compat
+  发送)零覆盖**,这是升级窗口暴露的真缺口。
+- **模型选型**:执行/核查用 deepseek-v4-pro(key 在用户级环境变量 ANTHROPIC_API_KEY,
+  进程不继承需从 User 域读;端点 https://api.deepseek.com/anthropic);快实验用 flash;
+  本地 qwen 已退役仅 smoke:local。
+- **外部项目跑 harness 的调用式**(案例 #4 定型):cwd 切到目标仓库(工具圈禁根),
+  `node <harness>/node_modules/tsx/dist/cli.mjs <harness>/src/cli.ts "$(cat 任务书)" --yes`;
+  AGENT_MCP_CONFIG 指向不存在文件关 MCP;AGENT_MEMORY_DIR 指回 harness 的 .agent-memory。
+  PowerShell here-string 传 git commit -m 会被撕,提交信息一律 Write 文件 + `git commit -F`。
+
+# Harness 设计定论（已数据背书,别再重新发现）
+
+- 修环境 > 提示词 > 事后核查;提示词只在【决策歧义点】有效(rule-precedence
+  7/10→10/10),打能力/环境缺口无效(prompt-hint 证伪)。
+- 失败形态即证据;先排除 harness 自身缺陷,再谈策略优劣;REPS=2 一律视为待复现。
+- verifier:核查者≥执行者是稳妥默认(非硬前提);主场=能力边界的语义错误;
+  只覆盖"完成但错";裁决按字面(verdict-side rule-precedence 已落地)。
+  **核查白名单是返工经济性问题**(案例 #4):verifier 取证能力不足时,fail-closed
+  会把"查不了"错判成"没做对",烧整轮空转返工——fail-closed 第三种误伤形态。
+- 连接层白名单(mcp.json includeTools)=各包需求的**并集**(能力信任边界),
+  包层做领域收窄——交集陷阱已坑过一次(1bcc567)。
+- 编排:三角(planner→executor→verifier)+DAG 并行(cap=3)+资源标签
+  (包级+子任务级覆盖);跨领域才值得拆,单领域单产物任务 planned 是纯开销;
+  实测并行节省 34-50%。跨进程资源锁:编排器内有互斥,**进程间由 stm32-gdb-mcp
+  探针锁兜底(案例 #4 落地)**。
+- 工具运行时完整性是地板的地板:cmd 冒充 bash(已修)→ bash 缺 coreutils 看父进程
+  脸色(案例 #4 修,bashTool 自带 Git usr/bin 上 PATH)。
+
+# 方向（用户认可的演进路线）
+
+双线飞轮:真实任务产需求 → harness 消化,全部落地(案例 #1 产 3 项、#3 产 3 项、
+#4 产 2 项 python-coding 包+bash coreutils 修复、#5 产 2 项 kicad 包+只读根、
+#6 产 rubric-verifier 设计种子、#7 产 4 项 ts-coding 包+白名单引号修复+依赖归零+
+L0 契约补测)。
+远期:"一人公司"形态——人上移为定义任务/验收标准/担责(onPlan 即签字位),
+可程序化核查环节 agent 自治;rubric-verifier 补主观领域;多 agent 并行已就绪。
+仓库 main @ 3013eb3,https://github.com/Zeraissh/Agent_HarnssEngineering.git,
+版本 1.0.0+,**225 单测,npm audit total 0**,案例 #1~#7 已归档 docs/cases/,
+研究总结 docs/05-findings.md,Web 宿主 UI 在 ui/(含委托方整改基线与关闭状态表)。
+
+## 2026-08-08 收工状态（下一轮从这里接）
+
+HEAD `8caed16`，**758 单测 / 22 文件**，工作树干净。当日 24 个提交，
+主题是**委托方界面反馈四步**：对话主干化 → 产物清单 → 装配状态条 →
+低切换成本三件套（停止按钮 / 常驻放行 / 会话标题 / 空态示例）。
+
+**交接清单已写进 `docs/06-backlog.md` 的第一屏**（"交接：从这里接着做"），
+含环境状态、开工前必看三条、按优先级排的开放项与每条的第一步动作。
+**下一轮开工先读那一节，不要凭记忆开工。**
+
+环境要点：`.env` 已配好（deepseek 兼容端点），`npm run ui/cli/eval` 自动读；
+但**进程环境变量压过 .env**，启动看到冲突告警要先清掉那个变量。
+Web 宿主在 4173（委托方自己起的），改 `src/**` 或 `ui/server.ts` 要重启，
+而**重启会丢掉全部运行历史**（内存 Map，已记入 backlog）。
+
+还开着的（详见 backlog 第一屏）：§2.1 等样本（**台账里带核查的运行是 0 次，
+所以裁决样本是 0 不是 16**——以后跑任务记得开核查）、9.9 等第二次出现
+（只有 CLI + 领域包那条路能产生）、NVDA 听感、
+运行历史不落盘（B2,下一个大件）、AC2-11 只量了日志面。
+**推荐下一步：开案例 #9**（跨领域交接
+只被案例 #8 验过一次；且真实运行会自动攒 §2.1 的样本）。
+
+## 2026-08-09 增量（已并回 main 并推 GitHub,origin/main @ 60c080e,**776 单测 + tsc 全绿**）
+
+本会话三个提交(变基后 SHA):f62ee3e 修台账 stopReason 的 "[object Object]"
+(口径提成 plannedStopReason,CLI/Web 共用一个定义);8f3617e **B1 终止原因
+口径收口**(事实源=src/types.ts STOP_REASONS 九值,类型层"loop⊆全集"锁 +
+ui-app 三条逐值一致锁,均变异验证;顺带修出 plan_gate_expired 从未触发的
+**潜伏**缺陷——expired 唯一触发是宿主关停,今天不可观测,B2 落盘后浮出水面,
+已提 planGateStopReason 纯函数钉住);60c080e B2b backlog 补标注。
+
+**B0 撞车(教训,下次开工前默诵)**:本会话在 worktree 里独立实现了一遍 B0,
+提交后合并时才发现 2026-08-08 23:50 另一会话已在 main 落了**更全**的实现
+(dbe3467:七个变异、UI 四处渲染锁、预算跨包取最大、planner recovery 追踪;
+**生效口径:env 名 AGENT_PLAN_MAX_TURNS、包字段 plan.maxTurns、失败摘要字段
+failureSummary/plannerFailure**)。我的重复实现(原 cd740c7,reflog 可查)整体
+弃用,无一处值得嫁接——他们的解耦测试用"数总调用次数=12+2"钉,天然免疫我
+发现的误绿形态。**规矩:worktree 开工前先对照 main 最新提交;交接队列上的
+条目动手前先查是否已被别的会话做掉。**
+
+杂项教训:变异测试后用 `git checkout --` 恢复会把**未提交**改动一并冲掉
+(types.ts 因此重写过一次)——脏文件上的变异要用反向 sed 或 stash 恢复。
+历史 .agent-runs.jsonl 里已写入的 "[object Object]" 行不回改,读数按脏值处理。
+
+**B2 已收口(ddcc18a,已并回 main 并推 GitHub,origin/main 同步)**:运行历史落盘,
+ui/history.ts + 宿主接线。四问判据:①meta/events/transcript 三文件分存,
+活对象不存;②.agent-run-history/<runId>/ 每 run 一目录(AGENT_RUN_HISTORY_DIR
+移根,注入 modelClient 默认不存——仪器纪律同台账);③保最近 50 个
+(AGENT_RUN_HISTORY_KEEP),修剪必须排在 run 自己的写入链上(fire-and-forget
+会与 meta 写赛跑漏剪,实测抓到);④归档明确不能续跑且到处照实说(archived
+标志,崩溃档案按 error 归档+合成 run_end)。784 单测全绿,变异验证两处。
+**宿主重启丢历史的时代结束——委托方 4173 那台重启升级不再二选一。**

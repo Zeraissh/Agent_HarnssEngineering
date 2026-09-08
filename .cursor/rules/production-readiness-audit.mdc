@@ -1,0 +1,29 @@
+---
+description: 2026-08-24 九维生产就绪度审计结论：唯一 blocker 是生产件全部未提交（CI 零运行、零 tag、零 registry），另有约 14 条 high 集中在执行面安全/监控闭环/成本防线/数据落盘 (Claude Code memory)
+alwaysApply: true
+---
+
+<!-- Synced from Claude Code memory on 2026-09-01 -->
+
+---
+name: production-readiness-audit
+description: 2026-08-24 九维生产就绪度审计结论：唯一 blocker 是生产件全部未提交（CI 零运行、零 tag、零 registry），另有约 14 条 high 集中在执行面安全/监控闭环/成本防线/数据落盘
+metadata: 
+  node_type: memory
+  type: project
+  originSessionId: 516906b8-b27b-4449-8106-99c065b54cb1
+  modified: 2026-08-25T08:36:58.887Z
+---
+
+2026-08-24 对 [[agent-design-harness-project]] 做了九维并行生产就绪度审计（部署/安全/可靠性/harness 核心/CI 发布/多用户 API/客户端/数据治理 + 完整性评审），每条差距均有文件:行号证据。
+
+**总裁决**：工程内功远超同类自研（fail-closed 启动、健康三端点、优雅关停、预算并发记账、1039 离线单测全绿全部实地兑现），但按"单操作员生产"口径仍有一条 blocker + 约 14 条 high。
+
+**唯一 blocker ✅ 已修（2026-08-24 当日）**：生产件三个提交入库（848575d cross-app / ddedd2d 生产件+harness 波 / 6e526f9 平台形状测试修复），CI 在 GitHub 首次真实跑绿（core/desktop-shell/container 三 job）。首跑抓出两条"本机 Windows 绿、ubuntu 红"的平台形状测试（tools.test.ts 写死 C:\ 形状、ui-server reveal 断言跟宿主平台走），已改平台无关并三平台 stub 钉死。**发布链亦已闭环（同日）**：release workflow（tag 触发完整门禁→推 GHCR→Release 记录 digest）+ 首个发布 v1.1.0 全绿，镜像 ghcr.io/zeraissh/agent-harness@sha256:92c60fda…（digest 在 GitHub Release v1.1.0 正文）；生产 compose 已弃本地 build 改 AGENT_IMAGE 必填 digest 引用，runbook 三处同步。PS 5.1 坑：给原生命令传含 ASCII 双引号的参数会被劈开——commit message 一律 `git commit -F <文件>`。同日视觉激活：deepseek-v4-flash-vision-exp 过双色对照探针 + describe_image 端到端（harness 装配路径），.env 已配 AGENT_VISION_MODEL，backlog 记录宿主代行退位。仪器坑第三次现身：agent 会话 shell 继承 ANTHROPIC_BASE_URL=api.anthropic.com 压过 --env-file，测试端点必须显式设 env。
+
+**high 主题**（细节见当日会话汇总；①⑥⑦部分已修，见下）：① ✅ 已修（1653b7b，三锁+变异验证）：bash 子进程 sanitizeChildEnv 按名剥密钥（AGENT_BASH_KEEP_ENV 显式放行）、read_file 对 .env*/.npmrc/.netrc/id_rsa*/*.pem fail-closed（.example/.sample 放行，credentialLikeName in fs-util）、启动横幅 accessHintLine 只打占位符不打令牌本体；② ✅ 已修（939be6e + 评审回收 4d6c357）：AgentHarnessDown（up==0/absent，scrape job 必须名为 agent-harness）、runs_finished 加 outcome 六档标签（RUN_OUTCOMES 唯一事实源+类型锁）、RunErrorRatio 告警、5xx 序列预注册（rate 首爆盲区）、全部告警选择器统一 job 限定、compose 日志轮转 50m×5；三条测试锁含告警-指标一致性全名比对。双镜头评审（PromQL+代码）抓出一条真缺陷：变异覆盖对"恒计 error 档"假绿——教训：**变异验证要对每个可变异形态逐一跑，"抓到一个变异"不等于覆盖**；另 waitForDone 2.5s 预算在满载 CI 误伤慢跑，已改 15s 截止线；③ 成本（指标半已修 bc39a9e+7b4a91c）：agent_harness_tokens_total{role×kind 16 序列}+TokenBurnRate 告警已上线；记账归属分工：execution/planner 走 pushEvent done（每段独立 usage）、verification 走 onVerification 逐轮（runPlanned 已加透传）、vision 走 meterModelClient 客户端包裹（评审抓出 describe_image usage 拿到即丢的 real-bug）。**宿主级日预算门 ✅ 已修（b62f6a5 + 评审回收 af73e9b，2026-08-25）**：AGENT_UI_DAILY_TOKEN_BUDGET——超限后新 run/追问/归档派生/**计划批准**一律 429（附账本读数 + Retry-After 到本地次日零点），在飞 run 不掐，进程态日翻页恢复，0=今日封盘；日账本由 meterModelClient **逐调用实时落账**（评审：段粒度落账让 TOCTOU 窗口有整段宽、跨午夜大段挤占新日——一改两消）；env 只武装 realHost（仪器纪律：残留变量不得武装测试宿主）；配 daily_tokens_used gauge + rejections{reason=budget}，六条锁 + 三处变异验证。AGENT_TOTAL_TOKEN_BUDGET 只约束执行谱系（verifier/planner 各拿等额独立预算、名义可达 3 倍）保持设计不变，但口径已诚实化写进 README/.env 双例/runbook。**仍未修**：视觉调用不进 runBudget（已 spawn_task 立项）；④ ✅ 已修（de6ddef + 评审回收 e95067a，2026-08-25）：ResourceCoordinator（tryAcquire 原子整占/holder 幂等/waitForRelease 唤醒，死锁自由不变量成文）——single/verified 按包声明准入整占（冲突 429 附持有者，finalize 释放，followUp/归档派生重占），plan 模式宿主表注入调度器按子任务粒度管、被外部持有**等待不 skip**；workdir 同用缺省告警、AGENT_UI_EXCLUSIVE_WORKDIR=1 拒绝。评审抓出 followUp 并发窗口 real-bug（readBody 前查后不复核 + same-holder 幂等穿透资源门）已修，竞态测试用 chunked POST 确定性构造（Promise.all 双发会被 HTTP 时序串行化，抓不住窗口——测试竞态要控制到调度点）；holder 缺省常量在共享表下静默瓦解互斥（改注入时 uuid）；无 pack 子任务资源兜底宿主默认包。十条锁+六处变异验证；⑤ 端点持续故障韧性窗口仅秒级、重试参数无 env 旋钮；⑥ token 无轮换/吊销、access_token 打进 stdout 日志（ui/serve.ts:73）；⑦ 档案全文明文落盘 runbook 零告知、备份零自动化；⑧ 反代后 SSE 无心跳/X-Accel-Buffering 会被憋死。
+
+另：cross-app 静态副本已实际漂移（app.js 4623 vs 5288 行）；Android 现状连不上任何带 token 的合规宿主（EventSource 送不到 Bearer/SameSite=Strict cookie）；全仓零 LICENSE；provider.ts:49 的密钥回退可把 sk-ant 发给第三方 OPENAI_BASE_URL。
+
+**Why**: 下次接手生产化工作时直接从这份清单开工，不必重新审计。
+**How to apply**: 第一步永远是"提交生产件 + CI 真跑绿一次 + tag/registry"，其余按 high→medium 顺序。

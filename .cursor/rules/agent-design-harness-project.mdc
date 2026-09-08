@@ -1,0 +1,199 @@
+---
+description: Agent_Design 项目全程演进史：TS 从零手写 harness（loop/上下文/工具/记忆/MCP）+ 三角编排与并行调度 + rubric-verifier 三值裁决 + 四领域包 + Web 宿主 UI；含全部 A/B 研究 (Claude Code memory)
+alwaysApply: true
+---
+
+<!-- Synced from Claude Code memory on 2026-09-01 -->
+
+---
+name: agent-design-harness-project
+description: Agent_Design 项目全程演进史：TS 从零手写 harness（loop/上下文/工具/记忆/MCP）+ 三角编排与并行调度 + rubric-verifier 三值裁决 + 四领域包 + Web 宿主 UI；含全部 A/B 研究结论与真实任务案例 #1-#7
+metadata: 
+  node_type: memory
+  type: project
+  originSessionId: 1c3e5a87-d841-4b53-b30f-1936d3e9ef34
+  modified: 2026-08-26T09:24:02.242Z
+---
+
+`D:\Work\Github_pros\Agent_Design` 是一个 harness engineering 智能体框架项目（2026-07-24 启动）。已定决策：**TypeScript**、**从零手写 agent loop**（直接基于 Anthropic Messages API + `@anthropic-ai/sdk`，刻意不用 Agent SDK/LangGraph，目的是学习与掌控）、**框架优先/领域无关**（后续可能接 STM32 调试等领域工具）。
+
+v0.1（设计文档）已完成：README + docs/01-philosophy、02-architecture（L0 ModelClient / L1 AgentLoop / L2 ToolLayer / L3 ContextManager 五层）、03-interfaces（TS 接口蓝本）、04-roadmap（v0.2 最小闭环 → v0.3 上下文/审批门 → v0.4 verifier 子代理）。
+
+v0.2 已完成并通过验收（2026-07-24）：src/ 下 L0–L3 全部实现 + bash/read_file/write_file 三工具 + CLI（`npm run cli -- "任务" [--yes]`），23 个 vitest 单测全绿。用户没有 Anthropic key，走 **DeepSeek Anthropic 兼容端点**（`ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic`，`AGENT_MODEL=deepseek-chat`，key 在用户级环境变量 ANTHROPIC_API_KEY）；为此加了 compat 模式（非 claude-* 模型自动去掉 thinking/effort/cache_control）。Anthropic 原生缓存断点尚未实测（compat 模式下 DeepSeek 自动缓存已验证命中）。v0.3 已完成并推送（commit 7b5038d，2026-07-24）：compact 真实实现（水位 80%、保护窗 6 条、幂等、替换正史保缓存稳定）、diffRenderedRequests 缓存诊断、userMessageWithContext 动态上下文注入、AGENT_CONTEXT_LIMIT；34 单测 + 端到端（4 次 compaction，产物独立核对正确）。v0.4 已完成并推送（commit cc36735）：verifier 子代理（干净上下文、只读硬约束、fail-closed JSON 裁决）+ runVerified 编排（返工带问题清单，CLI --verify）+ fetch_url 领域工具试点 + eval/ 5 用例回归基线（`npm run eval`，deepseek-chat 基线 5/5）。植入错误实验通过（verifier 2 轮抓出虚假报告）。44 单测。踩坑记录：① PowerShell 5.1 `Set-Content -Encoding utf8` 写 BOM 会让 tsx 解析 package.json 报错——改 JSON 用 Write 工具；② 本地 Ollama（v0.14+ 原生 Anthropic 兼容，用户机器 v0.32.1 + qwen3.5:9b 验证可用）：慢速模型必须设 AGENT_TIMEOUT_MS/AGENT_MAX_RETRIES=0/AGENT_MAX_TOKENS≈4096，否则思考螺旋 × SDK 10min 超时 ×3 重试 = 半小时僵死；被杀的长生成请求会堵死 Ollama 串行队列；生成中 CUDA 崩溃（0xc0000409）后需重启 Ollama 服务且会回退纯 CPU（GPU 恢复需重启电脑）；Ollama 默认 num_ctx=4096 偏小。commit 69aadf8 加了这三个环境旋钮与超时错误分类。v0.5 已完成并推送（commit 3f7a0c3）：L5 跨会话记忆——MemoryStore（一记忆一 .md、索引实时派生不落盘）+ 四记忆工具（圈禁不变量使 memory_write 可 auto）+ CLI 注入 memory_index；跨进程 e2e 通过（会话 1 存端口、新进程会话 2 凭索引读回答对）。52 单测。v0.6（OpenAI wire 协议，d44eda3）与 v0.7（MCP 接入 + STM32 真机，a503239）已完成推送。v0.7 要点：src/mcp.ts（adaptMcpTool + mcp.json 配置，默认 ask/串行，includeTools 白名单）；用户的 stm32-gdb-mcp 是其自己的项目（github.com/Zeraissh/stm32-gdb-mcp，开发副本在 D:\Work\MCP_Servers\stm32-gdb-mcp，editable venv）——插件已更新到 0.2.0、开发副本 0.6.0；harness mcp.json 直连开发副本 venv。**STM32L151 真机端到端已通**（ST-Link + OpenOCD，dev_id 0x427，deepseek-chat 7 轮自主完成调试自检并写报告）。69 单测。注意：同一时刻只能一个 OpenOCD 占用 ST-Link——harness 测试前须停掉别的调试会话。
+
+**真机故障定位里程碑（2026-07-25，commit 156c6d8）**：植入除零 HardFault 固件（examples/firmware/stm32l151_faultdemo，已提交到 stm32-gdb-mcp 仓库 commit 168d30f，含中英 README；max_tokens 短板已修，Agent_Design commit c858c85）到 L151，本地 **qwen3.5:9b（Ollama 262k 上下文）** 经 harness+MCP 9 轮自主定位成功，五项诊断全对（除零/process_config main.c:27/PC 0x08000042/调用链）。关键经验：① Ollama 262k 可用但 8GB 显存装不下 9B+KV，74% 回落 CPU，每轮约 15-20s（昨天慢是 CUDA 崩+队列堵的偶发，非速度本质）；② 野指针写 0xCCCCCCCC 在 L151 外部设备区被静默丢弃不触发故障，除零（DIV_0_TRP）才可靠；③ SWD 自锁（固件低功耗/重配引脚 + 无 NRST）需物理上电复位抢连接。**已知 harness 短板待修**：loop 把 max_tokens 截断当硬错误终止整轮（v0.2 设计），本地啰嗦模型写长报告易触发——应改为独立非 error 终止态、保留已生成内容（见 docs/04-roadmap.md v0.7 节）。
+
+v0.8（commit 3d90f6a/52ad788）：**调试 agent 预设 + verifier 上真机 + verifier 过程可见化**。src/presets.ts（AGENT_PRESET=stm32-debug：observe→orient→hypothesize→act→verify 调试循环 system prompt + 黄金规则 + 自动开 verifier + 领域核查指令）；verifier/orchestrate 支持 verifyInstructions 注入和 onEvent 过程透传，CLI 洋红渲染 verifier 独立复核过程。真机验证（deepseek-v4-pro）：主 agent 诊断 → verifier 自己重新连板重读 CFSR/HFSR/PC/寄存器/g_divisor 逐项比对 → passed=true。76 单测。注意：**DeepSeek 改模型名**，deepseek-chat 停用 → 用 deepseek-v4-pro / deepseek-v4-flash。真机跑发现的摩擦点：read_file 的 workdir 圈禁 + verifier 只读约束会挡住读工作目录外的固件源码（防线正确但偏严，read_file 或可加"额外只读根"）。max_tokens 短板已在 c858c85 修（优雅终止非 error）。
+
+**Harness A/B 研究已完成（2026-07-25，commit 05ecfb0）**：eval 扩到 11 常规 + 4 陷阱用例，eval/arms.ts（baseline/verified/bare-tools）+ eval/ab.ts 跑测器（AB_ARMS/AB_CASES/AB_REPS，每 run 前清 eval-out，verified 臂算 main+verifier+rework 成本）。三档模型报告：ab-report.md(pro/qwen)、ab-report-flash.md、ab-report-qwen.md。**关键发现**：① 简单用例上 pro/flash/qwen baseline 全 ~100%，verifier 纯成本(+51%~115% tok)；② 陷阱用例上（能问倒 qwen）**弱 verifier 净负**——baseline 50%→verified 25%、token 翻倍：救回 1(栅栏错)、无效 1(字节格式抓不到)、毁掉 2(假阴性裁决触发破坏性返工)。**设计原则：verifier 必须比执行者更可靠否则净负**（同 advisor "顾问≥执行" 约束）；真机故障诊断那次 verifier passed=true 是"确认无误"非"救回错误"。Ollama 32k 是本地正确配置（7.4GB 进 8GB 独显、73% GPU、~23tok/s、稳定），262k 掉 CPU 且不稳（KV cache 撑爆 8GB，核显 Ollama 用不上）；本地慢模型配 AGENT_CONTEXT_LIMIT=28000 让 compact 先于 Ollama 静默截断触发。
+
+**A/B 研究第二阶段（2026-07-25 下午，已完成）**：为验证"verifier 必须强于执行者"加了跨强度核查能力——runVerified 新增 verifierModel 选项（独立 client+compat）、provider.ts 支持端点覆盖、CLI 暴露 AGENT_VERIFIER_MODEL/_PROVIDER/_BASE_URL/_API_KEY、arms 新增 verified-strict（保守裁决协议）和 verified-strong（AB_VERIFIER_MODEL 强模型核查）、ab.ts 支持 AB_REPORT 路径 + **逐 run JSONL 留档**（eval/ab-log.jsonl，裁决细节全记录，诊断关键）。**新增 npm run lab 实验向导**（eval/lab.ts）：交互式选端点 profile/臂/用例/REPS，profile 存 eval/lab-profiles.json（含 key，已 gitignore），--last 重放；坑：rl.question 管道输入丢行，须用 readline 异步迭代器。用户 DeepSeek key 在 profile 里（曾漏 sk- 前缀导致认证失败）。
+**第二阶段三大结果（ab-report-strong.md）**：① **eval checker 自身有 bug**——trap-no-newline/trap-conditional 行数口径歧义（split vs wc -l 差 1），冤判正确答案/奇偶反转，已修；修后 qwen baseline 8/8，上轮"baseline 50%"大半是 checker 假象，**旧报告"字节级错误 verifier 抓不到"结论作废**（ab-report.md 已加勘误）。② **强 verifier（pro 查 qwen）真实救回有硬证据**：两次抓出执行者写 `"11"  \r\n`（hex dump 证据）→ 返工修复；对正确产物零假阴性——与弱 verifier 毁 h2-count 的对照构成"verifier 必须 ≥ 执行者"的完整正反证据。③ 新失效模式：pro 裁决偶尔非纯 JSON → parseVerdict fail-closed 空转返工（未破坏但烧 token），改进方向：解析失败先重问"只输出 JSON"。首轮 strong 数据曾被僵尸 strict 进程污染作废（见 [[windows-taskstop-node-zombie]]）。verified-strict 臂被用户叫停未出数据。遗留：关键对照 REPS≥5 复现。第二阶段改动已提交（e4d640d）。
+**第三阶段（2026-07-25 傍晚，ab-report-hard.md）**：修 verdict 重问（解析失败先让模型转写 JSON 再 fail-closed，空输出不重问；+2 单测=78）；4 个 hard-* 用例（unused-deps 子路径前缀匹配 / import-list 多约束+字节纪律 / substring-count grep -c vs -o / chain 跨文件行号链），设计纪律：先程序化采集事实、口径写死。踩坑：JSDoc 里写 `src/**/*.ts` 其中 `**/` 含 `*/` 提前终止注释；顺带发现 **tsconfig include 从来没含 eval/**（假安全），已加入。flash 执行 + pro 核查结果：baseline 5/8、verified 6/8,但 **flash 完成的 run 全对——语义陷阱全没绊住它,失败全是"没跑完"**（API error ×1、import-list 全 4 run max_turns 耗尽：flash 逐文件 read 而非一条 grep,15 轮不够;返工再烧 15 轮=127k 打水漂）。**verifier 适用边界定论：只覆盖"完成但错"；error/max_turns 两类失败核查根本不运行。verifier 主场=能力边界附近的语义错误。****第四阶段（2026-07-25 晚,本日最大发现）**：prompt-hint 臂证伪（import-list 0/2 不动,还有副作用:substring 反掉 1 个、chain 单 run 163k token——"批量优先"诱导命令行体操）;ab.ts 加完整 transcript 留档（eval/transcripts/,gitignore）后回放定位真凶——**bash 工具在 Windows 上是 cmd.exe 冒充 bash**（exec 默认 shell）,模型按工具名写 bash 管道→引号崩→每个 shell 任务烧 5-10 轮环境考古（uname/where/python 逃生）。修复:bash.ts 自动探测 Git Bash（避开 System32 WSL bash）,fallback cmd 时描述大写警告。**定量对照（同模型同用例唯一变量）:baseline 63%→88%,轮数 −26%,tokens −40%,import-list 复活**。Harness 定论:**工具运行时质量是模型表现的地板;名字暗示力 > 描述免责声明;修环境 > 提示词 > 事后核查**。evals 评分同时改纯产物制（stopReason 只做元数据）。budget-30 臂:30 轮给熬过考古期的余量（1/2）;其 rep2"完成但答错"=flash 把多行 import 的 stdio.js 语义化算入,违反任务成文规则——指令精确性陷阱成立并保留。import-list 在真 bash 下仍 1/2,保留区分度。报告:ab-report-hint/diagnose/bash.md。
+**loop 层瞬时错误重试已实现（20533e5）**：isTransientApiError（网络/超时/429/5xx 瞬时;认证/4xx/abort 不重试）+ 同轮幂等重发（errorRetries 默认 1,errorRetryBackoffMs 线性退避,api_retry 事件 CLI 可见）;与 SDK HTTP 重试是两层,SDK 耗尽后 loop 再兜。82 单测。
+**返工继承上下文已实现并 A/B 验证（e9e3bd9）**：AgentLoop.runContinuation（正史续跑,反馈并入末条 user 消息兼容第三方端点）+ runVerified reworkMode fresh|inherit + **max_turns 也照常核查**（纯产物哲学到编排层,本轮 6/16 run 靠它免死）+ executionUsage 全轮合计（修成本漏计 bug,旧报告 verified 臂成本被低估）。A/B（maxTurns=8 紧预算,flash+pro）:inherit 8/8 > fresh 7/8,机制在裁决序列:inherit 返工 F→P（增量修复）,fresh F→F（重蹈覆辙）。默认仍 fresh,REPS≥5 复现后翻转。85 单测。
+**REPS=5 复现批（5e76011,重大修正）**：两个待固化结论**都未复现**。①inherit>fresh 反向（fresh 4/5 > inherit 2/5,合并 7 次无显著差异）→ 结论悬置,默认 fresh 维持;且该批被新缺陷污染——**verifier 预算耦合**（t8 臂把 runVerifier 的 min(cfg.maxTurns,15) 一起压到 8,核查跑不完→空/半截裁决→fail-closed 噪声),已修:核查预算固定 15 解耦;**重问机制会编造裁决**（无结论引言被转写成 passed=true 幻觉）,已修:重问提示加硬规则。②弱 verifier 毁 h2 未复现:qwen 自查与 pro 核查双双 5/5——当初的破坏性主要是 harness 缺陷（裁决解析 fail-closed + cmd shell 摩擦）的产物,修掉后同强度自查不再净负。**设计原则修订:"verifier 必须强于执行者"降级为稳妥默认而非硬性前提;强 verifier 的确定优势是核查效率（约 1/3 成本）与裁决质量余量。**方法学元教训（本日三次验证）:先排除 harness 自身缺陷,再谈策略优劣;REPS=2 的"结论"一律视为待复现假设。
+**inherit vs fresh 线关闭（4fdcc5e）**：verifier 修复后干净重测 3/5 = 3/5 平局,三轮合并 8/12 vs 7/12 无差异。默认定稿 fresh（更简单、无上下文膨胀风险——inherit 失败 run 重喂正史到 300k）。修复验收通过:裁决全部实质化带证据、编造消失、仅存 1 例空输出被 fail-closed 正确兜住。verifier→rework 闭环在干净环境下按设计工作,管线可信,瓶颈回到用例设计。
+**kimi 跨厂商核查完成（6c22821,2026-07-27）**：kimi-k3 核查 flash（同负载 vs pro）4/5,全部 6 条裁决实质化带字节级证据、零噪声零编造;compat+thinking 模型下 JSON 契约/fail-closed/重问全部照常。**定论:strong-verifier 模式厂商可移植,修订版原则闭环。**环境:api.moonshot.cn 是国内站(key 与 .ai 国际站不互通),用户 Clash Verge 原本全局模式+fake-ip 劫持导致连不通——已改:rules 增强文件 rj1OjgZWzBIw.yaml 加 moonshot.cn/aliyunddos1022.com 直连,用户切到规则模式(其后用户自己又加了一批国外服务强制走代理的规则)。kimi profile: kimi-k3 @ https://api.moonshot.cn/anthropic。
+**v0.9 已完成并提交（a132f54,2026-07-28）**：DomainPack 领域包——五件套接口（builtinTools/mcp 接入面/systemPrompt/verify{enabled,mode:programmatic|rubric,instructions}/guardrails,优先级 env>包>默认）,AGENT_PACK 切换（AGENT_PRESET 兼容别名）。两个包:stm32-coding（固件工程纪律,构建即事实,mcp:false）、stm32-debug（原 preset 升级,加 flash/run 工具）。**跨包试点真机闭环**:coding 包修除零缺陷产出 ELF（verifier 被只读约束拦 bash 后自己改读 .map 核符号）→ debug 包烧录 L151 四项验收全过（PC 出 HardFault、g_cfg_errors==1、g_result==-1、heartbeat 跨两个独立会话自洽递增 +87万/+87万）→ verifier 独立连板复核 passed。**换包零核心代码改动**。报告存 eval/pilot-hw-verify.md;试点工作区 D:\Work\scratch\stm32l151-pilot。试点期间排障:硬件不可达真凶是僵尸 openocd 独占 ST-Link（见 [[windows-taskstop-node-zombie]] 硬件版）。
+**v1.0 已完成并提交（cd4bf27,2026-07-29,版本号 1.0.0）**：计划单元 + 三角编排。planner.ts（只读拆解,JSON 计划契约:子任务=id/title/pack/description/acceptance,verifier 同款解析纪律）;runPlanned（planner→逐子任务 runVerified→执行摘要交接下游,快速失败,onPlan 钩子留人工把关,resolveSubtask 宿主装配）;CLI --plan;selectPackTools 切包纯内存过滤。**演示一波三折极有价值**:demo#1 planner 计划惊艳（自己翻旧报告把验收写到 cpuid 粒度）但 s2 执行者嫌 MCP 占 3333 端口,用 bash 自建 openocd/gdb 调试栈,taskkill 清理时扫死共享 MCP server→verifier 连不上板子,**拒签一份七节数据自洽的漂亮报告**（还查 map 抓到 HardFault_Handler 地址标错）——三角纪律压力测试通过。修复:①stm32-debug 包收走 bash+黄金规则第8条（不自建调试栈不杀进程）;②mcp.ts 传输死亡自动重启 server 重连一次（isTransportDead）。demo#2 全绿:一句话任务（divisor 4→5）→ planner 自主选包 → coding → 烧录 → verifier 独立连板逐条复核 8 项验收（g_result=20/g_cfg_errors=0/heartbeat 2081万/内存布局逐字节/旧报告未动）。98 单测。报告 eval/plan-verify-2.md。
+**verifier 只读命令白名单已实现（0f39d6f）**：DomainPack verify.readOnlyCommands（领域声明最小命令集）,verifier 审批命中白名单放行、否则 deny 附提示;判定规则:前缀+词边界匹配,拒绝重定向/链式/命令替换,管道尾段限只读过滤器;白名单同时注入 verifier 提示（"别满足于间接证据"）。实战验证:verifier 亲手 --clean-first 全量重建+nm/size/grep 第一手取证,`cd X && cmake` 链式被正确拒绝,裁决从间接证据升级为第一手证明。101 单测。
+**调度单元已实现（5538b2a）**：router.ts——无工具单次分类调用（maxTurns 2）,JSON 契约 {pack, reason},**fail-open**（与 verifier fail-closed 相反:路由是便利不是闸门,选错包下游 verifier 兜底,路由挂了没有纠错机会）;跨域规则:pack=null+建议 --plan;CLI --auto（显式 AGENT_PACK 优先）。实测 4/4 路由正确（coding/debug/跨域null/通用null）。107 单测。至此角色单元集齐:router(选包)→planner(拆解)→executor(执行)→verifier(核查)。
+**xhard 套件完成（94d4d85）**：5 用例（多源聚合/四跳export链/字节CSV/正则口径提取/仅直接import规则）,设计工序定型:事实程序化采集→口径写进任务文本→checker 金标+对抗双向自检。区分度审计诚实结论:flash 9/10,**读-析-产任务已饱和**;唯一区分点是 **letter-vs-spirit 第二次独立复现**（多行 import `} from "./types.js"` 被语义计入:24=12+12 vs 成文口径 12;与 stdio.js 同模式）——flash 规则遵从稳定性 ~50/50,是 harness 可作用的缺口（候选臂:成文口径优先纪律条款）。区分度前沿:规模压力、变更+回归、紧预算、letter-vs-spirit 系列化。
+**rule-precedence 纪律 A/B 完成并采纳（3b58115,2026-07-31）**：REPS=5 × 两个 letter-vs-spirit 用例,baseline 7/10（3 次失败 transcript 实锤全部命中目标模式）→ rule-first **10/10** 且轮数降(8.6→6.6);副作用检查 8/8 干净（含软性语义任务）。已采纳进全局默认:presets.RULE_PRECEDENCE_DISCIPLINE 附着于 CLI 默认 prompt、两个包 prompt、eval baseline——**baseline 时代分界 2026-07-31,横向比较旧报告需注意**。方法论定论(与 prompt-hint 对照):**提示词是弱杠杆,打在决策歧义点上(规则vs直觉摇摆)一句话就够;打在能力/环境缺口上则无效**。107 单测。
+**变更+回归套件完成（e1460a7）**：EvalCase.setup 钩子 + mini-range fixture（零依赖 node --test,植入缺陷+3-3 单点区间回归地雷）+ 三层判定（既有测试/行为探针/测试防篡改字节比对),checker 双向自检 8/8（naive `>=` 修复被地雷精确捕获、篡改测试被识破)。**flash 9/9 饱和——机制定论:可运行测试套=agent 的自验证 oracle,编辑→测试→修复闭环拆弹;变更类区分度来自 oracle 的缺失/缓慢/不完备,即规模**。三套件审计终图景:flash+真bash+快oracle ≈95% 无论读写;真实区分维度仅四个（letter-vs-spirit 已解/预算×规模张力/能力边界语义滑坡/基建鲁棒性已修),**小尺度任务设计已挖尽**。mut-* 留作 harness 自身的"变更纪律"回归警报器。
+**规模压力套件完成,区分度研究弧线收官（c554b09）**：eval/scale-fixture.ts 生成式 fixture（确定性种子=口径,60 模块 DAG,调参到直接 8 vs 闭包 19、测试覆盖 9/60）;scale-audit（传递闭包 grep 抗性)+scale-double（不完备 oracle 下 60 文件字节级批量变更),自检 4/4 含"npm test 抓不住漏改而 checker 能"的程序化证明。结果:double 3/3（flash 脚本枚举正面击破不完备 oracle,合理通过）,audit 2/3（唯一失败=max_turns 耗尽,非语义捷径）。**四套件约 80 runs 总结论:flash 档唯一存活区分轴=轮次预算×规模张力（t15 下 67-83%）,其余全部饱和或已被 harness 解决。下一次 harness A/B 应直接打预算轴（compact 策略/子任务切分）。**eval 资产累计 29 用例全程序化判定+双向自检。
+**预算轴 A/B 完成（c527eef,2026-08-01）**：baseline/budget-30/planned × 两个预算敏感案 × 3。①**预算张力被 rule-precedence 采纳顺带解除**（import-list 6-8 轮 vs 历史 10-15——当年烧预算的大头是规则歧义 churn）,baseline 6/6,最后一条区分轴对 flash 档实质关闭;②**planned 臂在单领域任务=纯开销**（成功率持平,token 4-25×,单 run 最高 1018k,还有 verifier 假阴性返工空转）——三角编排价值边界:跨领域交接/长管线/高风险变更,router 的分流规则获数据背书。③两个潜伏 bug:eval 宿主审批抢答打穿 verifier 只读（respond 先到先得,已修:只放行 main/rework）;vitest 误收 fixture node:test 文件且被 grep 管道掩盖非零退出数轮（已修 vitest.config.ts;教训:**验证命令别用 grep 收尾,管道吃退出码**）。
+**本地 qwen 已退役为离线验证专用（b3cdde4,2026-08-02,用户决策）**：研究要的是"弱模型"不是"本地模型"——弱执行者实验今后用云端 qwen 阶梯（lab 里已留 qwen-cloud 模板 profile,SiliconFlow openai 协议,key/模型名待用户确认);本地路径只在大版本前跑 `npm run smoke:local`（强制指向 localhost,SMOKE_* 覆盖,~20s）验证存在性。**不为此项目升级电脑**——账算过:全部云端研究消耗 << 一张显卡,瓶颈是实验设计不是硬件。
+**真实任务案例 #1 完成（214af44,2026-08-03,docs/cases/case-01-telemetry-firmware.md）**：一句话任务→三角编排→stm32l151_telemetry 固件（HSI/SysTick/遥测/.noinit/故障闩锁,在用户 stm32-gdb-mcp examples/ 下,**未提交待用户审**）→真机 5/5 验收→verifier 备注挖出 boot_count 规格 bug(+510 vs +1,SysTick 误挂)→修复→严格 +1 复测→板子从备份逐字节还原（备份在 D:\Work\scratch\l151-backup-20260803,含 RESTORE.md）。两个 harness 改进项入库:①裁决 summary 是信号源,宿主别只看 passed;②**verifier 裁决端 letter-vs-spirit 宽纵**（验收写 +1 实测 +510 仍放行）——rule-precedence 需延伸进 verifier 提示（待做）。摩擦:SWD 抖动下执行者重连风暴（任务书内嵌执行纪律可缓解;机制层候选:MCP 错误提示原地重试）;openocd 该构建 write_image 静默中断,program 命令可靠。调试包已加 write_memory。
+**裁决端 rule-precedence 已落地（4992646,2026-08-04）**：verifier 核查规则第 4 条——验收标准按字面逐条判,实测不符必须 failed 并写"标准值 vs 实测值",对标准的怀疑只能进 summary("标准对错由委托方裁定,不由核查者裁定")。staged 验证:42/43 宽纵陷阱(复刻案例#1 的 +510 形状)被正确拒签,对照场景正常放行。108 单测。案例#1 的两个改进项余一个:裁决 summary 作为信号源浮出到宿主(待做)。
+**探针现状（2026-08-04）**：MCP 侧可用探针= DAPLink(cmsis-dap);ST-Link 被用户另一会话占用——真机操作一律用 DAPLink 配置(interface/cmsis-dap.cfg),不得碰 ST-Link。
+**调度器资源互斥已落地（4eb49d7,2026-08-04）**：DomainPack.resources 独占标签（stm32-debug 声明 swd-probe）,调度器发射前查锁、落地即释放,同标签强制串行、异标签正常并发,无死锁;CLI --plan 透传。3 测试,共 131。**这是双探针旗舰场景(DAPLink+ST-Link 双板并行调试)的前置机制**——等 ST-Link 释放后,给两只探针配不同资源标签+adapter serial 即可实战。注意:v1.1 并行编排主体(DAG 调度/结构化拆分协议/收益曲线 cap=3/案例#2)是其他会话完成的。**双线布局已终结（2026-08-04,用户确认后清理）**:worktree 目录+本地/远程特性分支+记忆副本全部清除（残留物鉴定无价值:rebase 冒烟报告/可再生基线快照/临时脚本）,仅剩句柄占用的空目录壳待手删。回到单 main 工作流。
+**真实任务案例 #3 完成（cf3e832,2026-08-05,双探针并行调试实战）**：两块 L151(ST-Link+DAPLink),注入式计划 boardA∥boardB→join,子任务级资源标签实战首秀;四轮才通,每轮失败精确归因——轮1/2:mcp.json 连接层白名单 v0.7 化石(交集陷阱,执行者无计时/烧录工具→reset 循环自我拆台+工具名幻觉),修复 1bcc567(连接层=包需求并集);轮3:我自己遗留的 hypo 会话攥着 ST-Link(**跨进程探针锁缺失**现行案例,stm32-gdb-mcp 需求#1:server 按探针 OS 级锁+"probe held by PID x"错误);轮4 全绿:三 verifier 独立复核,**并行节省 34%**(墙钟 361.8s vs 步和 549.6s),双 OpenOCD 会话(3343/3353)全程共存。两板逐字节还原(用户 Keil 自编译 telemetry,与我方 arm-gcc 构建差 402B 但语义同源——解释失败轮符号读数假象)。设计定论:**失败形态即证据**;连接层白名单是能力信任边界应取并集,包层做收窄。备份区 D:\Work\scratch\dual-probe-20260804。
+研究状态：flash 档全部区分轴关闭。
+**v1.1 并行编排已实现并完成首轮 A/B（分支 feat/parallel-orchestration,commits dcb5db9/95c74fa/4164a88/2aca4b0,2026-08-03）**：SubTask.dependsOn 依赖图契约（fail-closed:id重复/悬空/成环即废;无声明推断线性链保 v1.0 兼容）+ runPlanned ready-queue 调度器（concurrency 默认 1 与旧行为一致;失败停发射、在飞跑完、余者 skipped）+ 审批互斥门（并发审批逐个到宿主;verifier/planner 自答审批不入门防死锁）+ 逐直接依赖交接 + opts.plan 宿主注入固定计划（跳过 planner,非法图抛错）+ CLI --parallel[=N]。planner 拆分纪律加第三个合法切分理由「可并行分片」。119 单测。**A/B 结果（ab-report-parallel.md,flash,12+1 runs,par-fanout 用例=3 分片求和+汇总）**:①同 DAG 注入计划下 fixed-par3 墙钟 53s vs fixed-serial 127.7s（−58.5%）,且三个 rep 都精确等于关键路径 max(分片)+汇总——调度开销秒级不可见;token −8% 噪声级（"并行不省 token 省墙钟"成立）;②planner 拆分率 1/4（3 次 s1[] 不拆、1 次拆出正确 fan-out+join 图;四份计划零非法图）——planner 是并行价值的当前瓶颈;唯一一次拆分落在串行臂成全场最慢 335s——"拆而不并"两头亏,推论:拆分后应默认并行（待采纳,REPS=3 纪律视为待复现）;③单领域上 baseline(31k/41s) 仍完胜一切编排——并行只把编排的墙钟罚金从 3.1× 压到 1.3×,不改变"该不该编排"。实验方法学:冒烟单发先行暴露了 planner 混淆变量（既不拆又占 776s 里的 640s——离群值,正批 68-99s）,催生 fixed-* 注入臂解耦——**测调度器用注入计划,测 planner 用观测拆分率,两个问题两套仪器**。**REPS=5 复现批（同日,planned-par3×5,5/5 pass）推翻初批拆分观测**:拆分率合并 5/9（~50/50 不稳定,"1/4 倾向不拆"是小样本噪声——小 REPS 教训再应验）;九份 planner 计划零非法图（fail-closed 零触发,瓶颈是拆不拆的摇摆不是图写不对）;planner 产的 fan-out 计划进并行调度器 4/4 精确贴关键路径（调度收益不依赖手写计划）;**新发现:planner 版汇总步比手写注入版慢 3-4×——手写版有"只消费上游产物不重新推导"收口约束而 planner 版没有,任务书一句收口=下游一半墙钟（与 rule-precedence 同构:弱杠杆打歧义点）**。采纳建议（数据已足,待实施）:①planned 拆分后默认并行（串行默认让一半 run 白付拆分成本;CLI 口径 concurrency=min(3,DAG 反链宽度),--parallel=1 可退回）;②planner 提示词补汇总收口一句（"汇总类子任务只消费上游产物,不重新推导源数据"）。
+**v1.1 研究线收口（9508333 + 曲线批,2026-08-03 晚）**:两条采纳已实施——concurrency:"auto"=min(AUTO_CONCURRENCY_CAP=3, planParallelWidth 层宽启发式),CLI --plan 默认 auto（--parallel=N 覆盖、=1 退串行,线性链自动退化串行）;planner 拆分纪律第5条加收口句。121 单测。**收益曲线（par-fanout6:6分片×par1/3/6×3,9/9 pass）**:serial 210s → par3 93s（−56%）→ par6 79s（−62%,对par3仅−15%）;par6 三 rep 仍精确贴关键路径;边际衰减 = 汇总串行分量(Amdahl) + 并发12路流端点慢尾（分片44-53s vs 串行典型21-39s,零失败零限流,纯尾延迟）——**cap=3 获曲线背书**;token 三臂持平（第三次确认"并行不省token省墙钟"）。三问全闭环:调度器收益（−56~−62%,零可见开销）、planner图质量（合法9/9,拆分摇摆~50/50是瓶颈,已用默认并行+收口句对冲）、收益曲线（cap=3拐点）。开放项归"更远":拆分摇摆稳定化（更强planner模型或结构化拆分协议）、跨域真机并行（回main线场景）。分支报告:eval/ab-report-parallel.md（含全部分析,-smoke/-rep5/-curve 为原始矩阵）。
+**强planner杆已测并证伪（cb15e06,2026-08-04）**:plannerModel 独立模型口子落地（镜像verifierModel:runPlanned opts.plannerModel + CLI AGENT_PLANNER_* + eval AB_PLANNER_* + planned-strong-plan臂,122单测）;kimi-k3拆解+flash执行×5 → **拆分率2/5 vs flash 5/9同为掷硬币,摇摆不动;planner墙钟2.5×纯亏(thinking逐轮延迟,88-346s);图合法率累计14/14两家零非法**。定论并入项目原则:**拆分摇摆是"能一次完成的不拆"vs"可并行分片"两纪律歧义区的自由裁量问题,非能力问题——判断歧义用确定性规则消除,不能用更强判断者掩盖**（与prompt-hint证伪/rule-precedence有效合并成完整图景:提示词杠杆三定律）。下一杆候选（未实施）:结构化拆分协议——planner先枚举独立分片+各自预计工具轮数（事实清单）,再套确定性规则（"分片≥3且各自≥2轮→必须拆"）,拆不拆从自由裁量变规则输出。
+**结构化拆分协议已实施并证实（aebeb60+struct批,2026-08-04）**:runStructuredPlanner——模型只枚举互不依赖分片(写集不相交+estTurns+可选join,join强制写"只消费分片产物"收口句),拆不拆由宿主SplitRule纯函数判定(默认分片≥2即拆),buildPlanFromInventory构图(未命中→单体子任务,验收合并);plannerProtocol freeform|structured + AGENT_PLAN_PROTOCOL + planned-struct-par3臂;127单测。**A/B(flash×5):拆分率5/5、五次形状全同、分片枚举3/3/3/3/3零方差——摇摆消失且未迁移到枚举;planner反而快2.7×(29s vs 80s)且更便宜**。协议对照全景:freeform-flash 5/9、freeform-kimi 2/5、structured-flash 5/5。**杠杆定律补完(四案合并:prompt-hint证伪/rule-precedence有效/强planner证伪/结构化协议证实):能力缺口→修环境;判断歧义→一句纪律;歧义消不掉→裁量移出模型,宿主规则+模型只出事实**。协议边界:structured只表达fan-out+join与单体,顺序链(coding→烧录)仍归freeform——两协议并存;统一需清单契约扩deps字段(候选未实施)。
+**v1.1 已合并回 main（2026-08-04,main@7d11296,已推送）**:rebase 零冲突(main 侧 verdict-rule-precedence/案例#1 与分支零交集);合并门三道全绿——128 单测、全量基线 31/31、fixed-par3 冒烟 1/1(34t/77.5k/53s 与历史画像一致)。**合并门抓到的真问题:eval/run.ts 是化石(v0.6 起失修)**——缺 setup(fixture 用例跑在不存在的项目上,有 agent 自己找到 eval/scale-fixture.ts 跑生成器重建 fixture 导致后续用例"通过")、缺逐用例清场、过程门评分(纯产物制没跟上)、提示词缺 rule-precedence、shell 提示还是 cmd.exe——其 fixture 类结果历来无效,已全面对齐 ab.ts 口径(23055ed)+EVAL_CASES 过滤器。教训:**基线仪器也要跟 era,评分器/runner 的漂移比模型漂移更隐蔽**(与 checker-bug、eval宿主审批打穿同族,第三次仪器错误)。另:大批次刚结束的瞬时端点窗口会让并发 run 全 error(重跑即愈,ab-log 已补 error 消息字段)。feat/parallel-orchestration 分支保留在远程。
+**案例#2:并行编排首次真活（main@1621bc3,2026-08-04）**:`--plan --parallel=3` + 结构化协议 + pro 交付 docs/reference/（三份分组模块参考+索引,1304行,签名与源码逐一核对）。计划一次到位 3+1 零摇摆;4/4 过核查;**子任务墙钟 512s vs 串行合计 904s（−43%）,关键路径又一次精确（512=464.2+47.8）**——eval 结论在真实交付上复现。亮点:s3 verifier 重读 10 个源文件比对签名+确认执行者 4 项自述修复落地,bash 取证被只读门拦后改 read_file 完成;join 声明未读 src/ 只消费分文档（收口句生效）。**并行编排从研究线毕业进入生产可用**。文档任务实操口径:禁 MCP（AGENT_MCP_CONFIG 指向不存在文件）避免无关工具面+探针独占。：主目录 D:\Work\Github_pros\Agent_Design 停在 main = 「真实任务案例」线（稳定 v1.0 跑真活,案例文档小步提交）;worktree D:\Work\Github_pros\Agent_Design-parallel @ feat/parallel-orchestration = 「并行编排」开发线（大改 orchestrate 的特性分支）。本地文件已同步:lab-profiles.json(gitignore 含 key)、Claude 项目记忆(复制到 ...-parallel 的 slug,分叉点后各自演化)。**双线纪律**:①硬件(ST-Link/Ollama)同一时刻只归一线使用(默认归真实任务线),另一线要用先打招呼;②"官方"A/B 报告只从 main 出,特性分支的 eval 数据留分支内,合并后重跑关键基线(防 era 漂移);③main 上的 hotfix 保持小步,特性分支勤 rebase(orchestrate.ts 是它的主战场,拖久必冲突)。
+**真实任务案例 #4 完成（main@eeae001,2026-08-05,docs/cases/case-04-probe-lock-python.md）**:stm32-gdb-mcp 探针跨进程锁(案例 #3 需求#1)+ harness 首跑 Python 项目。交付:probe_lock.py(锁键 serial→interface cfg→server_type 三级,载荷 locker_pid+child_pid)+gdb_manager 集成(Popen 前取锁/adopted 不取/全失败路径释放)+error_taxonomy probe_locked(retryable=false,借 retry_call 现有判定快速失败)+15 测试;四道门禁 916 passed 全绿;**真机 HIL 三场景**:活持有者报 PID、僵尸 openocd 归因 child PID(历史事故形态重演)、陈锁自清。交付物留仓未提交待用户审(含轮2产出的 HANDOFF-PROBE-LOCK.md)。**通用配置轮实证两缺口**:①verifier 无白名单→核查饥饿→fail-closed"无实质结论"→22 轮零写入空转返工(fail-closed 第三种误伤形态:把"查不了"错判成"没做对"——白名单是返工经济性问题不只是证据质量问题);②执行者幻觉 edit_file ×2。**python-coding 包当日落地并 A/B 证实**(03be1ca):readOnlyCommands(pytest/ruff check/mypy/compileall/git 只读;禁裸 python/python -c,ruff 必须带 check)+成文"工具面没有 edit_file"+质量门禁纪律;同交付物同模型对照,verifier 升级为亲跑四道门禁的第一手裁决,零返工;deny 消息附白名单提示还能教 verifier 自改合规命令形态。**意外收获 bash 第三层地板(2bf2c69)**:Git Bash 的 coreutils 全赌父进程 PATH(bash -c 不跑 profile),PowerShell 宿主下 wc 失踪——bashTool 现自带 <git>/usr/bin 前置 PATH;发现路径=包新测试从 PowerShell 跑 vitest→既有白名单测试假失败→stash 对照锁定预存→探针定位。外部项目调用式与提交纪律已沉淀进 [[real-task-backlog]]。134 单测。
+**真实任务案例 #5 完成（main@b6c60d1,2026-08-05,docs/cases/case-05-kicad-swd-adapter.md）**:KiCad SWD 转接板(1.27mm 10-pin→2.54mm 6-pin)——harness 首个 EDA 领域案例。华秋 KiCad 构建的 MCP 创作面经**落盘矩阵实验**判死(place/create 族回执 ok 但文档不变、查询返回空;登录/版本/焦点三嫌疑全证伪,根因闭源不可达;岔路口由用户拍板先试登录),转**文件生成路线**:agent 直写 s-expression + kicad-cli 双判官(sch erc / pcb drc --schematic-parity,--exit-code-violations)。交付全绿:原理图三发(API 瞬断/双拒签暴露 lib_symbols+instances 格式硬结构缺口/结构契约+官方 demo 范本后 36 轮通过)、PCB 一发即中(三个零+全套 Gerber,会话中断吞签字后 7 轮补签 passed)。配套 harness 建设:**AGENT_READ_ROOTS 只读根**(c0060bb,v0.8 旧债由真需求清偿)+ **kicad 领域包**(cc0a4dd,库件保真/坐标网络/双判官纪律+核查白名单)。四条结构性发现:①MCP"回执 ok≠生效",接入未知 MCP 前落盘矩阵实验应为前置仪器(工具运行时地板的 MCP 变体);②领域文件格式深层结构=能力缺口新形态,结构契约+官方 demo 范本(文件形态 few-shot)一杆命中;③kicad 包核查白名单首战防住核查饥饿,三轮核查全部第一手取证、两次拒签实质有据;④debt 清偿的正确时机=真需求到期。139 单测。
+**真实任务案例 #6 完成（main@e00b7e7,2026-08-05,docs/cases/case-06-findings-doc.md）**:研究总结 docs/05-findings.md(418 行八主题,28 eval 报告+6 案例提炼,--plan --parallel=3 结构化协议,并行省 44%)。暗线=主观验收探针,三大核查行为观察:①"判不动就自陈判法"一句纪律使 join verifier 产出**结构化部分裁决**(可判/不可判移交/主观自陈三值)而非案例 #4 式核查饥饿——杠杆定律新样本(歧义点="查不了时怎么办");②passed 带 ⚠ 二次立功(s3 点名数字归属错误,join 修正未流终稿);③s1 verifier 按字面抓到任务书自身笔误——verdict-side 纪律反向验主。委托方地面真值 AC1-AC5 全过(418 行精确/34 文件名/8 数字逐一对源/仅目标文件),终审修一处标题错位。**rubric-verifier 设计种子已提取**(三值裁决明细/主观项不触发返工进宿主决策面/参考物代替文字规则),用户认可为下一步。PR #48 探针锁用户已合并(stm32-gdb-mcp main@1e2ec81)。
+**rubric-verifier 已落地（main@f0a307e,2026-08-05,核查版图收官）**:三值裁决协议——Verdict 增可选 unverified(缺手段核查,自陈移交委托方)/advisory(主观评分意见,自陈判法)字段,两者不影响 passed 不触发返工(返工仍只由客观 issues 驱动);verifier 提示第 5 条"诚实降级"通用条款;VerifyOptions.rubric 承载评分表(注入即声明"意见不影响 passed,主观裁决权在委托方");orchestrate verifyRubric 穿线;DomainPack.verify.rubric + mode:"rubric" 语义实化;CLI 渲染 ⋯待委托方复核/◈评审意见。旧三字段裁决完全兼容。145 单测。真模型 e2e(pro 评审 05-findings,混合验收):客观项亲测/不可程序化项精确落 unverified/评分表三维度落 advisory 带抽查依据,5 轮 2.8k tokens 零槽位混淆——该裁决同时补上了案例 #6 悬置的 AC6 正式评审。核查版图至此完整:programmatic(白名单第一手取证)+rubric(三值诚实降级),fail-closed 三种误伤形态全部有解。
+**真实任务案例 #7 完成（main@3013eb3,2026-08-05~08-06,docs/cases/case-07-web-host-ui.md）**:Web 宿主 UI——harness 给自己盖房子,全案跨度=建设两阶段+委托方整改报告五轮+依赖安全收尾,单测 146→225。**建设期(s1/s2 零返工)**:ui/server.ts 纯 Node 内置零依赖(SSE 重放+直播/approval respond 回调挂起到 HTTP/verifier 来源审批不入挂起表防双响/verdict 合成事件)+零构建原生 ES modules 前端(纯 reducer 与 DOM 渲染分离可 vitest 直测)。配套 ts-coding 第四包 + AGENT_VERIFY_RUBRIC 任务级评分表注入口(a78c3a5)。**rubric-verifier 生产首秀**:四维评分表意见落 advisory,与客观裁决同票各行其道。浏览器全栈实测:UI 提交→直播→点击放行审批→verifier 现场诚实降级→三值卡渲染,harness 的 UI 直播 harness 核查自己。**整改期**:委托方出具正式整改报告(P0/P1/P2 + R-01~R-08 + AC-01~AC-10 + 文案表),固化进 ui/remediation-v1.md 当验收基线(任务书要求 agent 先通读,验收直接引用委托方编号不做二次转译),逐条关闭状态见 ui/remediation-status.md。五轮:s3a P0 审批状态机(幂等 409+三态)/390px 单栏/文案(4156a57)、s3b P1P2 结果优先四层+日志分层+对比度+令牌(b1f7dfa)、s3c AC-10 六类流程回归(e0dae78)、s3d 无障碍实测修 ARIA(a1b548e)、s3e axe-core 常驻门禁(7a5ffdf)。**R-01~R-08 与 AC-01~AC-10 全部关闭**,仅余 NVDA 听感人工建议。**十条结构性发现(详见案例文档)**,新增的六条:④P0 状态机有'另一半'——完成路径验过≠失败路径对(error 结束时 pending 审批同样要转 expired);⑤静态断言只守护'写了什么',ARIA 父子契约要真实 DOM 才验得出(与案例 #5 落盘矩阵同族:声明层绿≠运行时对);⑥只加一半的无障碍改动比不改更糟(roving tabindex 必须配方向键,测试 32c 锁死这对约束);⑦引入检查工具的价值在'查你想不到要查的'(axe 首跑即抓两处真缺陷,其一正是 s3d 手工修复自己引入的空壳 listbox);⑧axe 的 incomplete 桶不是通过('本环境判不了'的规则落这里,故建白名单机制新增即失败);⑨verifier 的失败日志是 harness 缺陷富矿(两轮 fail-closed 空转→回放其被拒内容→定位 isReadOnlyCommand 引号缺陷)。**附带修复四项 harness 缺陷**:isReadOnlyCommand 引号感知(e0dae78)、两条 high 依赖漏洞非破坏修复(0243232)、@anthropic-ai/sdk 0.90→0.115 大版本升级使 npm audit 归零(7c8ae75,跨大版本零代码改动:先盘点使用面再对照变更清单)、L0 请求构造契约补测+effort 'max' 档+AGENT_EFFORT 旋钮(3013eb3——升级窗口暴露的真缺口:220 测试全用 FakeModelClient,'compat 剥离/非 compat 发送'这条 L0 核心契约长期零覆盖)。**SDK 升级验证纪律**:单测不碰真实 wire,升 SDK 必跑三条真机冒烟(Anthropic wire+compat/OpenAI wire/verifier 三值裁决),MCP SDK 变动另加活连通冒烟;未覆盖项=原生 Anthropic 非 compat 路径(本机无 key)。启动方式:createUiServer({workdir,packName,modelClient}) 可注入,tsx launcher 起任意端口。225 单测,npm audit total 0。
+**s3 整改完成(main@e1de927,2026-08-06)**:用户出具正式 UI/UX 整改报告(docx),已固化为仓库验收基线 ui/remediation-v1.md,逐条关闭状态见 ui/remediation-status.md。s3a(4156a57,P0+文案):审批幂等 409(重复/完结后应答,respond 只调一次)+审批三态(pending→只读记录→run 结束转 expired)+≤700px 单栏与返回路径+第12节文案全改。s3b(b1f7dfa,P1+P2):概览/运行日志/核查三标签(概览首屏=状态+结果摘要+三值裁决+待介入+用量)、日志摘要卡(成功折叠/失败与审批自动展开)、a11y 语义(tabindex+aria-selected+label+aria-live+focus-visible)、**对比度从报告实测 2.53:1 修到 5.19:1 并写成从 styles.css 解析色对按 WCAG 公式实算的 vitest 回归门禁**、洋红收敛、列表元数据+筛选、:root 令牌化(外部裸色值 0)。195 单测。委托方浏览器实测关闭 AC-01~04/07/08/09;剩 AC-05/06(键盘与屏幕阅读器专项)、AC-10 三类异常流程待补。**方法论新样本**:①"委托方出具正式报告→固化进仓库当任务书源→按 P0/P1/P2 分轮实施→逐条关闭状态表"是主观领域验收的可复用工作流,比 rubric 更强(rubric 出意见,报告出判据);②对比度这类主观感受可转成程序化门禁(WCAG 公式实算),**主观项能否程序化取决于是否存在公认量化标准**;③s3b/s3c 两轮 verifier 均 fail-closed 空转(非产物问题),客观 AC 由委托方机械复核关闭——fail-closed 误伤形态在真实长任务上再现。**s3c(e0dae78)补齐 AC-10 六类流程回归**(审批拒绝/执行失败/核查未通过,每类三层:服务端契约+reducer+呈现语义,脚本化模型走真实 http+SSE 不烧 token;发现 P0 状态机在 error 路径的等价要求:pending 审批同样要转 expired),并**从 verifier 日志定位修复 harness 缺陷**:isReadOnlyCommand 按 `|` 切段不感知引号,`grep -n "a\|b" f` 这类合法只读命令被误判管道链拒绝→verifier 退化重试烧光轮次(两轮空转元凶之一);改引号感知扫描(引号内 `|` 与转义 `\|` 视作字面量,引号外危险构造照拦,未闭合引号按可疑拒)。205 单测。**元教训:verifier 的失败日志本身是 harness 缺陷的富矿**——空转不只是噪声,要回放它在拒什么。**s3d(a1b548e)无障碍专项收尾**:浏览器真机走查(枚举 Tab 序/实测 :focus-visible 计算样式/ARIA 结构/aria-live 播报/真实 keydown 验标签组)——静态断言全绿但真实 DOM 暴露两处结构缺陷:①孤儿 role=option(父容器缺 role=listbox,屏幕阅读器无法播报"第 N 项/共 M 项");②tab 三件套不全(有 tablist/tab 无 tabpanel、tab 缺 aria-controls)。修复含 APG roving tabindex + **配套方向键**(只加 roving 不加 ←/→/Home/End 会让未选中标签彻底键盘不可达,比不改更糟——32c 测试专门锁死这对约束)。208 单测。**整改报告 R-01~R-08 与 AC-01~AC-10 全部关闭**,仅余 NVDA 听感人工建议。**教训:静态断言只能守护"写了什么",ARIA 的父子契约要真实 DOM 才验得出来**——与"落盘矩阵实验"(案例 #5)同族:声明层绿 ≠ 运行时对。**s3e(7a5ffdf)引入 axe-core+jsdom 常驻门禁**(用户拍板;严格圈在 test/ui-a11y.test.ts 单文件 @vitest-environment jsdom,ui/ 运行时零依赖不变;+30 包,npm audit 新增 0 条——既有 7 条全来自 anthropic/mcp sdk)。**首跑即抓两处真缺陷**:①空壳 listbox(critical)——s3d 手工修复把 role=listbox 静态写死,空态无 option 子项违反 aria-required-children,改为"身份与内容同生共死"(有项才挂 role);②缺页面级 h1,补 header(banner)包裹的 sr-only h1(裸 h1 游离地标外会触发 region 规则——补 h1 当场撞到的连锁反应)。**设计要点:incomplete 白名单机制**——只断言 violations 为空不够,axe 把"本环境判不了"的规则放 incomplete 桶(既非通过也非失败),锁定已知三条,新增即失败逼人看;双向自检三条证明扫描器抓得住。220 单测。**元教训:引入检查工具的价值在"查你想不到要查的"**——手写断言查了"role=option 在不在"(在,绿),真 bug 是缺父容器;自检过程还修正了我两个错误前提(placeholder 按 accname 算可及名称、duplicate-id 在 axe 4.x 已废弃)。
+**Web 宿主 UI v2 完成（2026-08-06~08-07，R0–R11，225 → 485 单测）**：委托方看着成品逐轮批注、我逐轮实施的长会话。基线文档 `ui/remediation-v2.md`，逐条关闭表 `ui/remediation-v2-status.md`（34 个问题项 V-01~V-34），**未做部分全部写进 `docs/06-backlog.md`（交接文档，含"为什么这么做/为什么不那么做"，接手不必重推演）**。
+
+轮次与要点：R1 修三条实锤 bug（返工轮审批永久挂死——`drain` 转发主轮 done 而 `applyDone` 无视 source；审批决策只在浏览器内存刷新即失真；stopReason 六值压两值把 max_turns 显示成绿色"已完成"）；R2 透数据面（pack 核查三件套此前一个没传给 runVerified，即 Web 上的 verifier 一直处于案例 #4 那个 22 轮空转的"无白名单"配置；executionUsage/逐轮裁决/usage 事件）；R3 细粒度渲染（`diffKeyed`/`patchList`/`appendOnly`/`createBatcher` 替换全量 innerHTML）；R4 四决定因素信息架构（Loop/Context/Tools/Verification，日志降为下钻）；R5 视觉语言重做；R6a 会话正史视图 + 逐 run 装配旋钮 + 搜索；R6b 去 emoji + 对话叙事优先 + 思考过程；R7 并行编排接入；R8 多轮对话；R9 逐 run 工作目录（白名单）+ 角色模型；R10 识图；R11 侧栏项目分组 + 常驻上下文水位 + 附件上传。
+
+**最重要的规律（已写进 backlog 第零节）：harness 早有能力、Web 宿主没接，本系列出现五次**——`result.messages`、thinking 块、`runContinuation`（本为返工 inherit 建的，多轮对话直接复用，零 src 改动）、`verifierModel`/`plannerModel`、`runPlanned`。**接手启示：遇到"这个功能没有"，先去 src/ 找一遍再动手写。**
+
+只有识图那轮真改了 src/：`describe_image` 内置工具（工厂而非常量——工具需要 ModelClient 而 ToolContext 里没有）+ 第四个角色模型 `AGENT_VISION_MODEL`；顺带修掉 `toOpenAIMessages` 丢弃图像块——Kimi/Qwen-VL/GLM-4V 都走 compat 端点，不补的话看图请求会静默变成"只发提示词不发图"，模型再一本正经编一段描述。
+
+**只有真机能抓到的四个 bug**（单测全绿却错）：① rAF 在隐藏标签页不触发 → 事件无限堆积、界面永不更新（后台标签页等审批的人永远等不到）；② `[hidden]` 被 `.live-strip{display:flex}` 压过（UA 样式表优先级极低）→ 已终止的运行仍显示"等待模型响应"；③ 侧栏分组的路径切分正则丢了反斜杠，Windows 路径切不开；④ `workdir` 未在源头 resolve，`D:/a/b` 与白名单里的 `D:\a\b` 字符串不等 → **默认工作目录过不了自己的白名单**（单测因 mkdtemp 本就规范化而没碰到）。
+
+**验证纪律沉淀**：能行为验证就别用字符串断言。本轮最有价值的几次都是"让脚本化模型真的去读它收到的东西"——续跑正史有没有带上（模型复述暗号）、图有没有送到 compat 端点（视觉客户端靠有没有收到图决定回答内容）、工作目录圈禁根有没有真移动（放行 bash 看 `pwd` 实际返回）。另：**测窄屏必须用真实视口**，强制元素宽度不会触发媒体查询（我为此误判过一次"没修好"）。
+
+后续候选：见 `docs/06-backlog.md`（R6 收尾 / 结构化输出 / 工具入参 schema 校验 / 重试抖动与模型降级 / Web 消费流式 / 计划确认门 / ask_user 澄清）。仓库 main 分支，远程 https://github.com/Zeraissh/Agent_HarnssEngineering.git。
+
+**backlog 开工第一批（2026-08-07，485 → 515 单测，未提交）**：
+
+- **AC2-06 关闭（真机）**：Web 宿主 `pack=ts-coding` + 四维度 rubric，deepseek-v4-pro 走 compat → `advisory` 4 条、逐条对上维度且内容可追溯到实物；`passed=true`/`reworks=0`。**双向自检**：同任务唯一变量为"不注入 rubric"的对照臂 → `advisory=0`。装配链纸面本就通，真机确认无偏差。顺带实证 V-06 白名单（verifier 自己 17 次工具调用、summary 带第一手数字）。
+- **§2.2 工具入参 schema 校验已落地**：`src/tools/validate-input.ts` + `ToolExecutor` 在**审批门之前**拦（入参不合法的调用不该去打扰人做授权决定）。**核心纪律是失败开放**——只拒"认得的构造被明确违反"，`oneOf`/`$ref`/未知 type 一律放行，也不强制 `additionalProperties`；schema 来自外部 MCP 服务端，"看不懂就拒"是亲手造 fail-closed 新失败模式。硬理由是 MCP：`src/mcp.ts` 原样收下外部 schema 并直接转发 input，**没有任何位置能手写检查**。另：`model-client-openai.ts` 的 `safeParseArgs` 注释早就在向"工具的输入校验层"交接，而那一层此前不存在。真机 26 次工具调用零误拒。
+- **§3 退避抖动已落地**：`backoffWithJitter` 用**等量抖动**（`ceiling/2 + rand*ceiling/2`）不用全抖动——全抖动可能几乎立刻重试，而 429 是服务端明说"你太快了"。
+- **两条方法论**：①纯函数测试覆不住调用点（改回线性退避，4 条纯函数测试照样全绿）——必须另加走真实路径的行为锁；②见 [[host-lags-harness]] 那条改写：**加字段的同一个提交里就会生成新的"宿主没接"缺口**。
+
+未做且理由已写进 backlog：`parseVerdict`/`parsePlan` 的字段校验（形状约束不同，需要的是"缺字段如何降级"而非"拒绝"）。
+
+**第二批（同日，485 → 538 单测，三个提交 97b8a47 / 6ea2c14 / d7937fb 已在 main，未 push）**：
+
+- **§4 文本流式接进 Web**：服务端 R2 起就在推 `event: delta`，前端一直丢弃。控制器侧 `liveTexts` 缓冲 + 独立 batcher，**不进 RunState**（delta 不占 seq、重放时不存在，进 state 会破坏 reducer 重放幂等）。真机 670 帧 delta、直播条随流推进。**副产品**：接上文本流式后"思考流式没接"变成肉眼可见的空窗——deepseek 开头约 3 秒 `deltas=0`。
+- **§5.1 计划确认门**：`onPlan` 本来就是 await 的，harness 零改动。默认关（宿主也被脚本化驱动，默认阻塞会挂死 eval/契约测试）；挂起点在第一个子任务发射之前（否决零副作用）；**否决不是 error**——`stopReason=plan_rejected`、徽章走 warn，混进 error 就是对委托方自己的决定说谎。挂起态归 ActionRail、已决归 Plan 面（不重复展示）。
+- **真机验证撞出一个先前就存在的缺陷**（详见 docs/06-backlog.md 第八节）：`app.js` 的 `applySegmentDone` 快路径"非核查模式 done 即终止"不限定来源，而编排模式下 **planner 自己那一轮也发 done**——客户端在 planner 结束时就 `es.close()`，之后的 plan_result / 子任务进度 / run_end 全丢。触发条件 `mode=plan` 且未勾核查，正是选"计划编排"后的默认组合。**它就是 V-01 那条「段终止 ≠ run 终止」在 reducer 侧的漏网**。教训：一条修在 A 层的纪律，要回头查 B 层有没有同构漏网。
+- **诊断手法值得留用**：界面与服务端不一致时，把服务端事件拉下来**在页面里用同一份 reducer 重新 reduce 一遍**——结果对就说明不是派生逻辑错，是实时投递断了。一步分开两类原因。
+
+**案例 #8（2026-08-07，commit bb524e0）**：STM32L151 镜像自校验固件，真机跨域，**计划确认门首次用于真实高风险交付**。详见 [[real-task-backlog]] 第 6 条与 `docs/cases/case-08-crc-selfcheck-hil.md`。三条对 harness 线最要紧的：
+
+- **开案例前撞出第七个「宿主没接」且是最大的一个**：`ui/server.ts` 从未 import `src/mcp.js`，`AGENT_UI_MCP=1` 只改快照文案 → **`stm32-debug` 这类全 MCP 工具面的包在 Web 宿主下等于废的**。已修（commit 6eabbbf，懒连接 + 逐子任务按包收窄 + 真实状态快照 + 关停断开）。
+- **发现 6 的误伤形态②（核查预算耦合）在新领域复现**：`VERIFIER_MAX_TURNS = 15` 是写死常量，`DomainPack` 无法覆盖。stm32-debug 执行者 40 轮、核查者 15 轮，而真机核查每条 AC 都要多次探针往返 → 两轮 verifier 都跑满 15 轮、都没写出裁决 → fail-closed。**当初"把核查预算与执行者解耦"还不够——15 是按软件域定的数**。加重情节：verifier 当时已经嗅到真缺陷（读 image_crc32=0 后去 debug_until CRC 代码、read_memory）**正在追查，是预算掐断了调查**。
+- **芯片系列常量是 agent 的稳定盲区**：`1u << 6`（F1 的 CRCEN）vs `1u << 12`（L1 的）。结构、时序、算法全对，只错这一个常量；编译器/静态检查/单测全都管不了，真机是唯一裁判——而这恰是 findings 说的 verifier 主场。
+
+**9.1 已实施（commit 3f7bb27，546 单测）**：`DomainPack.verify.maxTurns`，优先级 env(`AGENT_VERIFY_MAX_TURNS`) > 包 > 默认 15（导出为 `DEFAULT_VERIFIER_MAX_TURNS`）；`stm32-debug` 设 30 且**不高于其 40 轮执行者护栏**（有测试锁这个不等式）；编排下逐子任务按各自的包取。**定论更新：核查预算与执行者解耦是对的，但"一个常数走天下"是错的——15 是按软件域定的数。**
+
+写这条的行为锁踩了两个值得记的坑：①收口点设在第 18 轮会被**重问机制**(maxTurns 3)恰好救回——那是重问在按设计工作，不是预算够用，收口点必须 > 15+3；②脚本模型用全局计数器时**返工轮**会越过收口点让第二轮核查立刻通过，必须 `maxReworks: 0` 才测得准。
+
+**9.6 已实施（commit c35283a/f3c398f，566 单测）——本轮最重要的定论在这里**：
+
+三跑 A/B/C（同一份产物 ELF SHA256 逐字节相同，逐次只加一个变量）：15 轮 → 30 轮 → 30 轮+分形态纪律。`reset_target` 调用次数 —/0/**2**；实质结论 无/**误判**/**精确命中真缺陷**。第三跑独立读到与我完全相同的寄存器证据（`0x4002381C = 0x00008000`），AC5 判失败、AC6 落 unverified。
+
+**真凶不是泛化纪律，是领域包自己的指令**：`STM32_VERIFY_INSTRUCTIONS` 原文「不要 flash、不要 reset、不要写内存」一刀切。这条对**故障现场核查**完全正确（复位毁掉 .noinit/CFSR/栈帧，案例 #1/#3 血泪），对**运行行为核查**恰好相反。正解不是放宽，是把两种形态分开写清楚 + 给出"怎么认出板子没在跑"的判据。
+
+> **核查失败的三层归因，顺序不能颠倒**：①核查者被成文规则挡住（改规则）→ ②预算不够跑完（加预算）→ ③缺取证手段（补白名单）。先怀疑规则，再怀疑预算，最后才怀疑能力。本例若只加预算，得到的是一次跑得更久的错误裁决。
+
+**明确不做**：不为此新增 `DomainPack.verify.stateSetup` 字段——根因在指令文本，加字段等于把同一件事拆两处声明（P2 按需晋升）。
+
+**清单收尾（2026-08-08，585 单测，main @ 2720e14，未 push）**：
+- **9.7 收口续跑 + 9.2 兜底带过程摘要**：撞满预算时原有"重问"另起新 loop 只喂原始文本，文本为空就直接跳过 → **整场核查连同全部证据作废**。改为续跑同一会话（`runContinuation`），收口预算 `VERIFIER_WRAPUP_MAX_TURNS=2` 刻意很小。真机四跑对照证实：round 1 用了 31 轮（30 调查 + 1 收口），`unverified` 原文含「预算用尽」——同一位置第三跑是空输出落 fail-closed。
+- **9.8 段级续跑**：执行者因**瞬时**错误终止时带正史续跑。判据必须作用在**原始错误**上，为此让 loop 把原始错误挂到 `new Error(msg, {cause: err})`。新增 `segment_resume` 事件并同提交接了 CLI + Web。
+- **思考过程透出**（第八个"宿主没接"）：数据一直在 `message.content`，但只进会话正史、每段 done 才落盘。改为每轮发 `assistant_thinking` 事件。**turn 级不是流式**——`thinking_delta` 仍没接。
+- **9.4 未知工具名给最近候选**：后缀命中优先（MCP `<server>__` 前缀被漏是最常见形态），其次编辑距离 ≤ 名长/3；打不着就不提示（猜错方向比不猜更糟）。
+- **9.3 降级不做**（复议）：三值裁决已正确处理（AC6 四跑每次都精确落 unverified 并移交委托方——**诚实降级在按设计工作，不是失败**）；且 `selectPackTools` 给执行者与核查者同一套工具面，给 verifier 加 bash 等于也给执行者加，而 stm32-debug 不给 bash 是 v1.0 演示换来的。真要做得先有"**核查者专属工具面**"这个能力。
+- **docs/05-findings.md 33 → 41 条**，新增 7.5 宿主学 / 7.6 核查失败归因顺序两节。
+
+**v2 之后的界面轮（2026-08-08，24 提交，758 单测）**：委托方边用边提反馈，
+四步交付——① **对话成为主干**（改从事件流派生，因此实时；仪表盘退成默认收起的
+抽屉；工具/思考/审批痕迹/裁决按发生时刻织进对话）；② **产物清单**
+（`/artifact` 取件 + CSP 禁脚本 + `resolveInWorkdir` 圈禁 + reveal 用参数数组
+交 spawn，12 条攻击面测试）；③ **装配状态条**（条上是真实装配，点开才是设计
+思想——哲学通过它管着的数字被看见，不是通过标语）；④ 停止按钮 / 本次对话常驻
+放行 / 会话标题 / 空态示例。另有流式匀速放行、零依赖代码高亮、贴底跟随 + 跳转
+箭头、未读星、`.env` 装载与冲突告警、**L6 运行台账**（`src/ledger.ts`，
+判据 `STRUCTURED_OUTPUT_RULE` 在收数据之前写死）。
+**本轮方法学产出（findings 42~50）**：根因修掉补丁就是负债；UI 测试要单独断言
+可见性；复验用变异测试；量之前别猜瓶颈（瓶颈是布局不是脚本）；写死的计数一定
+会过期；**真机结论要先问这是被测对象还是观测装置的性质**（两次踩到）；
+**便利功能不许削掉它所在的不变量**（省掉的是点击不是记录；不能停的停止按钮比
+没有更糟）。三处自己写的谎话被交叉核对抓出来（含拿案例 #8 当"换模型可对照"
+的证据，而那次全程单模型）。
+
+**backlog B 批全清（2026-08-08 晚~08-09 晨，五提交至 ddcc18a，784 单测 + tsc 全绿）**：
+
+- **B0 planner 补齐 9.1/9.7/9.2（dbe3467，本会话）**：`drainPlannerEvents` 共享消费
+  （run/runContinuation 同款）；收口续跑 `PLANNER_WRAPUP_MAX_TURNS=2`（freeform 与
+  structured 两条路）；预算三级 `AGENT_PLAN_MAX_TURNS` > 包 `plan.maxTurns` > 默认 12
+  （`resolvePlannerMaxTurns`），与执行者 maxTurns 解耦；fail-closed 带 `failureSummary`
+  + `recovery` 四值。**多包预算取声明值最大**（planner 还没拆，不知道任务落在哪个域；
+  预算是护栏不是配额）；"计划不该比执行贵"由不等式测试锁，不再运行时夹断；
+  **没给包填数**——verifier 的 30 有案例 #8 实测，planner 侧等证据。七个变异全被抓红。
+  教训：交接页说"改那条钉死旧语义的测试"，现场发现它钉的是 `end_turn` 半边
+  （修后本就不变），实际动作=收窄标题+新增 `max_turns` 行为锁——**条目到现场先看它钉的是哪半边**。
+- **同夜其他会话收口**：`[object Object]` 台账污染修复（f62ee3e，我 spawn 的任务芯片）；
+  **B1 终止原因口径**（8f3617e）：事实源收敛为 `src/types.ts` 的 `STOP_REASONS` + 三处
+  逐值一致锁，**顺带修出潜伏缺陷**——计划门未应答（expired）此前也被写成
+  `plan_rejected`，B2 落盘后就会浮出水面；**B2 运行历史落盘**（ddcc18a）：
+  `ui/history.ts`，`.agent-run-history/<runId>/`（meta.json + events.jsonl +
+  transcript.jsonl 分离），保最近 50 个、注入 modelClient 不存（仪器纪律）、
+  **不能跨重启续跑且界面照实说**；B2b 补标注（60c080e）。
+- **现状**：B 节只剩 B3（AC2-11 其余面量化）；台账仍 16 次运行 / 0 次核查——
+  §2.1 样本 0/20。**主线 = C1 案例 #9 + A1 攒样本（跑真实任务勾核查）一次做**。
+  注意：Web 宿主若还跑着旧进程，其内存 run 不受落盘保护，换到 ≥ddcc18a 的那一次
+  重启仍会丢；此后不再丢。
+- **领域包经验来源定论（2026-08-10，案例 #11 期间与用户共识）**：包纪律两条腿——
+  ①自身失败复盘（每条带"为什么"，防博弈的核心）；②公开参考设计蒸馏，
+  但**按需蒸馏、随案验证，不建图书馆**：开新方向时用户给 1-2 张该方向的
+  高质量参考（成对 sch+pcb > 纯 sch；量产过的 > 来路不明；KiCad 原生 > 图片），
+  宿主审图提炼"带意图的惯例"进包 + 电路差异写成判官 checklist，
+  由案例本身验证规则价值（与"判据先写"同构）。大量同质参考边际价值≈0，
+  且解决不了纪律执行类失败（案例 #11 阶段二的手编桩封装不是"没见过好例子"）。
+  首张参考已蒸馏：F103 最小系统图 → 功能分块/块内自闭合/复位上拉/HSE 反馈电阻
+  /家族引脚差异（VBAT vs VLCD）五个提炼点，待阶段三随包纪律落地。
+- **案例 #11 收官（2026-08-17，三提交 63b9212 / a34c30f / 8bb6d1b）**：L151 最小系统 →
+  蓝药丸式开发板，S1/S3 原理图 ERC 0、S2 PCB DRC 0、开发板 v6 嘉立创口径 DRC 0 +
+  量产校准审计 5/7 + gerber。定论：①文本模型不能结构性编辑 8000 行 pcb（三发同形）→
+  答案是**结构化工具**（宿主工具箱 `eval/kicad-host-kit/` 已入仓，README 有纪律/边界/冒烟）；
+  ②自动布线守规矩 = 约束 + 事后审计（判据先写，量产板校准 7 条）+ 混合返工；
+  ③委托方三次红框（90°/锐角/无解绕线；排针无逐引脚丝印；过孔线距按嘉立创）→
+  包纪律 4c/4d/4e + 核查 #8。**下一步起点**：kit 收成 kicad 包 agent 可调用工具
+  （src/tools/kicad-py/），freerouting 桥进包；kit 已知边界：0.125 栅 A* 复现不了
+  0.45 节距紧密排线。文档 docs/cases/case-11-*.md、backlog D7。
+  **提交纪律实录**：另一会话的未提交改动（src 核心/ui/tests/README/backlog 大段）
+  与本会话共存于同一工作树——backlog 用 `git hash-object -w` + `update-index --cacheinfo`
+  只把自己的 hunk 送进索引；presets 在 HEAD 隔离 worktree 里验过 tsc+单测再提交。
+- **案例 #11 v7 清理轮（2026-08-18，提交 d818b6a）**：委托方点名 via/孤岛/"NRST 好几条并行线"→ kit 新增
+  redundancy/net_stats/net_view/edit_tracks/dedupe/trim_pad_stubs/trim_dust/via_in_pad；板 v7-DEVBOARD-clean-drc0：
+  DRC 0、审计 7/7、via 81→69、孤岛 1、拐角全 45°、32k 晶振簇重排（负载电容交叉→各归其位）。**五镜头独立核查 workflow**
+  （电气等价/冗余/几何工艺/晶振/视觉）第一轮撞会话上限 4/5 失败，第二轮全 confirmed 且抓到声明之外的 via-in-pad（major）、
+  工具误删入线、audit 盲区——**独立核查的价值在声明之外**。留下边界：OSC32_OUT∥OSC_IN 走廊 5mm@0.34、C12 离晶振 3.8mm、
+  C7-2 via-in-pad；根治要晶振簇竖放重摆。Bash 工具的 heredoc 会把双反斜杠折成单反斜杠——含反斜杠路径的脚本用 Write 工具写文件再跑。
+- **桌面一键启动（2026-08-26，未提交）**：用户嫌"先 npm run ui 再开壳"麻烦、问要不要换 C#/MAUI——结论：痛点在启动器缺口不在技术栈，
+  重写只会把 98 行壳翻译一遍而痛点原封不动。实现：`cross-app/electron/host-launcher.cjs`（纯 Node 可测模块：.env 按 node --env-file
+  语义装载/入口解析 override>源码tsx>dist（防陈旧 dist 静默顶包）/探活/收树）+ main.cjs 三模式（AGENT_UI_URL attach > 候选端口探活
+  attach > 自拉起，ELECTRON_RUN_AS_NODE 用 Electron 自带 Node）。真机三轮 E2E：spawn/attach/修后各一轮，窗口标题变"— Web UI"证页面
+  真加载，关窗后进程树零残留、attach 关壳宿主存活。**真机抓到 1 缺陷**：加载页与正式页 loadURL 竞态，ERR_ABORTED 误判失败用错误页
+  盖正式页（attach 探活快才露馅，spawn 慢就掩住）。**四镜头评审+双怀疑者对抗核实（40 agents）确认 9 条全修**：will-quit 二次 quit
+  放行跳过 SIGKILL 升级（cleanup 在途必须再 preventDefault）；子进程 EADDRINUSE 死后错误页盖健康 UI（覆盖前先复核 harnessHref 探活）；
+  activate 重建窗口丢错误状态（currentPage 状态化）；ELECTRON_RUN_AS_NODE 经 bash 工具透传进 agent 子命令（serve.ts 入口 delete，
+  cross-app 测试锁跨仓契约）；override 相对路径存在性检查与 spawn 解析基准漂移（path.resolve 统一）；测试侧四条变异盲区（waitForHealthy
+  下界断言/收树执行器注入化让两平台分支任意平台可测+吞 SIGTERM 真机升级用例/spawnHost env 契约回显断言/ERR_ABORTED 锁整句含 return）。
+  cross-app 28+1skip、根 1069、tsc 全绿。打包态（asar）自拉起需 AGENT_UI_HOST_ENTRY，README 已写；electron-builder 捆 dist 宿主是后续项。

@@ -1,0 +1,46 @@
+---
+description: 'Agent_Design 的反复规律——harness 早有能力而宿主（Web UI/CLI）没接；遇到\'这个功能没有\'先去 src/ 找一遍再动手写' (Claude Code memory)
+alwaysApply: true
+---
+
+<!-- Synced from Claude Code memory on 2026-09-01 -->
+
+---
+name: host-lags-harness
+description: "Agent_Design 的反复规律——harness 早有能力而宿主（Web UI/CLI）没接；遇到\"这个功能没有\"先去 src/ 找一遍再动手写"
+metadata: 
+  node_type: memory
+  type: project
+  originSessionId: 8b274376-2e13-4846-ae93-526a02432ed9
+  modified: 2026-08-07T10:07:45.809Z
+---
+
+在 Agent_Design 的 Web 宿主 UI v2 系列（R0–R11，2026-08-06~08-07）里，**"harness 早就有这个能力，只是宿主从没接"这件事出现了五次**：
+
+| 能力 | 早就在哪 | 直到哪轮才接 |
+|---|---|---|
+| 会话正史 | `AgentRunResult.messages` 一直返回 | R6a |
+| thinking 块 | `src/model-client.ts:41` 显式开了 adaptive | R6b |
+| 多轮续跑 | `AgentLoop.runContinuation`（`src/loop.ts:99`，本为返工 inherit 模式建的） | R8 |
+| 角色模型 | `verifierModel`/`plannerModel`，CLI 早已从 env 装配 | R9 |
+| 并行编排 | `runPlanned`，v1.1 就有 | R7 |
+
+已知未接的：memory 工具在 Web 上没有（CLI 有）；**文本流式** `text_delta` —— R2 就已改成 SSE 命名通道在推，前端 `app.js` 一行 `if (type === "text_delta") return state;` 直接丢弃（2026-08-07 实测一次 ~90 秒的 run 流了 **1133 条 delta**，全被扔）。
+
+**2026-08-07 规律要改写——不只是"旧宿主落后于新 harness"**：我给 `api_retry` 事件加 `backoffMs` 字段时，**在同一个提交里就制造了第七例**：`app.js` 的 reducer 是按事件类型**逐字段白名单投影**的，任何新字段默认被丢弃，而且**不报任何错**——界面只是少显示一行，肉眼看不出来。是我写的那条渲染锁（`test/ui-patch.test.ts`"重试退避等待在界面上可见"）抓到的。
+
+**同日第三次**（做 backlog 9.1 核查预算按领域可覆盖时）：`run_config` 的 reducer 分支同样是逐字段白名单投影，新加的 `verifierBudgetTurns`/`verifierBudgetSource` 不列出就静默丢弃；又是渲染锁抓到的。**同一轮里踩了三次**，说明这不是偶发。
+
+所以纪律不是"回头补"，而是：**harness 加一个字段 = 同一个提交里把宿主那一侧一起接上，并加一条渲染锁**。具体到 `ui/public/app.js`，加字段必查**三处**：`reduceEvent` 的投影分支、派生函数（`derive*Face`）、渲染分支。
+
+**同族的另一种谎话**：改了语义却没改文案。9.1 之后 `/api/harness` 里写死的 `verifierBudgetTurns: 15` 和 UI 上那句"（固定，与执行者解耦）"当场都变成假话——**改常量为可配置时，要搜一遍谁在文案里承诺过它"固定"**。
+
+**Why**：这个 harness 的核心层走得比它的宿主远得多。研究线（A/B、案例）驱动 `src/` 一路往前，而宿主只在需要演示时才补一块。加上前端 reducer 的白名单投影是"静默丢弃"语义，缺口生成成本为零、发现成本很高。
+
+**How to apply**：
+- 收到"能不能加 X"时，**先 `grep src/` 找 X 或它的近义词**，再决定是接线还是新建。五次里五次都是接线，成本差一个数量级。
+- 往 `TurnEvent` 加字段时，顺手检查 `ui/public/app.js` 的 `reduceEvent` 投影分支 + 渲染分支 + CLI 的 `case`，三处一起改，并补一条 DOM 断言。
+- 接线时注意宿主侧往往还要补一段**呈现层的诚实性**：能力接上了，但"配了没启用""未配置"这些状态要能看出来（如 `run_config` 报本 run 实际用了什么角色模型，而不是报配了什么）。
+- 未做清单与逐条理由在仓库 `docs/06-backlog.md`（含"为什么不那么做"，接手不必重推演）。
+
+相关：[[agent-design-harness-project]]、[[browser-only-defects]]

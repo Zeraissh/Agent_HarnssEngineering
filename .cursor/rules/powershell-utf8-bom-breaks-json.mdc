@@ -1,0 +1,22 @@
+---
+description: PowerShell 5.1 的 Set-Content/Out-File -Encoding utf8 会写 BOM，破坏 tsx/node 解析 package.json 等 JSON (Claude Code memory)
+alwaysApply: true
+---
+
+<!-- Synced from Claude Code memory on 2026-09-01 -->
+
+---
+name: powershell-utf8-bom-breaks-json
+description: PowerShell 5.1 的 Set-Content/Out-File -Encoding utf8 会写 BOM，破坏 tsx/node 解析 package.json 等 JSON
+metadata: 
+  node_type: memory
+  type: feedback
+  originSessionId: 90ccd8e9-39f2-41a1-b5c3-19c4130b24d2
+  modified: 2026-07-25T01:57:28.017Z
+---
+
+在 Windows PowerShell 5.1 环境里，**绝不用 `Set-Content`/`Out-File -Encoding utf8` 写 JSON 或代码文件**——它会加 UTF-8 BOM（首三字节 EF BB BF / 239 187 191）。tsx 解析带 BOM 的 package.json 会直接崩（`Error: Error parsing: package.json`），node 的某些解析也会。
+
+**Why:** 在 Agent_Design 项目里为改 package.json 版本号栽了两次（v0.4 和 v0.8），每次都浪费一轮排查——现象是后台 tsx 运行报 package.json parse error，而文件内容看着完全正常。
+
+**How to apply:** 改 JSON / 源码文件一律用 Write 或 Edit 工具（无 BOM）。必须用 PowerShell 写文件时，用 `[System.IO.File]::WriteAllText(path, text)`（默认无 BOM）或 `-Encoding utf8NoBOM`（仅 PS 6+）。验证：`[System.IO.File]::ReadAllBytes(f)[0]` 若为 239 即有 BOM。相关：[[agent-design-harness-project]]

@@ -1,0 +1,33 @@
+---
+description: 'Windows 上 TaskStop 杀后台 bash 任务杀不干净 node 子进程,僵尸会继续跑并污染共享资源;停止后必须用进程列表验证' (Claude Code memory)
+alwaysApply: true
+---
+
+<!-- Synced from Claude Code memory on 2026-09-01 -->
+
+---
+name: windows-taskstop-node-zombie
+description: "Windows 上 TaskStop 杀后台 bash 任务杀不干净 node 子进程,僵尸会继续跑并污染共享资源;停止后必须用进程列表验证"
+metadata: 
+  node_type: memory
+  type: feedback
+  originSessionId: 6894e6cd-c059-4c2b-8f8f-661a53bf1202
+  modified: 2026-08-07T02:56:15.433Z
+---
+
+在本机(Windows 11)用 TaskStop 停掉 `run_in_background` 的 bash 任务时,**node/tsx 子进程树经常存活**,变成僵尸继续运行——曾导致两个"已停止"的 eval 实验与新实验并发,抢占 Ollama 串行队列、互相清写共享的 eval-out/ 目录,污染整批实验数据(见 [[agent-design-harness-project]])。
+
+**Why:** TaskStop 只杀了 bash 包装进程,Windows 下进程树的孙子进程(npx → node → tsx)不随父进程退出。僵尸还会继续往原 output 文件写内容,造成"任务已停但输出还在长"的诡异现象——这也是识别僵尸的信号。
+
+**How to apply:** 停掉会启动 node 的后台任务后,立即验证:`Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object { $_.CommandLine -match '<脚本名>' }`,有残留就 `taskkill /PID <根PID> /T /F`(/T 杀整棵树)。凡是共享资源(Ollama 队列、输出目录)的实验,启动新实验前先确认旧进程死透。
+
+**端口判据的修正(2026-08-07 实测)**:"验证端口已释放"不能直接看 `Get-NetTCPConnection -LocalPort N` 有没有返回——刚断开的连接会以 **TimeWait** 状态残留几十秒,且 `OwningProcess = 0`。照着这个结果去 `taskkill` 会对 **PID 0 / PID 4(System)** 发命令(我这么干过一次,系统以 Access denied 拒绝,无害但完全是误判)。正确判据:
+
+```powershell
+Get-NetTCPConnection -LocalPort 4173 -EA SilentlyContinue |
+  Where-Object { $_.State -eq 'Listen' -and $_.OwningProcess -gt 4 }
+```
+
+有 **Listen** 才叫还占着;TimeWait 一律无视。再配一条按 CommandLine 找残留 node 的检查,两条都空才算停干净。
+
+**硬件版同款(2026-07-28)**:STM32 调试"硬件不可达"(CPUID/IDCODE 读全 0)先查僵尸 `openocd.exe`——它独占 ST-Link,新会话与它抢探针的表型是"SWD 握手偶尔成功、流量一上就死",极易误诊为接线/供电问题(当时电压正常、换线换探针都没用,taskkill 僵尸 openocd 后 self_check 立刻全绿)。机器上还常驻多个各时段的 stm32-gdb-mcp.exe(.codex runtimes 各会话残留),排障时一并检查。
