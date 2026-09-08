@@ -71,7 +71,7 @@ function modelsBody(overrides: Record<string, unknown> = {}): Record<string, unk
       { id: "m-fast", label: "快模型", provider: "openai", model: "deepseek-v4-flash", baseUrl: "https://api.deepseek.com", apiKey: "sk-fast-secret" },
       { id: "m-strong", label: "强模型", provider: "anthropic", model: "claude-opus-4-8", baseUrl: "" },
     ],
-    roles: { executor: "m-fast", planner: null, verifier: "m-strong", vision: null },
+    roles: { executor: "m-fast", planner: null, verifier: "m-strong", vision: null, image: null },
     ...overrides,
   };
 }
@@ -187,6 +187,7 @@ describe("PUT 重装配", () => {
     expect(after.roleModels.verifier).toMatchObject({ model: "claude-opus-4-8", provider: "anthropic", configured: true });
     expect(after.roleModels.planner.configured).toBe(false);
     expect(after.roleModels.vision.configured).toBe(false);
+    expect(after.roleModels.image.configured).toBe(false);
     // 注入 modelClient 的宿主锁定执行者：执行者不被库改写（仪器纪律）
     expect(after.roleModels.executor.model).toBe(before.roleModels.executor.model);
   });

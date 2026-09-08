@@ -1,7 +1,7 @@
 /**
  * SAFE-06 Phase 1 — 工具副作用事务层（纯函数 + 执行器钩子）。
  *
- * 范围：write_file / edit_file / bash 三个副作用内置工具。
+ * 范围：write_file / edit_file / bash / generate_image 四个副作用内置工具。
  * - idempotencyKey = runId:toolUseId（inputHash 只作审计与同 id 异参 fail-closed）
  * - 生命周期：prepared → running → committed | failed | aborted
  * - write_file：idempotent_retry（prepared 可重入；committed 跳过）
@@ -14,7 +14,7 @@
 import { createHash } from "node:crypto";
 import type { ToolResult } from "./types.js";
 
-export const SIDE_EFFECT_TOOL_NAMES = new Set(["write_file", "edit_file", "bash"]);
+export const SIDE_EFFECT_TOOL_NAMES = new Set(["write_file", "edit_file", "bash", "generate_image"]);
 
 export const TOOL_TX_STATUSES = [
   "prepared",

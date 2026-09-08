@@ -3820,6 +3820,39 @@ describe("ui-server", () => {
     expect(raw).not.toContain("api.moonshot.cn");
   });
 
+  it("配了 AGENT_IMAGE_MODEL 才注册 generate_image；没配就不该摆在工具面上", async () => {
+    handle = createUiServer({ modelClient: new FakeModelClient([]), workdir: process.cwd() });
+    port = await startServer(handle);
+    let snap = await (await fetch(`${baseUrl(port)}/api/harness`)).json() as any;
+    expect(snap.tools.map((t: any) => t.name)).not.toContain("generate_image");
+    expect(snap.roleModels.image.configured).toBe(false);
+    await handle.close();
+
+    handle = createUiServer({
+      modelClient: new FakeModelClient([]), workdir: process.cwd(),
+      roleEnv: {
+        AGENT_IMAGE_MODEL: "dall-e-3",
+        AGENT_IMAGE_PROVIDER: "openai",
+        AGENT_IMAGE_BASE_URL: "https://api.example-images.test/v1",
+        AGENT_IMAGE_API_KEY: "sk-image-must-not-leak",
+      },
+    });
+    port = await startServer(handle);
+    const raw = await (await fetch(`${baseUrl(port)}/api/harness`)).text();
+    snap = JSON.parse(raw);
+
+    const image = snap.tools.find((t: any) => t.name === "generate_image");
+    expect(image, "配了生图模型却没注册工具").toBeDefined();
+    expect(image.origin).toBe("builtin");
+    expect(image.permission).toBe("ask");
+    expect(image.approvalPolicy).toEqual({ maxScope: "once" });
+    expect(snap.roleModels.image).toEqual({
+      model: "dall-e-3", provider: "openai", configured: true,
+    });
+    expect(raw).not.toContain("sk-image-must-not-leak");
+    expect(raw).not.toContain("api.example-images.test");
+  });
+
   /**
    * 仪器纪律（与台账 / 历史落盘 / 日预算门同一条）：注入了 modelClient 的宿主跑的是
    * 假模型，不该被 shell 里残留的 env 武装。真实事故（2026-09-03）：开发机残留
@@ -3831,6 +3864,7 @@ describe("ui-server", () => {
       AGENT_VERIFIER_MODEL: "residual-verifier",
       AGENT_PLANNER_MODEL: "residual-planner",
       AGENT_VISION_MODEL: "residual-vision",
+      AGENT_IMAGE_MODEL: "residual-image",
       AGENT_FALLBACK_MODEL: "residual-backup",
       AGENT_FALLBACK_PROVIDER: "anthropic",
       // 非法值：真实宿主会在启动时炸——注入宿主根本不该读到它
@@ -3856,7 +3890,9 @@ describe("ui-server", () => {
       expect(snap.roleModels.verifier).toEqual({ configured: false });
       expect(snap.roleModels.planner).toEqual({ configured: false });
       expect(snap.roleModels.vision).toEqual({ configured: false });
+      expect(snap.roleModels.image).toEqual({ configured: false });
       expect(snap.tools.map((t: any) => t.name)).not.toContain("describe_image");
+      expect(snap.tools.map((t: any) => t.name)).not.toContain("generate_image");
       expect(snap.fallbackChain).toBeNull();
       expect(snap.fallbackScope).toBeNull();
       // 落点是选项给的那个目录，不是 env 里的；保留数是缺省 50，不是 env 里的 1

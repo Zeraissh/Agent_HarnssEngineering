@@ -118,4 +118,12 @@ describe("buildNewRunRequest 正交旋钮", () => {
       lineageBudget: false,
     });
   });
+
+  it("自动匹配领域包：传 autoPack，不传手选 pack", () => {
+    expect(buildNewRunRequest({ task: "t", autoPack: true, pack: "ts-coding" })).toEqual(
+      expect.objectContaining({ autoPack: true }),
+    );
+    expect(buildNewRunRequest({ task: "t", autoPack: true, pack: "ts-coding" })).not.toHaveProperty("pack");
+    expect(buildNewRunRequest({ task: "t", pack: "ts-coding" })).toMatchObject({ pack: "ts-coding" });
+  });
 });

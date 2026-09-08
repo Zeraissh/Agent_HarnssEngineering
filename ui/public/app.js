@@ -721,6 +721,12 @@ export function reduceEvent(state, sseEvent) {
         // 上下文窗口（事实）/ 预算（策略）各带来源（MEM-01 窗口 / 预算分离）——三段水位条的唯一数据源
         context: normalizeContextConfig(event.context),
         tools: Array.isArray(event.tools) ? event.tools : [],
+        packRoute: event.packRoute && typeof event.packRoute === "object"
+          ? {
+              pack: event.packRoute.pack == null ? null : String(event.packRoute.pack),
+              reason: String(event.packRoute.reason ?? ""),
+            }
+          : null,
       },
     };
   }
@@ -2069,6 +2075,7 @@ export function buildNewRunRequest({
   useVerifierModel = true,
   usePlannerModel = true,
   contextTokenLimit,
+  autoPack = false,
 } = {}) {
   const trimmedRubric = String(rubric ?? "").trim();
   // 逐 run 上下文预算：空 / 非数字不传（沿用 env > 包 > 默认）；填了就原样交给宿主校验区间——
@@ -2095,7 +2102,8 @@ export function buildNewRunRequest({
   return {
     task: String(task ?? ""),
     verify: Boolean(verify),
-    ...(pack ? { pack } : {}),
+    ...(pack && !autoPack ? { pack } : {}),
+    ...(autoPack ? { autoPack: true } : {}),
     ...(effort ? { effort } : {}),
     ...(trimmedRubric ? { rubric: trimmedRubric } : {}),
     ...(budget !== undefined && Number.isFinite(budget) ? { contextTokenLimit: budget } : {}),
@@ -2333,6 +2341,10 @@ export function patchComposer(mode, root = document) {
     if (!toggle.enabled && active === verify && input?.focus) input.focus();
   }
 
+  const autoPack = q("#auto-pack-toggle");
+  const packEl = q("#pack-select");
+  if (packEl && autoPack?.checked) setAttr(packEl, "disabled", "");
+
   const effort = q("#effort-select");
   if (effort) {
     if (mode.kind === "append" && mode.runId) {
@@ -2345,6 +2357,21 @@ export function patchComposer(mode, root = document) {
       }
     } else if (mode.kind === "new" && form?.dataset.effortRun) {
       delete form.dataset.effortRun;
+    }
+  }
+
+  const workdirEl = q("#workdir-select");
+  if (workdirEl instanceof HTMLSelectElement) {
+    if (mode.kind === "append" && mode.workdir) {
+      if (form?.dataset.workdirRun !== String(mode.runId ?? "")) {
+        if ([...workdirEl.options].some((o) => o.value === mode.workdir)) {
+          workdirEl.value = mode.workdir;
+          workdirEl.title = mode.workdir;
+        }
+        if (form) form.dataset.workdirRun = String(mode.runId ?? "");
+      }
+    } else if (mode.kind === "new" && form?.dataset.workdirRun) {
+      delete form.dataset.workdirRun;
     }
   }
 }
@@ -2686,6 +2713,8 @@ export function deriveThreadTitle(runs, runId, max = 24) {
   const rootId = conversationRootId(runs, runId);
   const root = (runs ?? []).find((r) => r.runId === rootId);
   const tip = (runs ?? []).find((r) => r.runId === runId);
+  const stored = String(root?.title || tip?.title || "").trim();
+  if (stored) return clip(stored, max);
   return deriveRunTitle(root?.task ?? tip?.task, max);
 }
 
@@ -3076,7 +3105,29 @@ export function expirePendingApprovals(state) {
  * @param {(runId:string)=>void} onSelect
  * @param {Map<string, import('./app.js').RunListItemMeta>} [metaMap]
  */
-export function renderRunList(runs, selectedRunId, onSelect, metaMap, onDelete) {
+export const WORKDIR_GROUP_COLLAPSE_KEY = "agent.ui.pref.collapsedWorkdirs";
+
+export function readCollapsedWorkdirGroups(storage = globalThis.localStorage) {
+  try {
+    const raw = storage?.getItem?.(WORKDIR_GROUP_COLLAPSE_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return new Set(Array.isArray(parsed) ? parsed.map(String) : []);
+  } catch {
+    return new Set();
+  }
+}
+
+export function toggleCollapsedWorkdirGroup(key, storage = globalThis.localStorage) {
+  const next = readCollapsedWorkdirGroups(storage);
+  if (next.has(key)) next.delete(key);
+  else next.add(key);
+  try {
+    storage?.setItem?.(WORKDIR_GROUP_COLLAPSE_KEY, JSON.stringify([...next]));
+  } catch { /* ignore */ }
+  return next;
+}
+
+export function renderRunList(runs, selectedRunId, onSelect, metaMap, onDelete, groupState) {
   const listEl = document.getElementById("run-list");
   if (!listEl) return;
   if (runs.length === 0) {
@@ -3109,25 +3160,35 @@ export function renderRunList(runs, selectedRunId, onSelect, metaMap, onDelete) 
       box.setAttribute("aria-label", g.label);
       box.innerHTML =
         '<div class="run-group-label">' +
-        '<span class="run-group-identity"><i class="ph ph-folder-simple" aria-hidden="true"></i><span class="run-group-name"></span></span>' +
+        '<span class="run-group-identity"><i class="ph ph-caret-down run-group-caret" aria-hidden="true"></i><i class="ph ph-folder-simple" aria-hidden="true"></i><span class="run-group-name"></span></span>' +
         '<span class="run-group-count"></span>' +
         '</div><div class="run-group-items"></div>';
-      patchRunGroupHeader(box, g);
+      const toggle = box.querySelector(".run-group-label");
+      toggle?.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        groupState?.onToggle?.(g.key);
+      });
+      patchRunGroupHeader(box, g, groupState?.collapsed);
       patchRunItems(box.querySelector(".run-group-items"), g.runs, metaMap, selectedRunId, onSelect, onDelete);
       return box;
     },
     update: (box, g) => {
-      patchRunGroupHeader(box, g);
+      patchRunGroupHeader(box, g, groupState?.collapsed);
       patchRunItems(box.querySelector(".run-group-items"), g.runs, metaMap, selectedRunId, onSelect, onDelete);
     },
   });
 }
 
-function patchRunGroupHeader(box, group) {
+function patchRunGroupHeader(box, group, collapsed) {
   const label = box.querySelector(".run-group-label");
+  const isCollapsed = Boolean(collapsed?.has(group.key));
   setText(box.querySelector(".run-group-name"), group.label);
   setText(box.querySelector(".run-group-count"), String(group.runs.length));
   setAttr(label, "title", group.key === "(default)" ? "默认工作目录" : group.key);
+  setClass(box, "run-group--collapsed", isCollapsed);
+  const caret = box.querySelector(".run-group-caret");
+  if (caret) caret.className = `ph ${isCollapsed ? "ph-caret-right" : "ph-caret-down"} run-group-caret`;
 }
 
 /**
@@ -3253,7 +3314,7 @@ function updateRunItem(el, r, metaMap, selectedRunId, onDelete) {
   setText(stateLabel, r.status === "running" ? "运行中" : "已完成");
   setClass(stateLabel, "thinking-shimmer", r.status === "running");
   // 标题是算出来的短句；完整任务原文挂 title，鼠标停一下就能看全
-  setText(el.querySelector(".run-item-task"), deriveRunTitle(r.task));
+  setText(el.querySelector(".run-item-task"), String(r.title || "").trim() || deriveRunTitle(r.task));
   setAttr(el.querySelector(".run-item-task"), "title", r.task);
   const recap = String(meta?.recap || r.recap || "").trim();
   const recapEl = el.querySelector(".run-item-recap");
@@ -3748,10 +3809,17 @@ export function deriveAssemblyBar(state, harness) {
   );
 
   // 领域包：本项目最独特的装配单位
+  const routed = cfg.packRoute && typeof cfg.packRoute === "object" ? cfg.packRoute : null;
+  const packName = pack?.name ?? null;
   push(
     "pack",
-    pack?.name ?? "无领域包",
-    "领域包一次装配三样东西：系统提示、工具面、以及**核查者的只读白名单与预算**。" +
+    packName
+      ? (routed ? `${packName} · 自动` : packName)
+      : routed
+        ? "无领域包 · 自动"
+        : "无领域包",
+    (routed ? `本次由自动路由选定${routed.reason ? `（${routed.reason}）` : ""}。` : "") +
+      "领域包一次装配三样东西：系统提示、工具面、以及**核查者的只读白名单与预算**。" +
       "分开配的后果案例 #4 实证过——核查者没有可用的只读命令，会在 22 轮里反复重新证明已经为真的事（核查饥饿），" +
       "烧光预算却什么也没查出来。",
   );
@@ -3858,6 +3926,21 @@ export function deriveAssemblyBar(state, harness) {
       : "没配视觉模型（`AGENT_VISION_MODEL`），所以 `describe_image` **根本不进工具面**——" +
         "而不是摆一个一调用就报错的工具。给模型一个用不了的工具，它会反复尝试并把失败归咎于自己；" +
         "工具面必须与真实能力一致，这是工具运行时地板那条纪律。",
+  );
+
+  const imageRun = cfg.roleModels?.image ?? null;
+  const imageCfg = harness?.roleModels?.image ?? null;
+  const imageName =
+    (typeof imageRun === "string" && imageRun) ||
+    (imageCfg && imageCfg.configured ? imageCfg.model ?? "已配" : null);
+  push(
+    "image",
+    imageName ? `生图 ${imageName}` : "生图 未配",
+    imageName
+      ? "配了生图模型，`generate_image` 才在工具面上。走独立 Images API，与执行者解耦——" +
+        "执行模型不必自己会画图。"
+      : "没配生图模型（`AGENT_IMAGE_MODEL`），所以 `generate_image` **根本不进工具面**——" +
+        "而不是摆一个一调用就报错的工具。",
   );
 
   /**
@@ -5701,6 +5784,7 @@ function renderToolsTab(tools) {
     html += row("planner 模型", rm.planner ?? "（与执行者同一个）");
     // 没配视觉模型时说清"看不了图"，而不是不提——执行者不知道自己缺这个能力
     html += row("视觉模型", rm.vision ?? "（未配置：本次运行看不了图）");
+    html += row("生图模型", rm.image ?? "（未配置：本次运行不能生图）");
   }
   html += row("额外只读根", tools.readRoots.length ? tools.readRoots.join("；") : "（无）");
   if (tools.history) {
@@ -7219,6 +7303,7 @@ const TOOL_VERB = {
   write_file: "write",
   fetch_url: "fetch",
   describe_image: "看图",
+  generate_image: "生图",
   memory_read: "记忆",
   memory_write: "记忆",
   memory_search: "记忆",
@@ -8103,6 +8188,12 @@ export function renderEmptyState(hasRuns) {
     `<p>${hasRuns
       ? "工作目录决定工具可触碰的边界；选好项目与角色模型，再把目标交给 Agent。"
       : "先选工作目录与角色模型，再描述目标。下面的例子只会填入输入框，由你确认后提交。"}</p>` +
+    '<div class="empty-hints">' +
+    '<button type="button" class="empty-workdir-hint" data-focus-workdir="1">' +
+    '<i class="ph ph-folder-simple" aria-hidden="true"></i>先选定这次任务的工作目录</button>' +
+    '<button type="button" class="empty-workdir-hint" data-replay-onboarding="1">' +
+    '<i class="ph ph-hand-waving" aria-hidden="true"></i>看看怎么用</button>' +
+    "</div>" +
     '<ul class="example-tasks">' +
     EXAMPLE_TASKS.map(
       (e, index) =>

@@ -130,6 +130,10 @@
       <i class="ph ph-clock" aria-hidden="true"></i>
       <span>定时任务</span>
     </button>
+    <button type="button" class="settings-open-btn" id="usage-open-btn" aria-label="打开消耗">
+      <i class="ph ph-chart-bar" aria-hidden="true"></i>
+      <span>消耗</span>
+    </button>
     <button type="button" class="settings-open-btn" id="settings-open-btn" aria-label="打开设置">
       <i class="ph ph-gear" aria-hidden="true"></i>
       <span>设置</span>
@@ -211,6 +215,10 @@
             <i class="ph ph-image" aria-hidden="true"></i>
             <span id="vision-role-text">识图 · 未配置</span>
           </span>
+          <span class="role-model-pill role-model-pill--muted" id="image-role-row">
+            <i class="ph ph-palette" aria-hidden="true"></i>
+            <span id="image-role-text">生图 · 未配置</span>
+          </span>
         </div>
         <span class="sr-only" id="role-models-hint"></span>
       </div>
@@ -253,6 +261,7 @@
       <i class="ph ph-paper-plane-right" aria-hidden="true"></i>
     </button>
     </div>
+    <p id="composer-suggest" class="composer-suggest" hidden aria-live="polite"></p>
     <div class="composer-quickbar">
       <label class="checkbox-label verify-toggle-label">
         <input type="checkbox" id="verify-toggle" />
@@ -312,6 +321,11 @@
         <select id="pack-select">
           <option value="">（不用领域包）</option>
         </select>
+        <label class="knob-check">
+          <input type="checkbox" id="auto-pack-toggle" />
+          自动匹配领域包
+        </label>
+        <span class="knob-hint" id="auto-pack-hint">按任务内容路由到已注册的包；选了具体包时以手选为准</span>
       </div>
       <div class="knob">
         <label for="plan-mode-toggle">计划模式</label>
@@ -366,8 +380,11 @@ import {
   filterRunsByQuery,
   conversationTipId,
   renderRunList,
+  readCollapsedWorkdirGroups,
+  toggleCollapsedWorkdirGroup,
   renderRunDetail,
   renderEmptyState,
+  EXAMPLE_TASKS,
   deriveComposerMode,
   composerSubmitPlan,
   buildNewRunRequest,
@@ -392,6 +409,9 @@ import {
   SETTINGS_HASH,
   initSettingsView,
 } from "/features/settings.js";
+import { initOnboarding } from "/features/onboarding.js";
+import { initComposerComplete } from "/features/complete.js";
+import { appendReviewToInput } from "/features/review-mode.js";
 import {
   isSchedulesRoute,
   SCHEDULES_HASH,
@@ -418,6 +438,11 @@ import {
   COMMAND_CENTER_HASH,
   initCommandCenterView,
 } from "/features/command-center.js";
+import {
+  isUsageRoute,
+  USAGE_HASH,
+  initUsageView,
+} from "/features/usage.js";
 
 // ---- 状态 ----
 /** @type {Map<string, import('/app.js').RunState>} */
@@ -435,6 +460,9 @@ let notificationsApi = /** @type {null|{ ingest:(runId:string, sseEvent:any)=>vo
  * 自动放行）启动时读它，当次改动不回写（除了自动放行，见下方 change 处理器）。
  */
 let settingsApi = /** @type {null|{ open:()=>void, close:()=>void, isOpen:()=>boolean, refresh:()=>void }} */ (null);
+let onboardingApi = /** @type {null|{ start:(opts?:{force?:boolean})=>boolean, replay:()=>boolean, isOpen:()=>boolean }} */ (null);
+let completeApi = /** @type {null|{ setEnabled:(on:boolean)=>void, isEnabled:()=>boolean }} */ (null);
+let usageApi = /** @type {null|{ open:()=>void, close:()=>void }} */ (null);
 
 /**
  * 变更审查（T8）实例，由文件末尾的动态 import 赋值；未加载时为 null，所有调用点可选链。
@@ -650,6 +678,17 @@ function syncScrollNav() {
   const area = document.getElementById("main-area");
   if (!area) return;
   area.addEventListener("click", (e) => {
+    const workdirBtn = e.target.closest?.("[data-focus-workdir]");
+    if (workdirBtn) {
+      workdirSelect?.focus();
+      workdirSelect?.showPicker?.();
+      return;
+    }
+    const tourBtn = e.target.closest?.("[data-replay-onboarding]");
+    if (tourBtn) {
+      onboardingApi?.replay();
+      return;
+    }
     const btn = e.target.closest?.("[data-example]");
     if (!btn) return;
     taskInput.value = btn.getAttribute("data-example");
@@ -720,6 +759,7 @@ const themeChoices = /** @type {HTMLButtonElement[]} */ ([...document.querySelec
 const knobsToggle = /** @type {HTMLButtonElement} */ (document.getElementById("knobs-toggle"));
 const runKnobs = /** @type {HTMLElement} */ (document.getElementById("run-knobs"));
 const packSelect = /** @type {HTMLSelectElement} */ (document.getElementById("pack-select"));
+const autoPackToggle = /** @type {HTMLInputElement|null} */ (document.getElementById("auto-pack-toggle"));
 const effortSelect = /** @type {HTMLSelectElement} */ (document.getElementById("effort-select"));
 const rubricInput = /** @type {HTMLTextAreaElement} */ (document.getElementById("rubric-input"));
 const planModeToggle = /** @type {HTMLInputElement|null} */ (document.getElementById("plan-mode-toggle"));
@@ -800,7 +840,13 @@ function refreshRunListView() {
   }
   const filtered = getFilteredRuns();
   const metaMap = deriveRunListItems(filtered, runStates, unreadRuns);
-  renderRunList(filtered, selectedRunId, selectRun, metaMap, deleteConversation);
+  renderRunList(filtered, selectedRunId, selectRun, metaMap, deleteConversation, {
+    collapsed: readCollapsedWorkdirGroups(),
+    onToggle: (key) => {
+      toggleCollapsedWorkdirGroup(key);
+      refreshRunListView();
+    },
+  });
   if (!selectedRunId) {
     renderEmptyState(runs.length > 0);
   }
@@ -937,6 +983,7 @@ function writeHash(runId, tab) {
   settingsApi?.close();
   schedulesApi?.close();
   boardApi?.close();
+  usageApi?.close();
   artifactCanvasApi?.close();
   pendingArtifact = null;
   // hashchange 是异步派发的，标志位要等它跑完再清
@@ -955,6 +1002,7 @@ function parseRoute() {
   if (isSettingsRoute(location.hash || "")) return { kind: "settings" };
   if (isSchedulesRoute(location.hash || "")) return { kind: "schedules" };
   if (isCommandCenterRoute(location.hash || "")) return { kind: "board" };
+  if (isUsageRoute(location.hash || "")) return { kind: "usage" };
   const artifact = parseArtifactRoute(location.hash || "");
   if (artifact) return { kind: "artifact", runId: artifact.runId, index: artifact.index, full: artifact.full };
   const m = /^#\/run\/([^/]+)(?:\/([^/?]+))?/.exec(location.hash || "");
@@ -963,6 +1011,14 @@ function parseRoute() {
 }
 
 /** 进入设置视图：走 hash，浏览器前进/后退天然可用 */
+function navigateToUsage() {
+  if (isUsageRoute(location.hash || "")) {
+    usageApi?.open();
+    return;
+  }
+  location.hash = USAGE_HASH;
+}
+
 function navigateToSettings() {
   enteredSettingsFromApp = true;
   if (isSettingsRoute(location.hash || "")) {
@@ -1019,31 +1075,48 @@ function closeBoardRoute() {
   location.hash = "#/";
 }
 
+function closeUsageRoute() {
+  location.hash = "#/";
+}
+
 function applyHash() {
   const route = parseRoute();
   if (route.kind === "settings") {
     schedulesApi?.close();
     boardApi?.close();
+    usageApi?.close();
     settingsApi?.open();
     return;
   }
   if (route.kind === "schedules") {
     settingsApi?.close();
     boardApi?.close();
+    usageApi?.close();
     schedulesApi?.open();
     return;
   }
   if (route.kind === "board") {
     settingsApi?.close();
     schedulesApi?.close();
+    usageApi?.close();
     artifactCanvasApi?.close();
     pendingArtifact = null;
     boardApi?.open();
     return;
   }
+  if (route.kind === "usage") {
+    settingsApi?.close();
+    schedulesApi?.close();
+    boardApi?.close();
+    artifactCanvasApi?.close();
+    pendingArtifact = null;
+    usageApi?.open();
+    return;
+  }
   settingsApi?.close();
   schedulesApi?.close();
   boardApi?.close();
+  usageApi?.close();
   if (route.kind === "artifact") {
     // 产物画布深链：先确保会话选中（selectRun 的 writeHash 会盖掉深链，随后恢复），
     // 产物清单就位后 openPendingArtifact 补开；state 还没流到产物时挂账等渲染。
@@ -1962,6 +2035,7 @@ async function submitNewRun({ text: task }) {
         rubric: rubricInput?.value,
         planMode: planModeToggle?.checked === true,
         multiAgent: multiAgentToggle?.checked === true,
+        autoPack: autoPackToggle?.checked === true,
         lineageBudget: false,
         dailyBudget: false,
         askUser: true,
@@ -2193,7 +2267,10 @@ function populateKnobs(snap) {
   // V-29 工作目录：列宿主声明过的集合，末项恒为「＋ 添加目录…」（哨兵值，
   // 选中即打开目录选择器浮层——见 features/workdir-picker.js）
   if (workdirSelect && Array.isArray(snap.availableWorkdirs)) {
-    renderWorkdirOptions(workdirSelect, snap.availableWorkdirs, { selected: snap.workdir });
+    const keep = workdirSelect.value && workdirSelect.value !== WORKDIR_ADD_VALUE
+      ? workdirSelect.value
+      : readPrefString(PREF_WORKDIR, snap.workdir);
+    renderWorkdirOptions(workdirSelect, snap.availableWorkdirs, { selected: keep || snap.workdir });
     // 有了「＋ 添加目录…」就永远有得选：不再因为只有一个目录而锁死下拉。
     // 运行中/追加模式的禁用走 patchComposer 的 optionsEnabled，语义不变。
     workdirSelect.disabled = false;
@@ -2237,14 +2314,25 @@ function populateKnobs(snap) {
         : "未配置视觉模型；图片仍可上传，但不提供 describe_image 工具";
     }
 
+    const imageRow = document.getElementById("image-role-row");
+    const imageText = document.getElementById("image-role-text");
+    if (imageRow && imageText) {
+      const configured = Boolean(rm.image?.configured);
+      imageRow.classList.toggle("role-model-pill--muted", !configured);
+      imageText.textContent = configured ? `生图 · ${rm.image.model}` : "生图 · 未配置";
+      imageRow.title = configured
+        ? `插图由 ${rm.image.model}（${rm.image.provider}）通过 generate_image 工具生成`
+        : "未配置生图模型；不提供 generate_image 工具";
+    }
+
     const hint = document.getElementById("role-models-hint");
     if (hint) {
       // 有实测依据的才说"更好"：D2 支持强 verifier，B3 证伪了强 planner
       hint.textContent = anyVerifier
-        ? "独立角色模型可逐次关闭；关闭后跟随执行模型。识图模型只作为工具接入。"
+        ? "独立角色模型可逐次关闭；关闭后跟随执行模型。识图与生图只作为工具接入。"
         : anyPlanner
           ? "独立角色模型可逐次关闭；关闭后跟随执行模型。"
-          : "规划与核查跟随执行模型；识图模型独立作为工具接入。";
+          : "规划与核查跟随执行模型；识图与生图模型独立作为工具接入。";
     }
   }
 }
@@ -2275,6 +2363,8 @@ if (packSelect) packSelect.addEventListener("change", updatePackHint);
 // 计划模式 / 多 agent：localStorage 记住偏好
 const PREF_PLAN = "agent.ui.pref.planMode";
 const PREF_MULTI = "agent.ui.pref.multiAgent";
+const PREF_WORKDIR = "agent.ui.pref.workdir";
+const PREF_AUTO_PACK = "agent.ui.pref.autoPack";
 function readPref(key, fallback) {
   try {
     const v = localStorage.getItem(key);
@@ -2287,6 +2377,18 @@ function readPref(key, fallback) {
 function writePref(key, on) {
   try {
     localStorage.setItem(key, on ? "1" : "0");
+  } catch { /* ignore */ }
+}
+function readPrefString(key, fallback) {
+  try {
+    return localStorage.getItem(key) ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+function writePrefString(key, value) {
+  try {
+    if (value) localStorage.setItem(key, value);
   } catch { /* ignore */ }
 }
 if (planModeToggle) {
@@ -2304,6 +2406,20 @@ if (planModeToggle) {
 if (multiAgentToggle) {
   multiAgentToggle.checked = readPref(PREF_MULTI, false);
   multiAgentToggle.addEventListener("change", () => writePref(PREF_MULTI, multiAgentToggle.checked));
+}
+if (autoPackToggle) {
+  autoPackToggle.checked = readPref(PREF_AUTO_PACK, false);
+  autoPackToggle.addEventListener("change", () => {
+    writePref(PREF_AUTO_PACK, autoPackToggle.checked);
+    if (packSelect) packSelect.disabled = autoPackToggle.checked;
+    const hint = document.getElementById("auto-pack-hint");
+    if (hint) {
+      hint.textContent = autoPackToggle.checked
+        ? "发送时由 router 选包；手选被忽略。编排模式（计划/多 agent）仍由 planner 按子任务选包"
+        : "按任务内容路由到已注册的包；选了具体包时以手选为准";
+    }
+  });
+  if (autoPackToggle.checked && packSelect) packSelect.disabled = true;
 }
 
 if (knobsToggle && runKnobs) {
@@ -2593,6 +2709,7 @@ if (workdirSelect) {
     });
     wireWorkdirSelect(workdirSelect, {
       onAddRequest: () => workdirPickerApi?.open(workdirSelect.value || null),
+      onChange: (path) => writePrefString(PREF_WORKDIR, path),
     });
   } catch { /* 目录选择器是增强项，初始化失败静默降级 */ }
 }
@@ -2824,6 +2941,11 @@ try {
         patch,
         { effortLevels: harnessSnapshot?.effortLevels ?? null },
       );
+      if (typeof patch?.predictiveInput === "boolean") completeApi?.setEnabled(patch.predictiveInput);
+    },
+    onReplayOnboarding: () => {
+      closeSettingsRoute();
+      onboardingApi?.replay();
     },
     onOpenSettings: () => navigateToSettings(),
     onCloseSettings: () => closeSettingsRoute(),
@@ -2854,6 +2976,68 @@ try {
     });
   }).catch(() => { /* 命令面板注册失败不影响设置本体 */ });
 } catch { /* 设置中心是增强项，初始化失败静默降级 */ }
+
+try {
+  onboardingApi = initOnboarding({
+    onAnnounce: (msg) => announceStatus(msg),
+  });
+  onboardingApi.start();
+  import("./features/command-palette.js").then((palette) => {
+    palette.registerPaletteCommand({
+      id: "replay-onboarding",
+      label: "新手引导",
+      hint: "再看一遍工作目录、输入框和运行设置",
+      icon: "ph-hand-waving",
+      run: () => onboardingApi?.replay(),
+    });
+  }).catch(() => { /* 命令面板注册失败不影响引导本体 */ });
+} catch { /* 新手引导是增强项 */ }
+
+try {
+  completeApi = initComposerComplete({
+    input: taskInput,
+    suggestEl: document.getElementById("composer-suggest"),
+    getRecent: () => {
+      const titles = runs
+        .map((r) => String(r.title || r.task || "").trim())
+        .filter(Boolean)
+        .slice(0, 20);
+      return [...EXAMPLE_TASKS.map((e) => e.text), ...titles];
+    },
+    fetchComplete: async (body) => {
+      const res = await fetch("/api/complete", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) throw new Error(`complete ${res.status}`);
+      return res.json();
+    },
+    announce: (msg) => announceStatus(msg),
+  });
+  completeApi.setEnabled(composerDefaults(uiSettings).predictiveInput);
+} catch { /* 输入补全是增强项 */ }
+
+try {
+  usageApi = initUsageView(document.body, {
+    fetchUsage: async () => {
+      const res = await fetch("/api/usage");
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.json();
+    },
+    onClose: () => closeUsageRoute(),
+  });
+  document.getElementById("usage-open-btn")?.addEventListener("click", () => navigateToUsage());
+  import("./features/command-palette.js").then((palette) => {
+    palette.registerPaletteCommand({
+      id: "open-usage",
+      label: "消耗",
+      hint: "按日、按模型查看台账成本",
+      icon: "ph-chart-bar",
+      run: () => navigateToUsage(),
+    });
+  }).catch(() => {});
+} catch { /* 消耗视图是增强项 */ }
 
 // ---- 定时任务（T9）----
 // 与设置中心同一条纪律：回调委托给本控制器已有函数，模块不反向 import 这里。
@@ -2971,6 +3155,13 @@ try {
     },
     onReveal: (path) => {
       if (selectedRunId) revealArtifact(selectedRunId, path);
+    },
+    onAppendReview: (line) => {
+      taskInput.value = appendReviewToInput(taskInput.value, line);
+      taskInput.dispatchEvent(new Event("input", { bubbles: true }));
+      taskInput.focus();
+      taskInput.setSelectionRange(taskInput.value.length, taskInput.value.length);
+      announceStatus("点评已写入输入框");
     },
     onAnnounce: (msg) => announceStatus(msg),
   });

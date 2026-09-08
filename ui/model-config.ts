@@ -21,8 +21,8 @@ export const MODEL_STORE_SCHEMA_VERSION = 1;
 export const MODEL_STORE_FILENAME = ".agent-models.json";
 
 export type ModelProvider = "anthropic" | "openai";
-export type RoleKey = "executor" | "planner" | "verifier" | "vision";
-export const ROLE_KEYS: readonly RoleKey[] = ["executor", "planner", "verifier", "vision"];
+export type RoleKey = "executor" | "planner" | "verifier" | "vision" | "image";
+export const ROLE_KEYS: readonly RoleKey[] = ["executor", "planner", "verifier", "vision", "image"];
 
 export interface ModelEntry {
   id: string;
@@ -37,13 +37,14 @@ export interface ModelEntry {
 
 /**
  * roles 语义：executor 必须指向库中条目（null 仅在"还没有库"的合成阶段出现）；
- * planner / verifier 的 null = 跟随执行；vision 的 null = 不配置。
+ * planner / verifier 的 null = 跟随执行；vision / image 的 null = 不配置。
  */
 export interface ModelRoles {
   executor: string | null;
   planner: string | null;
   verifier: string | null;
   vision: string | null;
+  image: string | null;
 }
 
 export interface ModelStore {
@@ -109,7 +110,7 @@ export function emptyStore(): ModelStore {
   return {
     schemaVersion: MODEL_STORE_SCHEMA_VERSION,
     models: [],
-    roles: { executor: null, planner: null, verifier: null, vision: null },
+    roles: { executor: null, planner: null, verifier: null, vision: null, image: null },
   };
 }
 
@@ -229,7 +230,7 @@ function envBaseUrl(env: EnvLike, provider: ModelProvider): string {
 
 /**
  * 把 env 现状合成一份初始库。executor 读 executorEnv（真实宿主 = process.env，
- * 口径与既有 `process.env.AGENT_MODEL` 一致）；verifier / planner / vision 读
+ * 口径与既有 `process.env.AGENT_MODEL` 一致）；verifier / planner / vision / image 读
  * roleEnv（仪器纪律：注入宿主拿到的是空 env，自然合成不出角色条目）。
  *
  * env 里的 key 处理分两层：executor 条目的 apiKey 一律 ""（= 继续走
@@ -256,7 +257,12 @@ export function synthesizeStoreFromEnv(
   store.models.push(executorEntry);
   store.roles.executor = executorEntry.id;
 
-  for (const [role, prefix] of [["verifier", "VERIFIER"], ["planner", "PLANNER"], ["vision", "VISION"]] as const) {
+  for (const [role, prefix] of [
+    ["verifier", "VERIFIER"],
+    ["planner", "PLANNER"],
+    ["vision", "VISION"],
+    ["image", "IMAGE"],
+  ] as const) {
     const name = roleEnv[`AGENT_${prefix}_MODEL`];
     if (!name || !isValidModelName(name)) continue;
     const roleProvider = envProvider(roleEnv[`AGENT_${prefix}_PROVIDER`]);
@@ -366,7 +372,7 @@ export function validateModelConfig(
 
   const rawRoles = (input.roles && typeof input.roles === "object" ? input.roles : null) as Record<string, unknown> | null;
   if (!rawRoles) {
-    errors.push("roles 必须是对象：{ executor, planner, verifier, vision }");
+    errors.push("roles 必须是对象：{ executor, planner, verifier, vision, image }");
   } else {
     for (const role of ROLE_KEYS) {
       const id = rawRoles[role];

@@ -44,7 +44,7 @@ function sampleStore(): ModelStore {
       { id: "m-a", label: "强模型", provider: "anthropic", model: "claude-opus-4-8", baseUrl: "", apiKey: "sk-secret" },
       { id: "m-b", label: "快模型", provider: "openai", model: "deepseek-v4-flash", baseUrl: "https://api.deepseek.com", apiKey: "" },
     ],
-    roles: { executor: "m-b", planner: null, verifier: "m-a", vision: null },
+    roles: { executor: "m-b", planner: null, verifier: "m-a", vision: null, image: null },
   };
 }
 
@@ -87,7 +87,7 @@ describe("读写 round-trip 与坏文件容错", () => {
       models: [{ id: "m-a", label: "x", provider: "anthropic", model: "claude-opus-4-8", baseUrl: "", apiKey: "" }],
       roles: { executor: "m-a", verifier: "ghost", planner: 42, vision: null },
     }));
-    expect(parsed?.roles).toEqual({ executor: "m-a", planner: null, verifier: null, vision: null });
+    expect(parsed?.roles).toEqual({ executor: "m-a", planner: null, verifier: null, vision: null, image: null });
   });
 });
 
@@ -123,6 +123,25 @@ describe("env 合成初始库", () => {
     });
     expect(store.roles.planner).toBeNull();
     expect(store.roles.vision).toBeNull();
+    expect(store.roles.image).toBeNull();
+  });
+
+  it("env 配了 AGENT_IMAGE_MODEL → 合成 env:image 条目", () => {
+    const store = synthesizeStoreFromEnv({}, {
+      AGENT_IMAGE_MODEL: "dall-e-3",
+      AGENT_IMAGE_PROVIDER: "openai",
+      AGENT_IMAGE_BASE_URL: "https://api.openai.com/v1",
+      AGENT_IMAGE_API_KEY: "sk-image-role",
+    });
+    const entry = roleEntryOf(store, "image");
+    expect(entry).toMatchObject({
+      id: "env:image",
+      provider: "openai",
+      model: "dall-e-3",
+      baseUrl: "https://api.openai.com/v1",
+      apiKey: "sk-image-role",
+    });
+    expect(store.roles.image).toBe("env:image");
   });
 
   it("非法 AGENT_PROVIDER 回退 anthropic；非法 baseUrl 回退空串", () => {
@@ -239,6 +258,6 @@ describe("脱敏与 baseUrl 规则", () => {
   });
 
   it("emptyStore 的角色初值全 null", () => {
-    expect(emptyStore().roles).toEqual({ executor: null, planner: null, verifier: null, vision: null });
+    expect(emptyStore().roles).toEqual({ executor: null, planner: null, verifier: null, vision: null, image: null });
   });
 });

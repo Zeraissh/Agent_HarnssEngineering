@@ -164,6 +164,31 @@ describe("domain packs", () => {
   });
 });
 
+describe("生图工具按包收窄（generate_image）", () => {
+  it("ts-coding / consult 声明 generate_image；stm32 与 kicad 不声明", () => {
+    expect(PACKS["ts-coding"]!.builtinTools).toContain("generate_image");
+    expect(PACKS.consult!.builtinTools).toContain("generate_image");
+    expect(PACKS["stm32-coding"]!.builtinTools).not.toContain("generate_image");
+    expect(PACKS["stm32-debug"]!.builtinTools).not.toContain("generate_image");
+    expect(PACKS.kicad!.builtinTools).not.toContain("generate_image");
+  });
+
+  it("池里有才进面；没配就干净缺席", () => {
+    const pool = [
+      makeTool({ name: "bash" }),
+      makeTool({ name: "read_file" }),
+      makeTool({ name: "write_file" }),
+      makeTool({ name: "glob" }),
+      makeTool({ name: "grep" }),
+      makeTool({ name: "generate_image" }),
+    ];
+    expect(selectPackTools(PACKS["ts-coding"], pool, []).some((t) => t.name === "generate_image")).toBe(true);
+    expect(selectPackTools(PACKS["ts-coding"], pool.filter((t) => t.name !== "generate_image"), [])
+      .some((t) => t.name === "generate_image")).toBe(false);
+    expect(selectPackTools(PACKS.kicad, pool, []).some((t) => t.name === "generate_image")).toBe(false);
+  });
+});
+
 describe("kicad 包的眼睛（describe_image，案例 #9 收官催生）", () => {
   const basePool = [makeTool({ name: "bash" }), makeTool({ name: "read_file" }), makeTool({ name: "write_file" })];
 

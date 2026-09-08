@@ -25,6 +25,9 @@
  *                       配了才注册 describe_image 工具，让纯文本执行者（DeepSeek/
  *                       Kimi 等）间接获得看图能力。若执行者自己必须看图才能推理
  *                       （如照着截图改 CSS），正解是换执行者模型而不是加这个工具
+ *   AGENT_IMAGE_MODEL   可选，生图模型（+ _PROVIDER / _BASE_URL / _API_KEY）：
+ *                       配了才注册 generate_image。走 OpenAI 兼容 Images API，
+ *                       不是 chat completions；没配就不把工具摆上工具面
  *   AGENT_VERIFIER_MODEL 可选，--verify 时 verifier 用的独立模型（应 ≥ 执行者强度）；
  *                       配套 AGENT_VERIFIER_PROVIDER / _BASE_URL / _API_KEY 可指向
  *                       不同端点，缺省沿用执行者的端点配置
@@ -119,6 +122,9 @@ import {
 } from "./task-completion.js";
 import { bashTool, SHELL_DESC } from "./tools/bash.js";
 import { createDescribeImageTool } from "./tools/describe-image.js";
+import { createGenerateImageTool } from "./tools/generate-image.js";
+import { createOpenAIImageClient, DEFAULT_OPENAI_IMAGE_BASE } from "./image-client.js";
+import { assertSafeProviderEndpoint } from "./provider-config.js";
 import { createWebSearchTool, isWebSearchConfigured } from "./tools/web-search.js";
 import { fetchUrlTool } from "./tools/fetch-url.js";
 import { editFileTool } from "./tools/edit-file.js";
@@ -569,6 +575,29 @@ async function main(): Promise<void> {
   const visionTool = visionClient
     ? createDescribeImageTool({ client: visionClient, modelName: visionModelName! })
     : undefined;
+  /**
+   * 生图（第五个角色）。Images API 不是 chat——不包 ModelClient、不进降级链。
+   * 配了才注册 generate_image，没配就不摆一个一调用就报错的工具。
+   */
+  const imageModelName = process.env.AGENT_IMAGE_MODEL;
+  const imageBaseURL = (
+    process.env.AGENT_IMAGE_BASE_URL
+    || process.env.OPENAI_BASE_URL
+    || DEFAULT_OPENAI_IMAGE_BASE
+  ).replace(/\/+$/, "");
+  let imageTool: ReturnType<typeof createGenerateImageTool> | undefined;
+  if (imageModelName) {
+    assertSafeProviderEndpoint(imageBaseURL, "AGENT_IMAGE_BASE_URL");
+    imageTool = createGenerateImageTool({
+      client: createOpenAIImageClient({
+        model: imageModelName,
+        baseURL: imageBaseURL,
+        apiKey: process.env.AGENT_IMAGE_API_KEY || process.env.OPENAI_API_KEY || "",
+      }),
+      modelName: imageModelName,
+    });
+    console.log(c.dim(`image model: ${imageModelName}`));
+  }
   const webSearchTool = isWebSearchConfigured() ? createWebSearchTool() : undefined;
   if (webSearchTool) console.log(c.dim("web_search: Tavily configured"));
 
@@ -585,6 +614,7 @@ async function main(): Promise<void> {
       updateProgressTool,
       ...(webSearchTool ? [webSearchTool] : []),
       ...(visionTool ? [visionTool] : []),
+      ...(imageTool ? [imageTool] : []),
     ].map((t) => [t.name, t]),
   );
   const builtinNames = pack?.builtinTools ?? [...builtinByName.keys()];
@@ -595,7 +625,7 @@ async function main(): Promise<void> {
    * describe_image 而未配 AGENT_VISION_MODEL，启动即炸——省略才是正确语义
    * （plan 模式的 selectPackTools 本就静默过滤，两条装配路径的语义要一致）。
    */
-  const CONDITIONAL_BUILTINS = new Set(["describe_image", "web_search"]);
+  const CONDITIONAL_BUILTINS = new Set(["describe_image", "web_search", "generate_image"]);
   const ALWAYS_ON = new Set(["update_progress"]);
   const namesForPool = [...new Set([...builtinNames, ...ALWAYS_ON])];
   const builtins = namesForPool.flatMap((n) => {
@@ -919,6 +949,7 @@ async function main(): Promise<void> {
       updateProgressTool,
       ...(webSearchTool ? [webSearchTool] : []),
       ...(visionTool ? [visionTool] : []),
+      ...(imageTool ? [imageTool] : []),
     ];
     const mcpPool = mcp?.tools ?? [];
     let currentStep = "";

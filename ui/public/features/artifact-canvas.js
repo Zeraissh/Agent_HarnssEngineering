@@ -32,6 +32,13 @@
 import { renderMarkdown } from "../core/markdown.js";
 import { highlight, normalizeLang } from "../core/highlight.js";
 import { createPreviewDock } from "./preview-dock.js";
+import {
+  attachImageAnnotator,
+  formatImageReview,
+  formatReviewComment,
+  injectInspectHook,
+  isInspectPick,
+} from "./review-mode.js";
 
 // ---------------------------------------------------------------
 // 常量
@@ -272,9 +279,10 @@ function renderPreviewErrorCard(body, message) {
  * 「先转义再变换」纪律只有一份，不会两处漂移。
  *
  * @param {HTMLElement} body 渲染容器
- * @param {{ path:string, url:string, fetch:Function|null, isStale?:()=>boolean }} opts
+ * @param {{ path:string, url:string, fetch:Function|null, isStale?:()=>boolean, inspect?:boolean }} opts
  *   path 只做类型分派与标题；url 是取件地址（圈禁在服务端端点做）；
  *   isStale 返回 true 表示调用方已切走，放弃渲染并返回 null。
+ *   inspect 仅 HTML：取文本、剥 script、注入点选钩子，用 srcdoc 打开。关着时仍走 src= URL，不 fetch。
  * @returns {Promise<{ size:number|null }|null>}
  *   读到的字节数（不可得/未读取为 null）；isStale 中途成立时整体返回 null。
  */
@@ -302,11 +310,35 @@ export async function renderPreviewBody(body, opts) {
   switch (kind) {
     case "html": {
       // 沙箱纪律见文件头注释：allow-scripts 但不给 allow-same-origin
-      body.innerHTML =
-        `<iframe class="ac-frame" sandbox="allow-scripts" referrerpolicy="no-referrer" ` +
-        `src="${esc(url)}" title="${esc(name)}"></iframe>` +
+      const note =
         `<p class="ac-note">HTML 产物在隔离沙箱中渲染；其内部的相对资源引用可能失效，属预期。</p>`;
-      return { size: null };
+      if (!opts.inspect) {
+        body.innerHTML =
+          `<iframe class="ac-frame" sandbox="allow-scripts" referrerpolicy="no-referrer" ` +
+          `src="${esc(url)}" title="${esc(name)}"></iframe>` +
+          note;
+        return { size: null };
+      }
+      body.innerHTML = '<p class="ac-note">正在准备点评模式…</p>';
+      const raw = await fetchText();
+      if (isStale()) return null;
+      if (raw == null) {
+        renderPreviewErrorCard(body, "读取失败——无法进入点评模式。");
+        return { size: null };
+      }
+      const doc = body.ownerDocument ?? document;
+      const iframe = doc.createElement("iframe");
+      iframe.className = "ac-frame";
+      iframe.setAttribute("sandbox", "allow-scripts");
+      iframe.setAttribute("referrerpolicy", "no-referrer");
+      iframe.title = name;
+      // srcdoc 走属性赋值，不进 innerHTML——避免父页解析钩子脚本。
+      iframe.srcdoc = injectInspectHook(raw);
+      const noteEl = doc.createElement("p");
+      noteEl.className = "ac-note";
+      noteEl.textContent = "点评模式：点页面元素后填写意见，会写进输入框。沙箱不含 same-origin。";
+      body.replaceChildren(iframe, noteEl);
+      return { size: new TextEncoder().encode(raw).length };
     }
     case "image": {
       body.innerHTML =
@@ -455,6 +487,12 @@ export function initArtifactCanvas(host = {}, env = {}) {
   let renderToken = 0;
   /** 内容更新自动刷新的防抖计时器（noteWrites） */
   let refreshTimer = 0;
+  /** HTML 点评：关着时 iframe 仍走 src=，不 fetch */
+  let inspectOn = false;
+  /** 图片画圈：叠一层 canvas，坐标写进输入框 */
+  let annotateOn = false;
+  /** @type {ReturnType<typeof attachImageAnnotator>|null} */
+  let annotator = null;
 
   // ---- 顶条特征控件（关闭/放大键由外壳提供，这里插中间段）----
   const prevBtn = doc.createElement("button");
@@ -493,8 +531,136 @@ export function initArtifactCanvas(host = {}, env = {}) {
   revealBtn.type = "button";
   revealBtn.className = "btn btn--ghost ac-reveal";
   revealBtn.innerHTML = '<i class="ph ph-folder-open" aria-hidden="true"></i><span>在文件夹中显示</span>';
+  const inspectBtn = doc.createElement("button");
+  inspectBtn.type = "button";
+  inspectBtn.id = "ac-inspect";
+  inspectBtn.className = "btn btn--ghost ac-inspect";
+  inspectBtn.hidden = true;
+  inspectBtn.setAttribute("aria-pressed", "false");
+  inspectBtn.innerHTML = '<i class="ph ph-cursor-click" aria-hidden="true"></i><span>点评</span>';
+  const annotateBtn = doc.createElement("button");
+  annotateBtn.type = "button";
+  annotateBtn.id = "ac-annotate";
+  annotateBtn.className = "btn btn--ghost ac-annotate";
+  annotateBtn.hidden = true;
+  annotateBtn.setAttribute("aria-pressed", "false");
+  annotateBtn.innerHTML = '<i class="ph ph-pencil-simple" aria-hidden="true"></i><span>标注</span>';
   actions.appendChild(downloadLink);
   actions.appendChild(revealBtn);
+  actions.appendChild(inspectBtn);
+  actions.appendChild(annotateBtn);
+
+  function hideReviewPopover() {
+    body.querySelector("#ac-review-pop")?.remove();
+  }
+
+  function dropAnnotator() {
+    annotator?.destroy();
+    annotator = null;
+    body.querySelector("#ac-annotate-bar")?.remove();
+  }
+
+  function paintReviewChrome(kind) {
+    const html = kind === "html";
+    const image = kind === "image";
+    inspectBtn.hidden = !html;
+    annotateBtn.hidden = !image;
+    if (!html) inspectOn = false;
+    if (!image) annotateOn = false;
+    inspectBtn.setAttribute("aria-pressed", inspectOn ? "true" : "false");
+    inspectBtn.classList.toggle("is-active", inspectOn);
+    annotateBtn.setAttribute("aria-pressed", annotateOn ? "true" : "false");
+    annotateBtn.classList.toggle("is-active", annotateOn);
+  }
+
+  function mountImageAnnotator() {
+    dropAnnotator();
+    const wrap = body.querySelector(".ac-image-wrap");
+    if (!wrap) return;
+    annotator = attachImageAnnotator(wrap);
+    const bar = doc.createElement("div");
+    bar.id = "ac-annotate-bar";
+    bar.className = "ac-annotate-bar";
+    const hint = doc.createElement("p");
+    hint.className = "ac-note";
+    hint.textContent = "在图上画圈或点一下定位，意见会写进输入框。";
+    const comment = doc.createElement("textarea");
+    comment.className = "ac-review-comment";
+    comment.rows = 2;
+    comment.placeholder = "说说这里要改什么";
+    const actionsRow = doc.createElement("div");
+    actionsRow.className = "ac-review-actions";
+    const undo = doc.createElement("button");
+    undo.type = "button";
+    undo.className = "btn btn--ghost";
+    undo.textContent = "撤销";
+    const submit = doc.createElement("button");
+    submit.type = "button";
+    submit.className = "btn btn--primary";
+    submit.textContent = "写进输入框";
+    undo.addEventListener("click", () => annotator?.undo());
+    submit.addEventListener("click", () => {
+      const line = formatImageReview({
+        comment: comment.value,
+        strokes: annotator?.strokes() ?? [],
+        pins: annotator?.pins() ?? [],
+      });
+      host.onAppendReview?.(line);
+      host.onAnnounce?.("点评已写入输入框");
+    });
+    actionsRow.appendChild(undo);
+    actionsRow.appendChild(submit);
+    bar.appendChild(hint);
+    bar.appendChild(comment);
+    bar.appendChild(actionsRow);
+    body.appendChild(bar);
+  }
+
+  function showReviewPopover(pick) {
+    hideReviewPopover();
+    const pop = doc.createElement("form");
+    pop.id = "ac-review-pop";
+    pop.className = "ac-review-pop";
+    pop.setAttribute("role", "dialog");
+    pop.setAttribute("aria-label", "点评选中元素");
+    const kicker = doc.createElement("p");
+    kicker.className = "ac-review-kicker";
+    kicker.textContent = "选中";
+    const sel = doc.createElement("code");
+    sel.className = "ac-review-sel";
+    sel.textContent = String(pick.selector ?? "");
+    const comment = doc.createElement("textarea");
+    comment.id = "ac-review-comment";
+    comment.className = "ac-review-comment";
+    comment.rows = 2;
+    comment.placeholder = "说说这里要改什么";
+    const actionsRow = doc.createElement("div");
+    actionsRow.className = "ac-review-actions";
+    const cancel = doc.createElement("button");
+    cancel.type = "button";
+    cancel.className = "btn btn--ghost";
+    cancel.textContent = "取消";
+    const submit = doc.createElement("button");
+    submit.type = "submit";
+    submit.className = "btn btn--primary";
+    submit.textContent = "写进输入框";
+    actionsRow.appendChild(cancel);
+    actionsRow.appendChild(submit);
+    pop.appendChild(kicker);
+    pop.appendChild(sel);
+    pop.appendChild(comment);
+    pop.appendChild(actionsRow);
+    cancel.addEventListener("click", () => hideReviewPopover());
+    pop.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const line = formatReviewComment(pick.selector, comment.value);
+      host.onAppendReview?.(line);
+      hideReviewPopover();
+      host.onAnnounce?.("点评已写入输入框");
+    });
+    body.appendChild(pop);
+    comment.focus();
+  }
 
   dock.insertHeadControl(prevBtn);
   dock.insertHeadControl(nextBtn);
@@ -531,6 +697,9 @@ export function initArtifactCanvas(host = {}, env = {}) {
     downloadLink.href = `${artifactUrl(path)}&download=1`;
     downloadLink.setAttribute("download", artifactBasename(path));
     setSize(null);
+    paintReviewChrome(kind);
+    hideReviewPopover();
+    dropAnnotator();
 
     // 渲染主体与文件预览覆盖层共用（renderPreviewBody）——纪律只有一份
     const result = await renderPreviewBody(body, {
@@ -538,8 +707,10 @@ export function initArtifactCanvas(host = {}, env = {}) {
       url,
       fetch: fetchImpl,
       isStale: () => token !== renderToken,
+      inspect: inspectOn && kind === "html",
     });
     if (result && token === renderToken) setSize(result.size);
+    if (token === renderToken && annotateOn && kind === "image") mountImageAnnotator();
   }
 
   // ---- 开关与切换 ----
@@ -577,6 +748,10 @@ export function initArtifactCanvas(host = {}, env = {}) {
       win.clearTimeout(refreshTimer);
       refreshTimer = 0;
     }
+    inspectOn = false;
+    annotateOn = false;
+    hideReviewPopover();
+    dropAnnotator();
     dock.close();
   }
 
@@ -607,6 +782,23 @@ export function initArtifactCanvas(host = {}, env = {}) {
   revealBtn.addEventListener("click", () => {
     const art = artifacts[current];
     if (art) host.onReveal?.(art.path);
+  });
+  inspectBtn.addEventListener("click", () => {
+    inspectOn = !inspectOn;
+    paintReviewChrome("html");
+    void renderCurrent();
+  });
+  annotateBtn.addEventListener("click", () => {
+    annotateOn = !annotateOn;
+    paintReviewChrome("image");
+    void renderCurrent();
+  });
+  win.addEventListener("message", (event) => {
+    if (!inspectOn || !dock.isOpen()) return;
+    const iframe = body.querySelector("iframe.ac-frame");
+    if (!iframe || event.source !== iframe.contentWindow) return;
+    if (!isInspectPick(event.data)) return;
+    showReviewPopover(event.data);
   });
 
   // ←/→ 切产物（Esc 归外壳：放大态先还原、停靠态上报关闭）

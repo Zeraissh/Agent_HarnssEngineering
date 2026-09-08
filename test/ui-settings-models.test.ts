@@ -11,6 +11,7 @@
  *             onModelsSaved 回调）、测试连接按钮
  */
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import { formatUsd, parseUsageReport } from "../ui/public/features/usage.js";
 import {
   SETTINGS_SECTIONS,
   MODEL_ROLE_META,
@@ -41,7 +42,7 @@ const SERVER_PAYLOAD = {
     { id: "m-fast", label: "快模型", provider: "openai", model: "deepseek-v4-flash", baseUrl: "https://api.deepseek.com", hasApiKey: true },
     { id: "m-strong", label: "强模型", provider: "anthropic", model: "claude-opus-4-8", baseUrl: "", hasApiKey: false },
   ],
-  roles: { executor: "m-fast", planner: null, verifier: "m-strong", vision: null },
+  roles: { executor: "m-fast", planner: null, verifier: "m-strong", vision: null, image: null },
   source: "store",
   roleModels: { executor: { model: "deepseek-v4-flash", provider: "openai" } },
 };
@@ -104,6 +105,12 @@ beforeEach(() => {
 // 纯函数层
 // ---------------------------------------------------------------
 describe("模型分组纯函数", () => {
+  it("消耗视图把未报价画成「未计价」，不画 $0.00", () => {
+    expect(formatUsd(null)).toBe("未计价");
+    expect(formatUsd(0)).toBe("$0.00");
+    expect(parseUsageReport({ totalRuns: 2, totalUsd: null }).totalUsd).toBeNull();
+  });
+
   it("SETTINGS_SECTIONS 含「模型」分组且位于第二位", () => {
     const idx = SETTINGS_SECTIONS.findIndex((s) => s.id === "settings-models");
     expect(idx).toBe(1);
@@ -119,7 +126,7 @@ describe("模型分组纯函数", () => {
       source: "store",
     });
     expect(parsed.models[0]).toMatchObject({ id: "a", label: "m", baseUrl: "", hasApiKey: true });
-    expect(parsed.roles).toEqual({ executor: "a", planner: null, verifier: null, vision: null });
+    expect(parsed.roles).toEqual({ executor: "a", planner: null, verifier: null, vision: null, image: null });
     expect(parsed.source).toBe("store");
   });
 
@@ -139,6 +146,7 @@ describe("模型分组纯函数", () => {
     expect(roleCurrentLabel("verifier", models, roles)).toBe("核查 · 强模型（claude-opus-4-8）");
     expect(roleCurrentLabel("planner", models, roles)).toBe("规划 · 跟随执行");
     expect(roleCurrentLabel("vision", models, roles)).toBe("识图 · 不配置");
+    expect(roleCurrentLabel("image", models, roles)).toBe("生图 · 不配置");
   });
 
   it("validateModelDraft：provider / 模型名 / baseUrl 逐条拦截", () => {
@@ -198,6 +206,9 @@ describe("模型分组视图行为", () => {
     expect(verifierSelect.value).toBe("m-strong");
     expect(verifierSelect.options[0].textContent).toBe("跟随执行");
     expect(document.getElementById("settings-role-vision-current").textContent).toContain("不配置");
+    expect(document.getElementById("settings-role-image-current").textContent).toContain("不配置");
+    const imageOpts = roleOptionsFor("image", parseModelsPayload(SERVER_PAYLOAD).models);
+    expect(imageOpts[0].label).toBe("不配置");
     expect(document.getElementById("settings-models-source").textContent).toContain("模型库文件");
 
     const executorSelect = document.getElementById("settings-role-executor");
@@ -212,7 +223,7 @@ describe("模型分组视图行为", () => {
         record.put = JSON.parse(opts.body);
         return { ok: true, status: 200, json: async () => SERVER_PAYLOAD };
       }
-      return { ok: true, status: 200, json: async () => ({ models: [], roles: { executor: null, planner: null, verifier: null, vision: null }, source: "env" }) };
+      return { ok: true, status: 200, json: async () => ({ models: [], roles: { executor: null, planner: null, verifier: null, vision: null, image: null }, source: "env" }) };
     });
     const api = initSettingsView(makeHost(), makeEnv(fetchImpl));
     await openAndSettle(api);
@@ -312,5 +323,25 @@ describe("模型分组视图行为", () => {
     await openAndSettle(api);
     api.open("settings-models");
     expect(document.activeElement?.id).toBe("settings-models");
+  });
+
+  it("模型分组有「同步到 .env」，MCP 分组能列出服务", async () => {
+    const fetchImpl = vi.fn(async (url, opts = {}) => {
+      if (url === "/api/models/sync-env" && opts.method === "POST") {
+        return { ok: true, status: 200, json: async () => ({ ok: true, changed: ["AGENT_MODEL"] }) };
+      }
+      if (url === "/api/mcp") {
+        return { ok: true, status: 200, json: async () => ({ path: "mcp.json", enabled: false, servers: [{ name: "demo", command: "python", enabled: true }] }) };
+      }
+      return { ok: true, status: 200, json: async () => SERVER_PAYLOAD };
+    });
+    const api = initSettingsView(makeHost(), makeEnv(fetchImpl));
+    await openAndSettle(api);
+    expect(document.getElementById("settings-models-sync-env")).toBeTruthy();
+    document.getElementById("settings-models-sync-env").click();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(document.getElementById("settings-models-status").textContent).toMatch(/\.env|已更新/);
+    expect(document.getElementById("settings-mcp")).toBeTruthy();
+    expect(document.getElementById("settings-mcp-list")?.textContent).toContain("demo");
   });
 });

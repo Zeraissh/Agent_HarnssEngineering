@@ -113,6 +113,8 @@ export interface ArchivedMeta {
   version: 1;
   runId: string;
   task: string;
+  /** 侧栏短标题；缺省则前端继续用任务第一句启发式 */
+  title?: string | null;
   /** "running" 只会出现在宿主没来得及正常收尾的档案里（崩溃/断电） */
   status: "running" | "done";
   verify: boolean;

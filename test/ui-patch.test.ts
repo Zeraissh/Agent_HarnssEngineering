@@ -34,7 +34,11 @@ import {
   foldChain,
   deriveRunListItems,
   deriveRunTitle,
+  deriveThreadTitle,
   deriveConversationRecap,
+  WORKDIR_GROUP_COLLAPSE_KEY,
+  readCollapsedWorkdirGroups,
+  toggleCollapsedWorkdirGroup,
   conversationChainIds,
   deriveThreadFiles,
   renderEmptyState,
@@ -2414,6 +2418,18 @@ describe("装配状态条", () => {
     expect(items.find((i) => i.key === "pack")!.chip).toBe("无领域包");
   });
 
+  it("自动路由的包在装配条上标「自动」，reason 进 why（白名单投影）", () => {
+    const s = reduceEvents(createInitialState("r-auto", "t", false), [
+      sse(0, "host", "run_config", {
+        pack: { name: "ts-coding" },
+        packRoute: { pack: "ts-coding", reason: "TypeScript 任务" },
+      }),
+    ]);
+    const chip = deriveAssemblyBar(s, null).find((i) => i.key === "pack");
+    expect(chip?.chip).toBe("ts-coding · 自动");
+    expect(chip?.why).toContain("TypeScript 任务");
+  });
+
   it("长工作目录只留尾部两级——状态条是一行", () => {
     const items = deriveAssemblyBar(configured(), null);
     const wd = items.find((i) => i.key === "workdir")!.chip;
@@ -2831,6 +2847,36 @@ describe("装配条的识图那一格", () => {
   });
 });
 
+describe("装配条的生图那一格", () => {
+  const bare = () => createInitialState("rv", "t", false);
+
+  it("未配时明说「未配」，并解释为什么工具面上干脆没有它", () => {
+    const item = deriveAssemblyBar(bare(), { roleModels: { image: { configured: false } } })
+      .find((i) => i.key === "image")!;
+    expect(item.chip).toBe("生图 未配");
+    expect(item.why).toContain("根本不进工具面");
+  });
+
+  it("未配的那个对象是真值——判据必须认 configured 而不是对象本身", () => {
+    const snapshot = { roleModels: { image: { configured: false } } };
+    expect(Boolean(snapshot.roleModels.image)).toBe(true);
+    expect(
+      deriveAssemblyBar(bare(), snapshot).find((i) => i.key === "image")!.chip,
+    ).toBe("生图 未配");
+  });
+
+  it("两种数据源形状都认：逐 run 是字符串，进程级是对象", () => {
+    const perRun = reduceEvents(bare(), [
+      sse(0, "host", "run_config", { roleModels: { image: "dall-e-3" } }),
+    ]);
+    expect(deriveAssemblyBar(perRun, null).find((i) => i.key === "image")!.chip).toContain("dall-e-3");
+    expect(
+      deriveAssemblyBar(bare(), { roleModels: { image: { configured: true, model: "gpt-image-1" } } })
+        .find((i) => i.key === "image")!.chip,
+    ).toContain("gpt-image-1");
+  });
+});
+
 // ================================================================
 // MODEL-01a 端点降级：换端点这件事必须在界面上留痕
 // ================================================================
@@ -3037,6 +3083,70 @@ describe("空态给的是能点的例子", () => {
     expect(document.querySelector(".empty-state h2")!.textContent).toBe("开始一段新对话");
   });
 
+  it("空态有工作目录入口，不另起一条选择器", () => {
+    renderEmptyState(false);
+    expect(document.querySelector("[data-focus-workdir]")).toBeTruthy();
+    expect(document.querySelector("[data-replay-onboarding]")).toBeTruthy();
+  });
+});
+
+describe("侧栏标题优先用服务端存的短句", () => {
+  it("deriveThreadTitle 认 title 字段，不再铺整段任务", () => {
+    const runs = [{ runId: "r1", task: "请帮我把这段很长的需求写成可扫视的标题", title: "需求标题" }];
+    expect(deriveThreadTitle(runs, "r1")).toBe("需求标题");
+  });
+});
+
+describe("追加模式显示该对话的工作目录", () => {
+  it("切到另一条对话时下拉跟上那条的 workdir，回到新建就清记号", () => {
+    const select = document.getElementById("workdir-select") as HTMLSelectElement;
+    const form = document.getElementById("submit-form") as HTMLFormElement;
+    select.innerHTML = "";
+    for (const dir of ["D:\\first", "D:\\other"]) {
+      const opt = document.createElement("option");
+      opt.value = dir;
+      opt.textContent = dir;
+      select.appendChild(opt);
+    }
+    select.value = "D:\\first";
+    patchComposer(deriveComposerMode({
+      info: { runId: "run-b", status: "done", canContinue: true, workdir: "D:\\other" },
+      localStatus: "done",
+    }));
+    expect(select.value).toBe("D:\\other");
+    expect(form.dataset.workdirRun).toBe("run-b");
+    patchComposer(deriveComposerMode({ info: null }));
+    expect(form.dataset.workdirRun).toBeUndefined();
+  });
+});
+
+describe("侧栏工作目录分组可收起", () => {
+  it("收起后条目隐藏，状态写进 localStorage", () => {
+    const storage = {
+      _m: new Map(),
+      getItem(k) { return this._m.get(k) ?? null; },
+      setItem(k, v) { this._m.set(k, String(v)); },
+    };
+    const key = "D:\\proj";
+    expect(readCollapsedWorkdirGroups(storage).has(key)).toBe(false);
+    toggleCollapsedWorkdirGroup(key, storage);
+    expect(readCollapsedWorkdirGroups(storage).has(key)).toBe(true);
+    expect(JSON.parse(storage.getItem(WORKDIR_GROUP_COLLAPSE_KEY))).toContain(key);
+
+    const runs = [
+      { runId: "r1", task: "a", status: "done", verify: false, workdir: key },
+      { runId: "r2", task: "b", status: "done", verify: false, workdir: "D:\\other" },
+    ];
+    renderRunList(runs, "r1", () => {}, new Map(), undefined, {
+      collapsed: new Set([key]),
+      onToggle: () => {},
+    });
+    const group = [...document.querySelectorAll(".run-group")].find(
+      (g) => g.getAttribute("aria-label")?.includes("proj") || g.querySelector(".run-group-name")?.textContent?.includes("proj"),
+    );
+    expect(group?.classList.contains("run-group--collapsed")).toBe(true);
+    expect(group?.querySelector(".run-group-caret")?.className).toContain("ph-caret-right");
+  });
 });
 
 

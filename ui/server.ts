@@ -51,6 +51,7 @@ import {
   loadWorkdirStore,
   saveWorkdirStore,
 } from "./workdirs.js";
+import { heuristicComplete, parseCompleteBody } from "./complete.js";
 import {
   instrumentModelClient,
   obsRegistry,
@@ -97,7 +98,17 @@ import {
   type ContextPlan,
 } from "../src/context-window.js";
 import { getPack, selectPackTools, PACKS, DEFAULT_HOST_DISCIPLINES, type DomainPack } from "../src/presets.js";
+import { routeToPack } from "../src/router.js";
 import { connectMcpServers, loadMcpConfig, type McpRuntime } from "../src/mcp.js";
+import { sanitizeGeneratedTitle, summarizeTitle, TITLE_SYSTEM } from "./title.js";
+import { aggregateUsage, parseLedgerLines } from "./usage.js";
+import { envUpdatesFromStore, upsertEnvKeys } from "./env-sync.js";
+import {
+  applyMcpServerPatch,
+  parseMcpConfigFile,
+  publicMcpServers,
+  serializeMcpConfig,
+} from "./mcp-config-file.js";
 import { createWorkdirScopedMemoryTools, MEMORY_TOOL_NAMES, MemoryStore } from "../src/memory.js";
 import { DEFAULT_VERIFIER_MAX_TURNS, resolveVerifierReadOnlyCommands } from "../src/verifier.js";
 import { resolvePlannerMaxTurns } from "../src/planner.js";
@@ -111,6 +122,8 @@ import {
   withTaskCompletion,
 } from "../src/task-completion.js";
 import { createDescribeImageTool } from "../src/tools/describe-image.js";
+import { createGenerateImageTool } from "../src/tools/generate-image.js";
+import { createOpenAIImageClient, DEFAULT_OPENAI_IMAGE_BASE } from "../src/image-client.js";
 import { createWebSearchTool, isWebSearchConfigured } from "../src/tools/web-search.js";
 import { fetchUrlTool } from "../src/tools/fetch-url.js";
 import { editFileTool } from "../src/tools/edit-file.js";
@@ -422,6 +435,10 @@ interface StoredRun {
   autoAllow?: Map<string, ExactInputApprovalRule>;
   /** 本次运行的装配（V-24：可逐 run 覆盖，不再是进程级常量） */
   packName?: string;
+  /** 侧栏短标题（启发式或首轮后的模型摘要） */
+  title?: string;
+  /** 自动匹配领域包时 router 的决定，给界面照实说 */
+  packRoute?: { pack: string | null; reason: string };
   effort?: Effort;
   rubric?: string;
   /**
@@ -1149,6 +1166,10 @@ export interface UiServerOptions {
    * 显式传路径可在测试里验证持久化与重装配。
    */
   modelStoreFile?: string | null;
+  /** 「同步到 .env」的落点。缺省真实宿主 `<cwd>/.env`；注入宿主缺省不写。 */
+  envFile?: string | null;
+  /** mcp.json 落点。缺省 `AGENT_MCP_CONFIG` 或 `<workdir>/mcp.json`。测试应显式传入，避免改仓库文件。 */
+  mcpConfigFile?: string;
   /**
    * 运行时工作目录清单文件（V-29 扩展，.agent-workdirs.json）落点。缺省：真实宿主
    * `<workdir>/.agent-workdirs.json`；**注入了 modelClient 的宿主缺省 null**
@@ -2001,6 +2022,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     : realHost
       ? join(resolve(options.workdir ?? process.cwd()), MODEL_STORE_FILENAME)
       : null;
+  const envFile = options.envFile !== undefined
+    ? options.envFile
+    : realHost
+      ? join(process.cwd(), ".env")
+      : null;
   let modelStoreState: { store: ModelStore; source: "store" | "env" } = (() => {
     if (modelStoreFile) {
       const loaded = loadModelStore(modelStoreFile);
@@ -2314,8 +2340,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   const injectedTools = options.tools;
 
   /**
-   * V-30 角色模型（MODEL-02 起由模型库驱动）：verifier / planner / vision 各自
-   * 可指向库中任意条目；roles 里 null = 跟随执行（vision 的 null = 不配置）。
+   * V-30 角色模型（MODEL-02 起由模型库驱动）：verifier / planner / vision / image 各自
+   * 可指向库中任意条目；roles 里 null = 跟随执行（vision / image 的 null = 不配置）。
    *
    * 密钥只在服务端解析，**绝不下发浏览器**——快照里只报模型名与 provider。
    * 浏览器能做的是"这次用不用独立角色模型"，不是"用哪个 key 连哪个端点"。
@@ -2335,10 +2361,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   let verifierRole: ResolvedRole | null = null;
   let plannerRole: ResolvedRole | null = null;
   let visionRole: ResolvedRole | null = null;
+  let imageRole: { name: string; provider: "anthropic" | "openai" } | null = null;
   let verifierClient: ModelClient | null = null;
   let plannerClient: ModelClient | null = null;
   let visionClient: ModelClient | null = null;
   let visionTool: Tool | null = null;
+  let imageTool: Tool | null = null;
 
   /** 降级链的角色名 → 指标口径的角色名（verifier 与 verification 是同一个东西） */
   const METRIC_ROLE_OF: Record<"verifier" | "planner" | "vision", MetricRole> = {
@@ -2395,8 +2423,28 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   const enabledBuiltinPool = bashEnabled
     ? BUILTIN_POOL
     : BUILTIN_POOL.filter((tool) => tool.name !== bashTool.name);
-  /** 工具面随角色装配重建：vision 配了才有 describe_image（V-31 的诚实工具面纪律） */
+  /** 工具面随角色装配重建：vision 配了才有 describe_image；image 配了才有 generate_image */
   let toolPool: Tool[] = [];
+
+  function resolveImageRoleFromLibrary(): {
+    name: string;
+    provider: "anthropic" | "openai";
+    baseURL: string;
+    apiKey: string;
+  } | null {
+    const entry = roleEntryOf(modelStoreState.store, "image");
+    if (!entry) return null;
+    const baseURL = (
+      entry.baseUrl
+      || process.env.AGENT_IMAGE_BASE_URL
+      || (entry.provider === "openai" ? process.env.OPENAI_BASE_URL : undefined)
+      || DEFAULT_OPENAI_IMAGE_BASE
+    ).replace(/\/+$/, "");
+    const apiKey = entry.apiKey
+      || process.env.AGENT_IMAGE_API_KEY
+      || (entry.provider === "openai" ? process.env.OPENAI_API_KEY ?? "" : "");
+    return { name: entry.model, provider: entry.provider, baseURL, apiKey };
+  }
 
   function assembleRoles(): void {
     verifierRole = resolveRoleFromLibrary("verifier");
@@ -2430,10 +2478,26 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           modelName: visionRole.name,
         })
       : null;
+    // 生图不走 ModelClient / 降级链 / token 计量——Images API 不是 chat usage。
+    const imageResolved = resolveImageRoleFromLibrary();
+    imageRole = imageResolved
+      ? { name: imageResolved.name, provider: imageResolved.provider }
+      : null;
+    imageTool = imageResolved
+      ? createGenerateImageTool({
+          client: createOpenAIImageClient({
+            model: imageResolved.name,
+            baseURL: imageResolved.baseURL,
+            apiKey: imageResolved.apiKey,
+          }),
+          modelName: imageResolved.name,
+        })
+      : null;
     toolPool = [
       ...enabledBuiltinPool,
       ...(webSearchTool ? [webSearchTool] : []),
       ...(visionTool ? [visionTool] : []),
+      ...(imageTool ? [imageTool] : []),
     ];
   }
   assembleRoles();
@@ -2598,6 +2662,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       version: 1,
       runId: run.id,
       task: run.task,
+      ...(run.title ? { title: run.title } : {}),
       status: run.status,
       verify: run.verify,
       createdAt: run.createdAt,
@@ -2745,6 +2810,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         runs.set(a.meta.runId, {
           id: a.meta.runId,
           task: a.meta.task,
+          ...(typeof a.meta.title === "string" && a.meta.title ? { title: a.meta.title } : {}),
           status: "done",
           verify: a.meta.verify,
           createdAt: a.meta.createdAt,
@@ -3027,11 +3093,13 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     return {
       runId: r.id,
       task: r.task,
+      title: r.title ?? summarizeTitle(r.task),
       status: r.status,
       verify: r.verify,
       createdAt: r.createdAt,
       finishedAt: r.finishedAt ?? null,
       packName: r.packName ?? pack?.name ?? null,
+      ...(r.packRoute ? { packRoute: r.packRoute } : {}),
       stopReason: r.mainStopReason ?? null,
       // 活 run 走 outcome，归档 run 走 meta 里的摘要——列表列不因重启而变
       finalPassed: r.outcome?.finalPassed ?? r.archivedOutcome?.finalPassed ?? null,
@@ -3255,7 +3323,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    * 常驻进程——默认连接就等于一个长期攥着调试探针的会话，正是案例 #3 里
    * 害得整块板子连不上的那种形态。要用就显式开，用完关掉宿主。
    */
-  const mcpConfigPath = process.env.AGENT_MCP_CONFIG ?? join(workdir, "mcp.json");
+  const mcpConfigPath = options.mcpConfigFile ?? process.env.AGENT_MCP_CONFIG ?? join(workdir, "mcp.json");
 
   /**
    * MCP 运行时（**懒连接**）。
@@ -4488,8 +4556,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     // 修剪排在本 run 的写入链上：直接 fire-and-forget 会与自己的 meta 写赛跑，
     // 读盘时档案未成形、计数不足就漏剪
     run.conversationRecap = recapFromRunEvents(run);
+    if (!run.title) run.title = summarizeTitle(run.task);
     finalizeDurableState(run, endInfo);
     persistMeta(run);
+    if (realHost && run.conversationTurn === 1) {
+      void refineRunTitle(run);
+    }
     if (historyRoot && run.archiveWriter) {
       const running = new Set(
         [...runs.values()].filter((r) => r.status === "running").map((r) => r.id),
@@ -4512,6 +4584,34 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         });
       });
     }
+  }
+
+  async function refineRunTitle(run: StoredRun): Promise<void> {
+    const fallback = summarizeTitle(run.task);
+    if (String(run.task ?? "").trim().length <= 24) {
+      run.title = fallback;
+      persistMeta(run);
+      return;
+    }
+    try {
+      const turn = await modelClient.send({
+        system: [{ type: "text", text: TITLE_SYSTEM }],
+        messages: [{ role: "user", content: String(run.task).slice(0, 800) }],
+        tools: [],
+        maxTokens: 48,
+        effort: "low",
+      });
+      const text = (turn.message.content ?? [])
+        .filter((b): b is Anthropic.TextBlock => b.type === "text")
+        .map((b) => b.text)
+        .join("")
+        .trim();
+      run.title = sanitizeGeneratedTitle(text) ?? fallback;
+    } catch {
+      run.title = fallback;
+    }
+    persistMeta(run);
+    broadcastLifecycle("run_updated", run);
   }
 
   /** 启动一次不带核查的运行 */
@@ -4793,7 +4893,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     run: StoredRun,
     feedback: string,
     parentApprovalGrants: readonly ArchivedApprovalGrant[] = [],
-    turn: { verify: boolean } = { verify: false },
+    turn: {
+      verify: boolean;
+      orchestrate?: boolean;
+      planGate?: boolean;
+      concurrency?: number | "auto";
+    } = { verify: false },
   ): Promise<void> {
     const history = run.history;
     const inheritedBudget = run.resumeBudget;
@@ -4856,6 +4961,15 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     });
     broadcastLifecycle("run_updated", run);
 
+    if (turn.orchestrate) {
+      run.mode = "plan";
+      run.concurrency = turn.concurrency ?? (turn.planGate ? 1 : "auto");
+      run.planGate = Boolean(turn.planGate);
+      persistMeta(run);
+      await startPlannedRun(run, feedback);
+      return;
+    }
+
     await executeTurn(run, {
       history,
       feedback,
@@ -4881,7 +4995,13 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     feedback: string,
     parentApprovalGrants: readonly ArchivedApprovalGrant[] = [],
     /** previousVerdict：父档案里判了被续那一轮的裁决（调用方按 verdictJudging 取） */
-    turn: { verify: boolean; previousVerdict?: Verdict } = { verify: false },
+    turn: {
+      verify: boolean;
+      previousVerdict?: Verdict;
+      orchestrate?: boolean;
+      planGate?: boolean;
+      concurrency?: number | "auto";
+    } = { verify: false },
   ): Promise<void> {
     const history = run.history?.length ? run.history : undefined;
     const inheritedBudget = run.resumeBudget;
@@ -4955,6 +5075,14 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
     // 与同进程追加同一个装配函数：原话 + 上一轮裁决摘要 + 无正史时的开局背景
     // （计划摘要 / 原任务）。重启前后执行者必须听到同一套话。
+    if (turn.orchestrate) {
+      run.mode = "plan";
+      run.concurrency = turn.concurrency ?? (turn.planGate ? 1 : "auto");
+      run.planGate = Boolean(turn.planGate);
+      persistMeta(run);
+      await startPlannedRun(run, feedback);
+      return;
+    }
     await executeTurn(run, {
       history,
       feedback,
@@ -5066,7 +5194,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
               || tool.name === FINISH_TASK_TOOL_NAME
               || MEMORY_TOOL_NAMES.has(tool.name),
           );
-          const domainTools = injectedTools ?? selectPackTools(sp, enabledBuiltinPool, mcpTools);
+          const domainTools = injectedTools ?? selectPackTools(sp, toolPool, mcpTools);
           return {
             cfg: {
               ...baseCfg,
@@ -5484,6 +5612,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         verifier: verifierRole && (run.useVerifierModel ?? true) ? verifierRole.name : null,
         planner: plannerRole && (run.usePlannerModel ?? true) ? plannerRole.name : null,
         vision: visionRole?.name ?? null,
+        image: imageRole?.name ?? null,
       },
       /**
        * 端点降级链（MODEL-01a）。未配置时 **null 而不是空数组**：
@@ -5525,6 +5654,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         daily: run.dailyBudget !== false,
         dailyConfigured: dailyTokenBudget !== undefined,
       },
+      ...(run.packRoute ? { packRoute: run.packRoute } : {}),
     });
   }
 
@@ -5593,6 +5723,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         : { configured: false },
       vision: visionRole
         ? { model: visionRole.name, provider: visionRole.provider.provider, configured: true }
+        : { configured: false },
+      image: imageRole
+        ? { model: imageRole.name, provider: imageRole.provider, configured: true }
         : { configured: false },
     };
   }
@@ -6046,6 +6179,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     | { type: "modelsGet" }
     | { type: "modelsPut" }
     | { type: "modelsTest" }
+    | { type: "modelsSyncEnv" }
+    | { type: "usageGet" }
+    | { type: "completePost" }
+    | { type: "mcpGet" }
+    | { type: "mcpPut" }
     | { type: "workdirsList" }
     | { type: "workdirAdd" }
     | { type: "workdirRemove" }
@@ -6110,6 +6248,21 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     }
     if (method === "POST" && url === "/api/models/test") {
       return { type: "modelsTest" };
+    }
+    if (method === "POST" && url === "/api/models/sync-env") {
+      return { type: "modelsSyncEnv" };
+    }
+    if (method === "GET" && url === "/api/usage") {
+      return { type: "usageGet" };
+    }
+    if (method === "POST" && url === "/api/complete") {
+      return { type: "completePost" };
+    }
+    if (method === "GET" && url === "/api/mcp") {
+      return { type: "mcpGet" };
+    }
+    if (method === "PUT" && url === "/api/mcp") {
+      return { type: "mcpPut" };
     }
 
     /**
@@ -6347,6 +6500,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     workdir?: string; useVerifierModel?: boolean; usePlannerModel?: boolean;
     planGate?: boolean; askUser?: boolean; autoApprove?: boolean; contextTokenLimit?: number | string;
     multiAgent?: boolean;
+    autoPack?: boolean;
     lineageBudget?: boolean; dailyBudget?: boolean;
   }
 
@@ -6448,6 +6602,27 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       runWorkdir = asked;
     }
 
+    let packRoute: { pack: string | null; reason: string } | undefined;
+    if (parsed.autoPack === true && !parsed.pack && !wantsOrchestrate) {
+      try {
+        const outcome = await routeToPack(
+          { systemPrompt: "router", tools: [], workdir: runWorkdir ?? workdir, compat: envCompat },
+          modelClient,
+          parsed.task,
+          Object.values(PACKS),
+        );
+        packRoute = outcome.decision;
+        if (outcome.decision.pack && getPack(outcome.decision.pack)) {
+          parsed.pack = outcome.decision.pack;
+        }
+      } catch (error) {
+        packRoute = {
+          pack: null,
+          reason: `路由失败，未选包：${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+    }
+
     const verify = parsed.verify === true;
     // §5.2 决定 1：默认关，逐 run 显式开
     const askUser = parsed.askUser === true;
@@ -6502,6 +6677,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     const run: StoredRun = {
       id,
       task: parsed.task,
+      title: summarizeTitle(parsed.task),
       status: "running",
       verify,
       createdAt: Date.now(),
@@ -6516,6 +6692,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       toolTally: {},
       abort: new AbortController(),
       ...(parsed.pack ? { packName: parsed.pack } : {}),
+      ...(packRoute ? { packRoute } : {}),
       ...(parsed.effort ? { effort: parsed.effort as Effort } : {}),
       ...(parsed.rubric ? { rubric: parsed.rubric } : {}),
       ...(wantsOrchestrate ? { mode: "plan" as const } : {}),
@@ -6785,6 +6962,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         "modelsTest",
         "workdirAdd",
         "workdirRemove",
+        "completePost",
       ]).has(route.type);
       const contentType = String(req.headers["content-type"] ?? "").toLowerCase();
       if (jsonRoute && !/^application\/(?:[\w.-]+\+)?json(?:\s*;|$)/.test(contentType)) {
@@ -6926,6 +7104,122 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           timeoutMs: 10_000,
         });
         return json(res, 200, testResult);
+      }
+
+      case "modelsSyncEnv": {
+        if (!hostname || !isLoopbackHostname(hostname)) {
+          return json(res, 403, { error: "同步到 .env 仅本机（loopback）可用" });
+        }
+        if (!envFile) {
+          return json(res, 409, { error: "当前宿主未配置 .env 落点（注入宿主默认不写）" });
+        }
+        const updates = envUpdatesFromStore({
+          models: modelStoreState.store.models.map((m) => ({
+            id: m.id,
+            provider: m.provider,
+            model: m.model,
+            baseUrl: m.baseUrl,
+          })),
+          roles: { ...modelStoreState.store.roles },
+        });
+        let existing = "";
+        try {
+          existing = await readFile(envFile, "utf8");
+        } catch {
+          existing = "";
+        }
+        const synced = upsertEnvKeys(existing, updates);
+        await writeFile(envFile, synced.text, "utf8");
+        if (realHost) operationalLog("info", "env_synced", { file: envFile, changed: synced.changed });
+        return json(res, 200, { ok: true, file: envFile, changed: synced.changed });
+      }
+
+      case "usageGet": {
+        if (!ledgerFile) {
+          return json(res, 200, aggregateUsage([]));
+        }
+        let text = "";
+        try {
+          text = await readFile(ledgerFile, "utf8");
+        } catch {
+          text = "";
+        }
+        return json(res, 200, aggregateUsage(parseLedgerLines(text)));
+      }
+
+      case "completePost": {
+        // 启发式前缀续写，不调模型——注入 FakeModelClient 的测试宿主也不得因此打 HTTP。
+        let body: string;
+        try {
+          body = await readBody(req, requestBodyMaxBytes);
+        } catch (error) {
+          return requestBodyFailure(res, error);
+        }
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          return badRequest(res, "Invalid JSON body");
+        }
+        const { prefix, recent } = parseCompleteBody(parsed);
+        return json(res, 200, { completion: heuristicComplete(prefix, recent) });
+      }
+
+      case "mcpGet": {
+        let servers: Record<string, unknown> = {};
+        try {
+          servers = parseMcpConfigFile(await readFile(mcpConfigPath, "utf8")).servers;
+        } catch {
+          servers = {};
+        }
+        return json(res, 200, {
+          path: mcpConfigPath,
+          enabled: mcpEnabled,
+          servers: publicMcpServers(servers),
+        });
+      }
+
+      case "mcpPut": {
+        if (!hostname || !isLoopbackHostname(hostname)) {
+          return json(res, 403, { error: "MCP 配置仅本机（loopback）可用" });
+        }
+        let body: string;
+        try {
+          body = await readBody(req, requestBodyMaxBytes);
+        } catch (error) {
+          return requestBodyFailure(res, error);
+        }
+        let parsed: { name?: unknown; server?: unknown; remove?: unknown };
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          return badRequest(res, "Invalid JSON body");
+        }
+        if (typeof parsed.name !== "string" || !parsed.name.trim()) {
+          return badRequest(res, '"name" 必须是非空字符串');
+        }
+        let current: Record<string, unknown> = {};
+        try {
+          current = parseMcpConfigFile(await readFile(mcpConfigPath, "utf8")).servers;
+        } catch {
+          current = {};
+        }
+        try {
+          current = applyMcpServerPatch(
+            current,
+            parsed.name,
+            parsed.remove === true ? null : (parsed.server as Parameters<typeof applyMcpServerPatch>[2] ?? {}),
+          );
+        } catch (error) {
+          return badRequest(res, error instanceof Error ? error.message : String(error));
+        }
+        await writeFile(mcpConfigPath, serializeMcpConfig(current), "utf8");
+        if (realHost) operationalLog("info", "mcp_updated", { name: parsed.name, removed: parsed.remove === true });
+        return json(res, 200, {
+          path: mcpConfigPath,
+          enabled: mcpEnabled,
+          servers: publicMcpServers(current),
+        });
       }
 
       /**
@@ -7881,7 +8175,16 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
               }
               broadcastLifecycle("run_updated", run);
               void withFallbackAttribution(run, () =>
-                startSameRunResume(run, feedback, run.archivedApprovalGrantAudit ?? [], { verify: turnVerify }),
+                startSameRunResume(run, feedback, run.archivedApprovalGrantAudit ?? [], {
+                  verify: turnVerify,
+                  ...(turnOrchestrate
+                    ? {
+                        orchestrate: true,
+                        planGate: turnPlanGate,
+                        ...(turnConcurrency !== undefined ? { concurrency: turnConcurrency } : {}),
+                      }
+                    : {}),
+                }),
               );
               return json(res, 200, {
                 runId: run.id,
@@ -7939,6 +8242,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
               ...(run.workdir ? { workdir: resolve(run.workdir) } : { workdir }),
               ...(run.askUser ? { askUser: true } : {}),
               ...(parsed.autoApprove === true ? { autoApprove: true } : {}),
+              ...(turnOrchestrate ? { mode: "plan" as const } : {}),
+              ...(turnConcurrency !== undefined ? { concurrency: turnConcurrency } : {}),
+              ...(turnPlanGate ? { planGate: true } : {}),
               // 逐 run 预算随对话走；buildConfig 会按当前窗口重新夹紧（窗口可能在父 run 之后学到）
               ...(run.contextTokenLimit !== undefined ? { contextTokenLimit: run.contextTokenLimit } : {}),
               ...(childResources.length ? { heldResources: childResources } : {}),
@@ -7968,6 +8274,13 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
               startForkedContinuation(child, feedback, run.archivedApprovalGrantAudit ?? [], {
                 verify: turnVerify,
                 ...(previousVerdict ? { previousVerdict } : {}),
+                ...(turnOrchestrate
+                  ? {
+                      orchestrate: true,
+                      planGate: turnPlanGate,
+                      ...(turnConcurrency !== undefined ? { concurrency: turnConcurrency } : {}),
+                    }
+                  : {}),
               }),
             );
             return json(res, 200, {

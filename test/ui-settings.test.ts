@@ -54,7 +54,7 @@ describe("设置读写与容错", () => {
   it("defaultSettings 形状完整", () => {
     const s = defaultSettings();
     expect(s.version).toBe(SETTINGS_SCHEMA_VERSION);
-    expect(s.defaults).toEqual({ effort: "", verify: false, autoApprove: true });
+    expect(s.defaults).toEqual({ effort: "", verify: false, autoApprove: true, predictiveInput: false });
     expect(s.badge).toBe(true);
   });
 
@@ -153,8 +153,8 @@ describe("旧键迁移与 composer 默认值派生", () => {
     const s = updateSettings(defaultSettings(), {
       defaults: { effort: "medium", verify: true, autoApprove: false },
     });
-    expect(composerDefaults(s)).toEqual({ effort: "medium", verify: true, autoApprove: false });
-    expect(composerDefaults(defaultSettings())).toEqual({ effort: "", verify: false, autoApprove: true });
+    expect(composerDefaults(s)).toEqual({ effort: "medium", verify: true, autoApprove: false, predictiveInput: false });
+    expect(composerDefaults(defaultSettings())).toEqual({ effort: "", verify: false, autoApprove: true, predictiveInput: false });
   });
 
   it("isValidEffort：空串恒合法；档位必须在服务端声明集合里", () => {
@@ -270,6 +270,7 @@ describe("initSettingsView 视图行为", () => {
       onSelectTheme: vi.fn(),
       getHarnessSnapshot: vi.fn(() => SNAP),
       onApplyComposerDefaults: vi.fn(),
+      onReplayOnboarding: vi.fn(),
       onOpenSettings: vi.fn(),
       onCloseSettings: vi.fn(),
       onAnnounce: vi.fn(),
@@ -392,6 +393,27 @@ describe("initSettingsView 视图行为", () => {
     expect(host.onApplyComposerDefaults).toHaveBeenCalledWith({ autoApprove: false });
   });
 
+  it("输入补全默认关；打开后持久化并通知 composer", () => {
+    const env = makeEnv();
+    const host = makeHost();
+    const api = initSettingsView(host, env);
+    api.open();
+    const toggle = api.element.querySelector("#settings-predictive");
+    expect(toggle.checked).toBe(false);
+    toggle.checked = true;
+    toggle.dispatchEvent(new Event("change", { bubbles: true }));
+    expect(parseSettings(env.storage.getItem(SETTINGS_STORAGE_KEY)).defaults.predictiveInput).toBe(true);
+    expect(host.onApplyComposerDefaults).toHaveBeenCalledWith({ predictiveInput: true });
+  });
+
+  it("关于：再看一遍新手引导走宿主回调", () => {
+    const host = makeHost();
+    const api = initSettingsView(host, makeEnv());
+    api.open();
+    api.element.querySelector("#settings-onboarding-replay").click();
+    expect(host.onReplayOnboarding).toHaveBeenCalledTimes(1);
+  });
+
   it("通知：展示授权状态；点请求授权走 Notification 并与 notifications.js 同源落 prompt 键", () => {
     const env = makeEnv();
     const api = initSettingsView(makeHost(), env);
@@ -456,14 +478,16 @@ describe("initSettingsView 视图行为", () => {
     expect(api2.element.querySelector("#settings-about-workdir").textContent).toBe("未获取");
   });
 
-  it("锚点导航：六个分组按钮齐全，点击把焦点交给目标分组", () => {
+  it("锚点导航：分组按钮齐全，点击把焦点交给目标分组", () => {
     const api = initSettingsView(makeHost(), makeEnv());
     api.open();
     const navBtns = [...api.element.querySelectorAll(".settings-nav-btn")];
     expect(navBtns.map((b) => b.getAttribute("data-section"))).toEqual(
       SETTINGS_SECTIONS.map((s) => s.id),
     );
-    navBtns[2].click();
+    expect(SETTINGS_SECTIONS.some((s) => s.id === "settings-mcp")).toBe(true);
+    const defaultsBtn = navBtns.find((b) => b.getAttribute("data-section") === "settings-defaults");
+    defaultsBtn.click();
     const target = document.getElementById("settings-defaults");
     expect(document.activeElement).toBe(target);
   });

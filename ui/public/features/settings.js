@@ -56,6 +56,7 @@ export const THEME_CHOICES = [
 export const SETTINGS_SECTIONS = [
   { id: "settings-appearance", label: "外观", icon: "ph-palette" },
   { id: "settings-models", label: "模型", icon: "ph-cpu" },
+  { id: "settings-mcp", label: "MCP", icon: "ph-plugs-connected" },
   { id: "settings-defaults", label: "运行默认值", icon: "ph-sliders-horizontal" },
   { id: "settings-notifications", label: "通知", icon: "ph-bell" },
   { id: "settings-shortcuts", label: "快捷键", icon: "ph-keyboard" },
@@ -81,14 +82,15 @@ export const MODEL_NAME_SUGGESTIONS = {
 };
 
 /**
- * 四个角色：executor 必选（没有执行者整个宿主就没有出发点）；
- * planner/verifier 的空值 = 跟随执行；vision 的空值 = 不配置。
+ * 五个角色：executor 必选（没有执行者整个宿主就没有出发点）；
+ * planner/verifier 的空值 = 跟随执行；vision / image 的空值 = 不配置。
  */
 export const MODEL_ROLE_META = [
   { key: "executor", label: "执行", allowEmpty: false, emptyLabel: "", hint: "实际干活的模型——拆任务、调工具、写代码" },
   { key: "planner", label: "规划", allowEmpty: true, emptyLabel: "跟随执行", hint: "复杂任务的框架设计与拆分；跟随执行 = 与执行者同一个模型" },
   { key: "verifier", label: "核查", allowEmpty: true, emptyLabel: "跟随执行", hint: "审查与复查检查——可以把这一步交给更强的模型" },
   { key: "vision", label: "识图", allowEmpty: true, emptyLabel: "不配置", hint: "图片理解（describe_image 工具）；不配置 = 不提供该工具" },
+  { key: "image", label: "生图", allowEmpty: true, emptyLabel: "不配置", hint: "文生图（generate_image 工具，OpenAI 兼容 Images API）；不配置 = 不提供该工具" },
 ];
 
 /**
@@ -115,7 +117,7 @@ export function parseModelsPayload(raw) {
       hasApiKey: m.hasApiKey === true,
     });
   }
-  const roles = { executor: null, planner: null, verifier: null, vision: null };
+  const roles = { executor: null, planner: null, verifier: null, vision: null, image: null };
   const rawRoles = raw.roles && typeof raw.roles === "object" ? raw.roles : {};
   for (const key of Object.keys(roles)) {
     const id = rawRoles[key];
@@ -237,7 +239,7 @@ const EFFORT_LABELS = { low: "低", medium: "中", high: "高", xhigh: "很高",
 /**
  * @typedef {{
  *   version:number,
- *   defaults:{ effort:string, verify:boolean, autoApprove:boolean },
+ *   defaults:{ effort:string, verify:boolean, autoApprove:boolean, predictiveInput:boolean },
  *   badge:boolean,
  * }} UiSettings
  */
@@ -250,7 +252,7 @@ const EFFORT_LABELS = { low: "低", medium: "中", high: "高", xhigh: "很高",
 export function defaultSettings() {
   return {
     version: SETTINGS_SCHEMA_VERSION,
-    defaults: { effort: "", verify: false, autoApprove: true },
+    defaults: { effort: "", verify: false, autoApprove: true, predictiveInput: false },
     badge: true,
   };
 }
@@ -276,6 +278,7 @@ export function parseSettings(raw) {
   if (typeof d.effort === "string") base.defaults.effort = d.effort;
   if (typeof d.verify === "boolean") base.defaults.verify = d.verify;
   if (typeof d.autoApprove === "boolean") base.defaults.autoApprove = d.autoApprove;
+  if (typeof d.predictiveInput === "boolean") base.defaults.predictiveInput = d.predictiveInput;
   if (typeof obj.badge === "boolean") base.badge = obj.badge;
   return base;
 }
@@ -355,13 +358,14 @@ export function migrateLegacyPrefs(storage, settings) {
  * composer 默认值派生。这就是"运行默认值"分组与 composer 的同源点：
  * composer 启动时与本视图读写同一份 settings。
  * @param {UiSettings} settings
- * @returns {{ effort:string, verify:boolean, autoApprove:boolean }}
+ * @returns {{ effort:string, verify:boolean, autoApprove:boolean, predictiveInput:boolean }}
  */
 export function composerDefaults(settings) {
   return {
     effort: settings?.defaults?.effort ?? "",
     verify: Boolean(settings?.defaults?.verify),
     autoApprove: settings?.defaults?.autoApprove !== false,
+    predictiveInput: settings?.defaults?.predictiveInput === true,
   };
 }
 
@@ -471,6 +475,7 @@ const VIEW_ID = "settings-view";
  *   onModelsSaved()             → 模型配置保存成功（宿主刷新 /api/harness 快照，composer pill 同步）
  *   onOpenSettings()            → 侧栏齿轮点击（宿主写 hash 路由）
  *   onCloseSettings()           → 返回上一视图（宿主决定 history.back 或回 "#/")
+ *   onReplayOnboarding()        → 再看一遍新手引导（设置 → 关于）
  *   onAnnounce(msg)             → aria-live 播报（可选）
  *
  * env（测试注入）：doc / win / storage / Notification / fetchImpl（模型库读写；
@@ -819,7 +824,14 @@ export function initSettingsView(host = {}, env = {}) {
   modelsSaveBtn.className = "btn btn--primary";
   modelsSaveBtn.id = "settings-models-save";
   modelsSaveBtn.textContent = "保存模型配置";
+  const modelsSyncEnvBtn = doc.createElement("button");
+  modelsSyncEnvBtn.type = "button";
+  modelsSyncEnvBtn.className = "btn btn--ghost";
+  modelsSyncEnvBtn.id = "settings-models-sync-env";
+  modelsSyncEnvBtn.textContent = "同步到 .env";
+  modelsSyncEnvBtn.title = "把当前角色模型名写回 .env，下次冷启动仍可用；不写 API key，当前进程不会因此换模型";
   modelsSaveRow.appendChild(modelsSaveBtn);
+  modelsSaveRow.appendChild(modelsSyncEnvBtn);
   modelsSection.appendChild(modelsSaveRow);
   const modelsStatus = doc.createElement("p");
   modelsStatus.className = "settings-field-hint";
@@ -1119,6 +1131,26 @@ export function initSettingsView(host = {}, env = {}) {
   modelCancelBtn.addEventListener("click", () => { resetModelForm(); setFormStatus(""); });
   modelTestBtn.addEventListener("click", () => { void testModelFromForm(); });
   modelsSaveBtn.addEventListener("click", () => { void saveModels(); });
+  modelsSyncEnvBtn.addEventListener("click", async () => {
+    if (!fetcher) return;
+    modelsSyncEnvBtn.disabled = true;
+    setModelsStatus("正在写入 .env…");
+    try {
+      const res = await fetcher("/api/models/sync-env", { method: "POST" });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        setModelsStatus(data?.error ?? `同步失败（HTTP ${res.status}）`, true);
+        return;
+      }
+      const n = Array.isArray(data?.changed) ? data.changed.length : 0;
+      setModelsStatus(n ? `已更新 ${n} 项到 .env，重启宿主后按文件生效` : ".env 已是最新");
+      host.onAnnounce?.("模型配置已同步到 .env");
+    } catch {
+      setModelsStatus("同步请求未能发出", true);
+    } finally {
+      modelsSyncEnvBtn.disabled = false;
+    }
+  });
   for (const meta of MODEL_ROLE_META) {
     roleSelects[meta.key].addEventListener("change", () => {
       if (!modelsState) return;
@@ -1128,6 +1160,109 @@ export function initSettingsView(host = {}, env = {}) {
       setModelsStatus("角色分配已修改（保存后生效）");
     });
   }
+
+  // ---- MCP 插件 ----
+  const mcpSection = addSection("settings-mcp", "MCP 插件");
+  const mcpNote = doc.createElement("p");
+  mcpNote.className = "settings-card-note";
+  mcpNote.textContent = "宿主已能把 mcp.json 里的服务适配成工具。这里改配置；启用需 AGENT_UI_MCP=1。";
+  mcpSection.appendChild(mcpNote);
+  const mcpList = doc.createElement("div");
+  mcpList.id = "settings-mcp-list";
+  mcpList.className = "settings-models-list";
+  mcpSection.appendChild(mcpList);
+  const mcpForm = doc.createElement("div");
+  mcpForm.className = "settings-field";
+  mcpForm.innerHTML =
+    '<label for="settings-mcp-name">添加服务</label>' +
+    '<input id="settings-mcp-name" placeholder="名称，如 stm32" autocomplete="off" />' +
+    '<input id="settings-mcp-command" placeholder="command，如 python" autocomplete="off" />' +
+    '<input id="settings-mcp-args" placeholder="args，空格分隔" autocomplete="off" />' +
+    '<input id="settings-mcp-url" placeholder="或 HTTP url" autocomplete="off" />';
+  mcpSection.appendChild(mcpForm);
+  const mcpAddBtn = doc.createElement("button");
+  mcpAddBtn.type = "button";
+  mcpAddBtn.className = "btn btn--primary";
+  mcpAddBtn.textContent = "添加 / 更新";
+  mcpSection.appendChild(mcpAddBtn);
+  const mcpStatus = doc.createElement("p");
+  mcpStatus.className = "settings-field-hint";
+  mcpSection.appendChild(mcpStatus);
+
+  async function refreshMcp() {
+    if (!fetcher) return;
+    try {
+      const res = await fetcher("/api/mcp");
+      const data = await res.json().catch(() => null);
+      const servers = Array.isArray(data?.servers) ? data.servers : [];
+      const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+      }[c]));
+      mcpList.innerHTML = servers.length
+        ? servers.map((s) =>
+            `<div class="settings-model-card" data-mcp-name="${esc(s.name)}">` +
+            `<strong>${esc(s.name)}</strong> · ${s.enabled === false ? "已停用" : "启用"} · ${esc(s.command || s.url || "（无命令）")}` +
+            `<div class="settings-model-form-actions">` +
+            `<button type="button" class="btn btn--ghost" data-mcp-toggle="${esc(s.name)}">${s.enabled === false ? "启用" : "停用"}</button>` +
+            `<button type="button" class="btn btn--ghost" data-mcp-remove="${esc(s.name)}">删除</button>` +
+            `</div></div>`,
+          ).join("")
+        : '<p class="settings-field-hint">还没有配置 MCP 服务。</p>';
+      mcpStatus.textContent = data?.enabled ? `已启用（${data.path}）` : `配置在 ${data?.path ?? "mcp.json"}；当前宿主未开 AGENT_UI_MCP=1`;
+    } catch {
+      mcpStatus.textContent = "无法读取 MCP 配置";
+    }
+  }
+
+  mcpList.addEventListener("click", (event) => {
+    const t = event.target instanceof Element ? event.target : null;
+    const remove = t?.closest?.("[data-mcp-remove]");
+    const toggle = t?.closest?.("[data-mcp-toggle]");
+    if (remove) {
+      void fetcher("/api/mcp", {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: remove.getAttribute("data-mcp-remove"), remove: true }),
+      }).then(refreshMcp);
+      return;
+    }
+    if (toggle) {
+      const name = toggle.getAttribute("data-mcp-toggle");
+      const card = mcpList.querySelector(`[data-mcp-name="${name}"]`);
+      const enabled = !card?.textContent?.includes("已停用");
+      void fetcher("/api/mcp", {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name, server: { enabled: !enabled } }),
+      }).then(refreshMcp);
+    }
+  });
+  mcpAddBtn.addEventListener("click", () => {
+    const name = /** @type {HTMLInputElement} */ (doc.getElementById("settings-mcp-name"))?.value.trim();
+    const command = /** @type {HTMLInputElement} */ (doc.getElementById("settings-mcp-command"))?.value.trim();
+    const args = /** @type {HTMLInputElement} */ (doc.getElementById("settings-mcp-args"))?.value.trim();
+    const url = /** @type {HTMLInputElement} */ (doc.getElementById("settings-mcp-url"))?.value.trim();
+    if (!name) {
+      mcpStatus.textContent = "先填服务名";
+      return;
+    }
+    void fetcher("/api/mcp", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        name,
+        server: { command, args: args ? args.split(/\s+/) : [], url, enabled: true },
+      }),
+    }).then(async (res) => {
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        mcpStatus.textContent = data?.error ?? `保存失败（HTTP ${res.status}）`;
+        return;
+      }
+      void refreshMcp();
+    });
+  });
+  void refreshMcp();
 
   // ---- 分组三：运行默认值 ----
   const defaultsSection = addSection("settings-defaults", "运行默认值");
@@ -1172,6 +1307,11 @@ export function initSettingsView(host = {}, env = {}) {
   };
   const verifyInput = buildToggle("settings-verify", "独立核查", "新对话默认开启独立核查；提交栏里可逐次关掉。");
   const autoApproveInput = buildToggle("settings-auto-approve", "自动放行工具", "新对话默认自动放行低风险工具；写入仍受工作目录边界约束。");
+  const predictiveInput = buildToggle(
+    "settings-predictive",
+    "输入补全（实验性）",
+    "根据欢迎页示例和最近对话标题补全当前输入，按 Tab 接受。默认关，不调模型。",
+  );
 
   effortSelect.addEventListener("change", () => {
     settings = updateSettings(settings, { defaults: { effort: effortSelect.value } });
@@ -1192,6 +1332,12 @@ export function initSettingsView(host = {}, env = {}) {
     try { storage?.setItem(LEGACY_AUTO_APPROVE_KEY, autoApproveInput.checked ? "1" : "0"); } catch { /* ignore */ }
     host.onApplyComposerDefaults?.({ autoApprove: autoApproveInput.checked });
     host.onAnnounce?.(autoApproveInput.checked ? "新对话将默认自动放行工具" : "新对话默认逐条审批工具");
+  });
+  predictiveInput.addEventListener("change", () => {
+    settings = updateSettings(settings, { defaults: { predictiveInput: predictiveInput.checked } });
+    persist();
+    host.onApplyComposerDefaults?.({ predictiveInput: predictiveInput.checked });
+    host.onAnnounce?.(predictiveInput.checked ? "已打开实验性输入补全" : "已关闭输入补全");
   });
 
   // ---- 分组四：通知 ----
@@ -1312,6 +1458,13 @@ export function initSettingsView(host = {}, env = {}) {
     aboutValues[key] = dd;
   }
   aboutSection.appendChild(aboutList);
+  const replayBtn = doc.createElement("button");
+  replayBtn.type = "button";
+  replayBtn.id = "settings-onboarding-replay";
+  replayBtn.className = "btn btn--ghost";
+  replayBtn.textContent = "再看一遍新手引导";
+  replayBtn.addEventListener("click", () => host.onReplayOnboarding?.());
+  aboutSection.appendChild(replayBtn);
 
   function renderAbout() {
     const snap = host.getHarnessSnapshot?.() ?? null;
@@ -1370,6 +1523,7 @@ export function initSettingsView(host = {}, env = {}) {
 
     verifyInput.checked = settings.defaults.verify;
     autoApproveInput.checked = settings.defaults.autoApprove;
+    predictiveInput.checked = settings.defaults.predictiveInput === true;
     badgeInput.checked = badgeEnabled(settings);
 
     renderPermission();

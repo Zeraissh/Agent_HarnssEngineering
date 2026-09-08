@@ -30,7 +30,7 @@ export interface DomainPack {
   /**
    * 内置工具名单（按工具名）。缺省 = 宿主装配的全部内置工具
    * （bash / fetch_url / read_file / write_file / edit_file / glob / grep，
-   * 外加配置齐全时才在场的条件性工具如 describe_image）。
+   * 外加配置齐全时才在场的条件性工具如 describe_image / generate_image）。
    * 领域包应只带用得上的工具——多余的工具是触发面噪声。
    */
   builtinTools?: string[];
@@ -576,7 +576,7 @@ export const PACKS: Record<string, DomainPack> = {
 7. 禁止 git 写命令(add/commit/push)——提交由委托方决定。
 
 把结论落到用户要求的产出,并用一两句话总结。用用户使用的语言回答。` + RULE_PRECEDENCE_DISCIPLINE + PROGRESS_DISCIPLINE,
-    builtinTools: ["bash", "read_file", "write_file", "glob", "grep"],
+    builtinTools: ["bash", "read_file", "write_file", "glob", "grep", "generate_image"],
     mcp: false,
     verify: {
       enabled: true,
@@ -611,7 +611,7 @@ export const PACKS: Record<string, DomainPack> = {
     description:
       "有据技术咨询：web_search + fetch_url 取一手资料；硬数字须引用或标未核实；回答禁装饰 emoji；插图可内嵌并链回源页",
     systemPrompt: CONSULT_SYSTEM + DEFAULT_HOST_DISCIPLINES,
-    // web_search 与 describe_image 同属条件性内置：无 AGENT_TAVILY_API_KEY 时宿主省略。
+    // web_search / describe_image / generate_image 同属条件性内置：没配对应依赖时宿主省略。
     builtinTools: [
       "web_search",
       "fetch_url",
@@ -620,6 +620,7 @@ export const PACKS: Record<string, DomainPack> = {
       "bash",
       "glob",
       "grep",
+      "generate_image",
     ],
     mcp: false,
     verify: {

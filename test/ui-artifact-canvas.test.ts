@@ -223,6 +223,39 @@ describe("initArtifactCanvas — 打开与 chrome", () => {
     expect(document.querySelector(".ac-name")?.textContent).toBe("index.html");
     expect(document.querySelector(".ac-badge")?.textContent).toBe("网站");
     expect(document.querySelector(".ac-pos")?.textContent).toBe("1 / 6");
+    expect(document.querySelector("#ac-inspect")?.hidden).toBe(false);
+    expect(document.querySelector("#ac-annotate")?.hidden).toBe(true);
+  });
+
+  it("图片产物：标注钮可见；打开后叠画布，不发 fetch", async () => {
+    const fakeFetch = vi.fn();
+    const api = initArtifactCanvas(setupHost(), { fetch: fakeFetch });
+    api.open(1);
+    const btn = document.querySelector("#ac-annotate");
+    expect(btn?.hidden).toBe(false);
+    expect(document.querySelector("#ac-inspect")?.hidden).toBe(true);
+    btn.click();
+    await flush();
+    expect(document.querySelector("canvas.ac-annotate-canvas")).toBeTruthy();
+    expect(document.querySelector("#ac-annotate-bar")).toBeTruthy();
+    expect(fakeFetch).not.toHaveBeenCalled();
+  });
+
+  it("点评模式才 fetch HTML，srcdoc 注入钩子且沙箱仍无 same-origin", async () => {
+    const fakeFetch = vi.fn(async () => textRes("<html><body><h1>Hi</h1><script>alert(1)</script></body></html>"));
+    const onAppendReview = vi.fn();
+    const api = initArtifactCanvas(setupHost({ onAppendReview }), { fetch: fakeFetch });
+    api.open(0);
+    expect(fakeFetch).not.toHaveBeenCalled();
+    document.querySelector("#ac-inspect").click();
+    await flush();
+    expect(fakeFetch).toHaveBeenCalled();
+    const frame = document.querySelector("iframe.ac-frame");
+    expect(frame.getAttribute("sandbox")).toBe("allow-scripts");
+    expect(frame.getAttribute("sandbox")).not.toContain("allow-same-origin");
+    expect(frame.getAttribute("src")).toBeNull();
+    expect(frame.srcdoc).toContain("agent-inspect-pick");
+    expect(frame.srcdoc).not.toContain("alert(1)");
   });
 
   it("图片产物：img 直显", () => {
