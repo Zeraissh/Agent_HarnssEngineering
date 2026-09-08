@@ -9,25 +9,32 @@ import path from "node:path";
 
 const DRIVE_ABS = /^([A-Za-z]):[\\/](.*)$/;
 const MNT_ABS = /^\/mnt\/([a-z])\/(.*)$/;
+const WSL_UNC = /^\\\\wsl\$\\([^\\]+)[\\/](.*)$/i;
 
 export function isWindowsAbsolutePath(value: string): boolean {
-  return DRIVE_ABS.test(path.win32.normalize(value.trim()));
+  const normalized = path.win32.normalize(value.trim());
+  return DRIVE_ABS.test(normalized) || WSL_UNC.test(normalized);
 }
 
-/** 规范化后的 Windows 绝对路径 → WSL `/mnt/<drive>/...`。 */
+/** 规范化后的 Windows 绝对路径 → WSL 路径（盘符 → `/mnt/<drive>/…`，或 `\\wsl$\Distro\…`）。 */
 export function windowsPathToWsl(windowsPath: string): string {
   const raw = windowsPath.trim();
   if (!raw) throw new Error("WSL path mapping rejected empty path");
   if (raw.includes("\0") || /[\r\n]/.test(raw)) {
     throw new Error("WSL path mapping rejected control characters in path");
   }
-  if (raw.startsWith("\\\\") || raw.startsWith("//")) {
-    throw new Error("WSL path mapping rejected UNC path; bind mounts require a drive letter");
-  }
   if (MNT_ABS.test(raw.replace(/\\/g, "/"))) {
     throw new Error("WSL path mapping rejected Linux path where a Windows path was required");
   }
   const normalized = path.win32.normalize(raw);
+  const unc = WSL_UNC.exec(normalized);
+  if (unc) {
+    const rest = (unc[2] ?? "").replace(/\\/g, "/").replace(/^\/+/, "");
+    return rest ? `/${rest}` : "/";
+  }
+  if (raw.startsWith("\\\\") || raw.startsWith("//")) {
+    throw new Error("WSL path mapping rejected UNC path; bind mounts require a drive letter or \\\\wsl$\\Distro\\…");
+  }
   const match = DRIVE_ABS.exec(normalized);
   if (!match) {
     throw new Error(

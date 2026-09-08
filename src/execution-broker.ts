@@ -19,7 +19,7 @@ import type {
   ShellExecutionRequest,
   ShellExecutionResult,
 } from "./types.js";
-import { dockerBindSource } from "./wsl-path.js";
+import { dockerBindSource, windowsPathToWsl } from "./wsl-path.js";
 import {
   buildWslDockerArgv,
   discoverWsl2DockerRuntime,
@@ -627,8 +627,11 @@ function parseLinuxProcStat(value: string, expectedPid: number): { state: string
 }
 
 export async function readOciOwnerIdentity(pid = process.pid): Promise<OciOwnerIdentity> {
-  if (process.platform !== "linux") throw new Error("OCI owner identity is available on Linux only");
   if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("OCI owner PID is invalid");
+  if (process.platform === "win32") {
+    return readWindowsOciOwnerIdentity(pid);
+  }
+  if (process.platform !== "linux") throw new Error("OCI owner identity is available on Linux only");
   const [rawBoot, rawPidNamespace, rawStat] = await Promise.all([
     readFile("/proc/sys/kernel/random/boot_id", "utf8"),
     readlink(`/proc/${pid}/ns/pid`),
@@ -649,6 +652,46 @@ export async function readOciOwnerIdentity(pid = process.pid): Promise<OciOwnerI
       .digest("hex"),
     pid,
     startTicks: parsed.startTicks,
+  };
+}
+
+/** Windows 宿主身份：MachineGuid + PID + CreationDate（毫秒）。供 WSL2 运输层租约/收割。 */
+async function readWindowsOciOwnerIdentity(pid: number): Promise<OciOwnerIdentity> {
+  const { spawnSync } = await import("node:child_process");
+  const bootProbe = spawnSync(
+    "reg.exe",
+    ["query", "HKLM\\SOFTWARE\\Microsoft\\Cryptography", "/v", "MachineGuid"],
+    { encoding: "utf8", windowsHide: true, timeout: 5_000 },
+  );
+  const bootMatch = /MachineGuid\s+REG_SZ\s+([0-9a-fA-F-]{36})/.exec(bootProbe.stdout ?? "");
+  if (!bootMatch?.[1]) throw new Error("Windows MachineGuid is unavailable for OCI owner identity");
+  const bootId = bootMatch[1].toLowerCase();
+  const script =
+    `$p = Get-CimInstance Win32_Process -Filter "ProcessId=${pid}" -ErrorAction Stop; `
+    + "if (-not $p) { throw 'process missing' }; "
+    + "([DateTimeOffset]$p.CreationDate).ToUnixTimeMilliseconds()";
+  const created = spawnSync(
+    "powershell.exe",
+    ["-NoProfile", "-Command", script],
+    { encoding: "utf8", windowsHide: true, timeout: 10_000 },
+  );
+  if (created.status !== 0) {
+    throw new Error(
+      `Windows process CreationDate unavailable for PID ${pid}: ${(created.stderr || created.stdout || "").trim()}`,
+    );
+  }
+  const startTicks = (created.stdout ?? "").trim();
+  if (!/^[1-9][0-9]*$/.test(startTicks)) {
+    throw new Error(`Windows process CreationDate is not a unix-ms integer: ${startTicks}`);
+  }
+  return {
+    boot: createHash("sha256").update("agent-harness/boot/v1\0").update(bootId).digest("hex"),
+    pidNamespace: createHash("sha256")
+      .update("agent-harness/pid-namespace/v1\0")
+      .update("windows:host")
+      .digest("hex"),
+    pid,
+    startTicks,
   };
 }
 
@@ -808,9 +851,9 @@ function createOciLeaseTarget(
 export const OCI_STDIN_BOOTSTRAP = [
   "set -eu",
   "umask 077",
-  'script=/tmp/agent-harness-command.sh',
-  'cat > "$script"',
-  'exec /bin/sh "$script" </dev/null',
+  // 字面路径、零 `$`：经 wsl.exe 转发时 argv 里的 `$var`/`$(…)` 会在容器外被展开。
+  "cat > /tmp/agent-harness-command.sh",
+  "exec /bin/sh /tmp/agent-harness-command.sh </dev/null",
 ].join("; ");
 
 /** 参数数组是安全契约：agent command 不进入 argv/Config.Cmd，只能经 stdin 输入。 */
@@ -975,12 +1018,14 @@ async function trustedDockerRuntime(policy: ExecutionPolicyConfig): Promise<Trus
     if (policy.ociRuntimeSha256 && policy.ociRuntimeSha256 !== discovery.dockerSha256) {
       throw new Error("Configured OCI runtime SHA-256 does not match the executable inside WSL");
     }
+    // 租约主人是 Windows Node 进程，不是信任探针里短暂的 WSL bash。
+    const owner = await readOciOwnerIdentity();
     return {
       file: discovery.wslExe,
       host: `unix://${discovery.socketPath}`,
       cwd: process.env["SystemRoot"] ?? "C:\\Windows",
       socketPath: discovery.socketPath,
-      owner: discovery.owner,
+      owner,
       wsl: discovery,
       env: {
         // wsl.exe 继承最小环境；密钥不进 WSL 命令行。
@@ -1091,28 +1136,61 @@ async function assertSafeWorkspaceForOci(
       }
     }
   } else if (opts.wsl) {
-    // Windows 宿主没有 /proc/self/mountinfo；嵌套挂载检查改在 WSL 内对 /mnt 路径做。
+    // Windows 宿主没有 /proc/self/mountinfo；嵌套挂载与 IPC 节点检查改在 WSL 内做。
+    // 必须经临时脚本：`wsl … bash -lc` 会在容器外展开 `$()`。
     const linuxWorkdir = dockerBindSource(root, true);
     const { spawnSync } = await import("node:child_process");
-    const nested = spawnSync(
-      opts.wsl.wslExe,
-      [
-        "-d",
-        opts.wsl.distro,
-        "--",
-        "/bin/bash",
-        "-lc",
-        `set -eu; ROOT=${JSON.stringify(linuxWorkdir)}; while IFS= read -r line; do mp=$(printf '%s' "$line" | awk '{print $5}'); mp=$(printf '%b' "\${mp}"); case "$mp" in "$ROOT"|"$ROOT"/*) if [ "$mp" != "$ROOT" ]; then echo "$mp"; exit 2; fi;; esac; done < /proc/self/mountinfo; test -d "$ROOT"; test -r "$ROOT"; test -w "$ROOT"; test -x "$ROOT"`,
-      ],
-      { encoding: "utf8", windowsHide: true, timeout: 15_000 },
-    );
-    if (nested.status === 2) {
-      throw new Error(`OCI workdir contains a nested host mount: ${(nested.stdout || "").trim()}`);
-    }
-    if (nested.status !== 0) {
-      throw new Error(
-        `OCI workdir WSL preflight failed: ${(nested.stderr || nested.stdout || "").trim() || `exit ${nested.status}`}`,
+    const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const dir = mkdtempSync(path.join(tmpdir(), "wsl2-workdir-preflight-"));
+    const scriptPath = path.join(dir, "preflight.sh");
+    try {
+      writeFileSync(
+        scriptPath,
+        [
+          "#!/bin/bash",
+          "set -eu",
+          `ROOT=${JSON.stringify(linuxWorkdir)}`,
+          'while IFS= read -r line; do',
+          '  mp=$(printf "%s" "$line" | awk \'{print $5}\')',
+          '  mp=$(printf "%b" "$mp")',
+          '  case "$mp" in',
+          '    "$ROOT"|"$ROOT"/*)',
+          '      if [ "$mp" != "$ROOT" ]; then echo "$mp"; exit 2; fi',
+          "      ;;",
+          "  esac",
+          "done < /proc/self/mountinfo",
+          'test -d "$ROOT"',
+          'test -r "$ROOT"',
+          'test -w "$ROOT"',
+          'test -x "$ROOT"',
+          // DrvFS 上 Windows Node 看不见 AF_UNIX；WSL find 是 IPC 门禁事实源。
+          'hit=$(find "$ROOT" -xdev \\( -type s -o -type p -o -type b -o -type c \\) -print -quit || true)',
+          'if [ -n "$hit" ]; then echo "$hit"; exit 3; fi',
+          "",
+        ].join("\n"),
+        "utf8",
       );
+      const nested = spawnSync(
+        opts.wsl.wslExe,
+        ["-d", opts.wsl.distro, "--", "/bin/bash", windowsPathToWsl(scriptPath)],
+        { encoding: "utf8", windowsHide: true, timeout: 15_000 },
+      );
+      if (nested.status === 2) {
+        throw new Error(`OCI workdir contains a nested host mount: ${(nested.stdout || "").trim()}`);
+      }
+      if (nested.status === 3) {
+        throw new Error(
+          `OCI workdir contains a forbidden host IPC/device entry: ${(nested.stdout || "").trim()}`,
+        );
+      }
+      if (nested.status !== 0) {
+        throw new Error(
+          `OCI workdir WSL preflight failed: ${(nested.stderr || nested.stdout || "").trim() || `exit ${nested.status}`}`,
+        );
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   }
 
@@ -1127,7 +1205,18 @@ async function assertSafeWorkspaceForOci(
         throw new Error("OCI workdir special-file scan exceeded 200000 entries");
       }
       const entryPath = path.join(dirPath, entry.name);
-      const entryInfo = await lstat(entryPath);
+      let entryInfo;
+      try {
+        entryInfo = await lstat(entryPath);
+      } catch (err) {
+        // DrvFS 上由 WSL 创建的 symlink，Windows Node lstat 常 EACCES；
+        // 符号链接本身允许进容器（逃逸断言在容器内做），跳过即可。
+        const code = err && typeof err === "object" && "code" in err
+          ? String((err as { code?: unknown }).code ?? "")
+          : "";
+        if (opts?.viaWsl && code === "EACCES") continue;
+        throw err;
+      }
       if (entryInfo.isSymbolicLink()) continue;
       if (entryInfo.isDirectory()) pending.push(entryPath);
       else if (entryInfo.isFile() && entryInfo.nlink > 1) {
@@ -1254,6 +1343,9 @@ async function dockerProbe(
         active?.delete(name);
         return { ready: false, runtimeVersion, reason: "Execution broker is disposed" };
       }
+      // WSL 运输层：`wsl.exe` 会把 argv 里的 `$(...)` 在容器外展开，探针脚本
+      // 必须走 stdin bootstrap（与 agent 命令同一路径），不能用 inline `-c`。
+      const viaWsl = Boolean(runtime.wsl);
       const result = await dockerCapture(
         runtime,
         buildOciRunArgs({
@@ -1263,13 +1355,14 @@ async function dockerProbe(
           workdir: workspace,
           command: PROBE_COMMAND,
           lease: target.lease,
-          delivery: "inline",
-          viaWsl: Boolean(runtime.wsl),
+          delivery: viaWsl ? "stdin" : "inline",
+          viaWsl,
         }),
         {
           timeoutMs: 15_000,
           maxBufferBytes: 256 * 1024,
           windowsHide: true,
+          ...(viaWsl ? { stdin: PROBE_COMMAND } : {}),
         },
       );
       const marker = (await readFile(path.join(workspace, "probe.out"), "utf8").catch(() => "")).trim();
@@ -1586,6 +1679,32 @@ export async function inspectOciOwnerLiveness(
   if (record.ownerPid === current.pid) {
     return record.ownerStartTicks === current.startTicks ? { state: "alive" } : { state: "dead" };
   }
+  if (process.platform === "win32") {
+    try {
+      const foreign = await readWindowsOciOwnerIdentity(record.ownerPid);
+      if (foreign.boot !== record.ownerBoot || foreign.pidNamespace !== record.ownerPidNamespace) {
+        return { state: "dead" };
+      }
+      return foreign.startTicks === record.ownerStartTicks ? { state: "alive" } : { state: "dead" };
+    } catch {
+      try {
+        probe.signalZero(record.ownerPid);
+        return {
+          state: "unknown",
+          reason: "Windows owner CreationDate unavailable while process signal-0 succeeded",
+        };
+      } catch (signalErr) {
+        const signalCode = signalErr && typeof signalErr === "object" && "code" in signalErr
+          ? String((signalErr as { code?: unknown }).code ?? "")
+          : "";
+        if (signalCode === "ESRCH") return { state: "dead" };
+        return {
+          state: "unknown",
+          reason: `Windows owner visibility is inconclusive: ${errorMessage(signalErr)}`,
+        };
+      }
+    }
+  }
   let rawStat: string;
   try {
     rawStat = await probe.readProcStat(record.ownerPid);
@@ -1827,6 +1946,7 @@ class DockerExecutionAdapter implements OciExecutionAdapter {
         this.active.delete(name);
         throw new Error("Execution broker is disposed");
       }
+      const viaWsl = Boolean(runtime.wsl);
       const result = await dockerCapture(runtime, buildOciRunArgs({
         image: policy.ociImage,
         name,
@@ -1834,12 +1954,13 @@ class DockerExecutionAdapter implements OciExecutionAdapter {
         workdir,
         command,
         lease: target.lease,
-        delivery: "inline",
-        viaWsl: Boolean(runtime.wsl),
+        delivery: viaWsl ? "stdin" : "inline",
+        viaWsl,
       }), {
         timeoutMs: 20_000,
         maxBufferBytes: 256 * 1024,
         windowsHide: true,
+        ...(viaWsl ? { stdin: command } : {}),
       });
       if (result.exitCode !== 0 || result.signal !== null || result.error) {
         const cleanup = await forceRemoveContainer(target);

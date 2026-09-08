@@ -6,6 +6,10 @@
  */
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { windowsPathToWsl } from "./wsl-path.js";
 
 const SHA256 = /^[0-9a-f]{64}$/i;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -25,28 +29,40 @@ export interface Wsl2RuntimeDiscovery {
   };
 }
 
-function wslCapture(
+/**
+ * 经临时 .sh 跑 WSL bash——避免把含 `$DOCKER` 的 -lc 串直接塞进 Windows 进程
+ * 参数表时被吃空（fixture 脚本曾踩过同一坑）。
+ */
+function wslCaptureScript(
   wslExe: string,
   distro: string,
-  script: string,
+  bashBody: string,
   timeoutMs = 15_000,
 ): { ok: boolean; stdout: string; stderr: string; status: number | null } {
-  const result = spawnSync(
-    wslExe,
-    ["-d", distro, "--", "/bin/bash", "-lc", script],
-    {
-      encoding: "utf8",
-      windowsHide: true,
-      timeout: timeoutMs,
-      maxBuffer: 1024 * 1024,
-    },
-  );
-  return {
-    ok: result.status === 0 && !result.error,
-    stdout: (result.stdout ?? "").toString(),
-    stderr: (result.stderr ?? "").toString(),
-    status: result.status,
-  };
+  const dir = mkdtempSync(path.join(tmpdir(), "wsl2-probe-"));
+  const scriptPath = path.join(dir, "probe.sh");
+  try {
+    writeFileSync(scriptPath, `#!/bin/bash\nset -eu\n${bashBody}\n`, "utf8");
+    const wslScript = windowsPathToWsl(scriptPath);
+    const result = spawnSync(
+      wslExe,
+      ["-d", distro, "--", "/bin/bash", wslScript],
+      {
+        encoding: "utf8",
+        windowsHide: true,
+        timeout: timeoutMs,
+        maxBuffer: 1024 * 1024,
+      },
+    );
+    return {
+      ok: result.status === 0 && !result.error,
+      stdout: (result.stdout ?? "").toString(),
+      stderr: (result.stderr ?? "").toString(),
+      status: result.status,
+    };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 /** 解析 `wsl -l -v` 的默认发行版（行首 `*`）。 */
@@ -113,32 +129,32 @@ export function discoverWsl2DockerRuntime(
 
   const dockerPath = configuredRuntime || "/usr/bin/docker";
   // 信任检查在 WSL 内完成：root 所有、非 group/world 可写、SHA-256、socket 为 root 拥有。
-  const script = [
-    "set -eu",
+  // 变量赋值用字面量注入（已 shellQuote），探针体不再依赖易被宿主吃掉的 -lc 串。
+  const bashBody = [
     `DOCKER=${shellQuote(dockerPath)}`,
     `SOCK=${shellQuote(socketPath)}`,
     'test -f "$DOCKER"',
-    "OWNER=$(stat -c '%u %a' \"$DOCKER\")",
-    "test \"$(echo \"$OWNER\" | awk '{print $1}')\" = \"0\"",
-    "PERM=$(echo \"$OWNER\" | awk '{print $2}')",
-    "test $((8#$PERM & 022)) -eq 0",
-    "HASH=$(sha256sum \"$DOCKER\" | awk '{print $1}')",
+    'OWNER=$(stat -c "%u %a" "$DOCKER")',
+    'test "$(echo "$OWNER" | awk \'{print $1}\')" = "0"',
+    'PERM=$(echo "$OWNER" | awk \'{print $2}\')',
+    'test $((8#$PERM & 022)) -eq 0',
+    'HASH=$(sha256sum "$DOCKER" | awk \'{print $1}\')',
     'test -S "$SOCK"',
-    "SOWNER=$(stat -c '%u %a' \"$SOCK\")",
-    "test \"$(echo \"$SOWNER\" | awk '{print $1}')\" = \"0\"",
-    "SPERM=$(echo \"$SOWNER\" | awk '{print $2}')",
-    "test $((8#$SPERM & 002)) -eq 0",
+    'SOWNER=$(stat -c "%u %a" "$SOCK")',
+    'test "$(echo "$SOWNER" | awk \'{print $1}\')" = "0"',
+    'SPERM=$(echo "$SOWNER" | awk \'{print $2}\')',
+    'test $((8#$SPERM & 002)) -eq 0',
     "BOOT=$(tr -d '\\n' </proc/sys/kernel/random/boot_id | tr 'A-F' 'a-f')",
     "PIDNS=$(readlink /proc/$$/ns/pid)",
     "STAT=$(cat /proc/$$/stat)",
-    "printf '%s\\n' \"$HASH\"",
-    "printf '%s\\n' \"$BOOT\"",
-    "printf '%s\\n' \"$PIDNS\"",
-    "printf '%s\\n' \"$$\"",
-    "printf '%s\\n' \"$STAT\"",
-  ].join("; ");
+    'printf "%s\\n" "$HASH"',
+    'printf "%s\\n" "$BOOT"',
+    'printf "%s\\n" "$PIDNS"',
+    'printf "%s\\n" "$$"',
+    'printf "%s\\n" "$STAT"',
+  ].join("\n");
 
-  const probed = wslCapture(wslExe, distro, script);
+  const probed = wslCaptureScript(wslExe, distro, bashBody);
   if (!probed.ok) {
     throw new Error(
       `WSL2 Docker trust probe failed: ${probed.stderr.trim() || probed.stdout.trim() || `exit ${probed.status}`}`,

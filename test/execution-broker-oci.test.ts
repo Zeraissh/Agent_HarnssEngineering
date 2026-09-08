@@ -17,6 +17,7 @@ import {
   parseExecutionPolicy,
   readOciOwnerIdentity,
 } from "../src/execution-broker.js";
+import { windowsPathToWsl } from "../src/wsl-path.js";
 import type { ShellExecutionRequest } from "../src/types.js";
 
 const image = process.env.AGENT_TEST_OCI_IMAGE;
@@ -26,6 +27,27 @@ const hasTrustedOciFixture = Boolean(image && runtime && runtimeSha256);
 /** Windows 上同一份 canary 走 WSL2 运输层；Linux CI 仍用原生 oci。 */
 const ociBackend = process.platform === "win32" ? "wsl2" : "oci";
 
+/**
+ * 工作区内指向圈外文件的 symlink。
+ * Windows 无 Developer Mode 时 Node `symlink` 会 EPERM——改走 WSL `ln -s`
+ *（DrvFs 上的 Linux 元数据链，bind mount 进容器后可见）。
+ */
+async function createEscapeSymlink(workspace: string, targetRel = "../outside.txt"): Promise<void> {
+  const linkPath = path.join(workspace, "outside-link");
+  if (process.platform === "win32" && ociBackend === "wsl2") {
+    const wslLink = windowsPathToWsl(linkPath);
+    const r = spawnSync(
+      process.env.AGENT_EXECUTION_WSL_EXE?.trim() || "C:\\Windows\\System32\\wsl.exe",
+      ["--", "ln", "-sfn", targetRel, wslLink],
+      { encoding: "utf8", windowsHide: true, timeout: 15_000 },
+    );
+    if (r.status !== 0) {
+      throw new Error(`WSL ln -s failed: ${r.stderr || r.stdout || String(r.status)}`);
+    }
+    return;
+  }
+  await symlink(targetRel, linkPath);
+}
 function ociEnv(extra: Record<string, string> = {}) {
   return {
     AGENT_EXECUTION_ISOLATION: "required",
@@ -43,7 +65,7 @@ it.skipIf(!hasTrustedOciFixture)("OCI required profile blocks host escape/env/ne
   await mkdir(workspace);
   await chmod(workspace, 0o777);
   await writeFile(path.join(root, "outside.txt"), "host-secret", "utf8");
-  await symlink("../outside.txt", path.join(workspace, "outside-link"));
+  await createEscapeSymlink(workspace);
   const boundaryId = `oci-it-${randomUUID()}`;
   const broker = createExecutionBroker({
     boundaryId,
@@ -92,7 +114,7 @@ it.skipIf(!hasTrustedOciFixture)("OCI required profile blocks host escape/env/ne
     expect(result.stdout).toContain("profile-ok");
     expect(result.status).toMatchObject({
       effectiveState: "partial",
-      resolvedBackend: "oci",
+      resolvedBackend: ociBackend,
       coverage: ["bash"],
       network: "none",
     });
@@ -132,16 +154,11 @@ it.skipIf(!hasTrustedOciFixture)("OCI abort removes the whole named worker inste
     expect(result.aborted).toBe(true);
     expect(result.cleanup).toBe("confirmed");
 
-    const ps = spawnSync(
-      runtime!,
-      [
-        "--host", "unix:///var/run/docker.sock",
-        "ps", "--all", "--filter",
-        `label=agent-harness.boundary=${executionBoundaryLabel(boundaryId)}`,
-        "--format", "{{.ID}}",
-      ],
-      { encoding: "utf8", timeout: 5_000 },
-    );
+    const ps = docker([
+      "ps", "--all", "--filter",
+      `label=agent-harness.boundary=${executionBoundaryLabel(boundaryId)}`,
+      "--format", "{{.ID}}",
+    ]);
     expect(ps.status).toBe(0);
     expect(ps.stdout.trim()).toBe("");
   } finally {
@@ -248,21 +265,50 @@ it.skipIf(!hasTrustedOciFixture)("OCI dispose kills an active worker and command
 }, 40_000);
 
 it.skipIf(!hasTrustedOciFixture)("OCI workdir preflight rejects a host Unix socket before execution", async () => {
-  const workspace = await mkdtemp(path.join(tmpdir(), "agent-harness-oci-socket-"));
-  await chmod(workspace, 0o777);
-  const socketPath = path.join(workspace, "host.sock");
-  const server = createServer();
-  await new Promise<void>((resolveListen, rejectListen) => {
-    server.once("error", rejectListen);
-    server.listen(socketPath, resolveListen);
-  });
+  let workspace: string;
+  let server: ReturnType<typeof createServer> | undefined;
+  const wslExe = process.env.AGENT_EXECUTION_WSL_EXE?.trim() || "C:\\Windows\\System32\\wsl.exe";
+  if (process.platform === "win32" && ociBackend === "wsl2") {
+    // DrvFS 不支持 AF_UNIX；工作区放到发行版本机盘，经 \\wsl$\ 映射。
+    const distro = process.env.AGENT_EXECUTION_WSL_DISTRO?.trim() || "Ubuntu";
+    const leaf = `agent-harness-oci-socket-${randomUUID()}`;
+    workspace = `\\\\wsl$\\${distro}\\tmp\\${leaf}`;
+    await mkdir(workspace, { recursive: true });
+    await chmod(workspace, 0o777);
+    const script = [
+      "import socket, os",
+      `p = "/tmp/${leaf}/host.sock"`,
+      "os.path.exists(p) and os.unlink(p)",
+      "s = socket.socket(socket.AF_UNIX)",
+      "s.bind(p)",
+    ].join("; ");
+    const r = spawnSync(wslExe, ["-d", distro, "--", "python3", "-c", script], {
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: 15_000,
+    });
+    if (r.status !== 0) {
+      throw new Error(`WSL AF_UNIX bind failed: ${r.stderr || r.stdout || String(r.status)}`);
+    }
+  } else {
+    workspace = await mkdtemp(path.join(tmpdir(), "agent-harness-oci-socket-"));
+    await chmod(workspace, 0o777);
+    const socketPath = path.join(workspace, "host.sock");
+    server = createServer();
+    await new Promise<void>((resolveListen, rejectListen) => {
+      server!.once("error", rejectListen);
+      server!.listen(socketPath, resolveListen);
+    });
+  }
   const broker = ociBroker(`oci-socket-${randomUUID()}`, workspace);
   try {
     const status = await broker.probe(true);
     expect(status).toMatchObject({ effectiveState: "failed", coverage: [] });
     expect(status.probe.reason).toMatch(/forbidden host IPC\/device entry/i);
   } finally {
-    await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    if (server) {
+      await new Promise<void>((resolveClose) => server!.close(() => resolveClose()));
+    }
     await broker.dispose?.();
     await rm(workspace, { recursive: true, force: true });
   }
@@ -296,7 +342,7 @@ it.skipIf(!hasTrustedOciFixture)("OCI durable reaper removes only an expired sch
   try {
     await waitForLeaseExpiry(stale.id);
     const status = await broker.probe(true);
-    expect(status).toMatchObject({ effectiveState: "partial", resolvedBackend: "oci" });
+    expect(status).toMatchObject({ effectiveState: "partial", resolvedBackend: ociBackend });
     const gone = docker(["container", "inspect", stale.id]);
     expect(gone.status).not.toBe(0);
     expect(`${gone.stderr}\n${gone.stdout}`).toMatch(/No such (?:container|object)/i);
@@ -315,7 +361,7 @@ it.skipIf(!hasTrustedOciFixture)("OCI durable reaper preserves an unexpired fore
   const broker = ociBroker(`reaper-probe-${randomUUID()}`, workspace, namespace);
   try {
     const status = await broker.probe(true);
-    expect(status).toMatchObject({ effectiveState: "partial", resolvedBackend: "oci" });
+    expect(status).toMatchObject({ effectiveState: "partial", resolvedBackend: ociBackend });
     const present = docker(["container", "inspect", "--format", "{{.Id}}", live.id]);
     expect(present.status).toBe(0);
     expect(present.stdout.trim()).toBe(live.id);
@@ -341,7 +387,7 @@ it.skipIf(!hasTrustedOciFixture)("OCI durable reaper preserves an expired lease 
   try {
     await waitForLeaseExpiry(live.id);
     const status = await broker.probe(true);
-    expect(status).toMatchObject({ effectiveState: "partial", resolvedBackend: "oci" });
+    expect(status).toMatchObject({ effectiveState: "partial", resolvedBackend: ociBackend });
     expect(docker(["container", "inspect", "--format", "{{.Id}}", live.id]).status).toBe(0);
   } finally {
     docker(["rm", "--force", live.id]);
@@ -372,7 +418,7 @@ it.skipIf(!hasTrustedOciFixture)("OCI durable reaper preserves an expired lease 
     });
     await waitForLeaseExpiry(live.id);
     const status = await broker.probe(true);
-    expect(status).toMatchObject({ effectiveState: "partial", resolvedBackend: "oci" });
+    expect(status).toMatchObject({ effectiveState: "partial", resolvedBackend: ociBackend });
     expect(docker(["container", "inspect", "--format", "{{.Id}}", live.id]).status).toBe(0);
   } finally {
     if (live) docker(["rm", "--force", live.id]);
@@ -425,15 +471,34 @@ it.skipIf(!hasTrustedOciFixture)("OCI durable reaper removes an expired worker a
     });
     expect(owner.kill("SIGKILL")).toBe(true);
     const exited = await ownerExit;
-    expect(exited).toMatchObject({ code: null, signal: "SIGKILL" });
-    await waitForLeaseExpiry(staleId);
+    if (process.platform === "win32") {
+      // Windows 对 SIGKILL 常回报非零 exit code 而非 signal 名。
+      expect(exited.signal === "SIGKILL" || (exited.code !== 0 && exited.code !== null)).toBe(true);
+    } else {
+      expect(exited).toMatchObject({ code: null, signal: "SIGKILL" });
+    }
 
+    const stillThere = docker(["container", "inspect", "--format", "{{.Id}}", staleId]);
     broker = ociBroker(`reaper-probe-${randomUUID()}`, workspace, namespace);
-    const status = await broker.probe(true);
-    expect(status).toMatchObject({ effectiveState: "partial", resolvedBackend: "oci" });
-    const gone = docker(["container", "inspect", staleId]);
-    expect(gone.status).not.toBe(0);
-    expect(`${gone.stderr}\n${gone.stdout}`).toMatch(/No such (?:container|object)/i);
+    if (stillThere.status === 0) {
+      await waitForLeaseExpiry(staleId);
+      const status = await broker.probe(true);
+      expect(status).toMatchObject({ effectiveState: "partial", resolvedBackend: ociBackend });
+      const gone = docker(["container", "inspect", staleId]);
+      expect(gone.status).not.toBe(0);
+      expect(`${gone.stderr}\n${gone.stdout}`).toMatch(/No such (?:container|object)/i);
+    } else {
+      // WSL 运输层：宿主被 SIGKILL 时 wsl→docker 客户端同死，附着 --rm worker
+      // 被 daemon 收走，收割器无墓碑。仍要求 probe 可就绪且命名空间无残留。
+      expect(`${stillThere.stderr}\n${stillThere.stdout}`).toMatch(/No such (?:container|object)/i);
+      const status = await broker.probe(true);
+      expect(status).toMatchObject({ effectiveState: "partial", resolvedBackend: ociBackend });
+      expect(docker([
+        "ps", "--all", "--filter",
+        `label=agent-harness.namespace=${executionNamespaceLabel(namespace)}`,
+        "--format", "{{.ID}}",
+      ]).stdout.trim()).toBe("");
+    }
   } catch (err) {
     throw new Error(`SIGKILL reaper acceptance failed: ${String(err)}${stderr ? `\nchild stderr:\n${stderr}` : ""}`);
   } finally {
@@ -530,7 +595,16 @@ function startManagedLease(
 }
 
 function docker(args: string[]) {
-  return spawnSync(runtime!, ["--host", "unix:///var/run/docker.sock", ...args], {
+  const hostArgs = ["--host", "unix:///var/run/docker.sock", ...args];
+  if (process.platform === "win32") {
+    const wslExe = process.env.AGENT_EXECUTION_WSL_EXE?.trim() || "C:\\Windows\\System32\\wsl.exe";
+    return spawnSync(wslExe, ["--", runtime!, ...hostArgs], {
+      encoding: "utf8",
+      timeout: 15_000,
+      windowsHide: true,
+    });
+  }
+  return spawnSync(runtime!, hostArgs, {
     encoding: "utf8",
     timeout: 15_000,
   });

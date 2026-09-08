@@ -19,7 +19,7 @@ const broker = createExecutionBroker({
   workdir: workspace,
   env: {
     AGENT_EXECUTION_ISOLATION: "required",
-    AGENT_EXECUTION_BACKEND: "oci",
+    AGENT_EXECUTION_BACKEND: process.platform === "win32" ? "wsl2" : "oci",
     AGENT_EXECUTION_OCI_IMAGE: required("AGENT_TEST_OCI_IMAGE"),
     AGENT_EXECUTION_OCI_RUNTIME: required("AGENT_TEST_OCI_RUNTIME"),
     AGENT_EXECUTION_OCI_RUNTIME_SHA256: required("AGENT_TEST_OCI_RUNTIME_SHA256"),

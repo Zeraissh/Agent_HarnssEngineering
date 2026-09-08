@@ -29,16 +29,22 @@ describe("wsl-path mapping (SAFE-05 §4.6 ④)", () => {
     expect(() => wslPathToWindows("\\\\wsl$\\Ubuntu\\home")).toThrow(/wsl\$/);
   });
 
+  it("maps \\\\wsl$\\Distro\\… to the distro-absolute Linux path", () => {
+    expect(windowsPathToWsl("\\\\wsl$\\Ubuntu\\tmp\\ws")).toBe("/tmp/ws");
+    expect(windowsPathToWsl("\\\\wsl$\\Ubuntu\\home\\a\\b")).toBe("/home/a/b");
+  });
+
+  it("isWindowsAbsolutePath recognises drive letters and \\\\wsl$", () => {
+    expect(isWindowsAbsolutePath("D:\\a")).toBe(true);
+    expect(isWindowsAbsolutePath("\\\\wsl$\\Ubuntu\\tmp\\a")).toBe(true);
+    expect(isWindowsAbsolutePath("/mnt/d/a")).toBe(false);
+  });
+
   it("dockerBindSource switches on viaWsl", () => {
     if (process.platform === "win32") {
       expect(dockerBindSource("D:\\tmp\\ws", true)).toBe("/mnt/d/tmp/ws");
     }
     expect(dockerBindSource("/tmp/ws", false).replace(/\\/g, "/")).toMatch(/\/tmp\/ws$/);
-  });
-
-  it("isWindowsAbsolutePath recognises drive letters only", () => {
-    expect(isWindowsAbsolutePath("D:\\a")).toBe(true);
-    expect(isWindowsAbsolutePath("/mnt/d/a")).toBe(false);
   });
 });
 
