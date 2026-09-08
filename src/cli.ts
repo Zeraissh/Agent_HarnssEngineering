@@ -183,6 +183,21 @@ function describeCompaction(event: Extract<TurnEvent, { type: "compaction" }>): 
   );
 }
 
+/** GhostApproval：审批提示附带解析后真实路径（与模型诱饵名对照）。 */
+function formatApprovalPrompt(event: Extract<TurnEvent, { type: "approval_request" }>): string {
+  const base = `approve ${event.name} ${JSON.stringify(event.input)}`;
+  const attention = (event.resolvedTargets ?? []).filter((t) => t.diverges || t.error);
+  if (attention.length === 0) return base;
+  const hints = attention
+    .map((t) =>
+      t.error
+        ? `REAL-PATH FAIL ${t.field}=${t.requested}: ${t.error}`
+        : `REAL PATH ${t.field}: ${t.requested} → ${t.real}`,
+    )
+    .join("; ");
+  return `${base}\n  ⚠ ${hints}`;
+}
+
 const SYSTEM_PROMPT = `You are a capable autonomous agent operating in a local working directory.
 Complete the user's task end to end using the available tools.
 Ground every claim of progress in an actual tool result. When the task is done, summarize what you did in one or two sentences.
@@ -1011,12 +1026,12 @@ async function main(): Promise<void> {
         case "approval_request": {
           if (isVerifier) break; // verifier 审批由其内部自答，仅供观察，不提示
           if (autoYes || !rl) {
-            console.log(c.yellow(`${tag} ⚠ auto-approved: ${event.name} ${JSON.stringify(event.input)}`));
+            console.log(c.yellow(`${tag} ⚠ auto-approved: ${formatApprovalPrompt(event)}`));
             event.respond("allow");
             break;
           }
           const answer = await rl.question(
-            c.yellow(`${tag} ⚠ approve ${event.name} ${JSON.stringify(event.input)}? [y/N] `),
+            c.yellow(`${tag} ⚠ ${formatApprovalPrompt(event)}? [y/N] `),
           );
           if (answer.trim().toLowerCase() === "y") event.respond("allow");
           else event.respond("deny", (await rl.question(c.dim("  reason (optional): "))).trim() || undefined);
@@ -1396,12 +1411,12 @@ async function main(): Promise<void> {
       case "approval_request": {
         endStreamLine();
         if (autoYes || !rl) {
-          console.log(c.yellow(`⚠ auto-approved: ${event.name} ${JSON.stringify(event.input)}`));
+          console.log(c.yellow(`⚠ auto-approved: ${formatApprovalPrompt(event)}`));
           event.respond("allow");
           break;
         }
         const answer = await rl.question(
-          c.yellow(`⚠ approve ${event.name} ${JSON.stringify(event.input)}? [y/N] `),
+          c.yellow(`⚠ ${formatApprovalPrompt(event)}? [y/N] `),
         );
         if (answer.trim().toLowerCase() === "y") {
           event.respond("allow");

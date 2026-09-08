@@ -1071,6 +1071,9 @@ function applyApproval(state, seq, source, event) {
   const input = event.input;
 
   const entry = { seq, source, type: "approval_request", toolUseId, name, input };
+  if (Array.isArray(event.resolvedTargets)) {
+    entry.resolvedTargets = event.resolvedTargets;
+  }
 
   // F2: verifier 审批不进 pendingApprovals（内部已自答，HTTP 不应再应答）
   if (isVerifierSource(source)) {
@@ -1095,6 +1098,7 @@ function applyApproval(state, seq, source, event) {
         status: "pending",
         requestSeq: seq,
         approvalId: `${toolUseId}#${seq}`,
+        ...(Array.isArray(event.resolvedTargets) ? { resolvedTargets: event.resolvedTargets } : {}),
         ...(event.grantPolicy && typeof event.grantPolicy === "object"
           ? { grantPolicy: event.grantPolicy }
           : {}),
@@ -4599,6 +4603,7 @@ function patchApprovalRail(parts, state, isRunning, callbacks) {
         '<span class="approval-result" hidden></span>' +
         "</div>" +
         '<pre class="approval-input"></pre>' +
+        '<div class="approval-resolved" hidden></div>' +
         '<div class="approval-actions" hidden>' +
         '<button type="button" class="btn btn--allow" data-action="allow">允许本次</button>' +
         // 规则只复用同一工具 + 完全相同参数，并受 TTL/次数/工具策略限制
@@ -4661,6 +4666,27 @@ function updateApprovalCard(card, a, isRunning) {
   }
 
   setText(card.querySelector(".approval-input"), formatInput(a.input));
+  const resolvedEl = card.querySelector(".approval-resolved");
+  const targets = Array.isArray(a.resolvedTargets) ? a.resolvedTargets : [];
+  const attention = targets.filter((t) => t && (t.diverges || t.error));
+  if (attention.length > 0) {
+    setAttr(resolvedEl, "hidden", null);
+    setClass(resolvedEl, "approval-resolved--warn", true);
+    resolvedEl.innerHTML = attention
+      .map((t) => {
+        if (t.error) {
+          return `<strong>真实目标不可用</strong>（${esc(t.field)}=${esc(t.requested)}）：${esc(t.error)}`;
+        }
+        return (
+          `<strong>真实写入目标</strong>（${esc(t.field)}）：` +
+          `<code>${esc(t.requested)}</code> → <code>${esc(t.real)}</code>`
+        );
+      })
+      .join("<br>");
+  } else {
+    setAttr(resolvedEl, "hidden", "");
+    resolvedEl.innerHTML = "";
+  }
   card.querySelector(".deny-reason").setAttribute(
     "aria-label",
     `拒绝 ${a.name} 的理由（可选）`,

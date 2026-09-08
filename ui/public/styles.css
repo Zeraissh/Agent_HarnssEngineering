@@ -1226,6 +1226,24 @@ code, pre, .chip-name, .usage-table td, .log-entry-body {
   word-break: break-all;
 }
 
+.approval-resolved {
+  font-size: var(--font-xs);
+  color: var(--fg1);
+  margin: 0 0 var(--space-sm);
+  padding: 6px var(--space-sm);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+}
+.approval-resolved--warn {
+  border-color: var(--status-warn, #b45309);
+  background: var(--status-warn-surface, rgba(180, 83, 9, 0.12));
+  color: var(--text-1, inherit);
+}
+.approval-resolved code {
+  font-size: inherit;
+  word-break: break-all;
+}
+
 .approval-actions { display: flex; gap: 6px; align-items: center; }
 
 .deny-reason {

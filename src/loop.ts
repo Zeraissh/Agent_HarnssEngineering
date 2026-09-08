@@ -20,6 +20,7 @@ import {
   planMidToolReplay,
   shouldAttemptMidToolReplay,
 } from "./mid-tool-replay.js";
+import { describeApprovalTargets } from "./approval-display.js";
 import { type DurableToolTx, type ToolTxController } from "./tool-tx.js";
 import { ToolExecutor, ToolRegistry } from "./tools/registry.js";
 import { parseProgressItems } from "./tools/update-progress.js";
@@ -360,6 +361,28 @@ export class AgentLoop {
     this.executor.setToolTx(this.toolTxCtrl);
   }
 
+  /** GhostApproval：审批事件附带解析后的真实路径目标。 */
+  private pushApprovalRequest(
+    q: AsyncEventQueue<TurnEvent>,
+    block: Anthropic.ToolUseBlock,
+    resolve: (value: { decision: "allow" | "deny"; reason?: string }) => void,
+  ): void {
+    const resolvedTargets = describeApprovalTargets(
+      block.name,
+      block.input,
+      this.cfg.workdir,
+      this.cfg.readRoots,
+    );
+    q.push({
+      type: "approval_request",
+      toolUseId: block.id,
+      name: block.name,
+      input: block.input,
+      ...(resolvedTargets.length ? { resolvedTargets } : {}),
+      respond: (decision, reason) => resolve({ decision, reason }),
+    });
+  }
+
   /**
    * 续跑正史修复入口（SAFE-06 mid-tool + P6）。
    *
@@ -423,13 +446,7 @@ export class AgentLoop {
         signal,
         (block) =>
           new Promise((resolve) => {
-            q.push({
-              type: "approval_request",
-              toolUseId: block.id,
-              name: block.name,
-              input: block.input,
-              respond: (decision, reason) => resolve({ decision, reason }),
-            });
+            this.pushApprovalRequest(q, block, resolve);
           }),
         (exec) => {
           executed.set(exec.toolUseId, {
@@ -1109,13 +1126,7 @@ export class AgentLoop {
             signal,
             (block) =>
               new Promise((resolve) => {
-                q.push({
-                  type: "approval_request",
-                  toolUseId: block.id,
-                  name: block.name,
-                  input: block.input,
-                  respond: (decision, reason) => resolve({ decision, reason }),
-                });
+                this.pushApprovalRequest(q, block, resolve);
               }),
             (executed) => {
               // OBS-02：工具延迟。名字只从**本轮的 blocks** 取——`ExecutedTool`

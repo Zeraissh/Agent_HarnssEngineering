@@ -497,6 +497,11 @@ export type TurnEvent =
       toolUseId: string;
       name: string;
       input: unknown;
+      /**
+       * GhostApproval：路径类工具在审批前解析出的真实目标。
+       * 与模型入参不一致（symlink / junction）或圈禁失败时，宿主必须醒目展示。
+       */
+      resolvedTargets?: import("./approval-display.js").ApprovalPathTarget[];
       /** 宿主必须调用 respond 才能让 loop 继续；deny 时可附给模型的理由 */
       respond: (decision: "allow" | "deny", reason?: string) => void;
     }

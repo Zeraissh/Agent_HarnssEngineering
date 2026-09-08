@@ -1251,6 +1251,29 @@ describe("需你决定：钉在输入框上方的固定坞", () => {
     expect(dock().contains(card)).toBe(true);
     expect(document.getElementById("main-area")!.contains(card)).toBe(false);
   });
+
+  it("GhostApproval：resolvedTargets 分歧时审批卡醒目展示真实路径", () => {
+    let s = createInitialState("ghost", "t", false);
+    s = reduceEvents(s, [sse(1, "main", "approval_request", {
+      toolUseId: "tu_g",
+      name: "write_file",
+      input: { path: "project_settings.json", content: "x" },
+      resolvedTargets: [{
+        field: "path",
+        requested: "project_settings.json",
+        lexical: "D:\\w\\project_settings.json",
+        real: "D:\\w\\.env",
+        diverges: true,
+      }],
+    })]);
+    s = { ...s, status: "running" };
+    renderRunDetail(s, { activeTab: "loop" });
+    const resolved = document.querySelector(".approval-resolved")!;
+    expect(resolved.hasAttribute("hidden")).toBe(false);
+    expect(resolved.classList.contains("approval-resolved--warn")).toBe(true);
+    expect(resolved.textContent).toContain("project_settings.json");
+    expect(resolved.textContent).toContain(".env");
+  });
 });
 
 // ================================================================
