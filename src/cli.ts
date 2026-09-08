@@ -147,6 +147,13 @@ import {
 import { warnEnvConflicts } from "./env-check.js";
 import { EFFORT_LEVELS } from "./types.js";
 import type { AgentConfig, Effort, ExecutionBroker, RecoveryPolicy, TurnEvent } from "./types.js";
+import {
+  cliDurableEnabled,
+  createCliDurable,
+  ensureCliHistoryRoot,
+  type CliDurableHandle,
+} from "./cli-durable.js";
+import { permissionModeSwitches, resolvePermissionMode } from "./permission-mode.js";
 
 let activeCliExecutionBroker: ExecutionBroker | undefined;
 
@@ -777,6 +784,28 @@ async function main(): Promise<void> {
       ]
     : [];
 
+  const cliRunId = `cli-${Date.now()}`;
+  let cliDurable: CliDurableHandle | undefined;
+  if (cliDurableEnabled()) {
+    await ensureCliHistoryRoot(process.cwd());
+    cliDurable = createCliDurable({ runId: cliRunId, cwd: process.cwd() });
+    console.log(c.dim(`durable: ${cliRunId} → .agent-run-history/${cliRunId}/state.json`));
+  }
+
+  let permissionModeLabel: import("./permission-mode.js").PermissionMode = "manual";
+  try {
+    permissionModeLabel = resolvePermissionMode(process.env.AGENT_PERMISSION_MODE);
+    const switches = permissionModeSwitches(permissionModeLabel);
+    console.log(
+      c.dim(
+        `permissionMode: ${permissionModeLabel} (approval=${switches.approvalDefault} plan=${switches.planMode} gate=${switches.planGate} yes=${switches.autoYes})`,
+      ),
+    );
+  } catch (err) {
+    console.error(c.red(err instanceof Error ? err.message : String(err)));
+    process.exit(1);
+  }
+
   const baseConfig: AgentConfig = {
     systemPrompt: pack?.systemPrompt ?? SYSTEM_PROMPT,
     tools: [
@@ -785,8 +814,9 @@ async function main(): Promise<void> {
       ...askUserTools,
     ],
     workdir: process.cwd(),
-    // SAFE-06：CLI 武装内存 toolTx（事件可见）；durable state 仍是 Web 先行残余
-    runId: `cli-${Date.now()}`,
+    // SAFE-06 + RUN-01：CLI durable 落 state.json；关 AGENT_CLI_DURABLE=0 退回纯内存
+    runId: cliRunId,
+    ...(cliDurable ? { toolTx: cliDurable.toolTx } : {}),
     ...(executionBroker ? { executionBroker } : {}),
     ...(readRoots.length ? { readRoots } : {}),
     compat,
@@ -1231,24 +1261,34 @@ async function main(): Promise<void> {
     printVerdictSignal("  ", outcome.finalPassed, outcome.verifications.at(-1)?.verdict);
   } else {
     const loop = new AgentLoop(config, modelClient);
-    for await (const event of loop.run(task)) {
-      noteForLedger("main", event);
-      if (event.type === "done") {
-        ledgerFacts = {
-          stopReason: event.result.stopReason,
-          error:
-            event.result.stopReason === "error" && event.result.error
-              ? ledgerErrorClass(event.result.error)
-              : event.result.stopReason === "error"
-                ? ledgerErrorClass("error")
-                : null,
-          turns: event.result.usage.turns,
-          reworks: null,
-          finalPassed: null,
-          verifications: [],
-        };
+    try {
+      for await (const event of loop.run(task)) {
+        noteForLedger("main", event);
+        if (event.type === "done") {
+          ledgerFacts = {
+            stopReason: event.result.stopReason,
+            error:
+              event.result.stopReason === "error" && event.result.error
+                ? ledgerErrorClass(event.result.error)
+                : event.result.stopReason === "error"
+                  ? ledgerErrorClass("error")
+                  : null,
+            turns: event.result.usage.turns,
+            reworks: null,
+            finalPassed: null,
+            verifications: [],
+          };
+          if (event.result.stopReason === "error" || event.result.stopReason === "aborted") {
+            cliDurable?.markInterrupted();
+          } else {
+            cliDurable?.markCompleted();
+          }
+        }
+        await renderEvent(event);
       }
-      await renderEvent(event);
+    } catch (err) {
+      cliDurable?.markFailed();
+      throw err;
     }
   }
   /**
@@ -1258,7 +1298,7 @@ async function main(): Promise<void> {
   void appendRunLedger(
     buildLedgerEntry({
       at: Date.now(),
-      runId: `cli-${ledgerStartedAt}`,
+      runId: cliRunId,
       host: "cli",
       task,
       pack: pack?.name ?? null,
