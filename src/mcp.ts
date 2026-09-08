@@ -30,6 +30,7 @@ import {
   getDefaultEnvironment,
   StdioClientTransport,
 } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { isToolPermission, resolveToolPermission, type ToolPermission } from "./permission-mode.js";
 import { truncate } from "./tools/fs-util.js";
 import type { JSONSchema, Tool } from "./types.js";
 
@@ -41,10 +42,10 @@ export interface McpServerConfig {
   args?: string[];
   env?: Record<string, string>;
   cwd?: string;
-  /** 默认 "ask"——外部进程能力面未知，审批兜底 */
-  permission?: "auto" | "ask";
+  /** 默认 "ask"——外部进程能力面未知，审批兜底；deny = 硬拒 */
+  permission?: ToolPermission;
   /** 按 MCP server 声明的原始工具名覆盖 permission */
-  toolPermissions?: Record<string, "auto" | "ask">;
+  toolPermissions?: Record<string, ToolPermission>;
   /** 默认 false——MCP server 内部多为有状态会话，保守串行 */
   parallelSafe?: boolean;
   /** 只暴露这些工具（可选，控制工具面大小） */
@@ -58,9 +59,9 @@ export interface McpConfig {
 /** server / DomainPack 共用的权限策略形状。 */
 export interface McpPermissionPolicy {
   /** 该层级的默认权限 */
-  permission?: "auto" | "ask";
+  permission?: ToolPermission;
   /** 按 MCP 原始工具名的细粒度覆盖 */
-  toolPermissions?: Record<string, "auto" | "ask">;
+  toolPermissions?: Record<string, ToolPermission>;
 }
 
 interface AdaptedMcpPermissionMetadata {
@@ -76,14 +77,11 @@ export function originalMcpToolName(tool: Tool): string | undefined {
   return adaptedMcpPermissionMetadata.get(tool)?.rawToolName;
 }
 
-function isToolPermission(value: unknown): value is "auto" | "ask" {
-  return value === "auto" || value === "ask";
-}
-
 /**
  * 合并 server 与 DomainPack 权限。优先级从低到高固定为：
  * server 默认 → pack 默认 → server 单工具 → pack 单工具。
  *
+ * deny-first：任一层出现 deny 立即胜出（宽 deny 压过窄 allow）。
  * 关键不变量：pack 的泛化默认不能放宽 server 对某个具体工具的显式 ask；
  * 若确实要覆盖，必须在 pack.toolPermissions 中同样点名该工具。
  */
@@ -91,15 +89,24 @@ export function resolveMcpToolPermission(
   rawToolName: string,
   serverPolicy?: McpPermissionPolicy,
   packPolicy?: McpPermissionPolicy,
-): "auto" | "ask" {
-  let resolved: "auto" | "ask" = "ask";
+): ToolPermission {
+  const serverTool = serverPolicy?.toolPermissions?.[rawToolName];
+  const packTool = packPolicy?.toolPermissions?.[rawToolName];
+  if (
+    serverPolicy?.permission === "deny"
+    || packPolicy?.permission === "deny"
+    || serverTool === "deny"
+    || packTool === "deny"
+  ) {
+    return "deny";
+  }
+
+  let resolved: ToolPermission = "ask";
   if (isToolPermission(serverPolicy?.permission)) resolved = serverPolicy.permission;
   if (isToolPermission(packPolicy?.permission)) resolved = packPolicy.permission;
-  const serverTool = serverPolicy?.toolPermissions?.[rawToolName];
   if (isToolPermission(serverTool)) resolved = serverTool;
-  const packTool = packPolicy?.toolPermissions?.[rawToolName];
   if (isToolPermission(packTool)) resolved = packTool;
-  return resolved;
+  return resolveToolPermission([resolved]);
 }
 
 /**
@@ -343,7 +350,7 @@ export async function loadMcpConfig(configPath: string): Promise<McpConfig | und
     }
     if (cfg.permission !== undefined && !isToolPermission(cfg.permission)) {
       throw new Error(
-        `Invalid MCP config ${configPath}: server "${serverName}" permission must be "auto" or "ask"`,
+        `Invalid MCP config ${configPath}: server "${serverName}" permission must be "auto" | "ask" | "deny"`,
       );
     }
     if (
@@ -357,7 +364,7 @@ export async function loadMcpConfig(configPath: string): Promise<McpConfig | und
     for (const [toolName, permission] of Object.entries(cfg.toolPermissions ?? {})) {
       if (!isToolPermission(permission)) {
         throw new Error(
-          `Invalid MCP config ${configPath}: server "${serverName}" tool "${toolName}" permission must be "auto" or "ask"`,
+          `Invalid MCP config ${configPath}: server "${serverName}" tool "${toolName}" permission must be "auto" | "ask" | "deny"`,
         );
       }
     }

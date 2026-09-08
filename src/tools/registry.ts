@@ -221,6 +221,16 @@ export class ToolExecutor {
       return { content: invalid, isError: true };
     }
 
+    if (tool.permission === "deny") {
+      return {
+        content:
+          `Tool "${block.name}" is denied by policy (permission=deny). ` +
+          `This hard deny cannot be overridden by --yes, auto mode, or approval grants. ` +
+          `Adjust the task or ask the operator to change the deny rule.`,
+        isError: true,
+      };
+    }
+
     if (tool.permission === "ask") {
       const { decision, reason } = await approve(block);
       if (decision === "deny") {
