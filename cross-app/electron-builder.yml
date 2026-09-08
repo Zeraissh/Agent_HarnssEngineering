@@ -25,6 +25,8 @@ win:
 nsis:
   oneClick: false
   allowToChangeInstallationDirectory: true
+  runAfterFinish: false
+  deleteAppDataOnUninstall: false
 mac:
   target: dmg
   hardenedRuntime: true
