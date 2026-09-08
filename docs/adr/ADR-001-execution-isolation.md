@@ -147,5 +147,8 @@ Hybrid 的实现成本最高，但它把不可避免的平台差异关在一个�
 4. [x] 增加 parser、broker 传播、命令参数不注入、secret/network/mount/resource 与 unavailable 负向测试。
 5. [ ] 把普通 MCP stdio 迁入 managed worker；硬件 MCP 改为 gateway + device lease。
 6. [~] 已增加每 run broker、销毁回执、并发 worker、workdir canary 与 ADR-002 durable lease/reaper；专属 worktree/UID lease、无后续 probe 的定时销毁仍待完成。
-7. [~] Linux CI/release 已配置 OCI 真实逃逸/资源/清理/reaper canary；本机 Windows 无可信 fixture，尚未取得本轮 CI 运行回执。Windows/macOS 仍只验 capability report 与 fail-closed。
+7. [~] Linux CI/release 已配置 OCI 真实逃逸/资源/清理/reaper canary；Windows 经
+   `AGENT_EXECUTION_BACKEND=wsl2` 走同一 profile（路径映射 + WSL 内信任探针，
+   `test/wsl2-path.test.ts` + 同文件 13 canary）。本机 canary skip=0 仍依赖 WSL
+   内已有 digest 镜像（`npm run wsl2:oci-fixture`）。macOS 仍只验 report + fail-closed。
 8. [ ] 独立 Broker 服务完成后重新评估多租户支持边界。

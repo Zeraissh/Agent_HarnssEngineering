@@ -23,6 +23,19 @@ const image = process.env.AGENT_TEST_OCI_IMAGE;
 const runtime = process.env.AGENT_TEST_OCI_RUNTIME;
 const runtimeSha256 = process.env.AGENT_TEST_OCI_RUNTIME_SHA256;
 const hasTrustedOciFixture = Boolean(image && runtime && runtimeSha256);
+/** Windows 上同一份 canary 走 WSL2 运输层；Linux CI 仍用原生 oci。 */
+const ociBackend = process.platform === "win32" ? "wsl2" : "oci";
+
+function ociEnv(extra: Record<string, string> = {}) {
+  return {
+    AGENT_EXECUTION_ISOLATION: "required",
+    AGENT_EXECUTION_BACKEND: ociBackend,
+    AGENT_EXECUTION_OCI_IMAGE: image!,
+    AGENT_EXECUTION_OCI_RUNTIME: runtime!,
+    AGENT_EXECUTION_OCI_RUNTIME_SHA256: runtimeSha256!,
+    ...extra,
+  };
+}
 
 it.skipIf(!hasTrustedOciFixture)("OCI required profile blocks host escape/env/network and enforces identity/resources", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "agent-harness-oci-it-"));
@@ -37,7 +50,7 @@ it.skipIf(!hasTrustedOciFixture)("OCI required profile blocks host escape/env/ne
     workdir: workspace,
     env: {
       AGENT_EXECUTION_ISOLATION: "required",
-      AGENT_EXECUTION_BACKEND: "oci",
+      AGENT_EXECUTION_BACKEND: ociBackend,
       AGENT_EXECUTION_OCI_IMAGE: image!,
       AGENT_EXECUTION_OCI_RUNTIME: runtime!,
       AGENT_EXECUTION_OCI_RUNTIME_SHA256: runtimeSha256!,
@@ -101,7 +114,7 @@ it.skipIf(!hasTrustedOciFixture)("OCI abort removes the whole named worker inste
     workdir: workspace,
     env: {
       AGENT_EXECUTION_ISOLATION: "required",
-      AGENT_EXECUTION_BACKEND: "oci",
+      AGENT_EXECUTION_BACKEND: ociBackend,
       AGENT_EXECUTION_OCI_IMAGE: image!,
       AGENT_EXECUTION_OCI_RUNTIME: runtime!,
       AGENT_EXECUTION_OCI_RUNTIME_SHA256: runtimeSha256!,
@@ -458,7 +471,7 @@ function ociBroker(boundaryId: string, workspace: string, namespace = boundaryId
     workdir: workspace,
     env: {
       AGENT_EXECUTION_ISOLATION: "required",
-      AGENT_EXECUTION_BACKEND: "oci",
+      AGENT_EXECUTION_BACKEND: ociBackend,
       AGENT_EXECUTION_OCI_IMAGE: image!,
       AGENT_EXECUTION_OCI_RUNTIME: runtime!,
       AGENT_EXECUTION_OCI_RUNTIME_SHA256: runtimeSha256!,
@@ -479,7 +492,7 @@ function startManagedLease(
   const name = `agent-harness-${boundary}-${leaseId}`;
   const policy = parseExecutionPolicy({
     AGENT_EXECUTION_ISOLATION: "required",
-    AGENT_EXECUTION_BACKEND: "oci",
+    AGENT_EXECUTION_BACKEND: ociBackend,
     AGENT_EXECUTION_OCI_IMAGE: image!,
     AGENT_EXECUTION_OCI_RUNTIME: runtime!,
     AGENT_EXECUTION_OCI_RUNTIME_SHA256: runtimeSha256!,

@@ -19,9 +19,15 @@ import type {
   ShellExecutionRequest,
   ShellExecutionResult,
 } from "./types.js";
+import { dockerBindSource } from "./wsl-path.js";
+import {
+  buildWslDockerArgv,
+  discoverWsl2DockerRuntime,
+  type Wsl2RuntimeDiscovery,
+} from "./wsl2-runtime.js";
 
 const MODES = ["off", "report", "required"] as const;
-const BACKENDS = ["auto", "oci", "bwrap"] as const;
+const BACKENDS = ["auto", "oci", "bwrap", "wsl2"] as const;
 const OCI_IMAGE = /^(?:[^\s@]+@)?sha256:[0-9a-f]{64}$/i;
 const SHA256 = /^[0-9a-f]{64}$/i;
 const LOCAL_UNIX_SOCKET = /^unix:\/\/(\/[^\r\n]+)$/;
@@ -182,10 +188,20 @@ export function parseExecutionPolicy(
   const mode = rawMode as ExecutionIsolationMode;
   const backend = rawBackend as ExecutionBackendPreference;
   const ociRuntime = env["AGENT_EXECUTION_OCI_RUNTIME"]?.trim() || undefined;
-  if (ociRuntime && !path.isAbsolute(ociRuntime)) {
-    throw new Error(
-      "AGENT_EXECUTION_OCI_RUNTIME must be an administrator-pinned absolute Docker CLI path; PATH lookup is forbidden",
-    );
+  if (ociRuntime) {
+    const linuxAbs = ociRuntime.startsWith("/") && !ociRuntime.startsWith("//");
+    const winAbs = path.isAbsolute(ociRuntime);
+    if (backend === "wsl2" || (backend === "auto" && process.platform === "win32")) {
+      if (!linuxAbs) {
+        throw new Error(
+          "AGENT_EXECUTION_OCI_RUNTIME for WSL2 must be an absolute Linux path inside the distro (e.g. /usr/bin/docker)",
+        );
+      }
+    } else if (!winAbs) {
+      throw new Error(
+        "AGENT_EXECUTION_OCI_RUNTIME must be an administrator-pinned absolute Docker CLI path; PATH lookup is forbidden",
+      );
+    }
   }
   const ociRuntimeSha256 = env["AGENT_EXECUTION_OCI_RUNTIME_SHA256"]?.trim().toLowerCase() || undefined;
   if (ociRuntimeSha256 && !SHA256.test(ociRuntimeSha256)) {
@@ -273,10 +289,22 @@ export function parseExecutionPolicy(
   };
 }
 
-function candidateFor(policy: ExecutionPolicyConfig): "oci" | "bwrap" | null {
+function candidateFor(policy: ExecutionPolicyConfig): "oci" | "bwrap" | "wsl2" | null {
   if (policy.backend === "oci") return "oci";
   if (policy.backend === "bwrap") return "bwrap";
-  return policy.ociImage ? "oci" : null;
+  if (policy.backend === "wsl2") return "wsl2";
+  // auto：Windows 有镜像时优先走 WSL2 运输层；Linux 仍走原生 OCI。
+  if (!policy.ociImage) return null;
+  if (process.platform === "win32") return "wsl2";
+  return "oci";
+}
+
+function isolationBackendOf(
+  candidate: "oci" | "bwrap" | "wsl2" | null,
+): "oci" | "wsl2" | null {
+  if (candidate === "wsl2") return "wsl2";
+  if (candidate === "oci") return "oci";
+  return null;
 }
 
 function initialStatus(
@@ -786,8 +814,8 @@ export const OCI_STDIN_BOOTSTRAP = [
 ].join("; ");
 
 /** 参数数组是安全契约：agent command 不进入 argv/Config.Cmd，只能经 stdin 输入。 */
-export function buildOciRunArgs(spec: OciRunSpec): string[] {
-  const workdir = path.resolve(spec.workdir);
+export function buildOciRunArgs(spec: OciRunSpec & { viaWsl?: boolean }): string[] {
+  const workdir = dockerBindSource(spec.workdir, Boolean(spec.viaWsl));
   if (/[\r\n,]/.test(workdir)) {
     throw new Error("OCI workdir cannot contain comma or newline characters");
   }
@@ -889,6 +917,8 @@ interface TrustedDockerRuntime {
   env: NodeJS.ProcessEnv;
   socketPath: string;
   owner: OciOwnerIdentity;
+  /** Windows → WSL2 运输层；存在时 dockerCapture 经 wsl.exe 转发。 */
+  wsl?: Wsl2RuntimeDiscovery;
 }
 
 async function fileSha256(file: string): Promise<string> {
@@ -919,10 +949,49 @@ async function assertRootOwnedPath(pathname: string, kind: "runtime" | "socket")
 
 /**
  * required 的信任根不能来自 PATH、工作区或 Docker context 环境变量。
- * 目前内嵌 adapter 只在 Linux + root 管理的 CLI/本机 socket 上成立；其它平台
- * 需要独立 Broker 服务完成 ACL/签名校验后再开放，不能拿文件 hash 猜权限。
+ * - Linux：管理员固定的 Docker CLI 绝对路径 + root 本机 socket。
+ * - Windows：仅允许 WSL2 运输层（discoverWsl2DockerRuntime）；绝不能把
+ *   宿主 docker Desktop / PATH 查找当成隔离。
  */
 async function trustedDockerRuntime(policy: ExecutionPolicyConfig): Promise<TrustedDockerRuntime> {
+  const candidate = candidateFor(policy);
+  if (candidate === "wsl2" || (process.platform === "win32" && candidate === "oci")) {
+    // 显式 oci 在 Windows 上也必须走 WSL2——本机没有可信的 Linux docker CLI。
+    if (process.platform !== "win32") {
+      throw new Error("WSL2 OCI transport is only available on Windows");
+    }
+    if (!policy.ociRuntime || !policy.ociRuntimeSha256) {
+      throw new Error(
+        "AGENT_EXECUTION_OCI_RUNTIME and AGENT_EXECUTION_OCI_RUNTIME_SHA256 are required for a trusted OCI backend",
+      );
+    }
+    const discovery = discoverWsl2DockerRuntime({
+      AGENT_EXECUTION_OCI_RUNTIME: policy.ociRuntime,
+      AGENT_EXECUTION_OCI_RUNTIME_SHA256: policy.ociRuntimeSha256,
+      AGENT_EXECUTION_OCI_HOST: policy.ociHost,
+      AGENT_EXECUTION_WSL_DISTRO: process.env["AGENT_EXECUTION_WSL_DISTRO"],
+      AGENT_EXECUTION_WSL_EXE: process.env["AGENT_EXECUTION_WSL_EXE"],
+    } as NodeJS.ProcessEnv);
+    if (policy.ociRuntimeSha256 && policy.ociRuntimeSha256 !== discovery.dockerSha256) {
+      throw new Error("Configured OCI runtime SHA-256 does not match the executable inside WSL");
+    }
+    return {
+      file: discovery.wslExe,
+      host: `unix://${discovery.socketPath}`,
+      cwd: process.env["SystemRoot"] ?? "C:\\Windows",
+      socketPath: discovery.socketPath,
+      owner: discovery.owner,
+      wsl: discovery,
+      env: {
+        // wsl.exe 继承最小环境；密钥不进 WSL 命令行。
+        SystemRoot: process.env["SystemRoot"] ?? "C:\\Windows",
+        PATH: process.env["SystemRoot"]
+          ? `${process.env["SystemRoot"]}\\System32`
+          : "C:\\Windows\\System32",
+      },
+    };
+  }
+
   if (!policy.ociRuntime || !policy.ociRuntimeSha256) {
     throw new Error(
       "AGENT_EXECUTION_OCI_RUNTIME and AGENT_EXECUTION_OCI_RUNTIME_SHA256 are required for a trusted OCI backend",
@@ -930,7 +999,8 @@ async function trustedDockerRuntime(policy: ExecutionPolicyConfig): Promise<Trus
   }
   if (process.platform !== "linux") {
     throw new Error(
-      "Embedded OCI required mode currently supports Linux only; other platforms require the broker service",
+      "Embedded OCI required mode currently supports Linux natively or Windows via AGENT_EXECUTION_BACKEND=wsl2; "
+      + "other platforms require the broker service — host fallback is forbidden",
     );
   }
   const configuredRuntime = path.resolve(policy.ociRuntime);
@@ -990,7 +1060,10 @@ function decodeMountInfoPath(value: string): string {
  * 每次执行前 fail-closed 扫描，并拒绝宿主的嵌套 mount；逐 run worktree lease 完成
  * 前仍保留极窄 TOCTOU，因此整体状态继续只能是 partial。
  */
-async function assertSafeWorkspaceForOci(workdir: string): Promise<void> {
+async function assertSafeWorkspaceForOci(
+  workdir: string,
+  opts?: { viaWsl?: boolean; wsl?: Wsl2RuntimeDiscovery },
+): Promise<void> {
   const configuredRoot = path.resolve(workdir);
   const root = await realpath(configuredRoot);
   if (root !== configuredRoot) {
@@ -998,22 +1071,48 @@ async function assertSafeWorkspaceForOci(workdir: string): Promise<void> {
   }
   const rootInfo = await stat(root);
   if (!rootInfo.isDirectory()) throw new Error("OCI workdir must be a directory");
-  const permissionBits = rootInfo.uid === 65_532
-    ? (rootInfo.mode >> 6) & 0o7
-    : rootInfo.gid === 65_532
-      ? (rootInfo.mode >> 3) & 0o7
-      : rootInfo.mode & 0o7;
-  if ((permissionBits & 0o7) !== 0o7) {
-    throw new Error("OCI workdir is not readable/writable/searchable by numeric UID/GID 65532");
-  }
+  if (!opts?.viaWsl) {
+    const permissionBits = rootInfo.uid === 65_532
+      ? (rootInfo.mode >> 6) & 0o7
+      : rootInfo.gid === 65_532
+        ? (rootInfo.mode >> 3) & 0o7
+        : rootInfo.mode & 0o7;
+    if ((permissionBits & 0o7) !== 0o7) {
+      throw new Error("OCI workdir is not readable/writable/searchable by numeric UID/GID 65532");
+    }
 
-  const mountInfo = await readFile("/proc/self/mountinfo", "utf8");
-  for (const line of mountInfo.split("\n")) {
-    const fields = line.split(" ");
-    if (fields.length < 5) continue;
-    const mountpoint = path.resolve(decodeMountInfoPath(fields[4]!));
-    if (mountpoint !== root && mountpoint.startsWith(`${root}${path.sep}`)) {
-      throw new Error(`OCI workdir contains a nested host mount: ${mountpoint}`);
+    const mountInfo = await readFile("/proc/self/mountinfo", "utf8");
+    for (const line of mountInfo.split("\n")) {
+      const fields = line.split(" ");
+      if (fields.length < 5) continue;
+      const mountpoint = path.resolve(decodeMountInfoPath(fields[4]!));
+      if (mountpoint !== root && mountpoint.startsWith(`${root}${path.sep}`)) {
+        throw new Error(`OCI workdir contains a nested host mount: ${mountpoint}`);
+      }
+    }
+  } else if (opts.wsl) {
+    // Windows 宿主没有 /proc/self/mountinfo；嵌套挂载检查改在 WSL 内对 /mnt 路径做。
+    const linuxWorkdir = dockerBindSource(root, true);
+    const { spawnSync } = await import("node:child_process");
+    const nested = spawnSync(
+      opts.wsl.wslExe,
+      [
+        "-d",
+        opts.wsl.distro,
+        "--",
+        "/bin/bash",
+        "-lc",
+        `set -eu; ROOT=${JSON.stringify(linuxWorkdir)}; while IFS= read -r line; do mp=$(printf '%s' "$line" | awk '{print $5}'); mp=$(printf '%b' "\${mp}"); case "$mp" in "$ROOT"|"$ROOT"/*) if [ "$mp" != "$ROOT" ]; then echo "$mp"; exit 2; fi;; esac; done < /proc/self/mountinfo; test -d "$ROOT"; test -r "$ROOT"; test -w "$ROOT"; test -x "$ROOT"`,
+      ],
+      { encoding: "utf8", windowsHide: true, timeout: 15_000 },
+    );
+    if (nested.status === 2) {
+      throw new Error(`OCI workdir contains a nested host mount: ${(nested.stdout || "").trim()}`);
+    }
+    if (nested.status !== 0) {
+      throw new Error(
+        `OCI workdir WSL preflight failed: ${(nested.stderr || nested.stdout || "").trim() || `exit ${nested.status}`}`,
+      );
     }
   }
 
@@ -1053,6 +1152,14 @@ function dockerCapture(
   args: string[],
   options: Omit<Parameters<typeof capture>[2], "cwd" | "env">,
 ): Promise<CapturedProcessResult> {
+  if (runtime.wsl) {
+    const forwarded = buildWslDockerArgv(runtime.wsl, runtime.host, args);
+    return capture(forwarded.file, forwarded.args, {
+      ...options,
+      cwd: runtime.cwd,
+      env: runtime.env,
+    });
+  }
   return capture(runtime.file, ["--host", runtime.host, ...args], {
     ...options,
     cwd: runtime.cwd,
@@ -1157,6 +1264,7 @@ async function dockerProbe(
           command: PROBE_COMMAND,
           lease: target.lease,
           delivery: "inline",
+          viaWsl: Boolean(runtime.wsl),
         }),
         {
           timeoutMs: 15_000,
@@ -1672,9 +1780,12 @@ class DockerExecutionAdapter implements OciExecutionAdapter {
     boundaryId: string,
   ): Promise<void> {
     if (this.disposed) throw new Error("Execution broker is disposed");
-    await assertSafeWorkspaceForOci(workdir);
     if (!policy.ociImage) throw new Error("Pinned OCI image is not configured");
     const runtime = await trustedDockerRuntime(policy);
+    await assertSafeWorkspaceForOci(workdir, {
+      viaWsl: Boolean(runtime.wsl),
+      ...(runtime.wsl ? { wsl: runtime.wsl } : {}),
+    });
     const nonce = randomUUID();
     const prefix = `.agent-harness-boundary-${nonce}`;
     const inputName = `${prefix}.in`;
@@ -1724,6 +1835,7 @@ class DockerExecutionAdapter implements OciExecutionAdapter {
         command,
         lease: target.lease,
         delivery: "inline",
+        viaWsl: Boolean(runtime.wsl),
       }), {
         timeoutMs: 20_000,
         maxBufferBytes: 256 * 1024,
@@ -1824,12 +1936,16 @@ class DockerExecutionAdapter implements OciExecutionAdapter {
         workdir: request.cwd,
         command: request.command,
         lease: target.lease,
+        viaWsl: Boolean(runtime.wsl),
       });
     } catch (err) {
       return failedResult(request, status, errorMessage(err));
     }
     try {
-      await assertSafeWorkspaceForOci(request.cwd);
+      await assertSafeWorkspaceForOci(request.cwd, {
+        viaWsl: Boolean(runtime.wsl),
+        ...(runtime.wsl ? { wsl: runtime.wsl } : {}),
+      });
     } catch (err) {
       return failedResult(request, status, `OCI workspace preflight failed: ${errorMessage(err)}`);
     }
@@ -1953,7 +2069,7 @@ class PolicyExecutionBroker implements ExecutionBroker {
   }
 
   private markFailed(
-    candidate: "oci" | "bwrap" | null,
+    candidate: "oci" | "bwrap" | "wsl2" | null,
     reason: string,
     runtimeVersion?: string,
   ): ExecutionBoundaryStatus {
@@ -2004,7 +2120,7 @@ class PolicyExecutionBroker implements ExecutionBroker {
     let result: OciProbeResult;
     if (candidate === "bwrap") {
       result = { ready: false, reason: "bwrap backend is not implemented in this release" };
-    } else if (candidate === "oci") {
+    } else if (candidate === "oci" || candidate === "wsl2") {
       try {
         result = await this.adapter.probe(this.policy);
         if (this.disposed) {
@@ -2040,7 +2156,8 @@ class PolicyExecutionBroker implements ExecutionBroker {
       return this.status();
     }
 
-    if (!result.ready || candidate !== "oci") {
+    const resolved = isolationBackendOf(candidate);
+    if (!result.ready || !resolved) {
       return this.markFailed(
         candidate,
         result.reason ?? "Isolation backend did not satisfy the required profile",
@@ -2052,14 +2169,16 @@ class PolicyExecutionBroker implements ExecutionBroker {
       ...this.current,
       // 只有 bash 在 OCI 内；MCP/gateway 与逐 run worktree lease 尚未覆盖，不能写 isolated。
       effectiveState: "partial",
-      resolvedBackend: "oci",
+      resolvedBackend: resolved,
       probe: {
         state: "ready",
-        candidate: "oci",
+        candidate,
         ...(result.runtimeVersion ? { runtimeVersion: result.runtimeVersion } : {}),
       },
       coverage: ["bash"],
-      filesystem: "read-only image root; one RW workdir bind; nested mounts and observed host IPC/device entries rejected before exec (worktree lease/TOCTOU still pending)",
+      filesystem: resolved === "wsl2"
+        ? "WSL2 transport → read-only image root; one RW workdir bind (/mnt/…); nested mounts rejected"
+        : "read-only image root; one RW workdir bind; nested mounts and observed host IPC/device entries rejected before exec (worktree lease/TOCTOU still pending)",
       network: "none",
       identity: `numeric non-root ${OCI_PROFILE.user}; cap-drop=ALL; no-new-privileges`,
       resources: `memory=${OCI_PROFILE.memory}; swap=0; cpu=${OCI_PROFILE.cpus}; pids=${OCI_PROFILE.pids}; nofile=${OCI_PROFILE.nofile}; tmpfs=64m; daemon-label lease/reaper on next successful probe; workspace disk quota and autonomous timer not yet covered`,
@@ -2077,7 +2196,10 @@ class PolicyExecutionBroker implements ExecutionBroker {
     const status = await this.probe(this.policy.mode === "required");
     if (this.disposed) return failedResult(request, status, "Execution broker is disposed");
     if (this.policy.mode === "required") {
-      if (status.effectiveState !== "partial" || status.resolvedBackend !== "oci") {
+      if (
+        status.effectiveState !== "partial"
+        || (status.resolvedBackend !== "oci" && status.resolvedBackend !== "wsl2")
+      ) {
         return failedResult(
           request,
           status,
@@ -2087,7 +2209,7 @@ class PolicyExecutionBroker implements ExecutionBroker {
       const result = await this.adapter.execute(this.policy, request, this.boundaryId, status);
       if (result.cleanup === "failed" || result.error) {
         this.markFailed(
-          "oci",
+          status.resolvedBackend === "wsl2" ? "wsl2" : "oci",
           result.error ?? "OCI worker cleanup could not be confirmed",
         );
         this.lastProbeAt = 0;

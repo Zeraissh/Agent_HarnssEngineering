@@ -26,6 +26,8 @@ uploads/
 .agent-runs.jsonl
 # B2 运行历史档案：每 run 一目录（meta.json + events.jsonl + transcript.jsonl），本地数据不进仓
 .agent-run-history/
+# OPS-01 备份演练本地产物（scripts/ops-history-backup-drill.mjs）
+.ops-drill/
 # vitest --coverage 的中间产物（子代理跑覆盖率时会留下）
 coverage/
 __pycache__/

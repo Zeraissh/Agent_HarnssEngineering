@@ -11,7 +11,8 @@ export type JSONSchema = Anthropic.Tool.InputSchema;
 
 /** SAFE-05：执行策略与具体隔离后端正交，避免 `auto` 被误解成宿主降级。 */
 export type ExecutionIsolationMode = "off" | "report" | "required";
-export type ExecutionBackendPreference = "auto" | "oci" | "bwrap";
+/** `wsl2` = Windows 上经 WSL2 调用 Linux 侧 OCI；隔离 profile 仍是 OCI，运输层不是沙箱。 */
+export type ExecutionBackendPreference = "auto" | "oci" | "bwrap" | "wsl2";
 export type ExecutionEffectiveState = "direct" | "report-only" | "partial" | "failed";
 
 /**
@@ -26,11 +27,11 @@ export interface ExecutionBoundaryStatus {
   requestedMode: ExecutionIsolationMode;
   requestedBackend: ExecutionBackendPreference;
   effectiveState: ExecutionEffectiveState;
-  resolvedBackend: "host" | "oci" | null;
+  resolvedBackend: "host" | "oci" | "wsl2" | null;
   policyDigest: string;
   probe: {
     state: "not-run" | "ready" | "unavailable" | "not-required";
-    candidate: "oci" | "bwrap" | null;
+    candidate: "oci" | "bwrap" | "wsl2" | null;
     reason?: string;
     runtimeVersion?: string;
   };
@@ -120,8 +121,11 @@ export interface Tool {
   /** 必须写清"何时调用"（触发条件），不只是"做什么" */
   description: string;
   inputSchema: JSONSchema;
-  /** auto = 直接执行；ask = 发 approval_request 事件，等宿主应答后执行 */
-  permission: "auto" | "ask";
+  /**
+   * auto = 直接执行；ask = 发 approval_request 事件，等宿主应答后执行；
+   * deny = 装配期/执行期硬拒（压过更具体的 allow；--yes 也打不穿）。
+   */
+  permission: "auto" | "ask" | "deny";
   /** true = 可与其他 parallelSafe 工具并发执行（典型：只读工具） */
   parallelSafe: boolean;
   /** 缺省为 once；高副作用工具不应开放 exact-input 复用 */
