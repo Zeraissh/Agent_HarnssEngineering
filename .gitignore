@@ -35,3 +35,26 @@ __pycache__/
 # V-29 运行时工作目录清单：本机目录偏好，不进仓
 .agent-workdirs.json
 .agent-workdirs.json.bak
+
+# 本机 Codex / Claude 运行时（截图、锁、过期 worktree）
+.codex/
+.claude/worktrees/
+.claude/scheduled_tasks.lock
+.claude/settings.local.json
+design-qa.md
+
+# 演示站 / 硬件工程 / PPT 曾堆在仓库根目录，正式位置是 D:\Work\scratch
+ad7793_thermocouple/
+demo_sites/
+penacony-site/
+postimpressionist-exhibition/
+threejs-fps-game/
+particle-gesture/
+home-nav/
+_qa/
+.tmp_search/
+/*.pptx
+/*.docx
+/index.html
+shanghai-michelin-guide.html
+assets/images/
