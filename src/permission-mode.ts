@@ -70,6 +70,26 @@ export function permissionModeSwitches(mode: PermissionMode): PermissionModeSwit
 }
 
 /**
+ * 从展开开关反推档位；对不上任何预设 → null（自定义组合）。
+ */
+export function matchPermissionMode(
+  switches: Omit<PermissionModeSwitches, "mode">,
+): PermissionMode | null {
+  for (const mode of PERMISSION_MODES) {
+    const row = PERMISSION_MODE_TABLE[mode];
+    if (
+      row.approvalDefault === switches.approvalDefault
+      && row.planMode === switches.planMode
+      && row.planGate === switches.planGate
+      && row.autoYes === switches.autoYes
+    ) {
+      return mode;
+    }
+  }
+  return null;
+}
+
+/**
  * deny-first：任何命中的 deny 压过更具体的 allow/ask。
  * 其余按「更具体优先」：tool 级 > server/pack 级 > default。
  */

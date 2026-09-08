@@ -328,6 +328,15 @@
         <span class="knob-hint" id="auto-pack-hint">按任务内容路由到已注册的包；选了具体包时以手选为准</span>
       </div>
       <div class="knob">
+        <label for="permission-mode-select">权限档</label>
+        <select id="permission-mode-select">
+          <option value="manual">manual · 逐次审批</option>
+          <option value="plan">plan · 计划确认门</option>
+          <option value="auto">auto · 自动放行 ask</option>
+        </select>
+        <span class="knob-hint">D3 预设只捆既有开关；条上必须展开真实值，不得只报模式名</span>
+      </div>
+      <div class="knob">
         <label for="plan-mode-toggle">计划模式</label>
         <label class="knob-check">
           <input type="checkbox" id="plan-mode-toggle" />
@@ -397,6 +406,8 @@ import {
   paceReveal,
   revealedWindow,
   foldLiveDelta,
+  permissionModeSwitches,
+  matchPermissionMode,
 } from "/app.js";
 import {
   loadSettings,
@@ -765,6 +776,7 @@ const rubricInput = /** @type {HTMLTextAreaElement} */ (document.getElementById(
 const planModeToggle = /** @type {HTMLInputElement|null} */ (document.getElementById("plan-mode-toggle"));
 const multiAgentToggle = /** @type {HTMLInputElement|null} */ (document.getElementById("multi-agent-toggle"));
 const autoApproveToggle = /** @type {HTMLInputElement} */ (document.getElementById("auto-approve-toggle"));
+const permissionModeSelect = /** @type {HTMLSelectElement|null} */ (document.getElementById("permission-mode-select"));
 const workdirSelect = /** @type {HTMLSelectElement} */ (document.getElementById("workdir-select"));
 const useVerifierModel = /** @type {HTMLInputElement} */ (document.getElementById("use-verifier-model"));
 const usePlannerModel = /** @type {HTMLInputElement} */ (document.getElementById("use-planner-model"));
@@ -1958,11 +1970,44 @@ if (autoApproveToggle) {
       localStorage.setItem(AUTO_APPROVE_PREF, autoApproveToggle.checked ? "1" : "0");
       saveSettings(localStorage, uiSettings);
     } catch { /* ignore */ }
+    syncPermissionModeSelectFromKnobs();
     const run = runs.find((r) => r.runId === selectedRunId);
     if (run && run.status === "running") {
       void postAutoApprove(selectedRunId, autoApproveToggle.checked);
     }
   });
+}
+
+/**
+ * D3：选档 → 展开到既有旋钮；改旋钮 → 能对上预设才回写档名。
+ */
+function applyPermissionModeToKnobs(mode) {
+  const switches = permissionModeSwitches(mode);
+  if (planModeToggle) planModeToggle.checked = switches.planMode;
+  if (autoApproveToggle) {
+    autoApproveToggle.checked = switches.autoYes || switches.approvalDefault === "auto";
+  }
+}
+
+function syncPermissionModeSelectFromKnobs() {
+  if (!permissionModeSelect) return;
+  const matched = matchPermissionMode({
+    approvalDefault: autoApproveToggle?.checked ? "auto" : "ask",
+    planMode: planModeToggle?.checked === true,
+    planGate: planModeToggle?.checked === true,
+    autoYes: autoApproveToggle?.checked === true,
+  });
+  if (matched) permissionModeSelect.value = matched;
+}
+
+if (permissionModeSelect) {
+  permissionModeSelect.addEventListener("change", () => {
+    applyPermissionModeToKnobs(permissionModeSelect.value);
+  });
+  syncPermissionModeSelectFromKnobs();
+}
+if (planModeToggle) {
+  planModeToggle.addEventListener("change", () => syncPermissionModeSelectFromKnobs());
 }
 // 独立核查默认值同样来自设置中心（此前无持久化，设置页是它的唯一出处）
 if (verifyToggle) {
@@ -2040,6 +2085,7 @@ async function submitNewRun({ text: task }) {
         dailyBudget: false,
         askUser: true,
         autoApprove: autoApproveToggle?.checked !== false,
+        permissionMode: permissionModeSelect?.value || undefined,
         workdir: workdirSelect?.value && workdirSelect.value !== WORKDIR_ADD_VALUE
           ? workdirSelect.value
           : undefined,

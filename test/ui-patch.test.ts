@@ -2441,6 +2441,24 @@ describe("装配状态条", () => {
     expect(deriveAssemblyBar(configured(), null).some((i) => i.key === "plan")).toBe(false);
   });
 
+  it("D3：装配条展开 permission 真实开关，不只报模式名", () => {
+    const s = createInitialState("rp", "t", false);
+    s.runConfig = {
+      permission: {
+        mode: "plan",
+        approvalDefault: "ask",
+        planMode: true,
+        planGate: true,
+        autoYes: false,
+      },
+    };
+    const chip = deriveAssemblyBar(s, null).find((i) => i.key === "permission");
+    expect(chip?.chip).toContain("档 plan");
+    expect(chip?.chip).toContain("确认门开");
+    expect(chip?.chip).toContain("autoYes 关");
+    expect(chip?.why).toMatch(/docs\/permission-modes/);
+  });
+
   /**
    * B0：planner 预算不再是写死的 12，plan 芯片必须报数字与来源。
    * 这条同时锁 run_config 的白名单投影——plannerBudget* 两个字段若在

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  matchPermissionMode,
   PERMISSION_MODE_TABLE,
   permissionModeSwitches,
   resolvePermissionMode,
@@ -36,6 +37,19 @@ describe("D3 permission modes", () => {
     expect(resolvePermissionMode(undefined)).toBe("manual");
     expect(resolvePermissionMode("AUTO")).toBe("auto");
     expect(() => resolvePermissionMode("bypass")).toThrow(/AGENT_PERMISSION_MODE/);
+  });
+
+  it("matchPermissionMode 反推档位；自定义组合返回 null", () => {
+    expect(matchPermissionMode(PERMISSION_MODE_TABLE.plan)).toBe("plan");
+    expect(matchPermissionMode(PERMISSION_MODE_TABLE.auto)).toBe("auto");
+    expect(
+      matchPermissionMode({
+        approvalDefault: "ask",
+        planMode: true,
+        planGate: false,
+        autoYes: false,
+      }),
+    ).toBeNull();
   });
 });
 

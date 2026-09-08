@@ -22,6 +22,7 @@
  * - 求值：`resolveToolPermission` / `resolveMcpToolPermission`
  * - 执行器：`ToolExecutor` 在审批门前拦截 `deny`
  * - CLI 启动行打印展开后的开关值（不许只报模式名）
+ * - Web：`permissionMode` 选择器 + `run_config.permission` 装配条展开真实开关
  */
 
 export {};

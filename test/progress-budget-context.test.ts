@@ -102,6 +102,23 @@ describe("buildNewRunRequest 正交旋钮", () => {
     expect(buildNewRunRequest({ task: "t", multiAgent: true })).not.toHaveProperty("planGate");
   });
 
+  it("D3 permissionMode=plan 覆盖为确认门开 + autoApprove 关", () => {
+    expect(buildNewRunRequest({ task: "t", permissionMode: "plan", autoApprove: true })).toMatchObject({
+      mode: "plan",
+      planGate: true,
+      permissionMode: "plan",
+    });
+    expect(buildNewRunRequest({ task: "t", permissionMode: "plan" })).not.toHaveProperty("autoApprove");
+  });
+
+  it("D3 permissionMode=auto 打开 autoApprove，不开计划门", () => {
+    expect(buildNewRunRequest({ task: "t", permissionMode: "auto", planMode: true })).toMatchObject({
+      autoApprove: true,
+      permissionMode: "auto",
+    });
+    expect(buildNewRunRequest({ task: "t", permissionMode: "auto" })).not.toHaveProperty("mode");
+  });
+
   it("计划模式单独开：确认门 + 串行", () => {
     expect(buildNewRunRequest({ task: "t", planMode: true })).toMatchObject({
       mode: "plan",
