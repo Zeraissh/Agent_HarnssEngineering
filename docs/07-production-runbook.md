@@ -166,7 +166,10 @@ path inside the distro (e.g. `/usr/bin/docker`) plus SHA-256. Discover fixture e
 | **RPO** | Time of last successful full-directory copy (sidecar `.last-success.json` or `npm run ops:backup-drill`) |
 | **RTO** | Stop host → replace history root from backup → restart; target **&lt; 15 minutes** for a single operator |
 
-Treat history backups like model keys (plaintext transcripts). Local drill: `npm run ops:backup-drill`.
+Treat history backups like model keys (plaintext transcripts). Local drills:
+`npm run ops:backup-drill` (plaintext) and `npm run ops:backup-drill:encrypted` (AES-256-GCM
+offsite package + wrong-passphrase fail-closed). Encrypted drill passphrase:
+`AGENT_OPS_BACKUP_PASSPHRASE` or an ephemeral value printed once.
 
 ## Rollback
  triggers and procedure

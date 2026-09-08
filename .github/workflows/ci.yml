@@ -37,6 +37,10 @@ jobs:
           retention-days: 14
       - run: npm run build
       - run: npm run pack:check
+      - name: OPS-01 plaintext + encrypted offsite backup drills
+        run: |
+          npm run ops:backup-drill
+          npm run ops:backup-drill:encrypted
 
   # EVAL-03a：确定性质量门。被测对象是编译产物（dist/src/cli.js），端点是
   # eval/mock-provider.ts 起的 loopback 假端点——零真实 provider、零凭据、零限流，
@@ -112,6 +116,30 @@ jobs:
         working-directory: .
       - run: npm run host:stage
       - run: node --check electron/main.cjs
+      - name: Electron launcher syntax smoke
+        working-directory: .
+        run: npm run e2e:electron-smoke
+
+  desktop-nsis-lifecycle:
+    # NSIS 安装/覆盖升级/卸载；仅 Windows。构建 unsigned 较慢，失败不挡 Ubuntu 主门。
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            cross-app/package-lock.json
+      - run: npm ci --ignore-scripts
+      - run: npm ci --ignore-scripts
+        working-directory: cross-app
+      - name: NSIS install → upgrade → uninstall smoke
+        env:
+          AGENT_ELECTRON_LIFECYCLE_REQUIRED: "1"
+        run: npm run e2e:electron-lifecycle -- --build
 
   container:
     runs-on: ubuntu-latest
