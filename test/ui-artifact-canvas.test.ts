@@ -284,12 +284,47 @@ describe("initArtifactCanvas — 打开与 chrome", () => {
     expect(document.querySelector("#ac-deck-bar")?.hidden).toBe(false);
     expect(document.querySelector(".ac-badge")?.textContent).toBe("幻灯");
     expect(document.querySelector(".ac-deck-pos")?.textContent).toContain("1 / 3");
+    expect(document.querySelectorAll(".ac-deck-page").length).toBe(3);
     host.onSwitch.mockClear();
     document.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight" }));
     expect(posts.some((p) => p?.type === DECK_GOTO_MESSAGE_TYPE && p.delta === 1)).toBe(true);
     expect(host.onSwitch).not.toHaveBeenCalled();
     document.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", altKey: true }));
     expect(host.onSwitch).toHaveBeenCalledWith(1);
+    posts.length = 0;
+    document.querySelectorAll(".ac-deck-page")[2].click();
+    expect(posts.some((p) => p?.type === DECK_GOTO_MESSAGE_TYPE && p.index === 2)).toBe(true);
+  });
+
+  it("点评列表可全部写入输入框，也可清空", async () => {
+    const onAppendReview = vi.fn();
+    const api = initArtifactCanvas(setupHost({ onAppendReview }), { fetch: vi.fn() });
+    api.open(0);
+    document.querySelector("#ac-inspect").click();
+    await flush();
+    const frame = document.querySelector("iframe.ac-frame");
+    const cw = {};
+    Object.defineProperty(frame, "contentWindow", { value: cw, configurable: true });
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        data: { type: "agent-inspect-pick", selector: "h1.hero", text: "标题", slide: "2" },
+        source: cw,
+      }),
+    );
+    await flush();
+    const comment = document.querySelector("#ac-review-comment");
+    expect(comment).toBeTruthy();
+    comment.value = "对比度不够";
+    document.querySelector("#ac-review-pop button[type='submit']").click();
+    await flush();
+    expect(onAppendReview).toHaveBeenCalled();
+    expect(onAppendReview.mock.calls[0][0]).toContain("[点评][slide:2]");
+    expect(document.querySelector("#ac-review-list")?.hidden).toBe(false);
+    onAppendReview.mockClear();
+    document.querySelector("#ac-review-flush").click();
+    expect(onAppendReview).toHaveBeenCalledWith(expect.stringContaining("[点评][slide:2]"));
+    document.querySelector("#ac-review-clear").click();
+    expect(document.querySelector("#ac-review-list")?.hidden).toBe(true);
   });
 
   it("图片产物：标注钮可见；打开后叠画布，不发 fetch", async () => {

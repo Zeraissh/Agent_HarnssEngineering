@@ -494,6 +494,8 @@ export function initArtifactCanvas(host = {}, env = {}) {
   let deckIndex = 0;
   let deckTotal = 0;
   let deckSlideId = "";
+  /** @type {string[]} */
+  let deckSlideIds = [];
   /** @type {{ line:string, slide?:string }[]} */
   let reviewNotes = [];
 
@@ -577,6 +579,9 @@ export function initArtifactCanvas(host = {}, env = {}) {
   deckPrev.type = "button";
   deckPrev.className = "btn btn--ghost";
   deckPrev.textContent = "上一页";
+  const deckPages = doc.createElement("div");
+  deckPages.className = "ac-deck-pages";
+  deckPages.id = "ac-deck-pages";
   const deckPos = doc.createElement("span");
   deckPos.className = "ac-deck-pos";
   const deckNext = doc.createElement("button");
@@ -584,6 +589,7 @@ export function initArtifactCanvas(host = {}, env = {}) {
   deckNext.className = "btn btn--ghost";
   deckNext.textContent = "下一页";
   deckBar.appendChild(deckPrev);
+  deckBar.appendChild(deckPages);
   deckBar.appendChild(deckPos);
   deckBar.appendChild(deckNext);
 
@@ -627,15 +633,31 @@ export function initArtifactCanvas(host = {}, env = {}) {
     deckIndex = 0;
     deckTotal = 0;
     deckSlideId = "";
+    deckSlideIds = [];
     paintDeckChrome();
   }
 
   function paintDeckChrome() {
     deckBar.hidden = !deckActive || deckTotal < 2;
+    deckPages.replaceChildren();
     if (!deckActive) return;
     deckPos.textContent = `${deckIndex + 1} / ${deckTotal}${deckSlideId ? ` · ${deckSlideId}` : ""}`;
     deckPrev.disabled = deckTotal < 2;
     deckNext.disabled = deckTotal < 2;
+    const ids = deckSlideIds.length === deckTotal
+      ? deckSlideIds
+      : Array.from({ length: deckTotal }, (_, i) => String(i + 1));
+    ids.forEach((id, idx) => {
+      const btn = doc.createElement("button");
+      btn.type = "button";
+      btn.className = "btn btn--ghost ac-deck-page";
+      btn.textContent = String(idx + 1);
+      btn.title = `跳到第 ${idx + 1} 页（${id}）`;
+      btn.setAttribute("aria-pressed", idx === deckIndex ? "true" : "false");
+      btn.classList.toggle("is-active", idx === deckIndex);
+      btn.addEventListener("click", () => postDeckGoto({ index: idx }));
+      deckPages.appendChild(btn);
+    });
   }
 
   function paintReviewList() {
@@ -643,12 +665,41 @@ export function initArtifactCanvas(host = {}, env = {}) {
     reviewList.hidden = !visible;
     reviewList.replaceChildren();
     if (!visible) return;
+    const head = doc.createElement("div");
+    head.className = "ac-review-list-head";
     const title = doc.createElement("p");
     title.className = "ac-review-list-title";
     title.textContent = `本会话点评（${reviewNotes.length}）`;
-    reviewList.appendChild(title);
+    const actionsRow = doc.createElement("div");
+    actionsRow.className = "ac-review-list-actions";
+    const flushBtn = doc.createElement("button");
+    flushBtn.type = "button";
+    flushBtn.id = "ac-review-flush";
+    flushBtn.className = "btn btn--ghost";
+    flushBtn.textContent = "全部写入输入框";
+    const clearBtn = doc.createElement("button");
+    clearBtn.type = "button";
+    clearBtn.id = "ac-review-clear";
+    clearBtn.className = "btn btn--ghost";
+    clearBtn.textContent = "清空";
+    flushBtn.addEventListener("click", () => {
+      if (reviewNotes.length === 0) return;
+      const block = reviewNotes.map((n) => n.line).join("\n");
+      host.onAppendReview?.(block);
+      host.onAnnounce?.(`已写入 ${reviewNotes.length} 条点评`);
+    });
+    clearBtn.addEventListener("click", () => {
+      reviewNotes = [];
+      paintReviewList();
+      host.onAnnounce?.("点评列表已清空");
+    });
+    actionsRow.appendChild(flushBtn);
+    actionsRow.appendChild(clearBtn);
+    head.appendChild(title);
+    head.appendChild(actionsRow);
+    reviewList.appendChild(head);
     const ul = doc.createElement("ul");
-    for (const note of reviewNotes.slice(-12)) {
+    for (const note of reviewNotes.slice(-20)) {
       const li = doc.createElement("li");
       li.textContent = note.line;
       ul.appendChild(li);
@@ -920,6 +971,7 @@ export function initArtifactCanvas(host = {}, env = {}) {
       deckTotal = Math.max(0, Number(data.total) || 0);
       deckIndex = Math.max(0, Number(data.index) || 0);
       deckSlideId = String(data.slide ?? "");
+      deckSlideIds = Array.isArray(data.slides) ? data.slides.map((s) => String(s)) : [];
       badgeEl.textContent = rendererKindLabel("html", { deck: deckActive && deckTotal > 1 });
       paintDeckChrome();
       return;
