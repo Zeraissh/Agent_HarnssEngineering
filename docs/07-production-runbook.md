@@ -152,7 +152,24 @@ Send only an operator canary first, then verify:
   and a malformed current-namespace tombstone blocks readiness without being deleted. This proves cleanup on
   the next successful sweep, not autonomous daemon TTL.
 
-## Rollback triggers and procedure
+### Windows WSL2 isolation (SAFE-05)
+
+On Windows developer hosts, `AGENT_EXECUTION_BACKEND=wsl2` (or `auto` with a pinned image) transports
+OCI through WSL2 — bare `wsl.exe` is **not** a sandbox. Pin `AGENT_EXECUTION_OCI_RUNTIME` to a Linux
+path inside the distro (e.g. `/usr/bin/docker`) plus SHA-256. Discover fixture env with
+`npm run wsl2:oci-fixture`, then run `npx vitest run test/execution-broker-oci.test.ts` (same 13 canaries).
+
+### OPS-01 history backup drill (solo)
+
+| Metric | Solo definition |
+|---|---|
+| **RPO** | Time of last successful full-directory copy (sidecar `.last-success.json` or `npm run ops:backup-drill`) |
+| **RTO** | Stop host → replace history root from backup → restart; target **&lt; 15 minutes** for a single operator |
+
+Treat history backups like model keys (plaintext transcripts). Local drill: `npm run ops:backup-drill`.
+
+## Rollback
+ triggers and procedure
 
 Rollback immediately when any of these occur: two consecutive readiness failures, authentication or
 Origin bypass, history write degradation, inability to answer `ask_user`, graceful shutdown beyond

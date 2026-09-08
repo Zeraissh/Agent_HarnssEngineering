@@ -32,8 +32,8 @@
 | [x] | SAFE-02 | 文件路径真实边界 | 5/5/3 | 30 | 拒绝通过 symlink/junction/reparse point 逃逸；不存在写目标校验最近存在父目录；合法工作区与只读根不回归；跨平台测试覆盖 |
 | [x] | SAFE-03 | `fetch_url` SSRF/重定向防护 | 5/5/3 | 30 | 仅 HTTPS；拒绝本机/私网/link-local/保留地址；每次重定向重新验证；限制跳转；测试覆盖 DNS 与重定向路径 |
 | [~] | SAFE-04 | 参数级审批授权 | 5/5/4 | 20 | approval grant 绑定 run、tool、规范化 input hash、scope 与 expiry；不同 bash/path/device 参数不能复用旧授权；审批可恢复、可审计 |
-| [~] | SAFE-05 | OS/容器执行隔离 | 5/5/5 | 10 Gate | 每 run 独立 worktree、UID、文件系统和网络策略；资源/CPU/内存上限；硬件操作经受控 gateway；逃逸测试通过 |
-| [~] | SAFE-06 | 工具副作用事务层 | 5/5/5 | 10 Gate | **Phase 1 已落地（2026-09-03）**：`write_file`/`bash` 具 idempotencyKey（runId:toolUseId）、`tool_prepared/running/committed/failed/aborted` 事件、`state.json.toolTx`；write_file 可幂等重入 + 内容级 unchanged；bash prepared/running **fail-closed 不重试**（无 undo）；崩溃注入同 key 不重复写；CLI+Web 同提交。**残余**：CLI durable state、mid-tool 自动重放未完成轮、MCP 写工具、bash compensation |
+| [~] | SAFE-05 | OS/容器执行隔离 | 5/5/5 | 10 Gate | **WSL2 运输层已落地（2026-09-08）**：`AGENT_EXECUTION_BACKEND=wsl2`；Windows↔`/mnt` 路径映射（`src/wsl-path.ts`）+ WSL 内 Docker 信任探针（`src/wsl2-runtime.ts`）；`required` 失败绝不 host fallback（平台锁）；同一份 13 canary 在 win32 上改走 `wsl2`。**残余**：本机需 WSL 内已有 digest 镜像才能 skip=0；每 run worktree/UID、MCP managed worker、全平台隔离完成定义仍开 |
+| [~] | SAFE-06 | 工具副作用事务层 | 5/5/5 | 10 Gate | **Phase 1 + CLI durable + mid-tool 计划（2026-09-08）**：既有 write_file/bash 事务；CLI 默认落 `.agent-run-history/<runId>/state.json`（`AGENT_CLI_DURABLE=0` 可关）；`planMidToolReplay` 对 prepared/running 的 idempotent 工具重放、bash fail-closed。**残余**：loop 自动挂接 mid-tool 重放入口、MCP 写工具、bash compensation |
 
 ### Phase 0 验收命令
 
@@ -189,11 +189,7 @@ npx tsc --noEmit                            passed
 
 | MEM-01 窗口 / 预算分离 | `contextTokenLimit` 一个数此前兼任"模型能装多少"与"我们在多少处压"，Phase C 的真端点复核把这笔债照了出来（窗口 1,048,576 而预算 150k = 在 11% 处压；128k 的模型则永远到不了主动压缩，只能白吃一次 400）。**窗口**（事实）`src/context-window.ts` 四级来源 env `AGENT_CONTEXT_WINDOW` > learned（`model-capability.ts`：撞 400 时 `parseContextWindowFromOverflowError` 只认两种见过的措辞，按 `provider|model|origin` 记，粘性 + TTL 30 天，落 `.agent-capabilities.json`，只存身份键与数字）> registry（`model-windows.ts`，每条带出处，**不认识就不猜**）> unknown；**预算**（策略）三级覆盖 run（Web 逐 run）> env > 包 > 默认 150k，再夹进 `maxBudget = window − maxTokens − margin`（`margin = max(4k, 2%)`），夹紧发告警且原值可见。loop 撞 400 先学窗口再硬压缩（`onContextWindowLearned` 钩子归宿主；编排层给独立 verifier / planner 剥掉——它们的 400 说的是自己的窗口）。两个宿主如实报数：CLI 启动行「预算 / 窗口（来源）」+ 夹紧 ⚠ 行 + 压缩行「学到窗口 …（下次运行生效）」；Web `run_config` / `/api/harness` 的 `context` 九字段投影、三段水位条（已用 / 预算 / 窗口，未知不画那一段）、到预算 80% 的「下一轮将压缩」、逐 run 预算控件（区间 `[32k, maxBudget]`，越界 **400 报区间**而非静默夹紧；>200k 成本忠告不阻断），逐 run 值随档案 meta 与派生 run 走；台账 `context { window, windowSource, budget, budgetSource }` + `npm run ledger` 来源直方图 / 预算分桶。测试：`test/context-window.test.ts` 21 条 + compact-tier2 / ledger / mock-provider 各若干 + Web 侧 9 条服务端契约 + 7 条渲染 / axe + 23 条派生与投影锁；确定性场景 `context-window-learned-across-runs`（二进程：第一跑学到 → 落盘 → 第二跑启动行报 learned）；变异 `context-budget-clamp-dropped` / `context-window-learn-dropped` + Web 侧 5 处（逐 run 校验 / 投影字段 / 80% 提示 / 水位边界 `>=`→`>` / 启动期 env 校验）全部 killed | **窗口只在撞过 400 或在登记表里时才知道**——首次跑一个陌生模型必然是"未知"，此时预算不夹紧，仍可能白吃一次 400（这一次的成本换来往后都知道）。登记表要人工维护，厂商升窗口后旧条目会过期（learned 优先于它可自愈，TTL 30 天）。夹紧只按 `maxTokens` 与固定边际算，**不读真实 token 计数**（token 是端点算的，我们只有上一轮读数）；预算**不随窗口自动抬高**是有意的策略选择，代价是大窗口模型上默认仍在 150k 处压。逐 run 预算不进台账的独立字段（只体现为 `budgetSource=run` + 生效数）。学到的窗口按端点身份记，同一模型换 baseURL 要重新学 |
 
-当前执行顺序（2026-09-03 成熟度第二波，单操作员形态）：
-`EVAL-03c → EVAL-01 held-out → OBS-01[~] → RUN-01[~ Phase 2] → MEM-01[~ Phase A+B] → MODEL-01b[~] → RUN-02[~] → SAFE-06[~ Phase 1] → E2E-01[~ Phase 1]`。
-下一刀候选：OBS-02 / OPS-01，或 E2E-01 Electron 打包路径，或 MODEL-01 残余（真成本路由 / Web 同步探针回写）；
-SAFE-05 2B 与 GOV-* 本波默认跳过。
-并行可继续：`A1 攒 §2.1 样本（ledger:samples）`（与质量门不冲突）。
-若目标改公网多人，`GOV-01/02/03` 必须提前到 `RUN-01` 之后、任何公开上线之前。
-Phase 2A 的 daemon-label orphan reaper 与真实 `SIGKILL → sweep` E2E 已落地；
-**2026-09-01 Linux CI #33461119575 全绿**，SAFE-05 评审结论为保持 `[~]`（见 Phase 0 实施记录）。
+当前执行顺序（2026-09-08 单操作员产品化）：
+`SAFE-05 WSL2[~] → D3 权限三档[~] → CLI durable + mid-tool 计划[~] → Electron pack smoke / OPS-01 drill`。
+对照表见 `docs/permission-modes.md`；WSL2 fixture：`npm run wsl2:oci-fixture`。
+GOV-* 与 SAFE-05 Phase 2B（每 run UID/worktree）本波默认跳过。
