@@ -251,8 +251,9 @@ const MUTANTS = [
   {
     id: "cli-plan-resume-ignores-budget",
     file: "src/cli-durable.ts",
-    find: "    budgetExhausted: durableBudgetExhausted(current.budget),",
-    replace: "    budgetExhausted: false, // MUTATION: 落盘账耗尽仍同 run 续",
+    find: "  const facts = planResumeFacts(current.plan);\n  const budgetExhausted = durableBudgetExhausted(current.budget);",
+    replace:
+      "  const facts = planResumeFacts(current.plan);\n  const budgetExhausted = false; // MUTATION: 落盘账耗尽仍同 run 续",
     testFiles: ["test/cli-durable.test.ts"],
     why: "CLI 半截 DAG 续跑必须读谱系预算；恒假会把已用尽的档案再跑一遍",
   },
