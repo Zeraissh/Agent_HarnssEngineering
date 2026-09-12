@@ -8,7 +8,7 @@
  *             路由编解码（往返、拒绝非画布 hash）/ 序号循环 / 字节格式化
  *   DOM 层  ：jsdom 里真实初始化，验证画布开关、按类型渲染（iframe 沙箱 /
  *             图片 / Markdown / 代码 / 文本 / CSV 表 / 二进制降级卡）、
- *             顶条 chrome（名称/徽章/大小/位置）、Esc 与 ←/→、取件失败错误卡
+ *             顶条 chrome（名称/徽章/大小/标签页）、Esc、取件失败错误卡
  */
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import {
@@ -18,14 +18,25 @@ import {
   artifactCodeLang,
   parseCsv,
   encodeArtifactHash,
+  artifactExitHash,
   parseArtifactRoute,
   isArtifactRoute,
   wrapIndex,
+  indexAfterCloseTab,
   formatBytes,
   artifactBasename,
   siteArtifactUrl,
   pathsMatch,
+  parseDesignPalette,
+  officeExportPaths,
+  pptxPathForHtml,
+  pngPathsForHtml,
   initArtifactCanvas,
+  parseBrowserUrl,
+  isBrowserPreviewPath,
+  browserTabLabel,
+  previewTabLabel,
+  previewAddressValue,
 } from "../ui/public/features/artifact-canvas.js";
 import { DECK_READY_MESSAGE_TYPE, DECK_GOTO_MESSAGE_TYPE } from "../ui/public/features/review-mode.js";
 import { deriveWrittenPaths } from "../ui/public/app.js";
@@ -59,6 +70,8 @@ describe("类型分派 artifactRendererKind", () => {
     ["out/model.bin", "binary"],
     ["out/archive.zip", "binary"],
     ["out/report.xlsx", "binary"],
+    ["out/deck.pptx", "binary"],
+    ["out/deck.pdf", "binary"],
     ["out/noext", "binary"],
   ])("%s → %s", (path, kind) => {
     expect(artifactRendererKind(path)).toBe(kind);
@@ -69,10 +82,26 @@ describe("类型分派 artifactRendererKind", () => {
   });
 
   it("每种渲染器都有中文徽章", () => {
-    for (const kind of ["html", "image", "markdown", "csv", "code", "text", "binary"]) {
+    for (const kind of ["html", "browser", "image", "markdown", "csv", "code", "text", "binary"]) {
       expect(rendererKindLabel(kind)).toBeTruthy();
     }
     expect(rendererKindLabel("csv")).toBe("表格");
+    expect(rendererKindLabel("browser")).toBe("网页");
+  });
+
+  it("http(s) 网址走内置浏览器，不按扩展名当分文件", () => {
+    expect(isBrowserPreviewPath("https://example.com/page.html")).toBe(true);
+    expect(artifactRendererKind("https://example.com/page.html")).toBe("browser");
+    expect(artifactRendererKind("http://127.0.0.1:4173")).toBe("browser");
+    expect(parseBrowserUrl("example.com/a")).toBe("https://example.com/a");
+    expect(parseBrowserUrl("https://example.com")).toBe("https://example.com/");
+    expect(parseBrowserUrl("javascript:alert(1)")).toBeNull();
+    expect(parseBrowserUrl("data:text/html,x")).toBeNull();
+    expect(browserTabLabel("https://www.example.com/path")).toBe("example.com");
+    expect(previewTabLabel("https://www.example.com/docs")).toBe("example.com");
+    expect(previewTabLabel("docs/10-design-mode-evolution.md")).toBe("docs/10-design-mode-evolution.md");
+    expect(previewAddressValue("https://example.com/a")).toBe("example.com");
+    expect(previewAddressValue("src/pack-files.ts")).toBe("src/pack-files.ts");
   });
 });
 
@@ -152,6 +181,12 @@ describe("路由编解码", () => {
     expect(isArtifactRoute("#/run/abc/artifact/0")).toBe(true);
     expect(isArtifactRoute("#/run/abc")).toBe(false);
   });
+
+  it("关闭落点是会话页，不是上一份预览", () => {
+    expect(artifactExitHash("run-123", "loop")).toBe("#/run/run-123/loop");
+    expect(artifactExitHash(null)).toBe("#/");
+    expect(isArtifactRoute(artifactExitHash("run-123", "loop"))).toBe(false);
+  });
 });
 
 describe("wrapIndex / formatBytes / artifactBasename", () => {
@@ -160,6 +195,14 @@ describe("wrapIndex / formatBytes / artifactBasename", () => {
     expect(wrapIndex(3, 3)).toBe(0);
     expect(wrapIndex(-1, 3)).toBe(2);
     expect(wrapIndex(5, 0)).toBe(-1);
+  });
+
+  it("关掉标签后落点：关当前取下一只，关左边序号减一，关完回 -1", () => {
+    expect(indexAfterCloseTab(1, 1, 2)).toBe(1);
+    expect(indexAfterCloseTab(2, 2, 2)).toBe(1);
+    expect(indexAfterCloseTab(1, 0, 2)).toBe(0);
+    expect(indexAfterCloseTab(0, 2, 2)).toBe(0);
+    expect(indexAfterCloseTab(0, 0, 0)).toBe(-1);
   });
 
   it("字节格式化", () => {
@@ -182,6 +225,34 @@ describe("wrapIndex / formatBytes / artifactBasename", () => {
     expect(siteArtifactUrl("a/b", "x y/z.html")).toBe(
       "/api/runs/a%2Fb/site/x%20y/z.html",
     );
+  });
+});
+
+describe("officeExportPaths", () => {
+  it("只收 .pptx / .pdf，有文件才可下载，不解析 OOXML", () => {
+    expect(officeExportPaths([
+      { path: "out/index.html" },
+      { path: "out/deck.pptx" },
+      { path: "out/deck.pdf" },
+      { path: "out/notes.docx" },
+      { path: "out/deck.PPTX" },
+      "slides/pack.pdf?x=1",
+      "C:\\work\\brief.pptx",
+    ])).toEqual([
+      "out/deck.pptx",
+      "out/deck.pdf",
+      "slides/pack.pdf?x=1",
+      "C:/work/brief.pptx",
+    ]);
+    expect(officeExportPaths([{ path: "out/index.html" }])).toEqual([]);
+    expect(officeExportPaths(null)).toEqual([]);
+  });
+
+  it("pptxPathForHtml 与 HTML 同茎", () => {
+    expect(pptxPathForHtml("out/index.html")).toBe("out/index.pptx");
+    expect(pptxPathForHtml("deck.htm")).toBe("deck.pptx");
+    expect(pngPathsForHtml("out/index.html", 1)).toEqual(["out/index.png"]);
+    expect(pngPathsForHtml("out/index.html", 2)).toEqual(["out/index-1.png", "out/index-2.png"]);
   });
 });
 
@@ -220,10 +291,11 @@ describe("initArtifactCanvas — 打开与 chrome", () => {
   });
 
   it("HTML 产物：整站预览，iframe 沙箱不允许 same-origin，且不发 fetch", async () => {
-    const fakeFetch = vi.fn();
+    const fakeFetch = vi.fn(async () => ({ ok: true, json: async () => ({ found: false }) }));
     const api = initArtifactCanvas(setupHost(), { fetch: fakeFetch });
     expect(api.open(0)).toBe(true);
     expect(api.isOpen()).toBe(true);
+    await flush();
     const frame = document.querySelector("iframe.ac-frame");
     expect(frame).toBeTruthy();
     expect(frame.getAttribute("sandbox")).toBe("allow-scripts");
@@ -231,25 +303,70 @@ describe("initArtifactCanvas — 打开与 chrome", () => {
     expect(frame.getAttribute("src")).toBe("/api/runs/run-1/site/out/index.html?deck=1");
     expect(document.querySelector(".ac-note")?.textContent).toContain("整站预览");
     expect(document.querySelector("#ac-site")).toBeNull();
-    expect(document.querySelector("#ac-zip")?.hidden).toBe(false);
-    expect(document.querySelector("#ac-print")?.hidden).toBe(false);
-    expect((document.querySelector("#ac-print") as HTMLAnchorElement).href).toContain("print=1");
+    expect(document.querySelector("#ac-export")?.hidden).toBe(false);
+    expect(document.querySelector(".ac-actions > .ac-download")).toBeNull();
+    expect(document.querySelector("#ac-zip")).toBeNull();
+    expect(document.querySelector("#ac-print")).toBeNull();
+    expect(document.querySelector("#ac-export-hint")).toBeNull();
+    expect(document.querySelector("#ac-template")).toBeNull();
+    // 整站预览不 fetch 产物本体，也不再拉 DESIGN.md 色板
     expect(fakeFetch).not.toHaveBeenCalled();
     // chrome：名称 + 徽章 + 位置
-    expect(document.querySelector(".ac-name")?.textContent).toBe("index.html");
+    expect(document.querySelector(".ac-name")?.textContent).toBe("out/index.html");
     expect(document.querySelector(".ac-badge")?.textContent).toBe("网站");
-    expect(document.querySelector(".ac-pos")?.textContent).toBe("1 / 6");
+    const tabs = [...document.querySelectorAll(".ac-tab")];
+    expect(tabs).toHaveLength(6);
+    expect(tabs[0].getAttribute("aria-selected")).toBe("true");
+    expect(tabs[0].textContent).toBe("out/index.html");
+    expect(document.getElementById("ac-browser-url")?.value).toBe("out/index.html");
+    expect(document.querySelector(".ac-title")?.classList.contains("sr-only")).toBe(true);
+    expect(document.querySelector(".ac-browser-bar")?.contains(document.querySelector(".ac-actions"))).toBe(true);
     expect(document.querySelector("#ac-inspect")?.hidden).toBe(false);
     expect(document.querySelector("#ac-annotate")?.hidden).toBe(true);
   });
 
+  it("内置浏览器：地址栏提交后按 http(s) 嵌网页，沙箱含 same-origin", async () => {
+    const onOpenBrowser = vi.fn();
+    const api = initArtifactCanvas(
+      setupHost({
+        getArtifacts: () => [{ path: "https://example.com/" }],
+        onOpenBrowser,
+      }),
+      { fetch: vi.fn() },
+    );
+    expect(api.open(0)).toBe(true);
+    await flush();
+    const frame = document.querySelector("iframe.ac-frame--web");
+    expect(frame).toBeTruthy();
+    expect(frame.getAttribute("src")).toBe("https://example.com/");
+    expect(frame.getAttribute("sandbox")).toContain("allow-same-origin");
+    expect(document.querySelector(".ac-badge")?.textContent).toBe("网页");
+    expect(document.querySelector(".ac-tab")?.textContent).toBe("example.com");
+    expect(document.querySelector(".ac-reveal")?.hidden).toBe(true);
+    const bar = document.getElementById("ac-browser-bar");
+    expect(bar).toBeTruthy();
+    const input = document.getElementById("ac-browser-url");
+    expect(input.value).toBe("example.com");
+    input.value = "example.org";
+    bar.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    expect(onOpenBrowser).toHaveBeenCalledWith("https://example.org/");
+    expect(api.focusAddress()).toBe(true);
+  });
+
   it("点评模式仍走整站 URL，只加 inspect=1，不 fetch、不用 srcdoc", async () => {
-    const fakeFetch = vi.fn();
+    const fakeFetch = vi.fn(async (url) => {
+      if (String(url).includes("design-md")) {
+        return { ok: true, json: async () => ({ found: false }) };
+      }
+      return { ok: false };
+    });
     const api = initArtifactCanvas(setupHost(), { fetch: fakeFetch });
     api.open(0);
-    expect(fakeFetch).not.toHaveBeenCalled();
+    await flush();
+    fakeFetch.mockClear();
     document.querySelector("#ac-inspect").click();
     await flush();
+    // inspect 重渲仍不 fetch 产物，也不拉 DESIGN.md
     expect(fakeFetch).not.toHaveBeenCalled();
     const frame = document.querySelector("iframe.ac-frame");
     expect(frame.getAttribute("sandbox")).toBe("allow-scripts");
@@ -259,7 +376,7 @@ describe("initArtifactCanvas — 打开与 chrome", () => {
     expect(document.querySelector(".ac-note")?.textContent).toContain("点评模式");
   });
 
-  it("幻灯报到后显示翻页条；裸方向键翻页，Alt+方向键切产物", async () => {
+  it("幻灯报到后显示翻页条；裸方向键只翻页，不再切文件", async () => {
     const host = setupHost();
     const api = initArtifactCanvas(host, { fetch: vi.fn() });
     api.open(0);
@@ -290,7 +407,7 @@ describe("initArtifactCanvas — 打开与 chrome", () => {
     expect(posts.some((p) => p?.type === DECK_GOTO_MESSAGE_TYPE && p.delta === 1)).toBe(true);
     expect(host.onSwitch).not.toHaveBeenCalled();
     document.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", altKey: true }));
-    expect(host.onSwitch).toHaveBeenCalledWith(1);
+    expect(host.onSwitch).not.toHaveBeenCalled();
     posts.length = 0;
     document.querySelectorAll(".ac-deck-page")[2].click();
     expect(posts.some((p) => p?.type === DECK_GOTO_MESSAGE_TYPE && p.index === 2)).toBe(true);
@@ -325,6 +442,271 @@ describe("initArtifactCanvas — 打开与 chrome", () => {
     expect(onAppendReview).toHaveBeenCalledWith(expect.stringContaining("[点评][slide:2]"));
     document.querySelector("#ac-review-clear").click();
     expect(document.querySelector("#ac-review-list")?.hidden).toBe(true);
+  });
+
+  it("parseDesignPalette 抽出色块；画布不再展示 DESIGN.md 色板；导出菜单收 ZIP，幻灯才出打印", async () => {
+    expect(
+      parseDesignPalette("## 色板\n- accent: #3b82f6\n## 字体\n- body: system").colors[0],
+    ).toEqual({
+      name: "accent",
+      value: "#3b82f6",
+    });
+    const fakeFetch = vi.fn(async (url) => {
+      if (String(url).includes("/design-md")) {
+        return {
+          ok: true,
+          json: async () => ({
+            found: true,
+            path: "DESIGN.md",
+            text: "## 色板\n- accent: #3b82f6\n",
+            palette: { colors: [{ name: "accent", value: "#3b82f6" }], fonts: [] },
+          }),
+        };
+      }
+      return { ok: false };
+    });
+    const api = initArtifactCanvas(setupHost(), { fetch: fakeFetch });
+    api.open(0);
+    await flush();
+    expect(document.querySelector("#ac-design-panel")?.hidden).toBe(true);
+    expect(document.querySelector(".ac-color-chip")).toBeNull();
+    expect(fakeFetch).not.toHaveBeenCalled();
+    document.querySelector("#ac-export").click();
+    await flush();
+    expect(document.querySelector("#ac-export-menu")).toBeTruthy();
+    expect((document.querySelector("#ac-download") as HTMLAnchorElement).href).toContain("download=1");
+    expect((document.querySelector("#ac-zip") as HTMLAnchorElement).href).toContain("site-zip");
+    expect(document.querySelector("#ac-print")).toBeNull();
+    expect(document.querySelector(".ac-office-download")).toBeNull();
+    expect(document.querySelector("#ac-export-note")?.textContent).toContain("[data-card]");
+    expect(document.querySelector("#ac-export-png")?.textContent).toContain("导出图片");
+    expect(document.querySelector("#ac-export-menu")?.textContent).not.toContain("宿主不做 Office 引擎");
+    expect(document.querySelector("#ac-export-menu")?.textContent).not.toContain("后导出");
+    expect(document.querySelector("#ac-export-pptx")).toBeNull();
+    const frame = document.querySelector("iframe.ac-frame");
+    const cw = {};
+    Object.defineProperty(frame, "contentWindow", { value: cw, configurable: true });
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        data: { type: DECK_READY_MESSAGE_TYPE, total: 3, index: 0, slide: "1", slides: ["1", "2", "3"] },
+        source: cw,
+      }),
+    );
+    await flush();
+    document.querySelector("#ac-export").click();
+    await flush();
+    expect((document.querySelector("#ac-print") as HTMLAnchorElement).href).toContain("print=1");
+    expect(document.querySelector("#ac-export-pptx")?.textContent).toContain("导出 PowerPoint");
+    expect(document.querySelector("#ac-export-note")?.textContent).toContain("从幻灯 HTML 转换");
+  });
+
+  it("已有同茎 pptx 时导出仍走宿主转换，不静默下载旧文件", async () => {
+    const fakeFetch = vi.fn(async (url, init) => {
+      if (String(url).includes("/export/pptx") && init?.method === "POST") {
+        expect(JSON.parse(init.body)).toEqual({ htmlPath: "out/index.html" });
+        return { ok: true, json: async () => ({ path: "out/index.pptx", slides: 3, titles: ["一", "二", "三"], lossy: ["渐变字改为强调色纯色"] }) };
+      }
+      return { ok: false };
+    });
+    const host = setupHost({
+      getArtifacts: () => [{ path: "out/index.html" }, { path: "out/index.pptx" }],
+    });
+    const api = initArtifactCanvas(host, { fetch: fakeFetch });
+    api.open(0);
+    await flush();
+    const frame = document.querySelector("iframe.ac-frame");
+    const cw = {};
+    Object.defineProperty(frame, "contentWindow", { value: cw, configurable: true });
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        data: { type: DECK_READY_MESSAGE_TYPE, total: 3, index: 0, slide: "1", slides: ["1", "2", "3"] },
+        source: cw,
+      }),
+    );
+    await flush();
+    document.querySelector("#ac-export").click();
+    await flush();
+    const btn = document.querySelector("#ac-export-pptx") as HTMLButtonElement;
+    expect(btn.tagName).toBe("BUTTON");
+    expect(btn.getAttribute("href")).toBeNull();
+    btn.click();
+    await flush();
+    expect(fakeFetch).toHaveBeenCalledWith(
+      "/api/runs/run-1/export/pptx",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(document.querySelector("#ac-export-status")?.textContent).toContain("已导出");
+    expect(document.querySelector("#ac-export-status")?.textContent).toContain("有损");
+    expect(host.onAnnounce).toHaveBeenCalledWith(expect.stringContaining("已导出"));
+  });
+
+  it("导出失败写可见状态，不假装成功", async () => {
+    const fakeFetch = vi.fn(async (url, init) => {
+      if (String(url).includes("/export/pptx") && init?.method === "POST") {
+        return { ok: false, json: async () => ({ error: "HTML 没有 section.slide[data-slide]，拒绝转换", code: "NO_SLIDES" }) };
+      }
+      return { ok: false };
+    });
+    const host = setupHost();
+    const api = initArtifactCanvas(host, { fetch: fakeFetch });
+    api.open(0);
+    await flush();
+    const frame = document.querySelector("iframe.ac-frame");
+    const cw = {};
+    Object.defineProperty(frame, "contentWindow", { value: cw, configurable: true });
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        data: { type: DECK_READY_MESSAGE_TYPE, total: 3, index: 0, slide: "1", slides: ["1", "2", "3"] },
+        source: cw,
+      }),
+    );
+    await flush();
+    document.querySelector("#ac-export").click();
+    await flush();
+    (document.querySelector("#ac-export-pptx") as HTMLButtonElement).click();
+    await flush();
+    const status = document.querySelector("#ac-export-status") as HTMLElement;
+    expect(status.hidden).toBe(false);
+    expect(status.getAttribute("role")).toBe("alert");
+    expect(status.textContent).toContain("没有 section.slide");
+    expect(status.dataset.kind).toBe("error");
+    expect(host.onAnnounce).toHaveBeenCalledWith(expect.stringContaining("没有 section.slide"));
+  });
+
+  it("点选某一页才进入改稿范围；仅报到不误伤", async () => {
+    const api = initArtifactCanvas(setupHost(), { fetch: vi.fn() });
+    api.open(0);
+    await flush();
+    expect(api.getEditScope()).toBeNull();
+    const frame = document.querySelector("iframe.ac-frame");
+    const cw = {};
+    Object.defineProperty(frame, "contentWindow", { value: cw, configurable: true });
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        data: { type: DECK_READY_MESSAGE_TYPE, total: 3, index: 0, slide: "1", slides: ["1", "2", "3"] },
+        source: cw,
+      }),
+    );
+    await flush();
+    expect(api.getEditScope()).toBeNull();
+    (document.querySelectorAll(".ac-deck-page")[2] as HTMLButtonElement).click();
+    expect(api.getEditScope()).toEqual({ slide: "3", path: "out/index.html" });
+  });
+
+  it("改稿写回后仍钉住被选页，并 goto 那一页", async () => {
+    const posts = [];
+    const cw = { postMessage: (msg) => posts.push(msg) };
+    const api = initArtifactCanvas(setupHost(), { fetch: vi.fn(), refreshDebounceMs: 5 });
+    api.open(0);
+    await flush();
+    const frame = document.querySelector("iframe.ac-frame");
+    Object.defineProperty(frame, "contentWindow", { value: cw, configurable: true });
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        data: { type: DECK_READY_MESSAGE_TYPE, total: 3, index: 0, slide: "1", slides: ["1", "2", "3"] },
+        source: cw,
+      }),
+    );
+    await flush();
+    (document.querySelectorAll(".ac-deck-page")[2] as HTMLButtonElement).click();
+    expect(api.getEditScope()?.slide).toBe("3");
+    const prev = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, "contentWindow");
+    Object.defineProperty(HTMLIFrameElement.prototype, "contentWindow", {
+      configurable: true,
+      get() { return cw; },
+    });
+    try {
+      api.noteWrites(["out/index.html"]);
+      await new Promise((r) => setTimeout(r, 20));
+      expect(api.getEditScope()).toEqual({ slide: "3", path: "out/index.html" });
+      expect(posts.some((p) => p?.type === DECK_GOTO_MESSAGE_TYPE && p.slide === "3")).toBe(true);
+    } finally {
+      if (prev) Object.defineProperty(HTMLIFrameElement.prototype, "contentWindow", prev);
+      else delete HTMLIFrameElement.prototype.contentWindow;
+    }
+  });
+
+  it("多页幻灯即使产物清单没有 pptx 也提供导出 PowerPoint，点击先转换", async () => {
+    const fakeFetch = vi.fn(async (url, init) => {
+      if (String(url).includes("/export/pptx") && init?.method === "POST") {
+        expect(JSON.parse(init.body)).toEqual({ htmlPath: "out/index.html" });
+        return { ok: true, json: async () => ({ path: "out/index.pptx", slides: 3, lossy: [] }) };
+      }
+      return { ok: false };
+    });
+    const api = initArtifactCanvas(setupHost(), { fetch: fakeFetch });
+    api.open(0);
+    await flush();
+    const frame = document.querySelector("iframe.ac-frame");
+    const cw = {};
+    Object.defineProperty(frame, "contentWindow", { value: cw, configurable: true });
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        data: { type: DECK_READY_MESSAGE_TYPE, total: 3, index: 0, slide: "1", slides: ["1", "2", "3"] },
+        source: cw,
+      }),
+    );
+    await flush();
+    document.querySelector("#ac-export").click();
+    await flush();
+    const btn = document.querySelector("#ac-export-pptx") as HTMLButtonElement;
+    expect(btn).toBeTruthy();
+    expect(btn.tagName).toBe("BUTTON");
+    expect(document.querySelector(".ac-office-download")).toBeNull();
+    btn.click();
+    await flush();
+    expect(fakeFetch).toHaveBeenCalledWith(
+      "/api/runs/run-1/export/pptx",
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
+
+  it("HTML 始终提供导出图片，点击打 /export/png", async () => {
+    const fakeFetch = vi.fn(async (url, init) => {
+      if (String(url).includes("/export/png") && init?.method === "POST") {
+        expect(JSON.parse(init.body)).toEqual({ htmlPath: "out/index.html" });
+        return { ok: true, json: async () => ({ paths: ["out/index-1.png", "out/index-2.png"], count: 2 }) };
+      }
+      return { ok: false };
+    });
+    const api = initArtifactCanvas(setupHost(), { fetch: fakeFetch });
+    api.open(0);
+    await flush();
+    document.querySelector("#ac-export").click();
+    await flush();
+    const btn = document.querySelector("#ac-export-png") as HTMLButtonElement;
+    expect(btn).toBeTruthy();
+    btn.click();
+    await flush();
+    expect(fakeFetch).toHaveBeenCalledWith(
+      "/api/runs/run-1/export/png",
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
+
+  it("workdir 已有 .pptx/.pdf 时导出菜单提供下载；清单只列已存在文件", async () => {
+    const api = initArtifactCanvas(
+      setupHost({
+        getArtifacts: () => [
+          { path: "out/index.html" },
+          { path: "out/deck.pptx" },
+          { path: "out/brief.pdf" },
+        ],
+      }),
+      { fetch: vi.fn() },
+    );
+    api.open(0);
+    await flush();
+    document.querySelector("#ac-export").click();
+    await flush();
+    const links = [...document.querySelectorAll(".ac-office-download")];
+    expect(links.map((a) => a.getAttribute("download"))).toEqual(["deck.pptx", "brief.pdf"]);
+    expect(links.every((a) => a.getAttribute("href")?.includes("download=1"))).toBe(true);
+    expect(links[0].getAttribute("href")).toContain(encodeURIComponent("out/deck.pptx"));
+    expect(links[1].getAttribute("href")).toContain(encodeURIComponent("out/brief.pdf"));
+    expect(document.querySelector("#ac-export-note")?.textContent).toContain("[data-card]");
+    expect(document.querySelector("#ac-export-png")?.textContent).toContain("导出图片");
+    expect(document.querySelector("#ac-export-menu")?.textContent).not.toContain("宿主不做 Office 引擎");
   });
 
   it("图片产物：标注钮可见；打开后叠画布，不发 fetch", async () => {
@@ -430,55 +812,71 @@ describe("initArtifactCanvas — 切换、关闭与键盘", () => {
     document.body.innerHTML = "";
   });
 
-  it("◀ ▶ 按钮只上报宿主（hash 归宿主），位置指示随之循环", async () => {
+  it("点标签上报宿主切换，选中态跟着变", async () => {
     const host = setupHost();
     const api = initArtifactCanvas(host, { fetch: vi.fn(async () => textRes("x")) });
     api.open(0);
-    document.querySelector(".ac-nav[aria-label='下一件产物']").click();
+    document.querySelectorAll(".ac-tab")[1].click();
     expect(host.onSwitch).toHaveBeenCalledWith(1);
-    // 宿主写完 hash 绕回来调 open——这里模拟这一圈
     api.open(1);
     await flush();
-    expect(document.querySelector(".ac-pos")?.textContent).toBe("2 / 6");
-    document.querySelector(".ac-nav[aria-label='上一件产物']").click();
+    const tabs = [...document.querySelectorAll(".ac-tab")];
+    expect(tabs[1].getAttribute("aria-selected")).toBe("true");
+    expect(tabs[0].getAttribute("aria-selected")).toBe("false");
+    tabs[0].click();
     expect(host.onSwitch).toHaveBeenCalledWith(0);
   });
 
-  it("单产物时 ◀ ▶ 禁用", () => {
+  it("悬停关闭钮上报 onCloseTab，不切到那只标签", () => {
+    const host = setupHost({ onCloseTab: vi.fn() });
+    const api = initArtifactCanvas(host, { fetch: vi.fn() });
+    api.open(1);
+    const close = document.querySelectorAll(".ac-tab-close")[0];
+    expect(close).toBeTruthy();
+    expect(close.getAttribute("aria-label")).toContain("关闭");
+    close.click();
+    expect(host.onCloseTab).toHaveBeenCalledWith(0);
+    expect(host.onSwitch).not.toHaveBeenCalled();
+  });
+
+  it("单文件也画一只标签，没有左右箭头", () => {
     const api = initArtifactCanvas(
       setupHost({ getArtifacts: () => [{ path: "out/a.png" }] }),
       { fetch: vi.fn() },
     );
     api.open(0);
-    expect(document.querySelector(".ac-nav[aria-label='上一件产物']").disabled).toBe(true);
-    expect(document.querySelector(".ac-pos")?.textContent).toBe("");
+    expect(document.querySelectorAll(".ac-tab")).toHaveLength(1);
+    expect(document.querySelector(".ac-nav")).toBeNull();
   });
 
-  it("Esc 关闭、←/→ 切换；关闭后键盘归还", async () => {
+  it("Esc 收起；全局方向键不再切文件", async () => {
     const host = setupHost();
-    const api = initArtifactCanvas(host, { fetch: vi.fn(async () => textRes("x")) });
+    const api = initArtifactCanvas(host, { fetch: vi.fn(async () => textRes("x")), closeAnimMs: 0 });
     api.open(2);
     document.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight" }));
-    expect(host.onSwitch).toHaveBeenCalledWith(3);
-    document.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft" }));
-    expect(host.onSwitch).toHaveBeenCalledWith(1);
+    expect(host.onSwitch).not.toHaveBeenCalled();
     document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", cancelable: true }));
-    expect(host.onClose).toHaveBeenCalled();
-    // 宿主收到后关视图；关掉再按箭头不再触发
-    api.close();
+    expect(host.onClose).not.toHaveBeenCalled();
+    expect(api.isOpen()).toBe(true);
+    expect(api.isCollapsed()).toBe(true);
     host.onSwitch.mockClear();
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight" }));
+    expect(host.onSwitch).not.toHaveBeenCalled();
+    api.close();
     document.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight" }));
     expect(host.onSwitch).not.toHaveBeenCalled();
   });
 
-  it("关闭按钮与在文件夹中显示走宿主回调", () => {
+  it("收起键不拆会话；在文件夹中显示仍走宿主回调", () => {
     const host = setupHost();
-    const api = initArtifactCanvas(host, { fetch: vi.fn() });
+    const api = initArtifactCanvas(host, { fetch: vi.fn(), closeAnimMs: 0 });
     api.open(1);
     document.querySelector(".ac-reveal").click();
     expect(host.onReveal).toHaveBeenCalledWith("out/plot.png");
     document.querySelector(".ac-close").click();
-    expect(host.onClose).toHaveBeenCalled();
+    expect(host.onClose).not.toHaveBeenCalled();
+    expect(api.isCollapsed()).toBe(true);
+    expect(api.isOpen()).toBe(true);
   });
 
   it("close 清空内容并隐藏视图（收起动画播完后）；幂等初始化返回同一实例", async () => {
@@ -505,6 +903,23 @@ describe("initArtifactCanvas — 停靠面板形态", () => {
       `<main id="main-panel"><div id="center-row">` +
       `<div id="main-area" class="content-area"><p>对话主列</p></div>` +
       `</div></main>`;
+  });
+
+  it("打开预览时收起 Progress 侧栏，避免对话列被挤扁", () => {
+    const row = document.getElementById("center-row");
+    const rail = document.createElement("aside");
+    rail.id = "detail-rail";
+    rail.className = "detail-rail";
+    const toggle = document.createElement("button");
+    toggle.id = "rail-toggle";
+    toggle.textContent = "Progress ⟩";
+    toggle.setAttribute("aria-expanded", "true");
+    rail.appendChild(toggle);
+    row.querySelector(".content-area")?.appendChild(rail);
+    const api = initArtifactCanvas(setupHost(), { fetch: vi.fn() });
+    api.open(0);
+    expect(rail.classList.contains("detail-rail--collapsed")).toBe(true);
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
   });
 
   it("默认停靠在 #center-row：对话主列保持可见，不再是盖住一切的覆盖视图", () => {
@@ -540,26 +955,28 @@ describe("initArtifactCanvas — 停靠面板形态", () => {
     expect(api.isExpanded()).toBe(true);
   });
 
-  it("Esc 两级：放大态先还原（不关），停靠态才上报 onClose", () => {
+  it("Esc 两级：放大态先还原，停靠态只收起", () => {
     const host = setupHost();
-    const api = initArtifactCanvas(host, { fetch: vi.fn(async () => ({ ok: true, text: async () => "x" })) });
+    const api = initArtifactCanvas(host, { fetch: vi.fn(async () => ({ ok: true, text: async () => "x" })), closeAnimMs: 0 });
     api.open(2, { full: true });
     document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", cancelable: true }));
     expect(api.isExpanded()).toBe(false);
     expect(api.isOpen()).toBe(true);
     expect(host.onClose).not.toHaveBeenCalled();
     document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", cancelable: true }));
-    expect(host.onClose).toHaveBeenCalledTimes(1);
+    expect(host.onClose).not.toHaveBeenCalled();
+    expect(api.isCollapsed()).toBe(true);
   });
 
-  it("窄屏退化：放大被忽略，Esc 一级直接上报关闭", () => {
+  it("窄屏退化：放大被忽略，Esc 一级直接收起", () => {
     const host = setupHost();
-    const api = initArtifactCanvas(host, { fetch: vi.fn(), isNarrow: () => true });
+    const api = initArtifactCanvas(host, { fetch: vi.fn(), isNarrow: () => true, closeAnimMs: 0 });
     api.open(0, { full: true });
     expect(api.isExpanded()).toBe(false);
     expect(api.element.classList.contains("preview-dock--narrow")).toBe(true);
     document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", cancelable: true }));
-    expect(host.onClose).toHaveBeenCalledTimes(1);
+    expect(host.onClose).not.toHaveBeenCalled();
+    expect(api.isCollapsed()).toBe(true);
   });
 
   it("拖拽左缘调宽，宽度记进注入的存储", () => {

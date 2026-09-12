@@ -56,25 +56,40 @@ function realpathOfRoot(root: string): string {
   }
 }
 
-export function resolveInWorkdir(workdir: string, p: string): string {
-  const lexicalRoot = path.resolve(workdir);
-  const resolved = path.resolve(lexicalRoot, p);
-  if (!isInside(lexicalRoot, resolved)) {
-    throw new Error(
-      `Path escapes the working directory: "${p}". Use a path inside ${workdir}.`,
-    );
+/** Shared tool-schema wording: relative **or** absolute, as long as it stays inside a configured root. */
+export const WORKDIR_OR_ROOT_PATH =
+  "Relative path from the working directory, or an absolute path that stays inside the working directory or a configured extra root.";
+
+export function resolveInWorkdir(workdir: string, p: string, extraRoots?: string[]): string {
+  const extras = (extraRoots ?? []).filter((root) => typeof root === "string" && root.trim());
+  if (extras.length === 0) {
+    const lexicalRoot = path.resolve(workdir);
+    const resolved = path.resolve(lexicalRoot, p);
+    if (!isInside(lexicalRoot, resolved)) {
+      throw new Error(
+        `Path escapes the working directory: "${p}". Use a path inside ${workdir}.`,
+      );
+    }
+
+    // workdir 本身必须存在；否则“最近存在父目录”会错误地扩大授权边界。
+    const realRoot = realpathOfRoot(lexicalRoot);
+    const realTargetParent = realpathOfNearestExisting(resolved);
+    if (!isInside(realRoot, realTargetParent)) {
+      throw new Error(
+        `Path escapes the working directory through a symbolic link or junction: "${p}". ` +
+          `Use a path inside ${workdir}.`,
+      );
+    }
+    return resolved;
   }
 
-  // workdir 本身必须存在；否则“最近存在父目录”会错误地扩大授权边界。
-  const realRoot = realpathOfRoot(lexicalRoot);
-  const realTargetParent = realpathOfNearestExisting(resolved);
-  if (!isInside(realRoot, realTargetParent)) {
+  try {
+    return resolveReadable(workdir, extras, p);
+  } catch {
     throw new Error(
-      `Path escapes the working directory through a symbolic link or junction: "${p}". ` +
-        `Use a path inside ${workdir}.`,
+      `Path escapes the working directory: "${p}". Use a path inside ${workdir} or ${extras.join(", ")}.`,
     );
   }
-  return resolved;
 }
 
 /** true 当 resolved 位于 root 之内（含 root 自身） */

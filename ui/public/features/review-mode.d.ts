@@ -22,4 +22,8 @@ export function formatReviewComment(
   comment?: string,
   slide?: string,
 ): string;
+export function appendReviewToInput(existing: string, line: string): string;
+export function normalizeDesignEditScope(scope: unknown): { slide: string; path?: string; selector?: string } | null;
+export function formatDesignEditScope(scope: unknown): string;
+export function attachDesignEditScope(text: string, scope: unknown): string;
 export function isInspectPick(data: unknown): boolean;

@@ -4,15 +4,15 @@
 
 ## 色板
 
-- background:
-- foreground:
-- muted:
-- accent:
+- background: #0f1419
+- foreground: #f4f1ea
+- muted: #a8a29a
+- accent: #3b82f6
 
 ## 字体
 
-- display:
-- body:
+- display: Segoe UI / PingFang SC
+- body: system-ui
 
 ## 反模式（不要做）
 

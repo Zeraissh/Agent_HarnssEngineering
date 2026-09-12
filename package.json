@@ -22,6 +22,7 @@
     "smoke:local": "tsx --env-file-if-exists=.env eval/smoke-local.ts",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
+    "test:changed-coverage": "node scripts/changed-line-coverage.mjs",
     "test:mutation-smoke": "node scripts/mutation-smoke.mjs",
     "typecheck": "tsc --noEmit",
     "ledger": "tsx --env-file-if-exists=.env eval/ledger-report.ts",
@@ -34,6 +35,7 @@
     "e2e:electron-lifecycle": "node scripts/electron-nsis-lifecycle-smoke.mjs",
     "ops:backup-drill": "node scripts/ops-history-backup-drill.mjs",
     "ops:backup-drill:encrypted": "node scripts/ops-history-encrypted-offsite-drill.mjs",
+    "ops:schema-migrate-drill": "tsx scripts/ops-schema-migrate-drill.ts",
     "wsl2:oci-fixture": "node scripts/wsl2-oci-fixture.mjs",
     "hil:stm32-canary": "node scripts/stm32-hil-canary.mjs",
     "eval:compare-baseline": "tsx eval/compare-baseline-cli.ts",
@@ -46,7 +48,8 @@
     "@anthropic-ai/sdk": "^0.115.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@phosphor-icons/web": "^2.1.2",
-    "openai": "^6.42.0"
+    "openai": "^6.42.0",
+    "pptxgenjs": "^4.0.1"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

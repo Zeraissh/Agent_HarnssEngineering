@@ -1,0 +1,82 @@
+:root {
+  --bg: #f4f1ea;
+  --fg: #1a1814;
+  --muted: #6b6560;
+  --accent: #3f7d4e;
+  --card: #fff;
+  --line: rgba(26, 24, 20, 0.1);
+  font-family: "Segoe UI", "PingFang SC", "Noto Sans SC", system-ui, sans-serif;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  line-height: 1.5;
+}
+
+.masthead,
+main {
+  max-width: 58rem;
+  margin: 0 auto;
+  padding: 0 clamp(1.25rem, 4vw, 2.5rem);
+}
+
+.masthead { padding-top: clamp(2rem, 7vw, 3.5rem); }
+.kicker {
+  margin: 0 0 0.5rem;
+  color: var(--accent);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  font-size: 0.78rem;
+}
+h1 { margin: 0 0 0.55rem; font-size: clamp(1.8rem, 4vw, 2.4rem); line-height: 1.15; }
+.lede { margin: 0 0 1.2rem; color: var(--muted); }
+
+.meta {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr));
+  gap: 0.7rem 1.2rem;
+  margin: 0 0 2rem;
+  padding: 0;
+}
+.meta dt {
+  margin: 0;
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.meta dd { margin: 0.15rem 0 0; font-weight: 650; }
+
+main { padding-bottom: 3.5rem; }
+.objective {
+  background: var(--card);
+  border: 1px solid var(--line);
+  padding: 1.15rem 1.2rem 1.3rem;
+  margin: 0 0 1.1rem;
+}
+h2 { margin: 0 0 0.45rem; font-size: 1.2rem; }
+.obj-text { margin: 0 0 0.9rem; color: var(--muted); }
+
+.scorecard {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.92rem;
+}
+th, td {
+  border: 1px solid var(--line);
+  padding: 0.5rem 0.6rem;
+  text-align: left;
+  vertical-align: top;
+}
+th {
+  font-size: 0.72rem;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--muted);
+  background: #eef3ea;
+}
+
+#notes ul { margin: 0; padding-left: 1.2rem; color: var(--muted); }

@@ -8,6 +8,8 @@
  * 形态：
  *   - 停靠（默认）：面板是 #center-row 的 flex 子项，对话主列被压缩但仍
  *     可见、可滚动、可继续交互——边看预览边继续对话；
+ *   - 收起：面板藏起、内容保留，右侧留展开钮（与左侧会话栏同一套「随时
+ *     显隐」，不再用关闭键退出预览）；
  *   - 放大：`.preview-dock--expanded` 切到 absolute inset:0，盖满整个主区
  *     （≈旧的覆盖形态）；按钮变「还原」；
  *   - 窄屏（≤900px，与 detail-rail 折叠同一断点）：CSS 媒体查询退化为覆盖式，
@@ -29,9 +31,9 @@
 // ---------------------------------------------------------------
 
 /** 拖拽调宽的允许区间（占主区宽度的比例）与默认值 */
-export const DOCK_MIN_FRACTION = 0.3;
+export const DOCK_MIN_FRACTION = 0.28;
 export const DOCK_MAX_FRACTION = 0.75;
-export const DOCK_DEFAULT_FRACTION = 0.5;
+export const DOCK_DEFAULT_FRACTION = 0.38;
 
 /** 收起退出动画时长（与 styles.css 的 dock-slide-out 同源；reduced-motion 下不用） */
 export const DOCK_CLOSE_ANIM_MS = 140;
@@ -98,15 +100,15 @@ export function dockFractionFromPointer(p) {
  *   overlay         → true 时为覆盖变体（absolute 钉右侧，不占 flex 位）
  *   extraClass      → 追加在根元素上的特征类（如 "artifact-canvas"）
  *   storageKey      → 宽度记忆键（默认 DOCK_WIDTH_STORAGE_KEY）
- *   onClose()       → 关闭按钮 / Esc（停靠态）时上报；路由归宿主，本模块不导航
  *   onExpandChange(expanded) → 放大/还原后上报（宿主可据此改写 hash 深链）
  *
  * env（测试注入）：doc / win / storage / isNarrow / closeAnimMs
  *
  * 返回：
- *   root / head / body / closeBtn / expandBtn
- *   insertHeadControl(el) → 把特征控件插进顶条（关闭键之后、放大键之前）
+ *   root / head / body / closeBtn（收起键，类名沿用） / expandBtn / revealBtn
+ *   insertHeadControl(el) → 把特征控件插进顶条（收起键之后、放大键之前）
  *   open() / close() / isOpen()
+ *   collapse() / expand() / isCollapsed()
  *   isExpanded() / setExpanded(b)
  *
  * @param {Record<string, any>} opts
@@ -138,8 +140,10 @@ export function createPreviewDock(opts = {}, env = {}) {
   // ---- 状态 ----
   let open = false;
   let expanded = false;
+  /** 会话还在，只是把面板藏到右边——跟左侧会话栏同一套显隐 */
+  let collapsed = false;
   let fraction = readDockFraction(storage, storageKey);
-  /** 收起动画在途计时器：动画没播完又被打开时不许把面板藏起来 */
+  /** 收起/关闭动画在途计时器：动画没播完又被打开时不许把面板藏起来 */
   let closeTimer = 0;
   /** @type {HTMLElement|null} */
   let restoreFocusTo = null;
@@ -166,9 +170,12 @@ export function createPreviewDock(opts = {}, env = {}) {
 
   const closeBtn = doc.createElement("button");
   closeBtn.type = "button";
-  closeBtn.className = "btn btn--ghost ac-close";
-  closeBtn.innerHTML = '<i class="ph ph-x" aria-hidden="true"></i><span>关闭</span>';
-  closeBtn.setAttribute("aria-label", "关闭预览（Esc）");
+  closeBtn.className = "btn btn--ghost ac-close pd-collapse";
+  closeBtn.innerHTML = '<i class="ph ph-caret-right" aria-hidden="true"></i>';
+  closeBtn.setAttribute("aria-label", "收起预览");
+  closeBtn.title = "收起预览（Esc / Ctrl+Shift+B）";
+  closeBtn.setAttribute("aria-keyshortcuts", "Escape Control+Shift+B Meta+Shift+B");
+  closeBtn.setAttribute("aria-expanded", "true");
 
   const expandBtn = doc.createElement("button");
   expandBtn.type = "button";
@@ -187,6 +194,18 @@ export function createPreviewDock(opts = {}, env = {}) {
   const mount =
     doc.getElementById("center-row") ?? doc.getElementById("main-panel") ?? doc.body;
   mount?.appendChild(root);
+
+  const revealBtn = doc.createElement("button");
+  revealBtn.type = "button";
+  revealBtn.id = `${id}-expand`;
+  revealBtn.className = "preview-expand";
+  revealBtn.hidden = true;
+  revealBtn.setAttribute("aria-label", "显示预览");
+  revealBtn.title = "显示预览（Ctrl+Shift+B）";
+  revealBtn.setAttribute("aria-keyshortcuts", "Control+Shift+B Meta+Shift+B");
+  revealBtn.setAttribute("aria-expanded", "false");
+  revealBtn.innerHTML = '<i class="ph ph-caret-left" aria-hidden="true"></i>';
+  (doc.body ?? mount)?.appendChild(revealBtn);
 
   // ---- 宽度 ----
   function applyWidth() {
@@ -225,46 +244,88 @@ export function createPreviewDock(opts = {}, env = {}) {
     opts.onExpandChange?.(expanded);
   }
 
-  // ---- 开 / 关 ----
-  function openDock() {
-    if (closeTimer) {
-      win.clearTimeout(closeTimer);
-      closeTimer = 0;
-      root.classList.remove("preview-dock--closing");
-    }
-    if (open) return;
-    open = true;
-    restoreFocusTo = /** @type {HTMLElement|null} */ (doc.activeElement);
-    root.hidden = false;
-    if (isNarrow()) root.classList.add("preview-dock--narrow");
-    else root.classList.remove("preview-dock--narrow");
+  // ---- 开 / 收起 / 关 ----
+  function syncRevealChrome() {
+    const shown = open && !collapsed;
+    revealBtn.hidden = !(open && collapsed);
+    revealBtn.setAttribute("aria-expanded", String(shown));
+    closeBtn.setAttribute("aria-expanded", String(shown));
   }
 
-  function finishClose() {
+  function cancelCloseTimer() {
+    if (!closeTimer) return;
+    win.clearTimeout(closeTimer);
     closeTimer = 0;
     root.classList.remove("preview-dock--closing");
-    root.hidden = true;
-    body.innerHTML = "";
   }
 
-  function closeDock() {
-    if (!open) return;
-    open = false;
+  function restoreFocus() {
     if (restoreFocusTo && typeof restoreFocusTo.focus === "function" && doc.contains?.(restoreFocusTo) !== false) {
       restoreFocusTo.focus();
     }
     restoreFocusTo = null;
+  }
+
+  function openDock() {
+    cancelCloseTimer();
+    collapsed = false;
+    if (!open) {
+      open = true;
+      restoreFocusTo = /** @type {HTMLElement|null} */ (doc.activeElement);
+    }
+    root.hidden = false;
+    if (isNarrow()) root.classList.add("preview-dock--narrow");
+    else root.classList.remove("preview-dock--narrow");
+    syncRevealChrome();
+  }
+
+  function finishHide({ clear } = { clear: false }) {
+    closeTimer = 0;
+    root.classList.remove("preview-dock--closing");
+    root.hidden = true;
+    if (clear) body.innerHTML = "";
+    syncRevealChrome();
+  }
+
+  function hideWithAnim(done) {
     if (closeAnimMs > 0 && !prefersReducedMotion()) {
       root.classList.add("preview-dock--closing");
-      closeTimer = win.setTimeout(finishClose, closeAnimMs);
+      closeTimer = win.setTimeout(done, closeAnimMs);
     } else {
-      finishClose();
+      done();
     }
+  }
+
+  function collapseDock() {
+    if (!open || collapsed) return;
+    if (expanded) setExpanded(false);
+    collapsed = true;
+    syncRevealChrome();
+    restoreFocus();
+    hideWithAnim(() => finishHide({ clear: false }));
+  }
+
+  function expandDock() {
+    if (!open || !collapsed) return;
+    cancelCloseTimer();
+    collapsed = false;
+    root.hidden = false;
+    syncRevealChrome();
+    closeBtn.focus();
+  }
+
+  function closeDock() {
+    cancelCloseTimer();
+    if (!open && !collapsed) return;
+    open = false;
+    collapsed = false;
+    restoreFocus();
+    hideWithAnim(() => finishHide({ clear: true }));
   }
 
   // ---- 拖拽调宽 ----
   handle.addEventListener("mousedown", (event) => {
-    if (!open || expanded || isNarrow()) return;
+    if (!open || collapsed || expanded || isNarrow()) return;
     event.preventDefault();
     const container = root.parentElement;
     const rect = container?.getBoundingClientRect?.();
@@ -291,16 +352,33 @@ export function createPreviewDock(opts = {}, env = {}) {
   });
 
   // ---- 事件 ----
-  closeBtn.addEventListener("click", () => opts.onClose?.());
+  closeBtn.addEventListener("click", () => collapseDock());
+  revealBtn.addEventListener("click", () => expandDock());
   expandBtn.addEventListener("click", () => setExpanded(!expanded));
 
-  // Esc 两级：放大态先还原，停靠态才上报关闭。只在开着时接管，关掉归还宿主。
+  function isTypingTarget(target) {
+    return target instanceof HTMLElement
+      && Boolean(target.closest("input, textarea, select, [contenteditable='true']"));
+  }
+
+  // Esc 两级：放大态先还原，停靠态收起（不拆会话）。Ctrl+Shift+B 随时显隐。
   doc.addEventListener("keydown", (event) => {
-    if (!open || event.key !== "Escape") return;
+    if (!open) return;
+    const toggleShortcut = (event.ctrlKey || event.metaKey) && event.shiftKey
+      && !event.altKey && (event.key === "b" || event.key === "B");
+    if (toggleShortcut) {
+      if (isTypingTarget(event.target)) return;
+      event.preventDefault();
+      if (collapsed) expandDock();
+      else collapseDock();
+      return;
+    }
+    if (event.key !== "Escape") return;
+    if (collapsed) return;
     event.preventDefault();
     event.stopPropagation();
     if (expanded) setExpanded(false);
-    else opts.onClose?.();
+    else collapseDock();
   });
 
   const api = {
@@ -309,14 +387,18 @@ export function createPreviewDock(opts = {}, env = {}) {
     body,
     closeBtn,
     expandBtn,
-    /** 特征控件插进顶条：关闭键之后、放大键之前（放大键恒在顶条最右） */
+    revealBtn,
+    /** 特征控件插进顶条：收起键之后、放大键之前（放大键恒在顶条最右） */
     insertHeadControl(el) {
       head.insertBefore(el, expandBtn.parentElement === head ? expandBtn : null);
       if (expandBtn.parentElement !== head) head.appendChild(expandBtn);
     },
     open: openDock,
     close: closeDock,
+    collapse: collapseDock,
+    expand: expandDock,
     isOpen: () => open,
+    isCollapsed: () => collapsed,
     isExpanded: () => expanded,
     setExpanded,
     /** 当前宽度比例（测试与诊断用） */

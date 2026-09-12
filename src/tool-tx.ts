@@ -1,28 +1,74 @@
 /**
  * SAFE-06 Phase 1 — 工具副作用事务层（纯函数 + 执行器钩子）。
  *
- * 范围：内置 write_file / edit_file / bash / generate_image，以及名字命中
- * MCP 写类启发式（flash_firmware / write_memory 等）的工具。
+ * 范围：内置 write_file / write_pptx / edit_file / bash / generate_image，以及 MCP 写类。
+ * MCP 写类有三层，漏一层就等于事务不存在：
+ *   ① `Tool.sideEffect === true`（mcp.json `sideEffectTools` / MCP `destructiveHint`）
+ *   ② 名字命中写动词（flash / write / erase / reset_target / call|batch 分发器）
+ *   ③ 内置 SIDE_EFFECT_TOOL_NAMES
  * - idempotencyKey = runId:toolUseId（inputHash 只作审计与同 id 异参 fail-closed）
  * - 生命周期：prepared → running → committed | failed | aborted
  * - write_file：idempotent_retry（prepared 可重入；committed 跳过）
  * - edit_file：idempotent_retry。字符串替换**不可能重复施加**——上一次若已写入，
  *   old_string 已不在文件里，重放只会得到 0 命中的报错而非二次修改。
- * - bash / MCP 启发式写类：fail_closed_no_retry（不知可否幂等；无 undo）
+ * - bash / MCP 写类：fail_closed_no_retry（不知可否幂等；无 undo）
  *
- * 残余：bash compensation；MCP 启发式漏检（认不出的写工具仍无事务）。
+ * 残余：bash compensation（ADR-003，明确不做）。启发式仍可能漏从未见过的动词——
+ * 那一层靠 ① 的显式声明补，不许再靠加正则假装收完。
  */
 import { createHash } from "node:crypto";
 import type { ToolResult } from "./types.js";
 
-export const SIDE_EFFECT_TOOL_NAMES = new Set(["write_file", "edit_file", "bash", "generate_image"]);
+export const SIDE_EFFECT_TOOL_NAMES = new Set([
+  "write_file",
+  "write_pptx",
+  "edit_file",
+  "bash",
+  "generate_image",
+]);
 
 /**
- * MCP 写类启发式（与 compact-ledger 同族，故意收窄）：
- * 只认明确写盘/烧录形态，避免误伤 `update_progress` 等。
+ * MCP 原始工具名（去掉 `server__` 前缀）。分发器 `call`/`batch` 能转调任意写工具，
+ * 名字本身看不出副作用——一律当写类，否则启发式永远漏。
  */
-const MCP_SIDE_EFFECT_RE =
-  /(?:^|__)(?:write_file|edit_file|write_memory|flash_firmware|flash_and_run|program_device)$/i;
+const MCP_SIDE_EFFECT_VERBS = new Set([
+  "write_file",
+  "edit_file",
+  "write_memory",
+  "flash_firmware",
+  "flash_and_run",
+  "program_device",
+  "erase_flash",
+  "erase",
+  "reset_target",
+  "build_firmware",
+  "call",
+  "batch",
+]);
+
+export function mcpRawToolName(name: string): string {
+  const sep = name.lastIndexOf("__");
+  return sep >= 0 ? name.slice(sep + 2) : name;
+}
+
+export type SideEffectToolRef = string | { name: string; sideEffect?: boolean };
+
+/**
+ * 是否进事务层。声明优先于启发式；启发式认不出的写工具必须靠 `sideEffect: true`。
+ * `update_progress` / `read_*` 不进。
+ */
+export function isSideEffectTool(nameOrTool: SideEffectToolRef): boolean {
+  if (typeof nameOrTool !== "string") {
+    if (nameOrTool.sideEffect === true) return true;
+    return isSideEffectTool(nameOrTool.name);
+  }
+  if (SIDE_EFFECT_TOOL_NAMES.has(nameOrTool)) return true;
+  const raw = mcpRawToolName(nameOrTool);
+  if (MCP_SIDE_EFFECT_VERBS.has(raw)) return true;
+  if (/^write_|^flash_|^erase_/.test(raw)) return true;
+  if (/_(?:write|flash)$/.test(raw)) return true;
+  return false;
+}
 
 export const TOOL_TX_STATUSES = [
   "prepared",
@@ -49,16 +95,12 @@ export interface DurableToolTx {
   resultIsError?: boolean;
 }
 
-export function isSideEffectTool(name: string): boolean {
-  if (SIDE_EFFECT_TOOL_NAMES.has(name)) return true;
-  return MCP_SIDE_EFFECT_RE.test(name);
-}
-
-export function retryPolicyForTool(name: string): ToolTxRetryPolicy {
+export function retryPolicyForTool(nameOrTool: SideEffectToolRef): ToolTxRetryPolicy {
+  const name = typeof nameOrTool === "string" ? nameOrTool : nameOrTool.name;
   // bash / 未知 MCP 写类：不可安全重试；内置 write/edit/image 可幂等
   if (name === "bash") return "fail_closed_no_retry";
   if (SIDE_EFFECT_TOOL_NAMES.has(name)) return "idempotent_retry";
-  if (MCP_SIDE_EFFECT_RE.test(name)) return "fail_closed_no_retry";
+  if (isSideEffectTool(nameOrTool)) return "fail_closed_no_retry";
   return "idempotent_retry";
 }
 

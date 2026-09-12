@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>产品规格</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="masthead">
+    <p class="kicker">产品规格 · pm-spec</p>
+    <h1 id="title">一句话产品主张</h1>
+    <p class="lede">复制本模板，改标题与各节；保持目录锚点与决策日志表头。</p>
+    <dl class="meta">
+      <div><dt>状态</dt><dd>草稿</dd></div>
+      <div><dt>负责人</dt><dd>待指定</dd></div>
+      <div><dt>日期</dt><dd>YYYY-MM-DD</dd></div>
+    </dl>
+  </header>
+
+  <nav class="toc" aria-labelledby="toc-heading">
+    <h2 id="toc-heading">目录</h2>
+    <ol>
+      <li><a href="#background">背景</a></li>
+      <li><a href="#goals">目标与非目标</a></li>
+      <li><a href="#scope">范围</a></li>
+      <li><a href="#requirements">需求</a></li>
+      <li><a href="#acceptance">验收</a></li>
+      <li><a href="#decisions">决策日志</a></li>
+    </ol>
+  </nav>
+
+  <main>
+    <section id="background">
+      <h2>背景</h2>
+      <p>谁在什么约束下要解决什么问题。用可核对的事实，不要口号。</p>
+    </section>
+
+    <section id="goals">
+      <h2>目标与非目标</h2>
+      <h3>目标</h3>
+      <ul>
+        <li>本轮必须交付的结果（可验收）</li>
+      </ul>
+      <h3>非目标</h3>
+      <ul>
+        <li>明确不做、避免范围膨胀的项</li>
+      </ul>
+    </section>
+
+    <section id="scope">
+      <h2>范围</h2>
+      <p>用户、场景、系统边界。点名依赖与不在本规格内的邻接系统。</p>
+    </section>
+
+    <section id="requirements">
+      <h2>需求</h2>
+      <ol>
+        <li><strong>R1</strong> — 一条可独立验收的需求。</li>
+        <li><strong>R2</strong> — 另一条需求。</li>
+      </ol>
+    </section>
+
+    <section id="acceptance">
+      <h2>验收</h2>
+      <ul>
+        <li>AC1 — 对应 R1 的可观察结果。</li>
+        <li>AC2 — 对应 R2 的可观察结果。</li>
+      </ul>
+    </section>
+
+    <section id="decisions">
+      <h2>决策日志</h2>
+      <p>只记已拍板的决定。未决项放到进行中状态，不要写进本表冒充已决。</p>
+      <table>
+        <thead>
+          <tr>
+            <th>日期</th>
+            <th>决定</th>
+            <th>理由</th>
+            <th>拍板人</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>YYYY-MM-DD</td>
+            <td>示例：先做 HTML 规格，幻灯另页导出</td>
+            <td>预览只认 HTML</td>
+            <td>委托方</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+  </main>
+</body>
+</html>

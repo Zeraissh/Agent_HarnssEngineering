@@ -8,7 +8,7 @@
  *             读取与损坏兜底）/ formatDockWidth / dockFractionFromPointer
  *   DOM 层  ：停靠形态（挂 #center-row、对话主列仍在）/ 拖拽调宽与宽度记忆 /
  *             放大还原（按钮、aria-pressed、onExpandChange 上报）/
- *             Esc 两级（放大态先还原再关闭）/ 窄屏退化（禁拖拽禁放大、Esc 直接关）/
+ *             Esc 两级（放大态先还原再收起）/ 窄屏退化（禁拖拽禁放大、Esc 直接收起）/
  *             收起退出动画（reduced-motion 判据同源）/ 幂等
  */
 import { describe, it, expect, beforeEach, vi } from "vitest";
@@ -177,7 +177,7 @@ describe("createPreviewDock — 拖拽调宽", () => {
     const storage = fakeStorage();
     const dock = createPreviewDock({ id: "pd-f", label: "预览" }, { storage });
     dock.open();
-    expect(dock.root.style.width).toBe("50%");
+    expect(parseFloat(dock.root.style.width)).toBeCloseTo(DOCK_DEFAULT_FRACTION * 100);
     const handle = dock.root.querySelector(".pd-handle");
     handle.dispatchEvent(new window.MouseEvent("mousedown", { bubbles: true, cancelable: true, clientX: 500 }));
     document.dispatchEvent(new window.MouseEvent("mousemove", { bubbles: true, clientX: 400 }));
@@ -204,12 +204,12 @@ describe("createPreviewDock — 拖拽调宽", () => {
     dock.open();
     dock.setExpanded(true);
     drag(dock, 500, 400);
-    expect(dock.fraction()).toBeCloseTo(0.5); // 没动
+    expect(dock.fraction()).toBeCloseTo(DOCK_DEFAULT_FRACTION); // 没动
 
     const narrow = createPreviewDock({ id: "pd-i", label: "预览" }, { storage: fakeStorage(), isNarrow: () => true });
     narrow.open();
     drag(narrow, 500, 400);
-    expect(narrow.fraction()).toBeCloseTo(0.5);
+    expect(narrow.fraction()).toBeCloseTo(DOCK_DEFAULT_FRACTION);
   });
 });
 
@@ -237,34 +237,54 @@ describe("createPreviewDock — 放大/还原与 Esc 两级", () => {
     expect(onExpandChange).toHaveBeenCalledWith(false);
   });
 
-  it("Esc 两级：放大态先还原，再按才上报关闭", () => {
+  it("Esc 两级：放大态先还原，再按只收起、不拆会话", () => {
     setupPage();
-    const onClose = vi.fn();
-    const dock = createPreviewDock({ id: "pd-k", label: "预览", onClose }, {});
+    const dock = createPreviewDock({ id: "pd-k", label: "预览" }, { closeAnimMs: 0 });
     dock.open();
+    dock.body.textContent = "还在";
     dock.setExpanded(true);
     document.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape", cancelable: true }));
     expect(dock.isExpanded()).toBe(false);
-    expect(onClose).not.toHaveBeenCalled();
     expect(dock.isOpen()).toBe(true);
+    expect(dock.isCollapsed()).toBe(false);
     document.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape", cancelable: true }));
-    expect(onClose).toHaveBeenCalledTimes(1);
-    // 关闭后 Esc 归还：dock.isOpen 由宿主 close() 翻转，这里模拟
-    dock.close();
-    document.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape", cancelable: true }));
-    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(dock.isOpen()).toBe(true);
+    expect(dock.isCollapsed()).toBe(true);
+    expect(dock.root.hidden).toBe(true);
+    expect(dock.body.textContent).toBe("还在");
+    expect(dock.revealBtn.hidden).toBe(false);
+    dock.revealBtn.click();
+    expect(dock.isCollapsed()).toBe(false);
+    expect(dock.root.hidden).toBe(false);
   });
 
-  it("窄屏退化：加 narrow 类、放大被忽略、Esc 直接上报关闭", () => {
+  it("窄屏退化：加 narrow 类、放大被忽略、Esc 直接收起", () => {
     setupPage();
-    const onClose = vi.fn();
-    const dock = createPreviewDock({ id: "pd-l", label: "预览", onClose }, { isNarrow: () => true });
+    const dock = createPreviewDock({ id: "pd-l", label: "预览" }, { isNarrow: () => true, closeAnimMs: 0 });
     dock.open();
     expect(dock.root.classList.contains("preview-dock--narrow")).toBe(true);
     dock.setExpanded(true);
     expect(dock.isExpanded()).toBe(false); // 窄屏本来就是覆盖式，放大无意义
     document.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape", cancelable: true }));
-    expect(onClose).toHaveBeenCalledTimes(1); // 没有「先还原」这一级
+    expect(dock.isCollapsed()).toBe(true);
+    expect(dock.isOpen()).toBe(true);
+  });
+
+  it("顶条收起键与右侧展开钮对开，close 才真正拆掉会话", () => {
+    setupPage();
+    const dock = createPreviewDock({ id: "pd-collapse", label: "预览" }, { closeAnimMs: 0 });
+    dock.open();
+    dock.body.textContent = "内容";
+    dock.closeBtn.click();
+    expect(dock.isCollapsed()).toBe(true);
+    expect(dock.isOpen()).toBe(true);
+    expect(dock.body.textContent).toBe("内容");
+    dock.revealBtn.click();
+    expect(dock.isCollapsed()).toBe(false);
+    dock.close();
+    expect(dock.isOpen()).toBe(false);
+    expect(dock.body.textContent).toBe("");
+    expect(dock.revealBtn.hidden).toBe(true);
   });
 
   it("覆盖变体：带 overlay 类，与停靠型同一份行为", () => {
@@ -276,7 +296,7 @@ describe("createPreviewDock — 放大/还原与 Esc 两级", () => {
     expect(dock.root.classList.contains("preview-dock--expanded")).toBe(true);
   });
 
-  it("insertHeadControl：特征控件在关闭键之后、放大键恒在最右", () => {
+  it("insertHeadControl：特征控件在收起键之后、放大键恒在最右", () => {
     setupPage();
     const dock = createPreviewDock({ id: "pd-n", label: "预览" }, {});
     const a = document.createElement("span");

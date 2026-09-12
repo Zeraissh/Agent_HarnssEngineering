@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN" data-look="ink">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Social basic</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!--
+    方图契约（design 包）：
+    - 每一张是 article.card[data-card][data-size]
+    - 宿主「导出图片」只截这些卡，不截整页
+    - 色板用 html[data-look] 五选一：ink / paper / night / meadow / terracotta
+  -->
+  <article class="card" data-card="1" data-size="1080x1080" aria-label="封面">
+    <p class="kicker">方图 01</p>
+    <h1>一句主张</h1>
+    <p class="lede">1080×1080。改文案与 data-look，不要另造一张生图冒充本页。</p>
+  </article>
+  <article class="card" data-card="2" data-size="1080x1080" aria-label="要点">
+    <p class="kicker">方图 02</p>
+    <h1>三点就够</h1>
+    <ul>
+      <li>入口仍是可预览的 HTML</li>
+      <li>色板写在 data-look，不要硬编码漂移</li>
+      <li>PNG 由宿主从本卡截出</li>
+    </ul>
+  </article>
+  <article class="card" data-card="3" data-size="1080x1080" aria-label="收束">
+    <p class="kicker">方图 03</p>
+    <h1>带走这一张</h1>
+    <p class="lede">朋友圈 / 小红书用画布「导出图片」。</p>
+  </article>
+</body>
+</html>

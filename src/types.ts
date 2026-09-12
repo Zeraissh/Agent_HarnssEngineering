@@ -82,10 +82,16 @@ export interface ToolContext {
   /** 工作目录（路径校验的根，所有文件类工具不得逃逸） */
   workdir: string;
   /**
-   * 额外只读根（可选）：read_file 可读取这些目录下的绝对路径（写类工具不受益）。
+   * 额外只读根（可选）：read_file 可读取这些目录下的绝对路径。
    * 用于领域素材库（如 KiCad 官方符号/封装库）在工作区之外的场景。
+   * 写类工具请用 writeRoots，不要把只读根当成可写。
    */
   readRoots?: string[];
+  /**
+   * 额外可写根（可选）：write_file / edit_file / bash 圈禁把这些目录与主 workdir
+   * 同等对待。Web 宿主注入整份白名单（除主目录）；AGENT_READ_ROOTS 仍只进 readRoots。
+   */
+  writeRoots?: string[];
   /** 本次调用的 tool_use_id，用于日志关联 */
   toolUseId: string;
   /** 取消信号：护栏触发或用户中断时，长时间运行的工具应尽快退出 */
@@ -130,6 +136,11 @@ export interface Tool {
   parallelSafe: boolean;
   /** 缺省为 once；高副作用工具不应开放 exact-input 复用 */
   approvalPolicy?: ToolApprovalPolicy;
+  /**
+   * SAFE-06：显式声明有副作用。MCP 名字启发式认不出的写工具靠这个进事务。
+   * 只有 `true` 会扩权进事务；不设 / false 仍走名字启发式。
+   */
+  sideEffect?: boolean;
   execute(input: unknown, ctx: ToolContext): Promise<ToolResult>;
 }
 
@@ -276,6 +287,8 @@ export interface AgentConfig {
   executionBroker?: ExecutionBroker;
   /** 额外只读根（见 ToolContext.readRoots）。CLI 经 AGENT_READ_ROOTS 注入 */
   readRoots?: string[];
+  /** 额外可写根（见 ToolContext.writeRoots）。Web 宿主注入整份白名单（除主目录） */
+  writeRoots?: string[];
   /**
    * 第三方 Anthropic 兼容端点模式（DeepSeek/GLM/Kimi 等）：
    * 去掉 Claude 专属参数（adaptive thinking / output_config.effort / cache_control）。
@@ -366,6 +379,25 @@ export interface AgentConfig {
    * drain 必须是**取空**语义（读后即清）；没赶上的由宿主在收尾时并入追加轮。
    */
   steering?: { drain(): string[] };
+  /**
+   * 外部 command hooks（docs/09 §4.2）。默认不装。
+   * verifier / planner / clarifier / router 必须经 withoutExternalHooks 剥掉。
+   * 结构类型写在这里，避免 types ↔ hooks 循环 import。
+   */
+  hooks?: {
+    runPreToolUse(
+      req: { name: string; toolUseId: string; input: unknown },
+      onEvent?: (event: TurnEvent) => void,
+    ): Promise<{ action: "allow" | "block"; reason?: string }>;
+    runPostToolUse(
+      req: { name: string; toolUseId: string; input: unknown; result: ToolResult },
+      onEvent?: (event: TurnEvent) => void,
+    ): Promise<void>;
+    runStop(
+      req: { stopReason: string; runId?: string },
+      onEvent?: (event: TurnEvent) => void,
+    ): Promise<void>;
+  };
 }
 
 export interface AggregateUsage {
@@ -551,6 +583,13 @@ export type TurnEvent =
   /** backoffMs = 本次实际等待毫秒（含抖动）——不带它宿主就看不出重试到底等了多久 */
   | { type: "api_retry"; turn: number; attempt: number; reason: string; backoffMs: number }
   /**
+   * 单次 `model.send` 的起止（OBS-01）。`turn_start` 含 compact，不能当 send span。
+   * attempt 与同轮 for-loop 计数一致（0 起）；overflow 重发会先 end 再 start。
+   * 抛错（含 abort）必须先发 end，再走 abort/retry/error 分支。
+   */
+  | { type: "model_call_start"; turn: number; attempt: number }
+  | { type: "model_call_end"; turn: number; attempt: number; status: "ok" | "error"; durationMs: number }
+  /**
    * 端点降级（MODEL-01a）。**唯一一条不由 AgentLoop 发射的 TurnEvent**：
    * 换端点发生在 L0（FallbackModelClient.send 内部），循环那一层只认识
    * ModelClient 接口，按设计不知道这次调用换了一家服务商。宿主在装配模型
@@ -616,4 +655,19 @@ export type TurnEvent =
    * （下一轮模型调用之前），UI 据此把它画成带「插队指令」标注的用户气泡。
    */
   | { type: "steering"; text: string }
+  /**
+   * 外部 command hook 的一次开火（docs/09 §4.2）。
+   * 未武装时整条机制不存在，不会出现这种事件。
+   * outcome=block 只在 PreToolUse 改变控制流；Post/Stop 的 block 只记账。
+   */
+  | {
+      type: "hook";
+      hook: "PreToolUse" | "PostToolUse" | "Stop";
+      outcome: "allow" | "block" | "error";
+      tool?: string;
+      toolUseId?: string;
+      exitCode?: number | null;
+      timedOut?: boolean;
+      detail?: string;
+    }
   | { type: "done"; result: AgentRunResult };

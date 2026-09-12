@@ -6,8 +6,11 @@ import {
   DECK_READY_MESSAGE_TYPE,
   PRINT_HOOK_SOURCE,
   appendReviewToInput,
+  attachDesignEditScope,
   buildCssSelector,
+  formatDesignEditScope,
   formatReviewComment,
+  normalizeDesignEditScope,
   formatImageReview,
   injectInspectHook,
   appendInspectHook,
@@ -32,6 +35,27 @@ describe("buildCssSelector / formatReviewComment", () => {
     expect(formatReviewComment("  ", "")).toBe("[点评] (未识别)");
     expect(appendReviewToInput("先改首页", "[点评] h1: 太大")).toBe("先改首页\n[点评] h1: 太大");
     expect(appendReviewToInput("", "[点评] h1: 太大")).toBe("[点评] h1: 太大");
+  });
+
+  it("选中范围进入续跑正文；未选中不误伤", () => {
+    expect(normalizeDesignEditScope(null)).toBeNull();
+    expect(normalizeDesignEditScope({ slide: "" })).toBeNull();
+    expect(normalizeDesignEditScope({ slide: '3" onclick' })).toBeNull();
+    expect(normalizeDesignEditScope({ slide: "3", path: "out/index.html" })).toEqual({
+      slide: "3",
+      path: "out/index.html",
+    });
+    expect(attachDesignEditScope("缩短标题", null)).toBe("缩短标题");
+    expect(attachDesignEditScope("缩短标题", {})).toBe("缩短标题");
+    const scoped = attachDesignEditScope("缩短标题", { slide: "3", path: "out/index.html" });
+    expect(scoped).toContain('[改稿范围] 只改 data-slide="3"（文件 out/index.html）');
+    expect(scoped).toContain("缩短标题");
+    expect(scoped).toContain("不要整份重写");
+    expect(attachDesignEditScope("[点评][slide:2] h1: 太大", { slide: "3" })).toBe(
+      "[点评][slide:2] h1: 太大",
+    );
+    const already = formatDesignEditScope({ slide: "1" });
+    expect(attachDesignEditScope(`${already}\n再改`, { slide: "9" })).toBe(`${already}\n再改`);
   });
 });
 

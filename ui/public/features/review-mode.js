@@ -48,6 +48,43 @@ export function appendReviewToInput(existing, line) {
   return cur ? `${cur}\n${next}` : next;
 }
 
+/**
+ * 画布点选的改稿范围。没有 slide 就不约束——未选中不得误伤整份稿。
+ * slide id 只收短 token，避免把选择器/路径写进 data-slide 引号里。
+ */
+export function normalizeDesignEditScope(scope) {
+  if (!scope || typeof scope !== "object") return null;
+  const slide = String(scope.slide ?? "").trim();
+  if (!slide || !/^[A-Za-z0-9._:-]+$/.test(slide)) return null;
+  const path = String(scope.path ?? "").replace(/\\/g, "/").trim();
+  const selector = String(scope.selector ?? "").replace(/\s+/g, " ").trim().slice(0, 160);
+  return {
+    slide,
+    ...(path && !path.includes("\n") ? { path } : {}),
+    ...(selector ? { selector } : {}),
+  };
+}
+
+export function formatDesignEditScope(scope) {
+  const n = normalizeDesignEditScope(scope);
+  if (!n) return "";
+  const fileBit = n.path ? `（文件 ${n.path}）` : "";
+  const selBit = n.selector ? ` 选择器 ${n.selector}。` : "";
+  return `[改稿范围] 只改 data-slide="${n.slide}"${fileBit}。${selBit}不要改其它页，不要整份重写。`;
+}
+
+/**
+ * 续跑正文加上明确约束。输入里已有 [改稿范围] 或 [点评][slide:…] 时不覆盖。
+ */
+export function attachDesignEditScope(text, scope) {
+  const body = String(text ?? "");
+  if (/\[改稿范围\]/.test(body) || /\[点评\]\[slide:/.test(body)) return body;
+  const line = formatDesignEditScope(scope);
+  if (!line) return body;
+  const trimmed = body.replace(/\s+$/g, "");
+  return trimmed ? `${line}\n${trimmed}` : line;
+}
+
 export function isInspectPick(data) {
   return Boolean(
     data
