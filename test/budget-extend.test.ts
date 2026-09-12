@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { autoExtendIfExhausted, extendSharedRunBudget, exhaustedBudgetReason } from "../ui/server.js";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 
 describe("extendSharedRunBudget / exhaustedBudgetReason", () => {
@@ -39,8 +39,12 @@ describe("extendSharedRunBudget / exhaustedBudgetReason", () => {
 });
 
 describe("直播缓冲不再截尾", () => {
-  it("ui 与 cross-app 的 index.html 不再声明截尾常量或 slice(-CAP)", () => {
-    for (const rel of ["ui/public/index.html", "cross-app/index.html"]) {
+  it("ui 的 index.html 不再声明截尾常量或 slice(-CAP)", () => {
+    const rels = ["ui/public/index.html", "cross-app/index.html"].filter((rel) =>
+      existsSync(path.join(process.cwd(), rel)),
+    );
+    expect(rels, "至少要有一份宿主 HTML").toContain("ui/public/index.html");
+    for (const rel of rels) {
       const src = readFileSync(path.join(process.cwd(), rel), "utf8");
       expect(src, rel).not.toMatch(/const\s+LIVE_TEXT_CAP\s*=/);
       expect(src, rel).not.toMatch(/slice\(\s*-LIVE_TEXT_CAP/);

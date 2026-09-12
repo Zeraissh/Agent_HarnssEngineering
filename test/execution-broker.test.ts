@@ -226,8 +226,9 @@ describe("OCI policy args", () => {
     );
     expect(args.filter((arg) => arg === "--mount")).toHaveLength(1);
     expect(args.slice(-3)).toEqual(["/bin/sh", "-c", OCI_STDIN_BOOTSTRAP]);
-    expect(OCI_STDIN_BOOTSTRAP).toContain('cat > "$script"');
-    expect(OCI_STDIN_BOOTSTRAP).toContain('exec /bin/sh "$script" </dev/null');
+    expect(OCI_STDIN_BOOTSTRAP).toContain("cat > /tmp/agent-harness-command.sh");
+    expect(OCI_STDIN_BOOTSTRAP).toContain("exec /bin/sh /tmp/agent-harness-command.sh </dev/null");
+    expect(OCI_STDIN_BOOTSTRAP).not.toContain("$");
     expect(args.slice(-6, -3)).toEqual([
       "-i",
       "HOME=/tmp",

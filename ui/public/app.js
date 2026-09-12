@@ -7534,8 +7534,9 @@ function renderPlanNode(n, maxDuration) {
   const mark = { passed: "✔", failed: "✘", skipped: "－", running: "●", pending: "○" }[n.status];
   const pct = n.durationMs ? Math.max(2, Math.round((n.durationMs / maxDuration) * 100)) : 0;
   const openable = n.status !== "pending";
-  let html = `<div class="plan-node plan-node--${n.status}${openable ? " plan-node--openable" : ""}"${openable ? ` data-agent-id="${esc(n.id)}" role="button" tabindex="0"` : ""}>`;
-  html += `<div class="plan-node-head"><span class="plan-node-mark">${mark}</span>`;
+  let html = `<div class="plan-node plan-node--${n.status}${openable ? " plan-node--openable" : ""}">`;
+  // 可点的是标题行，不是整张卡：卡里还有 <details>，套 role=button 会 nested-interactive。
+  html += `<div class="plan-node-head"${openable ? ` data-agent-id="${esc(n.id)}" role="button" tabindex="0"` : ""}><span class="plan-node-mark">${mark}</span>`;
   html += `<code class="plan-node-id">${esc(n.id)}</code> <span class="plan-node-title">${esc(n.title)}</span></div>`;
   html += '<div class="plan-node-meta">';
   if (n.pack) html += `<span class="chip-perm">包 ${esc(n.pack)}</span>`;

@@ -1037,7 +1037,7 @@ body.sidebar-collapsed .sidebar {
   background: var(--surface-1);
   padding: var(--space-sm) var(--space-md);
 }
-.plan-node--openable {
+.plan-node--openable .plan-node-head {
   cursor: pointer;
 }
 .plan-node--openable:hover {
@@ -3330,9 +3330,9 @@ body.sidebar-collapsed .sidebar {
 .usage-view,
 .usage-embed {
   --usage-s0: var(--accent);
-  --usage-s1: var(--p-hl-num);
+  --usage-s1: var(--hl-num);
   --usage-s2: var(--status-info);
-  --usage-s3: var(--p-verifier);
+  --usage-s3: var(--identity-verifier);
   --usage-s4: var(--status-warn);
   --usage-s5: var(--status-ok);
 }
@@ -3614,7 +3614,7 @@ body.sidebar-collapsed .sidebar {
   border: 1px solid var(--border-1);
   border-radius: 10px;
   background: var(--surface-0);
-  box-shadow: 0 8px 24px color-mix(in srgb, #000 28%, transparent);
+  box-shadow: 0 8px 24px color-mix(in srgb, var(--text-1) 28%, transparent);
   color: var(--text-1);
   text-align: left;
   pointer-events: none;

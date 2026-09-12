@@ -416,7 +416,27 @@ async function collectSse(
   return out;
 }
 
-async function submitTaskViaUi(page: Page, task: string): Promise<void> {
+async function skipOnboardingIfOpen(page: Page): Promise<void> {
+  const overlay = page.locator("#onboarding-overlay");
+  if (!(await overlay.isVisible().catch(() => false))) return;
+  await page.locator("#onboarding-skip").click();
+  await overlay.waitFor({ state: "hidden", timeout: 5_000 });
+}
+
+async function submitTaskViaUi(
+  page: Page,
+  task: string,
+  opts: { autoApprove?: boolean } = {},
+): Promise<void> {
+  await skipOnboardingIfOpen(page);
+  if (opts.autoApprove === false) {
+    await page.evaluate(() => {
+      const el = document.getElementById("auto-approve-toggle");
+      if (!(el instanceof HTMLInputElement) || !el.checked) return;
+      el.checked = false;
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+  }
   await page.locator("#task-input").fill(task);
   await page.locator("#submit-btn").click();
 }
@@ -477,7 +497,7 @@ const scenarios: Scenario[] = [
       const page = await browser.newPage();
       try {
         await page.goto(serve.baseUrl, { waitUntil: "domcontentloaded" });
-        await submitTaskViaUi(page, "write report.txt with e2e marker");
+        await submitTaskViaUi(page, "write report.txt with e2e marker", { autoApprove: false });
         await clickApproval(page, "allow");
         const rowDone = await waitRunDoneViaApi(serve.baseUrl);
         await waitStatusBadge(page, "已完成").catch(() => undefined);
@@ -546,7 +566,7 @@ const scenarios: Scenario[] = [
       const page = await browser.newPage();
       try {
         await page.goto(serve.baseUrl, { waitUntil: "domcontentloaded" });
-        await submitTaskViaUi(page, "try to write secret.txt");
+        await submitTaskViaUi(page, "try to write secret.txt", { autoApprove: false });
         await clickApproval(page, "deny");
         const rowDone = await waitRunDoneViaApi(serve.baseUrl);
         const leaked = await readFile(path.join(workdir, "secret.txt"), "utf8").catch(() => null);
@@ -818,12 +838,14 @@ const scenarios: Scenario[] = [
         const page = await browser.newPage();
         try {
           await page.goto(`${serve.baseUrl}/#/run/${runId}`, { waitUntil: "domcontentloaded" });
+          await skipOnboardingIfOpen(page);
           await sleep(800);
           const labelText = ((await page.locator("#submit-btn-label").textContent()) ?? "").trim();
+          const composerMode = (await page.locator("#submit-form").getAttribute("data-mode")) ?? "";
           checks.push({
-            name: `composer 显示同运行恢复（实测「${labelText}」）`,
-            ok: labelText.includes("同运行恢复"),
-            ...(labelText.includes("同运行恢复")
+            name: `composer 显示同运行恢复（实测「${labelText}」mode=${composerMode}）`,
+            ok: composerMode === "same-run" && labelText.includes("继续对话"),
+            ...(composerMode === "same-run" && labelText.includes("继续对话")
               ? {}
               : { detail: "UI 文案未就绪；续跑仍走 API" }),
           });
@@ -1120,10 +1142,10 @@ const scenarios: Scenario[] = [
             : { detail: `stopReason=${JSON.stringify(row2.stopReason)} turn=${JSON.stringify(row2.conversationTurn)}` }),
         });
 
-        // mock 端点收到的第 2 轮首个请求（第 5 次 send：前四次 = 执行 2 + 核查 2）：
-        // 带第 1 轮正史 + 裁决摘要
+        // 真实宿主会在第 1 轮收尾后异步 refineRunTitle，多一次模型请求。
+        // 按追加指令找第 2 轮，不要写死 requests[4]。
         const requests = mock.requestLog;
-        const secondTurnReq = requests[4];
+        const secondTurnReq = requests.find((req) => JSON.stringify(req.body).includes("read note.txt back"));
         const flat = secondTurnReq ? JSON.stringify(secondTurnReq.body) : "";
         checks.push({
           name: "第 2 轮执行者请求带第 1 轮正史（note.txt 读回）",

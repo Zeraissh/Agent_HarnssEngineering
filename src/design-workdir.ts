@@ -34,8 +34,8 @@ export function isHarnessPackageName(name: string | null | undefined): boolean {
 }
 
 export function sameWorkdirPath(a: string, b: string): boolean {
-  const left = resolve(a);
-  const right = resolve(b);
+  const left = resolve(String(a).replace(/\\/g, "/"));
+  const right = resolve(String(b).replace(/\\/g, "/"));
   return process.platform === "win32"
     ? left.toLowerCase() === right.toLowerCase()
     : left === right;

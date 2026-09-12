@@ -26,7 +26,10 @@ export type ProjectStatus = {
 const SLUG_RE = /^[\w][\w.-]{0,63}$/;
 
 export function projectSlugFromWorkdir(workdir: string): string {
-  const base = path.basename(path.resolve(String(workdir ?? "").trim() || "."));
+  const trimmed = String(workdir ?? "").trim();
+  // 斜杠先归一：Linux 上 `path.basename("D:\\work\\alpha")` 会把整段当成文件名。
+  const unix = (trimmed || ".").replace(/\\/g, "/").replace(/\/+$/, "") || ".";
+  const base = path.posix.basename(unix);
   const slug = base.replace(/[^\w.-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 64);
   return SLUG_RE.test(slug) ? slug : "project";
 }

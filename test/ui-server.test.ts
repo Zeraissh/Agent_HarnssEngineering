@@ -1311,11 +1311,16 @@ describe("ui-server", () => {
 
     const types = buffer
       .split("\n\n")
-      .map((b) => b.split("\n").find((l) => l.startsWith("data:")))
-      .filter((l): l is string => Boolean(l))
-      .map((l) => JSON.parse(l.slice(5).trimStart()));
+      .map((block) => {
+        const lines = block.split("\n");
+        const eventName = (lines.find((l) => l.startsWith("event:")) ?? "event: message").slice(6).trim() || "message";
+        const data = lines.find((l) => l.startsWith("data:"));
+        if (!data || eventName !== "message") return null;
+        return JSON.parse(data.slice(5).trimStart()) as { event?: { type?: string } };
+      })
+      .filter((e): e is { event?: { type?: string } } => Boolean(e?.event));
 
-    const expired = types.find((e: any) => e.event.type === "approval_expired") as any;
+    const expired = types.find((e: any) => e.event?.type === "approval_expired") as any;
     expect(expired, "关停时挂起的审批必须被宣告过期").toBeDefined();
     expect(expired.event.toolUseId).toBe("tu_never");
     expect(expired.event.cause).toBe("run_finished");
@@ -6736,10 +6741,9 @@ describe("B2 · 运行历史落盘", () => {
     const r = ((await (await fetch(`${base}/api/runs`)).json()) as any[]).find((x) => x.runId === "crash-run");
     expect(r.status).toBe("done");
     expect(r.stopReason).toBe("error");
-    // 会话中心化：无检查点的归档不再是只读——可派生一次"无正史的新一轮"（fork），
-    // 但绝不冒充同 run 热恢复。旧断言 canContinue=false 有记录退役（2026-09-03）
+    // 无检查点崩溃档案：同 run 重开一轮（reopen），不冒充有检查点的热恢复。
     expect(r.canContinue).toBe(true);
-    expect(r.continuationMode).toBe("fork");
+    expect(r.continuationMode).toBe("reopen");
     expect(r.sameRunResume).toBe(false);
     // 事件流缺 run_end 时合成一条，否则重放出来的界面会永远"运行中"
     const events = (await readSSEAll(await fetch(`${base}/api/runs/crash-run/events`))) as any[];

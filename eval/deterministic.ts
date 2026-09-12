@@ -209,7 +209,7 @@ const scenarios: Scenario[] = [
     ],
     expect: {
       exitCode: 0,
-      includes: ["completed", "auto-approved: write_file"],
+      includes: ["completed", "auto-approved: approve write_file"],
       files: { "report.txt": "deterministic ok\n" },
       ledger: { stopReason: "completed", mode: "single", verify: false },
       requestCount: 2,
@@ -281,7 +281,7 @@ const scenarios: Scenario[] = [
     ],
     expect: {
       exitCode: 0,
-      includes: ["incomplete", "恢复决策"],
+      includes: ["incomplete", "空转"],
       excludes: ["■ completed"],
       ledger: { stopReason: "incomplete" },
       requestCount: 3,
@@ -617,7 +617,7 @@ const scenarios: Scenario[] = [
     ],
     expect: {
       exitCode: 0,
-      includes: ["completed", "auto-approved: edit_file"],
+      includes: ["completed", "auto-approved: approve edit_file"],
       files: { "hello.txt": "hi world\n" },
       ledger: { stopReason: "completed", mode: "single", verify: false },
       requestCount: 2,
@@ -658,7 +658,7 @@ const scenarios: Scenario[] = [
     ],
     expect: {
       exitCode: 0,
-      includes: ["completed", "not unique", "auto-approved: edit_file"],
+      includes: ["completed", "not unique", "auto-approved: approve edit_file"],
       files: { "notes.txt": "TODO: alpha\nDONE: beta\nTODO: gamma\n" },
       ledger: { stopReason: "completed", mode: "single", verify: false },
       requestCount: 3,
