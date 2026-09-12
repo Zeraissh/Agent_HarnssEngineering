@@ -34,6 +34,22 @@ export const RUN_PHASES = [
 
 export type RunPhase = (typeof RUN_PHASES)[number];
 
+export const PLAN_NODE_STATUSES = ["pending", "running", "passed", "failed", "skipped"] as const;
+export type DurablePlanNodeStatus = (typeof PLAN_NODE_STATUSES)[number];
+
+export interface DurablePlanNode {
+  id: string;
+  title: string;
+  pack?: string | null;
+  description: string;
+  acceptance: string[];
+  dependsOn: string[];
+  resources?: string[];
+  status: DurablePlanNodeStatus;
+  evidenceSummary?: string;
+  failureStrategy?: string;
+}
+
 export interface DurablePlanSnapshot {
   protocol: "freeform" | "structured" | "fixed";
   taskIds: string[];
@@ -41,6 +57,50 @@ export interface DurablePlanSnapshot {
   edges: Record<string, string[]>;
   approvedAt: number | null;
   rejectedAt: number | null;
+  /**
+   * AGENT-01 / RUN-01：逐节点状态（可选）。旧档案没有 = 只有图结构。
+   * 半截 DAG 续发射靠这份快照，不靠会话正史检查点。
+   */
+  nodes?: DurablePlanNode[];
+}
+
+/** 半截 DAG 同 run 续发射的只读事实——给 canSameRunResume 用。 */
+export interface PlanResumeFacts {
+  /** 计划存在且未被否决（未开门的崩溃走 closed，到不了这里） */
+  approved: boolean;
+  hasPassedNode: boolean;
+  hasFailedNode: boolean;
+  /** pending 或 running：图上还有活要干 */
+  hasRemainingNode: boolean;
+}
+
+export function planResumeFacts(plan: DurablePlanSnapshot | null | undefined): PlanResumeFacts | undefined {
+  if (!plan || plan.rejectedAt != null || plan.taskIds.length === 0) return undefined;
+  const nodes = plan.nodes ?? [];
+  return {
+    approved: true,
+    hasPassedNode: nodes.some((n) => n.status === "passed"),
+    hasFailedNode: nodes.some((n) => n.status === "failed"),
+    hasRemainingNode: nodes.some((n) => n.status === "pending" || n.status === "running"),
+  };
+}
+
+function cloneDurablePlan(plan: DurablePlanSnapshot): DurablePlanSnapshot {
+  return {
+    ...plan,
+    taskIds: [...plan.taskIds],
+    edges: Object.fromEntries(Object.entries(plan.edges).map(([k, v]) => [k, [...v]])),
+    ...(plan.nodes
+      ? {
+          nodes: plan.nodes.map((n) => ({
+            ...n,
+            acceptance: [...n.acceptance],
+            dependsOn: [...n.dependsOn],
+            ...(n.resources ? { resources: [...n.resources] } : {}),
+          })),
+        }
+      : {}),
+  };
 }
 
 /** SharedRunBudget 的可序列化快照（字段同 src/types，避免循环依赖）。 */
@@ -49,6 +109,33 @@ export interface DurableBudgetSnapshot {
   maxTokens?: number;
   usedTurns: number;
   usedTokens: number;
+}
+
+/** 无快照 = 无法证明耗尽（fail-open）。有上限且 used ≥ max 才拒。 */
+export function durableBudgetExhausted(budget: DurableBudgetSnapshot | null | undefined): boolean {
+  if (!budget) return false;
+  if (budget.maxTurns !== undefined && budget.usedTurns >= budget.maxTurns) return true;
+  if (budget.maxTokens !== undefined && budget.usedTokens >= budget.maxTokens) return true;
+  return false;
+}
+
+export function snapshotDurableBudget(budget: DurableBudgetSnapshot): DurableBudgetSnapshot {
+  return {
+    usedTurns: budget.usedTurns,
+    usedTokens: budget.usedTokens,
+    ...(budget.maxTurns !== undefined ? { maxTurns: budget.maxTurns } : {}),
+    ...(budget.maxTokens !== undefined ? { maxTokens: budget.maxTokens } : {}),
+  };
+}
+
+/** 把落盘账写回活的谱系对象（同一引用，spawn / loop 才能看见）。 */
+export function seedDurableBudget(target: DurableBudgetSnapshot, snap: DurableBudgetSnapshot): void {
+  target.usedTurns = snap.usedTurns;
+  target.usedTokens = snap.usedTokens;
+  if (snap.maxTurns !== undefined) target.maxTurns = snap.maxTurns;
+  else delete target.maxTurns;
+  if (snap.maxTokens !== undefined) target.maxTokens = snap.maxTokens;
+  else delete target.maxTokens;
 }
 
 /**
@@ -96,6 +183,17 @@ export interface DurableRunState {
    * 旧档案缺省 []。中断后保留——恢复时 seed 给 ToolExecutor 防重复 commit。
    */
   toolTx: DurableToolTx[];
+  /**
+   * 单执行者已提交的 main 检查点游标。正史在 transcript.jsonl，不进 state。
+   * 旧档案缺省 null = 没有检查点。
+   */
+  checkpoint: DurableExecutorCheckpoint | null;
+}
+
+/** transcript 段号 + compact 水位；预算走 state.budget。 */
+export interface DurableExecutorCheckpoint {
+  segmentIndex: number;
+  contextInputTokens: number;
 }
 
 export type RunStateEvent =
@@ -104,6 +202,8 @@ export type RunStateEvent =
   | { type: "plan_ready"; plan: DurablePlanSnapshot; gated: boolean }
   | { type: "plan_approved"; at: number }
   | { type: "plan_rejected"; at: number }
+  /** 子任务起止后刷节点状态；不改 phase。 */
+  | { type: "plan_progress"; nodes: DurablePlanNode[] }
   | { type: "segment_begin"; index: number; source: string }
   | { type: "verify_begin"; round: number }
   | { type: "rework_begin"; round: number }
@@ -112,6 +212,7 @@ export type RunStateEvent =
   | { type: "question_wait"; questionId: string }
   | { type: "question_resolved"; questionId: string }
   | { type: "budget_snapshot"; budget: DurableBudgetSnapshot }
+  | { type: "executor_checkpoint"; checkpoint: DurableExecutorCheckpoint }
   | { type: "grant_audit"; entry: DurableGrantAuditEntry }
   | { type: "resume"; at: number }
   /**
@@ -145,6 +246,7 @@ export function initialRunState(runId: string, at = Date.now()): DurableRunState
     grantAudit: [],
     lastSameRunResumeAt: null,
     toolTx: [],
+    checkpoint: null,
   };
 }
 
@@ -161,7 +263,8 @@ export function transitionRunState(
     grantAudit: [...state.grantAudit],
     toolTx: state.toolTx.map((t) => ({ ...t })),
     budget: state.budget ? { ...state.budget } : null,
-    plan: state.plan ? { ...state.plan, edges: { ...state.plan.edges } } : null,
+    checkpoint: state.checkpoint ? { ...state.checkpoint } : null,
+    plan: state.plan ? cloneDurablePlan(state.plan) : null,
     updatedAt: at,
   };
 
@@ -188,6 +291,11 @@ export function transitionRunState(
       if (state.phase !== "plan_gated" || !next.plan) return null;
       next.plan = { ...next.plan, rejectedAt: event.at };
       next.phase = "closed";
+      return next;
+    case "plan_progress":
+      if (!next.plan) return null;
+      if (["completed", "failed", "closed"].includes(state.phase)) return null;
+      next.plan = { ...next.plan, nodes: event.nodes.map((n) => ({ ...n })) };
       return next;
     case "segment_begin":
       if (!["executing", "reworking", "verifying"].includes(state.phase)) return null;
@@ -238,6 +346,10 @@ export function transitionRunState(
     case "budget_snapshot":
       if (["completed", "failed", "closed"].includes(state.phase)) return null;
       next.budget = { ...event.budget };
+      return next;
+    case "executor_checkpoint":
+      if (["completed", "failed", "closed"].includes(state.phase)) return null;
+      next.checkpoint = { ...event.checkpoint };
       return next;
     case "grant_audit": {
       if (["completed", "failed", "closed"].includes(state.phase)) return null;
@@ -302,18 +414,25 @@ export function transitionRunState(
 }
 
 /** 崩溃恢复策略（ADR 表）：只读决策，不执行 I/O。 */
-export function recoveryActionForPhase(
-  phase: RunPhase,
-): "readonly" | "close_archive" | "expire_waits_and_fork" | "fork_from_checkpoint" {
+export type RecoveryAction =
+  | "readonly"
+  | "close_archive"
+  | "expire_waits_and_fork"
+  | "fork_from_checkpoint"
+  | "restore_gate";
+
+export function recoveryActionForPhase(phase: RunPhase): RecoveryAction {
   switch (phase) {
     case "completed":
     case "failed":
     case "closed":
     case "interrupted":
       return "readonly";
+    case "plan_gated":
+      // 计划已落盘、子任务还没发射：崩溃后回到门上，不把对话封成 closed。
+      return "restore_gate";
     case "created":
     case "planning":
-    case "plan_gated":
       return "close_archive";
     case "awaiting_approval":
     case "awaiting_question":
@@ -326,9 +445,10 @@ export function recoveryActionForPhase(
 /**
  * Phase 2 同 run 热恢复准入（ADR：checkpoint 段边界；SAFE-06 不改此门）。
  *
- * 仍只在 interrupted + 已提交 main checkpoint 时放行。
- * toolTx 让「同 key 再入不重复 commit」可证，但**不**把 mid-tool 未完成轮
- * 自动重放成续跑入口——那仍是残余（见 ADR-003 附录）。
+ * 单执行者：interrupted + 已提交 main checkpoint；verify/预算耗尽仍拒。
+ * 编排：不靠会话正史检查点（sN/main 不属于对话谱系），靠 durable plan 节点——
+ * 至少一枚 passed、没有 failed、还有 pending/running。
+ * 计划门未批的崩溃走 canRestorePlanGate，不走本函数。
  * Active grant 永不因本函数为 true 而复活。
  */
 export function canSameRunResume(input: {
@@ -337,13 +457,52 @@ export function canSameRunResume(input: {
   verify: boolean;
   mode: "single" | "plan";
   budgetExhausted: boolean;
+  plan?: PlanResumeFacts;
 }): boolean {
   if (input.phase !== "interrupted") return false;
+  if (input.budgetExhausted) return false;
+  if (input.mode === "plan") {
+    const p = input.plan;
+    if (!p?.approved) return false;
+    if (!p.hasPassedNode) return false;
+    if (p.hasFailedNode) return false;
+    if (!p.hasRemainingNode) return false;
+    return true;
+  }
   if (!input.hasCheckpoint) return false;
   if (input.verify) return false;
-  if (input.mode === "plan") return false;
-  if (input.budgetExhausted) return false;
   return true;
+}
+
+/**
+ * 崩溃停在计划确认门：计划已落盘、一个子任务都还没发射。
+ * 同 run 回到门上是零副作用的（没有工具可重放）。
+ */
+export function canRestorePlanGate(input: {
+  phase: RunPhase;
+  plan?: DurablePlanSnapshot | null;
+  budgetExhausted?: boolean;
+}): boolean {
+  if (input.budgetExhausted) return false;
+  if (input.phase !== "plan_gated") return false;
+  const plan = input.plan;
+  if (!plan || plan.taskIds.length === 0) return false;
+  if (plan.rejectedAt != null) return false;
+  if (plan.approvedAt != null) return false;
+  return true;
+}
+
+/**
+ * 不能热续（无检查点 / 零进度 DAG）时，仍可用任务正文在同 run 重开一轮。
+ * 不假装有检查点，也不自动重放飞行中的工具。
+ */
+export function canReopenSameRun(input: {
+  phase: RunPhase;
+  hasTask: boolean;
+  budgetExhausted?: boolean;
+}): boolean {
+  if (!input.hasTask || input.budgetExhausted) return false;
+  return ["interrupted", "failed", "completed", "closed"].includes(input.phase);
 }
 
 /** 供 history 解析复用：坏条目整表拒（与 grantAudit 同纪律）。 */

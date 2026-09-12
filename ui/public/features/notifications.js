@@ -95,6 +95,41 @@ export function classifyRunEndForNotify(stopReason) {
   }
 }
 
+function isChildAgentSource(source) {
+  const s = String(source ?? "");
+  if (s.startsWith("spawn/")) return true;
+  const slash = s.indexOf("/");
+  if (slash <= 0) return false;
+  const head = s.slice(0, slash);
+  return head !== "main" && head !== "rework" && head !== "verifier"
+    && head !== "planner" && head !== "host" && head !== "model";
+}
+
+/**
+ * 同一会话同一类待决叠成一条：并行子任务各要一次 bash 时，
+ * 「待你决定」不该出现五张长得一样的卡。
+ */
+export function collapseDecisionItems(items) {
+  const groups = new Map();
+  for (const item of items ?? []) {
+    if (!item || item.category !== "decision") continue;
+    const key = `${item.runId}:${item.kind}`;
+    const prev = groups.get(key);
+    if (!prev) {
+      groups.set(key, { ...item, count: 1 });
+      continue;
+    }
+    prev.count += 1;
+    if (!item.read) prev.read = false;
+    if (Number(item.at) > Number(prev.at)) {
+      prev.at = item.at;
+      prev.detail = item.detail;
+      prev.id = item.id;
+    }
+  }
+  return [...groups.values()];
+}
+
 /**
  * 把一条 SSE 事件折叠进通知存储。纯函数：返回新 store 与本次新增的条目
  * （DOM 层据此决定要不要发系统通知）。
@@ -138,8 +173,15 @@ export function applyRunEventToStore(store, input) {
 
   switch (type) {
     case "approval_request": {
-      // verifier 的审批由 harness 内部自答，不进「待你决定」（同 applyApproval 的 F2 口径）
-      if (source === "verifier") break;
+      // planner/verifier 在 drain 里自答，不进「待你决定」（同 applyApproval）
+      if (
+        source === "verifier" || source === "planner"
+        || (typeof source === "string" && (source.endsWith("/verifier") || source.endsWith("/planner")))
+      ) break;
+      // 子代理审批挂在「子代理工作中」卡上，不在这里摊成 N 张假待决。
+      if (isChildAgentSource(source)) break;
+      // 自动放行 / 同批已决：不是待你决定。再记一条会让通知中心堆出几十张假待决。
+      if (event.autoResolved === true) break;
       const toolUseId = String(event.toolUseId ?? "");
       const name = String(event.name ?? "工具");
       pushPending({
@@ -312,7 +354,7 @@ export function removeRunFromStore(store, runId) {
  * @returns {number}
  */
 export function decisionUnreadCount(store) {
-  return store.items.filter((i) => i.category === "decision" && !i.read).length;
+  return collapseDecisionItems(store.items.filter((i) => !i.read)).length;
 }
 
 /**
@@ -322,7 +364,7 @@ export function decisionUnreadCount(store) {
  */
 export function groupStoreItems(store) {
   const byAtDesc = (a, b) => b.at - a.at;
-  const decision = store.items.filter((i) => i.category === "decision").sort(byAtDesc);
+  const decision = collapseDecisionItems(store.items).sort(byAtDesc);
   const finished = store.items.filter((i) => i.category === "finished").sort(byAtDesc);
   const attention = store.items.filter((i) => i.category === "attention").sort(byAtDesc);
   const unread = (list) => list.filter((i) => !i.read).length;
@@ -657,7 +699,7 @@ export function initNotifications(host = {}, env = {}) {
         line1.className = "notif-item-line1";
         const label = doc.createElement("span");
         label.className = "notif-item-label";
-        label.textContent = item.label;
+        label.textContent = item.count > 1 ? `${item.label} · ${item.count} 项` : item.label;
         line1.appendChild(label);
         const conv = doc.createElement("span");
         conv.className = "notif-item-conv";

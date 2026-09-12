@@ -98,6 +98,35 @@ describe("OBS-01 trace core", () => {
     expect(done[0]!.status).toBe("ok");
   });
 
+  it("projects model_call_start/end into a paired model_send span", () => {
+    const openModels = new Map<string, TraceSpan>();
+    const openTools = new Map<string, TraceSpan>();
+    const start = projectTurnEventToSpans({
+      runId: "r1",
+      source: "main",
+      parentSpanId: "root",
+      openTools,
+      openModels,
+      event: { type: "model_call_start", turn: 1, attempt: 0 },
+    });
+    expect(start).toHaveLength(1);
+    expect(start[0]).toMatchObject({ kind: "model", name: "model_send", status: "running" });
+    expect(openModels.size).toBe(1);
+
+    const end = projectTurnEventToSpans({
+      runId: "r1",
+      source: "main",
+      parentSpanId: "root",
+      openTools,
+      openModels,
+      event: { type: "model_call_end", turn: 1, attempt: 0, status: "error", durationMs: 12 },
+    });
+    expect(end).toHaveLength(1);
+    expect(end[0]!.spanId).toBe(start[0]!.spanId);
+    expect(end[0]).toMatchObject({ status: "error", attrs: { durationMs: 12 } });
+    expect(openModels.size).toBe(0);
+  });
+
   it("exportRedactedTrace + playbackSummary round-trip", () => {
     const span = endSpan(
       startSpan({ kind: "run", name: "run", runId: "r", attrs: { token: "secret-value" } }),

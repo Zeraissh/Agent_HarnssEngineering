@@ -38,6 +38,7 @@ import {
   runOutcomeForStopReason,
   canonicalizeApprovalInput,
   approvalInputHash,
+  annotateApprovalReplay,
   type UiServerHandle,
 } from "../ui/server.js";
 import { resolvePlannerMaxTurns } from "../src/planner.js";
@@ -55,7 +56,9 @@ import { REQUIREMENTS_TOOL_NAME } from "../src/clarifier.js";
 import { FINISH_TASK_TOOL_NAME } from "../src/task-completion.js";
 import { DEFAULT_VERIFIER_READ_ONLY_COMMANDS, VERDICT_TOOL_NAME } from "../src/verifier.js";
 import { PACKS } from "../src/presets.js";
+import { readPptxOutline } from "../src/deck-pptx.js";
 import { bashTool } from "../src/tools/bash.js";
+import { writeFileTool } from "../src/tools/write-file.js";
 import { DEFAULT_HISTORY_KEEP, historyKeepCount, historyRootPath } from "../ui/history.js";
 import { startMockProvider } from "../eval/mock-provider.js";
 import {
@@ -185,23 +188,28 @@ async function waitForEvent(
   base: string,
   runId: string,
   predicate: (e: Record<string, unknown>) => boolean,
-  timeoutMs = 4000,
+  timeoutMs = 8000,
 ): Promise<Record<string, unknown> | undefined> {
   const res = await fetch(`${base}/api/runs/${runId}/events`);
-  const reader = res.body!.getReader();
+  if (!res.ok || !res.body) return undefined;
+  const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
   const deadline = Date.now() + timeoutMs;
 
   try {
+    // 只保留一次在飞的 reader.read()。用 100ms 空读跟它竞态，后到的真数据
+    // 会被废弃的挂起读吞掉——归档派生在 run_config 前有一段 git 探测空窗，
+    // 审批帧正好落在这个缝里。
     while (Date.now() < deadline) {
-      const chunk = await Promise.race([
-        reader.read(),
-        new Promise<{ value: undefined; done: false }>((r) =>
-          setTimeout(() => r({ value: undefined, done: false }), 100),
-        ),
+      const remaining = Math.max(1, deadline - Date.now());
+      const raced = await Promise.race([
+        reader.read().then((chunk) => ({ kind: "read" as const, chunk })),
+        new Promise<{ kind: "timeout" }>((r) => setTimeout(() => r({ kind: "timeout" }), remaining)),
       ]);
-      if (chunk.value) buffer += decoder.decode(chunk.value, { stream: true });
+      if (raced.kind === "timeout") break;
+      const { done, value } = raced.chunk;
+      if (value) buffer += decoder.decode(value, { stream: true });
 
       let idx: number;
       while ((idx = buffer.indexOf("\n\n")) !== -1) {
@@ -217,7 +225,7 @@ async function waitForEvent(
         const ev = JSON.parse(dataLines.join("\n"));
         if (predicate(ev)) return ev;
       }
-      if (chunk.done) break;
+      if (done) break;
     }
   } finally {
     await reader.cancel().catch(() => {});
@@ -343,6 +351,26 @@ function askTool(name: string): Tool {
 // ------------------------------------------------------
 // Tests
 // ------------------------------------------------------
+
+describe("annotateApprovalReplay", () => {
+  it("已决审批在重放的 request 帧上就带 autoResolved，不改原缓冲", () => {
+    const events = [
+      { seq: 1, source: "main", ts: 1, event: { type: "approval_request", toolUseId: "tu", name: "bash" } },
+      { seq: 2, source: "host", ts: 2, event: { type: "approval_resolved", toolUseId: "tu", requestSeq: 1, decision: "allow", actor: "auto-run" } },
+    ];
+    const out = annotateApprovalReplay(events);
+    expect(out[0].event.autoResolved).toBe(true);
+    expect(out[0].event.decision).toBe("allow");
+    expect(events[0].event.autoResolved).toBeUndefined();
+  });
+
+  it("还没人决定的 request 保持原样", () => {
+    const events = [
+      { seq: 1, source: "main", ts: 1, event: { type: "approval_request", toolUseId: "tu", name: "bash" } },
+    ];
+    expect(annotateApprovalReplay(events)[0].event.autoResolved).toBeUndefined();
+  });
+});
 
 describe("ui-server", () => {
   let handle: UiServerHandle | undefined;
@@ -1351,6 +1379,12 @@ describe("ui-server", () => {
     );
     expect(resumed.length).toBe(all.length - 2);
     expect((resumed[0] as any).seq).toBe(cut + 1);
+
+    const frames = await readSSEFrames(await fetch(`${base}/api/runs/${runId}/events`));
+    const replayDone = frames.filter((f) => f.event === "replay_done");
+    expect(replayDone).toHaveLength(1);
+    expect(frames.findIndex((f) => f.event === "replay_done"))
+      .toBeGreaterThan(frames.findIndex((f) => f.event === "message"));
   });
 
   // ---- V-03 审批引用二义解析 ----
@@ -1537,6 +1571,17 @@ describe("ui-server", () => {
     expect(Array.isArray(snap.tools)).toBe(true);
     expect(snap.tools.every((t: any) => t.name && t.permission)).toBe(true);
     expect(snap.shell).toBeTruthy();
+    expect(Object.keys(snap.latency ?? {}).sort()).toEqual(["modelCall", "modelTtft", "wait"]);
+    expect(Object.keys(snap.latency.wait).sort()).toEqual([
+      "approval",
+      "plan_gate",
+      "question",
+      "resource",
+    ]);
+    for (const q of [snap.latency.modelCall, snap.latency.modelTtft, ...Object.values(snap.latency.wait)]) {
+      if (q === null) continue;
+      expect(Object.keys(q as object).sort()).toEqual(["p50", "p95", "p99"]);
+    }
     // MCP 默认关（常驻宿主持有独占资源有风险），且如实说明原因
     expect(snap.mcp.enabled).toBe(false);
     expect(snap.mcp.reason).toContain("AGENT_UI_MCP");
@@ -1544,6 +1589,23 @@ describe("ui-server", () => {
     const asText = JSON.stringify(snap);
     expect(asText).not.toContain("apiKey");
     expect(asText).not.toContain("sk-");
+  });
+
+  it("v2-8d. /api/harness latency：无样本是 null，不是 0", async () => {
+    resetObservabilityMetrics();
+    handle = createUiServer({
+      modelClient: new FakeModelClient([]),
+      packName: "python-coding",
+      workdir: process.cwd(),
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+    const snap = (await (await fetch(`${base}/api/harness`)).json()) as any;
+    expect(snap.latency).toEqual({
+      modelCall: null,
+      modelTtft: null,
+      wait: { approval: null, question: null, plan_gate: null, resource: null },
+    });
   });
 
   /**
@@ -1773,8 +1835,10 @@ describe("ui-server", () => {
       "memory_write",
     ]);
     expect(memoryTools.every((t: { origin: string }) => t.origin === "memory")).toBe(true);
+    const statusTool = snap.tools.find((t: { name: string }) => t.name === "project_status");
+    expect(statusTool?.origin).toBe("memory");
     expect(snap.memory.enabled).toBe(true);
-    expect(snap.memory.toolCount).toBe(4);
+    expect(snap.memory.toolCount).toBe(5);
   });
 
   // ---- V-07 / V-08 成本口径与逐轮裁决 ----
@@ -1855,6 +1919,7 @@ describe("ui-server", () => {
     expect(list[0].stopReason).toBe("completed");
     expect(list[0]).toHaveProperty("verdict");
     expect(list[0]).toHaveProperty("pendingApprovals");
+    expect(list[0].host).toBe("web");
   });
 
   it("DELETE /api/runs/:id 删掉已完成的对话，运行中拒绝", async () => {
@@ -2061,6 +2126,7 @@ describe("ui-server", () => {
     expect(snap.availablePacks.length).toBeGreaterThan(0);
     for (const p of snap.availablePacks) {
       expect(typeof p.name).toBe("string");
+      expect(p.source).toBe("builtin");
       // 只给名字与描述，不泄露 systemPrompt
       expect(p).not.toHaveProperty("systemPrompt");
     }
@@ -2598,6 +2664,67 @@ describe("ui-server", () => {
     }
   });
 
+  it("GitHub MCP 无 token 时跳过：快照照实说 skipped，不把整份 MCP 标成失败", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "mcp-github-skip-"));
+    const mcpFile = join(dir, "mcp.json");
+    await writeFile(
+      mcpFile,
+      JSON.stringify({
+        servers: {
+          github: {
+            command: "docker",
+            args: ["run", "should-not-spawn"],
+            env: { GITHUB_PERSONAL_ACCESS_TOKEN: "${GITHUB_PERSONAL_ACCESS_TOKEN}" },
+            requiredEnv: ["GITHUB_PERSONAL_ACCESS_TOKEN"],
+            includeTools: ["get_file_contents", "create_pull_request"],
+          },
+        },
+      }),
+    );
+    const prior = {
+      AGENT_UI_MCP: process.env.AGENT_UI_MCP,
+      AGENT_MCP_CONFIG: process.env.AGENT_MCP_CONFIG,
+      GITHUB_PERSONAL_ACCESS_TOKEN: process.env.GITHUB_PERSONAL_ACCESS_TOKEN,
+      GITHUB_TOKEN: process.env.GITHUB_TOKEN,
+      AGENT_GITHUB_TOKEN: process.env.AGENT_GITHUB_TOKEN,
+    };
+    process.env.AGENT_UI_MCP = "1";
+    process.env.AGENT_MCP_CONFIG = mcpFile;
+    delete process.env.GITHUB_PERSONAL_ACCESS_TOKEN;
+    delete process.env.GITHUB_TOKEN;
+    delete process.env.AGENT_GITHUB_TOKEN;
+    try {
+      handle = createUiServer({
+        modelClient: new FakeModelClient([fakeMessage([textBlock("done")], "end_turn")]),
+        tools: [autoTool("noop")],
+        workdir: dir,
+        mcpConfigFile: mcpFile,
+      });
+      port = await startServer(handle);
+      base = baseUrl(port);
+
+      const { runId } = await (await fetch(`${base}/api/runs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task: "看看 GitHub 工具在不在", pack: "ts-coding" }),
+      })).json() as { runId: string };
+      await waitForDone(base, runId);
+
+      const after = await (await fetch(`${base}/api/harness`)).json() as any;
+      expect(after.mcp.error).toBeUndefined();
+      expect(after.mcp.connected).toBe(false);
+      expect(after.mcp.servers).toEqual([
+        { name: "github", status: "skipped", reason: "missing GITHUB_PERSONAL_ACCESS_TOKEN" },
+      ]);
+    } finally {
+      for (const [key, value] of Object.entries(prior)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("v2-34. 宿主关停时计划门被宣告过期（挂着不解除，编排协程会永远吊在 onPlan）", async () => {
     const runId = await startGatedRun();
     await waitForPlanGate(runId);
@@ -2685,6 +2812,83 @@ describe("ui-server", () => {
 
     const t = await (await fetch(`${base}/api/runs/${runId}/transcript`)).json() as any;
     expect(t.segments.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("同对话切换执行模型：正史仍送进新模型，并剥掉上一家长的思考签名", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "switch-exec-"));
+    const storeFile = join(dir, ".agent-models.json");
+    const model = new FakeModelClient([
+      fakeMessage(
+        [
+          {
+            type: "thinking",
+            thinking: "I will remember SECRET-THOUGHT",
+            signature: "sig-from-model-a",
+          } as any,
+          textBlock("第一轮：我记住了暗号 alpha-7"),
+        ],
+        "end_turn",
+      ),
+      fakeMessage([textBlock("第二轮：暗号仍是 alpha-7")], "end_turn"),
+    ]);
+    handle = createUiServer({
+      modelClient: model,
+      tools: [autoTool("noop")],
+      workdir: process.cwd(),
+      modelStoreFile: storeFile,
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+
+    const put = await fetch(`${base}/api/models`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        models: [
+          { id: "m-fast", label: "快", provider: "openai", model: "deepseek-v4-flash", baseUrl: "https://api.deepseek.com", apiKey: "sk-fast" },
+          { id: "m-strong", label: "强", provider: "anthropic", model: "claude-opus-4-8", baseUrl: "" },
+        ],
+        roles: { executor: "m-fast", planner: null, verifier: null, vision: null, image: null },
+      }),
+    });
+    expect(put.status).toBe(200);
+
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "记住暗号 alpha-7", verify: false }),
+    })).json() as { runId: string };
+    await waitForDone(base, runId);
+
+    const switched = await fetch(`${base}/api/models/roles`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ executor: "m-strong" }),
+    });
+    expect(switched.status).toBe(200);
+
+    const follow = await fetch(`${base}/api/runs/${runId}/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "请用刚换的模型继续，暗号是什么？" }),
+    });
+    expect(follow.status).toBe(200);
+    await waitForDone(base, runId);
+
+    const second = model.requests.at(-1)!;
+    const flat = JSON.stringify(second.messages);
+    expect(flat, "换模型后第二轮必须带着第一轮正史").toContain("alpha-7");
+    expect(flat, "换模型后仍要听见本轮追问").toContain("暗号是什么");
+    expect(flat, "必须声明这是同一场对话").toContain("执行模型已切换");
+    expect(flat, "上一家长的思考签名不得原样转给新模型").not.toContain("sig-from-model-a");
+    expect(flat, "思考正文也不该冒充正史").not.toContain("SECRET-THOUGHT");
+
+    const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`)) as any[];
+    const um = events.find((e) => e.event.type === "user_message");
+    expect(um?.event.continues).toBe("history");
+    expect(um?.event.executorSwitched).toBe(true);
+
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
   });
 
   /**
@@ -2897,6 +3101,30 @@ describe("ui-server", () => {
     expect(model.calls).toBe(2);
   });
 
+  it("停止必须马上收尾：模型无视 AbortSignal 时也不能卡在「正在停止」", async () => {
+    class DeafClient extends FakeModelClient {
+      override async send() {
+        return new Promise<never>(() => {
+          /* 永不结束、也不听 signal——兼容端点真机形态 */
+        });
+      }
+    }
+    const model = new DeafClient([]);
+    handle = createUiServer({ modelClient: model, tools: [autoTool("noop")], workdir: process.cwd() });
+    port = await startServer(handle);
+    base = baseUrl(port);
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "停得掉", verify: false }),
+    })).json() as { runId: string };
+    await new Promise((r) => setTimeout(r, 80));
+    const t0 = Date.now();
+    expect((await fetch(`${base}/api/runs/${runId}/stop`, { method: "POST" })).status).toBe(200);
+    await waitForDone(base, runId);
+    expect(Date.now() - t0).toBeLessThan(4000);
+    expect(((await (await fetch(`${base}/api/runs`)).json() as any[]).find((r) => r.runId === runId)).stopReason).toBe("aborted");
+  });
+
   /**
    * 真机现场（2026-09-03，deepseek-v4-flash）：一轮里 5 个串行 write_file，人在第一张
    * 审批卡上按停止。宿主 deny 掉挂起的那一个，可执行器照样把第二个块送到审批门，
@@ -3049,6 +3277,184 @@ describe("ui-server", () => {
     const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
     const rc = events.find((e: any) => e.event.type === "run_config") as any;
     expect(rc.event.workdir).toBe(resolve(sub));
+  });
+
+  it("AGENT.md 进 run_config：报实际文件 + guidance；测试宿主不读用户层", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ui-agent-md-"));
+    await writeFile(join(dir, "AGENT.md"), "PROJECT_UI_MARK prefer tests");
+    handle = createUiServer({
+      modelClient: new FakeModelClient([fakeMessage([textBlock("ok")], "end_turn")]),
+      tools: [autoTool("noop")],
+      workdir: dir,
+      workdirs: [dir],
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+    const snap = await (await fetch(`${base}/api/harness`)).json() as any;
+    expect(snap.agentMd.maxChars).toBeGreaterThanOrEqual(1000);
+    expect(snap.agentMd.layers).toContain("project");
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "t", workdir: dir }),
+    })).json() as { runId: string };
+    await waitForDone(base, runId);
+    const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+    const rc = events.find((e: any) => e.event.type === "run_config") as any;
+    expect(rc.event.agentMd.guidance).toBe(true);
+    expect(rc.event.agentMd.files.some((f: { layer: string }) => f.layer === "project")).toBe(true);
+    expect(rc.event.agentMd.files.every((f: { layer: string }) => f.layer !== "user")).toBe(true);
+  });
+
+  it("D3+A1：追问改编排后 permission.mode 跟开关；tools 是本 run 下发名单", async () => {
+    handle = createUiServer({
+      modelClient: new FakeModelClient([
+        fakeMessage([textBlock("先做完这一轮")], "end_turn"),
+        fakeMessage([textBlock(["```json", JSON.stringify({
+          subtasks: [{ id: "s1", title: "一步", description: "做", acceptance: ["ok"], dependsOn: [] }],
+        }), "```"].join("\n"))], "end_turn"),
+        fakeMessage([textBlock("编排完成")], "end_turn"),
+      ]),
+      tools: [autoTool("lab_only_tool")],
+      workdir: process.cwd(),
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+
+    const created = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        task: "先普通做",
+        permissionMode: "auto",
+        askUser: true,
+        lineageBudget: false,
+        dailyBudget: false,
+      }),
+    });
+    expect(created.status).toBe(200);
+    const { runId } = await created.json() as { runId: string };
+    await waitForDone(base, runId);
+    const firstEvents = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+    const firstCfg = firstEvents.find((e: any) => e.event.type === "run_config") as any;
+    expect(firstCfg.event.permission).toMatchObject({
+      mode: "auto",
+      approvalDefault: "auto",
+      planMode: false,
+      planGate: false,
+      autoYes: true,
+    });
+    const names = (firstCfg.event.tools as { name: string }[]).map((t) => t.name);
+    expect(names).toContain("lab_only_tool");
+    expect(names).toContain("ask_user");
+
+    const follow = await fetch(`${base}/api/runs/${runId}/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "这轮拆开并行", multiAgent: true }),
+    });
+    expect(follow.status).toBe(200);
+    await waitForDone(base, runId);
+    const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+    const configs = events.filter((e: any) => e.event.type === "run_config");
+    expect(configs.length).toBeGreaterThanOrEqual(2);
+    const second = (configs[configs.length - 1] as any).event.permission;
+    expect(second.planMode).toBe(true);
+    expect(second.autoYes).toBe(true);
+    expect(second.mode).toBeNull();
+  });
+
+  it("v2-26. extraWorkdirs 必须在白名单，生效值进 run_config.readRoots", async () => {
+    const extra = await mkdtemp(join(tmpdir(), "ui-extra-wd-"));
+    handle = createUiServer({
+      modelClient: new FakeModelClient([fakeMessage([textBlock("ok")], "end_turn")]),
+      tools: [autoTool("noop")],
+      workdir: process.cwd(),
+      workdirs: [extra],
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+    const post = (body: unknown) =>
+      fetch(`${base}/api/runs`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+      });
+
+    const outside = await post({ task: "t", extraWorkdirs: [join(tmpdir(), "not-allowed")] });
+    expect(outside.status).toBe(400);
+    expect((await outside.json() as { error: string }).error).toContain("白名单");
+
+    const ok = await post({ task: "t", extraWorkdirs: [extra] });
+    expect(ok.status).toBe(200);
+    const { runId } = await ok.json() as { runId: string };
+    await waitForDone(base, runId);
+    const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+    const rc = events.find((e: any) => e.event.type === "run_config") as any;
+    expect(rc.event.extraWorkdirs).toEqual([resolve(extra)]);
+    expect(rc.event.readRoots).toContain(resolve(extra));
+    expect(rc.event.writeRoots).toContain(resolve(extra));
+    await rm(extra, { recursive: true, force: true });
+  });
+
+  it("白名单目录默认可写，不必勾 extraWorkdirs", async () => {
+    const extra = await mkdtemp(join(tmpdir(), "ui-write-allow-"));
+    handle = createUiServer({
+      modelClient: new FakeModelClient([
+        fakeMessage([toolUseBlock("w1", "write_file", {
+          path: join(extra, "note.txt"),
+          content: "across-root",
+        })], "tool_use"),
+        fakeMessage([textBlock("ok")], "end_turn"),
+      ]),
+      tools: [{ ...writeFileTool, permission: "auto" }],
+      workdir: process.cwd(),
+      workdirs: [extra],
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+    const created = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "写到白名单另一目录", autoApprove: true }),
+    });
+    expect(created.status).toBe(200);
+    const { runId } = await created.json() as { runId: string };
+    await waitForDone(base, runId);
+    expect(await readFile(join(extra, "note.txt"), "utf8")).toBe("across-root");
+    const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+    const rc = events.find((e: any) => e.event.type === "run_config") as any;
+    expect(rc.event.writeRoots).toContain(resolve(extra));
+    await rm(extra, { recursive: true, force: true });
+  });
+
+  it("permissionMode=plan 加上显式 autoApprove 仍自动放行，不进挂起表", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("t1", "danger", { command: "echo hi" })], "tool_use"),
+      fakeMessage([textBlock("done")], "end_turn"),
+    ]);
+    handle = createUiServer({ modelClient: model, tools: [askTool("danger")], workdir: process.cwd() });
+    base = baseUrl(await startServer(handle));
+    const created = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        task: "档名是 plan，勾选仍要自动放行",
+        permissionMode: "plan",
+        autoApprove: true,
+        mode: "single",
+        planGate: false,
+        lineageBudget: false,
+        dailyBudget: false,
+      }),
+    });
+    expect(created.status).toBe(200);
+    const { runId } = await created.json() as { runId: string };
+    await waitForDone(base, runId);
+    const evs = await readSSESnapshot(base, runId) as any[];
+    const req = evs.find((e: any) => e.event.type === "approval_request");
+    expect(req.event.autoResolved).toBe(true);
+    expect(evs.filter((e: any) => e.event.type === "approval_resolved")).toHaveLength(1);
+    const createdRow = (await (await fetch(`${base}/api/runs`)).json()).find((x: any) => x.runId === runId);
+    expect(createdRow.autoApprove).toBe(true);
+    expect(createdRow.pendingApprovals).toBe(0);
   });
 
   it("SAFE-05. Web 为 run 固定独立 broker，并把真实 boundary 写进 run_config", async () => {
@@ -4335,6 +4741,38 @@ describe("产物取件：圈禁比功能更要紧", () => {
     expect(byInput.get("../outside.txt")).toEqual({ input: "../outside.txt", exists: false });
   });
 
+  it("裸文件名在工作目录里唯一时，探测会落到真实相对路径", async () => {
+    await mkdir(join(dir, "nested", "polish"), { recursive: true });
+    await writeFile(join(dir, "nested", "polish", "ringfix.css"), "/* ok */", "utf8");
+    const res = await fetch(`${base}/api/runs/${runId}/paths/inspect`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ paths: ["ringfix.css"] }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.paths[0]).toMatchObject({
+      input: "ringfix.css",
+      exists: true,
+      path: "nested/polish/ringfix.css",
+      kind: "file",
+    });
+  });
+
+  it("同名文件超过一处时不猜，探测失败而不是随便挑一个", async () => {
+    await mkdir(join(dir, "a"), { recursive: true });
+    await mkdir(join(dir, "b"), { recursive: true });
+    await writeFile(join(dir, "a", "twin.txt"), "1", "utf8");
+    await writeFile(join(dir, "b", "twin.txt"), "2", "utf8");
+    const res = await fetch(`${base}/api/runs/${runId}/paths/inspect`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ paths: ["twin.txt"] }),
+    });
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as any).paths[0]).toEqual({ input: "twin.txt", exists: false });
+  });
+
   it("正文路径探测有批量上限，不能把接口变成目录扫描器", async () => {
     const res = await fetch(`${base}/api/runs/${runId}/paths/inspect`, {
       method: "POST",
@@ -4475,6 +4913,307 @@ describe("整站预览：相对资源可解析，但仍无同源身份", () => {
 
   it("未知 run 404", async () => {
     expect((await fetch(`${base}/api/runs/nope/site/demos/liquid/index.html`)).status).toBe(404);
+  });
+});
+
+describe("design 模板 API：列表 / 拷贝 / DESIGN.md", () => {
+  let handle: Awaited<ReturnType<typeof createUiServer>>;
+  let base: string;
+  let dir: string;
+  let runId: string;
+  const templatesDir = join(dirname(fileURLToPath(import.meta.url)), "..", "templates", "design");
+
+  beforeAll(async () => {
+    dir = await mkdtemp(join(tmpdir(), "design-seed-"));
+    handle = createUiServer({
+      modelClient: new FakeModelClient([fakeMessage([textBlock("done")], "end_turn")]),
+      workdir: dir,
+      designTemplatesDir: templatesDir,
+    });
+    const port = await startServer(handle);
+    base = baseUrl(port);
+    const res = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "seed", pack: "design" }),
+    });
+    runId = (await res.json()).runId;
+  }, 30_000);
+
+  afterAll(async () => {
+    await handle.close();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("列出 deck-basic / landing-basic", async () => {
+    const res = await fetch(`${base}/api/design-templates`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.templates.map((t: { id: string }) => t.id)).toEqual(
+      expect.arrayContaining(["deck-basic", "landing-basic"]),
+    );
+  });
+
+  it("seed-template 拷进 workdir，默认不写 DESIGN.md", async () => {
+    const res = await fetch(`${base}/api/runs/${runId}/seed-template`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ template: "landing-basic", dest: "landing" }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.entry).toBe("landing/index.html");
+    expect(body.designMdWritten).toBe(false);
+    const html = await (
+      await fetch(`${base}/api/runs/${runId}/site/landing/index.html`)
+    ).text();
+    expect(html.length).toBeGreaterThan(20);
+    const md = await (await fetch(`${base}/api/runs/${runId}/design-md`)).json();
+    expect(md.found).toBe(false);
+  });
+
+  it("重复 seed 无 force → 409", async () => {
+    const res = await fetch(`${base}/api/runs/${runId}/seed-template`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ template: "landing-basic", dest: "landing" }),
+    });
+    expect(res.status).toBe(409);
+  });
+
+  it("非法 template id → 400", async () => {
+    const res = await fetch(`${base}/api/runs/${runId}/seed-template`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ template: "../etc" }),
+    });
+    expect(res.status).toBe(400);
+  });
+});
+
+describe("POST /api/runs/:id/export/pptx", () => {
+  let handle: Awaited<ReturnType<typeof createUiServer>>;
+  let base: string;
+  let dir: string;
+  let runId: string;
+  const fixtures = join(dirname(fileURLToPath(import.meta.url)), "..");
+
+  beforeAll(async () => {
+    dir = await mkdtemp(join(tmpdir(), "export-pptx-"));
+    const deckDir = join(dir, "deck");
+    const landingDir = join(dir, "landing");
+    await mkdir(deckDir, { recursive: true });
+    await mkdir(landingDir, { recursive: true });
+    for (const name of ["index.html", "style.css", "deck.js"]) {
+      await writeFile(
+        join(deckDir, name),
+        await readFile(join(fixtures, "templates", "design", "deck-basic", name), "utf8"),
+        "utf8",
+      );
+    }
+    for (const name of ["index.html", "style.css"]) {
+      await writeFile(
+        join(landingDir, name),
+        await readFile(join(fixtures, "templates", "design", "landing-basic", name), "utf8"),
+        "utf8",
+      );
+    }
+    handle = createUiServer({
+      modelClient: new FakeModelClient([fakeMessage([textBlock("done")], "end_turn")]),
+      workdir: dir,
+    });
+    const port = await startServer(handle);
+    base = baseUrl(port);
+    const res = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "export", pack: "design" }),
+    });
+    runId = (await res.json()).runId;
+  }, 30_000);
+
+  afterAll(async () => {
+    await handle.close();
+    try {
+      await rm(dir, { recursive: true, force: true });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EBUSY") throw err;
+    }
+  });
+
+  it("幻灯 HTML → 同目录 pptx，页数 3，PK 魔数", async () => {
+    const res = await fetch(`${base}/api/runs/${runId}/export/pptx`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ htmlPath: "deck/index.html" }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.path).toBe("deck/index.pptx");
+    expect(body.slides).toBe(3);
+    expect(body.titles).toEqual(["一页一个主张", "三点结构", "收束"]);
+    expect(Array.isArray(body.lossy)).toBe(true);
+    const bytes = await readFile(join(dir, "deck", "index.pptx"));
+    expect(bytes.subarray(0, 2).toString("ascii")).toBe("PK");
+    const outline = readPptxOutline(bytes);
+    expect(outline.slideCount).toBe(3);
+    expect(outline.slides.flatMap((s) => s.texts)).toEqual(
+      expect.arrayContaining(["一页一个主张", "三点结构", "收束"]),
+    );
+  });
+
+  it("子目录相对 CSS + 中文路径：宿主写出 pptx 可读回页数/标题", async () => {
+    const nested = join(dir, "幻灯", "子");
+    await mkdir(nested, { recursive: true });
+    await writeFile(
+      join(dir, "幻灯", "theme.css"),
+      ":root { --bg: #111111; --fg: #eeeeee; --accent: #cc0033; --muted: #888888; }\n",
+      "utf8",
+    );
+    await writeFile(
+      join(nested, "index.html"),
+      `<!doctype html><html lang="zh-CN"><head>
+<title>中文稿</title>
+<link rel="stylesheet" href="../theme.css">
+</head><body>
+<section class="slide" data-slide="cover"><h1 class="hero">封面主张</h1></section>
+<section class="slide" data-slide="p2"><h2>第二页标题</h2></section>
+</body></html>`,
+      "utf8",
+    );
+    const res = await fetch(`${base}/api/runs/${runId}/export/pptx`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ htmlPath: "幻灯/子/index.html" }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.path).toBe("幻灯/子/index.pptx");
+    expect(body.slides).toBe(2);
+    expect(body.titles).toEqual(["封面主张", "第二页标题"]);
+    const bytes = await readFile(join(nested, "index.pptx"));
+    const outline = readPptxOutline(bytes);
+    expect(outline.slideCount).toBe(2);
+    expect(outline.slides.flatMap((s) => s.texts)).toEqual(
+      expect.arrayContaining(["封面主张", "第二页标题"]),
+    );
+  });
+
+  it("无 .slide 的 HTML → 422，不写盘", async () => {
+    const res = await fetch(`${base}/api/runs/${runId}/export/pptx`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ htmlPath: "landing/index.html" }),
+    });
+    expect(res.status).toBe(422);
+    const body = await res.json();
+    expect(body.code).toBe("NO_SLIDES");
+    expect(existsSync(join(dir, "landing", "index.pptx"))).toBe(false);
+  });
+
+  it("逃出 workdir → 400", async () => {
+    const res = await fetch(`${base}/api/runs/${runId}/export/pptx`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ htmlPath: "../secret.html" }),
+    });
+    expect(res.status).toBe(400);
+    expect(existsSync(join(dir, "secret.pptx"))).toBe(false);
+  });
+
+  it("未知 run → 404", async () => {
+    const res = await fetch(`${base}/api/runs/nope/export/pptx`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ htmlPath: "deck/index.html" }),
+    });
+    expect(res.status).toBe(404);
+  });
+});
+
+describe("POST /api/runs/:id/export/png", () => {
+  let handle: Awaited<ReturnType<typeof createUiServer>>;
+  let base: string;
+  let dir: string;
+  let runId: string;
+  const fixtures = join(dirname(fileURLToPath(import.meta.url)), "..");
+
+  beforeAll(async () => {
+    dir = await mkdtemp(join(tmpdir(), "export-png-"));
+    const cardsDir = join(dir, "cards");
+    const landingDir = join(dir, "landing");
+    await mkdir(cardsDir, { recursive: true });
+    await mkdir(landingDir, { recursive: true });
+    for (const name of ["index.html", "style.css"]) {
+      await writeFile(
+        join(cardsDir, name),
+        await readFile(join(fixtures, "templates", "design", "social-basic", name), "utf8"),
+        "utf8",
+      );
+    }
+    for (const name of ["index.html", "style.css"]) {
+      await writeFile(
+        join(landingDir, name),
+        await readFile(join(fixtures, "templates", "design", "landing-basic", name), "utf8"),
+        "utf8",
+      );
+    }
+    handle = createUiServer({
+      modelClient: new FakeModelClient([fakeMessage([textBlock("done")], "end_turn")]),
+      workdir: dir,
+    });
+    const port = await startServer(handle);
+    base = baseUrl(port);
+    const res = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "export", pack: "design" }),
+    });
+    runId = (await res.json()).runId;
+  }, 30_000);
+
+  afterAll(async () => {
+    await handle.close();
+    try {
+      await rm(dir, { recursive: true, force: true });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EBUSY") throw err;
+    }
+  });
+
+  it("契约卡 → 写出 PNG，注入宿主不启动 Chromium", async () => {
+    const res = await fetch(`${base}/api/runs/${runId}/export/png`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ htmlPath: "cards/index.html" }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.count).toBe(3);
+    expect(body.paths).toEqual(["cards/index-1.png", "cards/index-2.png", "cards/index-3.png"]);
+    const bytes = await readFile(join(dir, "cards", "index-1.png"));
+    expect(bytes.subarray(0, 4).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47]))).toBe(true);
+  });
+
+  it("无 [data-card] → 422，不写盘", async () => {
+    const res = await fetch(`${base}/api/runs/${runId}/export/png`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ htmlPath: "landing/index.html" }),
+    });
+    expect(res.status).toBe(422);
+    const body = await res.json();
+    expect(body.code).toBe("NO_FRAMES");
+    expect(existsSync(join(dir, "landing", "index.png"))).toBe(false);
+  });
+
+  it("逃出 workdir → 400", async () => {
+    const res = await fetch(`${base}/api/runs/${runId}/export/png`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ htmlPath: "../secret.html" }),
+    });
+    expect(res.status).toBe(400);
   });
 });
 
@@ -6009,6 +6748,46 @@ describe("B2 · 运行历史落盘", () => {
     expect(events.at(-1)!.event.synthesized).toBe("host_not_finalized");
   });
 
+  it("CLI 档案 meta.host=cli 进列表；旧档案缺字段保持 null，不猜成 Web", async () => {
+    dir = await mkdtemp(join(tmpdir(), "history-host-"));
+    const cliDir = join(dir, "cli-run");
+    const oldDir = join(dir, "old-run-host");
+    await mkdir(cliDir, { recursive: true });
+    await mkdir(oldDir, { recursive: true });
+    const baseMeta = {
+      version: 1,
+      task: "来源",
+      status: "done",
+      verify: false,
+      createdAt: 1000,
+      finishedAt: 2000,
+      packName: null,
+      mode: "single",
+      effort: null,
+      rubric: null,
+      workdir: null,
+      conversationTurn: 1,
+      planGate: false,
+      planDecision: null,
+      mainStopReason: "completed",
+      outcome: null,
+    };
+    await writeFile(
+      join(cliDir, "meta.json"),
+      JSON.stringify({ ...baseMeta, runId: "cli-run", host: "cli" }),
+      "utf8",
+    );
+    await writeFile(
+      join(oldDir, "meta.json"),
+      JSON.stringify({ ...baseMeta, runId: "old-run-host", createdAt: 1100 }),
+      "utf8",
+    );
+    await boot({ modelClient: new FakeModelClient([]), tools: [], workdir: process.cwd(), history: dir });
+    const list = (await (await fetch(`${base}/api/runs`)).json()) as { runId: string; host: string | null }[];
+    expect(list.find((r) => r.runId === "cli-run")?.host).toBe("cli");
+    expect(list.find((r) => r.runId === "old-run-host")?.host).toBeNull();
+  });
+
   it("无检查点的归档派生：子 run 从头开一轮、run_forked.checkpoint=null、预算按当前上限从零起算", async () => {
     dir = await mkdtemp(join(tmpdir(), "history-nockpt-"));
     const runDir = join(dir, "old-run");
@@ -6046,6 +6825,102 @@ describe("B2 · 运行历史落盘", () => {
     const child = ((await (await fetch(`${base}/api/runs`)).json()) as any[]).find((x) => x.runId === body.runId);
     expect(child.stopReason).toBe("completed");
     expect(child.conversationTurn).toBe(2);
+  });
+
+  it("新开「继续」：同 workdir 最近会话写入开机背景，模型不得只看到空任务", async () => {
+    dir = await mkdtemp(join(tmpdir(), "rel-cont-"));
+    const model = new FakeModelClient([
+      fakeMessage([textBlock("第一轮做完暗色顶栏")], "end_turn"),
+      fakeMessage([textBlock("接着改完了")], "end_turn"),
+    ]);
+    await boot({ modelClient: model, tools: [autoTool("noop")], workdir: dir, history: false });
+    const first = await post("/api/runs", { task: "帮我优化这个网站", verify: false });
+    expect(first.status).toBe(200);
+    const { runId: firstId } = (await first.json()) as { runId: string };
+    await waitForDone(base, firstId);
+
+    const second = await post("/api/runs", { task: "继续", verify: false });
+    expect(second.status).toBe(200);
+    const { runId: secondId } = (await second.json()) as { runId: string };
+    await waitForDone(base, secondId);
+
+    expect(model.requests.length).toBe(2);
+    const contReq = model.requests[1]!;
+    const flat = JSON.stringify(contReq.messages);
+    expect(flat).toContain("继续");
+    expect(flat).toContain("同工作目录另有会话");
+    expect(flat).not.toContain("帮我优化这个网站");
+    expect(flat).not.toContain("默认接着上述会话");
+    expect(flat).not.toMatch(/先 ask_user 确认/);
+  });
+
+  it("同进程追问「继续」：有正史也钉本对话锚点，不把同目录另一场会话当续作对象", async () => {
+    dir = await mkdtemp(join(tmpdir(), "rel-follow-"));
+    const model = new FakeModelClient([
+      fakeMessage([textBlock("PPT 勘察记下了")], "end_turn"),
+      fakeMessage([textBlock("按本对话计划接着做")], "end_turn"),
+    ]);
+    await boot({ modelClient: model, tools: [autoTool("noop")], workdir: dir, history: false });
+    // 同目录先有一场网站优化——污染源
+    const noise = await post("/api/runs", { task: "帮我优化这个网站", verify: false });
+    expect(noise.status).toBe(200);
+    const { runId: noiseId } = (await noise.json()) as { runId: string };
+    await waitForDone(base, noiseId);
+
+    const ppt = await post("/api/runs", {
+      task: "我想制作一个关于华侨大学介绍的PPT",
+      verify: false,
+    });
+    expect(ppt.status).toBe(200);
+    const { runId } = (await ppt.json()) as { runId: string };
+    await waitForDone(base, runId);
+
+    const follow = await post(`/api/runs/${runId}/messages`, { text: "继续", verify: false });
+    expect(follow.status).toBe(200);
+    await waitForDone(base, runId);
+
+    expect(model.requests.length).toBeGreaterThanOrEqual(3);
+    const contReq = model.requests.at(-1)!;
+    const flat = JSON.stringify(contReq.messages);
+    expect(flat).toContain("继续");
+    expect(flat).toContain("本对话锚点");
+    expect(flat).toContain("华侨大学");
+    expect(flat).toContain("不要把邻居任务列进 ask_user");
+    // 邻居任务可以出现在别处，但锚点不得暗示去续它；至少原任务锚必须在
+    expect(flat).toContain("我想制作一个关于华侨大学介绍的PPT");
+  });
+
+  it("同进程追问「还能再优化吗」也钉本对话，不把 workdir 里其它站点当「它」", async () => {
+    dir = await mkdtemp(join(tmpdir(), "rel-opt-"));
+    const model = new FakeModelClient([
+      fakeMessage([textBlock("PPT 初稿已出")], "end_turn"),
+      fakeMessage([textBlock("按华侨大学 PPT 继续打磨")], "end_turn"),
+    ]);
+    await boot({ modelClient: model, tools: [autoTool("noop")], workdir: dir, history: false });
+    const noise = await post("/api/runs", { task: "帮我优化这个网站", verify: false });
+    expect(noise.status).toBe(200);
+    await waitForDone(base, ((await noise.json()) as { runId: string }).runId);
+
+    const ppt = await post("/api/runs", {
+      task: "我想制作一个关于华侨大学介绍的PPT",
+      verify: false,
+    });
+    expect(ppt.status).toBe(200);
+    const { runId } = (await ppt.json()) as { runId: string };
+    await waitForDone(base, runId);
+
+    const follow = await post(`/api/runs/${runId}/messages`, {
+      text: "还能再优化吗",
+      verify: false,
+    });
+    expect(follow.status).toBe(200);
+    await waitForDone(base, runId);
+
+    const flat = JSON.stringify(model.requests.at(-1)!.messages);
+    expect(flat).toContain("还能再优化吗");
+    expect(flat).toContain("本对话锚点");
+    expect(flat).toContain("华侨大学");
+    expect(flat).not.toMatch(/「它」指哪个对象/);
   });
 
   it("保留策略（判据③）：超出 keep 的最老档案被修剪，重启后列表同口径", async () => {
@@ -6244,17 +7119,81 @@ describe("B2 · 运行历史落盘", () => {
     expect(row.status).toBe("done");
     expect(row.durablePhase).toBe("interrupted");
     expect(row.sameRunResume).toBe(false);
-    expect(row.continuationMode).not.toBe("same");
-    expect(row.continuationMode).not.toBe("same-run");
+    expect(row.continuationMode).toBe("reopen");
+    expect(row.canContinue).toBe(true);
     const recovered = JSON.parse(await readFile(join(runDir, "state.json"), "utf8"));
     expect(recovered.phase).toBe("interrupted");
+  });
+
+  it("RUN-01：plan_gated 崩溃保持在门上，可 restore-gate，不 close_archive", async () => {
+    dir = await mkdtemp(join(tmpdir(), "history-gate-crash-"));
+    const runDir = join(dir, "gate-1");
+    await mkdir(runDir, { recursive: true });
+    await writeFile(
+      join(runDir, "meta.json"),
+      JSON.stringify({
+        version: 1,
+        runId: "gate-1",
+        task: "等批准",
+        status: "running",
+        verify: false,
+        createdAt: 1000,
+        finishedAt: null,
+        packName: null,
+        mode: "plan",
+        effort: null,
+        rubric: null,
+        workdir: null,
+        conversationTurn: 1,
+        planGate: true,
+        planDecision: null,
+        mainStopReason: null,
+        outcome: null,
+      }),
+      "utf8",
+    );
+    await writeFile(
+      join(runDir, "state.json"),
+      JSON.stringify({
+        version: 1,
+        runId: "gate-1",
+        phase: "plan_gated",
+        updatedAt: 1001,
+        plan: {
+          protocol: "freeform",
+          taskIds: ["s1"],
+          edges: { s1: [] },
+          approvedAt: null,
+          rejectedAt: null,
+        },
+        segmentIndex: 0,
+        segmentSource: "planner",
+        verificationRound: 0,
+        pendingApprovalIds: [],
+        pendingQuestionIds: [],
+        rootRunId: null,
+        continuedFrom: null,
+      }),
+      "utf8",
+    );
+    await writeFile(join(runDir, "events.jsonl"), "", "utf8");
+    await boot({ modelClient: new FakeModelClient([]), tools: [], workdir: process.cwd(), history: dir });
+    const list = (await (await fetch(`${base}/api/runs`)).json()) as any[];
+    const row = list.find((r) => r.runId === "gate-1");
+    expect(row.durablePhase).toBe("plan_gated");
+    expect(row.durableRecovery).toBe("restore_gate");
+    expect(row.continuationMode).toBe("restore-gate");
+    expect(row.canContinue).toBe(true);
+    expect(row.sameRunResume).toBe(false);
+    const recovered = JSON.parse(await readFile(join(runDir, "state.json"), "utf8"));
+    expect(recovered.phase).toBe("plan_gated");
   });
 
   /**
    * 会话中心化后新一轮的落盘顺序是 meta(running) → state(reopen)。两笔之间被硬杀：
    * meta 说在跑、state 还停在上一轮的 completed。按 meta 走（它是"当时在跑"的事实源），
    * 收成 interrupted；有检查点就能同 run 热恢复。CI 实测抓到的窗口（e2e crash 场景）。
-   * 反面：plan_gated 崩溃经 ADR 表收成 closed 的路径不受影响（只看盘上原相）。
+   * 反面：plan_gated 崩溃只看盘上原相，保持在门上（restore_gate），不改写成 interrupted。
    */
   it("RUN-01：meta=running 而 state 仍是上一轮 completed（reopen 未落盘就崩）→ interrupted + sameRunResume", async () => {
     dir = await mkdtemp(join(tmpdir(), "history-reopen-crash-"));
@@ -6365,6 +7304,88 @@ describe("B2 · 运行历史落盘", () => {
     const afterState = JSON.parse(await readFile(join(runDir, "state.json"), "utf8"));
     expect(afterState.lastSameRunResumeAt).toBeTruthy();
     expect(["executing", "completed"]).toContain(afterState.phase);
+  });
+
+  it("RUN-01 / AGENT-01：半截 DAG 崩溃后 sameRunResume；续发射跳过已通过节点", async () => {
+    dir = await mkdtemp(join(tmpdir(), "history-plan-dag-"));
+    const planJson = JSON.stringify({
+      subtasks: [
+        { id: "s1", title: "第一步", description: "做 A", acceptance: ["A 完成"], dependsOn: [] },
+        { id: "s2", title: "第二步", description: "做 B", acceptance: ["B 完成"], dependsOn: ["s1"] },
+      ],
+    });
+    const pass = () =>
+      fakeMessage([textBlock(JSON.stringify({ passed: true, issues: [], summary: "通过" }))], "end_turn");
+    await boot({
+      modelClient: new FakeModelClient([
+        fakeMessage([textBlock(["```json", planJson, "```"].join("\n"))], "end_turn"),
+        fakeMessage([textBlock("s1 完成")], "end_turn"),
+        pass(),
+        fakeMessage([textBlock("s2 完成")], "end_turn"),
+        pass(),
+      ]),
+      tools: [autoTool("noop")],
+      workdir: process.cwd(),
+      history: dir,
+    });
+    const created = await post("/api/runs", {
+      task: "两步任务",
+      verify: false,
+      mode: "plan",
+      concurrency: 1,
+    });
+    const { runId } = (await created.json()) as { runId: string };
+    await waitForDone(base, runId);
+    await handle!.close();
+    handle = undefined;
+
+    const runDir = join(dir, runId);
+    const liveState = JSON.parse(await readFile(join(runDir, "state.json"), "utf8"));
+    expect(liveState.plan?.nodes?.map((n: { status: string }) => n.status)).toEqual(["passed", "passed"]);
+
+    const meta = JSON.parse(await readFile(join(runDir, "meta.json"), "utf8"));
+    meta.status = "running";
+    meta.finishedAt = null;
+    await writeFile(join(runDir, "meta.json"), JSON.stringify(meta), "utf8");
+    liveState.phase = "executing";
+    liveState.plan.nodes = liveState.plan.nodes.map((n: { id: string }) =>
+      n.id === "s2" ? { ...n, status: "pending", evidenceSummary: undefined } : n,
+    );
+    await writeFile(join(runDir, "state.json"), JSON.stringify(liveState), "utf8");
+
+    const resumedModel = new FakeModelClient([
+      fakeMessage([textBlock("s2 续跑完成")], "end_turn"),
+      pass(),
+    ]);
+    await boot({
+      modelClient: resumedModel,
+      tools: [autoTool("noop")],
+      workdir: process.cwd(),
+      history: dir,
+    });
+    const row = ((await (await fetch(`${base}/api/runs`)).json()) as any[]).find((r) => r.runId === runId);
+    expect(row.durablePhase).toBe("interrupted");
+    expect(row.sameRunResume).toBe(true);
+    expect(row.continuationMode).toBe("same-run");
+    expect(row.mode).toBe("plan");
+
+    const follow = await post(`/api/runs/${runId}/messages`, { text: "接着跑剩下的" });
+    expect(follow.status).toBe(200);
+    expect(((await follow.json()) as any).continuationMode).toBe("same-run");
+    await waitForDone(base, runId);
+
+    const events = (await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`))) as any[];
+    const resumedAt = events.findIndex((item) => item.event.type === "run_resumed");
+    expect(resumedAt).toBeGreaterThanOrEqual(0);
+    const after = events.slice(resumedAt);
+    const resumeEv = after.find((item) => item.event.type === "plan_resume")?.event;
+    expect(resumeEv?.kept).toEqual(["s1"]);
+    expect(resumeEv?.remaining).toEqual(["s2"]);
+    expect(after.some((item) => item.event.type === "run_forked")).toBe(false);
+    expect(after.some((item) => item.source === "planner")).toBe(false);
+    expect(after.some((item) => String(item.source).startsWith("s1/"))).toBe(false);
+    expect(after.some((item) => String(item.source).startsWith("s2/"))).toBe(true);
+    expect(JSON.stringify(resumedModel.requests[0]!.messages)).toContain("做 B");
   });
 });
 
@@ -6494,6 +7515,38 @@ describe("§5.2 需求澄清：Web 宿主接线", () => {
     const resolved = events.find((e: any) => e.event.type === "user_question_resolved") as any;
     expect(resolved.event.skipped, "主动跳过与超时是两件事").toBe(true);
     expect(resolved.event.answers).toBeNull();
+  });
+
+  it("路径探活打满窗口后仍能提交澄清答复——人闸不与探活抢额度", async () => {
+    handle = createUiServer({
+      modelClient: new FakeModelClient(askingScript()),
+      tools: [autoTool("noop")],
+      workdir: process.cwd(),
+      mutationRateLimitPerMinute: 1,
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "做一版 Desktop UI", askUser: true }),
+    })).json() as { runId: string };
+    await waitForQuestion(runId);
+
+    const inspect = await fetch(`${base}/api/runs/${runId}/paths/inspect`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ paths: ["README.md", "ui/public/app.js"] }),
+    });
+    expect(inspect.status).toBe(200);
+
+    const res = await fetch(`${base}/api/runs/${runId}/answer`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ answers: ["Tauri", null] }),
+    });
+    expect(res.status, await res.text()).toBe(200);
+    await waitForDone(base, runId);
   });
 
   it("收尾时宣告过期并解除挂起——否则执行协程永远吊在 execute 里（V-01）", async () => {
@@ -6897,10 +7950,14 @@ describe("P0 production host boundary", () => {
     expect(response.status).toBe(413);
   });
 
-  it("单一来源的副作用请求超过窗口上限后返回 429", async () => {
+  it("单一来源的状态变更超过窗口上限后返回 429", async () => {
     await boot({ mutationRateLimitPerMinute: 1 });
-    const first = await fetch(`${base}/unknown-mutation`, { method: "POST" });
-    expect(first.status).toBe(404);
+    const first = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "first mutation", verify: false }),
+    });
+    expect(first.status).toBe(200);
     const second = await fetch(`${base}/api/runs`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -6908,6 +7965,31 @@ describe("P0 production host boundary", () => {
     });
     expect(second.status).toBe(429);
     expect(Number(second.headers.get("retry-after"))).toBeGreaterThan(0);
+  });
+
+  it("路径探活和未知 POST 不占突变额度", async () => {
+    await boot({ mutationRateLimitPerMinute: 1 });
+    const unknown = await fetch(`${base}/unknown-mutation`, { method: "POST" });
+    expect(unknown.status).toBe(404);
+    const created = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "still admitted", verify: false }),
+    });
+    expect(created.status).toBe(200);
+    const { runId } = await created.json() as { runId: string };
+    const inspect = await fetch(`${base}/api/runs/${runId}/paths/inspect`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ paths: ["README.md"] }),
+    });
+    expect(inspect.status).toBe(200);
+    const overflow = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "now limited", verify: false }),
+    });
+    expect(overflow.status).toBe(429);
   });
 
   it("关闭 bash 后工具快照与宿主限制都如实报告", async () => {
@@ -7899,6 +8981,16 @@ describe("MODEL-01a 端点降级：宿主接线", () => {
     expect(snapshot.fallbackChain).toHaveLength(2);
     expect(snapshot.fallbackChain[1]).toBe("mock-backup");
     expect(snapshot.fallbackScope).toBe("executor");
+    // MODEL-01 残余：链健康只读面——至少含执行者；不改路由语义
+    expect(Array.isArray(snapshot.endpointHealth)).toBe(true);
+    expect(snapshot.endpointHealth.some((row: any) => typeof row.model === "string")).toBe(true);
+    expect(snapshot.endpointHealth[0]).toEqual(
+      expect.objectContaining({
+        model: expect.any(String),
+        healthy: expect.any(Boolean),
+        circuit: expect.stringMatching(/^(closed|open|half_open)$/),
+      }),
+    );
     // 链上第二家的 baseURL / key 与角色模型同规格：绝不下发给浏览器
     const asText = JSON.stringify(snapshot);
     expect(asText).not.toContain("test-key");
@@ -7915,6 +9007,7 @@ describe("MODEL-01a 端点降级：宿主接线", () => {
     const cfg = events.find((e) => (e as any).event.type === "run_config") as any;
     expect(cfg.event.fallbackChain[1]).toBe("mock-backup");
     expect(cfg.event.fallbackScope).toBe("executor");
+    expect(Array.isArray(cfg.event.endpointHealth)).toBe(true);
   });
 
   /**
@@ -7992,7 +9085,7 @@ describe("MODEL-01a 端点降级：宿主接线", () => {
  * 核心层的四级来源、夹紧算式与区间校验有 test/context-window.ts 的纯函数锁；这一组管
  * **宿主有没有如实把它们报出来**，以及逐 run 预算这条外部输入的准入。
  * 为什么重要：此前界面上只有 `contextTokenLimit` 一个数，既当"模型能装多少"又当
- * "我们在多少处压"——150k 的默认预算在窗口 1,048,576 的端点上压了三个月没人看见。
+ * "我们在多少处压"——旧默认 150k 在窗口 1,048,576 的端点上压了三个月没人看见。
  * 窗口不知道就必须说"未知"，不许画 0；预算被夹紧必须说出原值。
  */
 describe("MEM-01 窗口 / 预算分离：Web 宿主", () => {
@@ -8046,11 +9139,11 @@ describe("MEM-01 窗口 / 预算分离：Web 宿主", () => {
 
     expect(snap.context.window).toBe(1_048_576);
     expect(snap.context.windowSource).toBe("registry");
-    expect(snap.context.budget).toBe(DEFAULT_CONTEXT_TOKEN_LIMIT);
-    expect(snap.context.budgetSource).toBe("default");
     expect(snap.context.maxTokens).toBe(DEFAULT_MAX_TOKENS);
     // 算式不写死数字：登记表里的窗口与边际口径归 src/context-window.ts 管
     expect(snap.context.maxBudget).toBe(maxContextBudget(1_048_576, DEFAULT_MAX_TOKENS));
+    expect(snap.context.budget).toBe(snap.context.maxBudget);
+    expect(snap.context.budgetSource).toBe("window");
     expect(snap.context.clamped).toBe(false);
     expect(snap.context.warning).toBeNull();
     // 生效预算与 guardrails 那一格是同一个数（界面两处不许各说一套）
@@ -8068,11 +9161,7 @@ describe("MEM-01 窗口 / 预算分离：Web 宿主", () => {
     expect(snap.context.budget).toBe(DEFAULT_CONTEXT_TOKEN_LIMIT);
   });
 
-  /**
-   * env 覆盖窗口 + 夹紧：200k 的窗口装不下 150k 预算 + 64k 输出，预算被夹到
-   * 200k − 64k − 4k。夹紧不是静默降级——生效值、原值、告警一起报。
-   */
-  it("env 覆盖窗口：来源 env，且预算被夹紧时报出原值与告警", async () => {
+  it("env 覆盖窗口：无显式水位时跟可用窗口，不先钉 150k 再夹", async () => {
     pinEnv("some-unlisted-model-v0");
     setEnv("AGENT_CONTEXT_WINDOW", "200000");
     const base = await startWith();
@@ -8081,8 +9170,22 @@ describe("MEM-01 窗口 / 预算分离：Web 宿主", () => {
     expect(snap.context.windowSource).toBe("env");
     expect(snap.context.maxBudget).toBe(maxContextBudget(200_000, DEFAULT_MAX_TOKENS));
     expect(snap.context.budget).toBe(snap.context.maxBudget);
+    expect(snap.context.budgetSource).toBe("window");
+    expect(snap.context.clamped).toBe(false);
+    expect(snap.guardrails.contextTokenLimit).toBe(snap.context.budget);
+  });
+
+  it("env 覆盖窗口 + 显式 150k 水位：装不下就夹紧，原值与告警一起报", async () => {
+    pinEnv("some-unlisted-model-v0");
+    setEnv("AGENT_CONTEXT_WINDOW", "200000");
+    setEnv("AGENT_CONTEXT_LIMIT", "150000");
+    const base = await startWith();
+    const snap = (await (await fetch(`${base}/api/harness`)).json()) as any;
+    expect(snap.context.maxBudget).toBe(maxContextBudget(200_000, DEFAULT_MAX_TOKENS));
+    expect(snap.context.budget).toBe(snap.context.maxBudget);
     expect(snap.context.clamped).toBe(true);
     expect(snap.context.requestedBudget).toBe(DEFAULT_CONTEXT_TOKEN_LIMIT);
+    expect(snap.context.budgetSource).toBe("env");
     expect(snap.context.warning).toContain("夹到");
     expect(snap.guardrails.contextTokenLimit).toBe(snap.context.budget);
   });
@@ -8139,9 +9242,11 @@ describe("MEM-01 窗口 / 预算分离：Web 宿主", () => {
     const after = (await (await fetch(`${base}/api/harness`)).json()) as any;
     expect(after.context.window).toBe(200_000);
     expect(after.context.windowSource).toBe("learned");
-    // 学到之后预算立刻被夹进新算出来的上限——窗口是分母，学到就该生效
+    // 学到窗口之后水位立刻跟可用窗口走——窗口是分母，学到就该生效
     expect(after.context.maxBudget).toBe(maxContextBudget(200_000, DEFAULT_MAX_TOKENS));
-    expect(after.context.clamped).toBe(true);
+    expect(after.context.budget).toBe(after.context.maxBudget);
+    expect(after.context.budgetSource).toBe("window");
+    expect(after.context.clamped).toBe(false);
 
     const { runId: second } = (await (await fetch(`${base}/api/runs`, {
       method: "POST", headers: { "Content-Type": "application/json" },
@@ -8227,7 +9332,7 @@ describe("MEM-01 窗口 / 预算分离：Web 宿主", () => {
     await waitForDone(base, runId);
     const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
     const cfg = events.find((e) => (e as any).event.type === "run_config") as any;
-    expect(cfg.event.context.budgetSource).toBe("default");
+    expect(cfg.event.context.budgetSource).toBe("window");
   });
 
   /** 校验用的窗口按**本 run 的包**算（包可改 maxTokens），与 buildConfig 同一口径 */
@@ -8241,6 +9346,257 @@ describe("MEM-01 窗口 / 预算分离：Web 宿主", () => {
     });
     expect(res.status).toBe(400);
     expect(((await res.json()) as any).contextTokenLimit.max).toBe(maxContextBudget(1_048_576, packMaxTokens));
+  });
+});
+
+describe("对话快照分叉 POST /api/runs/:id/fork", () => {
+  let handle: UiServerHandle | undefined;
+  afterEach(async () => {
+    await handle?.close();
+    handle = undefined;
+  });
+
+  it("子 run 已完成、继承正史、不启动模型，父 run 不变", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([textBlock("父对话正文")], "end_turn"),
+    ]);
+    handle = createUiServer({
+      modelClient: model,
+      tools: [],
+      workdir: process.cwd(),
+    });
+    const base = baseUrl(await startServer(handle));
+    const created = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "画一只鸟", verify: false }),
+    });
+    const { runId } = (await created.json()) as { runId: string };
+    await waitForDone(base, runId);
+    const callsAfterParent = model.requests.length;
+    expect(callsAfterParent).toBeGreaterThan(0);
+
+    const parentBefore = ((await (await fetch(`${base}/api/runs`)).json()) as any[])
+      .find((r) => r.runId === runId);
+
+    const forkRes = await fetch(`${base}/api/runs/${runId}/fork`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    expect(forkRes.status).toBe(200);
+    const fork = (await forkRes.json()) as any;
+    expect(fork.runId).not.toBe(runId);
+    expect(fork.continuedFrom).toBe(runId);
+    expect(fork.continuationMode).toBe("snapshot");
+    expect(fork.started).toBe(false);
+    expect(fork.run.status).toBe("done");
+    expect(fork.run.canContinue).toBe(true);
+    expect(fork.run.continuedFrom).toBe(runId);
+    expect(model.requests.length).toBe(callsAfterParent);
+
+    const parentAfter = ((await (await fetch(`${base}/api/runs`)).json()) as any[])
+      .find((r) => r.runId === runId);
+    expect(parentAfter.status).toBe(parentBefore.status);
+    expect(parentAfter.runId).toBe(runId);
+
+    const childEvents = (await readSSEAll(await fetch(`${base}/api/runs/${fork.runId}/events`))) as any[];
+    expect(childEvents.some((e) => e.event?.type === "assistant_text" && e.event.text === "父对话正文")).toBe(true);
+    expect(childEvents.some((e) => e.event?.type === "run_forked")).toBe(false);
+  });
+
+  it("未知 run 返回 404", async () => {
+    handle = createUiServer({
+      modelClient: new FakeModelClient([]),
+      tools: [],
+      workdir: process.cwd(),
+    });
+    const base = baseUrl(await startServer(handle));
+    const res = await fetch(`${base}/api/runs/does-not-exist/fork`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    expect(res.status).toBe(404);
+  });
+});
+
+describe("对话回退 POST /api/runs/:id/rewind", () => {
+  let handle: UiServerHandle | undefined;
+  afterEach(async () => {
+    await handle?.close();
+    handle = undefined;
+  });
+
+  it("子 run 只留裁点及之前的事件，父 run 不变，不启动模型", async () => {
+    const model = new FakeModelClient([
+      fakeMessage([textBlock("第一轮正文")], "end_turn"),
+      fakeMessage([textBlock("第二轮正文")], "end_turn"),
+    ]);
+    handle = createUiServer({
+      modelClient: model,
+      tools: [],
+      workdir: process.cwd(),
+    });
+    const base = baseUrl(await startServer(handle));
+    const created = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "写两轮", verify: false, lineageBudget: false, dailyBudget: false }),
+    });
+    const { runId } = (await created.json()) as { runId: string };
+    await waitForDone(base, runId);
+    const follow = await fetch(`${base}/api/runs/${runId}/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "再来一轮" }),
+    });
+    expect(follow.status).toBe(200);
+    await waitForDone(base, runId);
+    const callsAfterParent = model.requests.length;
+
+    const parentEvents = (await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`))) as any[];
+    const firstText = parentEvents.find((e) => e.event?.type === "assistant_text" && e.event.text === "第一轮正文");
+    expect(firstText).toBeTruthy();
+
+    const rewindRes = await fetch(`${base}/api/runs/${runId}/rewind`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ seq: firstText.seq, revertFiles: false }),
+    });
+    expect(rewindRes.status).toBe(200);
+    const rewind = (await rewindRes.json()) as any;
+    expect(rewind.runId).not.toBe(runId);
+    expect(rewind.continuationMode).toBe("rewind");
+    expect(rewind.started).toBe(false);
+    expect(rewind.rewindFrom).toEqual({
+      parentRunId: runId,
+      seq: firstText.seq,
+      revertFiles: false,
+    });
+    expect(model.requests.length).toBe(callsAfterParent);
+
+    const childEvents = (await readSSEAll(await fetch(`${base}/api/runs/${rewind.runId}/events`))) as any[];
+    expect(childEvents.some((e) => e.event?.type === "assistant_text" && e.event.text === "第一轮正文")).toBe(true);
+    expect(childEvents.some((e) => e.event?.type === "assistant_text" && e.event.text === "第二轮正文")).toBe(false);
+    expect(childEvents.some((e) => e.event?.type === "conversation_rewound")).toBe(true);
+
+    const parentAfter = ((await (await fetch(`${base}/api/runs`)).json()) as any[])
+      .find((r) => r.runId === runId);
+    expect(parentAfter.status).toBe("done");
+    const stillParent = (await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`))) as any[];
+    expect(stillParent.some((e) => e.event?.type === "assistant_text" && e.event.text === "第二轮正文")).toBe(true);
+  });
+
+  it("revertFiles 按写盘快照还原文件；只退对话则文件不动", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ui-rewind-"));
+    const model = new FakeModelClient([
+      fakeMessage([toolUseBlock("w1", "write_file", { path: "note.txt", content: "v1" })], "tool_use"),
+      fakeMessage([textBlock("第一轮")], "end_turn"),
+      fakeMessage([toolUseBlock("w2", "write_file", { path: "note.txt", content: "v2" })], "tool_use"),
+      fakeMessage([textBlock("第二轮")], "end_turn"),
+    ]);
+    handle = createUiServer({
+      modelClient: model,
+      tools: [{ ...writeFileTool, permission: "auto" }],
+      workdir: dir,
+    });
+    const base = baseUrl(await startServer(handle));
+    const created = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        task: "写文件两轮",
+        verify: false,
+        autoApprove: true,
+        lineageBudget: false,
+        dailyBudget: false,
+      }),
+    });
+    const { runId } = (await created.json()) as { runId: string };
+    await waitForDone(base, runId);
+    expect(await readFile(join(dir, "note.txt"), "utf8")).toBe("v1");
+
+    const follow = await fetch(`${base}/api/runs/${runId}/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "改成第二版" }),
+    });
+    expect(follow.status).toBe(200);
+    await waitForDone(base, runId);
+    expect(await readFile(join(dir, "note.txt"), "utf8")).toBe("v2");
+
+    const parentEvents = (await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`))) as any[];
+    expect(parentEvents.some((e) => e.event?.type === "file_rewind_snapshot")).toBe(true);
+    const firstText = parentEvents.find((e) => e.event?.type === "assistant_text" && e.event.text === "第一轮");
+
+    const chatOnly = await fetch(`${base}/api/runs/${runId}/rewind`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ seq: firstText.seq, revertFiles: false }),
+    });
+    expect(chatOnly.status).toBe(200);
+    expect(await readFile(join(dir, "note.txt"), "utf8")).toBe("v2");
+
+    const withFiles = await fetch(`${base}/api/runs/${runId}/rewind`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ seq: firstText.seq, revertFiles: true }),
+    });
+    expect(withFiles.status).toBe(200);
+    const body = (await withFiles.json()) as any;
+    expect(body.files.restored).toContain("note.txt");
+    expect(await readFile(join(dir, "note.txt"), "utf8")).toBe("v1");
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("运行中回退返回 409；未知 seq / run 分别 400 / 404", async () => {
+    handle = createUiServer({
+      modelClient: new FakeModelClient([
+        fakeMessage([toolUseBlock("t1", "danger", { command: "x" })], "tool_use"),
+        fakeMessage([textBlock("放行后才结束")], "end_turn"),
+      ]),
+      tools: [askTool("danger")],
+      workdir: process.cwd(),
+    });
+    const base = baseUrl(await startServer(handle));
+    const created = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "进行中", verify: false, lineageBudget: false, dailyBudget: false }),
+    });
+    const { runId } = (await created.json()) as { runId: string };
+    const deadline = Date.now() + 5000;
+    let pending = 0;
+    while (Date.now() < deadline) {
+      const row = ((await (await fetch(`${base}/api/runs`)).json()) as any[]).find((r) => r.runId === runId);
+      pending = row?.pendingApprovals ?? 0;
+      if (row?.status === "running" && pending > 0) break;
+      await new Promise((r) => setTimeout(r, 30));
+    }
+    expect(pending).toBeGreaterThan(0);
+    const running = await fetch(`${base}/api/runs/${runId}/rewind`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ seq: 0 }),
+    });
+    expect(running.status).toBe(409);
+
+    await fetch(`${base}/api/runs/${runId}/stop`, { method: "POST" });
+    await waitForDone(base, runId);
+    const badSeq = await fetch(`${base}/api/runs/${runId}/rewind`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ seq: 9999 }),
+    });
+    expect(badSeq.status).toBe(400);
+
+    const missing = await fetch(`${base}/api/runs/does-not-exist/rewind`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ seq: 0 }),
+    });
+    expect(missing.status).toBe(404);
   });
 });
 

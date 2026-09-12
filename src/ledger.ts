@@ -27,6 +27,7 @@
 import { appendFile } from "node:fs/promises";
 import path from "node:path";
 import { classifyApiError } from "./model-client.js";
+import { PERMISSION_MODES, type PermissionMode } from "./permission-mode.js";
 
 /** 裁决是怎么拿到的（与 verifier.ts 的 VerdictRecovery 同源） */
 export type LedgerRecovery = "tool" | "direct" | "reformat" | "wrapup" | "failed";
@@ -120,6 +121,76 @@ export interface LedgerCompactionTally {
   collapsedTurns: number;
 }
 
+/**
+ * 外部 hooks 计数（docs/09 §4.2）。
+ * `null` = 机制未武装（与 fallbackChain 同款：没这条防线 ≠ 零次开火）。
+ * 武装了即使零次开火也写 `{0,0}`。
+ */
+export interface LedgerHooksTally {
+  fired: number;
+  blocked: number;
+}
+
+export interface LedgerAgentMd {
+  files: number;
+  chars: number;
+  truncated: boolean;
+}
+
+export function emptyHooksTally(): LedgerHooksTally {
+  return { fired: 0, blocked: 0 };
+}
+
+/**
+ * 工具审批结局（docs/09 §4.3 判据 4）。
+ * 机制始终存在，新行恒写对象（零次也是 `{0,0,0}`）。
+ * 老行没有这个字段（undefined）= 切片落地前，不是零次。
+ *
+ * asked = 问过人（含过期未决）；auto = 宿主/规则代行（--yes、auto-run、SAFE-04）；
+ * denied ⊆ asked ∪ auto（人点了拒，或自动路径给出 deny——后者几乎不该发生）。
+ * 计划确认门、permission:deny / 圈禁 / hook 阻断都没有审批事件，不进这里。
+ */
+export interface LedgerApprovalsTally {
+  asked: number;
+  auto: number;
+  denied: number;
+}
+
+export function emptyApprovalsTally(): LedgerApprovalsTally {
+  return { asked: 0, auto: 0, denied: 0 };
+}
+
+/**
+ * 累加一次审批结局（不是请求）。只认 `approval_resolved` / `approval_expired`。
+ * `approval_request` 不计——Web 自动放行会先发请求再发 resolved，计请求会加倍。
+ */
+export function tallyApprovalOutcome(
+  tally: LedgerApprovalsTally,
+  event: { type?: unknown; actor?: unknown; decision?: unknown },
+): LedgerApprovalsTally {
+  if (event.type === "approval_expired") {
+    tally.asked += 1;
+    return tally;
+  }
+  if (event.type !== "approval_resolved") return tally;
+  const actor = event.actor;
+  if (actor === "user") tally.asked += 1;
+  else if (actor === "auto-run" || actor === "auto-rule") tally.auto += 1;
+  else return tally;
+  if (event.decision === "deny") tally.denied += 1;
+  return tally;
+}
+
+export function tallyHookEvent(
+  tally: LedgerHooksTally,
+  event: { type: string; outcome?: string },
+): LedgerHooksTally {
+  if (event.type !== "hook") return tally;
+  tally.fired += 1;
+  if (event.outcome === "block") tally.blocked += 1;
+  return tally;
+}
+
 export function emptyCompactionTally(): LedgerCompactionTally {
   return { proactive: 0, reactive: 0, droppedBlocks: 0, collapsedTurns: 0 };
 }
@@ -145,11 +216,11 @@ export interface LedgerContext {
   window: number | null;
   windowSource: "env" | "learned" | "registry" | "unknown";
   budget: number | null;
-  budgetSource: "run" | "env" | "pack" | "default" | null;
+  budgetSource: "run" | "env" | "pack" | "window" | "default" | null;
 }
 
 const WINDOW_SOURCES: LedgerContext["windowSource"][] = ["env", "learned", "registry", "unknown"];
-const BUDGET_SOURCES: NonNullable<LedgerContext["budgetSource"]>[] = ["run", "env", "pack", "default"];
+const BUDGET_SOURCES: NonNullable<LedgerContext["budgetSource"]>[] = ["run", "env", "pack", "window", "default"];
 
 /** 台账里记的恢复策略快照（完成门关着时为 null——那时 loop 到 maxTurns 即停） */
 export interface LedgerRecoveryPolicy {
@@ -232,6 +303,27 @@ export interface RunLedgerEntry {
    */
   cost?: LedgerCost;
   /**
+   * 外部 hooks（docs/09 §4.2）。`null` = 未武装；对象 = 武装（零次也是 `{0,0}`）。
+   * 老行没有这个字段（undefined）= 切片落地前，不是零次。
+   */
+  hooks?: LedgerHooksTally | null;
+  /**
+   * 分层 AGENT.md（docs/09 §4.7）。`null` = 本 run 没加载任何文件（机制不存在）。
+   * 只记数量与是否截断，不记正文、不记路径。
+   * 老行没有这个字段（undefined）= 切片落地前，不是零个文件。
+   */
+  agentMd?: LedgerAgentMd | null;
+  /**
+   * 权限档（docs/09 §4.3）。值来自**实际开关反推**，不是用户点过的标签。
+   * `null` = 对不上任何预设（自定义组合）。老行缺字段 = 未知，不是 manual。
+   */
+  permissionMode?: PermissionMode | null;
+  /**
+   * 该 run 实际发生的工具审批结局。新行恒有对象；老行缺字段 = 未知。
+   * 不记工具名、不记入参。
+   */
+  approvals?: LedgerApprovalsTally;
+  /**
    * 仪器纪律：**这一行是不是由带终结工具（§2.1）的构建写下的**。
    *
    * 不是配置项，是**构建标记**——`buildLedgerEntry` 恒写 true。为什么必须有它：
@@ -294,6 +386,13 @@ export interface LedgerInput {
     unpricedTokens?: number;
     reason?: string;
   } | null;
+  /** null / 省略 = 未武装；对象 = 武装（哪怕 0/0） */
+  hooks?: LedgerHooksTally | null;
+  /** null / 省略 = 本 run 没加载 AGENT.md；对象 = 加载了（只记数量） */
+  agentMd?: LedgerAgentMd | null;
+  /** 实际开关反推的档；对不上预设或未传 → null（新行恒写，老行 JSON 才缺字段） */
+  permissionMode?: PermissionMode | null;
+  approvals?: Partial<LedgerApprovalsTally> | null;
 }
 
 const RECOVERIES: LedgerRecovery[] = ["tool", "direct", "reformat", "wrapup", "failed"];
@@ -390,6 +489,27 @@ export function buildLedgerEntry(input: LedgerInput): RunLedgerEntry {
     // OBS-02 成本。宿主没传就整个字段不写——写一个 usd:null 的空壳会让读数器
     // 分不清"这个构建还不会算钱"和"这次算不出价"
     ...(input.cost ? { cost: normalizeLedgerCost(input.cost) } : {}),
+    hooks: input.hooks == null
+      ? null
+      : {
+          fired: nonNegativeInt(input.hooks.fired),
+          blocked: nonNegativeInt(input.hooks.blocked),
+        },
+    agentMd: input.agentMd == null
+      ? null
+      : {
+          files: nonNegativeInt(input.agentMd.files),
+          chars: nonNegativeInt(input.agentMd.chars),
+          truncated: input.agentMd.truncated === true,
+        },
+    permissionMode: PERMISSION_MODES.includes(input.permissionMode as PermissionMode)
+      ? (input.permissionMode as PermissionMode)
+      : null,
+    approvals: {
+      asked: nonNegativeInt(input.approvals?.asked),
+      auto: nonNegativeInt(input.approvals?.auto),
+      denied: nonNegativeInt(input.approvals?.denied),
+    },
     // 构建标记，不是配置：这个构建的 verifier/planner 一律带终结工具
     structuredDelivery: true,
   };
@@ -552,11 +672,42 @@ export interface LedgerSummary {
     /** 带 context 字段的行数（分母） */
     rows: number;
     windowSources: Record<"env" | "learned" | "registry" | "unknown", number>;
-    budgetSources: Record<"run" | "env" | "pack" | "default" | "unknown", number>;
+    budgetSources: Record<"run" | "env" | "pack" | "window" | "default" | "unknown", number>;
     /** 预算值 → 次数（按 token 数原样分桶，通常只有几个值） */
     budgets: Record<string, number>;
     /** 窗口已知的行里 budget / window 的均值；没有已知窗口时 null */
     meanBudgetToWindow: number | null;
+  };
+  /**
+   * 外部 hooks。只统计带 `hooks` 字段的行（含 null=未武装）。
+   * 老行没有字段 = 未知，不冒充零次。
+   */
+  hooks: {
+    rows: number;
+    armed: number;
+    fired: number;
+    blocked: number;
+  };
+  /**
+   * 分层 AGENT.md。只统计带 `agentMd` 字段的行（含 null=没加载）。
+   * 老行没有字段 = 未知，不冒充零个文件。
+   */
+  agentMd: {
+    rows: number;
+    loaded: number;
+    files: number;
+    truncatedRuns: number;
+  };
+  /**
+   * 权限档与审批计数。只统计带字段的行。
+   * 老行没有字段 = 未知，不把缺字段画成 manual / 零次问。
+   */
+  approvals: {
+    rows: number;
+    modes: { manual: number; plan: number; auto: number; custom: number };
+    asked: number;
+    auto: number;
+    denied: number;
   };
 }
 
@@ -580,9 +731,18 @@ export function summarizeLedger(entries: RunLedgerEntry[]): LedgerSummary {
   const context: LedgerSummary["context"] = {
     rows: 0,
     windowSources: { env: 0, learned: 0, registry: 0, unknown: 0 },
-    budgetSources: { run: 0, env: 0, pack: 0, default: 0, unknown: 0 },
+    budgetSources: { run: 0, env: 0, pack: 0, window: 0, default: 0, unknown: 0 },
     budgets: {},
     meanBudgetToWindow: null,
+  };
+  const hooks = { rows: 0, armed: 0, fired: 0, blocked: 0 };
+  const agentMd = { rows: 0, loaded: 0, files: 0, truncatedRuns: 0 };
+  const approvals = {
+    rows: 0,
+    modes: { manual: 0, plan: 0, auto: 0, custom: 0 },
+    asked: 0,
+    auto: 0,
+    denied: 0,
   };
   let ratioSum = 0;
   let ratioRows = 0;
@@ -604,6 +764,33 @@ export function summarizeLedger(entries: RunLedgerEntry[]): LedgerSummary {
         ratioSum += budget / window;
         ratioRows += 1;
       }
+    }
+    if (e.hooks !== undefined) {
+      hooks.rows += 1;
+      if (e.hooks) {
+        hooks.armed += 1;
+        hooks.fired += nonNegativeInt(e.hooks.fired);
+        hooks.blocked += nonNegativeInt(e.hooks.blocked);
+      }
+    }
+    if (e.agentMd !== undefined) {
+      agentMd.rows += 1;
+      if (e.agentMd) {
+        agentMd.loaded += 1;
+        agentMd.files += nonNegativeInt(e.agentMd.files);
+        if (e.agentMd.truncated) agentMd.truncatedRuns += 1;
+      }
+    }
+    if (e.permissionMode !== undefined || e.approvals !== undefined) {
+      approvals.rows += 1;
+      if (e.permissionMode === "manual" || e.permissionMode === "plan" || e.permissionMode === "auto") {
+        approvals.modes[e.permissionMode] += 1;
+      } else {
+        approvals.modes.custom += 1;
+      }
+      approvals.asked += nonNegativeInt(e.approvals?.asked);
+      approvals.auto += nonNegativeInt(e.approvals?.auto);
+      approvals.denied += nonNegativeInt(e.approvals?.denied);
     }
     if (e.compaction !== undefined) {
       const c = e.compaction;
@@ -656,6 +843,9 @@ export function summarizeLedger(entries: RunLedgerEntry[]): LedgerSummary {
     verifierWriteCalls,
     compaction,
     context: { ...context, meanBudgetToWindow: ratioRows > 0 ? ratioSum / ratioRows : null },
+    hooks,
+    agentMd,
+    approvals,
   };
 }
 

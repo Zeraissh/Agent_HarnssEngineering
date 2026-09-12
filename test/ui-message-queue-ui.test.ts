@@ -9,7 +9,7 @@
  *   ② 重放幂等：同一批事件灌进全新 state，长出与同态事件流相同的队列状态；
  *   ③ 渲染：排队 chips（含 ✕ 取消的 data-index）、插队指令用户气泡标注、
  *      message_queued 轻提示行；
- *   ④ composer：运行中亮出「插队重想 / 排队等待」，其余模式藏起。
+ *   ④ composer：运行中有草稿立即插入，空框停止；旧插队/排队键不再出现。
  */
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
@@ -153,14 +153,10 @@ describe("信息队列 · 渲染", () => {
 // ================================================================
 
 describe("信息队列 · composer 按钮", () => {
-  it("运行中（kind=stop）亮出「插队重想 / 排队等待」，其余模式藏起", () => {
+  it("运行中空框是停止，有草稿是立即插入；旧插队/排队键不再出现", () => {
     document.body.innerHTML = loadSkeleton();
-    const steerBtn = document.querySelector("#steer-btn");
-    const queueBtn = document.querySelector("#queue-btn");
-    expect(steerBtn, "骨架里要有插队按钮").not.toBeNull();
-    expect(queueBtn, "骨架里要有排队按钮").not.toBeNull();
-    expect(steerBtn.textContent).toContain("插队重想");
-    expect(queueBtn.textContent).toContain("排队等待");
+    expect(document.querySelector("#steer-btn")).toBeNull();
+    expect(document.querySelector("#queue-btn")).toBeNull();
 
     const running = deriveComposerMode({
       info: { status: "running", runId: "r1" },
@@ -168,29 +164,20 @@ describe("信息队列 · composer 按钮", () => {
     });
     expect(running.kind).toBe("stop");
     patchComposer(running);
-    expect(steerBtn.hasAttribute("hidden")).toBe(false);
-    expect(queueBtn.hasAttribute("hidden")).toBe(false);
-    // 主按钮此时仍是「停止」
     expect(document.querySelector("#submit-btn-label").textContent).toBe("停止");
 
-    // 停止中（正在停止…）：藏起来
-    patchComposer(deriveComposerMode({
+    const withDraft = deriveComposerMode({
       info: { status: "running", runId: "r1" },
       localStatus: "running",
-      stopping: true,
-    }));
-    expect(steerBtn.hasAttribute("hidden")).toBe(true);
+      draft: "改一下",
+    });
+    expect(withDraft.kind).toBe("steer");
+    patchComposer(withDraft);
+    expect(document.querySelector("#submit-btn-label").textContent).toBe("立即插入");
 
-    // 新建模式：藏起来
-    patchComposer(deriveComposerMode({ info: null }));
-    expect(steerBtn.hasAttribute("hidden")).toBe(true);
-    expect(queueBtn.hasAttribute("hidden")).toBe(true);
-
-    // 可追加（done）：藏起来——追加走主按钮
-    patchComposer(deriveComposerMode({
-      info: { status: "done", runId: "r1", canContinue: true, continuationMode: "same-run" },
-      localStatus: "done",
-    }));
-    expect(steerBtn.hasAttribute("hidden")).toBe(true);
+    const chips = renderQueueChips([], { insertNow: true });
+    expect(chips).toContain("立即插入");
+    expect(chips).toContain("data-insert-now");
+    expect(renderQueueChips(["排队甲"])).toContain("data-steer-index");
   });
 });

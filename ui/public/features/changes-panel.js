@@ -111,6 +111,18 @@ export function firstLines(text, maxLines = PREVIEW_MAX_LINES) {
 }
 
 /**
+ * JSON `null` 不能走 `Number(x)`——`Number(null) === 0`，会把「没有行差」
+ * 收成 `+0/-0`，未跟踪新文件看起来像空改动。
+ * @param {unknown} value
+ * @returns {number|null}
+ */
+export function optionalNumber(value) {
+  if (value == null || value === "") return null;
+  const n = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
  * 列表响应整形：宽容外部输入，只放行形状合法的条目。
  * @param {unknown} payload
  * @returns {{ runId:string|null, workdir:string|null, git:boolean, changes:ChangeEntry[] }}
@@ -127,17 +139,17 @@ export function normalizeChanges(payload) {
     changes.push({
       path: e.path,
       ops,
-      count: Number.isFinite(Number(e.count)) ? Number(e.count) : 0,
-      lastAt: Number.isFinite(Number(e.lastAt)) ? Number(e.lastAt) : null,
+      count: optionalNumber(e.count) ?? 0,
+      lastAt: optionalNumber(e.lastAt),
       outOfScope: e.outOfScope === true,
       exists: e.exists === true,
-      sizeBytes: Number.isFinite(Number(e.sizeBytes)) ? Number(e.sizeBytes) : null,
-      mtimeMs: Number.isFinite(Number(e.mtimeMs)) ? Number(e.mtimeMs) : null,
+      sizeBytes: optionalNumber(e.sizeBytes),
+      mtimeMs: optionalNumber(e.mtimeMs),
       git: gitRaw && typeof gitRaw.status === "string"
         ? {
             status: gitRaw.status,
-            added: Number.isFinite(Number(gitRaw.added)) ? Number(gitRaw.added) : null,
-            deleted: Number.isFinite(Number(gitRaw.deleted)) ? Number(gitRaw.deleted) : null,
+            added: optionalNumber(gitRaw.added),
+            deleted: optionalNumber(gitRaw.deleted),
           }
         : null,
     });
@@ -173,7 +185,9 @@ export function badgesForEntry(entry) {
     const known = GIT_STATUS_BADGES[entry.git.status];
     git = known ?? { label: entry.git.status, className: "chg-git-badge--other", hint: "git 状态" };
     const { added, deleted } = entry.git;
-    if (added !== null || deleted !== null) {
+    // 未跟踪文件的增删是 null（相对 HEAD 无 diff）。两端都是 0 也没信息——
+    // 画 +0/-0 看起来像坏账，不如不画。
+    if ((added !== null || deleted !== null) && ((added ?? 0) !== 0 || (deleted ?? 0) !== 0)) {
       diff = `+${added ?? 0}/-${deleted ?? 0}`;
     }
   }

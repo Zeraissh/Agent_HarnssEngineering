@@ -1,5 +1,9 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
+  describePermissionStance,
   matchPermissionMode,
   PERMISSION_MODE_TABLE,
   permissionModeSwitches,
@@ -39,6 +43,26 @@ describe("D3 permission modes", () => {
     expect(() => resolvePermissionMode("bypass")).toThrow(/AGENT_PERMISSION_MODE/);
   });
 
+  it("describePermissionStance 一次说清档位与会不会自动放行", () => {
+    expect(describePermissionStance("manual", PERMISSION_MODE_TABLE.manual)).toMatch(
+      /手动.*不会自动放行/,
+    );
+    expect(describePermissionStance("plan", PERMISSION_MODE_TABLE.plan)).toMatch(
+      /计划.*先出计划.*不会自动放行/,
+    );
+    expect(describePermissionStance("auto", PERMISSION_MODE_TABLE.auto)).toMatch(
+      /自动.*ask 级会自动放行/,
+    );
+    expect(
+      describePermissionStance(null, {
+        approvalDefault: "auto",
+        planMode: true,
+        planGate: false,
+        autoYes: true,
+      }),
+    ).toMatch(/自定义.*ask 级会自动放行/);
+  });
+
   it("matchPermissionMode 反推档位；自定义组合返回 null", () => {
     expect(matchPermissionMode(PERMISSION_MODE_TABLE.plan)).toBe("plan");
     expect(matchPermissionMode(PERMISSION_MODE_TABLE.auto)).toBe("auto");
@@ -50,6 +74,12 @@ describe("D3 permission modes", () => {
         autoYes: false,
       }),
     ).toBeNull();
+  });
+
+  it("装配条 run_config.permission.mode 只跟开关，不跟点过的标签", () => {
+    const web = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "ui", "server.ts"), "utf8");
+    expect(web).not.toMatch(/run\.permissionMode\s*\?\?\s*matchPermissionMode/);
+    expect(web).toMatch(/tools:\s*cfg\.tools\.map/);
   });
 });
 

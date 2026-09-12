@@ -30,6 +30,8 @@
 | [docs/04-roadmap.md](docs/04-roadmap.md) | 演进路线（v0.1 → v1.1）与每阶段验证 checklist |
 | [docs/08-maturity-optimization-checklist.md](docs/08-maturity-optimization-checklist.md) | 对标成熟 Agent 的分阶段优化清单、优先级与验收证据 |
 | [docs/09-借鉴清单.md](docs/09-借鉴清单.md) | 他山机制的借鉴决策台账：机制对照表 + 借/变形借/不借的理由 + 待借条目的判据（阈值先写） |
+| [docs/10-design-mode-evolution.md](docs/10-design-mode-evolution.md) | 设计模式（已拍板）：统一入口 + 模式内选制品类型 |
+| [docs/11-design-mode-benchmarks-ext.md](docs/11-design-mode-benchmarks-ext.md) | 设计模式外部对标扩展 |
 | [CHANGELOG.md](CHANGELOG.md) | 版本变更日志（Keep a Changelog；每条对应真实提交；Release 正文自动附对应小节） |
 | [docs/reference/README.md](docs/reference/README.md) | `src/` 全部 21 个模块的参考文档（签名与源码逐一核对；由 v1.1 并行编排自举生成，见案例 #2） |
 | [docs/cases/](docs/cases) | 真实任务案例：#1 遥测固件真机闭环、#2 并行编排交付参考文档（墙钟 −43%） |
@@ -65,6 +67,8 @@ npm run agent -- run --yes "……"                                  # 自动批
 npm run agent -- run --verify "……"                               # 完成后 verifier 独立核查，未通过自动返工
 npm run agent -- run --ask "……"                                  # 允许执行前集中提出 1~4 个选择题（可自由输入）
 npm run agent -- run --plan --parallel 3 "……"                    # 分离式并行度不会混入任务正文
+npm run agent -- run --plan --resume-run cli-123                 # 同 run 续发射半截 DAG（至少一枚 passed；预算耗尽则拒）
+npm run agent -- run --resume-run cli-123                        # 同 run 从 main 检查点续跑（飞行中无检查点则拒）
 npm run agent -- --help                                           # 严格参数说明
 npm run agent -- --version
 
@@ -140,6 +144,18 @@ $env:AGENT_VERIFIER_API_KEY  = "sk-..."                           # 可选，缺
 npm run cli -- --verify "……"
 ```
 
+### 设计模式
+
+「设计模式」是进入 HTML 设计台的**推荐入口**（文案用这个名字，不用 OpenDesign 当产品名）。后端仍是现有 `design` 领域包，工具面不另扩权。旧入口 `AGENT_PACK=design` / `AGENT_PRESET=design` 永久保留：未设 `AGENT_MODE=design` 时 CLI 会提示改用设计模式，不中断、不改包。Web 选包下拉仍在。
+
+| 入口 | 用法 |
+|---|---|
+| CLI（推荐） | `AGENT_MODE=design`（与 `AGENT_PACK` 同时出现时显式包优先；与 `--plan` 同用时 `--plan` 优先） |
+| Web UI（推荐） | 会话空态的「设计模式」入口；进入后是统一输入框 + 页签/模板 chip，不是必经侧栏清单 |
+| 旧入口 | `AGENT_PACK=design`（`AGENT_PRESET` 别名）仍按显式选包跑；无 `AGENT_MODE` 时只多一行提示 |
+
+多页幻灯的 PowerPoint 由宿主从 HTML 派生（画布「导出 PowerPoint」）；PDF 仍走打印路径。类型菜单是本仓库注册表（Open Design README 逐条表 + `3d-object`），不是把外部插件目录搬进仓库。拍板口径见 [docs/10-design-mode-evolution.md](docs/10-design-mode-evolution.md)。
+
 ### 端点降级、熔断与能力探针（可选）
 
 配一个备用端点，主端点在瞬时错误（网络/超时/429/5xx）上耗尽重试后自动换过去再试。
@@ -184,22 +200,19 @@ $env:AGENT_FALLBACK_ROUTING          = "prefer_healthy"       # 可选；缺省 
   context-too-long 400 后从报文里学到，按 `provider|model|origin` 记进
   `.agent-capabilities.json`，TTL 30 天）> **registry**（`src/model-windows.ts`，
   每条都带出处）> **未知**。不认识的模型不猜数——猜大了上限虚高照样 400，猜小了白白压缩。
-- **预算** = 我们在多大处压缩（`AGENT_CONTEXT_LIMIT`，默认 150k）。三级覆盖
-  Web 逐 run > env > 领域包 > 默认，再夹进 `窗口 − maxTokens − 边际`
-  （边际 = `max(4k, 2%)`；端点按 messages + max_tokens 之和计超长，2026-09-03 真机实测）。
-
-**预算默认不随窗口自动抬高。** 知道窗口是 1M 不等于该把预算设成 1M：每轮成本与时延随上下文
-线性增长，而压缩的质量损失有账本 + 首行摘录兜着。抬预算是按任务权衡的决定，不该由 harness
-因为"发现窗口更大"替人做。
+- **压缩水位** = 我们在多大处压缩。无覆盖时窗口已知就跟可用窗口走
+  （`窗口 − maxTokens − 边际`）；窗口未知才回落 150k。`AGENT_CONTEXT_LIMIT` /
+  逐 run / 领域包只用来**提前**压缩。边际 = `max(4k, 2%)`。
+  日消耗封顶（`AGENT_TOTAL_TOKEN_BUDGET`、UI 日账本）是另一道闸，跟这里无关。
 
 ```powershell
-$env:AGENT_CONTEXT_LIMIT  = "400000"   # 预算（策略）：默认 150000
+$env:AGENT_CONTEXT_LIMIT  = "400000"   # 可选：提前压缩。不设则跟窗口
 $env:AGENT_CONTEXT_WINDOW = "1048576"  # 窗口（事实）：只在自动解析不对时才需要手填
 ```
 
 两个宿主都把这两个数**各带来源**报出来，不合并成一个百分比：
 
-- **CLI** 启动行 `上下文：预算 150k / 窗口 1,048k（来源：learned）`（或 `窗口未知`）；
+- **CLI** 启动行 `上下文：水位 963k（跟窗口） / 窗口 1,048k（来源：learned）`（或 `窗口未知`）；
   被夹紧另起一行 ⚠ 并写明原值；压缩行带「学到窗口 …（下次运行生效）」。
 - **Web** 提交表单有「上下文预算」控件（区间 `[32k, 上限]`，越界 **400 并报出区间**，
   不静默夹紧；填超过 200k 给成本忠告，不阻断）；水位条是三段——已用 / 预算 / 窗口，
@@ -207,6 +220,19 @@ $env:AGENT_CONTEXT_WINDOW = "1048576"  # 窗口（事实）：只在自动解析
   `run_config` 与 `/api/harness` 的 `context` 字段是这些数字的唯一来源。
 - **台账** 每行记 `context { window, windowSource, budget, budgetSource }`，
   `npm run ledger` 出来源直方图——"我们平均在窗口的几分之几处压"从此可查。
+
+### 项目约定：AGENT.md（指导，不是执行）
+
+领域包纪律仍活在 `DomainPack.systemPrompt` 里（改一条要发版）。项目或个人约定用纯文本 Markdown，可审阅、可进版本控制：
+
+| 层 | 路径 |
+|---|---|
+| 用户全局 | `~/.agent/AGENT.md` |
+| 项目 | `<workdir>/AGENT.md`、`<workdir>/.agent/AGENT.md` |
+| 规则 | `<workdir>/.agent/rules/*.md` |
+| 子目录 | 勾选的额外目录若在项目内，沿路径收集各层 `AGENT.md` |
+
+文件不存在 = 机制不存在。注入进**首条 user 消息**，不进 system prompt，所以它**不能推翻领域包纪律，也不能授予或撤销工具权限**。确定性仍靠 permission 规则与圈禁。加载总量默认 16k 字符，超限会截断并告警（`AGENT_MD_MAX_CHARS`，非法值启动失败）。CLI 启动行与 Web Context 卡会列出实际加载了哪些文件，并写明「指导不是执行」。
 
 ## 在 Cloud Agent 里跑：凭据怎么过去
 

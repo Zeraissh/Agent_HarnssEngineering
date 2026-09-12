@@ -45,7 +45,7 @@ describe("onboarding 纯函数", () => {
 
 describe("initOnboarding", () => {
   beforeEach(() => {
-    document.body.innerHTML = '<select id="workdir-select"></select>';
+    document.body.innerHTML = '<div id="workdir-combobox"><select id="workdir-select"></select></div>';
   });
 
   it("未完成才自动打开；跳过会落盘", () => {

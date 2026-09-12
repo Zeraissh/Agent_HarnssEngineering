@@ -18,6 +18,8 @@ import {
   parseModelsPayload,
   newModelId,
   modelOptionLabel,
+  executorModelOptionLabel,
+  fillExecutorModelSelect,
   roleOptionsFor,
   roleCurrentLabel,
   validateModelDraft,
@@ -115,6 +117,53 @@ describe("模型分组纯函数", () => {
     const idx = SETTINGS_SECTIONS.findIndex((s) => s.id === "settings-models");
     expect(idx).toBe(1);
     expect(SETTINGS_SECTIONS[idx].label).toBe("模型");
+  });
+
+  it("executorModelOptionLabel 附带窗口预览，未知不瞎猜", () => {
+    expect(
+      executorModelOptionLabel({
+        label: "快",
+        provider: "openai",
+        model: "deepseek-v4-flash",
+        contextWindow: { window: 1_048_576, windowSource: "registry" },
+      }),
+    ).toContain("窗口 1048k（登记）");
+    expect(
+      executorModelOptionLabel({
+        label: "怪",
+        provider: "openai",
+        model: "mystery",
+        contextWindow: { window: null, windowSource: "unknown" },
+      }),
+    ).toContain("窗口未知");
+  });
+
+  it("fillExecutorModelSelect 按 roles.executor 选中并画出窗口", () => {
+    const select = document.createElement("select");
+    document.body.appendChild(select);
+    const payload = {
+      models: [
+        {
+          id: "m-fast",
+          label: "快",
+          provider: "openai",
+          model: "deepseek-v4-flash",
+          contextWindow: { window: 1_048_576, windowSource: "registry" },
+        },
+        {
+          id: "m-haiku",
+          label: "小",
+          provider: "anthropic",
+          model: "claude-haiku-4-5",
+          contextWindow: { window: 200_000, windowSource: "registry" },
+        },
+      ],
+      roles: { executor: "m-haiku" },
+    };
+    const result = fillExecutorModelSelect(select, payload);
+    expect(result.selectedId).toBe("m-haiku");
+    expect(select.value).toBe("m-haiku");
+    expect(select.options[1].textContent).toContain("窗口 200k");
   });
 
   it("parseModelsPayload：坏形状 → null；悬空 roles 收编为 null", () => {
@@ -237,13 +286,15 @@ describe("模型分组视图行为", () => {
     expect(document.getElementById("settings-model-form-status").textContent).toContain("HTTPS");
     expect(document.getElementById("settings-models-list").textContent).toContain("模型库为空");
 
-    // 合法输入 → 入库；执行者空缺时自动指派
+    // 合法输入 → 入库并立刻 PUT 落盘；执行者空缺时自动指派
     document.getElementById("settings-model-baseurl").value = "https://api.deepseek.com";
     document.getElementById("settings-model-label").value = "快模型";
     document.getElementById("settings-model-submit").click();
-    expect(document.getElementById("settings-models-list").textContent).toContain("快模型");
+    await new Promise((r) => setTimeout(r, 0));
     expect(document.getElementById("settings-role-executor").value).not.toBe("");
-    expect(document.getElementById("settings-models-status").textContent).toContain("保存后生效");
+    expect(record.put).toBeTruthy();
+    expect(record.put.models.some((m) => m.label === "快模型" || m.model === "deepseek-v4-flash")).toBe(true);
+    expect(document.getElementById("settings-models-status").textContent).toMatch(/\.agent-models\.json|已写入|已保存/);
   });
 
   it("删除被引用的模型：verifier 引用 → 角色重置为跟随执行并提示", async () => {
@@ -284,9 +335,9 @@ describe("模型分组视图行为", () => {
     for (const m of record.putBodies[0].models) expect(m).not.toHaveProperty("apiKey");
     expect(record.putBodies[0].roles).toEqual(SERVER_PAYLOAD.roles);
     expect(host.onModelsSaved).toHaveBeenCalledTimes(1);
-    expect(document.getElementById("settings-models-status").textContent).toContain("进行中的任务不受影响");
+    expect(document.getElementById("settings-models-status").textContent).toMatch(/\.agent-models\.json|进行中的这一轮不受影响/);
 
-    // 编辑快模型并清空 apiKey（碰过 = 清除语义）→ PUT 体带 apiKey: ""
+    // 编辑快模型并清空 apiKey（碰过 = 清除语义）→ 提交即自动落盘，PUT 体带 apiKey: ""
     const rows = [...document.querySelectorAll(".settings-model-row")];
     const fastRow = rows.find((r) => r.textContent.includes("快模型"));
     fastRow.querySelectorAll("button")[0].click(); // 编辑
@@ -294,11 +345,11 @@ describe("模型分组视图行为", () => {
     keyInput.value = "";
     keyInput.dispatchEvent(new window.Event("input", { bubbles: true }));
     document.getElementById("settings-model-submit").click();
-    document.getElementById("settings-models-save").click();
     await new Promise((r) => setTimeout(r, 0));
     expect(record.putBodies).toHaveLength(2);
     expect(record.putBodies[1].models.find((m) => m.id === "m-fast").apiKey).toBe("");
     expect(record.putBodies[1].models.find((m) => m.id === "m-strong")).not.toHaveProperty("apiKey");
+    expect(host.onModelsSaved).toHaveBeenCalledTimes(2);
   });
 
   it("测试连接按钮：表单校验通过后打 POST /api/models/test", async () => {

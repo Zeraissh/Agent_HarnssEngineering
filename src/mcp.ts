@@ -20,6 +20,13 @@
  *       "permission": "auto",
  *       "toolPermissions": { "flash_firmware": "ask", "read_memory": "auto" },
  *       "includeTools": ["start_debug_session", "..."]
+ *     },
+ *     "github": {
+ *       "command": "docker",
+ *       "args": ["run", "-i", "--rm", "-e", "GITHUB_PERSONAL_ACCESS_TOKEN", "-e", "GITHUB_TOOLS", "ghcr.io/github/github-mcp-server"],
+ *       "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_PERSONAL_ACCESS_TOKEN}" },
+ *       "requiredEnv": ["GITHUB_PERSONAL_ACCESS_TOKEN"],
+ *       "includeTools": ["get_file_contents", "create_pull_request"]
  *     }
  *   }
  * }
@@ -50,6 +57,18 @@ export interface McpServerConfig {
   parallelSafe?: boolean;
   /** 只暴露这些工具（可选，控制工具面大小） */
   includeTools?: string[];
+  /**
+   * SAFE-06：按 MCP 原始工具名显式标副作用。启发式认不出的写工具靠这份名单进事务。
+   * 只能扩进事务，不能把已命中启发式的写工具摘出去。
+   */
+  sideEffectTools?: string[];
+  /** 默认 true。设置页的停用开关；false 时不拉起进程。 */
+  enabled?: boolean;
+  /**
+   * 这些环境变量在展开后仍为空则跳过连接（同 web_search：没 key 就不进面）。
+   * 避免每次启动都去拉 docker / npx 再失败。
+   */
+  requiredEnv?: string[];
 }
 
 export interface McpConfig {
@@ -143,6 +162,7 @@ export interface McpToolInfo {
   name: string;
   description?: string;
   inputSchema?: unknown;
+  annotations?: { destructiveHint?: boolean };
 }
 
 export type McpCaller = (
@@ -154,9 +174,12 @@ export function adaptMcpTool(
   serverName: string,
   info: McpToolInfo,
   call: McpCaller,
-  cfg: Pick<McpServerConfig, "permission" | "toolPermissions" | "parallelSafe">,
+  cfg: Pick<McpServerConfig, "permission" | "toolPermissions" | "parallelSafe" | "sideEffectTools">,
 ): Tool {
   const permission = resolveMcpToolPermission(info.name, cfg);
+  const sideEffect =
+    info.annotations?.destructiveHint === true
+    || Boolean(cfg.sideEffectTools?.includes(info.name));
   const tool: Tool = {
     name: `${serverName}__${info.name}`,
     description: info.description?.trim() || `Tool "${info.name}" provided by MCP server "${serverName}".`,
@@ -165,6 +188,7 @@ export function adaptMcpTool(
     parallelSafe: cfg.parallelSafe ?? false,
     // MCP 可能控制进程、云资源或真实硬件；没有更细策略前一律只准单次审批。
     ...(permission === "ask" ? { approvalPolicy: { maxScope: "once" as const } } : {}),
+    ...(sideEffect ? { sideEffect: true } : {}),
     async execute(input) {
       const args = (input ?? {}) as Record<string, unknown>;
       const result = await call(info.name, args);
@@ -220,7 +244,7 @@ export class McpConnection {
     const transport = new StdioClientTransport({
       command: cfg.command,
       args: cfg.args ?? [],
-      env: { ...getDefaultEnvironment(), ...cfg.env },
+      env: { ...getDefaultEnvironment(), ...resolveMcpServerEnv(cfg) },
       ...(cfg.cwd ? { cwd: cfg.cwd } : {}),
     });
     const client = new Client({ name: "agent-harness", version: "0.7.0" });
@@ -260,7 +284,14 @@ export class McpConnection {
       .map((t) =>
         adaptMcpTool(
           this.serverName,
-          { name: t.name, description: t.description, inputSchema: t.inputSchema },
+          {
+            name: t.name,
+            description: t.description,
+            inputSchema: t.inputSchema,
+            ...(t.annotations?.destructiveHint === true
+              ? { annotations: { destructiveHint: true } }
+              : {}),
+          },
           (name, args) => this.call(name, args),
           this.cfg,
         ),
@@ -299,7 +330,118 @@ export interface McpRuntime {
   tools: Tool[];
   /** serverName → 工具数（宿主打印用） */
   summary: Record<string, number>;
+  /** 未拉起的 server → 原因（disabled / missing ENV）。不是连接失败。 */
+  skipped: Record<string, string>;
+  /** 尝试拉起但失败的 server → 错误原文。 */
+  failed: Record<string, string>;
   close(): Promise<void>;
+}
+
+const ENV_PLACEHOLDER = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
+
+/** 展开 mcp.json env 里的 `${VAR}`；空值回退同名进程环境变量。 */
+export function interpolateMcpEnvValue(raw: string, env: NodeJS.ProcessEnv = process.env): string {
+  return raw.replace(ENV_PLACEHOLDER, (_, name: string) => env[name] ?? "");
+}
+
+/**
+ * 解析一个 server 实际传给子进程的 env。
+ * `GITHUB_PERSONAL_ACCESS_TOKEN` 空时再试 `AGENT_GITHUB_TOKEN` / `GITHUB_TOKEN`
+ * （与 web_search 认两个 Tavily key 名同款）。
+ */
+export function resolveMcpServerEnv(
+  cfg: McpServerConfig,
+  env: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, raw] of Object.entries(cfg.env ?? {})) {
+    const expanded = interpolateMcpEnvValue(String(raw ?? ""), env);
+    out[key] = expanded.trim() ? expanded : (env[key] ?? "");
+  }
+  if (!(out.GITHUB_PERSONAL_ACCESS_TOKEN ?? "").trim()) {
+    const alias = (env.AGENT_GITHUB_TOKEN ?? env.GITHUB_TOKEN ?? "").trim();
+    if (alias) out.GITHUB_PERSONAL_ACCESS_TOKEN = alias;
+  }
+  return out;
+}
+
+/** 展开后仍会真正拉起 stdio 进程的 server。跳过项不触发 SAFE-05 的 host-MCP 拒绝。 */
+export function mcpConfigHasRunnableServers(
+  config: McpConfig | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (!config) return false;
+  return Object.values(config.servers).some((cfg) => !mcpServerSkipReason(cfg, resolveMcpServerEnv(cfg, env)));
+}
+
+/** 没配齐就不连：空壳 server 会诱使模型重试，并把失败归咎于自己。 */
+export function mcpServerSkipReason(
+  cfg: McpServerConfig,
+  resolvedEnv: Record<string, string> = resolveMcpServerEnv(cfg),
+): string | undefined {
+  if (cfg.enabled === false) return "disabled";
+  for (const key of cfg.requiredEnv ?? []) {
+    if (!(resolvedEnv[key] ?? "").trim()) return `missing ${key}`;
+  }
+  return undefined;
+}
+
+/**
+ * 按包的 MCP 接入面挑选要连接的 server。
+ * 连接层是并集，但**进程**按当前包需要的那些拉起——ts-coding 不得顺带启动 stm32。
+ * 包 `mcp: false` → 不连包声明的 server；`hostGithub` 仍可单独拉起 github。
+ * server 自己没写 includeTools 时无法证明不相交，保守保留。
+ */
+export function filterMcpConfigForPack(
+  config: McpConfig,
+  packMcp: boolean | { includeTools?: string[] } | undefined,
+  opts: { hostGithub?: boolean } = {},
+): McpConfig | undefined {
+  let servers: Record<string, McpServerConfig> | undefined;
+  if (packMcp === false) {
+    servers = undefined;
+  } else {
+    const wanted = packMcp && typeof packMcp === "object" ? packMcp.includeTools : undefined;
+    if (!wanted?.length) return withHostGithubServer(config, config, opts.hostGithub);
+    const allow = new Set(wanted);
+    const sliced: Record<string, McpServerConfig> = {};
+    for (const [name, cfg] of Object.entries(config.servers)) {
+      if (!cfg.includeTools?.length) {
+        sliced[name] = cfg;
+        continue;
+      }
+      if (cfg.includeTools.some((tool) => allow.has(tool))) sliced[name] = cfg;
+    }
+    servers = Object.keys(sliced).length ? sliced : undefined;
+  }
+  const next = servers ? { servers } : undefined;
+  return withHostGithubServer(config, next, opts.hostGithub);
+}
+
+function withHostGithubServer(
+  full: McpConfig,
+  slice: McpConfig | undefined,
+  hostGithub?: boolean,
+): McpConfig | undefined {
+  if (!hostGithub) return slice;
+  const github = full.servers.github;
+  if (!github) return slice;
+  if (!slice) return { servers: { github } };
+  if (slice.servers.github) return slice;
+  return { servers: { ...slice.servers, github } };
+}
+
+export function mergeMcpRuntimes(base: McpRuntime | undefined, extra: McpRuntime): McpRuntime {
+  if (!base) return extra;
+  return {
+    tools: [...base.tools, ...extra.tools],
+    summary: { ...base.summary, ...extra.summary },
+    skipped: { ...base.skipped, ...extra.skipped },
+    failed: { ...base.failed, ...extra.failed },
+    close: async () => {
+      await Promise.allSettled([base.close(), extra.close()]);
+    },
+  };
 }
 
 /** 连接配置里的全部 server；单个失败不拖垮整体（打印警告继续） */
@@ -310,8 +452,15 @@ export async function connectMcpServers(
   const connections: McpConnection[] = [];
   const tools: Tool[] = [];
   const summary: Record<string, number> = {};
+  const skipped: Record<string, string> = {};
+  const failed: Record<string, string> = {};
 
   for (const [name, cfg] of Object.entries(config.servers)) {
+    const skip = mcpServerSkipReason(cfg);
+    if (skip) {
+      skipped[name] = skip;
+      continue;
+    }
     try {
       const conn = await McpConnection.connect(name, cfg);
       const serverTools = await conn.tools();
@@ -319,13 +468,17 @@ export async function connectMcpServers(
       tools.push(...serverTools);
       summary[name] = serverTools.length;
     } catch (err) {
-      onWarn(`mcp: failed to connect "${name}": ${err instanceof Error ? err.message : String(err)}`);
+      const message = err instanceof Error ? err.message : String(err);
+      failed[name] = message;
+      onWarn(`mcp: failed to connect "${name}": ${message}`);
     }
   }
 
   return {
     tools,
     summary,
+    skipped,
+    failed,
     close: async () => {
       await Promise.allSettled(connections.map((c) => c.close()));
     },
@@ -365,6 +518,31 @@ export async function loadMcpConfig(configPath: string): Promise<McpConfig | und
       if (!isToolPermission(permission)) {
         throw new Error(
           `Invalid MCP config ${configPath}: server "${serverName}" tool "${toolName}" permission must be "auto" | "ask" | "deny"`,
+        );
+      }
+    }
+    if (cfg.sideEffectTools !== undefined) {
+      if (
+        !Array.isArray(cfg.sideEffectTools)
+        || cfg.sideEffectTools.some((name) => typeof name !== "string" || !name.trim())
+      ) {
+        throw new Error(
+          `Invalid MCP config ${configPath}: server "${serverName}" sideEffectTools must be an array of tool names`,
+        );
+      }
+    }
+    if (cfg.enabled !== undefined && typeof cfg.enabled !== "boolean") {
+      throw new Error(
+        `Invalid MCP config ${configPath}: server "${serverName}" enabled must be a boolean`,
+      );
+    }
+    if (cfg.requiredEnv !== undefined) {
+      if (
+        !Array.isArray(cfg.requiredEnv)
+        || cfg.requiredEnv.some((name) => typeof name !== "string" || !name.trim())
+      ) {
+        throw new Error(
+          `Invalid MCP config ${configPath}: server "${serverName}" requiredEnv must be an array of environment variable names`,
         );
       }
     }

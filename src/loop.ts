@@ -11,6 +11,7 @@ import { createHash } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { countModelError, countModelRetry, observeToolSeconds } from "./metrics.js";
 import { parseContextWindowFromOverflowError } from "./model-capability.js";
+import { rejectWhenAborted } from "./abort.js";
 import { apiErrorClass, classifyApiError, isContextOverflowError, isTransientApiError } from "./model-client.js";
 import { decideRecovery } from "./recovery.js";
 import {
@@ -275,6 +276,7 @@ export class AgentLoop {
       cfg.readRoots,
       cfg.executionBroker,
       cfg.toolResultMaxChars,
+      cfg.writeRoots,
     );
     // SAFE-06：有 runId 就武装事务层。宿主可注入持久化 controller；否则内存表。
     if (cfg.runId) {
@@ -313,6 +315,14 @@ export class AgentLoop {
     const queue = new AsyncEventQueue<TurnEvent>();
     this.startDrive(userInput, signal ?? new AbortController().signal, queue);
     return queue;
+  }
+
+  /**
+   * AGENT-02：父执行谱系的活预算引用。spawn_task 子支线必须扣同一份账，
+   * 不能另开额度——宿主在工具回调里拿这个引用注入子 AgentLoop。
+   */
+  getRunBudget(): SharedRunBudget {
+    return this.runBudget;
   }
 
   /**
@@ -372,6 +382,7 @@ export class AgentLoop {
       block.input,
       this.cfg.workdir,
       this.cfg.readRoots,
+      this.cfg.writeRoots,
     );
     q.push({
       type: "approval_request",
@@ -570,6 +581,11 @@ export class AgentLoop {
         q.push(event);
       });
     }
+    if (this.cfg.hooks) {
+      this.executor.setHooks(this.cfg.hooks, (event) => {
+        q.push(event);
+      });
+    }
     // 续跑正史：有 toolTx 种子时走 mid-tool 计划（幂等重放 / bash fail-closed）；
     // 否则 P6 全员合成 ABORTED——否则下一次请求被端点整条拒绝。
     if (history) {
@@ -604,13 +620,31 @@ export class AgentLoop {
       cacheHitRatio: 0,
     };
 
-    const finish = (
+    const finish = async (
       stopReason: AgentRunResult["stopReason"],
       error?: Error,
       completion?: TaskCompletion,
-    ): void => {
+    ): Promise<void> => {
       const denom = usage.inputTokens + usage.cacheCreationTokens + usage.cacheReadTokens;
       usage.cacheHitRatio = denom > 0 ? usage.cacheReadTokens / denom : 0;
+      // Stop 必须赶在 done 之前进队列：fire-and-forget 会让宿主先看到终止。
+      if (this.cfg.hooks) {
+        try {
+          await this.cfg.hooks.runStop(
+            { stopReason, ...(this.cfg.runId ? { runId: this.cfg.runId } : {}) },
+            (event) => {
+              q.push(event);
+            },
+          );
+        } catch (err) {
+          q.push({
+            type: "hook",
+            hook: "Stop",
+            outcome: "error",
+            detail: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
       q.push({
         type: "done",
         result: {
@@ -660,7 +694,7 @@ export class AgentLoop {
       // 护栏检查发生在每次模型调用之前（契约 4）
       if (signal.aborted) {
         // 不是 error：人叫停是决定不是故障（见 AgentRunResult.stopReason 注释）
-        return finish("aborted");
+        return await finish("aborted");
       }
       if (
         (this.runBudget.maxTurns !== undefined &&
@@ -668,7 +702,7 @@ export class AgentLoop {
         (this.runBudget.maxTokens !== undefined &&
           this.runBudget.usedTokens >= this.runBudget.maxTokens)
       ) {
-        return finish("budget_exhausted");
+        return await finish("budget_exhausted");
       }
 
       /**
@@ -677,9 +711,9 @@ export class AgentLoop {
        */
       if (turn >= turnCeiling) {
         if (!this.cfg.requireTerminalTool || !this.cfg.terminalTool) {
-          return finish("max_turns");
+          return await finish("max_turns");
         }
-        if (forceTerminal) return finish(forcedFailureReason);
+        if (forceTerminal) return await finish(forcedFailureReason);
 
         const decision = decideRecovery({
           trigger: "max_turns",
@@ -715,14 +749,14 @@ export class AgentLoop {
           : undefined;
       try {
         // 等锁期间其它并发轨可能已经把共享总账用完，必须在真正发请求前复查。
-        if (signal.aborted) return finish("aborted");
+        if (signal.aborted) return await finish("aborted");
         if (
           (this.runBudget.maxTurns !== undefined &&
             this.runBudget.usedTurns >= this.runBudget.maxTurns) ||
           (this.runBudget.maxTokens !== undefined &&
             this.runBudget.usedTokens >= this.runBudget.maxTokens)
         ) {
-          return finish("budget_exhausted");
+          return await finish("budget_exhausted");
         }
 
         /**
@@ -755,7 +789,7 @@ export class AgentLoop {
 
         // 压缩替换正史（一次性、确定性），保证后续请求前缀稳定（见 context.ts 注释）
         // Phase B：可选 LLM 摘要经 compactAsync；未配置客户端时与 Phase A 同步路径等价
-        const compacted = await this.context.compactAsync(messages, signal);
+        const compacted = await rejectWhenAborted(this.context.compactAsync(messages, signal), signal);
         if (compacted.changed) {
           messages = compacted.messages;
           q.push({
@@ -784,27 +818,35 @@ export class AgentLoop {
         // 同轮重试：SDK 的 HTTP 重试耗尽后，loop 层对瞬时错误再兜 errorRetries 次。
         // 请求是幂等的（同一 request 重发），非瞬时错误（认证/4xx/abort）立即终止。
         for (let attempt = 0; ; attempt++) {
+          const startedAt = Date.now();
+          q.push({ type: "model_call_start", turn, attempt });
           try {
-            modelTurn = await this.model.send(
-              request,
-              (delta) =>
-                q.push(
-                  delta.kind === "thinking"
-                    ? { type: "thinking_delta", text: delta.text }
-                    : { type: "text_delta", text: delta.text },
-                ),
-              // 中止位不能只在轮与轮之间查：一次长生成就是一次调用，
-              // 不把 signal 交给 SDK，"停止"就要等这一整轮吐完才生效
+            modelTurn = await rejectWhenAborted(
+              this.model.send(
+                request,
+                (delta) =>
+                  q.push(
+                    delta.kind === "thinking"
+                      ? { type: "thinking_delta", text: delta.text }
+                      : { type: "text_delta", text: delta.text },
+                  ),
+                // 中止位不能只在轮与轮之间查：一次长生成就是一次调用，
+                // 不把 signal 交给 SDK，"停止"就要等这一整轮吐完才生效。
+                // 兼容端点常吞掉 signal——rejectWhenAborted 再赛一次，点停止立即收尾。
+                signal,
+              ),
               signal,
             );
+            q.push({ type: "model_call_end", turn, attempt, status: "ok", durationMs: Date.now() - startedAt });
             break;
           } catch (err) {
+            q.push({ type: "model_call_end", turn, attempt, status: "error", durationMs: Date.now() - startedAt });
             /**
              * 中止把在飞的请求掐断，SDK 会抛 AbortError——那不是故障。
              * 不在这里分出去的话，"我按了停止"会被画成"它崩了"，
              * 而且 error 路径还会触发段级续跑（9.8），变成"停一下又自己接着跑"。
              */
-            if (signal.aborted) return finish("aborted");
+            if (signal.aborted) return await finish("aborted");
             /**
              * 反应式压缩（MEM-01 Phase C）：端点明说"prompt is too long"/
              * context_length_exceeded 是**永久性** 400，此前直接 finish("error")——
@@ -829,10 +871,13 @@ export class AgentLoop {
                   /* 学习失败就当没学到；反应式压缩照常 */
                 }
               }
-              const hard = await this.context.compactAsync(messages, signal, {
-                force: true,
-                protectRecent: REACTIVE_PROTECT_RECENT,
-              });
+              const hard = await rejectWhenAborted(
+                this.context.compactAsync(messages, signal, {
+                  force: true,
+                  protectRecent: REACTIVE_PROTECT_RECENT,
+                }),
+                signal,
+              );
               if (hard.changed) {
                 messages = hard.messages;
                 q.push({
@@ -857,7 +902,7 @@ export class AgentLoop {
               // 本项目一贯反对的做法。
               // OBS-02：终局错误按类计数（标签用固定枚举，不用给人看的那句话）
               countModelError(apiErrorClass(err));
-              return finish("error", new Error(classifyApiError(err), { cause: err }));
+              return await finish("error", new Error(classifyApiError(err), { cause: err }));
             }
             const backoffMs = backoffWithJitter(this.errorRetryBackoffMs, attempt);
             // OBS-02：轮内自愈的次数——端点抖动在它上面先亮，而 run 仍然会成功
@@ -934,9 +979,9 @@ export class AgentLoop {
         case "end_turn":
         case "stop_sequence": {
           if (!this.cfg.requireTerminalTool || !this.cfg.terminalTool) {
-            return finish("completed");
+            return await finish("completed");
           }
-          if (forceTerminal) return finish(forcedFailureReason);
+          if (forceTerminal) return await finish(forcedFailureReason);
 
           const decision = decideRecovery({
             trigger: "end_turn_without_completion",
@@ -965,16 +1010,16 @@ export class AgentLoop {
 
         case "refusal":
           // 不用同一 prompt 重试（API 硬约束 7）
-          return finish("refusal");
+          return await finish("refusal");
 
         case "max_tokens": {
           // 优雅终止而非报废整轮：部分 assistant 内容已入历史、assistant_text 已发出，
           // 都得以保留。max_tokens 是刻意的护栏（防本地模型跑飞/上下文预算），撞上限
           // 说明本轮输出需要更多空间——提高 maxTokens 即可，而非丢弃已完成的工作。
           if (!this.cfg.requireTerminalTool || !this.cfg.terminalTool) {
-            return finish("max_tokens");
+            return await finish("max_tokens");
           }
-          if (forceTerminal) return finish(forcedFailureReason);
+          if (forceTerminal) return await finish(forcedFailureReason);
           const decision = decideRecovery({
             trigger: "max_tokens_without_completion",
             policy: this.cfg.recovery,
@@ -1051,13 +1096,13 @@ export class AgentLoop {
               if (invalid) {
                 // 强制收口段也给一次修正 schema 的机会；仍受总预算约束。
                 if (forceTerminal) {
-                  if (terminalCorrectionUsed) return finish(forcedFailureReason);
+                  if (terminalCorrectionUsed) return await finish(forcedFailureReason);
                   terminalCorrectionUsed = true;
                   turnCeiling = turn + 1;
                 }
                 continue;
               }
-              return finish(
+              return await finish(
                 resolution?.stopReason ?? "completed",
                 undefined,
                 resolution?.completion,
@@ -1149,6 +1194,7 @@ export class AgentLoop {
               }
             },
           );
+          if (signal.aborted) return await finish("aborted");
 
           // 目标级进展判定：相同调用与相同观察才算重复；tool_use_id 不参与签名。
           const signature = observationSignature(blocks, results);
@@ -1199,7 +1245,7 @@ export class AgentLoop {
         }
 
         default:
-          return finish(
+          return await finish(
             "error",
             new Error(`Unhandled stop_reason: ${String(modelTurn.stopReason)}`),
           );

@@ -1,29 +1,29 @@
 /**
- * 上下文**窗口**（事实）与压缩**预算**（策略）——MEM-01 的两个概念，此前是一个数。
+ * 上下文**窗口**（事实）与压缩**水位**（策略）——MEM-01 的两个概念，此前是一个数。
  *
- * `contextTokenLimit`（默认 150k，env `AGENT_CONTEXT_LIMIT`，包 `guardrails.contextTokenLimit`）
+ * `contextTokenLimit`（env `AGENT_CONTEXT_LIMIT`，包 `guardrails.contextTokenLimit`）
  * 一直同时充当"模型能装多少"与"我们在多少处压缩"。真机实测 deepseek-v4-flash 的窗口是
- * 1,048,576（我们在它 11% 处就压），而一个 128k 的模型永远到不了主动压缩（150k > 窗口），
- * 只能靠反应式压缩白吃一次 400。两个概念分开之后：
+ * 1,048,576；旧默认把水位钉在 150k，等于在窗口 11% 处就压。成熟 agent 的做法是
+ * **窗口已知就跟可用窗口走**（窗口 − 输出上限 − 边际），不是另设一笔"token 预算"。
+ * 日消耗 / 总消耗封顶（`AGENT_TOTAL_TOKEN_BUDGET`、UI 日账本）是成本闸门，跟这里无关。
  *
  *  - **窗口** `contextWindowTokens`：端点会在多大处拒收。来源按优先级
  *    env `AGENT_CONTEXT_WINDOW` > learned（撞过的 400 报文里的数，`model-capability.ts`）
  *    > registry（`model-windows.ts`，有出处的登记表）> unknown。
- *  - **预算** `contextTokenLimit`：名字与 env 保持不变（兼容）。默认**仍是 150k**——
- *    知道窗口是 1M 不等于该把预算抬到 1M：每轮成本与时延随上下文线性增长，
- *    而压缩带来的质量损失有账本 / 摘录兜着；抬预算是委托方按任务权衡的决定，不该由
- *    harness 因为"发现窗口更大"自动替人做。三级覆盖 run（Web 逐 run）> env > 包 > 默认。
+ *  - **水位** `contextTokenLimit`：名字与 env 保持不变（兼容）。无 run / env / 包覆盖时：
+ *    窗口已知 → 用 `maxBudget`（来源 `window`）；窗口未知 → 回落 150k（来源 `default`）。
+ *    显式覆盖仍是 run > env > 包，用来**提前**压缩，不是再发明一笔独立预算。
  *  - **夹紧**：窗口已知时 `maxBudget = window − maxTokens − margin`（端点按 messages + max_tokens
- *    之和计超长，2026-09-03 真机实测），预算超过就夹到上限并**发出告警**——这不是静默降级：
+ *    之和计超长，2026-09-03 真机实测），显式水位超过就夹到上限并**发出告警**——这不是静默降级：
  *    夹紧值与被夹的原值都报出来（CLI 启动行 / Web run_config / 台账）。
  */
 import { getLearnedContextWindow, type EndpointIdentity } from "./model-capability.js";
 import { registryContextWindow } from "./model-windows.js";
 
 export type ContextWindowSource = "env" | "learned" | "registry" | "unknown";
-export type ContextBudgetSource = "run" | "env" | "pack" | "default";
+export type ContextBudgetSource = "run" | "env" | "pack" | "window" | "default";
 
-/** 默认预算：保守值，见文件头。不随窗口自动抬高 */
+/** 窗口未知时的回落水位。窗口已知时默认跟 maxBudget，不再钉这个数 */
 export const DEFAULT_CONTEXT_TOKEN_LIMIT = 150_000;
 /** 逐 run 预算下限：再小连任务首条 user 消息 + 保护窗都装不下，压缩会每轮开火 */
 export const MIN_CONTEXT_TOKEN_LIMIT = 32_000;
@@ -131,10 +131,23 @@ export interface ContextPlan {
   warning: string | null;
 }
 
-/** 预算三级覆盖 + 夹紧。纯函数，可测 */
+/** 无显式覆盖时的水位：窗口已知跟可用窗口，未知才回落 150k */
+function implicitCompactLimit(inputs: ContextBudgetInputs): { requested: number; source: ContextBudgetSource } {
+  if (inputs.window !== null) {
+    const cap = maxContextBudget(inputs.window, inputs.maxTokens);
+    return {
+      requested: cap > 0 ? Math.min(CONTEXT_TOKEN_LIMIT_HARD_CAP, cap) : CONTEXT_BUDGET_FLOOR,
+      source: "window",
+    };
+  }
+  return { requested: DEFAULT_CONTEXT_TOKEN_LIMIT, source: "default" };
+}
+
+/** 水位覆盖 + 夹紧。纯函数，可测 */
 export function planContextBudget(inputs: ContextBudgetInputs): ContextPlan {
+  const implicit = implicitCompactLimit(inputs);
   const requested =
-    inputs.runLimit ?? inputs.envLimit ?? inputs.packLimit ?? DEFAULT_CONTEXT_TOKEN_LIMIT;
+    inputs.runLimit ?? inputs.envLimit ?? inputs.packLimit ?? implicit.requested;
   const budgetSource: ContextBudgetSource =
     inputs.runLimit !== undefined
       ? "run"
@@ -142,7 +155,7 @@ export function planContextBudget(inputs: ContextBudgetInputs): ContextPlan {
         ? "env"
         : inputs.packLimit !== undefined
           ? "pack"
-          : "default";
+          : implicit.source;
   const maxBudget = inputs.window === null ? null : maxContextBudget(inputs.window, inputs.maxTokens);
 
   if (maxBudget === null || requested <= maxBudget) {
@@ -237,15 +250,17 @@ export function describeContextWindow(plan: Pick<ContextPlan, "window" | "window
 }
 
 /**
- * CLI 启动行：`上下文：预算 150k / 窗口 1,048k（来源：learned）`。
- * 预算不是默认值时带来源（`预算 200k（env）`），被夹紧时写明原值（`预算 60k（由 150k 夹紧）`）——
+ * CLI 启动行：`上下文：水位 963k（跟窗口） / 窗口 1,048k（来源：learned）`。
+ * 显式覆盖带来源（`水位 200k（env）`），被夹紧时写明原值（`水位 60k（由 150k 夹紧）`）——
  * 数字必须带来源，否则无从判断"这是不是我要的那个值"。
  */
 export function describeContextPlan(plan: ContextPlan): string {
   const budget = plan.clamped
-    ? `预算 ${formatTokensK(plan.budget)}（由 ${formatTokensK(plan.requestedBudget)} 夹紧）`
-    : plan.budgetSource === "default"
-      ? `预算 ${formatTokensK(plan.budget)}`
-      : `预算 ${formatTokensK(plan.budget)}（${plan.budgetSource}）`;
+    ? `水位 ${formatTokensK(plan.budget)}（由 ${formatTokensK(plan.requestedBudget)} 夹紧）`
+    : plan.budgetSource === "window"
+      ? `水位 ${formatTokensK(plan.budget)}（跟窗口）`
+      : plan.budgetSource === "default"
+        ? `水位 ${formatTokensK(plan.budget)}`
+        : `水位 ${formatTokensK(plan.budget)}（${plan.budgetSource}）`;
   return `上下文：${budget} / ${describeContextWindow(plan)}`;
 }

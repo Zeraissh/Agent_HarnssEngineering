@@ -18,6 +18,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -26,6 +28,11 @@ jobs:
       - run: npm audit
       - run: npm run typecheck
       - run: npm run test:coverage
+      - name: TEST-01 changed-line coverage
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch --no-tags origin "${{ github.base_ref }}"
+          npm run test:changed-coverage -- --base "origin/${{ github.base_ref }}"
       - run: npm run test:mutation-smoke
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v4

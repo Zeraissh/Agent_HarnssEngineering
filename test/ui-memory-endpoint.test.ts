@@ -8,7 +8,7 @@
  *   a. 目录不存在 → 200 空列表（不报错）
  *   b. 列表条目含 名称 / 摘要（去 # 前缀）/ 大小 / 修改时间
  *   c. 读取单条记忆全文（内容往返一致）
- *   d. 未知名字 → 404；非法名字（无 .md / 含 .. / 含斜杠）→ 404（路由层圈禁）
+ *   d. 未知名字 → 404；非法名字（无 .md / 含 ..）→ 404；嵌套 lessons/foo.md 可读
  *   e. 超过 256KB → 截断 + truncated 标记
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -111,8 +111,10 @@ describe("T5 /api/memory 记忆端点", () => {
     expect(body.truncated).toBe(false);
   });
 
-  it("d. 未知名字 404；非法名字在路由层圈禁（404）", async () => {
+  it("d. 未知名字 404；非法名字在路由层圈禁（404）；嵌套路径可读", async () => {
     await seedMemory("exists.md", "内容\n");
+    await mkdir(join(dir, ".agent-memory", "lessons"), { recursive: true });
+    await writeFile(join(dir, ".agent-memory", "lessons", "shell.md"), "嵌套内容\n", "utf8");
     const base = await boot();
 
     const missing = await fetch(`${base}/api/memory/nope.md`);
@@ -125,8 +127,13 @@ describe("T5 /api/memory 记忆端点", () => {
     // 路径穿越（百分号编码的 ../ 也挡）
     expect((await fetch(`${base}/api/memory/..%2Fsecret.md`)).status).toBe(404);
     expect((await fetch(`${base}/api/memory/..%2F..%2Fpackage.json.md`)).status).toBe(404);
-    // 子目录（名字字符集不含 "/"）
-    expect((await fetch(`${base}/api/memory/sub%2Fdir.md`)).status).toBe(404);
+    // 嵌套：编码斜杠与真实路径段均可（与 MemoryStore.NAME_RE 对齐）
+    const encoded = await fetch(`${base}/api/memory/lessons%2Fshell.md`);
+    expect(encoded.status).toBe(200);
+    expect(((await encoded.json()) as { content: string }).content).toBe("嵌套内容\n");
+    const nested = await fetch(`${base}/api/memory/lessons/shell.md`);
+    expect(nested.status).toBe(200);
+    expect(((await nested.json()) as { name: string }).name).toBe("lessons/shell.md");
     // 真文件仍在，圈禁不影响合法读取
     expect((await fetch(`${base}/api/memory/exists.md`)).status).toBe(200);
   });
@@ -142,5 +149,74 @@ describe("T5 /api/memory 记忆端点", () => {
     expect(body.sizeBytes).toBe(300_000);
     expect(Buffer.byteLength(body.content, "utf8")).toBeLessThanOrEqual(256 * 1024);
     expect(body.content.length).toBeLessThan(big.length);
+  });
+
+  it("f. 默认 scope=current 带 project/shared/scope；未打标文件在本目录仍可见", async () => {
+    await seedMemory("deploy-ports.md", "# 部署端口\n\nStaging 7788\n");
+    await mkdir(join(dir, ".agent-memory", "lessons"), { recursive: true });
+    await writeFile(join(dir, ".agent-memory", "lessons", "shell.md"), "# Git Bash\n", "utf8");
+    const base = await boot();
+    const res = await fetch(`${base}/api/memory`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      project: string;
+      shared: boolean;
+      status: null;
+      entries: Array<{ name: string; scope: string }>;
+    };
+    expect(body.shared).toBe(false);
+    expect(body.project).toBeTruthy();
+    expect(body.status).toBeNull();
+    expect(body.entries.map((e) => e.name)).toEqual(["deploy-ports.md", "lessons/shell.md"]);
+    expect(body.entries.find((e) => e.name === "lessons/shell.md")?.scope).toBe("global");
+    expect(body.entries.find((e) => e.name === "deploy-ports.md")?.scope).toBe("current");
+  });
+
+  it("g. scope=current 藏其它项目；scope=all 摊开；进行中看板单独给出", async () => {
+    await seedMemory("deploy-ports.md", "# 部署端口\n");
+    await mkdir(join(dir, ".agent-memory", "projects", "other-team"), { recursive: true });
+    await writeFile(
+      join(dir, ".agent-memory", "projects", "other-team", "note.md"),
+      "# 别的项目\n",
+      "utf8",
+    );
+    await seedMemory(
+      "in-progress.md",
+      [
+        "---",
+        "kind: in-progress",
+        "project: demo",
+        "updatedAt: 2026-09-12T00:00:00.000Z",
+        "---",
+        "# 规格待签字",
+        "",
+        "## 谁在等",
+        "- 委托方：规格签字",
+        "",
+        "## 下一门",
+        "评审会",
+        "",
+        "## 未决决策",
+        "- 是否先出幻灯",
+        "",
+      ].join("\n"),
+    );
+    const base = await boot();
+    const current = (await (await fetch(`${base}/api/memory`)).json()) as {
+      status: { summary: string; nextGate: string } | null;
+      entries: Array<{ name: string; scope: string }>;
+    };
+    expect(current.status).toMatchObject({ summary: "规格待签字", nextGate: "评审会" });
+    expect(current.entries.map((e) => e.name)).toEqual(["deploy-ports.md", "in-progress.md"]);
+    expect(current.entries.find((e) => e.name === "in-progress.md")?.scope).toBe("in-progress");
+
+    const all = (await (await fetch(`${base}/api/memory?scope=all`)).json()) as {
+      entries: Array<{ name: string }>;
+    };
+    expect(all.entries.map((e) => e.name)).toEqual([
+      "deploy-ports.md",
+      "in-progress.md",
+      "projects/other-team/note.md",
+    ]);
   });
 });

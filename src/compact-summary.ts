@@ -80,6 +80,7 @@ export function parseCompactSummaryResponse(raw: string): CompactSummaryEnrichme
   pushStrings(additions.failures, obj.failures);
   pushStrings(additions.evidence, obj.evidence);
   pushStrings(additions.sideEffects, obj.sideEffects);
+  pushStrings(additions.deliverables, obj.deliverables);
 
   let narrative: string | undefined;
   if (typeof obj.narrative === "string" && obj.narrative.trim()) {
@@ -91,7 +92,8 @@ export function parseCompactSummaryResponse(raw: string): CompactSummaryEnrichme
       additions.decisions.length +
       additions.failures.length +
       additions.evidence.length +
-      additions.sideEffects.length >
+      additions.sideEffects.length +
+      additions.deliverables.length >
     0;
   if (!hasBuckets && !narrative) return null;
   return { additions, ...(narrative ? { narrative } : {}) };
@@ -217,7 +219,8 @@ function bucketCount(ledger: CompactLedger): number {
     ledger.decisions.length +
     ledger.failures.length +
     ledger.evidence.length +
-    ledger.sideEffects.length
+    ledger.sideEffects.length +
+    ledger.deliverables.length
   );
 }
 

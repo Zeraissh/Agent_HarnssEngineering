@@ -11,8 +11,8 @@ export const ONBOARDING_STEPS = [
   {
     id: "workdir",
     title: "先圈定工作目录",
-    body: "工具只能碰这个目录。新建任务前先选好项目，欢迎页那一行也会带你过来。",
-    target: "#workdir-select",
+    body: "工具写入圈是白名单里的全部目录。主目录是这次的焦点；其它已添加的项目也可以直接改，不必绕路。",
+    target: "#workdir-combobox",
   },
   {
     id: "composer",

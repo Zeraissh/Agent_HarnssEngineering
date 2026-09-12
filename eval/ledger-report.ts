@@ -141,6 +141,42 @@ if (cx.rows === 0) {
 }
 console.log("");
 
+const hk = s.hooks;
+console.log("── 外部 hooks（docs/09 §4.2）──");
+if (hk.rows === 0) {
+  console.log("  0 行带 hooks 字段（切片落地前的老行不记，是未知不是零次）。");
+} else {
+  console.log(
+    `  有字段的运行 ${hk.rows} 次：武装 ${hk.armed}；开火 ${hk.fired} / 阻断 ${hk.blocked}`,
+  );
+}
+console.log("");
+
+const amd = s.agentMd;
+console.log("── 分层 AGENT.md（docs/09 §4.7）──");
+if (amd.rows === 0) {
+  console.log("  0 行带 agentMd 字段（切片落地前的老行不记，是未知不是零个文件）。");
+} else {
+  console.log(
+    `  有字段的运行 ${amd.rows} 次：加载 ${amd.loaded}；文件合计 ${amd.files}；截断 ${amd.truncatedRuns}`,
+  );
+}
+console.log("");
+
+const ap = s.approvals;
+console.log("── 权限档 / 审批（docs/09 §4.3）──");
+if (ap.rows === 0) {
+  console.log("  0 行带 permissionMode/approvals 字段（切片落地前的老行不记，是未知不是零次问）。");
+} else {
+  console.log(
+    `  有字段的运行 ${ap.rows} 次：manual ${ap.modes.manual} / plan ${ap.modes.plan} / auto ${ap.modes.auto} / 自定义 ${ap.modes.custom}`,
+  );
+  console.log(
+    `  审批结局：问过 ${ap.asked} · 自动 ${ap.auto} · 拒绝 ${ap.denied}`,
+  );
+}
+console.log("");
+
 /**
  * 终止原因 × 包 —— 领域包的恢复策略（`DomainPack.recovery`）该填几，只能从这里读。
  * 老行没有 maxTurns 字段时按**当前** presets 推算分母并标 `~`：包护栏是会改的

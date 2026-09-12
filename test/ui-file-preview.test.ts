@@ -194,26 +194,27 @@ describe("initFilePreview 停靠面板", () => {
     expect(api.element.textContent).toContain("读取失败");
   });
 
-  it("Esc 关闭并还原焦点；关闭后再打开仍是新渲染", async () => {
+  it("Esc 收起并还原焦点；再打开另一份仍是新渲染", async () => {
     const trigger = document.createElement("button");
     document.body.appendChild(trigger);
     trigger.focus();
-    const api = initFilePreview({}, { fetch: okText("hello") });
+    const api = initFilePreview({}, { fetch: okText("hello"), closeAnimMs: 0 });
     api.open({ path: "a.txt", url: "/api/file-preview?path=a.txt" });
     await flush();
     document.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
-    expect(api.isOpen()).toBe(false);
+    expect(api.isOpen()).toBe(true);
+    expect(api.isCollapsed()).toBe(true);
     expect(document.activeElement).toBe(trigger);
-    await settle(); // 收起退出动画播完才隐藏
     expect(api.element.hidden).toBe(true);
     api.open({ path: "b.txt", url: "/api/file-preview?path=b.txt" });
     await flush();
     expect(api.isOpen()).toBe(true);
+    expect(api.isCollapsed()).toBe(false);
     expect(api.element.querySelector(".ac-name").textContent).toBe("b.txt");
   });
 
-  it("没有遮罩了：点面板内部不收，关闭按钮关闭；外壳是覆盖变体停靠", async () => {
-    const api = initFilePreview({}, { fetch: okText("x") });
+  it("没有遮罩了：点面板内部不收，收起键只藏面板；外壳是覆盖变体停靠", async () => {
+    const api = initFilePreview({}, { fetch: okText("x"), closeAnimMs: 0 });
     api.open({ path: "a.txt", url: "/api/file-preview?path=a.txt" });
     await flush();
     expect(api.element.classList.contains("preview-dock--overlay")).toBe(true);
@@ -222,7 +223,8 @@ describe("initFilePreview 停靠面板", () => {
     );
     expect(api.isOpen()).toBe(true);
     api.element.querySelector(".ac-close").click();
-    expect(api.isOpen()).toBe(false);
+    expect(api.isOpen()).toBe(true);
+    expect(api.isCollapsed()).toBe(true);
   });
 
   it("放大/还原与 Esc 两级（与产物画布同一份外壳行为）", async () => {
@@ -238,9 +240,10 @@ describe("initFilePreview 停靠面板", () => {
     document.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
     expect(api.isExpanded()).toBe(false);
     expect(api.isOpen()).toBe(true);
-    // Esc 第二级：关闭
+    // Esc 第二级：收起，会话还在
     document.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
-    expect(api.isOpen()).toBe(false);
+    expect(api.isOpen()).toBe(true);
+    expect(api.isCollapsed()).toBe(true);
   });
 
   it("缺 path 或 url 不打开；重复 init 幂等", () => {

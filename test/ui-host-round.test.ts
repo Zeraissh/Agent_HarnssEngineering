@@ -237,22 +237,4 @@ describe("宿主 Round A–C", () => {
     expect(after.servers.find((s) => s.name === "http1")?.url).toContain("127.0.0.1");
   });
 
-  it("POST /api/complete 只做启发式续写，不碰模型", async () => {
-    const client = new FakeModelClient([]);
-    handle = createUiServer({
-      modelClient: client,
-      tools: [makeTool({ name: "noop", permission: "auto" })],
-      workdir: process.cwd(),
-    });
-    const base = `http://127.0.0.1:${await startServer(handle)}`;
-    const res = await fetch(`${base}/api/complete`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ prefix: "帮我看看", recent: [] }),
-    });
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as { completion: string | null };
-    expect(body.completion).toBe("这个项目现在的状态，用三句话总结。");
-    expect(client.requests).toEqual([]);
-  });
 });

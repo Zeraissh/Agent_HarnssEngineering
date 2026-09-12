@@ -14,8 +14,11 @@ import type Anthropic from "@anthropic-ai/sdk";
 import { AgentLoop, createRunBudget } from "./loop.js";
 import { sumUsage } from "./verifier.js";
 import { withoutTaskCompletion } from "./task-completion.js";
+import { withoutAgentMd } from "./agent-md.js";
+import { withoutExternalHooks } from "./hooks.js";
 import { withoutAskUser } from "./tools/ask-user.js";
 import { withoutEditFile } from "./tools/edit-file.js";
+import type { DurablePlanNode, DurablePlanSnapshot } from "./run-state.js";
 import type { DomainPack } from "./presets.js";
 import type { AgentConfig, AggregateUsage, ModelClient, Tool, TurnEvent } from "./types.js";
 
@@ -46,6 +49,187 @@ export interface SubTask {
 
 export interface Plan {
   subtasks: SubTask[];
+}
+
+/** 计划节点生命周期（AGENT-01）：调度器与界面共用同一套字面量。 */
+export type PlanNodeStatus = "pending" | "running" | "passed" | "failed" | "skipped";
+
+/**
+ * 一等计划节点状态——比 SubTask 多状态 / 证据 / 失败策略。
+ * 初始计划只有 pending；执行后由宿主写成 passed|failed|skipped。
+ */
+export interface PlanNodeState {
+  id: string;
+  title: string;
+  pack?: string | null;
+  description: string;
+  acceptance: string[];
+  dependsOn: string[];
+  resources?: string[];
+  status: PlanNodeStatus;
+  /** 交接摘要或裁决摘要——下一轮重规划时喂给 planner 的证据 */
+  evidenceSummary?: string;
+  /** 可选：失败后怎么办（retry / skip / replan）。缺省由宿主策略决定 */
+  failureStrategy?: string;
+}
+
+export interface PlanState {
+  nodes: PlanNodeState[];
+  protocol?: "freeform" | "structured" | "fixed";
+}
+
+/** SubTask → 待执行节点 */
+export function planNodesFromSubtasks(subtasks: SubTask[], status: PlanNodeStatus = "pending"): PlanNodeState[] {
+  return subtasks.map((s) => ({
+    id: s.id,
+    title: s.title,
+    pack: s.pack ?? null,
+    description: s.description,
+    acceptance: [...s.acceptance],
+    dependsOn: [...s.dependsOn],
+    ...(s.resources ? { resources: [...s.resources] } : {}),
+    status,
+  }));
+}
+
+export function planFromNodes(nodes: PlanNodeState[]): Plan {
+  return {
+    subtasks: nodes.map((n) => ({
+      id: n.id,
+      title: n.title,
+      pack: n.pack ?? null,
+      description: n.description,
+      acceptance: [...n.acceptance],
+      dependsOn: [...n.dependsOn],
+      ...(n.resources ? { resources: [...n.resources] } : {}),
+    })),
+  };
+}
+
+export function durableNodeFromPlanNode(n: PlanNodeState): DurablePlanNode {
+  return {
+    id: n.id,
+    title: n.title,
+    pack: n.pack ?? null,
+    description: n.description,
+    acceptance: [...n.acceptance],
+    dependsOn: [...n.dependsOn],
+    ...(n.resources ? { resources: [...n.resources] } : {}),
+    status: n.status,
+    ...(n.evidenceSummary ? { evidenceSummary: n.evidenceSummary } : {}),
+    ...(n.failureStrategy ? { failureStrategy: n.failureStrategy } : {}),
+  };
+}
+
+export function planNodesFromDurable(nodes: readonly DurablePlanNode[]): PlanNodeState[] {
+  return nodes.map((n) => ({
+    id: n.id,
+    title: n.title,
+    pack: n.pack ?? null,
+    description: n.description,
+    acceptance: [...n.acceptance],
+    dependsOn: [...n.dependsOn],
+    ...(n.resources ? { resources: [...n.resources] } : {}),
+    status: n.status,
+    ...(n.evidenceSummary ? { evidenceSummary: n.evidenceSummary } : {}),
+    ...(n.failureStrategy ? { failureStrategy: n.failureStrategy } : {}),
+  }));
+}
+
+export function handoffsFromPlanNodes(nodes: readonly PlanNodeState[]): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const n of nodes) {
+    if (n.status === "passed" && n.evidenceSummary) out[n.id] = n.evidenceSummary;
+  }
+  return out;
+}
+
+/** Plan → DurablePlanSnapshot（DAG 边 = dependsOn）。 */
+export function durablePlanFromPlan(
+  plan: Plan,
+  protocol: DurablePlanSnapshot["protocol"] = "freeform",
+  nodes?: PlanNodeState[],
+): DurablePlanSnapshot {
+  const edges: Record<string, string[]> = {};
+  for (const t of plan.subtasks) {
+    edges[t.id] = [...(t.dependsOn ?? [])];
+  }
+  return {
+    protocol,
+    taskIds: plan.subtasks.map((t) => t.id),
+    edges,
+    approvedAt: null,
+    rejectedAt: null,
+    ...(nodes && nodes.length
+      ? {
+          nodes: nodes.map(durableNodeFromPlanNode),
+        }
+      : {}),
+  };
+}
+
+function acceptanceKey(acceptance: string[]): string {
+  return acceptance.join("\n");
+}
+
+/**
+ * 重规划差分：id 相同且已 passed、且 description/acceptance 未改 → kept（不重跑）；
+ * 同 id 但内容变了 → changed（重跑）；新 id → added；旧 id 消失 → dropped。
+ */
+export function diffPlansForReplan(
+  previous: Plan,
+  next: Plan,
+  passedIds: ReadonlySet<string>,
+): { kept: string[]; added: string[]; dropped: string[]; changed: string[] } {
+  const prevById = new Map(previous.subtasks.map((s) => [s.id, s]));
+  const nextIds = new Set(next.subtasks.map((s) => s.id));
+  const kept: string[] = [];
+  const added: string[] = [];
+  const changed: string[] = [];
+  for (const n of next.subtasks) {
+    const p = prevById.get(n.id);
+    if (!p) {
+      added.push(n.id);
+      continue;
+    }
+    const same =
+      p.description === n.description && acceptanceKey(p.acceptance) === acceptanceKey(n.acceptance);
+    if (same && passedIds.has(n.id)) kept.push(n.id);
+    else changed.push(n.id);
+  }
+  const dropped = previous.subtasks.map((s) => s.id).filter((id) => !nextIds.has(id));
+  return { kept, added, dropped, changed };
+}
+
+/**
+ * 把用户反馈与上一份计划执行结果拼进 planner 任务书。
+ * 已通过节点带着交接摘要；失败 / 跳过节点写明，请 planner 决定保留、改写或删掉。
+ */
+export function buildReplanTask(input: {
+  originalTask: string;
+  feedback: string;
+  nodes: PlanNodeState[];
+}): string {
+  const lines: string[] = [
+    `【重规划】原任务：${input.originalTask}`,
+    `【委托方新要求】${input.feedback}`,
+    "上一份计划的节点状态如下。请产出一份**完整**新计划（JSON 契约不变）：",
+    "- 已通过且仍适用的节点：保留同一 id，description/acceptance 尽量不要改（宿主会跳过重跑）；",
+    "- 需要改写的节点：可改 description/acceptance，或换新 id；",
+    "- 不再需要的节点：从计划里删掉；",
+    "- 新工作：加新节点并写好 dependsOn。",
+    "",
+    "【上一份节点】",
+  ];
+  for (const n of input.nodes) {
+    const pack = n.pack ? ` pack=${n.pack}` : "";
+    lines.push(`- ${n.id} [${n.status}] ${n.title}${pack}`);
+    lines.push(`  description: ${n.description}`);
+    if (n.acceptance.length) lines.push(`  acceptance: ${n.acceptance.join("；")}`);
+    if (n.dependsOn.length) lines.push(`  dependsOn: ${n.dependsOn.join(", ")}`);
+    if (n.evidenceSummary) lines.push(`  evidence: ${n.evidenceSummary}`);
+  }
+  return lines.join("\n");
 }
 
 /**
@@ -326,7 +510,7 @@ export async function runStructuredPlanner(
   opts?: { maxTurns?: number },
 ): Promise<PlanOutcome> {
   const plannerMaxTurns = resolvePlannerMaxTurns(packs, opts?.maxTurns);
-  const roleBase = withoutTaskCompletion(cfg);
+  const roleBase = withoutAgentMd(withoutExternalHooks(withoutTaskCompletion(cfg)));
   // §2.1：终结工具进工具面（必须在面上，tool_choice 才点得动它）
   const plannerCfg: AgentConfig = {
     ...roleBase,
@@ -635,7 +819,7 @@ export async function runPlanner(
   opts?: { maxTurns?: number },
 ): Promise<PlanOutcome> {
   const plannerMaxTurns = resolvePlannerMaxTurns(packs, opts?.maxTurns);
-  const roleBase = withoutTaskCompletion(cfg);
+  const roleBase = withoutAgentMd(withoutExternalHooks(withoutTaskCompletion(cfg)));
   // §2.1：终结工具进工具面（必须在面上，tool_choice 才点得动它）
   const plannerCfg: AgentConfig = {
     ...roleBase,

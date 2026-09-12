@@ -6,6 +6,7 @@
  * 任一变异测绿（假绿）或还原失败都会让本脚本以非零退出。
  *
  * 用法：npm run test:mutation-smoke
+ * 只跑若干：MUTATION_ONLY=id1,id2 npm run test:mutation-smoke
  */
 import { spawnSync } from "node:child_process";
 import { copyFileSync, existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
@@ -224,11 +225,86 @@ const MUTANTS = [
   {
     id: "same-run-resume-allows-executing",
     file: "src/run-state.ts",
-    find: "  if (input.phase !== \"interrupted\") return false;\n  if (!input.hasCheckpoint) return false;",
+    find: "  if (input.phase !== \"interrupted\") return false;\n  if (input.budgetExhausted) return false;",
     replace:
-      "  if (false && input.phase !== \"interrupted\") return false; // MUTATION: allow non-interrupted\n  if (!input.hasCheckpoint) return false;",
+      "  if (false && input.phase !== \"interrupted\") return false; // MUTATION: allow non-interrupted\n  if (input.budgetExhausted) return false;",
     testFiles: ["test/run-state.test.ts"],
     why: "sameRunResume 仅 interrupted；放宽会把完成态档案谎报可同 run 热续",
+  },
+  {
+    id: "plan-resume-without-passed",
+    file: "src/run-state.ts",
+    find: "    if (!p.hasPassedNode) return false;",
+    replace: "    if (false && !p.hasPassedNode) return false; // MUTATION: 零进度也续发射",
+    testFiles: ["test/run-state.test.ts"],
+    why: "半截 DAG 必须已有 passed 节点才同 run 续发射；否则中途崩溃会用新 toolUseId 重做副作用",
+  },
+  {
+    id: "cli-plan-resume-skips-crash-interrupt",
+    file: "src/cli-durable.ts",
+    find: "  if (CLI_CRASH_PHASES.has(current.phase)) {\n    const interrupted = transitionRunState(current, { type: \"interrupt\" });\n    if (interrupted) current = interrupted;\n  }",
+    replace:
+      "  if (false && CLI_CRASH_PHASES.has(current.phase)) {\n    const interrupted = transitionRunState(current, { type: \"interrupt\" });\n    if (interrupted) current = interrupted;\n  }",
+    testFiles: ["test/cli-durable.test.ts"],
+    why: "CLI Ctrl+C / 硬杀常把 phase 留在 executing；不先 interrupt，canSameRunResume 会拒半截 DAG",
+  },
+  {
+    id: "cli-plan-resume-ignores-budget",
+    file: "src/cli-durable.ts",
+    find: "    budgetExhausted: durableBudgetExhausted(current.budget),",
+    replace: "    budgetExhausted: false, // MUTATION: 落盘账耗尽仍同 run 续",
+    testFiles: ["test/cli-durable.test.ts"],
+    why: "CLI 半截 DAG 续跑必须读谱系预算；恒假会把已用尽的档案再跑一遍",
+  },
+  {
+    id: "cli-single-resume-without-checkpoint",
+    file: "src/cli-durable.ts",
+    find: "  const hasCheckpoint = Boolean(current.checkpoint) && opts.hasHistory;",
+    replace: "  const hasCheckpoint = true; // MUTATION: 飞行中无检查点也同 run 续",
+    testFiles: ["test/cli-durable.test.ts"],
+    why: "单执行者同 run 必须已提交 main 检查点；恒真会把飞行中崩溃当可续",
+  },
+  {
+    id: "cli-skips-meta-json",
+    file: "src/cli-durable.ts",
+    find: "  writer.writeMeta(meta);\n",
+    replace: "  // MUTATION: 不写 meta.json → Web 列表看不见 CLI 档案\n",
+    testFiles: ["test/cli-durable.test.ts"],
+    why: "CLI 档案必须写 meta.json，否则 loadArchivedMetas 跳过、Web 列表空白",
+  },
+  {
+    id: "cli-skips-plan-result-event",
+    file: "src/cli.ts",
+    find: "    cliDurable?.noteHostEvent(hostPlanResultEvent(outcome, { startedAt, planReadyAt, finishedAt }));",
+    replace: "    // MUTATION: plan_result 不进 events.jsonl",
+    testFiles: ["test/cli-durable.test.ts"],
+    why: "CLI 编排收尾必须写 plan_result；否则 Web 重放看不到子任务结局与 planner 失败摘要",
+  },
+  {
+    id: "cli-skips-plan-resume-event",
+    file: "src/cli.ts",
+    find: "      cliDurable?.noteHostEvent(hostPlanResumeEvent({ kept, remaining, reason: plannedTask }));",
+    replace: "      // MUTATION: plan_resume 只打控制台，不进 events.jsonl",
+    testFiles: ["test/cli-durable.test.ts"],
+    why: "CLI 半截 DAG 续跑必须把 plan_resume 写入档案；否则 Web 重放看不见续发射",
+  },
+  {
+    id: "cli-skips-host-cli",
+    file: "src/cli-durable.ts",
+    find: "    checkpoint: cliMetaCheckpoint(opts.state),\n    host: \"cli\",\n    continuedFrom: prev?.continuedFrom ?? opts.state.continuedFrom ?? null,",
+    replace:
+      "    checkpoint: cliMetaCheckpoint(opts.state),\n    continuedFrom: prev?.continuedFrom ?? opts.state.continuedFrom ?? null,",
+    testFiles: ["test/cli-durable.test.ts"],
+    why: "CLI 档案必须写 meta.host=cli，否则 Web 列表无法标来源",
+  },
+  {
+    id: "cli-skips-turn-events",
+    file: "src/cli-durable.ts",
+    find: "    noteEvent(source, event) {\n      if (isEphemeralTurnEvent(event)) return;\n      const payload = serializeTurnEventForArchive(source, event, archiveSegmentIndex);\n      writer.appendEvent({",
+    replace:
+      "    noteEvent(source, event) {\n      if (isEphemeralTurnEvent(event)) return;\n      return; // MUTATION: turn events 不进 events.jsonl\n      const payload = serializeTurnEventForArchive(source, event, archiveSegmentIndex);\n      writer.appendEvent({",
+    testFiles: ["test/cli-durable.test.ts"],
+    why: "CLI 必须把 TurnEvent 投影进 events.jsonl；否则 Web 打开对话只有 run_end",
   },
   {
     id: "tool-tx-committed-must-skip",
@@ -238,6 +314,80 @@ const MUTANTS = [
       "  if (false && existing.status === \"committed\") {\n    // MUTATION: committed 不再跳过 → 重复副作用\n    return {\n      action: \"skip_committed\",",
     testFiles: ["test/tool-tx.test.ts"],
     why: "SAFE-06：已 committed 同 key 必须跳过，否则崩溃恢复会重复写入",
+  },
+  {
+    id: "hook-exit-1-quietly-blocks",
+    file: "src/hooks.ts",
+    find: "  if (exitCode === 2) return \"block\";",
+    replace: "  if (exitCode === 1 || exitCode === 2) return \"block\"; // MUTATION: exit 1 悄悄阻断",
+    testFiles: ["test/hooks.test.ts"],
+    why: "exit 1 必须是非阻断错误；悄悄阻断会让写坏的 hook 掐死整轮",
+  },
+  {
+    id: "hook-exit-2-quietly-allows",
+    file: "src/hooks.ts",
+    find: "  if (exitCode === 2) return \"block\";",
+    replace: "  if (exitCode === 2) return \"allow\"; // MUTATION: exit 2 悄悄放行",
+    testFiles: ["test/hooks.test.ts"],
+    why: "exit 2 必须阻断；悄悄放行等于 hooks 权限门不存在",
+  },
+  {
+    id: "agent-md-leaks-to-verifier",
+    file: "src/agent-md.ts",
+    find: "export function withoutAgentMd(cfg: AgentConfig): AgentConfig {\n  if (!cfg.dynamicContext?.[AGENT_MD_CONTEXT_KEY]) return cfg;",
+    replace:
+      "export function withoutAgentMd(cfg: AgentConfig): AgentConfig {\n  return cfg; // MUTATION: 核查者看得到 AGENT.md\n  if (!cfg.dynamicContext?.[AGENT_MD_CONTEXT_KEY]) return cfg;",
+    testFiles: ["test/agent-md.test.ts"],
+    why: "verifier 必须是干净上下文；AGENT.md 漏过去等于项目文件能写核查纪律",
+  },
+  {
+    id: "approval-auto-counted-as-asked",
+    file: "src/ledger.ts",
+    find: '  else if (actor === "auto-run" || actor === "auto-rule") tally.auto += 1;',
+    replace: '  else if (actor === "auto-run" || actor === "auto-rule") tally.asked += 1; // MUTATION: --yes 记成问过人',
+    testFiles: ["test/ledger.test.ts"],
+    why: "自动放行必须进 auto 桶；记进 asked 会把 --yes 画成人工审批",
+  },
+  {
+    id: "mcp-side-effect-declaration-ignored",
+    file: "src/tool-tx.ts",
+    find: "    if (nameOrTool.sideEffect === true) return true;",
+    replace: "    if (false && nameOrTool.sideEffect === true) return true; // MUTATION: 声明进不了事务",
+    testFiles: ["test/tool-tx.test.ts"],
+    why: "启发式认不出的 MCP 写工具只能靠 sideEffect 声明进事务；忽略声明等于漏检原样回来",
+  },
+  {
+    id: "future-schema-classified-as-malformed",
+    file: "ui/history.ts",
+    find: '    return { ok: false, state: null, reason: "unsupported_version", version };',
+    replace: '    return { ok: false, state: null, reason: "malformed", version }; // MUTATION: 未来版本与坏形状分不清',
+    testFiles: ["test/run-state-persist.test.ts"],
+    why: "升级演练必须把 unsupported_version 与 malformed 分开，否则不知道该回滚 schema 还是丢档案",
+  },
+  {
+    id: "run-config-permission-uses-stale-label",
+    file: "ui/server.ts",
+    find: "        const matched = matchPermissionMode(switches);",
+    replace: "        const matched = run.permissionMode ?? matchPermissionMode(switches); // MUTATION: 点过的档名盖过实际开关",
+    testFiles: ["test/permission-mode.test.ts"],
+    why: "装配条 mode 必须跟实际开关；标签盖过去会把追问改编排仍画成 auto",
+  },
+  {
+    id: "model-send-error-marked-ok",
+    file: "src/loop.ts",
+    find: 'q.push({ type: "model_call_end", turn, attempt, status: "error", durationMs: Date.now() - startedAt });',
+    replace:
+      'q.push({ type: "model_call_end", turn, attempt, status: "ok", durationMs: Date.now() - startedAt }); // MUTATION: 失败 send 画成成功',
+    testFiles: ["test/loop.test.ts"],
+    why: "抛错必须先发 model_call_end(error)；标成 ok 会让失败 send 的 span 撒谎",
+  },
+  {
+    id: "histogram-quantile-zero-on-empty",
+    file: "src/metrics.ts",
+    find: "  if (!Number.isFinite(total) || total <= 0) return null;",
+    replace: "  if (!Number.isFinite(total) || total <= 0) return 0; // MUTATION: 没有读数编成零",
+    testFiles: ["test/metrics.test.ts"],
+    why: "分位数没有样本必须是 null；编 0 会把空曲线画成瞬时完成",
   },
 ];
 
@@ -291,9 +441,24 @@ function restoreSync(abs, backup, original) {
 let failed = 0;
 const results = [];
 
-console.log(`mutation-smoke: ${MUTANTS.length} mutants @ ${root}\n`);
+const only = new Set(
+  (process.env.MUTATION_ONLY ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
+);
+const selected = only.size > 0 ? MUTANTS.filter((m) => only.has(m.id)) : MUTANTS;
+if (only.size > 0) {
+  const missing = [...only].filter((id) => !MUTANTS.some((m) => m.id === id));
+  if (missing.length) {
+    console.error(`MUTATION_ONLY unknown id(s): ${missing.join(", ")}`);
+    process.exit(1);
+  }
+}
 
-for (const m of MUTANTS) {
+console.log(`mutation-smoke: ${selected.length}/${MUTANTS.length} mutants @ ${root}\n`);
+
+for (const m of selected) {
   process.stdout.write(`→ ${m.id} … `);
   let handle;
   try {
@@ -347,7 +512,7 @@ for (const r of results) {
   console.log(`  ${r.outcome.padEnd(12)} ${r.id}`);
 }
 const killed = results.filter((r) => r.outcome === "killed").length;
-console.log(`\nkilled ${killed}/${MUTANTS.length}; failures=${failed}`);
+console.log(`\nkilled ${killed}/${selected.length}; failures=${failed}`);
 
 if (failed > 0) {
   process.exit(1);

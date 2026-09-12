@@ -1,8 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
+  canReopenSameRun,
+  canRestorePlanGate,
   canSameRunResume,
+  durableBudgetExhausted,
   initialRunState,
+  planResumeFacts,
   recoveryActionForPhase,
+  seedDurableBudget,
+  snapshotDurableBudget,
   transitionRunState,
   type DurablePlanSnapshot,
 } from "../src/run-state.js";
@@ -46,10 +52,60 @@ describe("RUN-01 Phase 1 run-state", () => {
   });
 
   it("maps crash phases to recovery actions per ADR-003", () => {
-    expect(recoveryActionForPhase("plan_gated")).toBe("close_archive");
+    expect(recoveryActionForPhase("plan_gated")).toBe("restore_gate");
     expect(recoveryActionForPhase("awaiting_approval")).toBe("expire_waits_and_fork");
     expect(recoveryActionForPhase("executing")).toBe("fork_from_checkpoint");
     expect(recoveryActionForPhase("completed")).toBe("readonly");
+    expect(recoveryActionForPhase("planning")).toBe("close_archive");
+  });
+
+  it("plan_gated 崩溃回到门上：有未批快照才 restore，不 close_archive", () => {
+    expect(
+      canRestorePlanGate({ phase: "plan_gated", plan }),
+    ).toBe(true);
+    expect(
+      canRestorePlanGate({
+        phase: "plan_gated",
+        plan: { ...plan, approvedAt: 9 },
+      }),
+    ).toBe(false);
+    expect(
+      canRestorePlanGate({
+        phase: "plan_gated",
+        plan: { ...plan, rejectedAt: 9 },
+      }),
+    ).toBe(false);
+    expect(canRestorePlanGate({ phase: "interrupted", plan })).toBe(false);
+    expect(
+      canRestorePlanGate({ phase: "plan_gated", plan, budgetExhausted: true }),
+    ).toBe(false);
+  });
+
+  it("零进度无检查点：有任务正文可 reopen，不假装能热续", () => {
+    expect(
+      canReopenSameRun({ phase: "interrupted", hasTask: true }),
+    ).toBe(true);
+    expect(
+      canReopenSameRun({ phase: "failed", hasTask: true }),
+    ).toBe(true);
+    expect(
+      canReopenSameRun({ phase: "interrupted", hasTask: false }),
+    ).toBe(false);
+    expect(
+      canReopenSameRun({ phase: "plan_gated", hasTask: true }),
+    ).toBe(false);
+    expect(
+      canReopenSameRun({ phase: "interrupted", hasTask: true, budgetExhausted: true }),
+    ).toBe(false);
+    expect(
+      canSameRunResume({
+        phase: "interrupted",
+        hasCheckpoint: false,
+        verify: false,
+        mode: "single",
+        budgetExhausted: false,
+      }),
+    ).toBe(false);
   });
 
   it("interrupt from executing", () => {
@@ -112,6 +168,95 @@ describe("RUN-01 Phase 2 same-run resume", () => {
     expect(canSameRunResume({ ...base, phase: "interrupted", verify: true })).toBe(false);
     expect(canSameRunResume({ ...base, phase: "interrupted", mode: "plan" })).toBe(false);
     expect(canSameRunResume({ ...base, phase: "interrupted", budgetExhausted: true })).toBe(false);
+  });
+
+  it("plan 半截 DAG：有 passed + remaining、无 failed 才放行；不要会话检查点", () => {
+    const half = {
+      approved: true,
+      hasPassedNode: true,
+      hasFailedNode: false,
+      hasRemainingNode: true,
+    };
+    const input = {
+      phase: "interrupted" as const,
+      hasCheckpoint: false,
+      verify: true,
+      mode: "plan" as const,
+      budgetExhausted: false,
+      plan: half,
+    };
+    expect(canSameRunResume(input)).toBe(true);
+    expect(canSameRunResume({ ...input, plan: { ...half, hasPassedNode: false } })).toBe(false);
+    expect(canSameRunResume({ ...input, plan: { ...half, hasFailedNode: true } })).toBe(false);
+    expect(canSameRunResume({ ...input, plan: { ...half, hasRemainingNode: false } })).toBe(false);
+    expect(canSameRunResume({ ...input, plan: { ...half, approved: false } })).toBe(false);
+    expect(canSameRunResume({ ...input, budgetExhausted: true })).toBe(false);
+  });
+
+  it("plan_progress 刷节点且不改 phase；终态拒绝", () => {
+    let s = transitionRunState(initialRunState("r"), { type: "plan_begin" })!;
+    s = transitionRunState(s, { type: "plan_ready", plan, gated: false })!;
+    expect(s.phase).toBe("executing");
+    const nodes = [
+      {
+        id: "s1",
+        title: "一",
+        description: "d",
+        acceptance: [] as string[],
+        dependsOn: [] as string[],
+        status: "passed" as const,
+        evidenceSummary: "s1 ok",
+      },
+      {
+        id: "s2",
+        title: "二",
+        description: "d",
+        acceptance: [] as string[],
+        dependsOn: ["s1"],
+        status: "pending" as const,
+      },
+    ];
+    s = transitionRunState(s, { type: "plan_progress", nodes })!;
+    expect(s.phase).toBe("executing");
+    expect(s.plan?.nodes?.map((n) => n.status)).toEqual(["passed", "pending"]);
+    expect(planResumeFacts(s.plan)).toEqual({
+      approved: true,
+      hasPassedNode: true,
+      hasFailedNode: false,
+      hasRemainingNode: true,
+    });
+    const done = transitionRunState(s, { type: "complete" })!;
+    expect(transitionRunState(done, { type: "plan_progress", nodes })).toBeNull();
+  });
+
+  it("executor_checkpoint 写入游标且不改 phase；终态拒绝", () => {
+    let s = transitionRunState(initialRunState("r"), { type: "start" })!;
+    s = transitionRunState(s, {
+      type: "executor_checkpoint",
+      checkpoint: { segmentIndex: 0, contextInputTokens: 12 },
+    })!;
+    expect(s.phase).toBe("executing");
+    expect(s.checkpoint).toEqual({ segmentIndex: 0, contextInputTokens: 12 });
+    const done = transitionRunState(s, { type: "complete" })!;
+    expect(
+      transitionRunState(done, {
+        type: "executor_checkpoint",
+        checkpoint: { segmentIndex: 1, contextInputTokens: 1 },
+      }),
+    ).toBeNull();
+  });
+
+  it("durableBudgetExhausted：无快照 fail-open；used ≥ max 才耗尽", () => {
+    expect(durableBudgetExhausted(undefined)).toBe(false);
+    expect(durableBudgetExhausted(null)).toBe(false);
+    expect(durableBudgetExhausted({ usedTurns: 9, usedTokens: 90 })).toBe(false);
+    expect(durableBudgetExhausted({ usedTurns: 9, usedTokens: 90, maxTurns: 10 })).toBe(false);
+    expect(durableBudgetExhausted({ usedTurns: 10, usedTokens: 90, maxTurns: 10 })).toBe(true);
+    expect(durableBudgetExhausted({ usedTurns: 1, usedTokens: 100, maxTokens: 100 })).toBe(true);
+    const live = { usedTurns: 0, usedTokens: 0, maxTurns: 80 };
+    seedDurableBudget(live, { usedTurns: 12, usedTokens: 400, maxTurns: 40 });
+    expect(live).toEqual({ usedTurns: 12, usedTokens: 400, maxTurns: 40 });
+    expect(snapshotDurableBudget(live)).toEqual({ usedTurns: 12, usedTokens: 400, maxTurns: 40 });
   });
 
   it("mutation lock: canSameRunResume must not allow executing phase", () => {

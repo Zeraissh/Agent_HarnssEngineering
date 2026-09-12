@@ -350,6 +350,38 @@ describe("瞬时 API 错误的同轮重试", () => {
     expect(result.stopReason).toBe("completed");
     expect(events.filter((e) => e.type === "api_retry")).toHaveLength(1);
     expect(model.calls).toBe(2);
+    const starts = events.filter((e) => e.type === "model_call_start");
+    const ends = events.filter((e) => e.type === "model_call_end");
+    expect(starts).toHaveLength(2);
+    expect(ends.map((e) => (e.type === "model_call_end" ? e.status : ""))).toEqual(["error", "ok"]);
+    expect(starts[0]!.attempt).toBe(0);
+    expect(starts[1]!.attempt).toBe(1);
+    const kinds = events.map((e) => e.type);
+    expect(kinds.indexOf("model_call_end")).toBeLessThan(kinds.indexOf("api_retry"));
+  });
+
+  it("中止在飞 send：先发 model_call_end(error) 再 aborted", async () => {
+    const ac = new AbortController();
+    const model: ModelClient = {
+      send: async (_req, _onDelta, signal) => {
+        queueMicrotask(() => ac.abort());
+        await new Promise<never>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => {
+            reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+          });
+        });
+      },
+    };
+    const loop = new AgentLoop({ ...baseConfig, tools: [] }, model);
+    const { events, result } = await collect(loop.run("t", ac.signal));
+    expect(result.stopReason).toBe("aborted");
+    const starts = events.filter((e) => e.type === "model_call_start");
+    const ends = events.filter((e) => e.type === "model_call_end");
+    expect(starts).toHaveLength(1);
+    expect(ends).toHaveLength(1);
+    expect(ends[0]).toMatchObject({ type: "model_call_end", status: "error" });
+    const kinds = events.map((e) => e.type);
+    expect(kinds.indexOf("model_call_end")).toBeLessThan(kinds.lastIndexOf("done"));
   });
 
   it("重试预算耗尽 → error 终止（errorRetries=1 共两次尝试）", async () => {

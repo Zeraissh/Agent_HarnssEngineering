@@ -1,16 +1,16 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Tool } from "../types.js";
-import { resolveInWorkdir } from "./fs-util.js";
+import { resolveInWorkdir, WORKDIR_OR_ROOT_PATH } from "./fs-util.js";
 
 export const writeFileTool: Tool = {
   name: "write_file",
   description:
-    "Create or overwrite a UTF-8 text file inside the working directory. Call this when the task requires producing or updating a file. Parent directories are created automatically. Overwrites existing content — read the file first if you need to preserve parts of it.",
+    "Create or overwrite a UTF-8 text file inside the working directory or an extra writable root. Absolute paths are allowed when they stay inside those roots — do not use bash to hop across allowlisted projects. Call this when the task requires producing or updating a file. Parent directories are created automatically. Overwrites existing content — read the file first if you need to preserve parts of it.",
   inputSchema: {
     type: "object",
     properties: {
-      path: { type: "string", description: "File path relative to the working directory" },
+      path: { type: "string", description: WORKDIR_OR_ROOT_PATH },
       content: { type: "string", description: "Full file content to write" },
     },
     required: ["path", "content"],
@@ -25,12 +25,12 @@ export const writeFileTool: Tool = {
     if (typeof p !== "string" || typeof content !== "string") {
       return { content: 'Invalid input: expected {"path": string, "content": string}.', isError: true };
     }
-    const resolved = resolveInWorkdir(ctx.workdir, p);
+    const resolved = resolveInWorkdir(ctx.workdir, p, ctx.writeRoots);
     await mkdir(path.dirname(resolved), { recursive: true });
     // mkdir 可能补齐原先不存在的父目录；在真正写文件前重新 realpath 校验一次。
     // 这会抓住创建过程中出现的 symlink/junction，但 Node 的跨平台 fs API 没有
     // openat-style、逐路径分量的原子圈禁，校验与 writeFile 间仍存在很窄的 TOCTOU。
-    const revalidated = resolveInWorkdir(ctx.workdir, p);
+    const revalidated = resolveInWorkdir(ctx.workdir, p, ctx.writeRoots);
     const bytes = Buffer.byteLength(content, "utf8");
     // SAFE-06：内容级幂等——写后未 committed 的崩溃重入时，同内容不二次覆盖。
     try {

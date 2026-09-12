@@ -46,7 +46,7 @@ export function createGenerateImageTool(opts: GenerateImageOptions): Tool {
   return {
     name: "generate_image",
     description:
-      "Generate an image from a text prompt and save it as a file in the working directory. Call this when the task asks for an illustration, mockup, diagram, or other newly created picture. Returns the relative path of the written file. You cannot see the image; if you need to inspect it afterwards, use describe_image (when configured). Optional path is relative to the working directory; omit it to write under generated/.",
+      "Generate an image from a text prompt and save it as a file in the working directory or an extra writable root. Call this when the task asks for an illustration, mockup, diagram, or other newly created picture. Returns the path of the written file. You cannot see the image; if you need to inspect it afterwards, use describe_image (when configured). Optional path may be relative or an absolute path inside a writable root; omit it to write under generated/.",
     inputSchema: {
       type: "object",
       properties: {
@@ -57,7 +57,7 @@ export function createGenerateImageTool(opts: GenerateImageOptions): Tool {
         path: {
           type: "string",
           description:
-            "Optional output path relative to the working directory (e.g. generated/hero.png). Parent directories are created. Omit to auto-name under generated/.",
+            "Optional output path relative to the working directory or an absolute path inside a writable root (e.g. generated/hero.png). Parent directories are created. Omit to auto-name under generated/.",
         },
         size: {
           type: "string",
@@ -94,7 +94,7 @@ export function createGenerateImageTool(opts: GenerateImageOptions): Tool {
       const requestedPath = typeof p === "string" && p.trim() ? p.trim() : null;
       if (requestedPath) {
         try {
-          resolveInWorkdir(ctx.workdir, requestedPath);
+          resolveInWorkdir(ctx.workdir, requestedPath, ctx.writeRoots);
         } catch (err) {
           return { content: err instanceof Error ? err.message : String(err), isError: true };
         }
@@ -124,13 +124,13 @@ export function createGenerateImageTool(opts: GenerateImageOptions): Tool {
 
       let resolved: string;
       try {
-        resolved = resolveInWorkdir(ctx.workdir, rel);
+        resolved = resolveInWorkdir(ctx.workdir, rel, ctx.writeRoots);
       } catch (err) {
         return { content: err instanceof Error ? err.message : String(err), isError: true };
       }
 
       await mkdir(path.dirname(resolved), { recursive: true });
-      const revalidated = resolveInWorkdir(ctx.workdir, rel);
+      const revalidated = resolveInWorkdir(ctx.workdir, rel, ctx.writeRoots);
       try {
         const existing = await readFile(revalidated);
         if (existing.equals(result.bytes)) {

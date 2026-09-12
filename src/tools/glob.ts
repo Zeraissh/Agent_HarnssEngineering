@@ -30,7 +30,7 @@ export const globTool: Tool = {
         type: "string",
         description:
           "Directory to search in, relative to the working directory (default: the working directory itself). " +
-          "An absolute path is allowed only inside a configured read-only root.",
+          "An absolute path is allowed inside the working directory or a configured extra root.",
       },
       limit: {
         type: "number",

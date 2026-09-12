@@ -12,6 +12,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
   normalizeChanges,
+  optionalNumber,
   isTextPreviewable,
   firstLines,
   badgesForEntry,
@@ -59,6 +60,28 @@ describe("normalizeChanges 响应整形", () => {
       .toHaveLength(1);
     // git 形状不合法 → null
     expect(normalizeChanges({ changes: [{ path: "a", git: { added: 1 } }] }).changes[0].git).toBeNull();
+  });
+
+  it("JSON null 数字字段保持 null——Number(null)===0 不得把未跟踪文件画成 +0/-0", () => {
+    expect(optionalNumber(null)).toBeNull();
+    expect(optionalNumber(undefined)).toBeNull();
+    expect(optionalNumber("")).toBeNull();
+    expect(optionalNumber(0)).toBe(0);
+    const out = normalizeChanges({
+      changes: [{
+        path: "ui-brand-fathom/index.html",
+        ops: ["write"],
+        count: 1,
+        lastAt: null,
+        sizeBytes: null,
+        mtimeMs: null,
+        git: { status: "??", added: null, deleted: null },
+      }],
+    });
+    expect(out.changes[0].lastAt).toBeNull();
+    expect(out.changes[0].sizeBytes).toBeNull();
+    expect(out.changes[0].git).toEqual({ status: "??", added: null, deleted: null });
+    expect(badgesForEntry(out.changes[0]).diff).toBeNull();
   });
 });
 
@@ -112,6 +135,12 @@ describe("badgesForEntry 徽章派生", () => {
     });
     expect(untracked.git.label).toBe("??");
     expect(untracked.diff).toBeNull();
+    const emptyStat = badgesForEntry({
+      path: "same.ts", ops: ["write"], count: 1, lastAt: null,
+      outOfScope: false, exists: true, sizeBytes: 1, mtimeMs: null,
+      git: { status: "??", added: 0, deleted: 0 },
+    });
+    expect(emptyStat.diff, "+0/-0 没有信息，不画").toBeNull();
     const unknown = badgesForEntry({
       path: "r.txt", ops: ["write"], count: 1, lastAt: null,
       outOfScope: false, exists: true, sizeBytes: 1, mtimeMs: null,
@@ -205,8 +234,10 @@ describe("initChangesPanel DOM 层", () => {
     expect(meta).toContain("2.0 KB");
     expect(meta).toContain("分钟前");
 
-    // 未跟踪新文件的 ?? 徽章
+    // 未跟踪新文件：?? 徽章在，不画假的 +0/-0
     expect(rows[1].querySelector(".chg-git-badge").textContent).toBe("??");
+    expect(rows[1].querySelector(".chg-diff")).toBeNull();
+    expect(rows[1].querySelector(".chg-badges").textContent).not.toContain("+0/-0");
     // 越界路径：不可展开（非 button），meta 标注越界
     expect(rows[2].querySelector("button.chg-row-head")).toBeNull();
     expect(rows[2].querySelector(".chg-meta").textContent).toContain("越出");

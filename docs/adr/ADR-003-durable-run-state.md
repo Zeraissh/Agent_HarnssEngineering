@@ -1,7 +1,7 @@
 # ADR-003: Durable RunState（分阶段）
 
-**Status:** Accepted（Phase 1–3 已落地；SAFE-06 Phase 1 toolTx 已落地；CLI 对等 durable / mid-tool 自动重放仍为残余）  
-**Date:** 2026-09-02（Phase 2+3：2026-09-03；SAFE-06 Phase 1：2026-09-03）  
+**Status:** Accepted（Phase 1–3 已落地；SAFE-06 Phase 1 toolTx 已落地；半截 DAG 同 run 续发射已落地；CLI 对等 durable / mid-tool 自动重放 / 零进度 plan 仍为残余）  
+**Date:** 2026-09-02（Phase 2+3：2026-09-03；SAFE-06 Phase 1：2026-09-03；半截 DAG：2026-09-10）  
 **Deciders:** Agent_Design 维护者  
 **Related:** RUN-01 / RUN-02；B2 `ui/history.ts`；SAFE-04 grant 边界；SAFE-06 toolTx；OBS-01 `trace.jsonl`
 
@@ -19,7 +19,7 @@
 
 缺口：
 
-1. **Plan DAG** 只活在内存 / 事件流里，没有一等 `PlanState` 快照可在“计划门已批准、子任务跑到一半”处精确续发射。
+1. **Plan DAG** 曾只活在内存 / 事件流里——Phase 1 已有任务/边快照；**2026-09-10** 补了节点状态，半截 DAG（至少一枚 passed）可同 run 续发射。`plan_gated` 崩溃回到确认门；零进度 / 节点中途仍不能热续 DAG（有任务正文可 reopen）。
 2. **审批/提问** 的 live grant 与 settle 回调跨进程不可恢复（SAFE-04 已明文：GOV-01 之前不允许跨重启恢复 capability）。
 3. **Tool transaction**（SAFE-06）尚未存在——没有 prepared/committed，崩溃注入无法证明“不重复副作用”。
 4. **Verifier/rework 指针** 依赖事件回扫，没有显式状态机游标。
@@ -45,7 +45,7 @@ runId, rootRunId?, continuedFrom?
 phase: created | planning | plan_gated | executing | verifying | reworking
        | awaiting_approval | awaiting_question | completed | failed | closed
        | interrupted
-plan?: { protocol, tasks[], approvedAt?, rejectedAt? }   # DAG 快照
+plan?: { protocol, tasks[], edges, approvedAt?, rejectedAt?, nodes? }  # DAG + 节点状态
 segment: { index, source, startedAt }
 verification?: { round, recovery?, lastVerdictHash? }
 budget: SharedRunBudget 快照                    # Phase 2
@@ -56,7 +56,7 @@ toolTx: DurableToolTx[]                         # SAFE-06 Phase 1：prepared|run
 
 Idempotency 边界：
 
-- **续跑入口**（同 run）：仍是 **checkpoint 段号**（interrupted + 已提交 main done）。
+- **续跑入口**（同 run）：单执行者仍是 **checkpoint 段号**（interrupted + 已提交 main done）。编排用 **节点快照**（至少一枚 passed、无 failed、有 remaining），不靠 `sN/main` 会话检查点。
 - **副作用提交**：`idempotencyKey = runId:toolUseId`；同 key 已 `committed` 不得再执行；`write_file` 另有内容级幂等；`bash` 在 prepared/running 残留上 **fail-closed 不重试**（无 undo）。
 
 ## Addendum — SAFE-06 Phase 1（2026-09-03）
@@ -79,13 +79,35 @@ Idempotency 边界：
 | 检查点来源 = 执行者谱系 | `main` **与 `rework`** 段都更新 checkpoint / budget_snapshot；此前只认 main，返工后的正史从未进过检查点。verifier / planner / `sN/*` 仍不算 |
 | `meta.outcome.judgedTurn` | 裁决核查的是第几轮对话；列表 `verdictTurn` 由此恢复 |
 
-`canSameRunResume` 的门**没动**（仍 interrupted + checkpoint + 非 verify/plan）；核查 / 编排的归档走 fork，无检查点的归档也可 fork 成"无正史的新一轮"（`run_forked.checkpoint = null`）。
+`canSameRunResume` 的单执行者门没动（interrupted + checkpoint + 非 verify）。编排另走节点事实：`verify` 不挡（子任务核查已经写进 node status）；没有 passed / 有 failed / 没有 remaining / 未批准 → 仍拒。完成态编排归档的**对话追问**仍走单执行者或 fork，不是 DAG。无检查点的归档也可 fork 成"无正史的新一轮"（`run_forked.checkpoint = null`）。
+
+## Addendum — 半截 DAG 同 run 续发射（2026-09-10）
+
+编排的检查点不能用 `sN/main`：会话中心化后那不是执行者谱系。续跑入口是 **节点快照**，不是 main checkpoint。
+
+| 已落地 | 残余 |
+|---|---|
+| `DurablePlanNode` + `plan_progress` 增量刷 `state.json` | `plan_gated` 崩溃走 `restore_gate`（回到确认门，不 close） |
+| `planResumeFacts`：批准 + 至少一枚 passed + 无 failed + 有 remaining | 零进度（全 pending / 第一子任务中途）不能同 run |
+| `runPlanned({ plan, resume })` 跳过 passed、种子交接；与 `replan` 互斥 | 节点中途新 `toolUseId`（既有 mid-tool 残余） |
+| Web `startSameRunResume` 注入同一张图；不重跑 planner、不重开计划门；`plan_resume` | 完成态追问仍单执行者 |
+| CLI `--resume-run`：`prepareCliPlanResume`（executing 先 interrupt）+ 节点落盘 | 零进度 / 节点中途仍不续 |
+| CLI 谱系预算：`durableBudgetExhausted` + settle/SIGINT `budget_snapshot` + `seedDurableBudget` | 无快照 fail-open；CLI 无「追加预算」旗标 |
+| CLI 单执行者 `--resume-run`：`executor_checkpoint` + transcript + `runContinuation` | 飞行中无检查点不续；`--verify` 拒 |
+| CLI `meta.json` + 收尾 `run_end`（Web 列表可见） | 旧档案缺 `host` 不标 |
+| CLI TurnEvent → `events.jsonl`（与 Web 同一投影；delta 不占 seq） | CLI 不写 `plan_warning` |
+| CLI `plan` / `plan_result` 进档案（与 Web 同一形状；续发射不重写 `plan`） | 旧 CLI 档案仍无这两条 |
+| CLI `plan_resume` / `plan_replan` 进档案（与 Web 同一形状） | CLI 无 `--replan` 入口 |
+| `meta.host=cli` + 列表徽章 | 旧档案缺字段不标 |
+
+变异：`plan-resume-without-passed`。
 
 **恢复语义（Phase 1）**：
 
 | 崩溃时 phase | 重启后行为 |
 |---|---|
-| `created` / `planning` / `plan_gated`（未批准） | 标 `closed` + 合成 `run_end`；不可续，可派生 |
+| `created` / `planning` | 标 `closed` + 合成 `run_end`；不可续，可派生 |
+| `plan_gated`（未批准） | **保持在门上**（`restore_gate`）；同 run 回到确认门，CLI 不代签 |
 | `awaiting_approval` / `awaiting_question` | 全部 pending → expired 事件；**不**自动应答；可派生 |
 | `executing` / `verifying` / `reworking` | 标 `interrupted`；用 checkpoint + transcript **派生新 run**（沿用 B2），state 记录 lineage |
 | `completed` / `failed` / `closed` | 只读 |
@@ -97,7 +119,10 @@ Phase 1 **明确不做**：同 runId 热恢复、跨重启复用 active grant、
 | 条件 | 行为 |
 |---|---|
 | `interrupted` + 已提交 main checkpoint + 非 verify/plan + 预算未耗尽 | **同 runId 热恢复**（`sameRunResume:true`，`continuationMode:"same-run"`）；首条事件 `run_resumed`；新建 AgentLoop/AbortController；**不**恢复 active grant；**seed toolTx** |
-| 同上但无 checkpoint | 只读 interrupted；不可续 |
+| 同上但无 checkpoint | 不谎称热续；有任务正文可 **reopen** 一轮（不重放飞行中工具）；完成态归档仍 fork |
+| `interrupted` + `mode=plan` + 计划已批 + 至少一枚 `passed` + 无 `failed` + 有 `pending`/`running` + 预算未耗尽 | **同 runId 半截 DAG 续发射**：注入同一张图，跳过 passed；不重跑 planner、不重开计划门；事件 `plan_resume`。不靠会话检查点 |
+| `plan_gated` 崩溃 | **restore_gate**：同 run 回到确认门 |
+| 零进度（全 pending 或第一子任务中途） | 不能热续半截 DAG；有任务正文可 reopen 一轮，不假装有检查点 |
 | 完成态归档 + checkpoint | 仍走 **fork**（新 runId）；`sameRunResume:false` |
 
 ### Phase 划分
@@ -105,7 +130,7 @@ Phase 1 **明确不做**：同 runId 热恢复、跨重启复用 active grant、
 | Phase | 范围 | 验收 |
 |---|---|---|
 | **1（已落地）** | 写 `state.json` 与 phase 迁移；崩溃档案带 phase；计划 DAG 快照进 state；与 meta/checkpoint 一致；单测 + 变异（丢 phase 变红） | docs/08 RUN-01 → `[~]` |
-| **2（已落地）** | 同 run 热恢复执行游标（idempotency = checkpoint）；预算/grantAudit 进 state；UI/API `sameRunResume` 诚实；变异 `same-run-resume-allows-executing` | docs/08 RUN-01 仍 `[~]`（CLI 残余） |
+| **2（已落地）** | 同 run 热恢复执行游标（idempotency = checkpoint）；预算/grantAudit 进 state；UI/API `sameRunResume` 诚实；变异 `same-run-resume-allows-executing`。**半截 DAG（2026-09-10）**：节点快照 + `plan-resume-without-passed`。**CLI `--resume-run`**：半截 DAG + 单执行者检查点 | docs/08 RUN-01 仍 `[~]`（零进度 / 飞行中无检查点 / mid-node） |
 | **3（已落地）** | 崩溃注入套件（RUN-02）+ SAFE-06 Phase 1 tool prepared/committed | docs/08 RUN-02 / SAFE-06 → `[~]` |
 
 ### 与现有件的关系
@@ -139,8 +164,9 @@ Phase 1 **明确不做**：同 runId 热恢复、跨重启复用 active grant、
 
 - ~~SAFE-06 tool transaction（prepared/committed）~~ → Phase 1 已落地，见上表残余
 - GOV-01 主体绑定的跨重启 grant
-- CLI 对等 durable state（Web 先行；CLI 仅内存 toolTx + 事件）
-- mid-tool 未完成 assistant 轮自动重放
+- CLI 对等 durable state（Web 先行；CLI 已有 state.json + meta.json + TurnEvent 事件流 + `host=cli` 列表徽章 + `plan`/`plan_result`/`plan_resume`/`plan_replan` 宿主事件 + 半截 DAG / 单执行者 `--resume-run`；飞行中无检查点仍不续；CLI 无 `--replan` 入口；CLI 不写 `plan_warning`；旧档案缺 host 不标）
+- mid-tool 未完成 assistant 轮自动重放（节点中途会拿到新 `toolUseId`）
+- 零进度 plan（全 pending / 第一子任务中途）同 run 续发射
 - bash undo / 通用 compensation
 - MEM-01 语义压缩（独立项，已另轨）
 
@@ -150,5 +176,6 @@ Phase 1 **明确不做**：同 runId 热恢复、跨重启复用 active grant、
 2. ~~`ui/history.ts`：`writeState` / `readState` / Phase 2 字段解析~~
 3. ~~`ui/server.ts`：迁移接线、崩溃收口、same-run followUp、预算/grant 快照~~
 4. ~~UI：`continuationMode:"same-run"` + `run_resumed` reducer/装配条~~
-5. docs/08 RUN-01 / SAFE-06 / RUN-02 保持 `[~]`；残余写清。
+5. docs/08 RUN-01 / SAFE-06 / RUN-02 / AGENT-01 保持 `[~]`；残余写清。
 6. ~~RUN-02 崩溃注入套件~~；~~SAFE-06 Phase 1~~（`src/tool-tx.ts` + `test/tool-tx.test.ts`）。
+7. ~~半截 DAG 同 run 续发射~~（节点快照 + `runPlanned({plan,resume})` + Web `plan_resume` + CLI `--resume-run`）。

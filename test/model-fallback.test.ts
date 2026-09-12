@@ -17,6 +17,7 @@ import {
   readFallbackEnv,
   readRoleFallbackMode,
   stripThinkingBlocks,
+  stripThinkingFromMessages,
 } from "../src/model-fallback.js";
 import type { FallbackInfo } from "../src/model-fallback.js";
 import { clearCapabilityCache, setStickyCapabilities } from "../src/model-capability.js";
@@ -369,6 +370,21 @@ describe("stripThinkingBlocks", () => {
     ]);
   });
 
+  it("stripThinkingFromMessages 只剥思考，正文与 tool_use 留下", () => {
+    const out = stripThinkingFromMessages([
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "secret", signature: "sig-a" },
+          { type: "text", text: "暗号 alpha-7" },
+        ],
+      },
+    ]);
+    expect(JSON.stringify(out)).toContain("暗号 alpha-7");
+    expect(JSON.stringify(out)).not.toContain("sig-a");
+    expect(JSON.stringify(out)).not.toContain("secret");
+  });
+
   it("system/tools/预算等其余字段照原样带过去", () => {
     const req = makeRequest({ maxTokens: 77, toolChoice: "none" });
     const out = stripThinkingBlocks(req);
@@ -427,8 +443,9 @@ describe("readFallbackEnv", () => {
     expect(readFallbackEnv({ AGENT_CIRCUIT_COOLDOWN_MS: "0" }).cooldownMs).toBe(0);
   });
 
-  it("AGENT_FALLBACK_ROUTING 只认 sequential / prefer_healthy", () => {
+  it("AGENT_FALLBACK_ROUTING 只认 sequential / prefer_healthy / prefer_cheap", () => {
     expect(readFallbackEnv({ AGENT_FALLBACK_ROUTING: "prefer_healthy" }).routing).toBe("prefer_healthy");
+    expect(readFallbackEnv({ AGENT_FALLBACK_ROUTING: "prefer_cheap" }).routing).toBe("prefer_cheap");
     expect(() => readFallbackEnv({ AGENT_FALLBACK_ROUTING: "cheapest" })).toThrow(/AGENT_FALLBACK_ROUTING/);
   });
 });
@@ -563,5 +580,73 @@ describe("orderEndpointsForRouting", () => {
     const ordered = orderEndpointsForRouting([sick, well], "prefer_healthy");
     expect(ordered.map((e) => e.name)).toEqual(["well", "sick"]);
     clearCapabilityCache();
+  });
+
+  it("prefer_cheap：主端点居首，备用按单价升序；未登记排最后", () => {
+    const primary = {
+      name: "deepseek-v4-pro",
+      client: okClient(),
+      identity: { provider: "anthropic" as const, model: "deepseek-v4-pro" },
+    };
+    const expensive = {
+      name: "claude-opus-4-8",
+      client: okClient(),
+      identity: { provider: "anthropic" as const, model: "claude-opus-4-8" },
+    };
+    const cheap = {
+      name: "deepseek-v4-flash",
+      client: okClient(),
+      identity: { provider: "anthropic" as const, model: "deepseek-v4-flash" },
+    };
+    const unknown = {
+      name: "mystery-model",
+      client: okClient(),
+      identity: { provider: "anthropic" as const, model: "mystery-model" },
+    };
+    // 配置序：贵 → 未知 → 便宜；排序后应 主 → 便宜 → 贵 → 未知
+    const ordered = orderEndpointsForRouting(
+      [primary, expensive, unknown, cheap],
+      "prefer_cheap",
+    );
+    expect(ordered.map((e) => e.name)).toEqual([
+      "deepseek-v4-pro",
+      "deepseek-v4-flash",
+      "claude-opus-4-8",
+      "mystery-model",
+    ]);
+  });
+
+  it("prefer_cheap 发送时先试廉价备用（主端点瞬时失败后）", async () => {
+    const primary = new ThrowingClient(apiError(503, "primary down"));
+    const expensive = okClient();
+    const cheap = okClient();
+    const events: FallbackInfo[] = [];
+    const client = new FallbackModelClient({
+      primary: {
+        name: "deepseek-v4-pro",
+        client: primary,
+        identity: { provider: "anthropic", model: "deepseek-v4-pro" },
+      },
+      fallbacks: [
+        {
+          name: "claude-opus-4-8",
+          client: expensive,
+          identity: { provider: "anthropic", model: "claude-opus-4-8" },
+        },
+        {
+          name: "deepseek-v4-flash",
+          client: cheap,
+          identity: { provider: "anthropic", model: "deepseek-v4-flash" },
+        },
+      ],
+      routing: "prefer_cheap",
+      onFallback: (info) => events.push(info),
+    });
+    await client.send(makeRequest());
+    expect(primary.calls).toBe(1);
+    expect(cheap.requests).toHaveLength(1);
+    expect(expensive.requests).toHaveLength(0);
+    expect(events[0]?.to).toBe("deepseek-v4-flash");
+    expect(events[0]?.routing).toBe("prefer_cheap");
   });
 });

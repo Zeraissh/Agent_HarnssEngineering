@@ -158,7 +158,7 @@ export function createBashTool(options: {
     }
     // report-only 宿主直跑没有 OS 圈禁；先拦可静态判定的圈外重定向 / 外 cd，
     // 与 write_file 的 resolveInWorkdir 同向。漏网面见 shell-confine.ts 头注。
-    const confine = confineShellCommand(command, ctx.workdir);
+    const confine = confineShellCommand(command, ctx.workdir, ctx.writeRoots);
     if (!confine.ok) {
       return { content: confine.reason, isError: true };
     }

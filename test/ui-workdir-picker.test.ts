@@ -21,6 +21,15 @@ import {
   wireWorkdirSelect,
   buildFsListUrl,
   initWorkdirPicker,
+  formatWorkdirTriggerLabel,
+  normalizeWorkdirSelection,
+  applyWorkdirSelection,
+  getWorkdirSelection,
+  renderWorkdirMenu,
+  initWorkdirCombobox,
+  buildFsMkdirUrl,
+  isSafeFolderName,
+  workdirBreadcrumbs,
 } from "../ui/public/features/workdir-picker.js";
 
 const flush = () => new Promise((r) => setTimeout(r, 0));
@@ -56,6 +65,35 @@ describe("shortenPath", () => {
   it("恰好等于上限不动", () => {
     const s = "x".repeat(40);
     expect(shortenPath(s, 40)).toBe(s);
+  });
+});
+
+describe("workdirBreadcrumbs / isSafeFolderName", () => {
+  it("Windows 盘符拆成可点的每一级", () => {
+    expect(workdirBreadcrumbs("D:\\Host\\proj")).toEqual([
+      { name: "D:\\", path: "D:\\" },
+      { name: "Host", path: "D:\\Host" },
+      { name: "proj", path: "D:\\Host\\proj" },
+    ]);
+  });
+
+  it("Unix 根拆成 / 加每一级", () => {
+    expect(workdirBreadcrumbs("/tmp/a")).toEqual([
+      { name: "/", path: "/" },
+      { name: "tmp", path: "/tmp" },
+      { name: "a", path: "/tmp/a" },
+    ]);
+  });
+
+  it("拒绝穿越与非法文件夹名", () => {
+    expect(isSafeFolderName("ok")).toBe(true);
+    expect(isSafeFolderName("..")).toBe(false);
+    expect(isSafeFolderName("a/b")).toBe(false);
+    expect(isSafeFolderName("a:b")).toBe(false);
+  });
+
+  it("mkdir 地址固定", () => {
+    expect(buildFsMkdirUrl()).toBe("/api/fs/mkdir");
   });
 });
 
@@ -99,6 +137,113 @@ describe("renderWorkdirOptions", () => {
     renderWorkdirOptions(select, ["B", "C"], { selected: "C" });
     expect([...select.options].map((o) => o.value)).toEqual(["B", "C", WORKDIR_ADD_VALUE]);
     expect(select.value).toBe("C");
+  });
+});
+
+describe("formatWorkdirTriggerLabel / normalizeWorkdirSelection", () => {
+  it("关闭态：只有主目录时缩短路径，有额外目录加 · +N", () => {
+    expect(formatWorkdirTriggerLabel("D:\\Work", [], 40)).toBe("D:\\Work");
+    expect(formatWorkdirTriggerLabel("D:\\a", ["D:\\b", "D:\\c"])).toBe("D:\\a · +2");
+    expect(formatWorkdirTriggerLabel("D:\\a", ["D:\\a"])).toBe("D:\\a");
+    expect(formatWorkdirTriggerLabel("")).toBe("选择目录");
+  });
+
+  it("额外目录去重、丢掉主目录、丢掉不在白名单里的", () => {
+    expect(normalizeWorkdirSelection(["A", "B", "C"], {
+      primary: "B",
+      extras: ["A", "A", "B", "Nope"],
+    })).toEqual({ primary: "B", extras: ["A"] });
+    expect(normalizeWorkdirSelection(["A", "B"], { primary: "Nope" })).toEqual({
+      primary: "A",
+      extras: [],
+    });
+  });
+});
+
+describe("applyWorkdirSelection", () => {
+  it("主目录写进 select.value，额外目录进 dataset.extras", () => {
+    const select = makeSelect();
+    renderWorkdirOptions(select, ["A", "B", "C"], { selected: "A" });
+    applyWorkdirSelection(select, ["A", "B", "C"], { primary: "C", extras: ["A", "C"] });
+    expect(select.value).toBe("C");
+    expect(getWorkdirSelection(select)).toEqual({ primary: "C", extras: ["A"] });
+  });
+});
+
+describe("renderWorkdirMenu + initWorkdirCombobox", () => {
+  function mountCombobox(workdirs = ["A", "B", "C"], selected = "A") {
+    const root = document.createElement("div");
+    root.id = "workdir-combobox";
+    const select = document.createElement("select");
+    select.id = "workdir-select";
+    const trigger = document.createElement("button");
+    trigger.id = "workdir-trigger";
+    trigger.type = "button";
+    const text = document.createElement("span");
+    text.className = "wd-trigger-text";
+    trigger.appendChild(text);
+    const menu = document.createElement("div");
+    menu.id = "workdir-menu";
+    menu.className = "wd-menu";
+    menu.hidden = true;
+    root.append(select, trigger, menu);
+    document.body.appendChild(root);
+    renderWorkdirOptions(select, workdirs, { selected });
+    return { root, select, trigger, menu, text };
+  }
+
+  it("菜单用主题色行而不是原生 option，未选中项也有完整路径字", () => {
+    const menu = document.createElement("div");
+    document.body.appendChild(menu);
+    renderWorkdirMenu(menu, ["D:\\Work", "D:\\Play"], { primary: "D:\\Play" });
+    const rows = [...menu.querySelectorAll(".wd-option")];
+    expect(rows).toHaveLength(2);
+    expect(rows[0].textContent).toContain("D:\\Work");
+    expect(rows[1].classList.contains("is-primary")).toBe(true);
+    expect(menu.querySelector(".wd-menu-hint")?.textContent).toContain("读写");
+    expect(menu.querySelector(".wd-add")?.textContent).toContain("添加目录");
+    expect(menu.querySelector("option")).toBeNull();
+  });
+
+  it("勾选额外目录 → onChange；设为主会把旧主目录留在 extras", () => {
+    const { root, select, trigger, menu } = mountCombobox();
+    const onChange = vi.fn();
+    const onAddRequest = vi.fn();
+    const api = initWorkdirCombobox(root, { onChange, onAddRequest });
+    expect(api).toBeTruthy();
+    expect(trigger.querySelector(".wd-trigger-text")?.textContent).toBe("A");
+
+    trigger.click();
+    expect(api.isOpen()).toBe(true);
+    const checkB = menu.querySelector('[data-path="B"] .wd-check');
+    checkB.checked = true;
+    checkB.dispatchEvent(new Event("change", { bubbles: true }));
+    expect(onChange).toHaveBeenCalledWith({ primary: "A", extras: ["B"] });
+    expect(getWorkdirSelection(select)).toEqual({ primary: "A", extras: ["B"] });
+    expect(trigger.querySelector(".wd-trigger-text")?.textContent).toBe("A · +1");
+
+    const setPrimary = menu.querySelector('[data-path="C"] .wd-primary-btn');
+    setPrimary.click();
+    expect(onChange).toHaveBeenLastCalledWith({ primary: "C", extras: ["B", "A"] });
+    expect(select.value).toBe("C");
+  });
+
+  it("添加目录按钮关掉菜单并请求浮层；Esc / 点外面关闭", () => {
+    const { root, trigger, menu } = mountCombobox();
+    const onAddRequest = vi.fn();
+    const api = initWorkdirCombobox(root, { onAddRequest });
+    trigger.click();
+    menu.querySelector("[data-add]").click();
+    expect(onAddRequest).toHaveBeenCalledTimes(1);
+    expect(api.isOpen()).toBe(false);
+
+    trigger.click();
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", cancelable: true }));
+    expect(api.isOpen()).toBe(false);
+
+    trigger.click();
+    document.body.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    expect(api.isOpen()).toBe(false);
   });
 });
 
@@ -157,6 +302,17 @@ function makeFakeFetch({ tree = {}, addResult = { status: 200, body: {} } } = {}
         json: async () => addResult.body,
       };
     }
+    if (url === "/api/fs/mkdir" && opts.method === "POST") {
+      const body = JSON.parse(opts.body ?? "{}");
+      const parent = tree[body.path];
+      if (!parent) {
+        return { ok: false, status: 404, json: async () => ({ error: "目录不存在" }) };
+      }
+      const created = `${body.path}\\${body.name}`;
+      parent.dirs = [...(parent.dirs ?? []), { name: body.name, path: created }];
+      tree[created] = { path: created, parent: body.path, dirs: [] };
+      return { ok: true, status: 200, json: async () => ({ path: created, parent: body.path, name: body.name }) };
+    }
     throw new Error(`unexpected fetch: ${url}`);
   });
   return { fetchImpl, calls };
@@ -211,6 +367,29 @@ describe("initWorkdirPicker", () => {
     picker.open("D:\\Nope");
     await flush();
     expect(document.querySelector(".wp-status").textContent).toContain("不存在");
+  });
+
+  it("面包屑可点回上级；新建文件夹 POST 后刷新列表", async () => {
+    const { fetchImpl, calls } = makeFakeFetch({ tree: TREE });
+    const picker = initWorkdirPicker({}, {
+      fetch: fetchImpl,
+      prompt: () => "newdir",
+    });
+    picker.open("D:\\Host");
+    await flush();
+    const crumbs = [...document.querySelectorAll(".wp-crumb")];
+    expect(crumbs.map((c) => c.textContent)).toEqual(["D:\\", "Host"]);
+    crumbs[0].click();
+    await flush();
+    expect(picker.currentPath()).toBe("D:\\");
+
+    picker.open("D:\\Host");
+    await flush();
+    document.querySelector(".wp-mkdir").click();
+    await flush();
+    const mkdir = calls.find((c) => c.url === "/api/fs/mkdir");
+    expect(JSON.parse(mkdir.opts.body)).toEqual({ path: "D:\\Host", name: "newdir" });
+    expect([...document.querySelectorAll(".wp-dir")].map((i) => i.textContent)).toContain("newdir");
   });
 
   it("粘贴路径 → 前往", async () => {

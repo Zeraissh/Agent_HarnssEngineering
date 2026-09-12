@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   RunHistoryWriter,
+  classifyDurableRunState,
   parseDurableRunState,
   readArchivedState,
 } from "../ui/history.js";
@@ -11,7 +12,7 @@ import {
   durablePlanFromPlan,
   recoverDurableStateOnCrash,
 } from "../ui/server.js";
-import { initialRunState, transitionRunState } from "../src/run-state.js";
+import { canSameRunResume, initialRunState, transitionRunState } from "../src/run-state.js";
 
 const dirs: string[] = [];
 afterEach(async () => {
@@ -71,7 +72,7 @@ describe("RUN-01 state.json persistence", () => {
       },
     )!;
     expect(gated.phase).toBe("plan_gated");
-    expect(recoverDurableStateOnCrash(gated).phase).toBe("closed");
+    expect(recoverDurableStateOnCrash(gated).phase).toBe("plan_gated");
 
     const exec = transitionRunState(initialRunState("r"), { type: "start" })!;
     expect(recoverDurableStateOnCrash(exec).phase).toBe("interrupted");
@@ -90,6 +91,60 @@ describe("RUN-01 state.json persistence", () => {
     expect(snap.protocol).toBe("structured");
     expect(snap.taskIds).toEqual(["s1", "s2"]);
     expect(snap.edges).toEqual({ s1: [], s2: ["s1"] });
+  });
+
+  it("state.json 往返保留 plan.nodes；缺 nodes 的旧档案仍可解析", async () => {
+    const dir = await temp();
+    const w = new RunHistoryWriter(dir);
+    let state = initialRunState("r-nodes", 10);
+    state = transitionRunState(state, { type: "plan_begin" }, 11)!;
+    const snap = durablePlanFromPlan(
+      {
+        subtasks: [
+          { id: "s1", title: "a", description: "d", acceptance: ["ok"], dependsOn: [] },
+          { id: "s2", title: "b", description: "d", acceptance: ["ok"], dependsOn: ["s1"] },
+        ],
+      },
+      "freeform",
+      [
+        {
+          id: "s1",
+          title: "a",
+          description: "d",
+          acceptance: ["ok"],
+          dependsOn: [],
+          status: "passed",
+          evidenceSummary: "s1 done",
+        },
+        {
+          id: "s2",
+          title: "b",
+          description: "d",
+          acceptance: ["ok"],
+          dependsOn: ["s1"],
+          status: "pending",
+        },
+      ],
+    );
+    state = transitionRunState(state, { type: "plan_ready", plan: snap, gated: false }, 12)!;
+    w.writeState(state);
+    await w.flush();
+    const loaded = await readArchivedState(dir);
+    expect(loaded?.plan?.nodes?.map((n) => n.status)).toEqual(["passed", "pending"]);
+    expect(loaded?.plan?.nodes?.[0]?.evidenceSummary).toBe("s1 done");
+    expect(canSameRunResume({
+      phase: "interrupted",
+      hasCheckpoint: false,
+      verify: true,
+      mode: "plan",
+      budgetExhausted: false,
+      plan: {
+        approved: true,
+        hasPassedNode: true,
+        hasFailedNode: false,
+        hasRemainingNode: true,
+      },
+    })).toBe(true);
   });
 
   it("Phase 2：budget + grantAudit round-trip；旧档案缺字段仍可解析", async () => {
@@ -139,5 +194,43 @@ describe("RUN-01 state.json persistence", () => {
     };
     expect(parseDurableRunState(legacy)?.budget).toBeNull();
     expect(parseDurableRunState(legacy)?.grantAudit).toEqual([]);
+    expect(parseDurableRunState(legacy)?.checkpoint).toBeNull();
+    expect(
+      parseDurableRunState({
+        ...legacy,
+        checkpoint: { segmentIndex: -1, contextInputTokens: 0 },
+      }),
+    ).toBeNull();
+  });
+});
+
+describe("OPS-01 schema migrate / in-flight upgrade", () => {
+  it("当前版本可解析；额外字段忽略；未来版本 unsupported_version 不是 malformed", () => {
+    let interrupted = transitionRunState(initialRunState("r-ops"), { type: "start" })!;
+    interrupted = transitionRunState(interrupted, { type: "interrupt" })!;
+    expect(classifyDurableRunState(interrupted)).toMatchObject({ ok: true, reason: "current" });
+    expect(parseDurableRunState({ ...interrupted, extraFutureField: true })).toEqual(interrupted);
+
+    const future = { ...interrupted, version: 2 };
+    expect(parseDurableRunState(future)).toBeNull();
+    expect(classifyDurableRunState(future)).toEqual({
+      ok: false,
+      state: null,
+      reason: "unsupported_version",
+      version: 2,
+    });
+    expect(classifyDurableRunState({ ...interrupted, phase: "not-a-phase" }).reason).toBe("malformed");
+    expect(classifyDurableRunState(null).reason).toBe("not_object");
+    // 未来版本 parse 为 null → 同 run 续跑读不到它（升级中的在途任务 fail-closed）
+    expect(parseDurableRunState(future)).toBeNull();
+    expect(
+      canSameRunResume({
+        phase: "interrupted",
+        hasCheckpoint: true,
+        mode: "single",
+        verify: false,
+        budgetExhausted: false,
+      }),
+    ).toBe(true);
   });
 });

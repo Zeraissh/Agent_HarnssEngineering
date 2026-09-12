@@ -7,6 +7,7 @@
  * intentionally fail-closed about what it cannot prove — residual gaps are
  * documented in docs/08, not papered over with an LLM summary.
  */
+import { isSideEffectTool } from "./tool-tx.js";
 
 export const COMPACT_LEDGER_MARKER = "[compact_ledger]";
 
@@ -16,6 +17,8 @@ export interface CompactLedger {
   failures: string[];
   evidence: string[];
   sideEffects: string[];
+  /** Successful write_file paths — compact 之后模型仍知道本对话交了什么 */
+  deliverables: string[];
   /**
    * Optional Phase B narrative prose. Never replaces the five buckets;
    * merge appends / dedupes. Omitted from ledgerEntryCount (buckets only).
@@ -38,7 +41,7 @@ const DECISION_RE =
   /(?:决定|选择|采用|改用|改为|结论|decided\b|decision\b|will use\b|switching to\b|chose\b|going with\b)[^\n。；;]{0,160}/gi;
 
 const PATH_RE =
-  /(?:[A-Za-z]:\\|\/|\.\/)[^\s"'`<>|]{3,120}|\b[\w.-]+\.(?:c|h|ts|js|py|md|elf|hex|kicad_sch|kicad_pcb|json|txt)\b/g;
+  /(?:[A-Za-z]:\\|\/|\.\/)[^\s"'`<>|]{3,120}|\b[\w.-]+\.(?:c|h|ts|js|mjs|cjs|py|md|html?|css|svg|png|jpe?g|webp|gif|elf|hex|kicad_sch|kicad_pcb|json|txt)\b/g;
 
 const HEX_RE = /\b0x[0-9A-Fa-f]{4,16}\b/g;
 const HASH_RE = /\b[A-Fa-f0-9]{64}\b/g;
@@ -48,11 +51,8 @@ const KEY_VALUE_RE =
 const MUTATING_BASH_RE =
   /\b(?:rm|mv|cp|dd|git\s+commit|git\s+push|cmake|make\b|ninja|flash|openocd|pip\s+install|npm\s+i(?:nstall)?|tee\b|mkdir|touch)\b|[>|]{1,2}/i;
 
-const SIDE_EFFECT_TOOL_RE =
-  /^(?:write_file|write_memory|flash_firmware|flash_and_run)$|flash|write_memory|program_device|erase/i;
-
 export function emptyCompactLedger(): CompactLedger {
-  return { constraints: [], decisions: [], failures: [], evidence: [], sideEffects: [] };
+  return { constraints: [], decisions: [], failures: [], evidence: [], sideEffects: [], deliverables: [] };
 }
 
 export function ledgerEntryCount(ledger: CompactLedger): number {
@@ -61,7 +61,8 @@ export function ledgerEntryCount(ledger: CompactLedger): number {
     ledger.decisions.length +
     ledger.failures.length +
     ledger.evidence.length +
-    ledger.sideEffects.length
+    ledger.sideEffects.length +
+    ledger.deliverables.length
   );
 }
 
@@ -74,6 +75,7 @@ export function mergeCompactLedgers(...parts: CompactLedger[]): CompactLedger {
     pushUnique(out.failures, part.failures);
     pushUnique(out.evidence, part.evidence);
     pushUnique(out.sideEffects, part.sideEffects);
+    pushUnique(out.deliverables, part.deliverables ?? []);
     if (part.narrative?.trim()) narratives.push(part.narrative.trim());
   }
   if (narratives.length) {
@@ -89,7 +91,7 @@ export function mergeCompactLedgers(...parts: CompactLedger[]): CompactLedger {
 export function parseCompactLedgerText(text: string): CompactLedger {
   if (!text.includes(COMPACT_LEDGER_MARKER)) return emptyCompactLedger();
   const out = emptyCompactLedger();
-  type Bucket = "constraints" | "decisions" | "failures" | "evidence" | "sideEffects";
+  type Bucket = "constraints" | "decisions" | "failures" | "evidence" | "sideEffects" | "deliverables";
   type Mode = Bucket | "narrative" | null;
   let mode: Mode = null;
   const narrativeParts: string[] = [];
@@ -116,6 +118,10 @@ export function parseCompactLedgerText(text: string): CompactLedger {
     }
     if (header === "side-effects" || header === "sideeffects") {
       mode = "sideEffects";
+      continue;
+    }
+    if (header === "deliverables") {
+      mode = "deliverables";
       continue;
     }
     if (header === "summary" || header === "narrative") {
@@ -145,6 +151,7 @@ export function formatCompactLedger(ledger: CompactLedger): string {
   appendBucket(lines, "failures", ledger.failures);
   appendBucket(lines, "evidence", ledger.evidence);
   appendBucket(lines, "side-effects", ledger.sideEffects);
+  appendBucket(lines, "deliverables", ledger.deliverables);
   if (ledger.narrative?.trim()) {
     lines.push("summary:");
     lines.push(ledger.narrative.trim());
@@ -273,8 +280,11 @@ export function extractFromToolExchange(
 
   if (name === "write_file") {
     const path = readStringField(input, "path");
-    if (path) pushUnique(local.sideEffects, [`write_file ${path}`]);
-  } else if (SIDE_EFFECT_TOOL_RE.test(name)) {
+    if (path) {
+      pushUnique(local.sideEffects, [`write_file ${path}`]);
+      pushUnique(local.deliverables, [path]);
+    }
+  } else if (name !== "bash" && isSideEffectTool(name)) {
     const detail = summarizeToolInput(name, input);
     pushUnique(local.sideEffects, [detail]);
   } else if (name === "bash") {

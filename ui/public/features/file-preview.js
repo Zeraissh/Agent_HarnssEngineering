@@ -151,7 +151,6 @@ export function initFilePreview(host = {}, env = {}) {
       label: "文件预览",
       overlay: true,
       extraClass: "fp-overlay",
-      onClose: () => closePreview(),
     },
     env,
   );
@@ -207,7 +206,7 @@ export function initFilePreview(host = {}, env = {}) {
     downloadLink.setAttribute("download", artifactBasename(path));
     setSize(null);
 
-    if (!dock.isOpen()) {
+    if (!dock.isOpen() || dock.isCollapsed()) {
       dock.open();
       host.onAnnounce?.(`文件预览已打开：${artifactBasename(path)}`);
     }
@@ -233,6 +232,7 @@ export function initFilePreview(host = {}, env = {}) {
     open: openPreview,
     close: closePreview,
     isOpen: () => dock.isOpen(),
+    isCollapsed: () => dock.isCollapsed(),
     isExpanded: () => dock.isExpanded(),
     setExpanded: (b) => dock.setExpanded(b),
     element: overlay,

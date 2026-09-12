@@ -8,6 +8,7 @@ import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, readFileSync } from "node:fs";
 import { join, extname, dirname, delimiter, resolve, basename, relative, sep, isAbsolute } from "node:path";
+import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -31,6 +32,7 @@ import {
 } from "../src/orchestrate.js";
 import { createModelClientFromEnv, type ResolvedProvider } from "../src/provider.js";
 import {
+  ROLE_KEYS,
   MODEL_STORE_FILENAME,
   isValidModelName,
   loadModelStore,
@@ -49,14 +51,19 @@ import {
   WORKDIRS_FILENAME,
   WORKDIRS_SCHEMA_VERSION,
   loadWorkdirStore,
+  mergeRunReadRoots,
+  parseExtraWorkdirs,
   saveWorkdirStore,
+  isSafeFolderName,
 } from "./workdirs.js";
-import { heuristicComplete, parseCompleteBody } from "./complete.js";
 import {
   instrumentModelClient,
+  modelCallSeconds,
+  modelTtftSeconds,
   obsRegistry,
   observeWaitSeconds,
   preregisterObservability,
+  waitSeconds,
   WAIT_KINDS,
   costUnpricedTokensTotal,
   costUsdTotal,
@@ -77,6 +84,8 @@ import {
   FallbackModelClient,
   readFallbackEnv,
   sharedBreakerRegistry,
+  stripThinkingFromMessages,
+  type CircuitState,
   type FallbackEndpoint,
   type FallbackInfo,
   type FallbackRouting,
@@ -84,8 +93,12 @@ import {
 import {
   capabilityStorePath,
   configureCapabilityStore,
+  endpointIdentityKey,
+  getStickyCapabilities,
   learnContextWindow,
   probeEndpointCapabilities,
+  probeVisionSupport,
+  shouldRunModelProbe,
   type EndpointCapabilities,
   type EndpointIdentity,
 } from "../src/model-capability.js";
@@ -97,12 +110,96 @@ import {
   validateRunContextBudget,
   type ContextPlan,
 } from "../src/context-window.js";
-import { getPack, selectPackTools, PACKS, DEFAULT_HOST_DISCIPLINES, type DomainPack } from "../src/presets.js";
+import { allPacks, clearFilePacks, getPack, selectPackTools, PACKS, DEFAULT_HOST_DISCIPLINES, type DomainPack } from "../src/presets.js";
+import {
+  discardDraftPack,
+  filePackListView,
+  installDraftPack,
+  listFilePacks,
+  loadInstalledFilePacksSync,
+  packsRootFromEnv,
+  writeDraftPack,
+} from "../src/pack-files.js";
+import { draftDomainPackTool } from "../src/tools/draft-domain-pack.js";
 import { routeToPack } from "../src/router.js";
-import { connectMcpServers, loadMcpConfig, type McpRuntime } from "../src/mcp.js";
-import { sanitizeGeneratedTitle, summarizeTitle, TITLE_SYSTEM } from "./title.js";
+import {
+  DESIGN_TABS,
+  designRouteForRunConfig,
+  installedFilePacksFrom,
+  publicDesignCatalog,
+  routeDesignTask,
+  seedsToCopy,
+  shouldSeedDesignTemplate,
+  shouldWriteBlankDesignIndex,
+  writeBlankDesignIndex,
+  writeDesignBundleHub,
+  type DesignRoute,
+} from "../src/design-mode.js";
+import {
+  decideDesignDraftsSelection,
+  isHarnessPackageName,
+  packageNameFromJson,
+  resolveDesignDraftsDir,
+  sameWorkdirPath,
+} from "../src/design-workdir.js";
+import {
+  convertDeckHtmlToPptx,
+  DECK_PPTX_NO_SLIDES,
+  deckSlideTitle,
+  isDeckPptxError,
+  joinHtmlRelative,
+  pptxRelPathForHtml,
+  relativeStylesheetHrefs,
+} from "../src/deck-pptx.js";
+import {
+  CARD_PNG_CAPTURE_UNAVAILABLE,
+  CARD_PNG_NO_FRAMES,
+  capturePngFramesWithPlaywright,
+  fixturePngCapture,
+  isCardPngError,
+  pngRelPathsForHtml,
+  requirePngFrames,
+  type PngCaptureFn,
+} from "../src/card-png.js";
+import {
+  connectMcpServers,
+  filterMcpConfigForPack,
+  loadMcpConfig,
+  mergeMcpRuntimes,
+  type McpRuntime,
+} from "../src/mcp.js";
+import { packAcceptsHostGithub } from "../src/mcp-github.js";
+import {
+  DirtyWorktreeError,
+  formatWorkspaceGitLine,
+  probeWorkspaceGit,
+  publicWorkspaceGit,
+  switchWorkspaceBranch,
+  type PublicWorkspaceGit,
+  type WorkspaceDirtyAction,
+} from "../src/workspace-git.js";
+import { resolveRunTitle, sanitizeGeneratedTitle, summarizeTitle, titleSourceText, TITLE_SYSTEM } from "./title.js";
 import { appendSiteHooks } from "./public/features/review-mode.js";
 import { buildStoreZip, zipEntryName } from "./zip.js";
+import {
+  copyDesignTemplate,
+  designTemplatesRootFromRepo,
+  listDesignTemplates,
+  parseDesignPalette,
+  readDesignMd,
+} from "./design-templates.js";
+import {
+  buildFreshTurnBackground,
+  buildContinuationAnchor,
+  buildExecutorSwitchBriefing,
+  buildThreadSketch,
+  buildWorkspaceGitBriefing,
+  formatSiblingBootContext,
+  isRelativeContinuation,
+  shouldTreatAsExecutorSwitch,
+  withBootContext,
+  type ThreadEventLike,
+} from "./conversation-context.js";
 import { aggregateUsage, parseLedgerLines } from "./usage.js";
 import { envUpdatesFromStore, upsertEnvKeys } from "./env-sync.js";
 import {
@@ -111,10 +208,27 @@ import {
   publicMcpServers,
   serializeMcpConfig,
 } from "./mcp-config-file.js";
-import { createWorkdirScopedMemoryTools, MEMORY_TOOL_NAMES, MemoryStore } from "../src/memory.js";
+import { createWorkdirScopedMemoryTools, MEMORY_TOOL_NAMES, MemoryStore, resolveMemoryDir } from "../src/memory.js";
+import {
+  annotateMemoryEntries,
+  createProjectStatusTool,
+  formatProjectStatusBlock,
+  isSharedMemoryDir,
+  projectSlugFromWorkdir,
+  readProjectStatus,
+  scopedMemoryIndex,
+} from "../src/project-status.js";
 import { DEFAULT_VERIFIER_MAX_TURNS, resolveVerifierReadOnlyCommands } from "../src/verifier.js";
-import { resolvePlannerMaxTurns } from "../src/planner.js";
-import type { Plan, SubTask } from "../src/planner.js";
+import type { Plan, PlanNodeState, SubTask } from "../src/planner.js";
+import {
+  durableNodeFromPlanNode,
+  durablePlanFromPlan,
+  handoffsFromPlanNodes,
+  planFromNodes,
+  planNodesFromDurable,
+  planNodesFromSubtasks,
+  resolvePlannerMaxTurns,
+} from "../src/planner.js";
 import { resolveRecoveryPolicy } from "../src/recovery.js";
 import {
   matchPermissionMode,
@@ -125,6 +239,14 @@ import {
 import type Anthropic from "@anthropic-ai/sdk";
 import { bashTool, SHELL_DESC } from "../src/tools/bash.js";
 import { ASK_USER_TOOL_NAME, createAskUserTool, type UserQuestion } from "../src/tools/ask-user.js";
+import { createProposeHandoffTool } from "../src/tools/propose-handoff.js";
+import { createSpawnTaskTool } from "../src/tools/spawn-task.js";
+import { runSpawnedTask } from "../src/spawn.js";
+import {
+  buildHandoffPlan,
+  buildHandoffTask,
+  findHandoffAmong,
+} from "../src/handoff.js";
 import {
   FINISH_TASK_TOOL_NAME,
   withTaskCompletion,
@@ -139,6 +261,7 @@ import { globTool } from "../src/tools/glob.js";
 import { grepTool } from "../src/tools/grep.js";
 import { readFileTool } from "../src/tools/read-file.js";
 import { writeFileTool } from "../src/tools/write-file.js";
+import { writePptxTool } from "../src/tools/write-pptx.js";
 import { updateProgressTool } from "../src/tools/update-progress.js";
 import { resolveInWorkdir } from "../src/tools/fs-util.js";
 import { DEFAULT_TOOL_RESULT_MAX_CHARS } from "../src/tools/registry.js";
@@ -146,17 +269,31 @@ import {
   appendRunLedger,
   buildLedgerEntry,
   emptyCompactionTally,
+  emptyHooksTally,
   emptyRecoveryTally,
   isExecutorSource,
   ledgerErrorClass,
   ledgerPath,
+  emptyApprovalsTally,
+  tallyApprovalOutcome,
   tallyCompaction,
+  tallyHookEvent,
   tallyRecoveryDecision,
   tallyToolCall,
+  type LedgerApprovalsTally,
   type LedgerCompactionTally,
+  type LedgerHooksTally,
   type LedgerRecoveryTally,
   type ToolTally,
 } from "../src/ledger.js";
+import { createHookRuntime, resolveHooksFromEnv, type NormalizedHookSpec } from "../src/hooks.js";
+import {
+  agentMdView,
+  loadAgentMd,
+  mergeAgentMdContext,
+  resolveAgentMdMaxChars,
+  type AgentMdBundle,
+} from "../src/agent-md.js";
 import {
   DEFAULT_HISTORY_KEEP,
   RunHistoryWriter,
@@ -172,7 +309,22 @@ import {
   type ArchivedApprovalGrant,
   type ArchivedCheckpoint,
   type ArchivedMeta,
+  parseArchiveHost,
 } from "./history.js";
+import {
+  applyFileRevert,
+  captureBeforeWrite,
+  conversationTurnFromEvents,
+  loadRewindSnapshots,
+  parseRewindFromMeta,
+  parseRewindRequest,
+  persistRewindSnapshot,
+  pickTranscriptForRewind,
+  truncateEventsToSeq,
+  wrapToolsWithRewindSnapshots,
+  writesAfterSeq,
+  type FileRewindRecord,
+} from "./conversation-rewind.js";
 import {
   ScheduleRunner,
   SCHEDULE_TICK_MS,
@@ -186,12 +338,16 @@ import {
   type ScheduleEntry,
 } from "./scheduler.js";
 import {
+  canReopenSameRun,
+  canRestorePlanGate,
   canSameRunResume,
   initialRunState,
+  planResumeFacts,
   recoveryActionForPhase,
   transitionRunState,
   type DurableBudgetSnapshot,
   type DurableGrantAuditEntry,
+  type DurablePlanNode,
   type DurablePlanSnapshot,
   type DurableRunState,
   type RunStateEvent,
@@ -207,6 +363,14 @@ import {
   startSpan,
   type TraceSpan,
 } from "../src/trace.js";
+import {
+  hostPlanEvent,
+  hostPlanReplanEvent,
+  hostPlanResultEvent,
+  hostPlanResumeEvent,
+  hostPlanSubtaskViews,
+  serializeTurnEventForArchive,
+} from "../src/archive-event.js";
 import { EFFORT_LEVELS } from "../src/types.js";
 import type {
   ModelClient,
@@ -401,6 +565,10 @@ interface StoredRun {
   recoveryTally?: LedgerRecoveryTally;
   /** 上下文压缩计数（全部角色；常规 / 反应式 / 置换块 / 折叠轮），同在事件旁路累加 */
   compactionTally?: LedgerCompactionTally;
+  /** 外部 hooks 计数；仅武装时累加。未武装的 run 不建这个字段。 */
+  hooksTally?: LedgerHooksTally;
+  /** 工具审批结局；在 approval_resolved / approval_expired 旁路累加（不是请求）。 */
+  approvalsTally?: LedgerApprovalsTally;
   /**
    * 本对话轮执行者谱系（main / rework / 子任务 main）各段 done.usage.turns 之和。
    * 台账 `turns` 此前只在带核查时有值（读 outcome.executionUsage），裸跑一律 null——
@@ -456,8 +624,19 @@ interface StoredRun {
   contextTokenLimit?: number;
   /** 最近一次 buildConfig 解析出的窗口 / 预算计划（台账记的是它，不是收尾时重算的） */
   contextPlan?: ContextPlan;
-  /** V-27：编排模式。plan = 走 runPlanned（planner 拆解 + 依赖调度 + 并行） */
-  mode?: "single" | "plan";
+  /** 档案来源。cli = CLI 写下的；缺省 = Web。列表只在 cli 时标徽章。 */
+  host?: "cli" | "web";
+  /** V-27：编排模式。plan = 走 runPlanned；design = 设计模式门面（单执行者） */
+  mode?: "single" | "plan" | "design";
+  /** 设计模式路由结果，给界面照实说 */
+  designRoute?: {
+    id: string | null;
+    reason: string;
+    seed: string;
+    kind: string;
+    bundle?: string | null;
+    extraSeeds?: string[];
+  };
   concurrency?: number | "auto";
   /**
    * 谱系 token/轮次硬顶。缺省 true（真实宿主默认 2M / 120）。
@@ -477,6 +656,12 @@ interface StoredRun {
    */
   loop?: AgentLoop;
   history?: Anthropic.MessageParam[];
+  /** 写出这段正史的执行者角色 id（模型库 roles.executor） */
+  lastExecutorRoleId?: string;
+  /** 写出这段正史的端点身份键（provider|model|origin） */
+  lastExecutorIdentityKey?: string;
+  /** 写出这段正史时的模型名——换模型 briefing 用 */
+  lastExecutorModel?: string;
   /**
    * 信息队列·排队指令（委托方："等队列结束后再发送"）。运行中收到、本轮结束后
    * 由宿主拼成一条自动续跑（见 finalizeRun 尾部的 flushQueuedMessagesAfterDone）。
@@ -492,6 +677,10 @@ interface StoredRun {
   conversationTurn: number;
   /** V-29：本次运行的工作目录（工具写入圈禁根），必来自白名单 */
   workdir?: string;
+  /** 工作区 git 身份（不带 remote URL）。跟 workdir 走，换包不消失。 */
+  workspaceGit?: PublicWorkspaceGit;
+  /** 勾选的额外白名单目录（提示焦点）。写入圈是整份白名单，不靠这一项放行。 */
+  extraWorkdirs?: string[];
   /** V-30：本次运行是否启用已配置的独立角色模型 */
   useVerifierModel?: boolean;
   usePlannerModel?: boolean;
@@ -535,6 +724,22 @@ interface StoredRun {
    * buildConfig 每次新造一个等于配额永远用不完（决定 2 当场作废）。
    */
   askUserTool?: Tool;
+  /**
+   * 不挡对话的「下一步」提议。工具立刻返回；人点同意才开子 run。
+   * 文案以包声明为准，不采信模型自己写的按钮字。
+   */
+  handoffProposal?: HandoffProposalState;
+  proposeHandoffTool?: Tool;
+  /** AGENT-02：spawn_task 实例缓存（与 ask_user 同款理由） */
+  spawnTaskTool?: Tool;
+  /** 宿主注入的计划（handoff 同意后）：跳过 planner，也不开计划确认门 */
+  injectedPlan?: Plan;
+  /**
+   * AGENT-01：上一份计划的节点状态 + 已通过节点交接摘要。
+   * 重规划时喂给 runPlanned.replan；普通追问不碰。
+   */
+  planNodes?: PlanNodeState[];
+  planHandoffs?: Record<string, string>;
   // ---- B2 运行历史落盘 ----
   /** 本次进程内的落盘写入器；无历史根或显式关闭时缺省（history 一名已被会话正史占用） */
   archiveWriter?: RunHistoryWriter;
@@ -560,6 +765,11 @@ interface StoredRun {
   rootRunId?: string;
   /** 本轮收尾摘要（执行者最后一段正文的首句）；列表与 fort 续跑沿用 */
   conversationRecap?: string;
+  /**
+   * 新开 run 时宿主装配的开机背景（同 workdir 最近会话等）。
+   * 只进执行者首轮任务书 / fresh 续跑反馈，不改写委托方原话、不冒充正史。
+   */
+  bootContext?: string;
   /** 仅供刚派生的新 run 装配首轮；完成后 checkpoint 会从真实 done 事件重建。 */
   resumeBudget?: SharedRunBudget;
   initialContextInputTokens?: number;
@@ -570,10 +780,20 @@ interface StoredRun {
    */
   durableState?: DurableRunState;
   // ---- OBS-01 trace ----
+  /**
+   * 对话回退：子 run 是裁到 parent.seq 的快照；谱系拼聊天时在这一头截断，
+   * 不再把父 run 裁点之后的轮次拼回来。
+   */
+  rewindFrom?: { parentRunId: string; seq: number; revertFiles: boolean };
+  /** write_file 等调用前的 before 镜像（进程内）；落盘在档案 rewinds/ */
+  fileRewindSnapshots?: FileRewindRecord[];
+  fileRewindBlobs?: Map<string, Buffer>;
   /** 本 run 根 span id；子 span 挂在其下 */
   traceRunSpanId?: string;
   /** tool_call → tool_result 开闭配对 */
   openToolSpans?: Map<string, TraceSpan>;
+  /** model_call_start → model_call_end 开闭配对 */
+  openModelSpans?: Map<string, TraceSpan>;
 }
 
 interface PendingPlan {
@@ -581,6 +801,17 @@ interface PendingPlan {
   at: number;
   /** 由 waitForPlanDecision 装填：应答或过期时结束等待 */
   settle: (decision: "approve" | "reject" | "expired") => void;
+}
+
+interface HandoffProposalState {
+  status: "pending" | "accepted" | "declined";
+  id: string;
+  handoffId: string;
+  summary: string;
+  label: string;
+  declineLabel: string;
+  requestSeq: number;
+  childRunId?: string;
 }
 
 /**
@@ -669,6 +900,51 @@ export function exactInputApprovalKey(name: string, inputHash: string): string {
   return `${name.length}:${name}:${inputHash}`;
 }
 
+/**
+ * SSE 重放时：档案里还没标 autoResolved 的 request，只要后面已有
+ * resolved/expired，就在出站帧上补上。客户端即使被 500ms 超时切批，
+ * 也不会先画出一张已决的幽灵卡。不回写 run.events。
+ */
+export function annotateApprovalReplay<T extends { seq: number; event: Record<string, unknown> }>(
+  events: readonly T[],
+): T[] {
+  const resolved = new Map<string, Record<string, unknown>>();
+  const byTool = new Map<string, Record<string, unknown>[]>();
+  for (const item of events) {
+    const ev = item.event;
+    if (ev.type !== "approval_resolved" && ev.type !== "approval_expired") continue;
+    const toolUseId = String(ev.toolUseId ?? "");
+    if (!toolUseId) continue;
+    const requestSeq = Number(ev.requestSeq);
+    if (Number.isFinite(requestSeq)) resolved.set(`${toolUseId}#${requestSeq}`, ev);
+    else {
+      const list = byTool.get(toolUseId) ?? [];
+      list.push(ev);
+      byTool.set(toolUseId, list);
+    }
+  }
+  if (resolved.size === 0 && byTool.size === 0) return events.slice();
+  return events.map((item) => {
+    const ev = item.event;
+    if (ev.type !== "approval_request" || ev.autoResolved === true) return item;
+    const toolUseId = String(ev.toolUseId ?? "");
+    const exact = resolved.get(`${toolUseId}#${item.seq}`);
+    const fallback = byTool.get(toolUseId);
+    const hit = exact ?? (fallback?.length === 1 ? fallback[0] : undefined);
+    if (!hit) return item;
+    return {
+      ...item,
+      event: {
+        ...ev,
+        autoResolved: true,
+        decision: hit.type === "approval_expired" ? "deny" : (hit.decision ?? "allow"),
+        actor: hit.actor,
+        ...(hit.type === "approval_expired" ? { expired: true } : {}),
+      },
+    };
+  });
+}
+
 /** 工具定义变化后旧 grant 必须失效；摘要不包含 execute 函数或任何 secret。 */
 export function approvalToolFingerprint(tool: Tool): string {
   const definition = canonicalizeApprovalInput({
@@ -727,11 +1003,9 @@ function safeDecode(s: string): string {
 }
 
 /**
- * T5 /api/memory/:name 的合法记忆名：仅 [A-Za-z0-9._-]、以 .md 结尾。
- * 比 MemoryStore.NAME_RE 更窄（不允许子目录）——HTTP 路径参数不含 "/"，
- * 名单收窄后穿越面为零；列表里出现的嵌套名字（若有）读不到，属有意收窄。
+ * T5 /api/memory/:name 的合法记忆名：与 MemoryStore.NAME_RE 对齐（允许嵌套
+ * lessons/foo.md）。路径穿越仍由 ".." 与 resolvePath 双保险挡住。
  */
-const MEMORY_API_NAME_RE = /^[A-Za-z0-9._-]+\.md$/;
 /** T5 单条记忆读取上限：超出截断并在响应里标注 truncated */
 const MEMORY_READ_MAX_BYTES = 256 * 1024;
 
@@ -911,13 +1185,14 @@ async function searchRunHistory(
 
 /**
  * 能从 tool_call 入参直接读出目标路径的写盘工具 → 操作标签。
- * 与 src/tools/ 的实际注册名一一对应（write_file / edit_file）。
+ * 与 src/tools/ 的实际注册名一一对应（write_file / write_pptx / edit_file）。
  * bash 不在其中：它的写入藏在任意命令串里，从入参读不出路径——
  * 这与 app.js deriveArtifacts 的口径一致，宁缺勿假。
  * memory_write 有自己的面板（T5），不混入"工作目录变更"。
  */
 const CHANGE_TOOL_OPS: Record<string, "write" | "edit"> = {
   write_file: "write",
+  write_pptx: "write",
   edit_file: "edit",
 };
 
@@ -1136,7 +1411,10 @@ export interface UiServerOptions {
   exclusiveWorkdir?: boolean;
   /** 内存中保留的运行（含事件/正文）上限；磁盘历史仍按 historyKeep 独立保留。 */
   maxStoredRuns?: number;
-  /** 单一远端地址每分钟可发出的 POST 数；真实宿主默认 120。 */
+  /**
+   * 单一远端地址每分钟可发出的**状态变更**请求数；真实宿主默认 120。
+   * 路径探活、在文件夹中显示不计入；澄清/审批/计划门/停止也不拦。
+   */
   mutationRateLimitPerMinute?: number;
   /** 优雅关停等待历史/MCP/连接的最长时间。 */
   shutdownTimeoutMs?: number;
@@ -1184,6 +1462,13 @@ export interface UiServerOptions {
   /** mcp.json 落点。缺省 `AGENT_MCP_CONFIG` 或 `<workdir>/mcp.json`。测试应显式传入，避免改仓库文件。 */
   mcpConfigFile?: string;
   /**
+   * 文件领域包根目录（drafts/ + installed/）。
+   * 缺省：真实宿主读 `AGENT_PACKS_DIR` 或 `<cwd>/.agent-packs`；
+   * **注入了 modelClient 的宿主缺省 null**——假模型路径不该被开发机草稿武装。
+   * 显式 `null` = 不装文件包；字符串 = 指定根。
+   */
+  packsDir?: string | null;
+  /**
    * 运行时工作目录清单文件（V-29 扩展，.agent-workdirs.json）落点。缺省：真实宿主
    * `<workdir>/.agent-workdirs.json`；**注入了 modelClient 的宿主缺省 null**
    * （不落盘、不读残留，仪器纪律同 modelStoreFile）。显式传路径可在测试里验证
@@ -1197,6 +1482,21 @@ export interface UiServerOptions {
    * 返回 true 时抛 ToolTxCrashError；宿主收成 interrupted 且不 finalize 完成态。
    */
   crashAfterToolPrepared?: (runId: string, tx: DurableToolTx) => boolean;
+  /**
+   * design 模板根目录（内含 deck-basic/ 等）。缺省探测仓库 `templates/design`；
+   * 显式 `null` = 关闭模板 API（测试可隔离）。
+   */
+  designTemplatesDir?: string | null;
+  /**
+   * 设计模式独立稿目录。缺省：真实宿主 `AGENT_DESIGN_DRAFTS_DIR` 或 `~/Fathom`；
+   * 注入宿主缺省落在该实例 workdir 下的 Fathom-drafts，避免测试写进操作员家目录。
+   */
+  designDraftsDir?: string;
+  /**
+   * 方图 PNG 截图器。缺省：真实宿主走 Playwright；注入宿主用 1×1 夹具，
+   * 避免测试套启动 Chromium。
+   */
+  capturePngFrames?: PngCaptureFn;
 }
 
 /**
@@ -1221,22 +1521,71 @@ export function runOutcomeForStopReason(reason?: string): RunEndInfo["outcome"] 
   }
 }
 
-/** Plan → DurablePlanSnapshot（DAG 边 = dependsOn）。 */
-export function durablePlanFromPlan(
-  plan: Plan,
-  protocol: DurablePlanSnapshot["protocol"] = "freeform",
-): DurablePlanSnapshot {
-  const edges: Record<string, string[]> = {};
-  for (const t of plan.subtasks) {
-    edges[t.id] = [...(t.dependsOn ?? [])];
-  }
-  return {
-    protocol,
-    taskIds: plan.subtasks.map((t) => t.id),
-    edges,
-    approvedAt: null,
-    rejectedAt: null,
-  };
+export {
+  durableNodeFromPlanNode,
+  durablePlanFromPlan,
+  handoffsFromPlanNodes,
+  planNodesFromDurable,
+};
+
+function evidenceFromVerifiedStep(result: {
+  finalPassed: boolean;
+  main: { completion?: { summary?: string; artifacts?: string[] } | null };
+  verifications: Array<{ verdict?: { summary?: string; issues?: string[] } | null }>;
+}): string | undefined {
+  const parts: string[] = [];
+  const completion = result.main.completion;
+  if (completion?.summary) parts.push(completion.summary);
+  if (completion?.artifacts?.length) parts.push(`产物：${completion.artifacts.join("、")}`);
+  const verdict = result.verifications.at(-1)?.verdict;
+  if (verdict?.summary) parts.push(`裁决：${verdict.summary}`);
+  if (verdict?.issues?.length) parts.push(`问题：${verdict.issues.join("；")}`);
+  return parts.length ? parts.join(" · ") : undefined;
+}
+
+/** plan_result 步骤 → PlanNodeState（重规划种子） */
+export function planNodesFromOutcome(input: {
+  subtasks: SubTask[];
+  steps: Array<{
+    id: string;
+    passed: boolean;
+    completion?: { summary?: string; artifacts?: string[] } | null;
+    verdict?: { summary?: string; issues?: string[] } | null;
+  }>;
+  skipped: { id: string }[];
+}): { nodes: PlanNodeState[]; handoffs: Record<string, string> } {
+  const stepById = new Map(input.steps.map((s) => [s.id, s]));
+  const skipped = new Set(input.skipped.map((s) => s.id));
+  const handoffs: Record<string, string> = {};
+  const nodes: PlanNodeState[] = input.subtasks.map((t) => {
+    const st = stepById.get(t.id);
+    let status: PlanNodeState["status"] = "pending";
+    if (skipped.has(t.id)) status = "skipped";
+    else if (st) status = st.passed ? "passed" : "failed";
+    const evidenceParts: string[] = [];
+    if (st?.completion?.summary) evidenceParts.push(st.completion.summary);
+    if (st?.completion?.artifacts?.length) evidenceParts.push(`产物：${st.completion.artifacts.join("、")}`);
+    if (st?.verdict?.summary) evidenceParts.push(`裁决：${st.verdict.summary}`);
+    if (st?.verdict?.issues?.length) evidenceParts.push(`问题：${st.verdict.issues.join("；")}`);
+    const evidenceSummary = evidenceParts.length ? evidenceParts.join(" · ") : undefined;
+    if (st?.passed && st.completion?.summary) {
+      handoffs[t.id] = st.completion.summary;
+    } else if (st?.passed && evidenceSummary) {
+      handoffs[t.id] = evidenceSummary;
+    }
+    return {
+      id: t.id,
+      title: t.title,
+      pack: t.pack ?? null,
+      description: t.description,
+      acceptance: [...t.acceptance],
+      dependsOn: [...t.dependsOn],
+      ...(t.resources ? { resources: [...t.resources] } : {}),
+      status,
+      ...(evidenceSummary ? { evidenceSummary } : {}),
+    };
+  });
+  return { nodes, handoffs };
 }
 
 /**
@@ -1250,7 +1599,7 @@ export function recoverDurableStateOnCrash(
   at = Date.now(),
 ): DurableRunState {
   const action = recoveryActionForPhase(state.phase);
-  if (action === "readonly") return state;
+  if (action === "readonly" || action === "restore_gate") return state;
   if (action === "close_archive") {
     return transitionRunState(state, { type: "close" }, at) ?? { ...state, phase: "closed", updatedAt: at };
   }
@@ -1770,43 +2119,13 @@ function isMessageHistory(value: unknown): value is Anthropic.MessageParam[] {
 }
 
 /** 把 TurnEvent 投影为可序列化对象，approval_request 去掉 respond 回调 */
+/** 档案投影与 CLI 共用（delta 不占 seq；done 不带正史）。 */
 function serializeEvent(
   _source: string,
   event: TurnEvent,
   segmentIndex: number,
 ): Record<string, unknown> {
-  switch (event.type) {
-    case "approval_request":
-      return {
-        type: event.type,
-        toolUseId: event.toolUseId,
-        name: event.name,
-        input: event.input,
-      };
-    case "done":
-      return {
-        type: event.type,
-        stopReason: event.result.stopReason,
-        usage: event.result.usage,
-        ...(event.result.completion ? { completion: event.result.completion } : {}),
-        ...(event.result.runBudget ? { runBudget: event.result.runBudget } : {}),
-        ...(event.result.contextInputTokens !== undefined
-          ? { contextInputTokens: event.result.contextInputTokens }
-          : {}),
-        // V-04：错误详情此前被整条丢弃，前端只能写死一句"运行异常终止"
-        ...(event.result.error
-          ? { error: { name: event.result.error.name, message: event.result.error.message } }
-          : {}),
-        // 会话正史不进 SSE（可达数 MB，全量缓冲会爆内存）——只给条数，正文走
-        // GET /api/runs/:id/transcript 按需拉
-        messageCount: event.result.messages.length,
-        // V-01：段终止 ≠ run 终止。带上段身份，让前端能区分"这一段结束了"
-        // 与"整个 run 结束了"——后者只由 run_end 宣告
-        segment: { index: segmentIndex, source: _source },
-      };
-    default:
-      return { ...event };
-  }
+  return serializeTurnEventForArchive(_source, event, segmentIndex);
 }
 
 /**
@@ -1955,11 +2274,61 @@ export function localPathTarget(value: string): string {
   return String(value ?? "").trim().replace(/:\d+(?::\d+)?$/, "");
 }
 
+const WORKDIR_WALK_SKIP = new Set(["node_modules", ".git", ".agent-run-history"]);
+
+/**
+ * 裸文件名在工作目录里唯一时，把它解析成相对路径。
+ * 两处同名就不猜——猜错比标「未找到」更糟。
+ */
+export async function findUniqueWorkdirFile(
+  root: string,
+  basename: string,
+  opts: { maxDepth?: number; maxVisits?: number } = {},
+): Promise<string | null> {
+  const name = String(basename ?? "").trim();
+  if (!name || /[\\/]/.test(name) || name === "." || name === ".." || name.includes("\0")) return null;
+  const maxDepth = opts.maxDepth ?? 8;
+  const maxVisits = opts.maxVisits ?? 4000;
+  const rootAbs = resolve(root);
+  const hits: string[] = [];
+  let visits = 0;
+
+  const walk = async (dir: string, depth: number): Promise<void> => {
+    if (hits.length > 1 || visits >= maxVisits || depth > maxDepth) return;
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const ent of entries) {
+      if (hits.length > 1 || visits >= maxVisits) return;
+      visits += 1;
+      if (ent.name === "." || ent.name === "..") continue;
+      const next = join(dir, ent.name);
+      if (ent.isDirectory()) {
+        if (WORKDIR_WALK_SKIP.has(ent.name)) continue;
+        await walk(next, depth + 1);
+        continue;
+      }
+      if (!ent.isFile() && !ent.isSymbolicLink()) continue;
+      if (ent.name !== name) continue;
+      const rel = relative(rootAbs, next).split(sep).join("/");
+      if (!rel || rel.startsWith("..")) continue;
+      hits.push(rel);
+    }
+  };
+
+  await walk(rootAbs, 0);
+  return hits.length === 1 ? hits[0]! : null;
+}
+
 const BUILTIN_POOL: Tool[] = [
   bashTool,
   fetchUrlTool,
   readFileTool,
   writeFileTool,
+  writePptxTool,
   editFileTool,
   globTool,
   grepTool,
@@ -1971,11 +2340,10 @@ const UPLOAD_SUBDIR = "uploads";
 const UPLOAD_MAX_BYTES = 20_000_000;
 /** 文件预览取件上限：超出直接 413——预览不是下载通道，超大文件走「在文件夹中显示」 */
 const FILE_PREVIEW_MAX_BYTES = 10_000_000;
-const DEFAULT_SYSTEM_PROMPT = `You are a capable autonomous agent operating in a local working directory.
-Complete the user's task end to end using the available tools.
-Ground every claim of progress in an actual tool result.
+const DEFAULT_SYSTEM_PROMPT = `You are a capable assistant in a local working directory.
+If the user is just talking, talk back in their language. If they asked you to do work, complete it with the available tools and ground claims of progress in tool results.
 
-You have a persistent memory that survives across sessions. The current memory index is provided in the <context> block of the first message. Consult relevant memories (memory_read) before starting work. When you learn a durable fact, user preference, or lesson worth reusing — a correction you received, a project constant, an approach that worked — save it with memory_write (one fact per file, first line = summary). Update or delete memories that turn out to be wrong. Do not store transient task state or things already recorded in the repository.` + DEFAULT_HOST_DISCIPLINES;
+You have a persistent memory that survives across sessions. The current memory index is provided in the <context> block of the first message and is scoped to this project (plus global lessons). When starting a task, or when a memory is likely relevant, consult it with memory_read. When you learn a durable fact, user preference, or lesson worth reusing — a correction you received, a project constant, an approach that worked — save it with memory_write (one fact per file, first line = summary). Update or delete memories that turn out to be wrong. Do not store transient task state in memory_write; use project_status for the in-progress board (who is waiting, next gate, open decisions). Do not store things already recorded in the repository.` + DEFAULT_HOST_DISCIPLINES;
 
 // ------------------------------------------------------
 // Server factory
@@ -1983,6 +2351,17 @@ You have a persistent memory that survives across sessions. The current memory i
 
 export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   const realHost = options.modelClient === undefined;
+  const packsRoot = options.packsDir === null
+    ? null
+    : typeof options.packsDir === "string"
+      ? options.packsDir
+      : realHost
+        ? packsRootFromEnv()
+        : null;
+  if (packsRoot) loadInstalledFilePacksSync(packsRoot);
+  else clearFilePacks();
+  let pack = options.packName ? getPack(options.packName) : undefined;
+  const packsReady = Promise.resolve();
   const positiveInteger = (value: number | undefined, name: string): number | undefined => {
     if (value === undefined) return undefined;
     if (!Number.isInteger(value) || value < 1) throw new Error(`${name} must be a positive integer`);
@@ -2087,6 +2466,22 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    * 台账、历史落盘、日预算门都按同一条纪律缺省关闭，这里补齐的是模型装配这一面。
    */
   const armamentEnv: NodeJS.ProcessEnv = realHost ? process.env : {};
+  /**
+   * hooks 只武装真实宿主。测试宿主读空 env——残留 AGENT_HOOKS_CONFIG 不得把假模型跑偏。
+   * 设了但文件缺失 / JSON 非法：fail-closed，启动即抛（与 AGENT_CONTEXT_WINDOW 同款）。
+   */
+  const hookSpec: NormalizedHookSpec | null = resolveHooksFromEnv(armamentEnv);
+  const agentMdMaxChars = resolveAgentMdMaxChars(armamentEnv);
+
+  function agentMdForRun(run?: StoredRun): AgentMdBundle | null {
+    return loadAgentMd({
+      workdir: run?.workdir ?? workdir,
+      userHome: realHost ? homedir() : null,
+      extraDirs: run?.extraWorkdirs,
+      maxChars: agentMdMaxChars,
+      ...(realHost ? { onWarn: (message) => console.warn(message) } : {}),
+    });
+  }
   const fallbackEnv = options.fallbackEnv ?? armamentEnv;
   const roleEnv = options.roleEnv ?? armamentEnv;
   const routingPolicy: FallbackRouting = readFallbackEnv(fallbackEnv).routing;
@@ -2121,10 +2516,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     return { store: synthesizeStoreFromEnv(process.env, roleEnv), source: "env" as const };
   })();
 
-  // F1: 缺省模型从模型库（或 env 合成库）读取，compat 取自 createModelClientFromEnv 返回值
   // MODEL-01b：Web 启动保持同步装配（createUiServer 契约）；compat 仍可名称猜测，
-  // 粘性探针在下方异步填充供 prefer_healthy。CLI 走 createModelClientWithProbe。
+  // 粘性探针在下方异步填充供 prefer_healthy；探针结果若与名称猜不一致则重装配
+  // （进行中的 run 手持旧 client 引用——与 MODEL-02 PUT /api/models 同款）。
   let executorCapabilities: EndpointCapabilities | null = null;
+  /** 识图探针结果；未探 / fail-open 时 null（工具仍按"配了就注册"） */
+  let visionProbe: { supportsVision: boolean; reason?: string } | null = null;
   /**
    * 端点降级链（MODEL-01a/b）。执行者 AGENT_FALLBACK_*；角色可 own / inherit。
    * 熔断按端点身份经 sharedBreakerRegistry 共享；装饰器实例按角色隔离。
@@ -2142,6 +2539,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    *
    * 执行者端点身份（provider|model|origin，不含 key）：降级链熔断、探针粘性、
    * 学到的上下文窗口都按它做键。
+   *
+   * `probedCompat`：异步探针回写用。名称猜错时（claude 别名挂 compat 端点等）
+   * 用探针结果重建 client；不传则仍名称猜。
    */
   let executorModelName = "";
   let resolved!: ResolvedProvider;
@@ -2151,15 +2551,18 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   let modelClient!: ModelClient;
   let envCompat = true;
 
-  function assembleExecutor(entry: ModelEntry | null): void {
+  function assembleExecutor(entry: ModelEntry | null, probedCompat?: boolean): void {
     executorModelName = entry?.model ?? process.env.AGENT_MODEL ?? "claude-opus-4-8";
+    const compatOverride =
+      probedCompat !== undefined ? { compat: probedCompat } : {};
     resolved = entry
       ? createModelClientFromEnv(entry.model, {
           provider: entry.provider,
           ...(entry.baseUrl ? { baseURL: entry.baseUrl } : {}),
           ...(entry.apiKey ? { apiKey: entry.apiKey } : {}),
+          ...compatOverride,
         })
-      : createModelClientFromEnv(executorModelName);
+      : createModelClientFromEnv(executorModelName, compatOverride);
     envCompat = resolved.compat;
     const envBaseURL = process.env.ANTHROPIC_BASE_URL || process.env.OPENAI_BASE_URL
       ? resolved.provider === "openai"
@@ -2198,7 +2601,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   }
   assembleExecutor(roleEntryOf(modelStoreState.store, "executor"));
 
-  /** 异步粘性探针（不挡 createUiServer）：填充 prefer_healthy 用的健康位。重装配后重探。 */
+  /** 异步粘性探针（不挡 createUiServer）：填充 prefer_healthy 用的健康位；compat 不一致则重装配。 */
   function probeExecutorEndpoint(entry: ModelEntry | null): void {
     if (options.modelClient) return;
     const envApiKey = resolved.provider === "openai" ? process.env.OPENAI_API_KEY : process.env.ANTHROPIC_API_KEY;
@@ -2210,6 +2613,13 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     })
       .then((caps) => {
         executorCapabilities = caps;
+        // MODEL-01 残余：探针学到的 compat 与启动名称猜不一致 → 重装执行者 client。
+        // 进行中的 run 仍握着旧引用（同 MODEL-02）；只影响此后新任务。
+        if (caps.compat !== envCompat) {
+          assembleExecutor(entry, caps.compat);
+          // 执行者备用端点对象换了，inherit 角色要跟着重建
+          assembleRoles();
+        }
       })
       .catch(() => {
         /* 探针失败不影响宿主启动——fail-open */
@@ -2270,6 +2680,36 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   // 三处必须是同一个字符串形态。`D:/a/b` 与 `D:` 指同一个目录，
   // 但字符串不等——不在源头 resolve 的话，默认路径会过不了自己的白名单
   const workdir = resolve(options.workdir ?? process.cwd());
+  const designDraftsDir = resolve(
+    options.designDraftsDir
+      ?? (realHost ? resolveDesignDraftsDir(process.env, homedir()) : join(workdir, "Fathom-drafts")),
+  );
+  const hostWorkdirIsHarness = (() => {
+    try {
+      return isHarnessPackageName(packageNameFromJson(readFileSync(join(workdir, "package.json"), "utf8")));
+    } catch {
+      return false;
+    }
+  })();
+  /**
+   * design 模板目录：真实宿主 / 未显式关闭时探测仓库 templates/design。
+   * 注入测试可传绝对路径或 null。
+   */
+  const designTemplatesDir =
+    options.designTemplatesDir === null
+      ? null
+      : typeof options.designTemplatesDir === "string"
+        ? resolve(options.designTemplatesDir)
+        : (() => {
+            for (const candidate of [join(__dirname, ".."), join(__dirname, "..", "..")]) {
+              const root = designTemplatesRootFromRepo(candidate);
+              if (existsSync(root)) return root;
+            }
+            return null;
+          })();
+  const capturePngFrames: PngCaptureFn =
+    options.capturePngFrames
+    ?? (realHost ? capturePngFramesWithPlaywright : fixturePngCapture);
   /**
    * V-29 白名单的活集合。env 声明（宿主 workdir + options.workdirs）与运行时
    * 添加（本机 UI 显式加入，持久化在 .agent-workdirs.json）分两本账——删除
@@ -2309,10 +2749,16 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     return false;
   }
   const memoryHost = createWorkdirScopedMemoryTools(
-    (runWorkdir) => process.env.AGENT_MEMORY_DIR ?? join(runWorkdir, ".agent-memory"),
+    (runWorkdir) => resolveMemoryDir(runWorkdir),
   );
-  const memoryTools = memoryHost.tools;
-  const defaultMemoryDir = process.env.AGENT_MEMORY_DIR ?? join(workdir, ".agent-memory");
+  const memoryTools = [
+    ...memoryHost.tools,
+    createProjectStatusTool(
+      (runWorkdir) => new MemoryStore(resolveMemoryDir(runWorkdir)),
+      { sharedFor: (runWorkdir) => isSharedMemoryDir(runWorkdir, resolveMemoryDir(runWorkdir)) },
+    ),
+  ];
+  const defaultMemoryDir = resolveMemoryDir(workdir);
   /**
    * T5 记忆面板的数据源：与 /api/harness 的 memory.dir 同一个目录（默认 workdir
    * 作用域，AGENT_MEMORY_DIR 可覆盖）。只读——面板起步不提供编辑/删除。
@@ -2417,7 +2863,6 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     return null;
   }
   const executionReady: Promise<void> = refreshExecutionHealth(true);
-  const pack = options.packName ? getPack(options.packName) : undefined;
   const injectedTools = options.tools;
 
   /**
@@ -2501,9 +2946,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   }
 
   const webSearchTool = isWebSearchConfigured() ? createWebSearchTool() : null;
-  const enabledBuiltinPool = bashEnabled
-    ? BUILTIN_POOL
-    : BUILTIN_POOL.filter((tool) => tool.name !== bashTool.name);
+  const draftPackTool = packsRoot ? draftDomainPackTool(packsRoot) : null;
+  const enabledBuiltinPool = [
+    ...(bashEnabled ? BUILTIN_POOL : BUILTIN_POOL.filter((tool) => tool.name !== bashTool.name)),
+    ...(draftPackTool ? [draftPackTool] : []),
+  ];
   /** 工具面随角色装配重建：vision 配了才有 describe_image；image 配了才有 generate_image */
   let toolPool: Tool[] = [];
 
@@ -2548,7 +2995,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       ...(visionRole ? [{ role: "vision" as const, model: visionRole.name }] : []),
     ]);
 
-    visionTool = visionRole && visionClient
+    visionTool = visionRole && visionClient && visionProbe?.supportsVision !== false
       ? createDescribeImageTool({
           // 计量包裹：视觉调用不经 done/verification 记账路径，只能在客户端边界抓。
           // 视觉是独立 client（不在主 modelClient 的日账包裹之内），日账本也在这里喂
@@ -2584,6 +3031,46 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   assembleRoles();
 
   /**
+   * 识图探针（MODEL-01 残余）：AGENT_MODEL_PROBE=1 时对 vision 端点塞一张最小图。
+   * supportsVision=false → 卸掉 describe_image（与"没配视觉就不注册"同纪律）；
+   * 未开探针 / 判不清 → fail-open 保留工具。
+   */
+  function probeVisionEndpoint(): void {
+    if (options.modelClient || !visionRole) return;
+    if (!shouldRunModelProbe(fallbackEnv)) return;
+    const entry = roleEntryOf(modelStoreState.store, "vision");
+    const envApiKey =
+      visionRole.provider.provider === "openai" ? process.env.OPENAI_API_KEY : process.env.ANTHROPIC_API_KEY;
+    const apiKey = entry?.apiKey || envApiKey;
+    void probeVisionSupport({
+      identity: {
+        provider: visionRole.provider.provider,
+        model: visionRole.name,
+        ...(visionRole.baseURL ? { baseURL: visionRole.baseURL } : {}),
+      },
+      ...(apiKey ? { apiKey } : {}),
+      env: fallbackEnv,
+    })
+      .then((result) => {
+        visionProbe = { supportsVision: result.supportsVision, ...(result.reason ? { reason: result.reason } : {}) };
+        if (result.supportsVision === false) {
+          // 卸工具即可；roleModels 仍报 configured（配了但端点不会看图）——
+          // 装配条读 tools 列表比读 configured 更诚实，见 deriveAssemblyBar。
+          visionTool = null;
+          toolPool = [
+            ...enabledBuiltinPool,
+            ...(webSearchTool ? [webSearchTool] : []),
+            ...(imageTool ? [imageTool] : []),
+          ];
+        }
+      })
+      .catch(() => {
+        /* fail-open：探针失败不卸工具 */
+      });
+  }
+  probeVisionEndpoint();
+
+  /**
    * 降级链快照全部现算（MODEL-02：PUT /api/models 后旧常量会撒谎）。
    * 未配置时 **null 而不是空数组**："没有这条防线"与"链上零个备用端点"
    * 在界面上必须能分开。只报名字——链上第二家的 baseURL / key 绝不下发。
@@ -2612,6 +3099,61 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         ? "roles"
         : "executor"
       : null;
+  }
+
+  /**
+   * 链健康只读面（MODEL-01 残余）：粘性探针 + 熔断状态。
+   * **不改路由语义**——界面看得见，调度仍按 AGENT_FALLBACK_ROUTING。
+   */
+  function endpointHealthView(): Array<{
+    model: string;
+    healthy: boolean;
+    circuit: CircuitState;
+    latencyMs?: number;
+    reason?: string;
+  }> {
+    const seen = new Set<string>();
+    const rows: Array<{
+      model: string;
+      healthy: boolean;
+      circuit: CircuitState;
+      latencyMs?: number;
+      reason?: string;
+    }> = [];
+    const pushEp = (name: string, identity: EndpointIdentity) => {
+      const key = endpointIdentityKey(identity);
+      if (seen.has(key)) return;
+      seen.add(key);
+      const sticky = getStickyCapabilities(key);
+      const circuit = sharedBreakerRegistry.state(key) ?? "closed";
+      const healthy = sticky ? sticky.healthy : true;
+      rows.push({
+        model: name,
+        healthy,
+        circuit,
+        ...(sticky?.latencyMs != null ? { latencyMs: sticky.latencyMs } : {}),
+        ...(sticky?.reason ? { reason: sticky.reason } : !sticky ? { reason: "unprobed" } : {}),
+      });
+    };
+    pushEp(executorModelName, executorIdentity);
+    for (const ep of executorBackups) {
+      pushEp(ep.name, ep.identity ?? { provider: "anthropic", model: ep.name });
+    }
+    // 角色自有链的 primary（inherit 的备用已在 executorBackups）
+    for (const role of [
+      { client: verifierClient, resolved: verifierRole },
+      { client: plannerClient, resolved: plannerRole },
+      { client: visionClient, resolved: visionRole },
+    ] as const) {
+      if (!role.resolved) continue;
+      const identity: EndpointIdentity = {
+        provider: role.resolved.provider.provider,
+        model: role.resolved.name,
+        ...(role.resolved.baseURL ? { baseURL: role.resolved.baseURL } : {}),
+      };
+      pushEp(role.resolved.name, identity);
+    }
+    return rows;
   }
 
   const runs = new Map<string, StoredRun>();
@@ -2734,6 +3276,41 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     return new RunHistoryWriter(join(historyRoot, runId), reportHistoryError);
   }
 
+  function rememberFileRewindSnapshot(
+    run: StoredRun,
+    record: FileRewindRecord,
+    blob?: Buffer,
+  ): void {
+    (run.fileRewindSnapshots ??= []).push(record);
+    if (blob) (run.fileRewindBlobs ??= new Map()).set(record.toolUseId, blob);
+    const archiveDir = run.archiveWriter?.dir ?? run.archiveDir;
+    if (archiveDir) {
+      const persist = () => persistRewindSnapshot(archiveDir, record, blob);
+      if (run.archiveWriter) run.archiveWriter.schedule(persist);
+      else void persist();
+    }
+    pushSyntheticEvent(run, "host", {
+      type: "file_rewind_snapshot",
+      toolUseId: record.toolUseId,
+      tool: record.tool,
+      path: record.path,
+      existed: record.existed,
+      bytes: record.bytes,
+      ...(record.skipped ? { skipped: record.skipped } : {}),
+      at: record.at,
+    });
+  }
+
+  async function ensureFileRewindSnapshots(run: StoredRun): Promise<void> {
+    if (run.fileRewindSnapshots?.length) return;
+    const dir = run.archiveWriter?.dir ?? run.archiveDir;
+    if (!dir) return;
+    const loaded = await loadRewindSnapshots(dir);
+    if (!loaded.records.length) return;
+    run.fileRewindSnapshots = loaded.records;
+    run.fileRewindBlobs = loaded.blobs;
+  }
+
   // ---- B2 运行历史落盘 ----
 
   /** run → meta.json 的形状。创建 / 追加轮开始 / 收尾各整写一次 */
@@ -2749,10 +3326,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       createdAt: run.createdAt,
       finishedAt: run.finishedAt ?? null,
       packName: run.packName ?? pack?.name ?? null,
-      mode: run.mode ?? "single",
+      // 档案 mode 仍是 plan | single：设计模式是单执行者门面，不另开归档形状
+      mode: run.mode === "plan" ? "plan" : "single",
       effort: run.effort ?? null,
       rubric: run.rubric ?? null,
       workdir: run.workdir ?? workdir,
+      ...(run.extraWorkdirs?.length ? { extraWorkdirs: run.extraWorkdirs } : {}),
       conversationTurn: run.conversationTurn,
       planGate: Boolean(run.planGate),
       planDecision: run.planDecision ?? null,
@@ -2760,9 +3339,16 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       askUser: Boolean(run.askUser),
       contextTokenLimit: run.contextTokenLimit ?? null,
       checkpoint: run.checkpoint ?? null,
+      host: run.host === "cli" ? "cli" : run.archived ? parseArchiveHost(run.host) : "web",
       continuedFrom: run.continuedFrom ?? null,
       rootRunId: run.rootRunId ?? null,
+      ...(run.rewindFrom ? { rewindFrom: run.rewindFrom } : {}),
       recap: run.conversationRecap || recapFromRunEvents(run) || null,
+      ...(run.lastExecutorRoleId ? { lastExecutorRoleId: run.lastExecutorRoleId } : {}),
+      ...(run.lastExecutorIdentityKey
+        ? { lastExecutorIdentityKey: run.lastExecutorIdentityKey }
+        : {}),
+      ...(run.lastExecutorModel ? { lastExecutorModel: run.lastExecutorModel } : {}),
       outcome: run.outcome
         ? {
             finalPassed: run.outcome.finalPassed,
@@ -2862,7 +3448,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           let recovered = recoverDurableStateOnCrash(durableState);
           // meta 说在跑、盘上 state 却已是终态：新一轮的 reopen 还没落盘就崩了（meta 先写、
           // 先到）。按 meta 走——它是"当时在跑"的事实源；有检查点就能同 run 热恢复。
-          // 只看**盘上原相**：plan_gated 崩溃经 ADR 表收成 closed 是另一回事，不许在这里被改写
+          // 只看**盘上原相**：plan_gated 崩溃保持在门上（restore_gate），不许改写成 interrupted
           if (["completed", "failed", "closed"].includes(durableState.phase)) {
             recovered = {
               ...recovered,
@@ -2921,6 +3507,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           ...(typeof a.meta.workdir === "string" && a.meta.workdir
             ? { workdir: a.meta.workdir }
             : {}),
+          ...(Array.isArray(a.meta.extraWorkdirs)
+            ? {
+                extraWorkdirs: a.meta.extraWorkdirs.filter((p): p is string => typeof p === "string" && p.trim() !== ""),
+              }
+            : {}),
           ...(a.meta.planGate ? { planGate: true } : {}),
           ...(a.meta.planDecision ? { planDecision: a.meta.planDecision } : {}),
           ...(a.meta.askUser ? { askUser: true } : {}),
@@ -2928,6 +3519,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           ...(typeof a.meta.contextTokenLimit === "number" && Number.isInteger(a.meta.contextTokenLimit) && a.meta.contextTokenLimit > 0
             ? { contextTokenLimit: a.meta.contextTokenLimit }
             : {}),
+          ...(parseArchiveHost(a.meta.host) === "cli" ? { host: "cli" as const } : {}),
           ...(checkpoint ? { checkpoint } : {}),
           ...(archivedApprovalGrantAudit.length ? { archivedApprovalGrantAudit } : {}),
           ...(typeof a.meta.continuedFrom === "string" && a.meta.continuedFrom
@@ -2936,10 +3528,29 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           ...(typeof a.meta.rootRunId === "string" && a.meta.rootRunId
             ? { rootRunId: a.meta.rootRunId }
             : {}),
+          ...(parseRewindFromMeta(a.meta.rewindFrom)
+            ? { rewindFrom: parseRewindFromMeta(a.meta.rewindFrom) }
+            : {}),
           ...(typeof a.meta.recap === "string" && a.meta.recap
             ? { conversationRecap: a.meta.recap }
             : {}),
+          ...(typeof a.meta.lastExecutorRoleId === "string" && a.meta.lastExecutorRoleId
+            ? { lastExecutorRoleId: a.meta.lastExecutorRoleId }
+            : {}),
+          ...(typeof a.meta.lastExecutorIdentityKey === "string" && a.meta.lastExecutorIdentityKey
+            ? { lastExecutorIdentityKey: a.meta.lastExecutorIdentityKey }
+            : {}),
+          ...(typeof a.meta.lastExecutorModel === "string" && a.meta.lastExecutorModel
+            ? { lastExecutorModel: a.meta.lastExecutorModel }
+            : {}),
           ...(durableState ? { durableState } : {}),
+          ...(durableState?.plan?.nodes?.length
+            ? {
+                planNodes: planNodesFromDurable(durableState.plan.nodes),
+                planHandoffs: handoffsFromPlanNodes(planNodesFromDurable(durableState.plan.nodes)),
+                injectedPlan: planFromNodes(planNodesFromDurable(durableState.plan.nodes)),
+              }
+            : {}),
           // 崩溃档案（meta 还停在 running）：没人正常收过尾，按宿主级异常归档
           ...(crashed
             ? { mainStopReason: "error" }
@@ -3165,16 +3776,39 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           verify: r.verify,
           mode: r.mode === "plan" ? "plan" : "single",
           budgetExhausted: false,
+          ...(r.mode === "plan" ? { plan: planResumeFacts(r.durableState.plan) } : {}),
+        }),
+    );
+    const archiveRestoreGate = Boolean(
+      r.archived &&
+        r.durableState &&
+        archiveBlockReason === null &&
+        canRestorePlanGate({
+          phase: r.durableState.phase,
+          plan: r.durableState.plan,
+        }),
+    );
+    const archiveCanReopen = Boolean(
+      r.archived &&
+        r.durableState &&
+        archiveBlockReason === null &&
+        !archiveCanSameRun &&
+        !archiveRestoreGate &&
+        r.durableState.phase !== "completed" &&
+        canReopenSameRun({
+          phase: r.durableState.phase,
+          hasTask: Boolean(String(r.task ?? "").trim()),
         }),
     );
     const grantCanStillBeCalled = !r.archived && (r.status === "running" || liveCanContinue);
     const activeApprovalGrants = grantCanStillBeCalled
       ? approvalGrantCheckpointSnapshot(r, approvalClock()).length
       : 0;
+    const handoff = effectiveHandoff(r);
     return {
       runId: r.id,
       task: r.task,
-      title: r.title ?? summarizeTitle(r.task),
+      title: resolveRunTitle(r.title, r.task),
       status: r.status,
       verify: r.verify,
       createdAt: r.createdAt,
@@ -3203,11 +3837,17 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       awaitingQuestion: r.pendingQuestion
         ? { id: r.pendingQuestion.id, questions: r.pendingQuestion.questions }
         : null,
+      awaitingHandoff: handoff?.status === "pending"
+        ? { id: handoff.id, summary: handoff.summary, label: handoff.label }
+        : null,
       askUser: Boolean(r.askUser),
       autoApprove: Boolean(r.autoApprove),
       planDecision: r.planDecision?.decision ?? null,
       verdict: r.outcome?.verifications.at(-1)?.verdict ?? r.archivedOutcome?.verdict ?? null,
       mode: r.mode ?? "single",
+      ...(r.designRoute ? { designRoute: r.designRoute } : {}),
+      // 只在明确是 CLI 时标 cli；旧档案缺字段保持 null，不猜成 Web。
+      host: r.host === "cli" ? "cli" : r.archived ? null : "web",
       // B2：父档案恒只读；有完整检查点时可派生子 run，不能把两者冒充成
       // “原进程无缝继续”。continuationMode 是这个环境边界的显式契约。
       ...(r.archived ? { archived: true } : {}),
@@ -3215,6 +3855,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       recap: r.conversationRecap || recapFromRunEvents(r) || null,
       continuedFrom: r.continuedFrom ?? null,
       rootRunId: r.rootRunId ?? null,
+      ...(r.rewindFrom ? { rewindFrom: r.rewindFrom } : {}),
       // RUN-01 Phase 2：sameRunResume 仅在 interrupted+checkpoint 且边界放行时为 true
       durablePhase: r.durableState?.phase ?? null,
       durableRecovery: r.durableState ? recoveryActionForPhase(r.durableState.phase) : null,
@@ -3228,16 +3869,20 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       workdir: r.workdir ?? workdir,
       effort: r.effort ?? null,
       // 能否追加：让界面据此决定要不要显示输入框，而不是点了才报错。
-      canContinue: liveCanContinue || archiveCanSameRun || archiveCanFork,
-      continuationMode: archiveCanSameRun
-        ? "same-run"
+      canContinue: liveCanContinue || archiveCanSameRun || archiveCanFork || archiveRestoreGate || archiveCanReopen,
+      continuationMode: archiveRestoreGate
+        ? "restore-gate"
+        : archiveCanSameRun
+          ? "same-run"
+        : archiveCanReopen
+          ? "reopen"
         : archiveCanFork
           ? "fork"
           : liveCanContinue
             ? "same"
             : null,
       continuationBlockReason:
-        !archiveCanSameRun && !archiveCanFork && r.archived
+        !archiveCanSameRun && !archiveCanFork && !archiveRestoreGate && !archiveCanReopen && r.archived
           ? archiveBlockReason
           : liveBudgetBlockReason,
       // 预算耗尽时可调用 POST .../extend-budget，不必改 env 重启
@@ -3421,43 +4066,81 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    */
   let mcpRuntime: McpRuntime | undefined;
   let mcpTools: Tool[] = [];
-  let mcpConnecting: Promise<void> | undefined;
+  let mcpConnecting: Promise<void> = Promise.resolve();
   let mcpError: string | undefined;
+  let mcpConnectWarnings: string[] = [];
 
-  async function ensureMcp(): Promise<void> {
-    if (!mcpEnabled || mcpRuntime || mcpError) return;
-    mcpConnecting ??= (async () => {
+  async function ensureMcp(runPack?: DomainPack): Promise<void> {
+    if (!mcpEnabled) return;
+    const work = async () => {
+      if (mcpError && !mcpRuntime) return;
       try {
         const cfg = await loadMcpConfig(mcpConfigPath);
         if (!cfg) {
           mcpError = `未找到 MCP 配置：${mcpConfigPath}`;
           return;
         }
+        const slice = filterMcpConfigForPack(cfg, runPack?.mcp, {
+          hostGithub: packAcceptsHostGithub(runPack),
+        });
+        if (!slice) return;
+        const already = new Set([
+          ...Object.keys(mcpRuntime?.summary ?? {}),
+          ...Object.keys(mcpRuntime?.skipped ?? {}),
+          ...Object.keys(mcpRuntime?.failed ?? {}),
+        ]);
+        const pending = {
+          servers: Object.fromEntries(
+            Object.entries(slice.servers).filter(([name]) => !already.has(name)),
+          ),
+        };
+        if (Object.keys(pending.servers).length === 0) return;
         const warnings: string[] = [];
-        mcpRuntime = await connectMcpServers(cfg, (m) => warnings.push(m));
+        const added = await connectMcpServers(pending, (m) => warnings.push(m));
+        mcpRuntime = mergeMcpRuntimes(mcpRuntime, added);
         mcpTools = mcpRuntime.tools;
-        if (warnings.length) mcpError = warnings.join("；");
+        if (warnings.length) mcpConnectWarnings = [...mcpConnectWarnings, ...warnings];
       } catch (err) {
         mcpError = err instanceof Error ? err.message : String(err);
       }
-    })();
+    };
+    mcpConnecting = mcpConnecting.then(work, work);
     await mcpConnecting;
   }
 
   function mcpSnapshot(): Record<string, unknown> {
+    const servers = [
+      ...Object.entries(mcpRuntime?.summary ?? {}).map(([name, n]) => ({
+        name,
+        status: "connected",
+        toolCount: n,
+        tools: n,
+      })),
+      ...Object.entries(mcpRuntime?.skipped ?? {}).map(([name, reason]) => ({
+        name,
+        status: "skipped",
+        reason,
+      })),
+      ...Object.entries(mcpRuntime?.failed ?? {}).map(([name, reason]) => ({
+        name,
+        status: "failed",
+        reason,
+      })),
+    ];
     return {
       configured: existsSync(mcpConfigPath),
       configPath: mcpConfigPath,
       enabled: mcpEnabled,
-      connected: Boolean(mcpRuntime),
-      servers: mcpRuntime ? Object.entries(mcpRuntime.summary).map(([name, n]) => ({ name, tools: n })) : [],
+      connected: Object.keys(mcpRuntime?.summary ?? {}).length > 0,
+      servers,
       toolCount: mcpTools.length,
       ...(mcpError ? { error: mcpError } : {}),
+      ...(mcpConnectWarnings.length ? { warnings: mcpConnectWarnings } : {}),
       // reason 三态互斥，不能含糊：没开 / 开了还没轮到 / 试过了但失败。
       // 失败时若还显示"尚未连接"，人会以为再等等就好——那是在骗人（V-04 同族）
       ...(!mcpEnabled
         ? { reason: "Web 宿主默认不接 MCP（设 AGENT_UI_MCP=1 开启）——常驻进程持有独占资源有风险" }
-        : mcpRuntime || mcpError
+        : mcpError || mcpRuntime
           ? {}
           : { reason: "已开启，但尚未连接——首个需要 MCP 的运行开始时才连（缩短常驻进程持有独占资源的窗口）" }),
     };
@@ -3477,21 +4160,43 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     const runPack = run?.packName ? getPack(run.packName) : pack;
     const runEffort = run?.effort ?? effort;
     const runWorkdir = run?.workdir ?? workdir;
+    const allowlistRoots = mergeRunReadRoots([...allowedWorkdirs], run?.extraWorkdirs, runWorkdir);
+    const runReadRoots = mergeRunReadRoots(readRoots, allowlistRoots, runWorkdir);
+    const runWriteRoots = allowlistRoots;
     const systemPrompt = runPack?.systemPrompt ?? DEFAULT_SYSTEM_PROMPT;
     // MCP 工具按包的 includeTools 收窄（selectPackTools 负责）。mcpTools 在
     // ensureMcp 之后才非空——所有 start*Run 都先 await 它，不会拿到半截工具面
-    const baseTools = injectedTools ?? (runPack
-      ? selectPackTools(runPack, toolPool, mcpTools)
-      : [...toolPool, ...mcpTools]);
+    const baseTools = injectedTools ?? selectPackTools(runPack, toolPool, mcpTools);
     /**
      * §5.2：逐 run 显式开启才装（决定 1）。工具实例挂在 run 上而不是每次新造——
      * 配额是逐实例计数的，重造等于配额永不耗尽。
      * verifier/planner 拿不到它：`withoutAskUser` 在 harness 层剔除（决定 3），
      * 宿主这边不必也不该重复实现那道闸。
      */
-    const tools = run?.askUser
+    let tools = run?.askUser
       ? [...appendMemoryTools(baseTools), (run.askUserTool ??= makeAskUserTool(run))]
       : appendMemoryTools(baseTools);
+    /**
+     * 下一步提议：包声明了 handoffs 才装。不挡对话（工具立刻返回），
+     * 也不走 --ask 开关——那是另一件事。verifier/planner 由 withoutAskUser 剔除。
+     */
+    if (run && runPack?.handoffs?.length) {
+      tools = [...tools, (run.proposeHandoffTool ??= makeProposeHandoffTool(run))];
+    }
+    // AGENT-02：默认关；AGENT_SPAWN_TASK=1 才装。verifier/planner 由 withoutAskUser 剥掉。
+    if (run && process.env.AGENT_SPAWN_TASK === "1") {
+      tools = [...tools, (run.spawnTaskTool ??= makeSpawnTaskTool(run))];
+    }
+    if (run) {
+      tools = wrapToolsWithRewindSnapshots(tools, async (name, input, ctx) => {
+        const rel = typeof (input as { path?: unknown } | null)?.path === "string"
+          ? String((input as { path: string }).path).trim()
+          : "";
+        if (!rel) return;
+        const captured = await captureBeforeWrite(runWorkdir, runWriteRoots, rel, ctx.toolUseId, name);
+        rememberFileRewindSnapshot(run, captured.record, captured.blob);
+      });
+    }
     // plan 可在 planner 产出后换包。即使初始包（如 stm32-debug）没有 bash，
     // 子任务仍可能选择 python/ts/stm32-coding 并引入 bash；broker 必须在首次
     // planner 模型调用前就按 runId/workdir 固定，不能到子任务里落 legacy lane。
@@ -3513,7 +4218,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       compat: envCompat,
       // 此前这里只设四个字段，pack 的护栏、只读根、effort 全部丢失
       ...(runEffort ? { effort: runEffort } : {}),
-      ...(readRoots.length ? { readRoots } : {}),
+      ...(runReadRoots.length ? { readRoots: runReadRoots } : {}),
+      ...(runWriteRoots.length ? { writeRoots: runWriteRoots } : {}),
       contextTokenLimit: contextPlan.budget,
       /**
        * 窗口学习钩子：loop 撞 400 学到的窗口记到执行者端点名下（内存表 + 真实宿主落盘）。
@@ -3544,6 +4250,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         ? { initialContextInputTokens: run.initialContextInputTokens }
         : {}),
       // SAFE-06：逐 run 武装 idempotency + durable toolTx
+      ...(hookSpec
+        ? { hooks: createHookRuntime(hookSpec, { workdir: runWorkdir }) }
+        : {}),
       ...(run
         ? {
             runId: run.id,
@@ -3592,9 +4301,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   ): Promise<AgentConfig> {
     const cfg = buildConfig(run, options);
     const runWorkdir = run?.workdir ?? workdir;
+    const allowlistRoots = mergeRunReadRoots([...allowedWorkdirs], run?.extraWorkdirs, runWorkdir);
+    const runReadRoots = mergeRunReadRoots(readRoots, allowlistRoots, runWorkdir);
     return {
       ...cfg,
-      dynamicContext: {
+      dynamicContext: mergeAgentMdContext({
         date: new Date().toISOString().slice(0, 10),
         platform: process.platform,
         shell: bashEnabled ? SHELL_DESC : "bash disabled",
@@ -3605,10 +4316,120 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
                 `${processExecutionStatus.effectiveState}/${processExecutionStatus.resolvedBackend ?? "none"}/${processExecutionStatus.policyDigest}`,
             }
           : {}),
-        ...(readRoots.length ? { read_only_roots: readRoots.join("; ") } : {}),
-        memory_index: await memoryHost.indexBlock(runWorkdir),
-      },
+        ...(runReadRoots.length ? { read_only_roots: runReadRoots.join("; ") } : {}),
+        ...(allowlistRoots.length ? { writable_roots: allowlistRoots.join("; ") } : {}),
+        memory_index: await scopedMemoryIndex(new MemoryStore(resolveMemoryDir(runWorkdir)), runWorkdir),
+        project_status: formatProjectStatusBlock(
+          await readProjectStatus(
+            new MemoryStore(resolveMemoryDir(runWorkdir)),
+            runWorkdir,
+            isSharedMemoryDir(runWorkdir, resolveMemoryDir(runWorkdir)),
+          ),
+        ),
+        workspace_git: formatWorkspaceGitLine(
+          (run?.workspaceGit ?? publicWorkspaceGit(await probeWorkspaceGit(runWorkdir))),
+        ),
+      }, agentMdForRun(run)),
     };
+  }
+
+  async function refreshWorkspaceGit(run: StoredRun): Promise<PublicWorkspaceGit> {
+    const snap = publicWorkspaceGit(await probeWorkspaceGit(run.workdir ?? workdir));
+    run.workspaceGit = snap;
+    return snap;
+  }
+
+  function listedWorkdir(raw: unknown): { ok: true; path: string } | { ok: false; status: number; error: string } {
+    if (typeof raw !== "string" || !raw.trim()) {
+      return { ok: false, status: 400, error: "缺少工作目录（workdir）" };
+    }
+    let asked: string;
+    try {
+      asked = resolve(raw.trim());
+    } catch {
+      return { ok: false, status: 400, error: "工作目录无效" };
+    }
+    if (!allowedWorkdirs.has(asked)) {
+      return {
+        ok: false,
+        status: 403,
+        error: `工作目录不在白名单内。可选：${[...allowedWorkdirs].join(" | ")}`,
+      };
+    }
+    return { ok: true, path: asked };
+  }
+
+  /**
+   * 追问轮把底栏旋钮写进这一轮：工作目录 / 额外可写根 / 领域包 / 思考强度 / 评分表。
+   * 运行中的插队只带文本，不走这里——在飞 loop 已经按旧装配造好了。
+   */
+  async function applyFollowUpAssembly(
+    target: StoredRun,
+    parsed: {
+      pack?: unknown;
+      autoPack?: unknown;
+      workdir?: unknown;
+      extraWorkdirs?: unknown;
+      effort?: unknown;
+      rubric?: unknown;
+    },
+    routeText: string,
+  ): Promise<{ ok: true } | { ok: false; error: string }> {
+    if (parsed.effort !== undefined && parsed.effort !== "" && parsed.effort !== null) {
+      if (!(EFFORT_LEVELS as readonly string[]).includes(String(parsed.effort))) {
+        return { ok: false, error: `effort "${parsed.effort}" 无效。可选：${EFFORT_LEVELS.join(" | ")}` };
+      }
+      target.effort = String(parsed.effort);
+    }
+    if (typeof parsed.rubric === "string") {
+      const trimmed = parsed.rubric.trim();
+      if (trimmed) target.rubric = trimmed;
+      else delete target.rubric;
+    }
+    if (parsed.workdir !== undefined && parsed.workdir !== "") {
+      const asked = resolve(String(parsed.workdir));
+      if (!allowedWorkdirs.has(asked)) {
+        return {
+          ok: false,
+          error: `工作目录不在白名单内。可选：${[...allowedWorkdirs].join(" | ")}（可点工作目录下拉的「＋ 添加目录…」即时加入）`,
+        };
+      }
+      target.workdir = asked;
+    }
+    if (parsed.extraWorkdirs !== undefined) {
+      const extraParsed = parseExtraWorkdirs(
+        parsed.extraWorkdirs,
+        allowedWorkdirs,
+        target.workdir ?? workdir,
+      );
+      if (!extraParsed.ok) return { ok: false, error: extraParsed.error };
+      if (extraParsed.extraWorkdirs.length) target.extraWorkdirs = extraParsed.extraWorkdirs;
+      else delete target.extraWorkdirs;
+    }
+    if (parsed.autoPack === true && (parsed.pack === undefined || parsed.pack === "")) {
+      try {
+        const outcome = await routeToPack(
+          { systemPrompt: "router", tools: [], workdir: target.workdir ?? workdir, compat: envCompat },
+          modelClient,
+          routeText,
+          allPacks(),
+        );
+        if (outcome.decision.pack && getPack(outcome.decision.pack)) {
+          target.packName = outcome.decision.pack;
+        }
+      } catch {
+        /* 路由失败保持原包，与新建 run 的 fail-open 同向 */
+      }
+    } else if (typeof parsed.pack === "string") {
+      if (parsed.pack === "") {
+        delete target.packName;
+      } else if (!getPack(parsed.pack)) {
+        return { ok: false, error: `未知领域包 "${parsed.pack}"。可选：${packNamesLine()}` };
+      } else {
+        target.packName = parsed.pack;
+      }
+    }
+    return { ok: true };
   }
 
   function toolOrigin(name: string): "builtin" | "memory" | "mcp" {
@@ -3746,7 +4567,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   /**
    * planner 探索预算：env > 包菜单声明取最大 > 默认 12（B0，口径同 src/cli.ts）。
    * 与核查预算的一处结构差异：planner 的菜单是**全部包**（runPlanned 收
-   * Object.values(PACKS)），预算跟菜单走，与逐 run 选中的默认包无关。
+   * allPacks()：内置 + 已安装文件包），预算跟菜单走，与逐 run 选中的默认包无关。
    */
   const envPlanMaxTurns = (() => {
     const raw = process.env.AGENT_PLAN_MAX_TURNS;
@@ -3754,11 +4575,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     const n = Number(raw);
     return Number.isInteger(n) && n >= 1 ? n : undefined;
   })();
-  const plannerBudgetTurns = (): number => resolvePlannerMaxTurns(Object.values(PACKS), envPlanMaxTurns);
+  const plannerBudgetTurns = (): number => resolvePlannerMaxTurns(allPacks(), envPlanMaxTurns);
   const plannerBudgetSource = (): "env" | "pack" | "default" =>
     envPlanMaxTurns !== undefined
       ? "env"
-      : Object.values(PACKS).some((p) => p.plan?.maxTurns !== undefined)
+      : allPacks().some((p) => p.plan?.maxTurns !== undefined)
         ? "pack"
         : "default";
 
@@ -3860,6 +4681,69 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     broadcastLifecycle("run_updated", run);
   }
 
+  function handoffFromEvents(run: StoredRun): HandoffProposalState | null {
+    let current: HandoffProposalState | null = null;
+    for (const item of run.events) {
+      const ev = item.event as { type?: string; [k: string]: unknown };
+      if (ev.type === "handoff_proposal") {
+        current = {
+          status: "pending",
+          id: String(ev.id ?? ""),
+          handoffId: String(ev.handoffId ?? ""),
+          summary: String(ev.summary ?? ""),
+          label: String(ev.label ?? ""),
+          declineLabel: String(ev.declineLabel ?? ""),
+          requestSeq: item.seq,
+        };
+      }
+      if (ev.type === "handoff_resolved" && current) {
+        const decision = ev.decision === "accept" ? "accepted" : "declined";
+        current = {
+          ...current,
+          status: decision,
+          ...(typeof ev.childRunId === "string" ? { childRunId: ev.childRunId } : {}),
+        };
+      }
+    }
+    return current;
+  }
+
+  function effectiveHandoff(run: StoredRun): HandoffProposalState | null {
+    if (run.handoffProposal) return run.handoffProposal;
+    const rebuilt = handoffFromEvents(run);
+    if (rebuilt) run.handoffProposal = rebuilt;
+    return rebuilt;
+  }
+
+  function makeProposeHandoffTool(run: StoredRun): Tool {
+    return createProposeHandoffTool({
+      resolveHandoff: (id) => findHandoffAmong(allPacks(), id),
+      onPropose: (proposal) => {
+        const id = randomUUID();
+        const at = Date.now();
+        const requestSeq = pushSyntheticEvent(run, "host", {
+          type: "handoff_proposal",
+          id,
+          handoffId: proposal.handoffId,
+          summary: proposal.summary,
+          label: proposal.label,
+          declineLabel: proposal.declineLabel,
+          at,
+        });
+        run.handoffProposal = {
+          status: "pending",
+          id,
+          handoffId: proposal.handoffId,
+          summary: proposal.summary,
+          label: proposal.label,
+          declineLabel: proposal.declineLabel,
+          requestSeq,
+        };
+        broadcastLifecycle("run_updated", run);
+      },
+    });
+  }
+
   function makeAskUserTool(run: StoredRun): Tool {
     return createAskUserTool({
       ...(maxAskRounds !== undefined ? { maxRounds: maxAskRounds } : {}),
@@ -3868,6 +4752,55 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           (run.questionQueue ??= []).push({ questions: req.questions, resolve });
           pumpQuestionQueue(run);
         }),
+    });
+  }
+
+  /**
+   * AGENT-02：同谱系支线。子事件 source=`spawn/<title>`，不回灌父正史；
+   * 子正史若有 archiveWriter 则随父 run 旁路记入（events 流可见）。
+   */
+  function makeSpawnTaskTool(run: StoredRun): Tool {
+    return createSpawnTaskTool({
+      depth: 0,
+      onStart: (request) => {
+        pushSyntheticEvent(run, "host", {
+          type: "spawn_start",
+          title: request.title,
+          at: Date.now(),
+        });
+      },
+      onDone: (request, result) => {
+        pushSyntheticEvent(run, "host", {
+          type: "spawn_done",
+          title: request.title,
+          passed: result.passed,
+          summary: result.summary,
+          ...(result.error ? { error: result.error } : {}),
+          ...(result.turns !== undefined ? { turns: result.turns } : {}),
+          at: Date.now(),
+        });
+      },
+      spawn: async (request) => {
+        const budget = run.loop?.getRunBudget();
+        if (!budget) {
+          return { summary: "", passed: false, error: "父 loop 尚未就绪，无法共享预算" };
+        }
+        const parentCfg = await buildRunConfig(run);
+        const childId = `${run.id}-spawn-${randomUUID().slice(0, 8)}`;
+        const spawnSource = `spawn/${request.title.slice(0, 40)}`;
+        return runSpawnedTask({
+          parentConfig: parentCfg,
+          modelClient,
+          runBudget: budget,
+          request,
+          childRunId: childId,
+          signal: run.abort?.signal,
+          onEvent: async (event) => {
+            // 旁路进事件流（可观测）；不进父会话正史（ContextManager 是子 loop 自己的）
+            pushEvent(run, spawnSource, event);
+          },
+        });
+      },
     });
   }
 
@@ -3973,15 +4906,20 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     if (event.type === "compaction") {
       tallyCompaction((run.compactionTally ??= emptyCompactionTally()), event);
     }
+    if (hookSpec && event.type === "hook") {
+      tallyHookEvent((run.hooksTally ??= emptyHooksTally()), event);
+    }
     // OBS-01：事件旁路投影 span（失败不打断 run）
     try {
       if (!run.openToolSpans) run.openToolSpans = new Map();
+      if (!run.openModelSpans) run.openModelSpans = new Map();
       const spans = projectTurnEventToSpans({
         runId: run.id,
         source,
         event,
         parentSpanId: run.traceRunSpanId ?? null,
         openTools: run.openToolSpans,
+        openModels: run.openModelSpans,
         ts: sseEvent.ts,
       });
       for (const span of spans) run.archiveWriter?.appendTraceSpan(span);
@@ -4035,6 +4973,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         event.respond("allow");
         autoApproved = true;
         rememberAutoDecision("allow");
+        Object.assign(sseEvent.event, {
+          autoResolved: true,
+          decision: "allow",
+        });
         deferredHostEvents.push({
           type: "approval_resolved",
           requestSeq: seq,
@@ -4066,6 +5008,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           event.respond("allow");
           autoApproved = true;
           rememberAutoDecision("allow");
+          Object.assign(sseEvent.event, {
+            autoResolved: true,
+            decision: "allow",
+          });
           deferredHostEvents.push({
             type: "approval_resolved",
             requestSeq: seq,
@@ -4133,6 +5079,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       // 它的正史不属于对话；返工段属于对话：返工后执行者手里的现状就是它
       if (isExecutorLineageSource(source) && event.result.messages?.length) {
         run.history = event.result.messages;
+        rememberExecutorFingerprint(run);
         if (event.result.runBudget) {
           const fallbackContextTokens =
             event.result.usage.inputTokens +
@@ -4247,6 +5194,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     if (event.type === "model_fallback") {
       const role = typeof event.role === "string" && event.role ? event.role : "main";
       broadcastDeltaReset(run, role);
+    }
+    if (event.type === "approval_resolved" || event.type === "approval_expired") {
+      tallyApprovalOutcome((run.approvalsTally ??= emptyApprovalsTally()), event);
     }
     const seq = run.events.length;
     const sseEvent: SSEEvent = { seq, source, ts: Date.now(), event };
@@ -4618,6 +5568,21 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             : null,
           recovery: run.recoveryTally ?? emptyRecoveryTally(),
           compaction: run.compactionTally ?? emptyCompactionTally(),
+          hooks: hookSpec ? (run.hooksTally ?? emptyHooksTally()) : null,
+          agentMd: (() => {
+            const bundle = agentMdForRun(run);
+            return bundle
+              ? { files: bundle.files.length, chars: bundle.chars, truncated: bundle.truncated }
+              : null;
+          })(),
+          // 档位跟实际开关走，不跟 run.permissionMode 标签（用户点完档位再拨开关会过期）。
+          permissionMode: matchPermissionMode({
+            approvalDefault: run.autoApprove ? "auto" : "ask",
+            planMode: run.mode === "plan",
+            planGate: Boolean(run.planGate),
+            autoYes: Boolean(run.autoApprove),
+          }),
+          approvals: run.approvalsTally ?? emptyApprovalsTally(),
           // 窗口 / 预算各带来源（口径同 CLI）：记**这次运行实际按哪份计划跑的**（buildConfig 留下的），
           // 不是收尾时重算的——本次才学到的窗口属于下一次运行
           context: {
@@ -4669,7 +5634,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
   async function refineRunTitle(run: StoredRun): Promise<void> {
     const fallback = summarizeTitle(run.task);
-    if (String(run.task ?? "").trim().length <= 24) {
+    // 附件行会把整段 task 撑过 24 字，不能拿它决定要不要花一次模型。
+    if (titleSourceText(run.task).length <= 24) {
       run.title = fallback;
       persistMeta(run);
       return;
@@ -4677,7 +5643,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     try {
       const turn = await modelClient.send({
         system: [{ type: "text", text: TITLE_SYSTEM }],
-        messages: [{ role: "user", content: String(run.task).slice(0, 800) }],
+        messages: [{ role: "user", content: titleSourceText(run.task).slice(0, 800) || String(run.task).slice(0, 800) }],
         tools: [],
         maxTokens: 48,
         effort: "low",
@@ -4687,7 +5653,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         .map((b) => b.text)
         .join("")
         .trim();
-      run.title = sanitizeGeneratedTitle(text) ?? fallback;
+      run.title = resolveRunTitle(sanitizeGeneratedTitle(text) ?? undefined, run.task);
     } catch {
       run.title = fallback;
     }
@@ -4697,7 +5663,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
   /** 启动一次不带核查的运行 */
   async function startPlainRun(run: StoredRun): Promise<void> {
-    await ensureMcp(); // 必须在 buildConfig 之前：工具面要么齐要么别开跑
+    await ensureMcp(run.packName ? getPack(run.packName) : pack); // 必须在 buildConfig 之前：工具面要么齐要么别开跑
     if (!(await pushRunConfig(run))) {
       finalizeRun(run, {
         outcome: "error",
@@ -4717,7 +5683,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     let mainStopReason: string | undefined;
     let mainError: string | null = null;
     try {
-      for await (const event of loop.run(run.task, run.abort?.signal)) {
+      for await (const event of loop.run(withBootContext(run.task, run.bootContext), run.abort?.signal)) {
         if (event.type === "done") {
           mainStopReason = event.result.stopReason;
           if (event.result.stopReason === "error" && event.result.error) {
@@ -4772,23 +5738,128 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    * 委托方的原话原样在最前面；事件流里 user_message 只记原话，附加段是宿主的装配。
    * 同进程追加 / 归档派生两条入口共用；派生时裁决来自父档案，由调用方传入。
    */
+  /**
+   * 新开「继续」类任务：从同 workdir 最近一条非相对指代会话抽开机背景。
+   * 不继承正史，只防模型空口说「没有任何任务记录」。
+   */
+  function resolveSiblingBootContext(task: string, runWorkdir: string, selfId: string): string | undefined {
+    if (!isRelativeContinuation(task)) return undefined;
+    const root = resolve(runWorkdir);
+    let best: StoredRun | undefined;
+    for (const r of runs.values()) {
+      if (r.id === selfId) continue;
+      if (resolve(r.workdir ?? workdir) !== root) continue;
+      if (isRelativeContinuation(r.task)) continue;
+      if (!best || r.createdAt > best.createdAt) best = r;
+    }
+    if (!best) return undefined;
+    return formatSiblingBootContext({
+      title: resolveRunTitle(best.title, best.task),
+      task: best.task,
+      recap: best.conversationRecap || recapFromRunEvents(best) || null,
+      conversationTurn: best.conversationTurn,
+    });
+  }
+
+  function executorSwitchOf(run: StoredRun): {
+    changed: boolean;
+    fromModel: string | null;
+    toModel: string;
+  } {
+    const roleId = modelStoreState.store.roles.executor;
+    const identityKey = endpointIdentityKey(executorIdentity);
+    const changed = shouldTreatAsExecutorSwitch(
+      { roleId: run.lastExecutorRoleId, identityKey: run.lastExecutorIdentityKey },
+      { roleId, identityKey },
+    );
+    return { changed, fromModel: run.lastExecutorModel ?? null, toModel: executorModelName };
+  }
+
+  function rememberExecutorFingerprint(run: StoredRun): void {
+    run.lastExecutorRoleId = modelStoreState.store.roles.executor;
+    run.lastExecutorIdentityKey = endpointIdentityKey(executorIdentity);
+    run.lastExecutorModel = executorModelName;
+  }
+
+  function historyForContinuation(
+    run: StoredRun,
+    switchInfo: { changed: boolean },
+  ): Anthropic.MessageParam[] | undefined {
+    const raw = run.history?.length ? run.history : undefined;
+    if (!raw) return undefined;
+    // 思考块带上一家的 signature；原样转给新模型轻则被忽略、重则整段 400，
+    // 看起来就像「换模型等于新开对话」。同模型续跑必须留签名（Claude 多轮需要）。
+    return switchInfo.changed ? stripThinkingFromMessages(raw) : raw;
+  }
+
   function composeTurnFeedback(
     run: StoredRun,
     feedback: string,
     previousTurn: number,
     history: Anthropic.MessageParam[] | undefined,
     lastVerdict: Verdict | undefined = verdictJudging(run, previousTurn),
+    opts: { executorChanged?: boolean } = {},
   ): string {
     const parts = [feedback];
     if (lastVerdict) parts.push(verdictFeedbackSummary(lastVerdict, previousTurn));
-    if (!history) {
-      const seed = run.planSummary ?? archivedPlanSummary(run);
-      // 措辞对两条入口都成立：活 run 无正史 = 执行阶段就失败；归档无检查点还可能是旧格式档案
+    const planSummary = run.planSummary ?? archivedPlanSummary(run);
+    const sketch = buildThreadSketch(
+      run.events.map((item) => ({ source: item.source, event: item.event as ThreadEventLike["event"] })),
+    );
+    const recap = run.conversationRecap || recapFromRunEvents(run) || null;
+    const relative = isRelativeContinuation(feedback);
+    if (opts.executorChanged) {
+      const sw = executorSwitchOf(run);
       parts.push(
-        seed ??
-          `【对话背景】本对话此前的任务：${run.task}\n上一轮没有留下可续的执行正史，本轮从头开始；工作目录里可能已有部分产物，请据实核对。`,
+        buildExecutorSwitchBriefing({
+          task: run.task,
+          fromModel: sw.fromModel,
+          toModel: sw.toModel,
+          conversationRecap: recap,
+          threadSketch: sketch || null,
+        }),
+      );
+      if (!history) {
+        parts.push(
+          buildFreshTurnBackground({
+            task: run.task,
+            planSummary,
+            conversationRecap: recap,
+            threadSketch: sketch || null,
+            bootContext: run.bootContext ?? null,
+          }),
+        );
+      }
+      const gitBriefOnSwitch = buildWorkspaceGitBriefing(run.workspaceGit);
+      if (gitBriefOnSwitch) parts.push(gitBriefOnSwitch);
+      return parts.join("\n\n");
+    }
+    // 无正史 → 完整开局背景。
+    // 有正史也必须钉本对话锚点：只认「继续」会漏掉「还能再优化吗」这类省略问句，
+    // 模型就去 workdir 里找「它」（liquid-demo 站点 vs 本场 PPT）。
+    // 编排追问不喂正史、只喂 feedback，缺锚点时同目录另一场会话会填坑。
+    if (!history) {
+      parts.push(
+        buildFreshTurnBackground({
+          task: run.task,
+          planSummary,
+          conversationRecap: recap,
+          threadSketch: sketch || null,
+          bootContext: run.bootContext ?? null,
+        }),
+      );
+    } else if (relative || feedback.trim().length <= 80) {
+      parts.push(
+        buildContinuationAnchor({
+          task: run.task,
+          planSummary,
+          conversationRecap: recap,
+          threadSketch: sketch || null,
+        }),
       );
     }
+    const gitBrief = buildWorkspaceGitBriefing(run.workspaceGit);
+    if (gitBrief) parts.push(gitBrief);
     return parts.join("\n\n");
   }
 
@@ -4814,10 +5885,13 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       orchestrate?: boolean;
       planGate?: boolean;
       concurrency?: number | "auto";
+      /** AGENT-01：带着上一份节点状态重跑 planner，而不是单执行者追问 */
+      replan?: boolean;
     },
   ): Promise<void> {
     const previousTurn = run.conversationTurn;
-    const history = run.history?.length ? run.history : undefined;
+    const switchInfo = executorSwitchOf(run);
+    const history = historyForContinuation(run, switchInfo);
 
     run.status = "running";
     delete run.finishedAt;
@@ -4825,7 +5899,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     run.turnExecutorTurns = 0; // 台账 turns 按对话轮计，新一轮从零累计
     run.verify = turn.verify;
     const previousMode = run.mode;
-    if (turn.orchestrate) {
+    const doReplan = Boolean(turn.replan && run.planNodes?.length);
+    if (turn.orchestrate || doReplan) {
       run.mode = "plan";
       run.concurrency = turn.concurrency ?? (turn.planGate ? 1 : "auto");
       run.planGate = Boolean(turn.planGate);
@@ -4850,13 +5925,22 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
     // 追加的这句话本身要进事件流：它是会话的一部分，也是"这一段为什么开始"的解释。
     // verify 是本轮的核查设置（前端 reducer 据此判断 done 是不是 run 终止）；
-    // continues 说清这一轮接的是什么：正史 / 计划摘要 / 从头
+    // continues 说清这一轮接的是什么：正史 / 计划摘要 / 重规划 / 从头
     pushSyntheticEvent(run, "host", {
       type: "user_message",
       turn: run.conversationTurn,
       text: feedback,
       verify: turn.verify,
-      continues: turn.orchestrate ? "fresh" : history ? "history" : previousMode === "plan" ? "plan-summary" : "fresh",
+      continues: doReplan
+        ? "replan"
+        : turn.orchestrate
+          ? "fresh"
+          : history
+            ? "history"
+            : previousMode === "plan"
+              ? "plan-summary"
+              : "fresh",
+      ...(switchInfo.changed ? { executorSwitched: true } : {}),
       at: Date.now(),
     });
     broadcastLifecycle("run_updated", run);
@@ -4869,9 +5953,28 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         run.resumeBudget ?? restoredBudget(run.checkpoint, { maxTotalTurns, maxTokensBudget });
       run.initialContextInputTokens = run.checkpoint.contextInputTokens;
     }
-    const executorFeedback = composeTurnFeedback(run, feedback, previousTurn, history);
+    const executorFeedback = composeTurnFeedback(
+      run,
+      feedback,
+      previousTurn,
+      history,
+      verdictJudging(run, previousTurn),
+      { executorChanged: switchInfo.changed },
+    );
+    if (doReplan) {
+      await startPlannedRun(run, executorFeedback, {
+        replan: {
+          originalTask: run.task,
+          feedback,
+          nodes: run.planNodes!,
+          handoffs: run.planHandoffs ?? {},
+        },
+        skipClarifier: true,
+      });
+      return;
+    }
     if (turn.orchestrate) {
-      await startPlannedRun(run, executorFeedback);
+      await startPlannedRun(run, executorFeedback, { skipClarifier: true });
       return;
     }
     await executeTurn(run, {
@@ -4903,7 +6006,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       signal: AbortSignal;
     },
   ): Promise<void> {
-    await ensureMcp();
+    await ensureMcp(run.packName ? getPack(run.packName) : pack);
     if (!(await pushRunConfig(run))) {
       finalizeRun(run, {
         outcome: "error",
@@ -4968,7 +6071,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    *
    * 与 fork 的差别：不新建 run、不写 continuedFrom、首条事件是 run_resumed。
    * 诚实边界：不恢复 AbortController 以外的"原进程"——loop 是新建的；
-   * active grant 一律不继承；只从最后提交的 main checkpoint 续跑。
+   * active grant 一律不继承。
+   * 单执行者：从最后提交的 main checkpoint 续跑。
+   * 半截 DAG：注入同一张图，跳过 passed；不重跑 planner、不重开计划门。
    */
   async function startSameRunResume(
     run: StoredRun,
@@ -4981,9 +6086,37 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       concurrency?: number | "auto";
     } = { verify: false },
   ): Promise<void> {
-    const history = run.history;
-    const inheritedBudget = run.resumeBudget;
-    if (!history?.length || !inheritedBudget) {
+    const switchInfo = executorSwitchOf(run);
+    const history = historyForContinuation(run, switchInfo);
+    const dagFacts = run.mode === "plan" ? planResumeFacts(run.durableState?.plan) : undefined;
+    const dagResume = Boolean(
+      dagFacts?.approved && dagFacts.hasPassedNode && !dagFacts.hasFailedNode && dagFacts.hasRemainingNode,
+    );
+    const inheritedBudget = run.resumeBudget ?? run.durableState?.budget ?? undefined;
+    if (dagResume) {
+      const nodes =
+        run.planNodes ??
+        (run.durableState?.plan?.nodes ? planNodesFromDurable(run.durableState.plan.nodes) : []);
+      if (!nodes.length) {
+        pushSyntheticEvent(run, "host", {
+          type: "run_resume_failed",
+          reason: "半截 DAG 恢复缺少节点快照",
+          at: Date.now(),
+        });
+        finalizeRun(run, {
+          outcome: "error",
+          mainStopReason: "error",
+          error: ledgerErrorClass("半截 DAG 恢复缺少节点快照"),
+        });
+        return;
+      }
+      run.planNodes = nodes;
+      run.planHandoffs = run.planHandoffs ?? handoffsFromPlanNodes(nodes);
+      run.injectedPlan = planFromNodes(nodes);
+      if (!run.resumeBudget && run.durableState?.budget) {
+        run.resumeBudget = { ...run.durableState.budget };
+      }
+    } else if (!history?.length || !inheritedBudget) {
       pushSyntheticEvent(run, "host", {
         type: "run_resume_failed",
         reason: "同 run 恢复缺少正史或预算快照",
@@ -5004,15 +6137,16 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       type: "run_resumed",
       runId: run.id,
       rootRunId: run.rootRunId ?? run.id,
-      boundary:
-        "同 run 热恢复：从最后提交的 main 检查点续跑；不恢复原进程 loop/审批回调/active grant；" +
-        "SAFE-06 toolTx 从 state.json 种子化（同 key 不重复 commit）；续跑入口仍是 checkpoint 段号；" +
-        "若正史末条悬空 tool_use，AgentLoop 按 mid-tool 计划幂等重放 / bash fail-closed。",
+      boundary: dagResume
+        ? "同 run 热恢复：按已落盘的计划节点续发射半截 DAG；已通过的子任务不重跑；不恢复原进程 loop/审批回调/active grant；不重开计划确认门。"
+        : "同 run 热恢复：从最后提交的 main 检查点续跑；不恢复原进程 loop/审批回调/active grant；" +
+          "SAFE-06 toolTx 从 state.json 种子化（同 key 不重复 commit）；续跑入口仍是 checkpoint 段号；" +
+          "若正史末条悬空 tool_use，AgentLoop 按 mid-tool 计划幂等重放 / bash fail-closed。",
       checkpoint: {
         conversationTurn: run.conversationTurn - 1,
         contextInputTokens: run.initialContextInputTokens ?? 0,
         segmentIndex: run.checkpoint?.segmentIndex ?? null,
-        runBudget: { ...inheritedBudget },
+        runBudget: inheritedBudget ? { ...inheritedBudget } : { usedTurns: 0, usedTokens: 0 },
       },
       reset: ["审批放行规则", "挂起交互", "ask_user 已用配额", "AbortController", "AgentLoop"],
       at: resumeAt,
@@ -5038,26 +6172,309 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       text: feedback,
       verify: turn.verify,
       continues: "history",
+      ...(switchInfo.changed ? { executorSwitched: true } : {}),
       at: Date.now(),
     });
     broadcastLifecycle("run_updated", run);
+
+    if (dagResume && run.planNodes?.length) {
+      const kept = run.planNodes.filter((n) => n.status === "passed").map((n) => n.id);
+      const remaining = run.planNodes
+        .filter((n) => n.status === "pending" || n.status === "running")
+        .map((n) => n.id);
+      pushSyntheticEvent(run, "host", hostPlanResumeEvent({ kept, remaining, reason: feedback }));
+      persistMeta(run);
+      await startPlannedRun(run, withBootContext(run.task, run.bootContext), {
+        resume: { nodes: run.planNodes, handoffs: run.planHandoffs ?? {} },
+      });
+      return;
+    }
 
     if (turn.orchestrate) {
       run.mode = "plan";
       run.concurrency = turn.concurrency ?? (turn.planGate ? 1 : "auto");
       run.planGate = Boolean(turn.planGate);
       persistMeta(run);
-      await startPlannedRun(run, feedback);
+      await startPlannedRun(run, feedback, { skipClarifier: true });
       return;
     }
 
     await executeTurn(run, {
       history,
       feedback,
-      executorFeedback: feedback,
+      executorFeedback: switchInfo.changed
+        ? composeTurnFeedback(
+            run,
+            feedback,
+            run.conversationTurn - 1,
+            history,
+            undefined,
+            { executorChanged: true },
+          )
+        : feedback,
       verify: turn.verify,
       signal: run.abort?.signal ?? new AbortController().signal,
     });
+  }
+
+  function historySnapshotForFork(parent: StoredRun): Anthropic.MessageParam[] | undefined {
+    if (parent.history?.length) return structuredClone(parent.history);
+    const fromCheckpoint = archivedCheckpointHistory(parent);
+    if (fromCheckpoint?.length) return fromCheckpoint;
+    const last = [...parent.transcript].reverse().find((seg) => isExecutorLineageSource(seg.source));
+    if (last && isMessageHistory(last.messages)) return structuredClone(last.messages);
+    return undefined;
+  }
+
+  /**
+   * Cursor 式分叉：复制当前对话快照成一条新的已完成 run，不启动模型。
+   * 父 run 原样不动（运行中也不掐）。后续追问走子 run 的 /messages。
+   */
+  async function snapshotConversationFork(parent: StoredRun): Promise<StoredRun> {
+    await hydrateArchive(parent);
+    const id = randomUUID();
+    const now = Date.now();
+    const events = parent.events.map((item, index) => {
+      const clone = structuredClone(item) as SSEEvent;
+      return { ...clone, seq: index };
+    });
+    const history = historySnapshotForFork(parent);
+    const checkpoint = parent.checkpoint
+      ? (() => {
+          const copy = structuredClone(parent.checkpoint);
+          delete copy.approvalGrants;
+          return copy;
+        })()
+      : undefined;
+    const child: StoredRun = {
+      id,
+      task: parent.task,
+      ...(parent.title ? { title: parent.title } : {}),
+      status: "done",
+      verify: parent.verify,
+      createdAt: now,
+      finishedAt: now,
+      events,
+      pendingApprovals: new Map(),
+      respondedApprovals: new Map(),
+      respondedToolUseIds: new Set(),
+      sseClients: new Set(),
+      segmentIndex: parent.segmentIndex,
+      transcript: parent.transcript.map((seg) => structuredClone(seg)),
+      conversationTurn: parent.conversationTurn,
+      toolTally: { ...parent.toolTally },
+      continuedFrom: parent.id,
+      rootRunId: parent.rootRunId ?? parent.id,
+      mainStopReason: parent.mainStopReason ?? "completed",
+      ...(history ? { history } : {}),
+      ...(checkpoint ? { checkpoint } : {}),
+      ...(parent.conversationRecap ? { conversationRecap: parent.conversationRecap } : {}),
+      ...(parent.planSummary ? { planSummary: parent.planSummary } : {}),
+      ...(parent.packName ? { packName: parent.packName } : {}),
+      ...(parent.effort ? { effort: parent.effort } : {}),
+      ...(parent.rubric ? { rubric: parent.rubric } : {}),
+      ...(parent.workdir ? { workdir: parent.workdir } : {}),
+      ...(parent.extraWorkdirs?.length ? { extraWorkdirs: [...parent.extraWorkdirs] } : {}),
+      ...(parent.askUser ? { askUser: true } : {}),
+      ...(parent.autoApprove ? { autoApprove: true } : {}),
+      ...(parent.permissionMode ? { permissionMode: parent.permissionMode } : {}),
+      ...(parent.mode === "plan" ? { mode: "plan" as const } : {}),
+      ...(parent.contextTokenLimit !== undefined ? { contextTokenLimit: parent.contextTokenLimit } : {}),
+      ...(parent.lastExecutorRoleId ? { lastExecutorRoleId: parent.lastExecutorRoleId } : {}),
+      ...(parent.lastExecutorIdentityKey ? { lastExecutorIdentityKey: parent.lastExecutorIdentityKey } : {}),
+      ...(parent.lastExecutorModel ? { lastExecutorModel: parent.lastExecutorModel } : {}),
+      ...(parent.outcome ? { outcome: structuredClone(parent.outcome) } : {}),
+      ...(parent.outcomeTurn !== undefined ? { outcomeTurn: parent.outcomeTurn } : {}),
+    };
+    if (historyRoot) {
+      child.archiveWriter = createArchiveWriter(id);
+      persistMeta(child);
+      seedDurableState(child);
+      applyDurableTransition(child, { type: "complete" });
+      for (const ev of events) child.archiveWriter?.appendEvent(ev);
+      for (const seg of child.transcript) child.archiveWriter?.appendTranscriptSegment(seg);
+    } else {
+      seedDurableState(child);
+      applyDurableTransition(child, { type: "complete" });
+    }
+    runs.set(id, child);
+    metrics.runsStarted += 1;
+    if (realHost) {
+      operationalLog("info", "run_forked_snapshot", {
+        runId: id,
+        parentRunId: parent.id,
+        events: events.length,
+      });
+    }
+    broadcastLifecycle("run_created", child);
+    return child;
+  }
+
+  /**
+   * 回到某条消息：复制父对话但只留 seq 及之前的事件。
+   * 父 run 原样不动。可选按写盘快照还原工作区（bash 不保证）。
+   */
+  async function snapshotConversationRewind(
+    parent: StoredRun,
+    seq: number,
+    revertFiles: boolean,
+  ): Promise<{ child: StoredRun; files: Awaited<ReturnType<typeof applyFileRevert>> | null }> {
+    await hydrateArchive(parent);
+    await ensureFileRewindSnapshots(parent);
+    const kept = truncateEventsToSeq(parent.events, seq);
+    const events = kept.map((item, index) => {
+      const clone = structuredClone(item) as SSEEvent;
+      return { ...clone, seq: index };
+    });
+    const picked = pickTranscriptForRewind(kept, parent.transcript);
+    const conversationTurn = conversationTurnFromEvents(kept);
+    const history = picked.history as Anthropic.MessageParam[] | undefined;
+    const checkpoint =
+      parent.checkpoint
+      && parent.checkpoint.conversationTurn <= conversationTurn
+      && parent.checkpoint.segmentIndex < picked.segmentIndex
+        ? (() => {
+            const copy = structuredClone(parent.checkpoint);
+            delete copy.approvalGrants;
+            return copy;
+          })()
+        : undefined;
+
+    let files: Awaited<ReturnType<typeof applyFileRevert>> | null = null;
+    if (revertFiles) {
+      const writes = writesAfterSeq(parent.events, seq);
+      const snapshots = new Map(
+        (parent.fileRewindSnapshots ?? []).map((record) => [
+          record.toolUseId,
+          { record, blob: parent.fileRewindBlobs?.get(record.toolUseId) },
+        ]),
+      );
+      const root = parent.workdir ?? workdir;
+      const gitOk = await detectGitRepo(root);
+      files = await applyFileRevert({
+        workdir: root,
+        writeRoots: mergeRunReadRoots([...allowedWorkdirs], parent.extraWorkdirs, root),
+        gitRoot: gitOk ? root : null,
+        writes,
+        snapshots,
+      });
+    }
+
+    const id = randomUUID();
+    const now = Date.now();
+    const rewindFrom = { parentRunId: parent.id, seq, revertFiles };
+    const child: StoredRun = {
+      id,
+      task: parent.task,
+      ...(parent.title ? { title: parent.title } : {}),
+      status: "done",
+      verify: parent.verify,
+      createdAt: now,
+      finishedAt: now,
+      events,
+      pendingApprovals: new Map(),
+      respondedApprovals: new Map(),
+      respondedToolUseIds: new Set(),
+      sseClients: new Set(),
+      segmentIndex: picked.segmentIndex,
+      transcript: picked.transcript.map((seg) => structuredClone(seg)),
+      conversationTurn,
+      toolTally: { ...parent.toolTally },
+      continuedFrom: parent.id,
+      rootRunId: parent.rootRunId ?? parent.id,
+      rewindFrom,
+      mainStopReason: parent.mainStopReason ?? "completed",
+      ...(history ? { history } : {}),
+      ...(checkpoint ? { checkpoint } : {}),
+      ...(conversationTurn === parent.conversationTurn && parent.conversationRecap
+        ? { conversationRecap: parent.conversationRecap }
+        : {}),
+      ...(parent.planSummary && kept.some((e) => e.event?.type === "plan_result")
+        ? { planSummary: parent.planSummary }
+        : {}),
+      ...(parent.packName ? { packName: parent.packName } : {}),
+      ...(parent.effort ? { effort: parent.effort } : {}),
+      ...(parent.rubric ? { rubric: parent.rubric } : {}),
+      ...(parent.workdir ? { workdir: parent.workdir } : {}),
+      ...(parent.extraWorkdirs?.length ? { extraWorkdirs: [...parent.extraWorkdirs] } : {}),
+      ...(parent.askUser ? { askUser: true } : {}),
+      ...(parent.autoApprove ? { autoApprove: true } : {}),
+      ...(parent.permissionMode ? { permissionMode: parent.permissionMode } : {}),
+      ...(parent.mode === "plan" ? { mode: "plan" as const } : {}),
+      ...(parent.contextTokenLimit !== undefined ? { contextTokenLimit: parent.contextTokenLimit } : {}),
+      ...(parent.lastExecutorRoleId ? { lastExecutorRoleId: parent.lastExecutorRoleId } : {}),
+      ...(parent.lastExecutorIdentityKey ? { lastExecutorIdentityKey: parent.lastExecutorIdentityKey } : {}),
+      ...(parent.lastExecutorModel ? { lastExecutorModel: parent.lastExecutorModel } : {}),
+      ...(parent.outcome && (parent.outcomeTurn ?? 1) <= conversationTurn
+        ? { outcome: structuredClone(parent.outcome), outcomeTurn: parent.outcomeTurn }
+        : {}),
+    };
+
+    const keptIds = new Set(
+      kept
+        .filter((e) => e.event?.type === "file_rewind_snapshot" || e.event?.type === "tool_call")
+        .map((e) => String((e.event as { toolUseId?: unknown }).toolUseId ?? ""))
+        .filter(Boolean),
+    );
+    if (parent.fileRewindSnapshots?.length) {
+      child.fileRewindSnapshots = parent.fileRewindSnapshots.filter((r) => keptIds.has(r.toolUseId));
+      child.fileRewindBlobs = new Map(
+        [...(parent.fileRewindBlobs ?? [])].filter(([id]) => keptIds.has(id)),
+      );
+    }
+
+    const rewindEvent: SSEEvent = {
+      seq: events.length,
+      source: "host",
+      ts: now,
+      event: {
+        type: "conversation_rewound",
+        parentRunId: parent.id,
+        seq,
+        revertFiles,
+        ...(files
+          ? {
+              restored: files.restored,
+              deleted: files.deleted,
+              gitRestored: files.gitRestored,
+              skipped: files.skipped,
+            }
+          : {}),
+      },
+    };
+    events.push(rewindEvent);
+    child.events = events;
+
+    if (historyRoot) {
+      child.archiveWriter = createArchiveWriter(id);
+      persistMeta(child);
+      seedDurableState(child);
+      applyDurableTransition(child, { type: "complete" });
+      for (const ev of events) child.archiveWriter?.appendEvent(ev);
+      for (const seg of child.transcript) child.archiveWriter?.appendTranscriptSegment(seg);
+      if (child.fileRewindSnapshots?.length && child.archiveWriter) {
+        for (const record of child.fileRewindSnapshots) {
+          const blob = child.fileRewindBlobs?.get(record.toolUseId);
+          child.archiveWriter.schedule(() => persistRewindSnapshot(child.archiveWriter!.dir, record, blob));
+        }
+      }
+    } else {
+      seedDurableState(child);
+      applyDurableTransition(child, { type: "complete" });
+    }
+    runs.set(id, child);
+    metrics.runsStarted += 1;
+    if (realHost) {
+      operationalLog("info", "run_rewound", {
+        runId: id,
+        parentRunId: parent.id,
+        seq,
+        revertFiles,
+        events: events.length,
+      });
+    }
+    broadcastLifecycle("run_created", child);
+    return { child, files };
   }
 
   /**
@@ -5084,7 +6501,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       concurrency?: number | "auto";
     } = { verify: false },
   ): Promise<void> {
-    const history = run.history?.length ? run.history : undefined;
+    const switchInfo = executorSwitchOf(run);
+    const history = historyForContinuation(run, switchInfo);
     const inheritedBudget = run.resumeBudget;
     if (!run.continuedFrom || (history && !inheritedBudget)) {
       pushSyntheticEvent(run, "host", {
@@ -5150,6 +6568,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       text: feedback,
       verify: turn.verify,
       continues: history ? "history" : run.planSummary ? "plan-summary" : "fresh",
+      ...(switchInfo.changed ? { executorSwitched: true } : {}),
       at: Date.now(),
     });
     broadcastLifecycle("run_updated", run);
@@ -5161,7 +6580,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       run.concurrency = turn.concurrency ?? (turn.planGate ? 1 : "auto");
       run.planGate = Boolean(turn.planGate);
       persistMeta(run);
-      await startPlannedRun(run, feedback);
+      await startPlannedRun(run, feedback, { skipClarifier: true });
       return;
     }
     await executeTurn(run, {
@@ -5173,6 +6592,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         run.conversationTurn - 1,
         history,
         turn.previousVerdict,
+        { executorChanged: switchInfo.changed },
       ),
       verify: turn.verify,
       signal: run.abort?.signal ?? new AbortController().signal,
@@ -5192,8 +6612,24 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    *   ③ onPlan / 结果合成事件：计划与调度结果不进 TurnEvent 流，
    *      不显式发出来前端就永远看不到 DAG 与并行收益。
    */
-  async function startPlannedRun(run: StoredRun, taskText = run.task): Promise<void> {
-    await ensureMcp();
+  async function startPlannedRun(
+    run: StoredRun,
+    taskText = withBootContext(run.task, run.bootContext),
+    extras?: {
+      replan?: {
+        originalTask: string;
+        feedback: string;
+        nodes: PlanNodeState[];
+        handoffs: Record<string, string>;
+      };
+      resume?: {
+        nodes: PlanNodeState[];
+        handoffs: Record<string, string>;
+      };
+      skipClarifier?: boolean;
+    },
+  ): Promise<void> {
+    await ensureMcp(run.packName ? getPack(run.packName) : pack);
     if (!(await pushRunConfig(run))) {
       finalizeRun(run, {
         outcome: "error",
@@ -5202,7 +6638,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       });
       return;
     }
-    applyDurableTransition(run, { type: "plan_begin" });
+    if (!extras?.resume) applyDurableTransition(run, { type: "plan_begin" });
     const baseCfg = await buildRunConfig(run);
     const startedAt = Date.now();
     let planReadyAt = startedAt;
@@ -5213,49 +6649,107 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
     try {
       const usePlanner = run.usePlannerModel ?? true;
+      // 重规划不能跳过 planner；半截 DAG 续发射注入同一张图；二者与对方互斥
+      const injectPlan = extras?.replan
+        ? undefined
+        : extras?.resume
+          ? planFromNodes(extras.resume.nodes)
+          : run.injectedPlan;
+      const persistPlanNodes = (nodes: PlanNodeState[]) => {
+        run.planNodes = nodes;
+        if (!run.durableState?.plan) return;
+        applyDurableTransition(run, { type: "plan_progress", nodes: nodes.map(durableNodeFromPlanNode) });
+      };
       const outcome = await runPlanned(baseCfg, modelClient, taskText, {
-        packs: Object.values(PACKS),
+        packs: allPacks(),
         concurrency,
+        ...(injectPlan ? { plan: injectPlan } : {}),
+        ...(extras?.replan ? { replan: extras.replan } : {}),
+        ...(extras?.resume ? { resume: extras.resume } : {}),
+        ...(extras?.skipClarifier ? { skipClarifier: true } : {}),
         ...(run.abort ? { signal: run.abort.signal } : {}),
         ...(envPlanMaxTurns !== undefined ? { planMaxTurns: envPlanMaxTurns } : {}),
         ...(plannerRole && usePlanner
           ? { plannerModel: { client: plannerClient!, compat: plannerRole.provider.compat } }
           : {}),
+        onReplan: async (diff) => {
+          pushSyntheticEvent(run, "host", hostPlanReplanEvent(diff));
+        },
         onPlan: async (plan: Plan) => {
           planReadyAt = Date.now();
           if (concurrency === "auto") {
             effectiveConcurrency = Math.min(AUTO_CONCURRENCY_CAP, planParallelWidth(plan.subtasks));
           }
+          if (extras?.resume) return;
           const protocol =
             process.env.AGENT_PLAN_PROTOCOL === "structured" ? "structured" : "freeform";
-          pushSyntheticEvent(run, "host", {
-            type: "plan",
-            concurrency: effectiveConcurrency,
-            concurrencyMode: concurrency === "auto" ? "auto" : "fixed",
-            plannerMs: planReadyAt - startedAt,
-            subtasks: plan.subtasks.map((t) => ({
-              id: t.id,
-              title: t.title,
-              pack: t.pack ?? null,
-              description: t.description,
-              acceptance: t.acceptance,
-              dependsOn: t.dependsOn,
-              resources: t.resources ?? (t.pack ? getPack(t.pack)?.resources ?? [] : []),
-            })),
-            /** 门开着时前端要知道"这份计划还在等签字"，而不是以为已经在跑了 */
-            gated: Boolean(run.planGate),
-          });
+          const pending = planNodesFromSubtasks(plan.subtasks, "pending");
+          run.planNodes = pending;
+          pushSyntheticEvent(
+            run,
+            "host",
+            hostPlanEvent({
+              concurrency: effectiveConcurrency,
+              concurrencyMode: concurrency === "auto" ? "auto" : "fixed",
+              plannerMs: planReadyAt - startedAt,
+              subtasks: hostPlanSubtaskViews(plan.subtasks, (name) => getPack(name)?.resources),
+              /** 门开着时前端要知道"这份计划还在等签字"，而不是以为已经在跑了 */
+              gated: Boolean(run.planGate),
+              ...(extras?.replan ? { replanned: true } : {}),
+            }),
+          );
           applyDurableTransition(
             run,
             {
               type: "plan_ready",
-              plan: durablePlanFromPlan(plan, protocol),
+              plan: durablePlanFromPlan(plan, protocol, pending),
               gated: Boolean(run.planGate),
             },
             planReadyAt,
           );
           // 签字位：计划已发出、一个子任务都还没发射，此时停下是零副作用的
           if (run.planGate) await waitForPlanDecision(run);
+        },
+        onSubtaskStart: (sub) => {
+          const current = run.planNodes ?? [];
+          const nodes = current.map((n) =>
+            n.id === sub.id ? { ...n, status: "running" as const } : n,
+          );
+          if (!current.some((n) => n.id === sub.id)) {
+            nodes.push({ ...planNodesFromSubtasks([sub], "running")[0]! });
+          }
+          persistPlanNodes(nodes);
+        },
+        onSubtaskSettled: (sub, result) => {
+          const evidence = evidenceFromVerifiedStep(result);
+          const current = run.planNodes ?? [];
+          const nodes = current.map((n) =>
+            n.id === sub.id
+              ? {
+                  ...n,
+                  status: result.finalPassed ? ("passed" as const) : ("failed" as const),
+                  ...(evidence ? { evidenceSummary: evidence } : {}),
+                }
+              : n,
+          );
+          if (!current.some((n) => n.id === sub.id)) {
+            nodes.push({
+              ...planNodesFromSubtasks([sub], result.finalPassed ? "passed" : "failed")[0]!,
+              ...(evidence ? { evidenceSummary: evidence } : {}),
+            });
+          }
+          persistPlanNodes(nodes);
+          if (result.finalPassed && evidence) {
+            run.planHandoffs = { ...(run.planHandoffs ?? {}), [sub.id]: evidence };
+          }
+          const budget = result.main.runBudget;
+          if (budget) {
+            applyDurableTransition(run, {
+              type: "budget_snapshot",
+              budget: { ...budget } as DurableBudgetSnapshot,
+            });
+            run.resumeBudget = { ...budget };
+          }
         },
         resolveSubtask: (sub: SubTask) => {
           const sp = sub.pack ? getPack(sub.pack) : undefined;
@@ -5276,13 +6770,16 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
               || MEMORY_TOOL_NAMES.has(tool.name),
           );
           const domainTools = injectedTools ?? selectPackTools(sp, toolPool, mcpTools);
+          const proposeForSub = sp?.handoffs?.length
+            ? [(run.proposeHandoffTool ??= makeProposeHandoffTool(run))]
+            : [];
           return {
             cfg: {
               ...baseCfg,
               systemPrompt: sp?.systemPrompt ?? baseCfg.systemPrompt,
               // 逐子任务按各自的包收窄 MCP 工具面：stm32-coding 的 mcp:false
               // 拿不到任何 MCP 工具，stm32-debug 才拿到它 includeTools 里那些
-              tools: [...domainTools, ...controlTools].filter(
+              tools: [...domainTools, ...controlTools, ...proposeForSub].filter(
                 (tool, i, all) => all.findIndex((candidate) => candidate.name === tool.name) === i,
               ),
               ...(sp?.guardrails?.maxTurns !== undefined ? { maxTurns: sp.guardrails.maxTurns } : {}),
@@ -5326,8 +6823,6 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       });
 
       const finishedAt = Date.now();
-      const stepSum = outcome.steps.reduce((n, st) => n + st.durationMs, 0);
-      const subtaskWall = finishedAt - planReadyAt;
       mainStopReason = plannedStopReason(outcome);
       if (mainStopReason === "error") {
         const failed = outcome.steps.find((st) => st.result.main.stopReason === "error");
@@ -5338,51 +6833,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
       // 并行收益的口径必须写清：子任务阶段墙钟排除 planner，"节省"是相对
       // 串行全序和而言的。不标口径的数字等于没有数字。
-      pushSyntheticEvent(run, "host", {
-        type: "plan_result",
-        completed: outcome.completed,
-        planned: Boolean(outcome.plan),
-        plannerRaw: outcome.plan ? undefined : outcome.planOutcome.raw.slice(0, 400),
-        // B0：计划的获得路径与 fail-closed 过程摘要。没有摘要时，"planner 胡言
-        // 乱语"与"探索没来得及收口"在界面上长得一模一样，返工策略却完全不同
-        plannerRecovery: outcome.planOutcome.recovery ?? null,
-        ...(outcome.planOutcome.failureSummary
-          ? { plannerFailure: outcome.planOutcome.failureSummary }
-          : {}),
-        plannerUsage: outcome.planOutcome.usage,
-        ...(outcome.clarification
-          ? {
-              clarification: {
-                task: outcome.clarification.task,
-                acceptance: outcome.clarification.acceptance,
-                assumptions: outcome.clarification.assumptions,
-                asked: outcome.clarification.asked,
-                usage: outcome.clarification.usage,
-              },
-            }
-          : {}),
-        ...(outcome.planOutcome.inventory ? { inventory: outcome.planOutcome.inventory } : {}),
-        steps: outcome.steps.map((st) => ({
-          id: st.sub.id,
-          title: st.sub.title,
-          pack: st.sub.pack ?? null,
-          durationMs: st.durationMs,
-          passed: st.result.finalPassed,
-          reworks: st.result.reworks,
-          stopReason: st.result.main.stopReason,
-          ...(st.result.main.completion ? { completion: st.result.main.completion } : {}),
-          verdict: st.result.verifications.at(-1)?.verdict ?? null,
-          usage: st.result.executionUsage,
-        })),
-        skipped: outcome.skipped.map((t) => ({ id: t.id, title: t.title })),
-        timing: {
-          totalMs: finishedAt - startedAt,
-          plannerMs: planReadyAt - startedAt,
-          subtaskWallMs: subtaskWall,
-          stepSumMs: stepSum,
-          savedMs: Math.max(0, stepSum - subtaskWall),
-        },
-      });
+      pushSyntheticEvent(
+        run,
+        "host",
+        hostPlanResultEvent(outcome, { startedAt, planReadyAt, finishedAt }),
+      );
 
       // 会话中心化：下一轮对话的种子——续的是对话，不是 DAG。与归档重建走同一个纯函数。
       run.planSummary = buildPlanSummary({
@@ -5407,6 +6862,23 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         completed: outcome.completed,
         plannerFailure: outcome.planOutcome.failureSummary,
       });
+      // AGENT-01：节点状态落内存，供下一轮 replan:true 使用
+      if (outcome.plan) {
+        const seeded = planNodesFromOutcome({
+          subtasks: outcome.plan.subtasks,
+          steps: outcome.steps.map((st) => ({
+            id: st.sub.id,
+            passed: st.result.finalPassed,
+            completion: st.result.main.completion
+              ? { summary: st.result.main.completion.summary, artifacts: st.result.main.completion.artifacts }
+              : null,
+            verdict: st.result.verifications.at(-1)?.verdict ?? null,
+          })),
+          skipped: outcome.skipped.map((t) => ({ id: t.id })),
+        });
+        run.planNodes = seeded.nodes;
+        run.planHandoffs = seeded.handoffs;
+      }
       // 全部子任务共用一份执行总账（planExecutionBudget）；任一步的收尾快照就是
       // 整场编排的累计读数——下一轮单执行者从这里接着记，续跑不重置总账
       const planBudget = outcome.steps.at(-1)?.result.main.runBudget;
@@ -5453,7 +6925,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
   /** 启动一次带核查的运行 */
   async function startVerifiedRun(run: StoredRun): Promise<void> {
-    await ensureMcp();
+    await ensureMcp(run.packName ? getPack(run.packName) : pack);
     if (!(await pushRunConfig(run))) {
       finalizeRun(run, {
         outcome: "error",
@@ -5466,7 +6938,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     const cfg = await buildRunConfig(run);
     // 信息队列·插队（核查轮同口径；核查者的配置在 orchestrate 里被剥掉这个钩子）
     cfg.steering = { drain: () => (run.steeringQueue ?? []).splice(0) };
-    await runVerifiedTurn(run, cfg, run.task);
+    await runVerifiedTurn(run, cfg, withBootContext(run.task, run.bootContext));
   }
 
   /**
@@ -5579,10 +7051,13 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     const lastEventId = Number(req.headers["last-event-id"]);
     const from = Number.isFinite(lastEventId) ? lastEventId : -1;
 
-    for (const evt of run.events) {
+    for (const evt of annotateApprovalReplay(run.events)) {
       if (evt.seq <= from) continue;
       res.write(frameFor(evt));
     }
+    // 历史重放结束标记。切会话时 EventSource 会把缓冲拆成多帧；前端先攒着，
+    // 收到这帧再一次性 reduce，避免审批卡先画出再被 resolved 抹掉。
+    res.write(`event: replay_done\ndata: ${JSON.stringify({ lastSeq: run.events.at(-1)?.seq ?? from })}\n\n`);
 
     if (run.status === "done") {
       // run 已结束：重放完即关闭
@@ -5662,6 +7137,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     cfg: AgentConfig,
     executionBoundary: ExecutionBoundaryStatus | null,
   ): void {
+    const allowlistRoots = mergeRunReadRoots([...allowedWorkdirs], run.extraWorkdirs, cfg.workdir);
     pushSyntheticEvent(run, "host", {
       type: "run_config",
       pack: packView(runPack),
@@ -5686,6 +7162,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       verifierReadOnlyCommands: readOnlyFor(runPack).commands,
       verifierReadOnlySource: readOnlyFor(runPack).source,
       workdir: cfg.workdir,
+      extraWorkdirs: run.extraWorkdirs ?? [],
+      writeRoots: allowlistRoots,
+      readRoots: mergeRunReadRoots(readRoots, allowlistRoots, cfg.workdir),
       executionIsolation: executionBoundary,
       roleModels: {
         executor: executorModelName,
@@ -5706,6 +7185,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       fallbackScope: fallbackScopeNow(),
       fallbackRouting: fallbackChain || anyRoleFallbackNow() ? routingPolicy : null,
       compatSource: executorCapabilities?.source ?? "name",
+      endpointHealth: endpointHealthView(),
+      supportsVision: visionRole
+        ? visionProbe
+          ? visionProbe.supportsVision
+          : null
+        : false,
       guardrails: {
         maxTurns: cfg.maxTurns ?? null,
         maxTokens: cfg.maxTokens ?? null,
@@ -5743,15 +7228,21 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           planGate: Boolean(run.planGate),
           autoYes: Boolean(run.autoApprove),
         };
-        const matched =
-          run.permissionMode
-          ?? matchPermissionMode(switches);
+        // 档位只跟实际开关走，不跟用户点过的标签（追问改编排后标签会过期）。
+        const matched = matchPermissionMode(switches);
         return {
           mode: matched,
           ...switches,
         };
       })(),
       ...(run.packRoute ? { packRoute: run.packRoute } : {}),
+      mode: run.mode ?? "single",
+      ...(run.designRoute ? { designRoute: run.designRoute } : {}),
+      hooks: hookSpec
+        ? { timeoutMs: hookSpec.timeoutMs, events: ["PreToolUse", "PostToolUse", "Stop"] }
+        : null,
+      agentMd: agentMdView(agentMdForRun(run)),
+      workspaceGit: run.workspaceGit ?? { present: false },
     });
   }
 
@@ -5759,6 +7250,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     const runPack = run.packName ? getPack(run.packName) : pack;
     // 若 cleanup 在路由预检之后、进入本启动函数之前已经挂起，连 per-run
     // canary worker 都不应创建。这里必须早于 buildConfig：后者会按需构造 broker。
+    await refreshWorkspaceGit(run);
     const preProbeBlockReason = executionAdmissionBlockReason();
     if (preProbeBlockReason) {
       // 早拒也必须先落 durable run_config。用不绑定 broker 的纯配置投影，避免
@@ -5827,12 +7319,48 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     };
   }
 
-  /** GET /api/models 出栈：库脱敏视图 + 当前装配的角色快照。 */
+  /** GET /api/models 出栈：库脱敏视图 + 当前角色装配快照 + 窗口预览。 */
   function modelsApiPayload(): Record<string, unknown> {
+    const redacted = redactStore(modelStoreState.store, modelStoreState.source);
+    const byId = new Map(modelStoreState.store.models.map((m) => [m.id, m]));
     return {
-      ...redactStore(modelStoreState.store, modelStoreState.source),
+      ...redacted,
+      models: redacted.models.map((pub) => {
+        const full = byId.get(pub.id);
+        const identity: EndpointIdentity = {
+          provider: pub.provider,
+          model: pub.model,
+          ...(full?.baseUrl ? { baseURL: full.baseUrl } : {}),
+        };
+        const win = resolveContextWindow(identity);
+        return {
+          ...pub,
+          contextWindow: {
+            window: win.window,
+            windowSource: win.windowSource,
+          },
+        };
+      }),
       roleModels: roleModelsView(),
+      /** 当前执行者装配下的窗口/水位——换模型后立刻可读，不必另拉 /api/harness */
+      context: contextView(processContextPlan()),
     };
+  }
+
+  function availablePacksView(): Array<Record<string, unknown>> {
+    return allPacks().map((p) => ({
+      name: p.name,
+      description: p.description,
+      source: PACKS[p.name] ? "builtin" : "installed",
+      verifyMode: p.verify.mode ?? null,
+      hasRubric: Boolean(p.verify.rubric),
+      groundedConsult: p.name === "consult",
+      wantsWebSearch: Array.isArray(p.builtinTools) && p.builtinTools.includes("web_search"),
+    }));
+  }
+
+  function packNamesLine(): string {
+    return allPacks().map((p) => p.name).join(" | ");
   }
 
   function harnessSnapshot(): Record<string, unknown> {
@@ -5894,15 +7422,17 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       uploadSubdir: UPLOAD_SUBDIR,
       uploadMaxBytes: UPLOAD_MAX_BYTES,
       // V-24：提交表单要能列出可选领域包。只给名字与描述，不泄露 systemPrompt
-      availablePacks: Object.entries(PACKS).map(([name, p]) => ({
-        name,
-        description: p.description,
-        verifyMode: p.verify.mode ?? null,
-        hasRubric: Boolean(p.verify.rubric),
-        // 装配诚实：consult 需要检索时，没配 key 要能在选包提示里看见
-        groundedConsult: name === "consult",
-        wantsWebSearch: Array.isArray(p.builtinTools) && p.builtinTools.includes("web_search"),
-      })),
+      availablePacks: availablePacksView(),
+      designMode: {
+        tabs: [...DESIGN_TABS],
+        catalog: publicDesignCatalog(),
+        installedFilePacks: installedFilePacksFrom(allPacks()).map((p) => ({
+          name: p.name,
+          description: p.description,
+        })),
+        draftsWorkdir: designDraftsDir,
+        hostWorkdirIsHarness,
+      },
       webSearchConfigured: isWebSearchConfigured(),
       effortLevels: [...EFFORT_LEVELS],
       // V-29：合法工作目录集合由宿主声明，浏览器只在其中选（运行时经
@@ -5916,6 +7446,14 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       fallbackScope: fallbackScopeNow(),
       fallbackRouting: fallbackChain || anyRoleFallbackNow() ? routingPolicy : null,
       compatSource: executorCapabilities?.source ?? "name",
+      // MODEL-01 残余：链健康只读面（粘性探针 + 熔断）；不改路由
+      endpointHealth: endpointHealthView(),
+      // null = 配了但尚未探完；false = 明确不会看图（工具已卸）
+      supportsVision: visionRole
+        ? visionProbe
+          ? visionProbe.supportsVision
+          : null
+        : false,
       // 核查预算与执行者解耦，但**不是常数**（9.1）：领域包可用 verify.maxTurns
       // 覆盖。这里报进程级默认包的值；逐 run 的真实值走 run_config
       verifierBudgetTurns: verifyMaxTurnsOf(pack) ?? DEFAULT_VERIFIER_MAX_TURNS,
@@ -5940,6 +7478,20 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         origin: toolOrigin(t.name),
       })),
       mcp: mcpSnapshot(),
+      hooks: hookSpec
+        ? { timeoutMs: hookSpec.timeoutMs, events: ["PreToolUse", "PostToolUse", "Stop"] }
+        : null,
+      // 进程级只报上限与层次；实际加载了哪几个文件是逐 run 的（workdir 不同）
+      agentMd: { maxChars: agentMdMaxChars, layers: ["user", "project", "rules", "subdir"] },
+      /**
+       * OBS-02：直方图分位数。没有样本是 null，不是 0。
+       * 模型曲线用执行者角色+当前装配模型；等待按 kind。本切片不发明仪表盘。
+       */
+      latency: {
+        modelCall: modelCallSeconds.quantiles({ role: "execution", model: executorModelName }),
+        modelTtft: modelTtftSeconds.quantiles({ role: "execution", model: executorModelName }),
+        wait: Object.fromEntries(WAIT_KINDS.map((kind) => [kind, waitSeconds.quantiles({ kind })])),
+      },
     };
   }
 
@@ -6101,6 +7653,45 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     res.setHeader("Retry-After", String(rejection.retryAfterSeconds));
     json(res, 429, rejection.payload);
   }
+
+  /**
+   * 突变额度只计会改宿主/run 状态的写操作。
+   * 不计路径探活、在资源管理器中显示——那些是 POST 只因要带 body，
+   * 对话每刷一次就会打，跟「新建任务」抢额度会把提问卡锁死。
+   * 人闸（澄清/审批/计划门/停止）另算：解开挂起的 agent 不得被旁路 POST 挤掉。
+   */
+  const MUTATION_QUOTA_ROUTES = new Set([
+    "createRun",
+    "followUp",
+    "forkConversation",
+    "rewindConversation",
+    "upload",
+    "uploadDelete",
+    "autoApprove",
+    "modelsPut",
+    "modelsRolesPatch",
+    "modelsTest",
+    "modelsSyncEnv",
+    "mcpPut",
+    "packsDraft",
+    "packsInstall",
+    "packsDiscard",
+    "workdirAdd",
+    "designDraftsWorkdir",
+    "workdirRemove",
+    "fsMkdir",
+    "workspaceGitCheckout",
+    "seedTemplate",
+    "exportPptx",
+    "exportPng",
+    "scheduleCreate",
+    "scheduleUpdate",
+    "scheduleDelete",
+    "scheduleRun",
+    "deleteRun",
+    "extendBudget",
+    "messageQueue",
+  ]);
 
   function mutationRetryAfter(req: IncomingMessage): number | null {
     if (mutationRateLimitPerMinute === Number.MAX_SAFE_INTEGER) return null;
@@ -6275,17 +7866,25 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     | { type: "harness" }
     | { type: "modelsGet" }
     | { type: "modelsPut" }
+    | { type: "modelsRolesPatch" }
     | { type: "modelsTest" }
     | { type: "modelsSyncEnv" }
     | { type: "usageGet" }
-    | { type: "completePost" }
     | { type: "mcpGet" }
     | { type: "mcpPut" }
+    | { type: "packsGet" }
+    | { type: "packsDraft" }
+    | { type: "packsInstall"; name: string }
+    | { type: "packsDiscard"; name: string }
     | { type: "workdirsList" }
     | { type: "workdirAdd" }
+    | { type: "designDraftsWorkdir" }
     | { type: "workdirRemove" }
+    | { type: "workspaceGitGet"; workdir: string | null }
+    | { type: "workspaceGitCheckout" }
     | { type: "fsList"; path: string | null }
-    | { type: "memoryList" }
+    | { type: "fsMkdir" }
+    | { type: "memoryList"; scope: "current" | "all"; workdir?: string }
     | { type: "memoryRead"; name: string }
     | { type: "searchRuns"; query: string; limit: string | null }
     | { type: "runChanges"; runId: string }
@@ -6297,11 +7896,18 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     | { type: "artifact"; runId: string; path: string; download: boolean }
     | { type: "site"; runId: string; path: string; inspect: boolean; deck: boolean; print: boolean }
     | { type: "siteZip"; runId: string; path: string }
+    | { type: "designTemplates" }
+    | { type: "designMd"; runId: string }
+    | { type: "seedTemplate"; runId: string }
+    | { type: "exportPptx"; runId: string }
+    | { type: "exportPng"; runId: string }
     | { type: "filePreview"; path: string; workdir: string | null; download: boolean }
     | { type: "reveal"; runId: string }
     | { type: "stop"; runId: string }
     | { type: "deleteRun"; runId: string }
     | { type: "followUp"; runId: string }
+    | { type: "forkConversation"; runId: string }
+    | { type: "rewindConversation"; runId: string }
     | { type: "messageQueue"; runId: string }
     | { type: "extendBudget"; runId: string }
     | { type: "upload" }
@@ -6316,6 +7922,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     | { type: "approval"; runId: string; toolUseId: string }
     | { type: "autoApprove"; runId: string }
     | { type: "planApproval"; runId: string }
+    | { type: "handoff"; runId: string }
     | { type: "answer"; runId: string }
     | { type: "malformed" } {
     if (method === "GET" && url === "/health") return { type: "health" };
@@ -6345,6 +7952,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     if (method === "PUT" && url === "/api/models") {
       return { type: "modelsPut" };
     }
+    /** 只改角色分配（composer 快捷换执行模型）；不动库条目与密钥。 */
+    if (method === "PATCH" && url === "/api/models/roles") {
+      return { type: "modelsRolesPatch" };
+    }
     if (method === "POST" && url === "/api/models/test") {
       return { type: "modelsTest" };
     }
@@ -6354,14 +7965,25 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     if (method === "GET" && url === "/api/usage") {
       return { type: "usageGet" };
     }
-    if (method === "POST" && url === "/api/complete") {
-      return { type: "completePost" };
-    }
     if (method === "GET" && url === "/api/mcp") {
       return { type: "mcpGet" };
     }
     if (method === "PUT" && url === "/api/mcp") {
       return { type: "mcpPut" };
+    }
+    if (method === "GET" && url === "/api/packs") {
+      return { type: "packsGet" };
+    }
+    if (method === "POST" && url === "/api/packs/drafts") {
+      return { type: "packsDraft" };
+    }
+    const packInstallMatch = method === "POST" && url.match(/^\/api\/packs\/drafts\/([^/]+)\/install$/);
+    if (packInstallMatch) {
+      return { type: "packsInstall", name: decodeURIComponent(packInstallMatch[1]!) };
+    }
+    const packDiscardMatch = method === "DELETE" && url.match(/^\/api\/packs\/drafts\/([^/]+)$/);
+    if (packDiscardMatch) {
+      return { type: "packsDiscard", name: decodeURIComponent(packDiscardMatch[1]!) };
     }
 
     /**
@@ -6376,8 +7998,19 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     if (method === "POST" && url === "/api/workdirs") {
       return { type: "workdirAdd" };
     }
+    if (method === "POST" && url === "/api/design-drafts-workdir") {
+      return { type: "designDraftsWorkdir" };
+    }
     if (method === "DELETE" && url === "/api/workdirs") {
       return { type: "workdirRemove" };
+    }
+    const workspaceGitMatch = method === "GET" && url.match(/^\/api\/workspace\/git(?:\?(.*))?$/);
+    if (workspaceGitMatch) {
+      const params = new URLSearchParams(workspaceGitMatch[1] ?? "");
+      return { type: "workspaceGitGet", workdir: params.get("workdir") };
+    }
+    if (method === "POST" && url === "/api/workspace/git/checkout") {
+      return { type: "workspaceGitCheckout" };
     }
 
     /**
@@ -6389,20 +8022,30 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       const params = new URLSearchParams(fsListMatch[1] ?? "");
       return { type: "fsList", path: params.get("path") };
     }
+    if (method === "POST" && url === "/api/fs/mkdir") {
+      return { type: "fsMkdir" };
+    }
 
     /**
      * T5 记忆面板（L5 可审查化）：只读暴露默认 workdir 作用域的 .agent-memory/。
-     * name 严格圈禁：只允许 [A-Za-z0-9._-] 且以 .md 结尾——字符集里根本没有
-     * "/" 与 ".."，路径穿越在路由层就无路可走（与 MemoryStore.resolvePath 双保险）。
-     * 注意顺序：/:name 必须先于精确匹配之后判断，/api/memory 本体是列表端点。
+     * name 与 MemoryStore.NAME_RE 对齐（含嵌套路径）；捕获 catch-all 段并 decode，
+     * ".." 与 resolvePath 仍防穿越。注意顺序：/:name 在精确 /api/memory 之后。
      */
-    if (method === "GET" && url === "/api/memory") {
-      return { type: "memoryList" };
+    if (method === "GET" && (url === "/api/memory" || url.startsWith("/api/memory?"))) {
+      const params = new URLSearchParams(url.includes("?") ? url.slice(url.indexOf("?") + 1) : "");
+      const scopeRaw = String(params.get("scope") ?? "current").trim().toLowerCase();
+      const scope = scopeRaw === "all" ? "all" : "current";
+      const asked = params.get("workdir");
+      return {
+        type: "memoryList",
+        scope,
+        ...(asked ? { workdir: asked } : {}),
+      };
     }
-    const memoryReadMatch = method === "GET" && url.match(/^\/api\/memory\/([^/?#]+)$/);
+    const memoryReadMatch = method === "GET" && url.match(/^\/api\/memory\/([^?#]+)$/);
     if (memoryReadMatch) {
-      const name = safeDecode(memoryReadMatch[1]!);
-      if (!MEMORY_API_NAME_RE.test(name)) return { type: "malformed" };
+      const name = safeDecode(memoryReadMatch[1]!).replaceAll("\\", "/");
+      if (!MemoryStore.NAME_RE.test(name) || name.includes("..")) return { type: "malformed" };
       return { type: "memoryRead", name };
     }
 
@@ -6481,6 +8124,28 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       if (!wanted) return { type: "malformed" };
       return { type: "siteZip", runId: siteZipMatch[1]!, path: wanted };
     }
+    if (method === "GET" && url === "/api/design-templates") {
+      return { type: "designTemplates" };
+    }
+    const designMdMatch = method === "GET" && sitePathOnly.match(/^\/api\/runs\/([^/]+)\/design-md$/);
+    if (designMdMatch) {
+      return { type: "designMd", runId: designMdMatch[1]! };
+    }
+    const seedTemplateMatch =
+      method === "POST" && sitePathOnly.match(/^\/api\/runs\/([^/]+)\/seed-template$/);
+    if (seedTemplateMatch) {
+      return { type: "seedTemplate", runId: seedTemplateMatch[1]! };
+    }
+    const exportPptxMatch =
+      method === "POST" && sitePathOnly.match(/^\/api\/runs\/([^/]+)\/export\/pptx$/);
+    if (exportPptxMatch) {
+      return { type: "exportPptx", runId: exportPptxMatch[1]! };
+    }
+    const exportPngMatch =
+      method === "POST" && sitePathOnly.match(/^\/api\/runs\/([^/]+)\/export\/png$/);
+    if (exportPngMatch) {
+      return { type: "exportPng", runId: exportPngMatch[1]! };
+    }
     const siteMatch = method === "GET" && sitePathOnly.match(/^\/api\/runs\/([^/]+)\/site\/(.+)$/);
     if (siteMatch) {
       try {
@@ -6545,6 +8210,16 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       return { type: "followUp", runId: followUpMatch[1]! };
     }
 
+    const forkMatch = method === "POST" && url.match(/^\/api\/runs\/([^/]+)\/fork$/);
+    if (forkMatch) {
+      return { type: "forkConversation", runId: forkMatch[1]! };
+    }
+
+    const rewindMatch = method === "POST" && url.match(/^\/api\/runs\/([^/]+)\/rewind$/);
+    if (rewindMatch) {
+      return { type: "rewindConversation", runId: rewindMatch[1]! };
+    }
+
     // 信息队列：取消排队中的消息。body 可带 { index } 取消单条；空 body = 清空整队
     const queueMatch = method === "DELETE" && url.match(/^\/api\/runs\/([^/]+)\/queue$/);
     if (queueMatch) {
@@ -6594,6 +8269,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       return { type: "planApproval", runId: planApprovalMatch[1]! };
     }
 
+    const handoffMatch = method === "POST" && url.match(/^\/api\/runs\/([^/]+)\/handoff$/);
+    if (handoffMatch) {
+      return { type: "handoff", runId: handoffMatch[1]! };
+    }
+
     // §5.2：委托方回答 agent 的澄清问题（或显式跳过）
     const answerMatch = method === "POST" && url.match(/^\/api\/runs\/([^/]+)\/answer$/);
     if (answerMatch) {
@@ -6623,17 +8303,45 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   // T9 定时任务：createRun 的统一内部入口 + 调度器
   // ------------------------------------------------------
 
+  async function applyUiDesignSeed(route: DesignRoute, destRoot: string): Promise<void> {
+    try {
+      if (shouldSeedDesignTemplate(route)) {
+        if (!designTemplatesDir) return;
+        for (const seed of seedsToCopy(route)) {
+          await copyDesignTemplate({
+            templatesRoot: designTemplatesDir,
+            templateId: seed,
+            destRoot,
+          });
+        }
+        if (route.bundle === "spec-plus-deck") {
+          await writeDesignBundleHub(destRoot);
+        }
+        return;
+      }
+      if (shouldWriteBlankDesignIndex(route)) {
+        await writeBlankDesignIndex(destRoot);
+      }
+    } catch {
+      /* 播种失败不挡会话；agent 仍可自己写 index.html */
+    }
+  }
+
   /** POST /api/runs 的请求体形状（HTTP 层只负责 JSON 解析，语义校验全在 createRunFromBody） */
   interface RunCreateBody {
     task?: string; verify?: boolean; pack?: string; effort?: string; rubric?: string;
     mode?: string; concurrency?: number | string;
-    workdir?: string; useVerifierModel?: boolean; usePlannerModel?: boolean;
+    workdir?: string; extraWorkdirs?: unknown; useVerifierModel?: boolean; usePlannerModel?: boolean;
     planGate?: boolean; askUser?: boolean; autoApprove?: boolean; contextTokenLimit?: number | string;
     multiAgent?: boolean;
     autoPack?: boolean;
     lineageBudget?: boolean; dailyBudget?: boolean;
     /** D3：manual | plan | auto；给出则覆盖 plan/autoApprove 为预设开关 */
     permissionMode?: string;
+    designId?: string;
+    designTab?: string;
+    designTemplate?: string;
+    designFilePack?: string;
   }
 
   /** 准入结果：HTTP 处理器把它写成响应；调度器把非 200 记成 lastTrigger=error */
@@ -6652,15 +8360,23 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    * readBody **之前**完成它（SAFE-05 慢 body 测试依赖这个顺序）；调度器路径的
    * launch 回调自己做同一道门。
    */
-  async function createRunFromBody(parsed: RunCreateBody): Promise<RunAdmissionOutcome> {
-    if (!parsed.task || typeof parsed.task !== "string") {
+  async function createRunFromBody(
+    parsed: RunCreateBody,
+    extras?: { injectedPlan?: Plan; parentRunId?: string },
+  ): Promise<RunAdmissionOutcome> {
+    if (parsed.mode === "design") {
+      if (parsed.task !== undefined && parsed.task !== null && typeof parsed.task !== "string") {
+        return { status: 400, payload: { error: 'Missing or invalid "task" field' } };
+      }
+      parsed.task = typeof parsed.task === "string" ? parsed.task : "";
+    } else if (!parsed.task || typeof parsed.task !== "string") {
       return { status: 400, payload: { error: 'Missing or invalid "task" field' } };
     }
     // V-24：外部输入一律当场校验拒绝，不静默降级——静默降级会让"我明明选了
     // python-coding"与实际行为长期不一致，查起来很贵（口径同 src/cli.ts 对
     // AGENT_EFFORT 的处理）
     if (parsed.pack !== undefined && parsed.pack !== "" && !getPack(parsed.pack)) {
-      return { status: 400, payload: { error: `未知领域包 "${parsed.pack}"。可选：${Object.keys(PACKS).join(" | ")}` } };
+      return { status: 400, payload: { error: `未知领域包 "${parsed.pack}"。可选：${packNamesLine()}` } };
     }
     /**
      * 逐 run 上下文预算（MEM-01 窗口 / 预算分离）：区间 [32k, 窗口 − maxTokens − 边际]
@@ -6691,8 +8407,13 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       return { status: 400, payload: { error: `effort "${parsed.effort}" 无效。可选：${EFFORT_LEVELS.join(" | ")}` } };
     }
 
-    if (parsed.mode !== undefined && parsed.mode !== "single" && parsed.mode !== "plan") {
-      return { status: 400, payload: { error: `mode "${parsed.mode}" 无效。可选：single | plan` } };
+    if (
+      parsed.mode !== undefined &&
+      parsed.mode !== "single" &&
+      parsed.mode !== "plan" &&
+      parsed.mode !== "design"
+    ) {
+      return { status: 400, payload: { error: `mode "${parsed.mode}" 无效。可选：single | plan | design` } };
     }
     let permissionMode: PermissionMode | undefined;
     if (parsed.permissionMode !== undefined && parsed.permissionMode !== "") {
@@ -6704,17 +8425,22 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       }
       permissionMode = parsed.permissionMode as PermissionMode;
       const switches = permissionModeSwitches(permissionMode);
-      // 预设覆盖显式开关——否则界面选了 plan 档却仍按 body 旧 checkbox 跑
-      if (switches.planMode) parsed.mode = "plan";
-      else if (parsed.mode === "plan" && !switches.planMode) parsed.mode = "single";
-      parsed.planGate = switches.planGate;
-      parsed.autoApprove = switches.autoYes || switches.approvalDefault === "auto";
+      // 档位只填没写明的旋钮。Web 上计划编排与自动放行是正交开关；
+      // 用档名盖掉勾选，就会出现「自动放行开着却仍逐条问」。
+      if (parsed.mode === undefined && parsed.multiAgent !== true) {
+        if (switches.planMode) parsed.mode = "plan";
+      }
+      if (parsed.planGate === undefined) parsed.planGate = switches.planGate;
+      if (parsed.autoApprove === undefined) {
+        parsed.autoApprove = switches.autoYes || switches.approvalDefault === "auto";
+      }
     }
     // 多 agent 与计划确认门正交。planGate 必须配 mode=plan 或 multiAgent，
     // 单独传 planGate 拒绝——静默忽略会让界面与实际行为长期不一致。
     const multiAgent = parsed.multiAgent === true;
     const planGateRequested = parsed.planGate === true;
     const wantsOrchestrate = multiAgent || parsed.mode === "plan";
+    const wantsDesign = parsed.mode === "design" && !wantsOrchestrate;
     if (planGateRequested && !wantsOrchestrate) {
       return { status: 400, payload: { error: "planGate 仅在编排（mode=plan 或 multiAgent）下有意义：单跑模式没有计划这一步" } };
     }
@@ -6750,14 +8476,61 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       runWorkdir = asked;
     }
 
+    const extraParsed = parseExtraWorkdirs(
+      parsed.extraWorkdirs,
+      allowedWorkdirs,
+      runWorkdir ?? workdir,
+    );
+    if (!extraParsed.ok) {
+      return { status: 400, payload: { error: extraParsed.error } };
+    }
+    const extraWorkdirs = extraParsed.extraWorkdirs;
+
     let packRoute: { pack: string | null; reason: string } | undefined;
-    if (parsed.autoPack === true && !parsed.pack && !wantsOrchestrate) {
+    let admittedDesignRoute: DesignRoute | undefined;
+    if (wantsDesign) {
+      const installed = installedFilePacksFrom(allPacks());
+      const installedNames = installed.map((p) => p.name);
+      // 设计模式锁定后端包为 design，除非点了已安装文件包。内置工程包忽略。
+      if (parsed.pack && PACKS[parsed.pack] && !installedNames.includes(parsed.pack)) {
+        parsed.pack = undefined;
+      }
+      const explicitFilePack =
+        typeof parsed.designFilePack === "string" && installedNames.includes(parsed.designFilePack)
+          ? parsed.designFilePack
+          : typeof parsed.pack === "string" && installedNames.includes(parsed.pack)
+            ? parsed.pack
+            : undefined;
+      admittedDesignRoute = await routeDesignTask({
+        cfg: { systemPrompt: "router", tools: [], workdir: runWorkdir ?? workdir, compat: envCompat },
+        model: modelClient,
+        task: parsed.task,
+        explicitId: typeof parsed.designId === "string" ? parsed.designId : undefined,
+        explicitTab: typeof parsed.designTab === "string" ? parsed.designTab : undefined,
+        explicitTemplate: typeof parsed.designTemplate === "string" ? parsed.designTemplate : undefined,
+        explicitFilePack,
+        installedFilePacks: installed,
+      });
+      if (admittedDesignRoute.kind === "r2") {
+        return {
+          status: 409,
+          payload: {
+            error: admittedDesignRoute.reason,
+            designRoute: {
+              ...designRouteForRunConfig(admittedDesignRoute),
+              tab: admittedDesignRoute.tab ?? null,
+            },
+          },
+        };
+      }
+      parsed.pack = admittedDesignRoute.pack;
+    } else if (parsed.autoPack === true && !parsed.pack && !wantsOrchestrate) {
       try {
         const outcome = await routeToPack(
           { systemPrompt: "router", tools: [], workdir: runWorkdir ?? workdir, compat: envCompat },
           modelClient,
           parsed.task,
-          Object.values(PACKS),
+          allPacks(),
         );
         packRoute = outcome.decision;
         if (outcome.decision.pack && getPack(outcome.decision.pack)) {
@@ -6843,9 +8616,19 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       ...(packRoute ? { packRoute } : {}),
       ...(parsed.effort ? { effort: parsed.effort as Effort } : {}),
       ...(parsed.rubric ? { rubric: parsed.rubric } : {}),
-      ...(wantsOrchestrate ? { mode: "plan" as const } : {}),
+      ...(wantsOrchestrate
+        ? { mode: "plan" as const }
+        : wantsDesign
+          ? {
+              mode: "design" as const,
+              ...(admittedDesignRoute
+                ? { designRoute: designRouteForRunConfig(admittedDesignRoute) }
+                : {}),
+            }
+          : {}),
       ...(concurrency !== undefined ? { concurrency } : {}),
       ...(runWorkdir ? { workdir: runWorkdir } : {}),
+      ...(extraWorkdirs.length ? { extraWorkdirs } : {}),
       ...(parsed.useVerifierModel === false ? { useVerifierModel: false } : {}),
       ...(parsed.usePlannerModel === false ? { usePlannerModel: false } : {}),
       ...(planGateRequested ? { planGate: true } : {}),
@@ -6857,6 +8640,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       ...(lineageBudget ? {} : { lineageBudget: false }),
       ...(dailyBudget ? {} : { dailyBudget: false }),
     };
+    if (extras?.injectedPlan) run.injectedPlan = extras.injectedPlan;
+    if (extras?.parentRunId) run.continuedFrom = extras.parentRunId;
+    const boot = resolveSiblingBootContext(parsed.task, run.workdir ?? workdir, id);
+    if (boot) run.bootContext = boot;
     // B2：建档要在第一条事件之前——writer 的写入链从 mkdir 开始保序
     if (historyRoot) {
       run.archiveWriter = createArchiveWriter(id);
@@ -6892,6 +8679,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         });
         run.traceRunSpanId = root.spanId;
         run.openToolSpans = new Map();
+        run.openModelSpans = new Map();
         run.archiveWriter?.appendTraceSpan(root);
       } catch {
         // ignore
@@ -6911,6 +8699,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       });
     }
     broadcastLifecycle("run_created", run);
+
+    if (admittedDesignRoute) {
+      await applyUiDesignSeed(admittedDesignRoute, run.workdir ?? workdir);
+    }
 
     if (run.mode === "plan") {
       void withFallbackAttribution(run, () => startPlannedRun(run));
@@ -7087,31 +8879,44 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       }
     }
 
-    if (method === "POST" || method === "PUT"
-      || (method === "DELETE" && (route.type === "workdirRemove" || route.type === "uploadDelete"))) {
+    if (MUTATION_QUOTA_ROUTES.has(route.type)) {
       const retryAfter = mutationRetryAfter(req);
       if (retryAfter !== null) {
         metrics.rateRejected += 1;
         res.setHeader("Retry-After", String(retryAfter));
         return json(res, 429, { error: "Mutation rate limit exceeded" });
       }
+    }
+
+    if (method === "POST" || method === "PUT" || method === "PATCH"
+      || (method === "DELETE" && (route.type === "workdirRemove" || route.type === "uploadDelete"))) {
       const jsonRoute = new Set([
         "upload",
         "uploadDelete",
         "followUp",
+        "forkConversation",
+        "rewindConversation",
         "inspectPaths",
         "reveal",
         "createRun",
         "scheduleCreate",
         "planApproval",
+        "handoff",
         "answer",
         "approval",
         "autoApprove",
         "modelsPut",
+        "modelsRolesPatch",
         "modelsTest",
         "workdirAdd",
+        "designDraftsWorkdir",
         "workdirRemove",
-        "completePost",
+        "fsMkdir",
+        "workspaceGitCheckout",
+        "seedTemplate",
+        "exportPptx",
+        "exportPng",
+        "packsDraft",
       ]).has(route.type);
       const contentType = String(req.headers["content-type"] ?? "").toLowerCase();
       if (jsonRoute && !/^application\/(?:[\w.-]+\+)?json(?:\s*;|$)/.test(contentType)) {
@@ -7122,7 +8927,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     // B2：档案恢复完成前不应答 API——启动后的第一个 GET /api/runs 就要看得到
     // 历史，否则界面会先画一份空列表再闪一次（静态资源不用等）
     if (route.type !== "static" && route.type !== "health" && route.type !== "metrics") {
-      await Promise.all([historyReady, executionReady]);
+      await Promise.all([historyReady, executionReady, packsReady]);
     }
 
     switch (route.type) {
@@ -7195,7 +9000,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             assembleExecutor(entry);
             probeExecutorEndpoint(entry);
           }
+          visionProbe = null;
           assembleRoles();
+          probeVisionEndpoint();
         } catch (error) {
           return json(res, 500, {
             error: `模型装配失败：${error instanceof Error ? error.message : String(error)}`,
@@ -7205,6 +9012,84 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           operationalLog("info", "models_updated", {
             source: modelStoreState.source,
             modelCount: result.store.models.length,
+          });
+        }
+        return json(res, 200, modelsApiPayload());
+      }
+
+      case "modelsRolesPatch": {
+        let body: string;
+        try {
+          body = await readBody(req, requestBodyMaxBytes);
+        } catch (error) {
+          return requestBodyFailure(res, error);
+        }
+        let parsed: Record<string, unknown>;
+        try {
+          parsed = JSON.parse(body) as Record<string, unknown>;
+        } catch {
+          return badRequest(res, "Invalid JSON body");
+        }
+        const nextRoles = { ...modelStoreState.store.roles };
+        for (const key of ROLE_KEYS) {
+          if (!(key in parsed)) continue;
+          const v = parsed[key];
+          if (key === "executor") {
+            if (typeof v !== "string" || !v) {
+              return badRequest(res, "executor 必须指向库中的模型 id");
+            }
+            if (!modelStoreState.store.models.some((m) => m.id === v)) {
+              return badRequest(res, `executor 引用了不存在的模型 id：${v}`);
+            }
+            nextRoles.executor = v;
+            continue;
+          }
+          if (v === null) {
+            nextRoles[key] = null;
+            continue;
+          }
+          if (typeof v !== "string" || !v) {
+            return badRequest(res, `${key} 必须是模型 id 或 null`);
+          }
+          if (!modelStoreState.store.models.some((m) => m.id === v)) {
+            return badRequest(res, `${key} 引用了不存在的模型 id：${v}`);
+          }
+          nextRoles[key] = v;
+        }
+        if (!nextRoles.executor) {
+          return badRequest(res, "executor 不能为空");
+        }
+        const nextStore = { ...modelStoreState.store, roles: nextRoles };
+        if (modelStoreFile) {
+          try {
+            saveModelStore(modelStoreFile, nextStore);
+          } catch (error) {
+            return json(res, 500, {
+              error: `模型库写盘失败：${error instanceof Error ? error.message : String(error)}`,
+            });
+          }
+        }
+        modelStoreState = { store: nextStore, source: modelStoreFile ? "store" : "env" };
+        try {
+          if (!options.modelClient) {
+            const entry = roleEntryOf(nextStore, "executor");
+            assembleExecutor(entry);
+            probeExecutorEndpoint(entry);
+          }
+          visionProbe = null;
+          assembleRoles();
+          probeVisionEndpoint();
+        } catch (error) {
+          return json(res, 500, {
+            error: `模型装配失败：${error instanceof Error ? error.message : String(error)}`,
+          });
+        }
+        if (realHost) {
+          const plan = processContextPlan();
+          operationalLog("info", "models_roles_updated", {
+            executor: nextRoles.executor,
+            contextWindow: plan.window,
+            windowSource: plan.windowSource,
           });
         }
         return json(res, 200, modelsApiPayload());
@@ -7296,24 +9181,6 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         return json(res, 200, aggregateUsage(parseLedgerLines(text)));
       }
 
-      case "completePost": {
-        // 启发式前缀续写，不调模型——注入 FakeModelClient 的测试宿主也不得因此打 HTTP。
-        let body: string;
-        try {
-          body = await readBody(req, requestBodyMaxBytes);
-        } catch (error) {
-          return requestBodyFailure(res, error);
-        }
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(body);
-        } catch {
-          return badRequest(res, "Invalid JSON body");
-        }
-        const { prefix, recent } = parseCompleteBody(parsed);
-        return json(res, 200, { completion: heuristicComplete(prefix, recent) });
-      }
-
       case "mcpGet": {
         let servers: Record<string, unknown> = {};
         try {
@@ -7326,6 +9193,92 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           enabled: mcpEnabled,
           servers: publicMcpServers(servers),
         });
+      }
+
+      case "packsGet": {
+        if (!packsRoot) {
+          return json(res, 200, { drafts: [], installed: [], root: null });
+        }
+        const listed = await listFilePacks(packsRoot);
+        return json(res, 200, { ...filePackListView(listed), root: packsRoot });
+      }
+
+      case "packsDraft": {
+        if (!hostname || !isLoopbackHostname(hostname)) {
+          return json(res, 403, { error: "领域包草稿仅本机（loopback）可写" });
+        }
+        if (!packsRoot) {
+          return json(res, 400, { error: "文件包目录未配置" });
+        }
+        let body: string;
+        try {
+          body = await readBody(req, requestBodyMaxBytes);
+        } catch (error) {
+          return requestBodyFailure(res, error);
+        }
+        let parsed: { name?: unknown; description?: unknown; systemPrompt?: unknown; verifyInstructions?: unknown };
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          return badRequest(res, "Invalid JSON body");
+        }
+        try {
+          const rec = await writeDraftPack(packsRoot, {
+            name: String(parsed.name ?? ""),
+            description: String(parsed.description ?? ""),
+            systemPrompt: String(parsed.systemPrompt ?? ""),
+            ...(typeof parsed.verifyInstructions === "string"
+              ? { verifyInstructions: parsed.verifyInstructions }
+              : {}),
+          });
+          const listed = await listFilePacks(packsRoot);
+          return json(res, 200, {
+            ok: true,
+            draft: { name: rec.name, description: rec.manifest.description, dir: rec.dir },
+            ...filePackListView(listed),
+            root: packsRoot,
+          });
+        } catch (error) {
+          return json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+
+      case "packsInstall": {
+        if (!hostname || !isLoopbackHostname(hostname)) {
+          return json(res, 403, { error: "安装领域包仅本机（loopback）可用" });
+        }
+        if (!packsRoot) {
+          return json(res, 400, { error: "文件包目录未配置" });
+        }
+        try {
+          const rec = await installDraftPack(packsRoot, route.name);
+          const listed = await listFilePacks(packsRoot);
+          return json(res, 200, {
+            ok: true,
+            installedPack: { name: rec.name, description: rec.manifest.description },
+            ...filePackListView(listed),
+            root: packsRoot,
+            availablePacks: availablePacksView(),
+          });
+        } catch (error) {
+          return json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+
+      case "packsDiscard": {
+        if (!hostname || !isLoopbackHostname(hostname)) {
+          return json(res, 403, { error: "丢弃草稿仅本机（loopback）可用" });
+        }
+        if (!packsRoot) {
+          return json(res, 400, { error: "文件包目录未配置" });
+        }
+        try {
+          await discardDraftPack(packsRoot, route.name);
+          const listed = await listFilePacks(packsRoot);
+          return json(res, 200, { ok: true, ...filePackListView(listed), root: packsRoot });
+        } catch (error) {
+          return json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+        }
       }
 
       case "mcpPut": {
@@ -7459,6 +9412,80 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         });
       }
 
+      /**
+       * 设计模式稿目录：mkdir + 加入白名单。当前目录是宿主仓库才建议切过去；
+       * 用户已选别的目录不抢。
+       */
+      case "designDraftsWorkdir": {
+        if (!hostname || !isLoopbackHostname(hostname)) {
+          return json(res, 403, { error: "工作目录管理仅本机（loopback）可用" });
+        }
+        let body: string;
+        try {
+          body = await readBody(req, requestBodyMaxBytes);
+        } catch (error) {
+          return requestBodyFailure(res, error);
+        }
+        let parsed: { currentWorkdir?: unknown };
+        try {
+          parsed = JSON.parse(body || "{}");
+        } catch {
+          return badRequest(res, "Invalid JSON");
+        }
+        const currentRaw = typeof parsed.currentWorkdir === "string" ? parsed.currentWorkdir.trim() : "";
+        let currentAbs = currentRaw ? resolve(currentRaw) : "";
+        if (currentAbs && !allowedWorkdirs.has(currentAbs)) {
+          const hit = [...allowedWorkdirs].find((w) => sameWorkdirPath(w, currentAbs));
+          currentAbs = hit ?? "";
+        }
+        try {
+          await mkdir(designDraftsDir, { recursive: true });
+        } catch (err) {
+          return json(res, 500, {
+            error: `无法创建设计稿目录：${(err as Error).message ?? String(err)}`,
+          });
+        }
+        let canonical = designDraftsDir;
+        try {
+          canonical = resolve(await realpath(designDraftsDir));
+        } catch {
+          canonical = resolve(designDraftsDir);
+        }
+        const already = allowedWorkdirs.has(canonical);
+        if (!already) {
+          runtimeWorkdirs.add(canonical);
+          allowedWorkdirs.add(canonical);
+          try {
+            persistRuntimeWorkdirs();
+          } catch (error) {
+            runtimeWorkdirs.delete(canonical);
+            allowedWorkdirs.delete(canonical);
+            return json(res, 500, {
+              error: `工作目录清单写盘失败：${error instanceof Error ? error.message : String(error)}`,
+            });
+          }
+        }
+        let currentIsHarness = false;
+        const probe = currentAbs || workdir;
+        try {
+          currentIsHarness = isHarnessPackageName(
+            packageNameFromJson(await readFile(join(probe, "package.json"), "utf8")),
+          );
+        } catch { /* 没有 package.json 就不是宿主仓库 */ }
+        const decision = decideDesignDraftsSelection({
+          currentWorkdir: currentAbs || null,
+          draftsDir: canonical,
+          currentIsHarness,
+        });
+        return json(res, 200, {
+          workdir: canonical,
+          added: !already,
+          select: decision.select,
+          reason: decision.reason,
+          workdirs: [...allowedWorkdirs],
+        });
+      }
+
       case "workdirRemove": {
         if (!hostname || !isLoopbackHostname(hostname)) {
           return json(res, 403, { error: "工作目录管理仅本机（loopback）可用" });
@@ -7512,6 +9539,72 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         });
       }
 
+      case "workspaceGitGet": {
+        const listed = listedWorkdir(route.workdir);
+        if (!listed.ok) return json(res, listed.status, { error: listed.error });
+        return json(res, 200, publicWorkspaceGit(await probeWorkspaceGit(listed.path)));
+      }
+
+      case "workspaceGitCheckout": {
+        if (!hostname || !isLoopbackHostname(hostname)) {
+          return json(res, 403, { error: "切换分支仅本机（loopback）可用" });
+        }
+        let body: string;
+        try {
+          body = await readBody(req, requestBodyMaxBytes);
+        } catch (error) {
+          return requestBodyFailure(res, error);
+        }
+        let parsed: { workdir?: unknown; branch?: unknown; dirtyAction?: unknown };
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          return badRequest(res, "Invalid JSON body");
+        }
+        const listed = listedWorkdir(parsed.workdir);
+        if (!listed.ok) return json(res, listed.status, { error: listed.error });
+        const branch = typeof parsed.branch === "string" ? parsed.branch.trim() : "";
+        if (!branch) return badRequest(res, "缺少分支名（branch）");
+        let dirtyAction: WorkspaceDirtyAction | undefined;
+        if (parsed.dirtyAction !== undefined && parsed.dirtyAction !== null && parsed.dirtyAction !== "") {
+          if (parsed.dirtyAction !== "stash" && parsed.dirtyAction !== "discard") {
+            return badRequest(res, "dirtyAction 只能是 stash 或 discard");
+          }
+          dirtyAction = parsed.dirtyAction;
+        }
+        const current = await probeWorkspaceGit(listed.path);
+        if (!current.present) {
+          return json(res, 409, { error: "当前工作目录不是 git 仓库", present: false });
+        }
+        if (!current.branches.includes(branch)) {
+          return badRequest(res, `本地没有分支 ${branch}`);
+        }
+        if (current.dirty && !dirtyAction) {
+          return json(res, 409, {
+            error: "工作区有未提交改动，切换前需要先选择如何处理",
+            code: "dirty_worktree",
+            dirty: true,
+            branch: current.branch,
+          });
+        }
+        try {
+          const next = await switchWorkspaceBranch(listed.path, branch, dirtyAction ? { dirtyAction } : {});
+          return json(res, 200, publicWorkspaceGit(next));
+        } catch (error) {
+          if (error instanceof DirtyWorktreeError) {
+            return json(res, 409, {
+              error: error.message,
+              code: error.code,
+              dirty: true,
+              branch: current.branch,
+            });
+          }
+          const message = error instanceof Error ? error.message : String(error);
+          if (message.startsWith("非法分支名")) return badRequest(res, message);
+          return json(res, 409, { error: message });
+        }
+      }
+
       case "fsList": {
         if (!hostname || !isLoopbackHostname(hostname)) {
           return json(res, 403, { error: "目录浏览仅本机（loopback）可用" });
@@ -7534,6 +9627,26 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           for (const d of allowedWorkdirs) {
             if (d !== workdir) pushRoot(d, "白名单目录");
           }
+          try {
+            const home = homedir();
+            if (home) {
+              pushRoot(home, "用户主目录");
+              for (const [folder, label] of [
+                ["Desktop", "桌面"],
+                ["Documents", "文档"],
+                ["Downloads", "下载"],
+                ["桌面", "桌面"],
+                ["文档", "文档"],
+                ["下载", "下载"],
+              ] as const) {
+                const place = join(home, folder);
+                try {
+                  await access(place);
+                  pushRoot(place, label);
+                } catch { /* 这台机器没有这个常用目录 */ }
+              }
+            }
+          } catch { /* homedir 不可用时仍有盘符/白名单 */ }
           if (process.platform === "win32") {
             for (const letter of "CDEFGHIJKLMNOPQRSTUVWXYZ") {
               const drive = `${letter}:\\`;
@@ -7588,28 +9701,97 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         });
       }
 
+      case "fsMkdir": {
+        if (!hostname || !isLoopbackHostname(hostname)) {
+          return json(res, 403, { error: "新建文件夹仅本机（loopback）可用" });
+        }
+        let mkdirBody: string;
+        try {
+          mkdirBody = await readBody(req, requestBodyMaxBytes);
+        } catch (error) {
+          return requestBodyFailure(res, error);
+        }
+        let mkdirParsed: { path?: unknown; name?: unknown };
+        try {
+          mkdirParsed = JSON.parse(mkdirBody);
+        } catch {
+          return badRequest(res, "Invalid JSON body");
+        }
+        if (typeof mkdirParsed.path !== "string" || !mkdirParsed.path.trim()) {
+          return badRequest(res, "缺少父目录路径（path）");
+        }
+        if (typeof mkdirParsed.name !== "string" || !isSafeFolderName(mkdirParsed.name)) {
+          return badRequest(res, "文件夹名不合法（不能含路径分隔符或 \\ / : * ? \" < > |）");
+        }
+        const parent = resolve(mkdirParsed.path.trim());
+        try {
+          const parentStat = await stat(parent);
+          if (!parentStat.isDirectory()) {
+            return badRequest(res, `不是目录：${parent}`);
+          }
+        } catch {
+          return notFound(res, `目录不存在或读不了：${parent}`);
+        }
+        const target = join(parent, mkdirParsed.name.trim());
+        if (resolve(dirname(target)) !== parent) {
+          return badRequest(res, "文件夹名不合法");
+        }
+        try {
+          await mkdir(target, { recursive: false });
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code;
+          if (code === "EEXIST") {
+            return json(res, 409, { error: `已经有这个文件夹：${target}` });
+          }
+          return json(res, 500, {
+            error: `新建失败：${error instanceof Error ? error.message : String(error)}`,
+          });
+        }
+        return json(res, 200, { path: target, parent, name: mkdirParsed.name.trim() });
+      }
+
       case "memoryList": {
         /**
-         * T5 记忆面板：默认 workdir 作用域的 .agent-memory/ 列表。
+         * T5 记忆面板：默认 current = 当前项目 + 全局教训 + 进行中看板。
          * 目录不存在 = 还没有记忆，返回空列表而不是报错（与 MemoryStore.list 同口径）。
          */
-        const entries = await defaultMemoryStore.list();
+        let targetWorkdir = workdir;
+        if (route.workdir) {
+          const listed = listedWorkdir(route.workdir);
+          if (!listed.ok) return json(res, listed.status, { error: listed.error });
+          targetWorkdir = listed.path;
+        }
+        const memDir = resolveMemoryDir(targetWorkdir);
+        const store = memDir === defaultMemoryDir ? defaultMemoryStore : new MemoryStore(memDir);
+        const shared = isSharedMemoryDir(targetWorkdir, memDir);
+        const project = projectSlugFromWorkdir(targetWorkdir);
+        const annotated = await annotateMemoryEntries(store, targetWorkdir);
+        const visible = route.scope === "all"
+          ? annotated
+          : annotated.filter((entry) => entry.scope !== "other");
         const withMtime = await Promise.all(
-          entries.map(async (entry) => {
+          visible.map(async (entry) => {
             let mtimeMs: number | null = null;
             try {
-              mtimeMs = (await stat(join(defaultMemoryDir, entry.name))).mtimeMs;
+              mtimeMs = (await stat(join(memDir, entry.name))).mtimeMs;
             } catch { /* 列出后被并发删掉：mtime 降级为 null，不拖垮整个列表 */ }
-            return { ...entry, mtimeMs };
+            return { name: entry.name, summary: entry.summary, sizeBytes: entry.sizeBytes, scope: entry.scope, mtimeMs };
           }),
         );
-        return json(res, 200, { dir: defaultMemoryDir, entries: withMtime });
+        const status = await readProjectStatus(store, targetWorkdir, shared);
+        return json(res, 200, {
+          dir: memDir,
+          project,
+          shared,
+          status,
+          entries: withMtime,
+        });
       }
 
       case "memoryRead": {
         /**
-         * T5 单条记忆全文（只读）。名字已在路由层被 MEMORY_API_NAME_RE 收窄到
-         * [A-Za-z0-9._-]+.md；MemoryStore.resolvePath 再做一次逃逸校验（双保险）。
+         * T5 单条记忆全文（只读）。名字已在路由层按 MemoryStore.NAME_RE 校验
+         * （含嵌套路径）；resolvePath 再做一次逃逸校验（双保险）。
          */
         let content: string;
         try {
@@ -7655,7 +9837,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
        * T8 变更审查：这次运行触碰了哪些文件。
        *
        * 数据源是 run 的事件流（在飞 run 的内存缓冲 / 归档 run 的 events.jsonl，
-       * hydrateArchive 统一成同一份），只聚合 write_file / edit_file 的 tool_call
+       * hydrateArchive 统一成同一份），只聚合 write_file / write_pptx / edit_file 的 tool_call
        * 入参路径——bash 写盘从入参读不出路径，宁缺勿假。
        *
        * 圈禁与产物取件同一条纪律：路径按**该 run 自己的 workdir** 用
@@ -8188,6 +10370,13 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           multiAgent?: unknown;
           planGate?: unknown;
           mode?: unknown;
+          replan?: unknown;
+          pack?: unknown;
+          autoPack?: unknown;
+          workdir?: unknown;
+          extraWorkdirs?: unknown;
+          effort?: unknown;
+          rubric?: unknown;
         };
         try {
           parsed = JSON.parse(body);
@@ -8210,14 +10399,20 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         if (parsed.multiAgent !== undefined && typeof parsed.multiAgent !== "boolean") {
           return badRequest(res, '"multiAgent" 必须是布尔值');
         }
+        if (parsed.replan !== undefined && typeof parsed.replan !== "boolean") {
+          return badRequest(res, '"replan" 必须是布尔值');
+        }
+        if (parsed.replan === true && !run.planNodes?.length) {
+          return badRequest(res, "replan 需要上一份计划的节点状态；本对话还没有可重规划的计划");
+        }
         const turnOrchestrate = parsed.multiAgent === true || parsed.planMode === true || parsed.mode === "plan";
         const turnPlanGate = parsed.planMode === true || parsed.planGate === true;
-        if (turnPlanGate && !turnOrchestrate) {
+        if (turnPlanGate && !turnOrchestrate && parsed.replan !== true) {
           return badRequest(res, "planGate 仅在编排（planMode 或 multiAgent）下有意义");
         }
         const turnConcurrency: number | "auto" | undefined = parsed.multiAgent === true
           ? "auto"
-          : turnOrchestrate
+          : turnOrchestrate || parsed.replan === true
             ? 1
             : undefined;
         const feedback = parsed.text.trim();
@@ -8272,9 +10467,15 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             const planSeed = archivedPlanSummary(run);
             const nextTurn = (checkpoint?.conversationTurn ?? run.conversationTurn) + 1;
 
+            const planFacts = run.mode === "plan" ? planResumeFacts(run.durableState?.plan) : undefined;
+            const restoreGate = Boolean(
+              run.durableState &&
+                canRestorePlanGate({
+                  phase: run.durableState.phase,
+                  plan: run.durableState.plan,
+                }),
+            );
             const preferSameRun = Boolean(
-              checkpoint &&
-              history &&
               run.durableState &&
                 canSameRunResume({
                   phase: run.durableState.phase,
@@ -8282,11 +10483,89 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
                   verify: run.verify,
                   mode: run.mode === "plan" ? "plan" : "single",
                   budgetExhausted: false,
+                  ...(planFacts ? { plan: planFacts } : {}),
                 }),
             );
+            const dagResume = Boolean(
+              preferSameRun &&
+                planFacts?.approved &&
+                planFacts.hasPassedNode &&
+                planFacts.hasRemainingNode &&
+                !planFacts.hasFailedNode,
+            );
 
-            if (preferSameRun && checkpoint && history) {
+            if (restoreGate) {
+              const assembled = await applyFollowUpAssembly(run, parsed, feedback);
+              if (!assembled.ok) {
+                return badRequest(res, assembled.error);
+              }
+              const gatePack = run.packName ? getPack(run.packName) : pack;
+              const gateResources = gatePack?.resources ?? [];
+              if (acquireRunResources(res, run.id, gateResources) === "refused") return;
+              if (refuseOrWarnSharedWorkdir(res, run.id, run.workdir ?? workdir, run.id)) {
+                hostResources.release(gateResources, run.id);
+                return;
+              }
+              const nodes =
+                run.planNodes ??
+                (run.durableState?.plan?.nodes
+                  ? planNodesFromDurable(run.durableState.plan.nodes)
+                  : []);
+              if (nodes.length) {
+                run.planNodes = nodes;
+                run.planHandoffs = run.planHandoffs ?? handoffsFromPlanNodes(nodes);
+                run.injectedPlan = planFromNodes(nodes);
+              }
+              delete run.archived;
+              run.status = "running";
+              delete run.finishedAt;
+              run.verify = turnVerify;
+              applyTurnAutoApprove(run);
+              run.abort = new AbortController();
+              run.mode = "plan";
+              run.planGate = true;
+              run.pendingApprovals = new Map();
+              run.respondedApprovals = new Map();
+              run.respondedToolUseIds = new Set();
+              delete run.autoAllow;
+              if (gateResources.length) run.heldResources = gateResources;
+              if (run.archiveDir && historyRoot) {
+                run.archiveWriter = new RunHistoryWriter(run.archiveDir, reportHistoryError);
+              }
+              persistMeta(run);
+              if (realHost) {
+                operationalLog("info", "run_started", {
+                  runId: run.id,
+                  mode: "plan",
+                  verify: turnVerify,
+                  continuation: "restore-gate",
+                });
+              }
+              broadcastLifecycle("run_updated", run);
+              void withFallbackAttribution(run, () =>
+                startConversationTurn(run, feedback, {
+                  verify: turnVerify,
+                  orchestrate: true,
+                  planGate: true,
+                  concurrency: 1,
+                }),
+              );
+              return json(res, 200, {
+                runId: run.id,
+                conversationTurn: run.conversationTurn,
+                continuationMode: "restore-gate",
+                sameRunResume: false,
+                restorePlanGate: true,
+                run: runSummary(run),
+              });
+            }
+
+            if (preferSameRun && (dagResume || (checkpoint && history))) {
               // Phase 2：同 runId 复活——追加原目录，不派生 child
+              const assembled = await applyFollowUpAssembly(run, parsed, feedback);
+              if (!assembled.ok) {
+                return badRequest(res, assembled.error);
+              }
               const resumePack = run.packName ? getPack(run.packName) : pack;
               const resumeResources = resumePack?.resources ?? [];
               if (acquireRunResources(res, run.id, resumeResources) === "refused") return;
@@ -8300,11 +10579,17 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
               run.verify = turnVerify;
               applyTurnAutoApprove(run);
               run.abort = new AbortController();
-              run.history = history;
-              run.resumeBudget = resumeBudgetForContinuation(checkpoint);
-              run.initialContextInputTokens = checkpoint.contextInputTokens;
-              run.conversationTurn = checkpoint.conversationTurn + 1;
-              run.segmentIndex = run.transcript.length;
+              if (dagResume) {
+                if (run.durableState?.budget) run.resumeBudget = { ...run.durableState.budget };
+                run.conversationTurn = (run.conversationTurn ?? 1) + 1;
+                run.segmentIndex = run.transcript.length;
+              } else if (checkpoint && history) {
+                run.history = history;
+                run.resumeBudget = resumeBudgetForContinuation(checkpoint);
+                run.initialContextInputTokens = checkpoint.contextInputTokens;
+                run.conversationTurn = checkpoint.conversationTurn + 1;
+                run.segmentIndex = run.transcript.length;
+              }
               run.pendingApprovals = new Map();
               run.respondedApprovals = new Map();
               run.respondedToolUseIds = new Set();
@@ -8317,7 +10602,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
               if (realHost) {
                 operationalLog("info", "run_started", {
                   runId: run.id,
-                  mode: "single",
+                  mode: dagResume ? "plan" : "single",
                   verify: turnVerify,
                   continuation: "same-run",
                 });
@@ -8326,7 +10611,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
               void withFallbackAttribution(run, () =>
                 startSameRunResume(run, feedback, run.archivedApprovalGrantAudit ?? [], {
                   verify: turnVerify,
-                  ...(turnOrchestrate
+                  ...(turnOrchestrate && !dagResume
                     ? {
                         orchestrate: true,
                         planGate: turnPlanGate,
@@ -8340,6 +10625,73 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
                 conversationTurn: run.conversationTurn,
                 continuationMode: "same-run",
                 sameRunResume: true,
+                run: runSummary(run),
+              });
+            }
+
+            const reopenSame = Boolean(
+              run.durableState &&
+                run.durableState.phase !== "completed" &&
+                canReopenSameRun({
+                  phase: run.durableState.phase,
+                  hasTask: Boolean(String(run.task ?? "").trim()),
+                }),
+            );
+            if (reopenSame) {
+              const assembled = await applyFollowUpAssembly(run, parsed, feedback);
+              if (!assembled.ok) {
+                return badRequest(res, assembled.error);
+              }
+              const reopenPack = run.packName ? getPack(run.packName) : pack;
+              const reopenResources =
+                turnOrchestrate || parsed.replan === true ? [] : (reopenPack?.resources ?? []);
+              if (acquireRunResources(res, run.id, reopenResources) === "refused") return;
+              if (refuseOrWarnSharedWorkdir(res, run.id, run.workdir ?? workdir, run.id)) {
+                hostResources.release(reopenResources, run.id);
+                return;
+              }
+              delete run.archived;
+              run.status = "running";
+              delete run.finishedAt;
+              run.verify = turnVerify;
+              applyTurnAutoApprove(run);
+              run.abort = new AbortController();
+              run.pendingApprovals = new Map();
+              run.respondedApprovals = new Map();
+              run.respondedToolUseIds = new Set();
+              delete run.autoAllow;
+              if (reopenResources.length) run.heldResources = reopenResources;
+              if (run.archiveDir && historyRoot) {
+                run.archiveWriter = new RunHistoryWriter(run.archiveDir, reportHistoryError);
+              }
+              persistMeta(run);
+              if (realHost) {
+                operationalLog("info", "run_started", {
+                  runId: run.id,
+                  mode: run.mode ?? "single",
+                  verify: turnVerify,
+                  continuation: "reopen",
+                });
+              }
+              broadcastLifecycle("run_updated", run);
+              void withFallbackAttribution(run, () =>
+                startConversationTurn(run, feedback, {
+                  verify: turnVerify,
+                  ...(parsed.replan === true ? { replan: true, planGate: turnPlanGate } : {}),
+                  ...(turnOrchestrate
+                    ? {
+                        orchestrate: true,
+                        planGate: turnPlanGate,
+                        ...(turnConcurrency !== undefined ? { concurrency: turnConcurrency } : {}),
+                      }
+                    : {}),
+                }),
+              );
+              return json(res, 200, {
+                runId: run.id,
+                conversationTurn: run.conversationTurn,
+                continuationMode: "reopen",
+                sameRunResume: false,
                 run: runSummary(run),
               });
             }
@@ -8373,6 +10725,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
               toolTally: {},
               abort: new AbortController(),
               ...(history ? { history } : {}),
+              ...(run.lastExecutorRoleId ? { lastExecutorRoleId: run.lastExecutorRoleId } : {}),
+              ...(run.lastExecutorIdentityKey
+                ? { lastExecutorIdentityKey: run.lastExecutorIdentityKey }
+                : {}),
+              ...(run.lastExecutorModel ? { lastExecutorModel: run.lastExecutorModel } : {}),
               continuedFrom: run.id,
               rootRunId,
               // 有检查点：正史/预算/水位延续；无检查点：无正史新一轮，预算按当前上限从零起算
@@ -8389,6 +10746,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
               ...(run.effort ? { effort: run.effort } : {}),
               ...(run.rubric ? { rubric: run.rubric } : {}),
               ...(run.workdir ? { workdir: resolve(run.workdir) } : { workdir }),
+              ...(run.extraWorkdirs?.length ? { extraWorkdirs: run.extraWorkdirs } : {}),
               ...(run.askUser ? { askUser: true } : {}),
               ...(parsed.autoApprove === true ? { autoApprove: true } : {}),
               ...(turnOrchestrate ? { mode: "plan" as const } : {}),
@@ -8398,6 +10756,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
               ...(run.contextTokenLimit !== undefined ? { contextTokenLimit: run.contextTokenLimit } : {}),
               ...(childResources.length ? { heldResources: childResources } : {}),
             };
+            const childAssembled = await applyFollowUpAssembly(child, parsed, feedback);
+            if (!childAssembled.ok) {
+              hostResources.release(childResources, id);
+              return badRequest(res, childAssembled.error);
+            }
             if (historyRoot) {
               child.archiveWriter = createArchiveWriter(id);
               persistMeta(child);
@@ -8448,8 +10811,13 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         // 追问续跑重启执行：finalize 时已释放的资源要重新占——否则另一个持有
         // 同资源的 run 与本次续跑会同时上探针。本轮若开编排，资源改回调度器
         // 按子任务粒度管，这里不整占（与 createRun 同口径）。
+        const liveAssembled = await applyFollowUpAssembly(run, parsed, feedback);
+        if (!liveAssembled.ok) {
+          releaseAdmission();
+          return badRequest(res, liveAssembled.error);
+        }
         const resumePack = run.packName ? getPack(run.packName) : pack;
-        const resumeResources = turnOrchestrate ? [] : (resumePack?.resources ?? []);
+        const resumeResources = (turnOrchestrate || parsed.replan === true) ? [] : (resumePack?.resources ?? []);
         if (acquireRunResources(res, run.id, resumeResources) === "refused") {
           releaseAdmission();
           return;
@@ -8472,6 +10840,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         // startConversationTurn 在第一个 await 之前就把轮数加过了，这里不能再 +1
         void withFallbackAttribution(run, () => startConversationTurn(run, feedback, {
           verify: turnVerify,
+          ...(parsed.replan === true ? { replan: true, planGate: turnPlanGate } : {}),
           ...(turnOrchestrate
             ? {
                 orchestrate: true,
@@ -8487,6 +10856,74 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           verify: turnVerify,
           continuationMode: "same",
           run: runSummary(run),
+        });
+      }
+
+      case "forkConversation": {
+        const run = runs.get(route.runId);
+        if (!run) return notFound(res, `Run not found: ${route.runId}`);
+        let rawBody = "";
+        try {
+          rawBody = await readBody(req, requestBodyMaxBytes);
+        } catch (error) {
+          return requestBodyFailure(res, error);
+        }
+        if (rawBody.trim()) {
+          try {
+            JSON.parse(rawBody);
+          } catch {
+            return badRequest(res, "Invalid JSON body");
+          }
+        }
+        const child = await snapshotConversationFork(run);
+        return json(res, 200, {
+          runId: child.id,
+          continuedFrom: run.id,
+          rootRunId: child.rootRunId ?? run.id,
+          continuationMode: "snapshot",
+          started: false,
+          conversationTurn: child.conversationTurn,
+          run: runSummary(child),
+        });
+      }
+
+      case "rewindConversation": {
+        const run = runs.get(route.runId);
+        if (!run) return notFound(res, `Run not found: ${route.runId}`);
+        if (run.status === "running") {
+          return json(res, 409, { error: "对话还在跑，先停止再回退" });
+        }
+        let rawBody = "";
+        try {
+          rawBody = await readBody(req, requestBodyMaxBytes);
+        } catch (error) {
+          return requestBodyFailure(res, error);
+        }
+        let parsedBody: unknown = {};
+        if (rawBody.trim()) {
+          try {
+            parsedBody = JSON.parse(rawBody);
+          } catch {
+            return badRequest(res, "Invalid JSON body");
+          }
+        }
+        const parsed = parseRewindRequest(parsedBody);
+        if (!parsed.ok) return badRequest(res, parsed.error);
+        await hydrateArchive(run);
+        if (parsed.seq !== -1 && !run.events.some((e) => e.seq === parsed.seq)) {
+          return badRequest(res, `没有序号为 ${parsed.seq} 的消息`);
+        }
+        const { child, files } = await snapshotConversationRewind(run, parsed.seq, parsed.revertFiles);
+        return json(res, 200, {
+          runId: child.id,
+          continuedFrom: run.id,
+          rootRunId: child.rootRunId ?? run.id,
+          continuationMode: "rewind",
+          started: false,
+          conversationTurn: child.conversationTurn,
+          rewindFrom: child.rewindFrom,
+          ...(files ? { files } : {}),
+          run: runSummary(child),
         });
       }
 
@@ -8614,6 +11051,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
               const rel = relative(resolve(root), abs).split(sep).join("/") || ".";
               return { input, exists: true as const, path: rel, kind };
             } catch {
+              const target = localPathTarget(input);
+              if (!/[\\/]/.test(target)) {
+                const found = await findUniqueWorkdirFile(root, target);
+                if (found) return { input, exists: true as const, path: found, kind: "file" as const };
+              }
               return { input, exists: false as const };
             }
           }),
@@ -8791,6 +11233,249 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         }
       }
 
+      case "designTemplates": {
+        if (!designTemplatesDir) {
+          return json(res, 200, { templates: [], disabled: true });
+        }
+        const templates = await listDesignTemplates(designTemplatesDir);
+        return json(res, 200, { templates });
+      }
+
+      case "designMd": {
+        const run = runs.get(route.runId);
+        if (!run) return notFound(res, `Run not found: ${route.runId}`);
+        const root = run.workdir ?? workdir;
+        try {
+          const doc = await readDesignMd(root);
+          if (!doc) return json(res, 200, { found: false });
+          const palette = parseDesignPalette(doc.text);
+          return json(res, 200, {
+            found: true,
+            path: doc.path,
+            text: doc.text,
+            palette,
+          });
+        } catch (err) {
+          return json(res, 413, { error: (err as Error).message });
+        }
+      }
+
+      case "seedTemplate": {
+        const run = runs.get(route.runId);
+        if (!run) return notFound(res, `Run not found: ${route.runId}`);
+        if (!designTemplatesDir) {
+          return json(res, 503, { error: "design templates unavailable" });
+        }
+        let body: string;
+        try {
+          body = await readBody(req, requestBodyMaxBytes);
+        } catch (err) {
+          return json(res, 413, { error: (err as Error).message });
+        }
+        let parsed: { template?: unknown; dest?: unknown; force?: unknown };
+        try {
+          parsed = JSON.parse(body || "{}");
+        } catch {
+          return badRequest(res, "Invalid JSON");
+        }
+        const templateId = typeof parsed.template === "string" ? parsed.template : "";
+        const destName = typeof parsed.dest === "string" ? parsed.dest : undefined;
+        const force = parsed.force === true;
+        try {
+          const result = await copyDesignTemplate({
+            templatesRoot: designTemplatesDir,
+            templateId,
+            destRoot: run.workdir ?? workdir,
+            destName,
+            force,
+          });
+          return json(res, 200, result);
+        } catch (err) {
+          const msg = (err as Error).message ?? String(err);
+          if (msg.startsWith("目标已存在")) return json(res, 409, { error: msg });
+          if (msg.startsWith("非法模板") || msg.startsWith("模板不存在") || msg.startsWith("模板缺少")) {
+            return badRequest(res, msg);
+          }
+          return badRequest(res, msg);
+        }
+      }
+
+      /**
+       * 从幻灯 HTML 派生 PPTX。圈在 run workdir；零 .slide 拒绝写盘。
+       * 有损版式写进 lossy，不假装像素还原。
+       */
+      case "exportPptx": {
+        const run = runs.get(route.runId);
+        if (!run) return notFound(res, `Run not found: ${route.runId}`);
+        let body: string;
+        try {
+          body = await readBody(req, requestBodyMaxBytes);
+        } catch (err) {
+          return json(res, 413, { error: (err as Error).message });
+        }
+        let parsed: { htmlPath?: unknown };
+        try {
+          parsed = JSON.parse(body || "{}");
+        } catch {
+          return badRequest(res, "Invalid JSON");
+        }
+        const root = run.workdir ?? workdir;
+        let htmlRel = typeof parsed.htmlPath === "string" ? parsed.htmlPath.trim() : "";
+        if (!htmlRel) {
+          try {
+            const absIndex = resolveInWorkdir(root, "index.html");
+            if (existsSync(absIndex)) htmlRel = "index.html";
+          } catch { /* 下面再找唯一入口 */ }
+          if (!htmlRel) {
+            const found = await findUniqueWorkdirFile(root, "index.html");
+            if (!found) {
+              return badRequest(res, "未指定 htmlPath，且工作目录没有唯一的 index.html");
+            }
+            htmlRel = found;
+          }
+        }
+        htmlRel = htmlRel.replace(/\\/g, "/");
+        if (!/\.html?$/i.test(htmlRel.split("/").pop() ?? "")) {
+          return badRequest(res, "htmlPath 必须是 .html 幻灯入口");
+        }
+        let htmlAbs: string;
+        try {
+          htmlAbs = resolveInWorkdir(root, htmlRel);
+        } catch (err) {
+          return json(res, 400, { error: (err as Error).message });
+        }
+        let html: string;
+        try {
+          const st = await stat(htmlAbs);
+          if (!st.isFile()) return badRequest(res, "htmlPath 不是文件");
+          html = await readFile(htmlAbs, "utf8");
+        } catch {
+          return notFound(res, `HTML not found: ${htmlRel}`);
+        }
+        const cssParts: string[] = [];
+        for (const href of relativeStylesheetHrefs(html)) {
+          try {
+            const cssAbs = resolveInWorkdir(root, joinHtmlRelative(htmlRel, href));
+            cssParts.push(await readFile(cssAbs, "utf8"));
+          } catch { /* 缺样式仍转，色板走默认 */ }
+        }
+        let designMd: string | undefined;
+        for (const cand of [...new Set([joinHtmlRelative(htmlRel, "DESIGN.md"), "DESIGN.md"])]) {
+          try {
+            const mdAbs = resolveInWorkdir(root, cand);
+            designMd = await readFile(mdAbs, "utf8");
+            break;
+          } catch { /* 下一候选 */ }
+        }
+        try {
+          const { ir, bytes } = await convertDeckHtmlToPptx({
+            html,
+            css: cssParts.join("\n"),
+            designMd,
+          });
+          const pptxRel = pptxRelPathForHtml(htmlRel).replace(/\\/g, "/");
+          const pptxAbs = resolveInWorkdir(root, pptxRel);
+          await writeFile(pptxAbs, bytes);
+          return json(res, 200, {
+            path: pptxRel,
+            slides: ir.slides.length,
+            titles: ir.slides.map(deckSlideTitle),
+            lossy: ir.lossy,
+          });
+        } catch (err) {
+          if (isDeckPptxError(err) && err.code === DECK_PPTX_NO_SLIDES) {
+            return json(res, 422, { error: err.message, code: err.code });
+          }
+          return json(res, 400, { error: (err as Error).message ?? String(err) });
+        }
+      }
+
+      /**
+       * 从方图 HTML 派生 PNG。只截 [data-card]，零契约拒绝写盘。
+       */
+      case "exportPng": {
+        const run = runs.get(route.runId);
+        if (!run) return notFound(res, `Run not found: ${route.runId}`);
+        let body: string;
+        try {
+          body = await readBody(req, requestBodyMaxBytes);
+        } catch (err) {
+          return json(res, 413, { error: (err as Error).message });
+        }
+        let parsed: { htmlPath?: unknown };
+        try {
+          parsed = JSON.parse(body || "{}");
+        } catch {
+          return badRequest(res, "Invalid JSON");
+        }
+        const root = run.workdir ?? workdir;
+        let htmlRel = typeof parsed.htmlPath === "string" ? parsed.htmlPath.trim() : "";
+        if (!htmlRel) {
+          try {
+            const absIndex = resolveInWorkdir(root, "index.html");
+            if (existsSync(absIndex)) htmlRel = "index.html";
+          } catch { /* 下面再找唯一入口 */ }
+          if (!htmlRel) {
+            const found = await findUniqueWorkdirFile(root, "index.html");
+            if (!found) {
+              return badRequest(res, "未指定 htmlPath，且工作目录没有唯一的 index.html");
+            }
+            htmlRel = found;
+          }
+        }
+        htmlRel = htmlRel.replace(/\\/g, "/");
+        if (!/\.html?$/i.test(htmlRel.split("/").pop() ?? "")) {
+          return badRequest(res, "htmlPath 必须是 .html 入口");
+        }
+        let htmlAbs: string;
+        try {
+          htmlAbs = resolveInWorkdir(root, htmlRel);
+        } catch (err) {
+          return json(res, 400, { error: (err as Error).message });
+        }
+        let html: string;
+        try {
+          const st = await stat(htmlAbs);
+          if (!st.isFile()) return badRequest(res, "htmlPath 不是文件");
+          html = await readFile(htmlAbs, "utf8");
+        } catch {
+          return notFound(res, `HTML not found: ${htmlRel}`);
+        }
+        let frames;
+        try {
+          frames = requirePngFrames(html);
+        } catch (err) {
+          if (isCardPngError(err) && err.code === CARD_PNG_NO_FRAMES) {
+            return json(res, 422, { error: err.message, code: err.code });
+          }
+          return json(res, 400, { error: (err as Error).message ?? String(err) });
+        }
+        try {
+          const shots = await capturePngFrames({ htmlAbs, frames });
+          const rels = pngRelPathsForHtml(htmlRel, shots.length);
+          const paths: string[] = [];
+          for (let i = 0; i < shots.length; i++) {
+            const rel = (rels[i] ?? `${htmlRel}-${i + 1}.png`).replace(/\\/g, "/");
+            const abs = resolveInWorkdir(root, rel);
+            await writeFile(abs, shots[i]!.bytes);
+            paths.push(rel);
+          }
+          return json(res, 200, {
+            paths,
+            count: paths.length,
+            lossy: ["截的是契约卡渲染，不是通用整页长图"],
+          });
+        } catch (err) {
+          if (isCardPngError(err) && err.code === CARD_PNG_NO_FRAMES) {
+            return json(res, 422, { error: err.message, code: err.code });
+          }
+          if (isCardPngError(err) && err.code === CARD_PNG_CAPTURE_UNAVAILABLE) {
+            return json(res, 503, { error: err.message, code: err.code });
+          }
+          return json(res, 400, { error: (err as Error).message ?? String(err) });
+        }
+      }
+
       /**
        * V-35 文件预览取件：不绑定 run 的只读预览/下载。
        *
@@ -8934,6 +11619,14 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         // §5.2 提问同理。settle(null) 而不是抛——停止是委托方的决定，
         // 工具那边会回"按你的最佳判断继续"，不是把它当故障（决定 4）
         try { expireQuestion(run, "stopped"); } catch { /* 已应答 */ }
+        // 兼容端点 / 无视 signal 的工具：abort 后仍可能卡在 await。
+        // 点了停止超过 1.5s 还 running，就强制收尾——按钮不能停比没有更糟。
+        const stoppingId = run.id;
+        setTimeout(() => {
+          const still = runs.get(stoppingId);
+          if (!still || still.status !== "running" || !still.abort?.signal.aborted) return;
+          finalizeRun(still, { outcome: "closed", mainStopReason: "aborted" });
+        }, 1500);
         broadcastLifecycle("run_updated", run);
         return json(res, 200, { stopping: true });
       }
@@ -9081,6 +11774,106 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         pendingPlan.settle(parsed.decision);
         broadcastLifecycle("run_updated", run);
         return json(res, 200, { acknowledged: true });
+      }
+
+      case "handoff": {
+        const run = runs.get(route.runId);
+        if (!run) return notFound(res, `Run not found: ${route.runId}`);
+
+        let body: string;
+        try {
+          body = await readBody(req, requestBodyMaxBytes);
+        } catch (error) {
+          return requestBodyFailure(res, error);
+        }
+        let parsed: { decision?: string };
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          return badRequest(res, "Invalid JSON body");
+        }
+        if (parsed.decision !== "accept" && parsed.decision !== "decline") {
+          return badRequest(res, 'decision must be "accept" or "decline"');
+        }
+
+        const proposal = effectiveHandoff(run);
+        if (!proposal || proposal.status !== "pending") {
+          return json(res, 409, { error: "当前没有待确认的下一步" });
+        }
+        if (parsed.decision === "accept" && run.status === "running") {
+          return json(res, 409, { error: "等这次调试结束再换段" });
+        }
+
+        if (parsed.decision === "decline") {
+          const at = Date.now();
+          run.handoffProposal = { ...proposal, status: "declined" };
+          pushSyntheticEvent(run, "host", {
+            type: "handoff_resolved",
+            id: proposal.id,
+            decision: "decline",
+            at,
+          });
+          broadcastLifecycle("run_updated", run);
+          return json(res, 200, { acknowledged: true });
+        }
+
+        if (run.dailyBudget !== false) {
+          const budgetRefusal = dailyBudgetRefusal();
+          if (budgetRefusal) return rejectAtDailyBudget(res, budgetRefusal);
+        }
+
+        const spec = findHandoffAmong(allPacks(), proposal.handoffId);
+        if (!spec) {
+          return json(res, 409, { error: "这份提议已经失效（领域包不再提供该下一步）" });
+        }
+        const sketch = buildThreadSketch(
+          run.events.map((item) => ({ source: item.source, event: item.event as ThreadEventLike["event"] })),
+        );
+        const ctx = {
+          summary: proposal.summary,
+          parentTask: run.task,
+          ...(sketch ? { sketch } : {}),
+        };
+        const injectedPlan = buildHandoffPlan(spec, ctx);
+        const child = await createRunFromBody(
+          {
+            task: buildHandoffTask(ctx),
+            mode: "plan",
+            planGate: false,
+            concurrency: 1,
+            verify: true,
+            ...(run.workdir ? { workdir: run.workdir } : {}),
+            ...(run.extraWorkdirs ? { extraWorkdirs: run.extraWorkdirs } : {}),
+            ...(run.effort ? { effort: run.effort } : {}),
+            ...(run.contextTokenLimit !== undefined ? { contextTokenLimit: run.contextTokenLimit } : {}),
+            ...(run.autoApprove ? { autoApprove: true } : {}),
+          },
+          { injectedPlan, parentRunId: run.id },
+        );
+        if (child.status !== 200) {
+          if (child.headers) {
+            for (const [name, value] of Object.entries(child.headers)) {
+              res.setHeader(name, value);
+            }
+          }
+          return json(res, child.status, child.payload);
+        }
+        const childRunId = (child.payload as { runId?: string }).runId;
+        const at = Date.now();
+        run.handoffProposal = {
+          ...proposal,
+          status: "accepted",
+          ...(childRunId ? { childRunId } : {}),
+        };
+        pushSyntheticEvent(run, "host", {
+          type: "handoff_resolved",
+          id: proposal.id,
+          decision: "accept",
+          ...(childRunId ? { childRunId } : {}),
+          at,
+        });
+        broadcastLifecycle("run_updated", run);
+        return json(res, 200, { acknowledged: true, runId: childRunId });
       }
 
       /**

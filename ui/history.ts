@@ -35,7 +35,9 @@ import {
   RUN_STATE_VERSION,
   parseToolTxList,
   type DurableBudgetSnapshot,
+  type DurableExecutorCheckpoint,
   type DurableGrantAuditEntry,
+  type DurablePlanNode,
   type DurablePlanSnapshot,
   type DurableRunState,
   type RunPhase,
@@ -108,6 +110,13 @@ export interface ArchivedCheckpoint {
   approvalGrants?: ArchivedApprovalGrant[];
 }
 
+export const ARCHIVE_HOSTS = ["web", "cli"] as const;
+export type ArchiveHost = (typeof ARCHIVE_HOSTS)[number];
+
+export function parseArchiveHost(raw: unknown): ArchiveHost | undefined {
+  return raw === "cli" || raw === "web" ? raw : undefined;
+}
+
 /** meta.json 的形状。version 是将来格式演进的逃生口 */
 export interface ArchivedMeta {
   version: 1;
@@ -125,6 +134,8 @@ export interface ArchivedMeta {
   effort: string | null;
   rubric: string | null;
   workdir: string | null;
+  /** 勾选的额外白名单目录（本次只读根）；旧档案缺省 */
+  extraWorkdirs?: string[];
   conversationTurn: number;
   planGate: boolean;
   planDecision: { decision: "approve" | "reject"; at: number } | null;
@@ -136,13 +147,24 @@ export interface ArchivedMeta {
    * 派生 run 沿用它，但会按**当前**宿主的窗口重新夹紧（窗口是事实，可能已经学到了新值）。
    */
   contextTokenLimit?: number | null;
+  /**
+   * 谁写下的档案。CLI 必写 `"cli"`；Web 写 `"web"`。
+   * 旧档案缺省 — 列表只在值为 cli 时标来源，不把缺省猜成 Web。
+   */
+  host?: ArchiveHost;
   /** 归档可恢复检查点；旧档案缺省 = 只读 */
   checkpoint?: ArchivedCheckpoint | null;
   /** 派生谱系；父档案始终不可变 */
   continuedFrom?: string | null;
   rootRunId?: string | null;
+  /** 对话回退快照；旧档案缺省 */
+  rewindFrom?: { parentRunId: string; seq: number; revertFiles: boolean } | null;
   /** 本轮收尾摘要；旧档案缺省。列表与续跑 fort 的「此前对话」用它，不另开模型 */
   recap?: string | null;
+  /** 写出正史的执行者指纹；换模型后续跑要剥思考签名。旧档案缺省 */
+  lastExecutorRoleId?: string | null;
+  lastExecutorIdentityKey?: string | null;
+  lastExecutorModel?: string | null;
   /**
    * 列表列所需的裁决摘要；完整裁决在事件流里，不重复存。
    * judgedTurn = 这份裁决核查的是第几轮对话（会话中心化后核查是逐轮选项，
@@ -317,6 +339,33 @@ export async function readArchivedState(dir: string): Promise<DurableRunState | 
   }
 }
 
+export type DurableRunStateLoad =
+  | { ok: true; state: DurableRunState; reason: "current" }
+  | {
+      ok: false;
+      state: null;
+      reason: "not_object" | "unsupported_version" | "malformed";
+      version: number | null;
+    };
+
+/**
+ * OPS-01：把"读不成"拆开——未来版本与坏形状必须分开，否则升级演练分不清
+ * 该回滚 schema 还是该当损坏档案丢掉。
+ */
+export function classifyDurableRunState(raw: unknown): DurableRunStateLoad {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return { ok: false, state: null, reason: "not_object", version: null };
+  }
+  const versionRaw = (raw as { version?: unknown }).version;
+  const version = typeof versionRaw === "number" && Number.isFinite(versionRaw) ? versionRaw : null;
+  if (version !== RUN_STATE_VERSION) {
+    return { ok: false, state: null, reason: "unsupported_version", version };
+  }
+  const state = parseDurableRunState(raw);
+  if (!state) return { ok: false, state: null, reason: "malformed", version: RUN_STATE_VERSION };
+  return { ok: true, state, reason: "current" };
+}
+
 /** 校验 DurableRunState 形状；任何必填字段缺失即 null。 */
 export function parseDurableRunState(raw: unknown): DurableRunState | null {
   if (!raw || typeof raw !== "object") return null;
@@ -359,6 +408,11 @@ export function parseDurableRunState(raw: unknown): DurableRunState | null {
   }
   const toolTx = parseToolTxList(o.toolTx);
   if (toolTx === null) return null;
+  let checkpoint: DurableExecutorCheckpoint | null = null;
+  if (o.checkpoint !== undefined && o.checkpoint !== null) {
+    checkpoint = parseDurableExecutorCheckpoint(o.checkpoint);
+    if (!checkpoint) return null;
+  }
   return {
     version: RUN_STATE_VERSION,
     runId: o.runId,
@@ -377,7 +431,24 @@ export function parseDurableRunState(raw: unknown): DurableRunState | null {
     lastSameRunResumeAt:
       typeof o.lastSameRunResumeAt === "number" ? o.lastSameRunResumeAt : null,
     toolTx,
+    checkpoint,
   };
+}
+
+function parseDurableExecutorCheckpoint(raw: unknown): DurableExecutorCheckpoint | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const o = raw as Record<string, unknown>;
+  if (typeof o.segmentIndex !== "number" || !Number.isInteger(o.segmentIndex) || o.segmentIndex < 0) {
+    return null;
+  }
+  if (
+    typeof o.contextInputTokens !== "number" ||
+    !Number.isFinite(o.contextInputTokens) ||
+    o.contextInputTokens < 0
+  ) {
+    return null;
+  }
+  return { segmentIndex: o.segmentIndex, contextInputTokens: o.contextInputTokens };
 }
 
 function parseDurableBudget(raw: unknown): DurableBudgetSnapshot | null {
@@ -450,12 +521,57 @@ function parseDurablePlanSnapshot(raw: unknown): DurablePlanSnapshot | null {
   }
   if (o.approvedAt !== null && typeof o.approvedAt !== "number") return null;
   if (o.rejectedAt !== null && typeof o.rejectedAt !== "number") return null;
+  let nodes: DurablePlanSnapshot["nodes"];
+  if (o.nodes !== undefined) {
+    if (!Array.isArray(o.nodes)) return null;
+    const parsed = o.nodes.map(parseDurablePlanNode);
+    if (parsed.some((n) => n === null)) return null;
+    nodes = parsed as NonNullable<DurablePlanSnapshot["nodes"]>;
+  }
   return {
     protocol: o.protocol,
     taskIds: [...o.taskIds],
     edges,
     approvedAt: o.approvedAt as number | null,
     rejectedAt: o.rejectedAt as number | null,
+    ...(nodes ? { nodes } : {}),
+  };
+}
+
+function parseDurablePlanNode(raw: unknown): DurablePlanNode | null {
+  if (!raw || typeof raw !== "object") return null;
+  const o = raw as Record<string, unknown>;
+  if (typeof o.id !== "string" || o.id === "") return null;
+  if (typeof o.title !== "string") return null;
+  if (typeof o.description !== "string") return null;
+  if (!Array.isArray(o.acceptance) || !o.acceptance.every((x) => typeof x === "string")) return null;
+  if (!Array.isArray(o.dependsOn) || !o.dependsOn.every((x) => typeof x === "string")) return null;
+  if (
+    o.status !== "pending" &&
+    o.status !== "running" &&
+    o.status !== "passed" &&
+    o.status !== "failed" &&
+    o.status !== "skipped"
+  ) {
+    return null;
+  }
+  if (o.pack !== undefined && o.pack !== null && typeof o.pack !== "string") return null;
+  if (o.resources !== undefined && (!Array.isArray(o.resources) || !o.resources.every((x) => typeof x === "string"))) {
+    return null;
+  }
+  if (o.evidenceSummary !== undefined && typeof o.evidenceSummary !== "string") return null;
+  if (o.failureStrategy !== undefined && typeof o.failureStrategy !== "string") return null;
+  return {
+    id: o.id,
+    title: o.title,
+    description: o.description,
+    acceptance: [...o.acceptance],
+    dependsOn: [...o.dependsOn],
+    status: o.status,
+    ...(o.pack !== undefined ? { pack: o.pack as string | null } : {}),
+    ...(o.resources ? { resources: [...(o.resources as string[])] } : {}),
+    ...(typeof o.evidenceSummary === "string" ? { evidenceSummary: o.evidenceSummary } : {}),
+    ...(typeof o.failureStrategy === "string" ? { failureStrategy: o.failureStrategy } : {}),
   };
 }
 

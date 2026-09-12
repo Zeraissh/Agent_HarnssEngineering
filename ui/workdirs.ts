@@ -89,3 +89,67 @@ export function saveWorkdirStore(file: string, store: WorkdirStore): void {
   writeFileSync(tmp, `${JSON.stringify(store, null, 2)}\n`, "utf8");
   renameSync(tmp, file);
 }
+
+/**
+ * 请求体 extraWorkdirs：每条必须是白名单绝对路径；主目录自身丢掉（它已可写）。
+ * 非法形状 / 越白名单一律失败——静默丢掉会让界面上勾着的目录实际没进圈。
+ */
+export function parseExtraWorkdirs(
+  raw: unknown,
+  allowed: Iterable<string>,
+  primaryWorkdir: string,
+): { ok: true; extraWorkdirs: string[] } | { ok: false; error: string } {
+  if (raw === undefined || raw === null) return { ok: true, extraWorkdirs: [] };
+  if (!Array.isArray(raw)) {
+    return { ok: false, error: "extraWorkdirs 必须是路径数组" };
+  }
+  const allowedSet = new Set([...allowed].map((p) => resolve(p)));
+  const primary = resolve(primaryWorkdir);
+  const extras: string[] = [];
+  const seen = new Set<string>();
+  for (const item of raw) {
+    if (typeof item !== "string" || !item.trim()) {
+      return { ok: false, error: "extraWorkdirs 每项必须是非空路径" };
+    }
+    const asked = resolve(item);
+    if (!allowedSet.has(asked)) {
+      return { ok: false, error: `额外目录不在白名单内：${asked}` };
+    }
+    if (asked === primary || seen.has(asked)) continue;
+    seen.add(asked);
+    extras.push(asked);
+  }
+  return { ok: true, extraWorkdirs: extras };
+}
+
+/**
+ * 新建文件夹名：拒绝穿越、空名、Windows 非法字符。
+ * 选择器浮层与 POST /api/fs/mkdir 共用同一条，避免一边放行一边 400。
+ */
+export function isSafeFolderName(name: string): boolean {
+  const n = String(name ?? "").trim();
+  if (!n || n === "." || n === "..") return false;
+  if (n.length > 255) return false;
+  if (/[\\/]/.test(n)) return false;
+  if (/[<>:"|?*\u0000-\u001f]/.test(n)) return false;
+  return true;
+}
+
+/** 本次 run 的额外根 = env / 白名单 / 勾选项的并集，去掉主 workdir。 */
+export function mergeRunReadRoots(
+  envRoots: string[],
+  extraWorkdirs: string[] | undefined,
+  primaryWorkdir: string,
+): string[] {
+  const primary = resolve(primaryWorkdir);
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const root of [...envRoots, ...(extraWorkdirs ?? [])]) {
+    if (typeof root !== "string" || !root.trim()) continue;
+    const normalized = resolve(root);
+    if (normalized === primary || seen.has(normalized)) continue;
+    seen.add(normalized);
+    out.push(normalized);
+  }
+  return out;
+}

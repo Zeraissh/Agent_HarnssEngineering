@@ -26,6 +26,7 @@ export interface ApprovalPathTarget {
 
 const PATH_FIELDS_BY_TOOL: Record<string, string[]> = {
   write_file: ["path"],
+  write_pptx: ["path"],
   edit_file: ["path"],
   read_file: ["path"],
   generate_image: ["path", "output_path"],
@@ -64,15 +65,16 @@ function realpathExistingOrNearest(lexical: string): string {
 export function inspectPathForApproval(input: {
   workdir: string;
   readRoots?: string[];
+  writeRoots?: string[];
   requested: string;
   field: string;
   readable?: boolean;
 }): ApprovalPathTarget {
-  const { workdir, readRoots, requested, field } = input;
+  const { workdir, readRoots, writeRoots, requested, field } = input;
   try {
     const lexical = input.readable
       ? resolveReadable(workdir, readRoots, requested)
-      : resolveInWorkdir(workdir, requested);
+      : resolveInWorkdir(workdir, requested, writeRoots);
     const real = realpathExistingOrNearest(lexical);
     const diverges =
       path.normalize(lexical) !== path.normalize(real)
@@ -96,6 +98,7 @@ export function describeApprovalTargets(
   toolInput: unknown,
   workdir: string,
   readRoots?: string[],
+  writeRoots?: string[],
 ): ApprovalPathTarget[] {
   if (!toolInput || typeof toolInput !== "object" || Array.isArray(toolInput)) return [];
   const obj = toolInput as Record<string, unknown>;
@@ -108,6 +111,7 @@ export function describeApprovalTargets(
       inspectPathForApproval({
         workdir,
         readRoots,
+        writeRoots,
         requested: value,
         field,
         readable,

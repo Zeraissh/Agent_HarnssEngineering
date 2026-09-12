@@ -77,6 +77,14 @@ describe("confineShellCommand", () => {
     const root = await freshWorkdir();
     expect(confineShellCommand("ls eval-out 2>&1", root).ok).toBe(true);
   });
+
+  it("allows redirect into an extra writable root", async () => {
+    const root = await freshWorkdir();
+    const extra = await freshWorkdir();
+    const target = `${extra.replace(/\\/g, "/")}/out.txt`;
+    expect(confineShellCommand(`printf x > "${target}"`, root, [extra]).ok).toBe(true);
+    expect(confineShellCommand(`printf x > "${target}"`, root).ok).toBe(false);
+  });
 });
 
 describe("bash tool applies confine before spawn", () => {

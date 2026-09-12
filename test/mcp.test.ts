@@ -4,11 +4,19 @@ import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   adaptMcpTool,
+  connectMcpServers,
+  filterMcpConfigForPack,
+  interpolateMcpEnvValue,
   loadMcpConfig,
+  mcpConfigHasRunnableServers,
+  mcpServerSkipReason,
   renderMcpContent,
+  resolveMcpServerEnv,
   resolveMcpToolPermission,
   type McpCaller,
 } from "../src/mcp.js";
+import { GITHUB_MCP_TOOLS, GITHUB_MCP_TOOLS_CSV, GITHUB_MCP_WRITE_TOOLS } from "../src/mcp-github.js";
+import { PACKS } from "../src/presets.js";
 
 const ctx = { workdir: "x", toolUseId: "tu", signal: new AbortController().signal };
 
@@ -77,6 +85,23 @@ describe("adaptMcpTool（MCP tool → harness Tool）", () => {
     const bad = await failing.execute({}, ctx);
     expect(bad.isError).toBe(true);
     expect(bad.content).toContain("GDB not connected");
+  });
+
+  it("SAFE-06：destructiveHint / sideEffectTools 标副作用；读工具不标", () => {
+    const hinted = adaptMcpTool(
+      "lab",
+      { name: "put_secret", annotations: { destructiveHint: true } },
+      okCaller,
+      { permission: "auto" },
+    );
+    expect(hinted.sideEffect).toBe(true);
+    const listed = adaptMcpTool("lab", { name: "put_secret" }, okCaller, {
+      permission: "auto",
+      sideEffectTools: ["put_secret"],
+    });
+    expect(listed.sideEffect).toBe(true);
+    const read = adaptMcpTool("stm32", { name: "read_memory" }, okCaller, { permission: "auto" });
+    expect(read.sideEffect).toBeUndefined();
   });
 });
 
@@ -159,7 +184,7 @@ describe("loadMcpConfig", () => {
       '{"servers":{"a":{"command":"python","permission":"always"}}}',
       "utf8",
     );
-    await expect(loadMcpConfig(badServer)).rejects.toThrow(/permission must be "auto" or "ask"/);
+    await expect(loadMcpConfig(badServer)).rejects.toThrow(/permission must be "auto" \| "ask" \| "deny"/);
 
     const badTool = path.join(dir, "bad-tool-permission.json");
     await writeFile(
@@ -168,5 +193,162 @@ describe("loadMcpConfig", () => {
       "utf8",
     );
     await expect(loadMcpConfig(badTool)).rejects.toThrow(/tool "flash" permission/);
+
+    const badSide = path.join(dir, "bad-side-effect.json");
+    await writeFile(
+      badSide,
+      '{"servers":{"a":{"command":"python","sideEffectTools":"erase"}}}',
+      "utf8",
+    );
+    await expect(loadMcpConfig(badSide)).rejects.toThrow(/sideEffectTools/);
+
+    const badRequired = path.join(dir, "bad-required-env.json");
+    await writeFile(
+      badRequired,
+      '{"servers":{"a":{"command":"python","requiredEnv":"TOKEN"}}}',
+      "utf8",
+    );
+    await expect(loadMcpConfig(badRequired)).rejects.toThrow(/requiredEnv/);
+  });
+});
+
+describe("MCP env 展开与跳过连接", () => {
+  it("${VAR} 从进程环境展开；空值回退同名变量", () => {
+    const env = { GITHUB_PERSONAL_ACCESS_TOKEN: "ghp_test", PATH: "/bin" };
+    expect(interpolateMcpEnvValue("${GITHUB_PERSONAL_ACCESS_TOKEN}", env)).toBe("ghp_test");
+    expect(interpolateMcpEnvValue("plain", env)).toBe("plain");
+    const resolved = resolveMcpServerEnv(
+      { command: "x", env: { GITHUB_PERSONAL_ACCESS_TOKEN: "${GITHUB_PERSONAL_ACCESS_TOKEN}" } },
+      env,
+    );
+    expect(resolved.GITHUB_PERSONAL_ACCESS_TOKEN).toBe("ghp_test");
+  });
+
+  it("GITHUB_PERSONAL_ACCESS_TOKEN 空时认 AGENT_GITHUB_TOKEN / GITHUB_TOKEN", () => {
+    expect(
+      resolveMcpServerEnv(
+        { command: "x", env: { GITHUB_PERSONAL_ACCESS_TOKEN: "${GITHUB_PERSONAL_ACCESS_TOKEN}" } },
+        { AGENT_GITHUB_TOKEN: "from-agent" },
+      ).GITHUB_PERSONAL_ACCESS_TOKEN,
+    ).toBe("from-agent");
+    expect(
+      resolveMcpServerEnv(
+        { command: "x", env: { GITHUB_PERSONAL_ACCESS_TOKEN: "${GITHUB_PERSONAL_ACCESS_TOKEN}" } },
+        { GITHUB_TOKEN: "from-gh" },
+      ).GITHUB_PERSONAL_ACCESS_TOKEN,
+    ).toBe("from-gh");
+  });
+
+  it("enabled=false 或 requiredEnv 缺失 → 跳过，不拉起进程", async () => {
+    expect(mcpServerSkipReason({ command: "docker", enabled: false })).toBe("disabled");
+    expect(
+      mcpServerSkipReason(
+        { command: "docker", requiredEnv: ["GITHUB_PERSONAL_ACCESS_TOKEN"] },
+        {},
+      ),
+    ).toBe("missing GITHUB_PERSONAL_ACCESS_TOKEN");
+
+    const prior = {
+      GITHUB_PERSONAL_ACCESS_TOKEN: process.env.GITHUB_PERSONAL_ACCESS_TOKEN,
+      GITHUB_TOKEN: process.env.GITHUB_TOKEN,
+      AGENT_GITHUB_TOKEN: process.env.AGENT_GITHUB_TOKEN,
+    };
+    delete process.env.GITHUB_PERSONAL_ACCESS_TOKEN;
+    delete process.env.GITHUB_TOKEN;
+    delete process.env.AGENT_GITHUB_TOKEN;
+    try {
+      const runtime = await connectMcpServers({
+        servers: {
+          github: {
+            command: "docker",
+            args: ["run", "should-not-spawn"],
+            requiredEnv: ["GITHUB_PERSONAL_ACCESS_TOKEN"],
+          },
+        },
+      });
+      expect(runtime.tools).toEqual([]);
+      expect(runtime.summary).toEqual({});
+      expect(runtime.skipped.github).toBe("missing GITHUB_PERSONAL_ACCESS_TOKEN");
+      expect(runtime.failed).toEqual({});
+      await runtime.close();
+    } finally {
+      for (const [key, value] of Object.entries(prior)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
+  it("只有会被跳过的 server 时，required 隔离不把配置当成已启用 host MCP", () => {
+    expect(
+      mcpConfigHasRunnableServers(
+        {
+          servers: {
+            github: { command: "docker", requiredEnv: ["GITHUB_PERSONAL_ACCESS_TOKEN"] },
+          },
+        },
+        {},
+      ),
+    ).toBe(false);
+    expect(
+      mcpConfigHasRunnableServers({
+        servers: {
+          stm32: { command: "python" },
+        },
+      }),
+    ).toBe(true);
+  });
+});
+
+describe("filterMcpConfigForPack", () => {
+  const mixed = {
+    servers: {
+      stm32: { command: "python", includeTools: ["flash_firmware", "read_memory"] },
+      github: { command: "docker", includeTools: [...GITHUB_MCP_TOOLS] },
+    },
+  };
+
+  it("mcp:false → 不连", () => {
+    expect(filterMcpConfigForPack(mixed, false)).toBeUndefined();
+  });
+
+  it("mcp:false + hostGithub → 只拉 github，不拉 stm32", () => {
+    const sliced = filterMcpConfigForPack(mixed, false, { hostGithub: true });
+    expect(Object.keys(sliced?.servers ?? {})).toEqual(["github"]);
+  });
+
+  it("无包 / 未点名 includeTools → 整份配置", () => {
+    expect(filterMcpConfigForPack(mixed, undefined)?.servers).toEqual(mixed.servers);
+    expect(filterMcpConfigForPack(mixed, true)?.servers).toEqual(mixed.servers);
+  });
+
+  it("ts-coding 只留 github，不把 stm32 拉起来", () => {
+    const sliced = filterMcpConfigForPack(mixed, PACKS["ts-coding"]!.mcp);
+    expect(Object.keys(sliced?.servers ?? {})).toEqual(["github"]);
+  });
+
+  it("stm32-debug 只留 stm32", () => {
+    const sliced = filterMcpConfigForPack(mixed, PACKS["stm32-debug"]!.mcp);
+    expect(Object.keys(sliced?.servers ?? {})).toEqual(["stm32"]);
+  });
+});
+
+describe("仓库 mcp.json 的 GitHub 连接层", () => {
+  it("includeTools / GITHUB_TOOLS / 写工具 ask 与常量同源，且不含 merge/delete", async () => {
+    const cfg = await loadMcpConfig(path.resolve("mcp.json"));
+    const github = cfg?.servers.github;
+    expect(github).toBeDefined();
+    expect(github!.requiredEnv).toEqual(["GITHUB_PERSONAL_ACCESS_TOKEN"]);
+    expect(github!.env?.GITHUB_TOOLS).toBe(GITHUB_MCP_TOOLS_CSV);
+    expect(github!.includeTools?.slice().sort()).toEqual([...GITHUB_MCP_TOOLS].sort());
+    for (const write of GITHUB_MCP_WRITE_TOOLS) {
+      expect(github!.toolPermissions?.[write]).toBe("ask");
+      expect(github!.sideEffectTools).toContain(write);
+    }
+    expect(github!.includeTools).not.toContain("merge_pull_request");
+    expect(github!.includeTools).not.toContain("delete_file");
+    expect(github!.includeTools).not.toContain("push_files");
+    expect(github!.includeTools).not.toContain("call");
+    expect(github!.includeTools).not.toContain("batch");
   });
 });

@@ -42,6 +42,7 @@ describe("compact-ledger pure helpers (MEM-01)", () => {
       false,
     );
     expect(ok.sideEffects).toContain("write_file src/crc.c");
+    expect(ok.deliverables).toContain("src/crc.c");
     expect(ok.evidence.some((e) => /Wrote 128 bytes/.test(e))).toBe(true);
 
     const fail = extractFromToolExchange(
@@ -51,6 +52,13 @@ describe("compact-ledger pure helpers (MEM-01)", () => {
     );
     expect(fail.failures.some((f) => /LIBUSB_ERROR_ACCESS/.test(f))).toBe(true);
     expect(fail.sideEffects.some((s) => /bash:/.test(s))).toBe(true);
+
+    const erase = extractFromToolExchange(
+      { name: "stm32__erase_flash", input: { bank: 0 } },
+      "erased",
+      false,
+    );
+    expect(erase.sideEffects.some((s) => /erase_flash/.test(s))).toBe(true);
   });
 
   it("format/parse round-trip preserves buckets", () => {
@@ -60,19 +68,22 @@ describe("compact-ledger pure helpers (MEM-01)", () => {
       failures: ["bash: denied"],
       evidence: ["0x7189AAB5"],
       sideEffects: ["write_file report.md"],
+      deliverables: ["report.md"],
       narrative: "assistant weighed Manhattan vs free-angle",
     });
     const text = formatCompactLedger(ledger);
     expect(text.startsWith(COMPACT_LEDGER_MARKER)).toBe(true);
     expect(text).toContain("summary:");
+    expect(text).toContain("deliverables:");
     const parsed = parseCompactLedgerText(text);
     expect(parsed.constraints).toEqual(ledger.constraints);
     expect(parsed.decisions).toEqual(ledger.decisions);
     expect(parsed.failures).toEqual(ledger.failures);
     expect(parsed.evidence).toEqual(ledger.evidence);
     expect(parsed.sideEffects).toEqual(ledger.sideEffects);
+    expect(parsed.deliverables).toEqual(ledger.deliverables);
     expect(parsed.narrative).toBe(ledger.narrative);
-    expect(ledgerEntryCount(parsed)).toBe(5);
+    expect(ledgerEntryCount(parsed)).toBe(6);
   });
 
   it("semantic placeholder keeps local residue and stays marked compacted", () => {

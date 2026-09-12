@@ -41,6 +41,66 @@
         "debug_until",
         "write_memory"
       ]
+    },
+    "github": {
+      "command": "docker",
+      "args": [
+        "run",
+        "-i",
+        "--rm",
+        "-e",
+        "GITHUB_PERSONAL_ACCESS_TOKEN",
+        "-e",
+        "GITHUB_TOOLS",
+        "ghcr.io/github/github-mcp-server"
+      ],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_PERSONAL_ACCESS_TOKEN}",
+        "GITHUB_TOOLS": "get_me,get_file_contents,get_repository_tree,search_code,search_repositories,list_issues,issue_read,list_pull_requests,pull_request_read,list_commits,get_commit,create_branch,create_pull_request,add_issue_comment,issue_write"
+      },
+      "requiredEnv": ["GITHUB_PERSONAL_ACCESS_TOKEN"],
+      "permission": "ask",
+      "toolPermissions": {
+        "get_me": "auto",
+        "get_file_contents": "auto",
+        "get_repository_tree": "auto",
+        "search_code": "auto",
+        "search_repositories": "auto",
+        "list_issues": "auto",
+        "issue_read": "auto",
+        "list_pull_requests": "auto",
+        "pull_request_read": "auto",
+        "list_commits": "auto",
+        "get_commit": "auto",
+        "create_branch": "ask",
+        "create_pull_request": "ask",
+        "add_issue_comment": "ask",
+        "issue_write": "ask"
+      },
+      "parallelSafe": true,
+      "includeTools": [
+        "get_me",
+        "get_file_contents",
+        "get_repository_tree",
+        "search_code",
+        "search_repositories",
+        "list_issues",
+        "issue_read",
+        "list_pull_requests",
+        "pull_request_read",
+        "list_commits",
+        "get_commit",
+        "create_branch",
+        "create_pull_request",
+        "add_issue_comment",
+        "issue_write"
+      ],
+      "sideEffectTools": [
+        "create_branch",
+        "create_pull_request",
+        "add_issue_comment",
+        "issue_write"
+      ]
     }
   }
 }

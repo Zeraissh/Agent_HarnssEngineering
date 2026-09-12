@@ -166,6 +166,62 @@ describe("planner 前结构化需求澄清门", () => {
     expect(model.requests[2]!.tools.some((t) => t.name === "ask_user")).toBe(false);
   });
 
+  it("skipClarifier 时不跑澄清门，planner 直接看到原任务", async () => {
+    const ask = createAskUserTool({
+      ask: async () => {
+        throw new Error("追问续跑不该再问");
+      },
+    });
+    const model = new FakeModelClient([
+      fakeMessage(
+        [
+          toolUseBlock("plan", PLAN_TOOL_NAME, {
+            subtasks: [
+              {
+                id: "s1",
+                title: "实现 UI",
+                description: "继续本对话的 Desktop UI",
+                acceptance: ["能启动"],
+                dependsOn: [],
+              },
+            ],
+          }),
+        ],
+        "tool_use",
+      ),
+      fakeMessage([textBlock("实现完成")], "end_turn"),
+      fakeMessage(
+        [
+          toolUseBlock("verdict", VERDICT_TOOL_NAME, {
+            passed: true,
+            issues: [],
+            unverified: [],
+            advisory: [],
+            summary: "通过",
+          }),
+        ],
+        "tool_use",
+      ),
+    ]);
+    const sources: string[] = [];
+    const outcome = await runPlanned(
+      { ...baseConfig, tools: [ask] },
+      model,
+      "继续未完成的任务\n\n【本对话锚点】这场对话的原任务是：给项目开发一版 Desktop UI",
+      {
+        skipClarifier: true,
+        onEvent: (source, event) => {
+          if (event.type === "turn_start") sources.push(source);
+        },
+      },
+    );
+    expect(outcome.completed).toBe(true);
+    expect(outcome.clarification).toBeUndefined();
+    expect(sources[0]).toBe("planner");
+    expect(sources).not.toContain("clarifier");
+    expect(JSON.stringify(model.requests[0]!.messages)).toContain("本对话锚点");
+  });
+
   it("计划内所有并行子任务共享 maxTotalTurns，不得按子任务复制总额度", async () => {
     const requests: ModelRequest[] = [];
     const model: ModelClient = {

@@ -3,6 +3,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import {
   Counter,
   Histogram,
+  histogramQuantile,
   MetricsRegistry,
   instrumentModelClient,
   modelCallSeconds,
@@ -218,6 +219,40 @@ describe("OBS-02 · TTFT 与调用时长", () => {
     expect(obsRegistry.renderLines().some((l) => l.startsWith("agent_harness_tool_seconds_count"))).toBe(
       true,
     );
+  });
+});
+
+describe("OBS-02 · 直方图分位数", () => {
+  it("没有读数或坏 q 是 null，不是 0", () => {
+    expect(histogramQuantile(0.5, [{ le: 1, count: 0 }], 0)).toBeNull();
+    expect(histogramQuantile(0, [{ le: 1, count: 1 }], 1)).toBeNull();
+    expect(histogramQuantile(1.1, [{ le: 1, count: 1 }], 1)).toBeNull();
+    expect(histogramQuantile(0.5, [], 3)).toBeNull();
+    const empty = new Histogram({ name: "q", help: "h", buckets: [1] });
+    empty.preregister({});
+    expect(empty.quantiles({})).toBeNull();
+    expect(empty.quantiles({ missing: "x" })).toBeNull();
+  });
+
+  it("在累计桶之间线性插值；落到 +Inf 的分位数仍是 null", () => {
+    // 样本 0.5 / 1.5 / 9 → le=1 累计 1，le=2 累计 2，+Inf 3
+    const buckets = [
+      { le: 1, count: 1 },
+      { le: 2, count: 2 },
+    ];
+    expect(histogramQuantile(0.5, buckets, 3)).toBeCloseTo(1.5);
+    expect(histogramQuantile(1, buckets, 2)).toBeCloseTo(2);
+    expect(histogramQuantile(0.99, buckets, 3)).toBeNull();
+
+    const h = new Histogram({ name: "q", help: "h", labelNames: ["role"], buckets: [1, 2] });
+    h.observe({ role: "execution" }, 0.5);
+    h.observe({ role: "execution" }, 1.5);
+    h.observe({ role: "execution" }, 9);
+    const q = h.quantiles({ role: "execution" });
+    expect(q).not.toBeNull();
+    expect(q!.p50).toBeCloseTo(1.5);
+    expect(q!.p95).toBeNull();
+    expect(q!.p99).toBeNull();
   });
 });
 

@@ -66,6 +66,40 @@ interface HistogramSeries {
   count: number;
 }
 
+/**
+ * Prometheus `histogram_quantile` 的有界实现。
+ * `buckets[].count` 必须已经是累计值（与 `Histogram.observe` 一致）。
+ * 没有读数或 q 不在 (0, 1] → null（没有读数 ≠ 零）。
+ */
+export function histogramQuantile(
+  q: number,
+  buckets: ReadonlyArray<{ le: number; count: number }>,
+  total: number,
+): number | null {
+  if (!Number.isFinite(q) || q <= 0 || q > 1) return null;
+  if (!Number.isFinite(total) || total <= 0) return null;
+  if (buckets.length === 0) return null;
+
+  const sorted = [...buckets]
+    .filter((b) => Number.isFinite(b.le) && Number.isFinite(b.count))
+    .sort((a, b) => a.le - b.le);
+  if (sorted.length === 0) return null;
+
+  const rank = q * total;
+  let prevLe = 0;
+  let prevCount = 0;
+  for (const b of sorted) {
+    if (b.count >= rank) {
+      const span = b.count - prevCount;
+      if (span <= 0) return b.le;
+      return prevLe + ((rank - prevCount) / span) * (b.le - prevLe);
+    }
+    prevLe = b.le;
+    prevCount = b.count;
+  }
+  return null;
+}
+
 export class Histogram {
   readonly name: string;
   readonly help: string;
@@ -113,6 +147,21 @@ export class Histogram {
   snapshot(labels: Labels = {}): { count: number; sum: number } | null {
     const s = this.series.get(seriesKey(this.labelNames, labels));
     return s ? { count: s.count, sum: s.sum } : null;
+  }
+
+  /**
+   * p50/p95/p99。没有这组标签、或 count=0（含预注册空序列）→ null。
+   * 单个分位数落在 +Inf 桶时该项也是 null，不编一个 0。
+   */
+  quantiles(labels: Labels = {}): { p50: number | null; p95: number | null; p99: number | null } | null {
+    const s = this.series.get(seriesKey(this.labelNames, labels));
+    if (!s || s.count <= 0) return null;
+    const buckets = this.buckets.map((le, i) => ({ le, count: s.counts[i]! }));
+    return {
+      p50: histogramQuantile(0.5, buckets, s.count),
+      p95: histogramQuantile(0.95, buckets, s.count),
+      p99: histogramQuantile(0.99, buckets, s.count),
+    };
   }
 
   render(): string[] {

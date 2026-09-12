@@ -25,7 +25,7 @@
   **PATH 复测已做（2026-09-03，bdc3cd9 worktree，同 nightly 口径 ×3 rep）**：三用例 9/9；turns 51→38、tokens 136.6k→79.7k、
   `command not found` 8/9 run → 0；ho-line-count 9/9/9 → 5/6/6 轮。数字表见 `eval/heldout-report-v1.3.0.md` §7，基线 JSON 不动。
 - **OBS-01[~]** — `src/trace.ts` + `trace.jsonl`；`GET /api/runs/:id/trace` 脱敏导出。
-- **RUN-01[~ Phase 1+2]** — ADR-003；`state.json`；崩溃→interrupted；**同 run 热恢复**（checkpoint 边界，`sameRunResume`/`run_resumed`）；预算+grantAudit 进 state。
+- **RUN-01[~ Phase 1+2]** — ADR-003；`state.json`；崩溃→interrupted；**同 run 热恢复**（checkpoint 边界，`sameRunResume`/`run_resumed`）；预算+grantAudit 进 state。**半截 DAG（2026-09-10）**：节点状态落盘后可同 run 续发射（至少一枚 passed）。
 - **MEM-01[~ Phase A+B+C]** — 语义压缩：`[compact_ledger]` + 语义占位（A）；可选 LLM 摘要进账本（B）；
   入口截断 + tier 2 折叠旧轮 + 反应式硬压缩重发（C，见下文「loop / context 四件 ③」）；mutation 4 个。
   **C 之后的一刀（2026-09-03）**：占位符 / 折叠块 results 行带原文首行摘录（≤100 字符 + 行数，`excerpt:`），台账行记
@@ -49,7 +49,8 @@
   （先有危险命令注入评测集，否则分不清"在拦"还是"在乱拦"）；转述未直读的事实已标 `未核实`，勿当一手证据引用。
 
 **下一刀**：CI 绿后开 `MEM-01 Phase B`，或 RUN-02 / MODEL-01 残余。
-RUN-01 残余：SAFE-06 toolTx、CLI 对等 durable、mid-tool 恢复。
+RUN-01 残余：无快照 fail-open；CLI 无追加预算旗标；完成态 plan 追问仍单执行者；CLI 无 `--replan` 入口；CLI 不写 `plan_warning`；旧档案缺 `host` 不标；SAFE-06 MCP 写工具 / bash undo。
+`plan_gated` 崩溃改走 `restore_gate`（同 run 回到确认门，CLI 不代签）；零进度 / 飞行中无检查点不再 409 封死——有任务正文可 reopen 一轮，不假装有检查点。
 MEM-01 残余（Phase C 之后）：保护窗内与任务首条永不压；折叠块按行摘要不做语义合并；tier 2 触发用字符/4 粗估；
 反应式只重发一次；启发式漏检；MCP 写工具靠名字启发。逐条见 docs/08 Phase 5 实施记录的 Phase C 行。
 窗口 / 预算残余：窗口未知时不夹紧；登记表人工维护；夹紧只按 maxTokens + 固定边际算不读真实 token；
@@ -73,12 +74,12 @@ MODEL-01 残余：Web 同步探针回写 compat、成本/延迟真路由、识�
   负责**；下一轮的执行者反馈里附上一轮裁决摘要（`verdictFeedbackSummary`）；核查者仍是
   全新上下文，核查的是本轮指令（`continuationVerifyTask`，原任务只作背景）。续跑轮的
   返工**强制 inherit**（fresh 会把对话正史丢掉）。
-- **plan run 可追加**：续的是对话不是 DAG——下一轮以计划摘要（子任务 / 结局 / 交接 /
+- **plan run 可追加**：完成态续的是对话不是 DAG——下一轮以计划摘要（子任务 / 结局 / 交接 /
   裁决，`buildPlanSummary`）为种子按单执行者跑；执行总账从 plan 的共享预算延续。
-  `replan: true` **没做**（残余，见下）。
+  `replan: true` 与半截 DAG 崩溃续发射已在 2026-09-10 落地（见 docs/08 AGENT-01 / RUN-01）。
 - **归档同口径**：核查 / 编排 / 无检查点的档案都可派生（无检查点 = 无正史新一轮，
-  `run_forked.checkpoint = null` 照实说）；RUN-01 同 run 热恢复规则不变（仅 interrupted +
-  checkpoint + 非 verify/plan）。
+  `run_forked.checkpoint = null` 照实说）；RUN-01 同 run 热恢复：单执行者仍是 interrupted +
+  checkpoint + 非 verify；半截 DAG 另认节点事实（至少一枚 passed）。
 - **唯一结构性阻断 = 执行谱系预算耗尽**，文案带 env 名（`AGENT_TOTAL_MAX_TURNS` /
   `AGENT_TOTAL_TOKEN_BUDGET`）与提法；仍 409。日预算门 / 并发门 / 隔离准入照旧。
 - **每轮新建 AgentLoop**：预算与 Context 水位从检查点延续（与 fork / same-run 同口径），
@@ -462,6 +463,8 @@ auto=--yes/审批 auto。缺的只是**命名的装配预设**（一个三态选
 开关），不是新机制。硬约束：装配条必须继续显示展开后的真实开关值，模式名
 不得替代它——否则又是"界面说谎"那族（V-04）。→ 第一步：写清三档各捆哪些
 开关的对照表，再动 UI。
+**切片（2026-09-10）判据 3+4**：装配条 `run_config.permission.mode` 跟实际开关（标签过期则自定义）；台账已记实际开关反推的 `permissionMode` + `approvals{asked,auto,denied}`。
+整条 D3 仍是 `[~]`（分类器未做）。
 
 **D4. 候选：给各角色 agent 起人名。**
 有趣且与"一人公司"的同事感契合，但要守两条：① **显示层别名 only**——

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { getPack, getPreset, PACKS, selectPackTools } from "../src/presets.js";
+import { getPack, getPreset, PACKS, selectPackTools, DEFAULT_HOST_DISCIPLINES } from "../src/presets.js";
 import { makeTool } from "./helpers.js";
 import { runVerified } from "../src/orchestrate.js";
 import type Anthropic from "@anthropic-ai/sdk";
@@ -25,6 +25,18 @@ describe("domain packs", () => {
     // v1.0 演示教训：给 bash 会被用来绕开 MCP 自建调试栈、taskkill 扫死共享 server
     expect(p!.builtinTools).not.toContain("bash");
     expect(p!.systemPrompt).toContain("不要自建 OpenOCD/GDB");
+    expect(p!.handoffs?.map((h) => h.id)).toEqual(["fix_then_verify"]);
+    expect(p!.systemPrompt).toContain("propose_handoff");
+    const offer = p!.handoffs![0]!;
+    expect(`${offer.label} ${offer.declineLabel}`).not.toMatch(/stm32-coding|stm32-debug|切包/);
+    expect(offer.label).toContain("改固件");
+    expect(offer.declineLabel).toBe("先不用");
+  });
+
+  it("默认宿主先分清对话和任务：闲聊不检索、不写进度单", () => {
+    expect(DEFAULT_HOST_DISCIPLINES).toMatch(/Conversation vs task/);
+    expect(DEFAULT_HOST_DISCIPLINES).toMatch(/does not apply to casual chat/);
+    expect(DEFAULT_HOST_DISCIPLINES).toMatch(/Do not turn a chat into a report/);
   });
 
   it("consult 包：有据咨询 + fetch_url/web_search + rubric 核查 + 禁装饰 emoji", () => {
@@ -46,12 +58,39 @@ describe("domain packs", () => {
     expect(p!.mcp).toBe(false);
     expect(p!.verify.mode).toBe("rubric");
     expect(p!.systemPrompt).toContain(".slide[data-slide");
-    expect(p!.systemPrompt).toContain("DESIGN.md");
+    expect(p!.systemPrompt).not.toContain("DESIGN.md");
+    expect(p!.systemPrompt).toContain("不要把「禁 CDN」理解成「不能有图」");
     expect(p!.systemPrompt).toContain("templates/design/deck-basic");
+    expect(p!.systemPrompt).toContain("templates/design/pm-spec");
+    expect(p!.systemPrompt).toContain("templates/design/team-okrs");
     expect(p!.systemPrompt).toMatch(/pptx/i);
+    expect(p!.systemPrompt).toMatch(/\.pdf/i);
+    expect(p!.systemPrompt).toContain("预览入口");
+    expect(p!.systemPrompt).toContain("导出 PowerPoint");
+    expect(p!.systemPrompt).not.toContain("PPTX 需后导出");
+    expect(p!.systemPrompt).not.toContain("后导出");
+    expect(p!.systemPrompt).not.toContain("宿主只提供下载");
+    expect(p!.verify.instructions).toMatch(/pptx/i);
+    expect(p!.verify.instructions).toContain("存在性");
+    expect(p!.verify.instructions).toContain("扩展名");
+    expect(p!.verify.instructions).toContain("不要解析 OOXML");
+    expect(p!.verify.instructions).not.toContain("后导出");
+    expect(p!.systemPrompt).toMatch(/Conversation vs task/);
+    expect(p!.systemPrompt).toContain("不等于每一句都要交 HTML");
+    expect(p!.systemPrompt).toContain("write_pptx");
+    expect(p!.systemPrompt).toContain("[改稿范围]");
+    expect(p!.systemPrompt).toContain("[点评][slide:");
     expect(p!.builtinTools).toEqual(
-      expect.arrayContaining(["read_file", "write_file", "bash"]),
+      expect.arrayContaining(["read_file", "write_file", "write_pptx", "bash", "web_search", "fetch_url"]),
     );
+    expect(p!.builtinTools).toContain("write_pptx");
+  });
+
+  it("write_pptx 只挂在 design 包，其它内置包不声明", () => {
+    expect(PACKS.design!.builtinTools).toContain("write_pptx");
+    for (const name of Object.keys(PACKS).filter((n) => n !== "design")) {
+      expect(PACKS[name]!.builtinTools ?? []).not.toContain("write_pptx");
+    }
   });
 
   it("stm32-coding 包：固件工程纪律 + 构建验收 + 不接 MCP（编程阶段不碰硬件）", () => {
@@ -149,7 +188,7 @@ describe("domain packs", () => {
     expect(p!.verify.instructions).toContain("读 .kicad_pro");
   });
 
-  it("ts-coding 包：vitest/tsc 双门禁白名单 + 不接 MCP（案例 #7 催生）", () => {
+  it("ts-coding 包：vitest/tsc 双门禁白名单 + GitHub MCP 白名单（不接硬件）", () => {
     const p = getPack("ts-coding");
     expect(p).toBeDefined();
     expect(p!.verify.enabled).toBe(true);
@@ -160,7 +199,23 @@ describe("domain packs", () => {
     expect(p!.verify.readOnlyCommands).not.toContain("npx");
     expect(p!.systemPrompt).toContain("没有】edit_file");
     expect(p!.systemPrompt).toContain("npx vitest run");
-    expect(p!.mcp).toBe(false);
+    expect(p!.systemPrompt).toContain("github__");
+    expect(p!.systemPrompt).toContain("不可信数据");
+    expect(typeof p!.mcp).toBe("object");
+    if (!p!.mcp || typeof p!.mcp !== "object") throw new Error("ts-coding mcp policy missing");
+    expect(p!.mcp.includeTools).toContain("get_file_contents");
+    expect(p!.mcp.includeTools).toContain("create_pull_request");
+    expect(p!.mcp.includeTools).not.toContain("merge_pull_request");
+    expect(p!.mcp.includeTools).not.toContain("flash_firmware");
+    expect(p!.mcp.toolPermissions?.create_pull_request).toBe("ask");
+    expect(p!.mcp.toolPermissions?.get_file_contents).toBe("auto");
+    expect(p!.verify.instructions).toContain("不要调用 github 写工具");
+  });
+
+  it("每个领域包都先分对话再开工，勾选不等于交差", () => {
+    for (const [name, pack] of Object.entries(PACKS)) {
+      expect(pack.systemPrompt, name).toMatch(/Conversation vs task/);
+    }
   });
 
   it("未知包名返回 undefined", () => {

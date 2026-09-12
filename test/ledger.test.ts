@@ -22,6 +22,7 @@ import {
   buildLedgerEntry,
   decideStructuredOutput,
   decideStructuredOutputEffect,
+  emptyApprovalsTally,
   emptyCompactionTally,
   emptyRecoveryTally,
   isExecutorSource,
@@ -31,6 +32,7 @@ import {
   ledgerPath,
   summarizeLedger,
   summarizeTermination,
+  tallyApprovalOutcome,
   STRUCTURED_OUTPUT_BASELINE,
   STRUCTURED_OUTPUT_EFFECT_RULE,
   STRUCTURED_OUTPUT_RULE,
@@ -132,6 +134,51 @@ describe("buildLedgerEntry：只记元数据，且对脏输入不炸", () => {
     // 脏输入不炸也不留 NaN——台账每一行的形状必须一致
     expect(buildLedgerEntry({ ...base, fallbacks: Number.NaN }).fallbacks).toBe(0);
     expect(buildLedgerEntry({ ...base, fallbacks: -3 }).fallbacks).toBe(0);
+  });
+
+  it("agentMd：没加载是 null；加载写 files/chars/truncated，不记路径", () => {
+    expect(buildLedgerEntry(base).agentMd).toBeNull();
+    expect(buildLedgerEntry({
+      ...base,
+      agentMd: { files: 2, chars: 1200, truncated: true },
+    }).agentMd).toEqual({ files: 2, chars: 1200, truncated: true });
+    const e = buildLedgerEntry({
+      ...base,
+      agentMd: { files: 1, chars: 10, truncated: false },
+    });
+    expect(e.agentMd).toEqual({ files: 1, chars: 10, truncated: false });
+    expect(JSON.stringify(e.agentMd)).not.toMatch(/path|AGENT\.md/);
+  });
+
+  it("hooks：未武装是 null，武装写 {fired, blocked}（零次也是对象）", () => {
+    expect(buildLedgerEntry(base).hooks).toBeNull();
+    expect(buildLedgerEntry({ ...base, hooks: { fired: 2, blocked: 1 } }).hooks).toEqual({
+      fired: 2,
+      blocked: 1,
+    });
+    expect(buildLedgerEntry({ ...base, hooks: { fired: -1, blocked: Number.NaN } }).hooks).toEqual({
+      fired: 0,
+      blocked: 0,
+    });
+  });
+
+  it("permissionMode / approvals：新行恒有字段；非法档位归 null；脏计数归 0", () => {
+    const fresh = buildLedgerEntry(base);
+    expect(fresh.permissionMode).toBeNull();
+    expect(fresh.approvals).toEqual({ asked: 0, auto: 0, denied: 0 });
+
+    expect(buildLedgerEntry({ ...base, permissionMode: "auto", approvals: { asked: 2, auto: 3, denied: 1 } })).toMatchObject({
+      permissionMode: "auto",
+      approvals: { asked: 2, auto: 3, denied: 1 },
+    });
+    expect(buildLedgerEntry({
+      ...base,
+      permissionMode: "bypass" as unknown as "manual",
+      approvals: { asked: -2, auto: Number.NaN, denied: 1.8 },
+    })).toMatchObject({
+      permissionMode: null,
+      approvals: { asked: 0, auto: 0, denied: 1 },
+    });
   });
 });
 
@@ -357,6 +404,102 @@ describe("上下文压缩计数（compaction）", () => {
   });
 });
 
+describe("分层 AGENT.md 台账（docs/09 §4.7）", () => {
+  it("两个宿主的写入口都接了 agentMd，读数器把它印出来", () => {
+    const web = readFileSync(join(__dirname, "..", "ui", "server.ts"), "utf-8");
+    const cli = readFileSync(join(__dirname, "..", "src", "cli.ts"), "utf-8");
+    const report = readFileSync(join(__dirname, "..", "eval", "ledger-report.ts"), "utf-8");
+    expect(web).toMatch(/agentMd:\s*\(\(\) => \{/);
+    expect(cli).toMatch(/agentMd:\s*agentMdBundle/);
+    expect(report).toMatch(/s\.agentMd/);
+  });
+});
+
+describe("D3 审批计数（docs/09 §4.3 判据 4）", () => {
+  it("只认结局：请求不计；人允/拒、自动放行、过期各进对应桶", () => {
+    const t = emptyApprovalsTally();
+    tallyApprovalOutcome(t, { type: "approval_request", actor: "user" });
+    tallyApprovalOutcome(t, { type: "plan_approval_resolved", actor: "user", decision: "allow" });
+    tallyApprovalOutcome(t, { type: "approval_resolved", actor: "mystery", decision: "deny" });
+    expect(t).toEqual({ asked: 0, auto: 0, denied: 0 });
+
+    tallyApprovalOutcome(t, { type: "approval_resolved", actor: "user", decision: "allow" });
+    tallyApprovalOutcome(t, { type: "approval_resolved", actor: "user", decision: "deny" });
+    tallyApprovalOutcome(t, { type: "approval_resolved", actor: "auto-run", decision: "allow" });
+    tallyApprovalOutcome(t, { type: "approval_resolved", actor: "auto-rule", decision: "allow" });
+    tallyApprovalOutcome(t, { type: "approval_expired" });
+    expect(t).toEqual({ asked: 3, auto: 2, denied: 1 });
+  });
+
+  it("自动放行不得记进 asked——否则 --yes 看起来像问过一遍人", () => {
+    const t = emptyApprovalsTally();
+    tallyApprovalOutcome(t, { type: "approval_resolved", actor: "auto-run", decision: "allow" });
+    expect(t.asked).toBe(0);
+    expect(t.auto).toBe(1);
+    expect(t.denied).toBe(0);
+  });
+
+  it("两个宿主的写入口都接了 permissionMode / approvals，读数器把它印出来", () => {
+    const web = readFileSync(join(__dirname, "..", "ui", "server.ts"), "utf-8");
+    const cli = readFileSync(join(__dirname, "..", "src", "cli.ts"), "utf-8");
+    const report = readFileSync(join(__dirname, "..", "eval", "ledger-report.ts"), "utf-8");
+    expect(web).toMatch(/tallyApprovalOutcome\(\(run\.approvalsTally \?\?= emptyApprovalsTally\(\)\), event\)/);
+    expect(web).toMatch(/permissionMode:\s*matchPermissionMode\(/);
+    expect(web).toMatch(/approvals:\s*run\.approvalsTally \?\? emptyApprovalsTally\(\)/);
+    expect(cli).toMatch(/tallyApprovalOutcome\(ledgerApprovals/);
+    expect(cli).toMatch(/permissionMode:\s*matchPermissionMode\(/);
+    expect(cli).toMatch(/approvals:\s*ledgerApprovals/);
+    expect((cli.match(/respondCliApproval\(/g) ?? []).length).toBeGreaterThanOrEqual(5);
+    expect(report).toMatch(/s\.approvals/);
+  });
+
+  it("summarizeLedger.approvals：只算带字段的行；老行是未知不是零次问", () => {
+    const legacy = JSON.parse(
+      '{"at":1,"runId":"old","host":"cli","taskChars":1,"pack":null,"model":null,"effort":null,' +
+        '"mode":"single","verify":false,"rubric":false,"stopReason":"completed","error":null,' +
+        '"turns":1,"reworks":null,"finalPassed":null,"verifications":[],"verifierBudgetTurns":null,' +
+        '"verifierHitBudget":false,"fallbackChain":null,"fallbacks":0,"tools":{},"durationMs":1,' +
+        '"structuredDelivery":true}',
+    ) as RunLedgerEntry;
+    expect(legacy.permissionMode).toBeUndefined();
+    expect(legacy.approvals).toBeUndefined();
+    expect(summarizeLedger([legacy]).approvals).toEqual({
+      rows: 0,
+      modes: { manual: 0, plan: 0, auto: 0, custom: 0 },
+      asked: 0,
+      auto: 0,
+      denied: 0,
+    });
+
+    const s = summarizeLedger([
+      buildLedgerEntry({ ...base, permissionMode: "manual", approvals: { asked: 2, auto: 0, denied: 1 } }),
+      buildLedgerEntry({ ...base, permissionMode: "auto", approvals: { asked: 0, auto: 4, denied: 0 } }),
+      buildLedgerEntry({ ...base, permissionMode: null, approvals: { asked: 1, auto: 1, denied: 0 } }),
+      legacy,
+    ]);
+    expect(s.approvals).toEqual({
+      rows: 3,
+      modes: { manual: 1, plan: 0, auto: 1, custom: 1 },
+      asked: 3,
+      auto: 5,
+      denied: 1,
+    });
+  });
+});
+
+describe("外部 hooks 台账（docs/09 §4.2）", () => {
+  it("两个宿主的写入口都接了 hooks，读数器把它印出来", () => {
+    const web = readFileSync(join(__dirname, "..", "ui", "server.ts"), "utf-8");
+    const cli = readFileSync(join(__dirname, "..", "src", "cli.ts"), "utf-8");
+    const report = readFileSync(join(__dirname, "..", "eval", "ledger-report.ts"), "utf-8");
+    expect(web).toMatch(/tallyHookEvent\(\(run\.hooksTally \?\?= emptyHooksTally\(\)\), event\)/);
+    expect(web).toMatch(/hooks:\s*hookSpec \? \(run\.hooksTally \?\? emptyHooksTally\(\)\) : null/);
+    expect(cli).toMatch(/tallyHookEvent\(ledgerHooks, event\)/);
+    expect(cli).toMatch(/hooks:\s*ledgerHooks,/);
+    expect(report).toMatch(/s\.hooks/);
+  });
+});
+
 /**
  * MEM-01 窗口 / 预算分离：台账行记窗口与预算各带来源。150k 预算在 1M 窗口上压了三个月
  * 没人发现，正是因为没有一处把这两个数并排放着——这里锁的是"两个数 + 两个来源都在行里"。
@@ -393,7 +536,7 @@ describe("上下文窗口 / 预算（context）", () => {
     const s = summarizeLedger(rows);
     expect(s.context.rows).toBe(4);
     expect(s.context.windowSources).toEqual({ env: 1, learned: 1, registry: 1, unknown: 1 });
-    expect(s.context.budgetSources).toEqual({ run: 1, env: 1, pack: 0, default: 2, unknown: 0 });
+    expect(s.context.budgetSources).toEqual({ run: 1, env: 1, pack: 0, window: 0, default: 2, unknown: 0 });
     expect(s.context.budgets).toEqual({ "150000": 2, "524288": 1, "59904": 1 });
     // 三行窗口已知：150000/1048576 + 524288/1048576 + 59904/128000，均值 ≈ 0.370
     expect(s.context.meanBudgetToWindow).toBeCloseTo((150_000 / 1_048_576 + 524_288 / 1_048_576 + 59_904 / 128_000) / 3, 6);

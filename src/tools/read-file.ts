@@ -1,16 +1,16 @@
 import { readFile } from "node:fs/promises";
 import type { Tool } from "../types.js";
-import { credentialLikeName, resolveReadable, truncate } from "./fs-util.js";
+import { credentialLikeName, resolveReadable, truncate, WORKDIR_OR_ROOT_PATH } from "./fs-util.js";
 
 export const readFileTool: Tool = {
   name: "read_file",
   description:
-    "Read a UTF-8 text file inside the working directory (or one of the configured read-only roots, using an absolute path). Call this whenever you need the contents of a specific file before analyzing or modifying it. Input path is relative to the working directory. " +
+    "Read a UTF-8 text file inside the working directory or a configured extra root (writable allowlisted projects or read-only roots). Absolute paths are allowed when they stay inside those roots. Call this whenever you need the contents of a specific file before analyzing or modifying it. " +
     "For large files, pass offset (1-based starting line) and/or limit (max lines) to read a slice.",
   inputSchema: {
     type: "object",
     properties: {
-      path: { type: "string", description: "File path relative to the working directory" },
+      path: { type: "string", description: WORKDIR_OR_ROOT_PATH },
       // 案例 #9 第四跑催生：verifier 读大 s-expression 文件时幻觉了这个参数，
       // 被失败开放校验静默放行、返回文件头，还把"没生效"写进了裁决。
       // 模型会自发想要的参数,是真需求的最诚实信号——补上,而不是让幻觉继续撞墙。

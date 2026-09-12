@@ -1,8 +1,8 @@
 /**
  * features/settings — 设置中心（T7）。
  *
- * 零依赖原生 ESM。独立视图（hash 路由 #/settings），分六组：
- *   外观 / 模型 / 运行默认值 / 通知 / 快捷键 / 关于。
+ * 零依赖原生 ESM。独立视图（hash 路由 #/settings），分组：
+ *   外观 / 模型 / MCP / 领域包 / 运行默认值 / 通知 / 快捷键 / 消耗 / 关于。
  *
  * 与 command-palette / notifications / memory-panel 同一约定：
  *   1) 纯函数层（设置读写 / 容错解析 / 旧键迁移 / composer 默认值派生 /
@@ -23,11 +23,13 @@
 
 import { SHORTCUTS } from "./command-palette.js";
 import { persistPromptChoice } from "./notifications.js";
+import { attachUsagePanel } from "./usage.js";
 import {
   READING_MODE_COPY,
   readReadingMode,
   writeReadingMode,
 } from "./reading-mode.js";
+import { upgradeSelects } from "./theme-select.js";
 
 // ---------------------------------------------------------------
 // 常量
@@ -57,9 +59,11 @@ export const SETTINGS_SECTIONS = [
   { id: "settings-appearance", label: "外观", icon: "ph-palette" },
   { id: "settings-models", label: "模型", icon: "ph-cpu" },
   { id: "settings-mcp", label: "MCP", icon: "ph-plugs-connected" },
+  { id: "settings-packs", label: "领域包", icon: "ph-package" },
   { id: "settings-defaults", label: "运行默认值", icon: "ph-sliders-horizontal" },
   { id: "settings-notifications", label: "通知", icon: "ph-bell" },
   { id: "settings-shortcuts", label: "快捷键", icon: "ph-keyboard" },
+  { id: "settings-usage", label: "消耗", icon: "ph-chart-bar" },
   { id: "settings-about", label: "关于", icon: "ph-info" },
 ];
 
@@ -69,6 +73,29 @@ export const SETTINGS_SECTIONS = [
 
 export const MODELS_API_URL = "/api/models";
 export const MODELS_TEST_API_URL = "/api/models/test";
+export const PACKS_API_URL = "/api/packs";
+
+/** 设置页领域包列表：只收名字与描述，不要把 systemPrompt 画进 DOM。 */
+export function parsePacksPayload(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const slim = (list) => {
+    if (!Array.isArray(list)) return [];
+    return list
+      .filter((item) => item && typeof item.name === "string" && item.name.trim())
+      .map((item) => ({
+        name: item.name.trim(),
+        description: typeof item.description === "string" ? item.description : "",
+        measured: item.measured === true,
+        builtinTools: Array.isArray(item.builtinTools) ? item.builtinTools.map(String) : [],
+        verifyEnabled: item.verifyEnabled === true,
+      }));
+  };
+  return {
+    drafts: slim(raw.drafts),
+    installed: slim(raw.installed),
+    root: typeof raw.root === "string" && raw.root ? raw.root : null,
+  };
+}
 
 export const MODEL_PROVIDER_CHOICES = [
   { id: "anthropic", label: "Anthropic / Claude 兼容" },
@@ -133,6 +160,53 @@ export function newModelId() {
 
 export function modelOptionLabel(m) {
   return `${m.label}（${m.provider} · ${m.model}）`;
+}
+
+/** composer 执行模型选项：附窗口预览（有登记/已学才写数，未知不瞎猜）。 */
+export function executorModelOptionLabel(m) {
+  const base = modelOptionLabel(m);
+  const win = m?.contextWindow;
+  if (!win || win.windowSource === "unknown" || win.window == null) {
+    return `${base} · 窗口未知`;
+  }
+  const k = win.window >= 1000 ? `${Math.floor(win.window / 1000)}k` : String(win.window);
+  const src = win.windowSource === "learned" ? "已学" : win.windowSource === "registry" ? "登记" : win.windowSource;
+  return `${base} · 窗口 ${k}（${src}）`;
+}
+
+/**
+ * 把 /api/models 填进 composer 执行模型下拉。
+ * @returns {{selectedId: string|null, changed: boolean}}
+ */
+export function fillExecutorModelSelect(select, payload) {
+  if (!select || !payload || !Array.isArray(payload.models)) {
+    return { selectedId: null, changed: false };
+  }
+  const models = payload.models;
+  const roles = payload.roles ?? {};
+  const selectedId = typeof roles.executor === "string" ? roles.executor : null;
+  const prev = select.value;
+  select.innerHTML = "";
+  if (models.length === 0) {
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = "执行 · 未配置模型库";
+    select.appendChild(opt);
+    select.disabled = true;
+    return { selectedId: null, changed: prev !== "" };
+  }
+  for (const m of models) {
+    const opt = document.createElement("option");
+    opt.value = m.id;
+    opt.textContent = executorModelOptionLabel(m);
+    select.appendChild(opt);
+  }
+  if (selectedId && models.some((m) => m.id === selectedId)) {
+    select.value = selectedId;
+  } else {
+    select.value = models[0].id;
+  }
+  return { selectedId: select.value || null, changed: prev !== select.value };
 }
 
 /** 角色下拉选项：允许空的角色首项是「跟随执行 / 不配置」。 */
@@ -239,7 +313,7 @@ const EFFORT_LABELS = { low: "低", medium: "中", high: "高", xhigh: "很高",
 /**
  * @typedef {{
  *   version:number,
- *   defaults:{ effort:string, verify:boolean, autoApprove:boolean, predictiveInput:boolean },
+ *   defaults:{ effort:string, verify:boolean, autoApprove:boolean },
  *   badge:boolean,
  * }} UiSettings
  */
@@ -252,7 +326,7 @@ const EFFORT_LABELS = { low: "低", medium: "中", high: "高", xhigh: "很高",
 export function defaultSettings() {
   return {
     version: SETTINGS_SCHEMA_VERSION,
-    defaults: { effort: "", verify: false, autoApprove: true, predictiveInput: false },
+    defaults: { effort: "", verify: false, autoApprove: true },
     badge: true,
   };
 }
@@ -278,7 +352,6 @@ export function parseSettings(raw) {
   if (typeof d.effort === "string") base.defaults.effort = d.effort;
   if (typeof d.verify === "boolean") base.defaults.verify = d.verify;
   if (typeof d.autoApprove === "boolean") base.defaults.autoApprove = d.autoApprove;
-  if (typeof d.predictiveInput === "boolean") base.defaults.predictiveInput = d.predictiveInput;
   if (typeof obj.badge === "boolean") base.badge = obj.badge;
   return base;
 }
@@ -358,14 +431,13 @@ export function migrateLegacyPrefs(storage, settings) {
  * composer 默认值派生。这就是"运行默认值"分组与 composer 的同源点：
  * composer 启动时与本视图读写同一份 settings。
  * @param {UiSettings} settings
- * @returns {{ effort:string, verify:boolean, autoApprove:boolean, predictiveInput:boolean }}
+ * @returns {{ effort:string, verify:boolean, autoApprove:boolean }}
  */
 export function composerDefaults(settings) {
   return {
     effort: settings?.defaults?.effort ?? "",
     verify: Boolean(settings?.defaults?.verify),
     autoApprove: settings?.defaults?.autoApprove !== false,
-    predictiveInput: settings?.defaults?.predictiveInput === true,
   };
 }
 
@@ -473,9 +545,12 @@ const VIEW_ID = "settings-view";
  *   getHarnessSnapshot()        → /api/harness 快照或 null（档位、版本、工作目录）
  *   onApplyComposerDefaults(p)  → 设置页改动实时同步 composer 控件
  *   onModelsSaved()             → 模型配置保存成功（宿主刷新 /api/harness 快照，composer pill 同步）
+ *   onPacksChanged()            → 领域包安装/丢弃后刷新可选包菜单
  *   onOpenSettings()            → 侧栏齿轮点击（宿主写 hash 路由）
  *   onCloseSettings()           → 返回上一视图（宿主决定 history.back 或回 "#/")
  *   onReplayOnboarding()        → 再看一遍新手引导（设置 → 关于）
+ *   fetchUsage()                → GET /api/usage 载荷（消耗分组嵌图；缺则只留说明）
+ *   nowUsage()                  → 消耗切片的当前时刻（测试注入）
  *   onAnnounce(msg)             → aria-live 播报（可选）
  *
  * env（测试注入）：doc / win / storage / Notification / fetchImpl（模型库读写；
@@ -670,7 +745,9 @@ export function initSettingsView(host = {}, env = {}) {
 
   const modelsNote = doc.createElement("p");
   modelsNote.className = "settings-card-note";
-  modelsNote.textContent = "模型库与角色分配保存在服务端。配置对新任务生效；进行中的任务不受影响。";
+  modelsNote.textContent =
+    "模型库落在服务端工作目录的 .agent-models.json。添加、删除或改角色会立刻写盘；重启宿主仍在。" +
+    "切换执行模型后，新任务与下一轮对话立刻用新模型，并按该模型窗口能力重算水位；进行中的这一轮不受影响。";
   modelsSection.appendChild(modelsNote);
 
   const modelsSource = doc.createElement("p");
@@ -765,7 +842,7 @@ export function initSettingsView(host = {}, env = {}) {
   modelSubmitBtn.type = "button";
   modelSubmitBtn.className = "btn btn--primary";
   modelSubmitBtn.id = "settings-model-submit";
-  modelSubmitBtn.textContent = "添加到模型库";
+  modelSubmitBtn.textContent = "保存到模型库";
   const modelCancelBtn = doc.createElement("button");
   modelCancelBtn.type = "button";
   modelCancelBtn.className = "btn btn--ghost";
@@ -823,7 +900,8 @@ export function initSettingsView(host = {}, env = {}) {
   modelsSaveBtn.type = "button";
   modelsSaveBtn.className = "btn btn--primary";
   modelsSaveBtn.id = "settings-models-save";
-  modelsSaveBtn.textContent = "保存模型配置";
+  modelsSaveBtn.textContent = "立即保存";
+  modelsSaveBtn.title = "条目改动会自动写盘；此按钮用于确认或重试失败的保存";
   const modelsSyncEnvBtn = doc.createElement("button");
   modelsSyncEnvBtn.type = "button";
   modelsSyncEnvBtn.className = "btn btn--ghost";
@@ -937,7 +1015,7 @@ export function initSettingsView(host = {}, env = {}) {
     modelApiKeyInput.dataset.touched = "0";
     modelApiKeyInput.placeholder = "留空 = 使用环境变量";
     modelFormLegend.textContent = "添加模型";
-    modelSubmitBtn.textContent = "添加到模型库";
+    modelSubmitBtn.textContent = "保存到模型库";
     modelCancelBtn.hidden = true;
   }
 
@@ -972,9 +1050,10 @@ export function initSettingsView(host = {}, env = {}) {
     if (editingModelId === id) resetModelForm();
     modelsDirty = true;
     renderModelsAll();
-    const msg = ["已删除模型（保存后生效）", ...result.warnings].join("；");
+    const msg = ["已删除模型", ...result.warnings].filter(Boolean).join("；");
     setModelsStatus(msg);
     host.onAnnounce?.(msg);
+    void persistModels({ quietStatus: true });
   }
 
   function upsertModelFromForm() {
@@ -1020,7 +1099,9 @@ export function initSettingsView(host = {}, env = {}) {
     resetModelForm();
     renderModelsAll();
     setFormStatus("");
-    setModelsStatus("模型库已更新（保存后生效）");
+    void persistModels({
+      successHint: "已写入 .agent-models.json（重启后仍在）",
+    });
   }
 
   async function testModelFromForm() {
@@ -1092,13 +1173,21 @@ export function initSettingsView(host = {}, env = {}) {
   }
 
   async function saveModels() {
-    if (!fetcher || !modelsState) return;
+    return persistModels({});
+  }
+
+  /**
+   * 立刻 PUT 到服务端写 .agent-models.json。
+   * 添加/删除/改角色走这条——两步草稿曾让人以为「加进库」就持久了，重启全丢。
+   */
+  async function persistModels({ successHint, quietStatus } = {}) {
+    if (!fetcher || !modelsState) return false;
     if (!modelsState.roles.executor) {
       setModelsStatus("请先在「角色分配」里为执行选择一个模型", true);
-      return;
+      return false;
     }
     modelsSaveBtn.disabled = true;
-    setModelsStatus("正在保存…");
+    if (!quietStatus) setModelsStatus("正在保存…");
     try {
       const res = await fetcher(MODELS_API_URL, {
         method: "PUT",
@@ -1108,7 +1197,7 @@ export function initSettingsView(host = {}, env = {}) {
       const data = await res.json().catch(() => null);
       if (!res.ok) {
         setModelsStatus(data?.error ?? `保存失败（HTTP ${res.status}）`, true);
-        return;
+        return false;
       }
       const parsed = parseModelsPayload(data);
       if (parsed) modelsState = parsed;
@@ -1116,21 +1205,24 @@ export function initSettingsView(host = {}, env = {}) {
       modelsDirty = false;
       resetModelForm();
       renderModelsAll();
-      setModelsStatus("已保存——对新任务生效；进行中的任务不受影响");
-      host.onAnnounce?.("模型配置已保存，对新任务生效");
-      // composer 的角色 pill 读 /api/harness：保存成功后立刻刷新快照
+      const hint = successHint
+        ?? "已写入 .agent-models.json——新任务与下一轮立刻生效，并按执行模型重算窗口；进行中的这一轮不受影响";
+      setModelsStatus(hint);
+      host.onAnnounce?.("模型配置已保存");
       host.onModelsSaved?.();
+      return true;
     } catch {
       setModelsStatus("保存请求未能发出——请检查网络或服务端状态", true);
+      return false;
     } finally {
       modelsSaveBtn.disabled = false;
     }
   }
 
-  modelSubmitBtn.addEventListener("click", upsertModelFromForm);
+  modelSubmitBtn.addEventListener("click", () => { void upsertModelFromForm(); });
   modelCancelBtn.addEventListener("click", () => { resetModelForm(); setFormStatus(""); });
   modelTestBtn.addEventListener("click", () => { void testModelFromForm(); });
-  modelsSaveBtn.addEventListener("click", () => { void saveModels(); });
+  modelsSaveBtn.addEventListener("click", () => { void persistModels({}); });
   modelsSyncEnvBtn.addEventListener("click", async () => {
     if (!fetcher) return;
     modelsSyncEnvBtn.disabled = true;
@@ -1157,7 +1249,7 @@ export function initSettingsView(host = {}, env = {}) {
       modelsState.roles = { ...modelsState.roles, [meta.key]: roleSelects[meta.key].value || null };
       modelsDirty = true;
       renderRoleSelects();
-      setModelsStatus("角色分配已修改（保存后生效）");
+      void persistModels({ successHint: "角色分配已写入 .agent-models.json" });
     });
   }
 
@@ -1264,6 +1356,113 @@ export function initSettingsView(host = {}, env = {}) {
   });
   void refreshMcp();
 
+  // ---- 领域包（文件草稿签字安装）----
+  const packsSection = addSection("settings-packs", "领域包");
+  const packsNote = doc.createElement("p");
+  packsNote.className = "settings-card-note";
+  packsNote.textContent =
+    "草稿不能选用。签字安装后才进菜单。生成器只写名字、描述和工作循环；MCP、探针锁和核查默认关，且标明未实测。";
+  packsSection.appendChild(packsNote);
+  const packsDraftsTitle = doc.createElement("h3");
+  packsDraftsTitle.className = "settings-subhead";
+  packsDraftsTitle.textContent = "待安装草稿";
+  packsSection.appendChild(packsDraftsTitle);
+  const packsDrafts = doc.createElement("div");
+  packsDrafts.id = "settings-packs-drafts";
+  packsDrafts.className = "settings-models-list";
+  packsSection.appendChild(packsDrafts);
+  const packsInstalledTitle = doc.createElement("h3");
+  packsInstalledTitle.className = "settings-subhead";
+  packsInstalledTitle.textContent = "已安装（文件包）";
+  packsSection.appendChild(packsInstalledTitle);
+  const packsInstalled = doc.createElement("div");
+  packsInstalled.id = "settings-packs-installed";
+  packsInstalled.className = "settings-models-list";
+  packsSection.appendChild(packsInstalled);
+  const packsStatus = doc.createElement("p");
+  packsStatus.id = "settings-packs-status";
+  packsStatus.className = "settings-field-hint";
+  packsSection.appendChild(packsStatus);
+
+  const escPack = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+
+  function renderPackCards(listEl, items, emptyText, actions) {
+    if (!items.length) {
+      listEl.innerHTML = `<p class="settings-field-hint">${escPack(emptyText)}</p>`;
+      return;
+    }
+    listEl.innerHTML = items.map((p) =>
+      `<div class="settings-model-card" data-pack-name="${escPack(p.name)}">` +
+      `<strong>${escPack(p.name)}</strong> · ${escPack(p.description || "（无描述）")}` +
+      (actions
+        ? `<div class="settings-model-form-actions">` +
+          `<button type="button" class="btn btn--primary" data-pack-install="${escPack(p.name)}">安装</button>` +
+          `<button type="button" class="btn btn--ghost" data-pack-discard="${escPack(p.name)}">丢弃</button>` +
+          `</div>`
+        : "") +
+      `</div>`,
+    ).join("");
+  }
+
+  async function loadPacks() {
+    if (!fetcher) {
+      packsStatus.textContent = "当前环境无法连接服务端";
+      return;
+    }
+    try {
+      const res = await fetcher(PACKS_API_URL);
+      const data = await res.json().catch(() => null);
+      const parsed = parsePacksPayload(data);
+      if (!res.ok || !parsed) {
+        packsStatus.textContent = data?.error ?? `领域包列表加载失败（HTTP ${res.status}）`;
+        return;
+      }
+      renderPackCards(packsDrafts, parsed.drafts, "没有待安装的草稿。对话里可用 draft_domain_pack 起草。", true);
+      renderPackCards(packsInstalled, parsed.installed, "还没有签字安装的文件包。内置包在提交栏里选。", false);
+      packsStatus.textContent = parsed.root
+        ? `文件包目录：${parsed.root}`
+        : "此宿主未配置文件包目录（测试或未挂载）。";
+    } catch {
+      packsStatus.textContent = "无法读取领域包列表";
+    }
+  }
+
+  packsDrafts.addEventListener("click", (event) => {
+    const t = event.target instanceof Element ? event.target : null;
+    const install = t?.closest?.("[data-pack-install]");
+    const discard = t?.closest?.("[data-pack-discard]");
+    if (install) {
+      const name = install.getAttribute("data-pack-install");
+      void fetcher(`${PACKS_API_URL}/drafts/${encodeURIComponent(name)}/install`, { method: "POST" })
+        .then(async (res) => {
+          const data = await res.json().catch(() => null);
+          if (!res.ok) {
+            packsStatus.textContent = data?.error ?? `安装失败（HTTP ${res.status}）`;
+            return;
+          }
+          host.onAnnounce?.(`已安装领域包 ${name}`);
+          host.onPacksChanged?.();
+          void loadPacks();
+        });
+      return;
+    }
+    if (discard) {
+      const name = discard.getAttribute("data-pack-discard");
+      void fetcher(`${PACKS_API_URL}/drafts/${encodeURIComponent(name)}`, { method: "DELETE" })
+        .then(async (res) => {
+          const data = await res.json().catch(() => null);
+          if (!res.ok) {
+            packsStatus.textContent = data?.error ?? `丢弃失败（HTTP ${res.status}）`;
+            return;
+          }
+          host.onAnnounce?.(`已丢弃草稿 ${name}`);
+          void loadPacks();
+        });
+    }
+  });
+
   // ---- 分组三：运行默认值 ----
   const defaultsSection = addSection("settings-defaults", "运行默认值");
   const defaultsNote = doc.createElement("p");
@@ -1307,11 +1506,6 @@ export function initSettingsView(host = {}, env = {}) {
   };
   const verifyInput = buildToggle("settings-verify", "独立核查", "新对话默认开启独立核查；提交栏里可逐次关掉。");
   const autoApproveInput = buildToggle("settings-auto-approve", "自动放行工具", "新对话默认自动放行低风险工具；写入仍受工作目录边界约束。");
-  const predictiveInput = buildToggle(
-    "settings-predictive",
-    "输入补全（实验性）",
-    "根据欢迎页示例和最近对话标题补全当前输入，按 Tab 接受。默认关，不调模型。",
-  );
 
   effortSelect.addEventListener("change", () => {
     settings = updateSettings(settings, { defaults: { effort: effortSelect.value } });
@@ -1332,12 +1526,6 @@ export function initSettingsView(host = {}, env = {}) {
     try { storage?.setItem(LEGACY_AUTO_APPROVE_KEY, autoApproveInput.checked ? "1" : "0"); } catch { /* ignore */ }
     host.onApplyComposerDefaults?.({ autoApprove: autoApproveInput.checked });
     host.onAnnounce?.(autoApproveInput.checked ? "新对话将默认自动放行工具" : "新对话默认逐条审批工具");
-  });
-  predictiveInput.addEventListener("change", () => {
-    settings = updateSettings(settings, { defaults: { predictiveInput: predictiveInput.checked } });
-    persist();
-    host.onApplyComposerDefaults?.({ predictiveInput: predictiveInput.checked });
-    host.onAnnounce?.(predictiveInput.checked ? "已打开实验性输入补全" : "已关闭输入补全");
   });
 
   // ---- 分组四：通知 ----
@@ -1439,6 +1627,23 @@ export function initSettingsView(host = {}, env = {}) {
   }
   shortcutSection.appendChild(scList);
 
+  // ---- 分组：消耗（侧栏不再单列入口，台账图画在这里）----
+  const usageSection = addSection("settings-usage", "消耗");
+  /** @type {{ refresh: () => Promise<void> } | null} */
+  let usagePanel = null;
+  if (typeof host.fetchUsage === "function") {
+    usagePanel = attachUsagePanel(usageSection, {
+      fetchUsage: host.fetchUsage,
+      now: typeof host.nowUsage === "function" ? host.nowUsage : undefined,
+      idPrefix: "settings-usage",
+    });
+  } else {
+    const usageNote = doc.createElement("p");
+    usageNote.className = "settings-card-note";
+    usageNote.textContent = "本机台账里的运行轮次与已计价成本。台账不记 token 原文，图上按模型堆叠的是轮次。";
+    usageSection.appendChild(usageNote);
+  }
+
   // ---- 分组六：关于 ----
   const aboutSection = addSection("settings-about", "关于");
   const aboutList = doc.createElement("dl");
@@ -1523,13 +1728,14 @@ export function initSettingsView(host = {}, env = {}) {
 
     verifyInput.checked = settings.defaults.verify;
     autoApproveInput.checked = settings.defaults.autoApprove;
-    predictiveInput.checked = settings.defaults.predictiveInput === true;
     badgeInput.checked = badgeEnabled(settings);
 
     renderPermission();
     renderAbout();
     // 模型库数据在服务端：每次打开都拉一次最新（外部可能刚 PUT 过）
     void loadModels();
+    void loadPacks();
+    void usagePanel?.refresh();
   }
 
   /** 焦点移交某个分组（命令面板「模型设置」直达用） */
@@ -1544,6 +1750,7 @@ export function initSettingsView(host = {}, env = {}) {
   function openView(sectionId) {
     if (open) {
       // 已打开时重复调用 = 只换焦点（命令面板直达分组的路径）
+      if (sectionId === "settings-usage") void usagePanel?.refresh();
       if (sectionId) focusSection(sectionId);
       return;
     }
@@ -1560,6 +1767,8 @@ export function initSettingsView(host = {}, env = {}) {
 
   function closeView() {
     if (!open) return;
+    // 关设置前若还有未落盘改动，补一次写盘（自动保存失败或竞态时的兜底）
+    if (modelsDirty) void persistModels({ quietStatus: true });
     open = false;
     view.hidden = true;
     if (restoreFocusTo && typeof restoreFocusTo.focus === "function" && doc.contains?.(restoreFocusTo) !== false) {
@@ -1578,6 +1787,7 @@ export function initSettingsView(host = {}, env = {}) {
 
   // 角标偏好在首次打开前就该生效（启动即隐藏角标，不用等进设置页）
   applyBadgePref();
+  upgradeSelects(view);
 
   return {
     open: openView,
@@ -1587,6 +1797,7 @@ export function initSettingsView(host = {}, env = {}) {
     refresh,
     /** 测试与诊断用 */
     getSettings: () => settings,
+    fillExecutorModelSelect,
   };
 }
 

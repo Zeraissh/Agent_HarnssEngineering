@@ -20,6 +20,7 @@ import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { createUiServer, type UiServerHandle } from "../ui/server.js";
+import { mergeRunReadRoots, parseExtraWorkdirs } from "../ui/workdirs.js";
 import { resetObservabilityMetrics } from "../src/metrics.js";
 import { clearCapabilityCache } from "../src/model-capability.js";
 import { FakeModelClient, fakeMessage, makeTool, textBlock, toolUseBlock } from "./helpers.js";
@@ -56,22 +57,25 @@ async function makeHost(opts: {
   workdirs?: string[];
   storeFile?: string | null;
   allowedHosts?: string[];
+  designDraftsDir?: string;
   script?: import("@anthropic-ai/sdk").default.Message[];
   tools?: import("../src/types.js").Tool[];
-} = {}): Promise<{ base: string; hostWorkdir: string; storeFile: string }> {
+} = {}): Promise<{ base: string; hostWorkdir: string; storeFile: string; draftsDir: string }> {
   const dir = await mkdtemp(join(tmpdir(), "workdirs-api-"));
   tempDirs.push(dir);
   const hostWorkdir = resolve(opts.workdir ?? dir);
   const storeFile = opts.storeFile === undefined ? join(dir, ".agent-workdirs.json") : opts.storeFile;
+  const draftsDir = resolve(opts.designDraftsDir ?? join(dir, "injected-drafts"));
   handle = createUiServer({
     modelClient: new FakeModelClient(opts.script ?? [fakeMessage([textBlock("ok")], "end_turn")]),
     tools: opts.tools ?? [makeTool({ name: "noop", permission: "auto", parallelSafe: true })],
     workdir: hostWorkdir,
     ...(opts.workdirs ? { workdirs: opts.workdirs } : {}),
     workdirStoreFile: storeFile,
+    designDraftsDir: draftsDir,
     ...(opts.allowedHosts ? { allowedHosts: opts.allowedHosts } : {}),
   });
-  return { base: await startServer(), hostWorkdir, storeFile: storeFile ?? "" };
+  return { base: await startServer(), hostWorkdir, storeFile: storeFile ?? "", draftsDir };
 }
 
 function postWorkdir(base: string, body: unknown, headers: Record<string, string> = {}): Promise<Response> {
@@ -99,6 +103,30 @@ async function waitForStatus(base: string, runId: string, status: string): Promi
   }
   throw new Error(`Run ${runId} did not reach ${status} in time`);
 }
+
+describe("parseExtraWorkdirs / mergeRunReadRoots", () => {
+  const allowed = ["D:\\a", "D:\\b", "D:\\c"];
+
+  it("缺省 / 主目录自身 / 重复项都收成干净列表", () => {
+    expect(parseExtraWorkdirs(undefined, allowed, "D:\\a")).toEqual({ ok: true, extraWorkdirs: [] });
+    expect(parseExtraWorkdirs(["D:\\a", "D:\\b", "D:\\b"], allowed, "D:\\a")).toEqual({
+      ok: true,
+      extraWorkdirs: [resolve("D:\\b")],
+    });
+  });
+
+  it("越白名单或非数组失败，不静默丢掉", () => {
+    expect(parseExtraWorkdirs("D:\\b", allowed, "D:\\a").ok).toBe(false);
+    expect(parseExtraWorkdirs(["D:\\nope"], allowed, "D:\\a").ok).toBe(false);
+  });
+
+  it("合并只读根时去掉主目录并去重", () => {
+    expect(mergeRunReadRoots(["D:\\refs", "D:\\a"], ["D:\\b", "D:\\refs"], "D:\\a")).toEqual([
+      resolve("D:\\refs"),
+      resolve("D:\\b"),
+    ]);
+  });
+});
 
 // ------------------------------------------------------
 // GET /api/workdirs
@@ -279,7 +307,12 @@ describe("DELETE /api/workdirs", () => {
     expect(denied.status).toBe(409);
     expect((await denied.json() as any).error).toContain("正在运行");
 
-    releaseTool!();
+    const latch = Date.now() + 15_000;
+    while (!releaseTool && Date.now() < latch) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    expect(releaseTool).toEqual(expect.any(Function));
+    releaseTool();
     await waitForStatus(base, runId, "done");
     const ok = await deleteWorkdir(base, { path: resolve(target) });
     expect(ok.status).toBe(200);
@@ -332,6 +365,28 @@ describe("GET /api/fs/list", () => {
     expect(top.parent).toBeNull();
   });
 
+  it("POST /api/fs/mkdir 在当前目录下建文件夹", async () => {
+    const { base } = await makeHost();
+    const root = await mkdtemp(join(tmpdir(), "workdirs-mkdir-"));
+    tempDirs.push(root);
+    const created = await fetch(`${base}/api/fs/mkdir`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: root, name: "fresh" }),
+    });
+    expect(created.status).toBe(200);
+    const body = await created.json() as any;
+    expect(body.path).toBe(resolve(join(root, "fresh")));
+    const listed = await (await fetch(`${base}/api/fs/list?path=${encodeURIComponent(root)}`)).json() as any;
+    expect(listed.dirs.map((d: any) => d.name)).toContain("fresh");
+    const bad = await fetch(`${base}/api/fs/mkdir`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: root, name: ".." }),
+    });
+    expect(bad.status).toBe(400);
+  });
+
   it("不存在 → 404；是文件 → 400", async () => {
     const { base, hostWorkdir } = await makeHost();
     expect((await fetch(`${base}/api/fs/list?path=${encodeURIComponent(join(hostWorkdir, "nope"))}`)).status).toBe(404);
@@ -379,7 +434,7 @@ describe("loopback 门", () => {
     });
   }
 
-  it("四个端点对非 loopback Host 一律 403", async () => {
+  it("工作目录管理端点对非 loopback Host 一律 403", async () => {
     const { base } = await makeHost({ allowedHosts: ["example.com"] });
     const remote = { Host: "example.com", "Content-Type": "application/json" };
     const get = await rawRequest(base, "GET", "/api/workdirs", remote);
@@ -388,6 +443,8 @@ describe("loopback 门", () => {
     expect((await rawRequest(base, "POST", "/api/workdirs", remote)).status).toBe(403);
     expect((await rawRequest(base, "DELETE", "/api/workdirs", remote)).status).toBe(403);
     expect((await rawRequest(base, "GET", "/api/fs/list", remote)).status).toBe(403);
+    expect((await rawRequest(base, "POST", "/api/fs/mkdir", remote)).status).toBe(403);
+    expect((await rawRequest(base, "POST", "/api/design-drafts-workdir", remote)).status).toBe(403);
   });
 });
 
@@ -426,5 +483,96 @@ describe("持久化", () => {
     expect(list.source.stored).toEqual([]);
     // .bak 留档
     await stat(`${storeFile}.bak`);
+  });
+});
+
+// ------------------------------------------------------
+// POST /api/design-drafts-workdir
+// ------------------------------------------------------
+
+function postDesignDrafts(base: string, body: unknown, headers: Record<string, string> = {}): Promise<Response> {
+  return fetch(`${base}/api/design-drafts-workdir`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...headers },
+    body: JSON.stringify(body),
+  });
+}
+
+describe("POST /api/design-drafts-workdir", () => {
+  it("GET /api/harness 报稿目录但不建目录", async () => {
+    const root = await mkdtemp(join(tmpdir(), "design-drafts-snap-"));
+    tempDirs.push(root);
+    const hostWorkdir = join(root, "Agent_Design");
+    const draftsDir = join(root, "Fathom");
+    await mkdir(hostWorkdir);
+    await writeFile(join(hostWorkdir, "package.json"), JSON.stringify({ name: "agent-harness" }));
+    const { base } = await makeHost({ workdir: hostWorkdir, designDraftsDir: draftsDir });
+    const snap = await (await fetch(`${base}/api/harness`)).json() as any;
+    expect(snap.designMode.draftsWorkdir).toBe(resolve(draftsDir));
+    expect(snap.designMode.hostWorkdirIsHarness).toBe(true);
+    await expect(stat(draftsDir)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("当前是宿主仓库 → 建目录、加入白名单、建议切过去", async () => {
+    const root = await mkdtemp(join(tmpdir(), "design-drafts-host-"));
+    tempDirs.push(root);
+    const hostWorkdir = join(root, "Agent_Design");
+    const draftsDir = join(root, "Fathom");
+    await mkdir(hostWorkdir);
+    await writeFile(join(hostWorkdir, "package.json"), JSON.stringify({ name: "agent-harness" }));
+    const { base, storeFile } = await makeHost({ workdir: hostWorkdir, designDraftsDir: draftsDir });
+
+    const res = await postDesignDrafts(base, { currentWorkdir: hostWorkdir });
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.select).toBe(true);
+    expect(body.reason).toBe("host-repo");
+    expect(body.added).toBe(true);
+    expect(body.workdir).toBe(resolve(draftsDir));
+    expect(body.workdirs).toContain(resolve(draftsDir));
+    expect((await stat(draftsDir)).isDirectory()).toBe(true);
+
+    const stored = JSON.parse(await readFile(storeFile, "utf8"));
+    expect(stored.workdirs).toContain(resolve(draftsDir));
+
+    const again = await postDesignDrafts(base, { currentWorkdir: draftsDir });
+    expect(again.status).toBe(200);
+    const second = await again.json() as any;
+    expect(second.added).toBe(false);
+    expect(second.select).toBe(false);
+    expect(second.reason).toBe("already-drafts");
+  });
+
+  it("用户已选别的目录 → 仍建稿目录但不抢选择", async () => {
+    const campaign = await mkdtemp(join(tmpdir(), "design-drafts-campaign-"));
+    tempDirs.push(campaign);
+    const drafts = await mkdtemp(join(tmpdir(), "design-drafts-keep-"));
+    tempDirs.push(drafts);
+    await rm(drafts, { recursive: true, force: true });
+    const { base, draftsDir } = await makeHost({
+      workdirs: [campaign],
+      designDraftsDir: drafts,
+    });
+
+    const res = await postDesignDrafts(base, { currentWorkdir: campaign });
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.select).toBe(false);
+    expect(body.reason).toBe("custom");
+    expect(body.workdir).toBe(resolve(draftsDir));
+    expect(body.workdirs).toContain(resolve(campaign));
+    expect(body.workdirs).toContain(resolve(draftsDir));
+    expect((await stat(draftsDir)).isDirectory()).toBe(true);
+  });
+
+  it("非 JSON Content-Type → 415，且不建目录", async () => {
+    const { base, draftsDir } = await makeHost();
+    const wrongType = await fetch(`${base}/api/design-drafts-workdir`, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain" },
+      body: "{}",
+    });
+    expect(wrongType.status).toBe(415);
+    await expect(stat(draftsDir)).rejects.toMatchObject({ code: "ENOENT" });
   });
 });

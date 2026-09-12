@@ -12,6 +12,7 @@ import {
   getStickyCapabilities,
   guessCompatFromName,
   probeEndpointCapabilities,
+  probeVisionSupport,
   shouldRunModelProbe,
 } from "../src/model-capability.js";
 import { createModelClientWithProbe } from "../src/provider.js";
@@ -32,6 +33,46 @@ describe("guessCompatFromName / shouldRunModelProbe", () => {
     expect(shouldRunModelProbe({ AGENT_MODEL_PROBE: "0" }, "http://127.0.0.1:9")).toBe(false);
     expect(shouldRunModelProbe({}, "http://127.0.0.1:9")).toBe(false);
     expect(shouldRunModelProbe({}, "https://api.deepseek.com/anthropic")).toBe(false);
+  });
+});
+
+describe("probeVisionSupport", () => {
+  it("未开 AGENT_MODEL_PROBE → fail-open supportsVision=true（保持配了就注册）", async () => {
+    const result = await probeVisionSupport({
+      identity: { provider: "anthropic", model: "vision-x", baseURL: "http://127.0.0.1:9" },
+      env: {},
+    });
+    expect(result.supportsVision).toBe(true);
+    expect(result.source).toBe("name");
+    expect(result.reason).toBe("probe_skipped");
+  });
+
+  it("端点 200 接受图像 → supportsVision=true", async () => {
+    const fetchImpl = async () =>
+      new Response(JSON.stringify({ content: [{ type: "text", text: "ok" }] }), { status: 200 });
+    const result = await probeVisionSupport({
+      identity: { provider: "anthropic", model: "vl", baseURL: "https://vision.example" },
+      apiKey: "k",
+      env: { AGENT_MODEL_PROBE: "1" },
+      fetchImpl: fetchImpl as typeof fetch,
+    });
+    expect(result.supportsVision).toBe(true);
+    expect(result.source).toBe("probe");
+  });
+
+  it("端点 400 拒图 → supportsVision=false（调用方应不注册 describe_image）", async () => {
+    const fetchImpl = async () =>
+      new Response(JSON.stringify({ error: { message: "Model does not support image content" } }), {
+        status: 400,
+      });
+    const result = await probeVisionSupport({
+      identity: { provider: "openai", model: "text-only", baseURL: "https://api.example/v1" },
+      apiKey: "k",
+      env: { AGENT_MODEL_PROBE: "1" },
+      fetchImpl: fetchImpl as typeof fetch,
+    });
+    expect(result.supportsVision).toBe(false);
+    expect(result.reason).toMatch(/vision_rejected/);
   });
 });
 

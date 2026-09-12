@@ -41,14 +41,22 @@ describe("normalizeMemoryList 响应整形", () => {
     expect(out.dir).toBe("/x/.agent-memory");
     expect(out.entries).toHaveLength(2);
     expect(out.entries[0]).toMatchObject({ name: "a.md", summary: "摘要", sizeBytes: 12, mtimeMs: NOW });
+    expect(out.status).toBeNull();
+    expect(out.shared).toBe(false);
     expect(out.entries[1].mtimeMs).toBeNull();
   });
 
   it("畸形负载降级为空列表，无名条目被过滤", () => {
-    expect(normalizeMemoryList(null)).toEqual({ dir: null, entries: [] });
+    expect(normalizeMemoryList(null)).toEqual({
+      dir: null,
+      project: null,
+      shared: false,
+      status: null,
+      entries: [],
+    });
     expect(normalizeMemoryList({}).entries).toEqual([]);
     expect(normalizeMemoryList({ entries: [{ summary: "没名字" }, 42, { name: "ok.md" }] }).entries)
-      .toEqual([{ name: "ok.md", summary: "", sizeBytes: 0, mtimeMs: null }]);
+      .toEqual([{ name: "ok.md", summary: "", sizeBytes: 0, mtimeMs: null, scope: null }]);
   });
 });
 
@@ -266,6 +274,48 @@ describe("initMemoryPanel DOM 层", () => {
     expect(api.isOpen()).toBe(true);
     api.element.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
     expect(api.isOpen()).toBe(false);
+  });
+
+  it("进行中看板单独钉在列表上；本项目/全部切换请求参数", async () => {
+    const fetchFn = vi.fn(async (url) => {
+      if (String(url).startsWith("/api/memory?")) {
+        return mockResponse(200, {
+          dir: "/proj/.agent-memory",
+          project: "proj",
+          status: {
+            summary: "规格待签字",
+            waiting: ["委托方：规格签字"],
+            nextGate: "评审会",
+            decisions: ["是否先出幻灯"],
+          },
+          entries: LIST_PAYLOAD.entries,
+        });
+      }
+      return mockResponse(200, {
+        ...LIST_PAYLOAD,
+        status: {
+          summary: "规格待签字",
+          waiting: ["委托方：规格签字"],
+          nextGate: "评审会",
+          decisions: ["是否先出幻灯"],
+        },
+      });
+    });
+    const api = initMemoryPanel(
+      { getWorkdir: () => "D:/proj/alpha" },
+      { fetchFn, now: () => NOW },
+    );
+    api.open();
+    await waitFor(() => document.querySelector(".mem-board:not([hidden])"));
+    expect(fetchFn).toHaveBeenCalledWith("/api/memory?workdir=D%3A%2Fproj%2Falpha");
+    expect(document.querySelector(".mem-board-summary")?.textContent).toBe("规格待签字");
+    expect(document.querySelector(".mem-board-meta")?.textContent).toContain("评审会");
+    expect(document.querySelector('[data-scope="current"]')?.getAttribute("aria-selected")).toBe("true");
+
+    document.querySelector('[data-scope="all"]').click();
+    await waitFor(() => fetchFn.mock.calls.some((c) => String(c[0]).includes("scope=all")));
+    expect(fetchFn).toHaveBeenCalledWith("/api/memory?scope=all&workdir=D%3A%2Fproj%2Falpha");
+    expect(api.getState().listScope).toBe("all");
   });
 
   it("幂等：重复初始化返回既有节点薄壳，不重复挂 DOM", async () => {

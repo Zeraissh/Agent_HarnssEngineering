@@ -36,6 +36,11 @@ export interface EndpointCapabilities {
   healthy: boolean;
   /** true = 不发 Claude 专属 thinking / effort / cache_control */
   compat: boolean;
+  /**
+   * 识图能力（仅 vision 探针写入）。`undefined` = 没探过；
+   * fail-open：未探 / 判不清时调用方应继续注册 describe_image。
+   */
+  supportsVision?: boolean;
   latencyMs: number | null;
   source: CapabilitySource;
   probedAt: number;
@@ -444,6 +449,181 @@ function joinUrl(baseURL: string | undefined, path: string): string {
     return `${base}${path.slice(3)}`;
   }
   return `${base}${path}`;
+}
+
+/**
+ * 1×1 透明 PNG（最小合法图）。识图探针专用——只验证端点是否接受图像块，
+ * 不关心它描述出什么。
+ */
+export const MINIMAL_PNG_BASE64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+export interface VisionProbeResult {
+  supportsVision: boolean;
+  latencyMs: number | null;
+  source: CapabilitySource;
+  reason?: string;
+  probedAt: number;
+}
+
+/**
+ * 识图能力探针：发一张最小图。仅 `AGENT_MODEL_PROBE=1` 时真打；
+ * 未开探针 → fail-open `supportsVision=true`（保持"配了就注册"的既有语义）。
+ * 端点明确拒图 → `false`（调用方应不注册 describe_image）。
+ */
+export async function probeVisionSupport(opts: ProbeOptions): Promise<VisionProbeResult> {
+  const now = opts.now ?? Date.now;
+  const env = opts.env ?? process.env;
+  const started = now();
+
+  if (!shouldRunModelProbe(env, opts.identity.baseURL)) {
+    return {
+      supportsVision: true,
+      latencyMs: null,
+      source: "name",
+      reason: "probe_skipped",
+      probedAt: now(),
+    };
+  }
+
+  const fetchImpl = opts.fetchImpl ?? globalThis.fetch;
+  if (typeof fetchImpl !== "function") {
+    return {
+      supportsVision: true,
+      latencyMs: null,
+      source: "assumed",
+      reason: "fetch_unavailable",
+      probedAt: now(),
+    };
+  }
+
+  try {
+    const result =
+      opts.identity.provider === "openai"
+        ? await probeOpenAIVision(opts, fetchImpl)
+        : await probeAnthropicVision(opts, fetchImpl);
+    return {
+      ...result,
+      latencyMs: Math.max(0, now() - started),
+      source: "probe",
+      probedAt: now(),
+    };
+  } catch (err) {
+    // 网络级失败：判不清 → fail-open 保留工具（别因为瞬时故障把识图卸掉）
+    return {
+      supportsVision: true,
+      latencyMs: Math.max(0, now() - started),
+      source: "assumed",
+      reason: err instanceof Error ? err.message : String(err),
+      probedAt: now(),
+    };
+  }
+}
+
+async function probeAnthropicVision(
+  opts: ProbeOptions,
+  fetchImpl: typeof fetch,
+): Promise<Pick<VisionProbeResult, "supportsVision" | "reason">> {
+  const url = joinUrl(opts.identity.baseURL, "/v1/messages");
+  const res = await fetchImpl(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "anthropic-version": "2023-06-01",
+      ...(opts.apiKey ? { "x-api-key": opts.apiKey } : {}),
+    },
+    body: JSON.stringify({
+      model: opts.identity.model,
+      max_tokens: 1,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "image",
+              source: {
+                type: "base64",
+                media_type: "image/png",
+                data: MINIMAL_PNG_BASE64,
+              },
+            },
+            { type: "text", text: "ping" },
+          ],
+        },
+      ],
+    }),
+    signal: opts.signal,
+  });
+
+  if (res.ok) return { supportsVision: true, reason: "vision_ok" };
+  const text = await res.text().catch(() => "");
+  const lower = text.toLowerCase();
+  if (
+    res.status === 400 &&
+    (lower.includes("image") ||
+      lower.includes("vision") ||
+      lower.includes("multimodal") ||
+      lower.includes("media") ||
+      lower.includes("content type"))
+  ) {
+    return { supportsVision: false, reason: `vision_rejected:${res.status}` };
+  }
+  if (res.status === 401 || res.status === 403) {
+    // 认证问题不是"不会看图"；fail-open 保留工具，让真调用自己报认证错
+    return { supportsVision: true, reason: `auth:${res.status}` };
+  }
+  // 其它可达但形态不明 → fail-open
+  return { supportsVision: true, reason: `reachable_status:${res.status}` };
+}
+
+async function probeOpenAIVision(
+  opts: ProbeOptions,
+  fetchImpl: typeof fetch,
+): Promise<Pick<VisionProbeResult, "supportsVision" | "reason">> {
+  const url = joinUrl(opts.identity.baseURL, "/chat/completions");
+  const res = await fetchImpl(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...(opts.apiKey ? { authorization: `Bearer ${opts.apiKey}` } : {}),
+    },
+    body: JSON.stringify({
+      model: opts.identity.model,
+      max_tokens: 1,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "ping" },
+            {
+              type: "image_url",
+              image_url: { url: `data:image/png;base64,${MINIMAL_PNG_BASE64}` },
+            },
+          ],
+        },
+      ],
+    }),
+    signal: opts.signal,
+  });
+
+  if (res.ok) return { supportsVision: true, reason: "vision_ok" };
+  const text = await res.text().catch(() => "");
+  const lower = text.toLowerCase();
+  if (
+    res.status === 400 &&
+    (lower.includes("image") ||
+      lower.includes("vision") ||
+      lower.includes("multimodal") ||
+      lower.includes("media") ||
+      lower.includes("content type") ||
+      lower.includes("does not support"))
+  ) {
+    return { supportsVision: false, reason: `vision_rejected:${res.status}` };
+  }
+  if (res.status === 401 || res.status === 403) {
+    return { supportsVision: true, reason: `auth:${res.status}` };
+  }
+  return { supportsVision: true, reason: `reachable_status:${res.status}` };
 }
 
 /**

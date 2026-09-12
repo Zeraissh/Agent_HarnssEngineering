@@ -17,7 +17,7 @@
  *      实时性由宿主在既有 SSE 批处理节拍里调 refresh() 获得。
  */
 
-import { formatRelTime, classifyRunEndForNotify } from "./notifications.js";
+import { formatRelTime, classifyRunEndForNotify, collapseDecisionItems } from "./notifications.js";
 
 // ---------------------------------------------------------------
 // 常量
@@ -176,7 +176,7 @@ export function deriveBoardModel(input) {
   // ---- 栏一：待你决定（与通知中心同源的待决条目）----
   /** @type {DecisionCard[]} */
   const decision = [];
-  for (const item of decisionItems) {
+  for (const item of collapseDecisionItems(decisionItems)) {
     if (!item || item.category !== "decision") continue;
     const at = Number(item.at) || nowMs;
     decision.push({

@@ -25,7 +25,7 @@
  */
 import { readFile, writeFile } from "node:fs/promises";
 import type { Tool } from "../types.js";
-import { credentialLikeName, resolveInWorkdir } from "./fs-util.js";
+import { credentialLikeName, resolveInWorkdir, WORKDIR_OR_ROOT_PATH } from "./fs-util.js";
 
 export const EDIT_FILE_TOOL_NAME = "edit_file";
 
@@ -132,7 +132,7 @@ export const editFileTool: Tool = {
   inputSchema: {
     type: "object",
     properties: {
-      path: { type: "string", description: "File path relative to the working directory. The file must already exist." },
+      path: { type: "string", description: `${WORKDIR_OR_ROOT_PATH} The file must already exist.` },
       old_string: {
         type: "string",
         description: "Exact text to find, copied verbatim from the file (indentation included). Must be unique unless replace_all is true.",
@@ -202,7 +202,7 @@ export const editFileTool: Tool = {
       };
     }
 
-    const resolved = resolveInWorkdir(ctx.workdir, p);
+    const resolved = resolveInWorkdir(ctx.workdir, p, ctx.writeRoots);
 
     let before: string;
     try {
@@ -247,7 +247,7 @@ export const editFileTool: Tool = {
     const applied = replaceAll === true ? offsets : [offsets[0]!];
 
     // mkdir 不参与（文件必须已存在），但父目录仍可能在读之后被替换成链接——重算一次
-    const revalidated = resolveInWorkdir(ctx.workdir, p);
+    const revalidated = resolveInWorkdir(ctx.workdir, p, ctx.writeRoots);
     await writeFile(revalidated, after, "utf8");
 
     const diff = renderEditDiff(p, before, after, applied, oldString.length, newString.length);

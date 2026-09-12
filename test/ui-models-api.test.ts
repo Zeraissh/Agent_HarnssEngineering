@@ -313,3 +313,42 @@ describe("POST /api/models/test", () => {
     expect(badProvider.status).toBe(400);
   });
 });
+
+describe("模型窗口预览与角色快捷切换", () => {
+  it("GET /api/models 每条带 contextWindow；响应带当前 context", async () => {
+    const { base } = await makeHost();
+    await putModels(base, modelsBody());
+    const body = await (await fetch(`${base}/api/models`)).json() as any;
+    const flash = body.models.find((m: any) => m.id === "m-fast");
+    const opus = body.models.find((m: any) => m.id === "m-strong");
+    expect(flash.contextWindow).toMatchObject({ window: 1_048_576, windowSource: "registry" });
+    expect(opus.contextWindow).toMatchObject({ window: 1_000_000, windowSource: "registry" });
+    expect(body.context).toMatchObject({
+      windowSource: expect.stringMatching(/^(env|learned|registry|unknown)$/),
+      budget: expect.any(Number),
+    });
+  });
+
+  it("PATCH /api/models/roles 改 executor；悬空 id → 400；写盘可读回", async () => {
+    const { base, storeFile } = await makeHost();
+    await putModels(base, modelsBody());
+    const bad = await fetch(`${base}/api/models/roles`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ executor: "ghost" }),
+    });
+    expect(bad.status).toBe(400);
+
+    const ok = await fetch(`${base}/api/models/roles`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ executor: "m-strong" }),
+    });
+    expect(ok.status).toBe(200);
+    const body = await ok.json() as any;
+    expect(body.roles.executor).toBe("m-strong");
+    // 注入 FakeModelClient 时执行者装配锁定——但库文件角色必须已改（重启/真宿主生效）
+    const disk = JSON.parse(await readFile(storeFile, "utf8"));
+    expect(disk.roles.executor).toBe("m-strong");
+  });
+});

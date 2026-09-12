@@ -58,6 +58,18 @@ describe("resolveInWorkdir", () => {
     expect(resolveInWorkdir(workdir, "..safe.txt")).toBe(path.resolve(workdir, "..safe.txt"));
   });
 
+  it("额外可写根里的绝对路径放行，圈外仍拒", async () => {
+    const extra = await mkdtemp(path.join(tmpdir(), "harness-write-root-"));
+    try {
+      const inside = path.join(extra, "note.txt");
+      expect(resolveInWorkdir(workdir, inside, [extra])).toBe(path.resolve(inside));
+      const outsider = path.join(tmpdir(), "not-a-write-root", "x.txt");
+      expect(() => resolveInWorkdir(workdir, outsider, [extra])).toThrow(/escapes/);
+    } finally {
+      await rm(extra, { recursive: true, force: true });
+    }
+  });
+
   it("不存在的合法写目标按最近存在父目录校验并放行", () => {
     expect(resolveInWorkdir(workdir, "brand-new/deep/file.txt")).toBe(
       path.resolve(workdir, "brand-new/deep/file.txt"),
@@ -220,6 +232,11 @@ describe("额外只读根（readRoots，案例 #5 催生）", () => {
 });
 
 describe("write_file + read_file", () => {
+  it("路径字段允许绝对路径落在额外根里，避免模型改走 bash", () => {
+    expect(String(writeFileTool.inputSchema.properties?.path?.description ?? "")).toMatch(/absolute path/i);
+    expect(String(writeFileTool.description)).toMatch(/writable root/i);
+  });
+
   it("写入后可读回，自动创建父目录", async () => {
     const w = await writeFileTool.execute({ path: "nested/dir/out.txt", content: "你好 harness" }, ctx());
     expect(w.isError).toBeUndefined();

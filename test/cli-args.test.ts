@@ -28,6 +28,22 @@ describe("CLI argument contract", () => {
       .toMatchObject({ concurrency: "auto", task: "执行" });
   });
 
+  it("--resume-run 可单独用于单执行者；--verify 互斥；runId 拒绝路径穿越", () => {
+    expect(parseCliArgs(["--plan", "--resume-run", "cli-1", "接着跑"]))
+      .toMatchObject({ plan: true, resumeRun: "cli-1", task: "接着跑" });
+    expect(parseCliArgs(["--resume-run", "cli-1", "接着跑"]))
+      .toMatchObject({ plan: false, resumeRun: "cli-1", task: "接着跑" });
+    expect(parseCliArgs(["--plan", "--resume-run=cli-2"]))
+      .toMatchObject({ resumeRun: "cli-2", task: "" });
+    expect(() => parseCliArgs(["--resume-run", "cli-1", "--verify"]))
+      .toThrow(/不能与 --verify/);
+    expect(() => parseCliArgs(["--plan", "--resume-run", "../x", "t"]))
+      .toThrow(/runId 无效/);
+    expect(() => parseCliArgs(["--plan", "--resume-run"]))
+      .toThrow(/需要 runId/);
+    expect(cliHelpText()).toContain("--resume-run");
+  });
+
   it("-- 分隔符后的 flag 形状属于任务正文", () => {
     expect(parseCliArgs(["run", "--", "--not-a-flag", "正文"]).task)
       .toBe("--not-a-flag 正文");

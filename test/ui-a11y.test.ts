@@ -26,10 +26,12 @@ import {
   renderRunList,
   renderRunDetail,
   renderEmptyState,
+  renderStarterGallery,
   deriveComposerMode,
   composerSubmitPlan,
   patchComposer,
 } from "../ui/public/app.js";
+import { upgradeSelects } from "../ui/public/features/theme-select.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const UI_DIR = join(__dirname, "..", "ui", "public");
@@ -39,6 +41,12 @@ function loadSkeleton(): string {
   const html = readFileSync(join(UI_DIR, "index.html"), "utf-8");
   const body = html.match(/<body[^>]*>([\s\S]*)<\/body>/)?.[1] ?? "";
   return body.replace(/<script[\s\S]*?<\/script>/g, "");
+}
+
+/** 与真页一致：骨架挂上后立刻把原生 select 收成自绘菜单 */
+function mountSkeleton(): void {
+  document.body.innerHTML = loadSkeleton();
+  upgradeSelects(document);
 }
 
 /**
@@ -160,14 +168,35 @@ beforeEach(() => {
   // 故手动补齐，避免 document-title / html-has-lang 这类脚手架假阳性
   document.documentElement.lang = "zh-CN";
   document.title = "Agent Harness — Web UI";
-  document.body.innerHTML = loadSkeleton();
+  mountSkeleton();
 });
 
 describe("axe 自动扫描：空态 / 列表 / 详情三种画面零 violations", () => {
   it("空态（尚无运行）", async () => {
+    const panel = document.getElementById("main-panel");
+    panel?.classList.add("is-welcome");
+    const gallery = document.getElementById("starter-gallery");
+    if (gallery) gallery.hidden = false;
     renderEmptyState(false);
+    renderStarterGallery();
     const violations = await runAxe();
     expect(violations, JSON.stringify(violations, null, 2)).toEqual([]);
+  });
+
+  it("设计模式空态样例卡零 violations", async () => {
+    const panel = document.getElementById("main-panel");
+    panel?.classList.add("is-welcome");
+    const gallery = document.getElementById("starter-gallery");
+    if (gallery) gallery.hidden = false;
+    renderEmptyState(false, { designModeActive: true });
+    renderStarterGallery({
+      designModeActive: true,
+      selectedDesignTab: "Deck",
+      selectedDesignSample: "deck-free",
+    });
+    const violations = await runAxe();
+    expect(violations, JSON.stringify(violations, null, 2)).toEqual([]);
+    expect(document.querySelectorAll("[data-design-sample]").length).toBeGreaterThanOrEqual(3);
   });
 
   it("运行列表（含选中项，role=option 需在 role=listbox 内）", async () => {
@@ -220,7 +249,7 @@ describe("axe 自动扫描：空态 / 列表 / 详情三种画面零 violations"
     openDrawer();
     expect(rowOf("运行历史")).toBe("D:\\repo\\.agent-run-history（保留最近 50 个）");
 
-    document.body.innerHTML = loadSkeleton();
+    mountSkeleton();
     renderRunDetail(buildRichState(), {
       activeTab: "tools",
       harness: { ...FAKE_HARNESS, history: { enabled: false, dir: null, keep: 50 } },
@@ -543,8 +572,9 @@ describe("扫描器双向自检：植入已知缺陷必须被抓到", () => {
     const input = document.getElementById("task-input")!;
     document.querySelector('label[for="task-input"]')?.remove();
     input.removeAttribute("aria-label");
-    // placeholder 按 accname 规范也算可及名称（兜底档），不摘掉就仍有名字、不构成违规
+    // placeholder / title 按 accname 规范也算可及名称（兜底档），不摘掉就仍有名字、不构成违规
     input.removeAttribute("placeholder");
+    input.removeAttribute("title");
     const violations = await runAxe();
     expect(violations.map((v) => v.id)).toContain("label");
   });
@@ -585,7 +615,13 @@ describe("环境边界声明（防止把 incomplete 误当通过）", () => {
 
 describe("多主题：data-theme 切换不改变结构语义", () => {
   const SCREENS: [string, () => void][] = [
-    ["空态", () => renderEmptyState(false)],
+    ["空态", () => {
+      document.getElementById("main-panel")?.classList.add("is-welcome");
+      const gallery = document.getElementById("starter-gallery");
+      if (gallery) gallery.hidden = false;
+      renderEmptyState(false);
+      renderStarterGallery();
+    }],
     [
       "运行列表",
       () =>
@@ -630,7 +666,7 @@ describe("多主题：data-theme 切换不改变结构语义", () => {
   it("切换主题不改变可访问性树（同一画面各主题的 ARIA 快照一致）", () => {
     const snapshot = (theme: string) => {
       document.documentElement.setAttribute("data-theme", theme);
-      document.body.innerHTML = loadSkeleton();
+      mountSkeleton();
       renderRunDetail(buildRichState(), { activeTab: "verify", harness: FAKE_HARNESS });
       openDrawer();
       return [...document.querySelectorAll("[role],[aria-label],[aria-labelledby],[aria-selected]")]
@@ -651,7 +687,7 @@ describe("多主题：data-theme 切换不改变结构语义", () => {
   });
 
   it("展开的主题菜单零 violations，当前项用单选语义表达", async () => {
-    document.body.innerHTML = loadSkeleton();
+    mountSkeleton();
     const menu = document.getElementById("theme-menu") as HTMLElement;
     const toggle = document.getElementById("theme-toggle") as HTMLButtonElement;
     menu.hidden = false;
@@ -776,7 +812,7 @@ describe("编排面板", () => {
 
   it("编排面板零 violations（全部主题）", async () => {
     for (const theme of ["light", "dark", "graphite", "contrast"]) {
-      document.body.innerHTML = loadSkeleton();
+      mountSkeleton();
       document.documentElement.setAttribute("data-theme", theme);
       renderRunDetail(planState(), { activeTab: "loop", harness: FAKE_HARNESS });
       openDrawer();
@@ -962,11 +998,11 @@ describe("统一 composer：一个框，两种去向", () => {
     patchComposer(deriveComposerMode({ info: { ...CONTINUABLE, runId: "run-other", verify: false }, localStatus: "done" }));
     expect(toggle.checked).toBe(false);
 
-    // 运行中禁用
+    // 运行中核查开关仍可改——下一轮发送才生效
     patchComposer(deriveComposerMode({
       info: { ...CONTINUABLE, status: "running", canContinue: false }, localStatus: "running",
     }));
-    expect(toggle.disabled).toBe(true);
+    expect(toggle.disabled).toBe(false);
   });
 
   it("提交在飞时按钮不可点——服务端在返回响应之前就广播了 run_created", () => {
@@ -977,23 +1013,25 @@ describe("统一 composer：一个框，两种去向", () => {
 
   // ---- 提交去向（纯函数）----
 
-  it("提交计划：追加带 runId，去空白，运行中一律不发", () => {
+  it("提交计划：追加带 runId，去空白，运行中有字即插入", () => {
     const append = deriveComposerMode({ info: CONTINUABLE, localStatus: "done" });
     expect(composerSubmitPlan(append, "  暗号是什么？  ")).toEqual({
       kind: "append", runId: "run-mt", text: "暗号是什么？",
     });
     expect(composerSubmitPlan(append, "   ")).toBeNull();
 
-    /**
-     * 运行中这个位置**改成了「停止」**（此前是一个灰着的「运行任务」）。
-     * 所以判据从"一律不发"变成"发的是停止、且不吃那半截草稿"——
-     * 那段文字是给下一轮准备的，不该拦着人叫停。
-     */
-    const running = deriveComposerMode({
+    const runningEmpty = deriveComposerMode({
       info: { ...CONTINUABLE, status: "running", canContinue: false }, localStatus: "running",
     });
-    expect(composerSubmitPlan(running, "已经写好了")).toEqual({
+    expect(composerSubmitPlan(runningEmpty, "")).toEqual({
       kind: "stop", runId: "run-mt", text: "",
+    });
+    const runningDraft = deriveComposerMode({
+      info: { ...CONTINUABLE, status: "running", canContinue: false }, localStatus: "running",
+      draft: "已经写好了",
+    });
+    expect(composerSubmitPlan(runningDraft, "已经写好了")).toEqual({
+      kind: "steer", runId: "run-mt", text: "已经写好了",
     });
 
     expect(composerSubmitPlan(deriveComposerMode({ info: null }), "新任务")).toEqual({
@@ -1003,7 +1041,7 @@ describe("统一 composer：一个框，两种去向", () => {
 
   // ---- DOM 应用 ----
 
-  it("追加模式：按钮/标签/说明一起变，装配项禁用但附件仍可用", () => {
+  it("追加模式：按钮/标签/说明一起变，装配项可改、附件仍可用", () => {
     patchComposer(deriveComposerMode({ info: CONTINUABLE, localStatus: "done" }));
     expect(q("#submit-btn-label").textContent).toBe("继续对话");
     expect((q("#submit-btn") as HTMLButtonElement).disabled).toBe(false);
@@ -1012,12 +1050,11 @@ describe("统一 composer：一个框，两种去向", () => {
     expect(q("#composer-note").hidden).toBe(true);
     expect(q("#task-input").getAttribute("aria-describedby")).toBeNull();
 
-    // 续跑复用原运行的装配，这一组构造上无效——禁用而不是藏起来。
-    // 例外：核查 / 计划模式 / 多 agent 是每一轮的选项，追加轮仍可选。
     expect((q("#verify-toggle") as HTMLInputElement).disabled).toBe(false);
     expect((q("#plan-mode-toggle") as HTMLInputElement).disabled).toBe(false);
     expect((q("#multi-agent-toggle") as HTMLInputElement).disabled).toBe(false);
-    expect((q("#rubric-input") as HTMLTextAreaElement).disabled).toBe(true);
+    expect((q("#rubric-input") as HTMLTextAreaElement).disabled).toBe(false);
+    expect((q("#pack-select") as HTMLSelectElement).disabled).toBe(false);
     // 但**不动面板的开合**：那是用户状态，后台事件去改它会把焦点踢回 body
     expect(q("#run-knobs").hidden).toBe(true); // 骨架初始就是折叠的，没被动过
     // 附件走独立端点、不进请求体，续跑照常能用
@@ -1058,11 +1095,11 @@ describe("统一 composer：一个框，两种去向", () => {
     expect(clicks).toBe(1);
   });
 
-  it("禁用一个正被聚焦的装配项时，焦点交还输入框而不是掉回 body", () => {
+  it("提交中禁用一个正被聚焦的装配项时，焦点交还输入框而不是掉回 body", () => {
     const rubric = q("#rubric-input") as HTMLTextAreaElement;
     rubric.focus();
     expect(document.activeElement).toBe(rubric);
-    patchComposer(deriveComposerMode({ info: CONTINUABLE, localStatus: "done" }));
+    patchComposer(deriveComposerMode({ info: CONTINUABLE, localStatus: "done", submitting: true }));
     expect(document.activeElement).toBe(q("#task-input"));
   });
 
@@ -1136,7 +1173,7 @@ describe("统一 composer：一个框，两种去向", () => {
     ];
     for (const theme of ["light", "dark", "graphite", "contrast"]) {
       for (const mode of modes) {
-        document.body.innerHTML = loadSkeleton();
+        mountSkeleton();
         document.documentElement.setAttribute("data-theme", theme);
         renderRunDetail(doneState(), {
           activeTab: "loop", harness: FAKE_HARNESS, loopView: "chat", transcript,
@@ -1226,7 +1263,7 @@ describe("常驻上下文水位", () => {
     openDrawer();
     expect((document.querySelector(".ctx-gauge") as HTMLElement).hidden).toBe(true);
 
-    document.body.innerHTML = loadSkeleton();
+    mountSkeleton();
     renderRunDetail(stateWithUsage(900), { activeTab: "loop", harness: H });
     openDrawer();
     const g = document.querySelector(".ctx-gauge") as HTMLElement;
@@ -1254,7 +1291,7 @@ describe("常驻上下文水位", () => {
     openDrawer();
     expect((document.querySelector(".ctx-gauge") as HTMLElement).hidden).toBe(true);
 
-    document.body.innerHTML = loadSkeleton();
+    mountSkeleton();
     renderRunDetail(stateWithUsage(900), { activeTab: "loop", harness: H3 });
     openDrawer();
     const hot = document.querySelector(".ctx-gauge") as HTMLElement;
@@ -1313,7 +1350,7 @@ describe("常驻上下文水位", () => {
     renderRunDetail(stateWithUsage(150), { activeTab: "loop", harness: H2 });
     openDrawer();
     expect((document.querySelector(".ctx-gauge") as HTMLElement).hidden).toBe(true);
-    document.body.innerHTML = loadSkeleton();
+    mountSkeleton();
     renderRunDetail(stateWithUsage(950), { activeTab: "loop", harness: H2 });
     openDrawer();
     const high = document.querySelector(".ctx-gauge")!;
@@ -1383,7 +1420,7 @@ describe("MEM-01 三段上下文水位条与预算控件（渲染面）", () => 
     expect(document.querySelector(".meter-hint--warn")).toBeNull();
     expect(strip().classList.contains("ctx-strip--compact-next")).toBe(false);
 
-    document.body.innerHTML = loadSkeleton();
+    mountSkeleton();
     renderRunDetail(ctxState(800), { activeTab: "context", harness: harnessWith(CTX) });
     openDrawer();
     const hint = document.querySelector(".meter-hint--warn") as HTMLElement;

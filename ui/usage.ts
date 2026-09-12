@@ -21,6 +21,16 @@ export interface UsageModelRow {
   unpricedRuns: number;
 }
 
+/** 按日再按模型——堆叠柱的事实源。byDay 仍是当日合计，不能从那里还原分模型。 */
+export interface UsageDayModelRow {
+  day: string;
+  model: string;
+  runs: number;
+  turns: number;
+  usd: number | null;
+  unpricedRuns: number;
+}
+
 export interface UsageReport {
   totalRuns: number;
   totalTurns: number;
@@ -28,6 +38,7 @@ export interface UsageReport {
   unpricedRuns: number;
   byDay: UsageDayRow[];
   byModel: UsageModelRow[];
+  byDayModel: UsageDayModelRow[];
 }
 
 export interface UsageLedgerRow {
@@ -68,6 +79,7 @@ function addUsd(current: number | null, next: number | null): number | null {
 export function aggregateUsage(rows: UsageLedgerRow[]): UsageReport {
   const byDay = new Map<string, UsageDayRow>();
   const byModel = new Map<string, UsageModelRow>();
+  const byDayModel = new Map<string, UsageDayModelRow>();
   let totalRuns = 0;
   let totalTurns = 0;
   let totalUsd: number | null = null;
@@ -99,6 +111,21 @@ export function aggregateUsage(rows: UsageLedgerRow[]): UsageReport {
     modelRow.usd = addUsd(modelRow.usd, usd);
     if (usd == null) modelRow.unpricedRuns += 1;
     byModel.set(model, modelRow);
+
+    const dayModelKey = `${day}\t${model}`;
+    const dayModelRow = byDayModel.get(dayModelKey) ?? {
+      day,
+      model,
+      runs: 0,
+      turns: 0,
+      usd: null,
+      unpricedRuns: 0,
+    };
+    dayModelRow.runs += 1;
+    dayModelRow.turns += turns;
+    dayModelRow.usd = addUsd(dayModelRow.usd, usd);
+    if (usd == null) dayModelRow.unpricedRuns += 1;
+    byDayModel.set(dayModelKey, dayModelRow);
   }
 
   return {
@@ -108,5 +135,9 @@ export function aggregateUsage(rows: UsageLedgerRow[]): UsageReport {
     unpricedRuns,
     byDay: [...byDay.values()].sort((a, b) => b.day.localeCompare(a.day)),
     byModel: [...byModel.values()].sort((a, b) => b.runs - a.runs),
+    byDayModel: [...byDayModel.values()].sort((a, b) => {
+      const dayCmp = b.day.localeCompare(a.day);
+      return dayCmp !== 0 ? dayCmp : b.turns - a.turns;
+    }),
   };
 }

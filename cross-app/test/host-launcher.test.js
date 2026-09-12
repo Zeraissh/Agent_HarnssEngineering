@@ -12,6 +12,7 @@ import {
   pickFreePort,
   probeHealthy,
   resolveHostEntry,
+  resolveMemoryDir,
   spawnHost,
   stopHostTree,
   taskkillArgs,
@@ -103,6 +104,16 @@ describe('parseDotEnv / mergeEnv：.env 装载语义与 node --env-file 对齐',
     expect(loadDotEnv(dir)).toEqual({});
     writeFileSync(join(dir, '.env'), 'FROM_FILE=1\n');
     expect(loadDotEnv(dir)).toEqual({ FROM_FILE: '1' });
+  });
+});
+
+describe('resolveMemoryDir：与 src/memory.ts 同一合同', () => {
+  it('AGENT_MEMORY_DIR 覆盖，否则 <workdir>/.agent-memory', () => {
+    const workdir = join('proj', 'a');
+    expect(resolveMemoryDir(workdir, {})).toBe(join(workdir, '.agent-memory'));
+    expect(resolveMemoryDir(workdir, { AGENT_MEMORY_DIR: join('custom', 'mem') })).toBe(
+      join('custom', 'mem'),
+    );
   });
 });
 

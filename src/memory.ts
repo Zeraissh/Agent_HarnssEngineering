@@ -7,6 +7,9 @@
  * - 记忆工具是 P2 "晋升为专用工具" 的正面案例：写操作被硬性圈禁在 memoryDir 内，
  *   这个不变量让 memory_write 可以 permission: "auto"——而通用 write_file 必须 ask；
  * - 记忆索引每次 run 开始时经 dynamicContext 注入 messages（P3：易变信息不进 system）。
+ *
+ * MEM-02/03 合同切片：resolveMemoryDir 为 CLI/Web/Electron 唯一目录源；
+ * NAME_RE 同时约束工具与 Web GET /api/memory/:name（含嵌套路径）。不做加密/同步/多租户。
  */
 import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -17,25 +20,43 @@ export const MEMORY_TOOL_NAMES = new Set([
   "memory_read",
   "memory_write",
   "memory_delete",
+  "project_status",
 ]);
 
 /** 单条记忆上限：记忆是"值得复用的事实/教训"，不是数据仓库 */
 const MAX_MEMORY_BYTES = 64 * 1024;
-/** 合法记忆名：相对路径、常规字符，杜绝逃逸与怪名 */
-const NAME_RE = /^[\w][\w\-./]*\.md$/;
+/**
+ * 合法记忆名：相对路径、常规字符，杜绝逃逸与怪名。
+ * Web 路由与工具共用此正则（嵌套如 lessons/foo.md 合法）。
+ */
+export const MEMORY_NAME_RE = /^[\w][\w\-./]*\.md$/;
+
+/**
+ * MEM-02/03：记忆目录唯一解析。
+ * `AGENT_MEMORY_DIR` 覆盖，否则 `<workdir>/.agent-memory`。
+ */
+export function resolveMemoryDir(
+  workdir: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  return env.AGENT_MEMORY_DIR ?? path.join(workdir, ".agent-memory");
+}
 
 export interface MemoryEntry {
   name: string;
-  /** 文件首个非空行（去掉 # 前缀），截断到 80 字符 */
+  /** 文件首个非空内容行（跳过可选 YAML frontmatter；去掉 # 前缀），截断到 80 字符 */
   summary: string;
   sizeBytes: number;
 }
 
 export class MemoryStore {
+  /** 与模块级 MEMORY_NAME_RE 同一份——宿主注释/路由应引用此处或导出名。 */
+  static readonly NAME_RE = MEMORY_NAME_RE;
+
   constructor(readonly dir: string) {}
 
   private resolvePath(name: string): string {
-    if (!NAME_RE.test(name) || name.includes("..")) {
+    if (!MEMORY_NAME_RE.test(name) || name.includes("..")) {
       throw new Error(
         `Invalid memory name "${name}". Use a relative path of word characters ending in .md, e.g. "deploy-port.md" or "lessons/windows-shell.md".`,
       );
@@ -95,8 +116,22 @@ export class MemoryStore {
   }
 }
 
+/**
+ * 可选 YAML frontmatter（如 sourceRunId / updatedAt）不参与摘要行选取——
+ * 摘要仍是 frontmatter 之后首个非空内容行。
+ */
+function bodyAfterOptionalFrontmatter(text: string): string {
+  if (!text.startsWith("---")) return text;
+  const firstNl = text.indexOf("\n");
+  if (firstNl < 0) return text;
+  const rest = text.slice(firstNl + 1);
+  const close = rest.match(/\n---[ \t]*(?:\r?\n|$)/);
+  if (!close || close.index === undefined) return text;
+  return rest.slice(close.index + close[0].length);
+}
+
 function firstLineSummary(text: string): string {
-  const line = text.split("\n").find((l) => l.trim().length > 0) ?? "";
+  const line = bodyAfterOptionalFrontmatter(text).split("\n").find((l) => l.trim().length > 0) ?? "";
   const clean = line.replace(/^#+\s*/, "").trim();
   return clean.length > 80 ? `${clean.slice(0, 80)}…` : clean;
 }
@@ -136,7 +171,7 @@ function buildMemoryTools(resolveStore: MemoryStoreResolver): Tool[] {
   const memoryWrite: Tool = {
     name: "memory_write",
     description:
-      "Create or update a memory file that persists across sessions. Call this when you learn a durable fact, user preference, or lesson worth reusing later (a correction you received, a project constant, an approach that worked). One fact per file; put a one-line summary on the first line. Do NOT store things already recorded in the repository, or transient task state.",
+        "Create or update a memory file that persists across sessions. Call this when you learn a durable fact, user preference, or lesson worth reusing later (a correction you received, a project constant, an approach that worked). One fact per file; put a one-line summary on the first line. Do NOT store things already recorded in the repository. Do NOT store transient task state — use project_status for the in-progress board (who is waiting, next gate, open decisions).",
     inputSchema: {
       type: "object",
       properties: {

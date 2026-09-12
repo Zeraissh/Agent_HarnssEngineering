@@ -309,6 +309,15 @@ describe("collectTouchedPaths 事件聚合", () => {
     expect(out[0]!.lastAt).toBe(200);
   });
 
+  it("write_pptx 的 path 计入 write 变更", () => {
+    const out = collectTouchedPaths([
+      toolCall(0, "write_pptx", { path: "talk.pptx", slides: [{ title: "Hi" }] }, 100),
+    ]);
+    expect(out).toHaveLength(1);
+    expect(out[0]!.input).toBe("talk.pptx");
+    expect([...out[0]!.ops]).toEqual(["write"]);
+  });
+
   it("事件无 ts 时 lastAt 保持 null 而不是污染成 NaN", () => {
     const out = collectTouchedPaths([
       { seq: 0, source: "main", event: { type: "tool_call", name: "write_file", input: { path: "x" } } },

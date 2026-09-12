@@ -57,7 +57,7 @@ export const grepTool: Tool = {
         type: "string",
         description:
           "File or directory to search, relative to the working directory (default: the working directory). " +
-          "An absolute path is allowed only inside a configured read-only root.",
+          "An absolute path is allowed inside the working directory or a configured extra root.",
       },
       glob: {
         type: "string",

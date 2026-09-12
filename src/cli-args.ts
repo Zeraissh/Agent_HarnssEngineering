@@ -17,6 +17,8 @@ export interface ParsedCliArgs {
   ask: boolean;
   concurrency: number | "auto";
   parallelSpecified: boolean;
+  /** 同 run 续跑：--plan 续半截 DAG，否则续单执行者检查点 */
+  resumeRun: string | null;
 }
 
 export class CliArgumentError extends Error {
@@ -29,6 +31,7 @@ export class CliArgumentError extends Error {
 }
 
 const RUN_FLAGS = new Set(["--yes", "--verify", "--plan", "--auto", "--ask"]);
+const RUN_ID_RE = /^[\w.-]+$/;
 const COMMAND_FLAGS = new Map<string, CliCommand>([
   ["--help", "help"], ["-h", "help"],
   ["--version", "version"], ["-V", "version"],
@@ -68,6 +71,7 @@ export function parseCliArgs(argv: readonly string[]): ParsedCliArgs {
   let afterDelimiter = false;
   let parallelSpecified = false;
   let concurrency: number | "auto" = "auto";
+  let resumeRun: string | null = null;
 
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i]!;
@@ -91,6 +95,22 @@ export function parseCliArgs(argv: readonly string[]): ParsedCliArgs {
       seen.add(arg);
       continue;
     }
+    if (arg === "--resume-run" || arg.startsWith("--resume-run=")) {
+      if (resumeRun) throw new CliArgumentError("参数重复: --resume-run");
+      let raw: string | undefined;
+      if (arg.includes("=")) raw = arg.slice(arg.indexOf("=") + 1);
+      else {
+        raw = args[i + 1];
+        if (raw !== undefined && !raw.startsWith("-")) i += 1;
+        else raw = undefined;
+      }
+      if (!raw) throw new CliArgumentError("--resume-run 需要 runId");
+      if (!RUN_ID_RE.test(raw) || raw.includes("..")) {
+        throw new CliArgumentError(`--resume-run 的 runId 无效: "${raw}"`);
+      }
+      resumeRun = raw;
+      continue;
+    }
     if (arg === "--parallel" || arg.startsWith("--parallel=")) {
       if (parallelSpecified) throw new CliArgumentError("参数重复: --parallel");
       parallelSpecified = true;
@@ -112,7 +132,7 @@ export function parseCliArgs(argv: readonly string[]): ParsedCliArgs {
   if (selectedCommands.size > 1) {
     throw new CliArgumentError(`命令冲突: ${[...selectedCommands].join(" 与 ")}`);
   }
-  const hasRunOptions = seen.size > 0 || parallelSpecified;
+  const hasRunOptions = seen.size > 0 || parallelSpecified || resumeRun != null;
   if (command !== "run" && (hasRunOptions || taskParts.length > 0)) {
     throw new CliArgumentError(`${command} 不能与任务或 run 参数同时使用`);
   }
@@ -127,6 +147,9 @@ export function parseCliArgs(argv: readonly string[]): ParsedCliArgs {
   if (parallelSpecified && !plan) {
     throw new CliArgumentError("--parallel 只对 --plan 生效（并行度是子任务调度的属性）");
   }
+  if (resumeRun && seen.has("--verify")) {
+    throw new CliArgumentError("--resume-run 不能与 --verify 同时使用（同 run 热恢复不接核查）");
+  }
 
   return {
     command,
@@ -138,6 +161,7 @@ export function parseCliArgs(argv: readonly string[]): ParsedCliArgs {
     ask,
     concurrency,
     parallelSpecified,
+    resumeRun,
   };
 }
 
@@ -160,6 +184,7 @@ export function cliHelpText(): string {
     "  --parallel N   plan 并行度；也接受 --parallel=N，省略 N 表示 auto",
     "  --auto         自动选择单领域 pack",
     "  --ask          允许 agent 在执行前集中提问（与 --yes 互斥）",
+    "  --resume-run ID  同 run 续跑（单执行者=检查点；--plan=半截 DAG；预算耗尽则拒）",
     "  --             后续内容一律视为任务文本",
     "",
     "Doctor is static: it performs no network request and starts no execution worker.",

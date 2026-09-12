@@ -12,6 +12,7 @@ import {
   type DurableToolTx,
   type ToolTxController,
 } from "../tool-tx.js";
+import { rejectWhenAborted } from "../abort.js";
 import { validateToolInput } from "./validate-input.js";
 
 export class ToolRegistry {
@@ -88,9 +89,23 @@ export interface ExecutedTool {
 /** SAFE-06：生命周期事件交给 loop 推入 TurnEvent 流 */
 export type ToolTxEventSink = (event: TurnEvent) => void | Promise<void>;
 
+/** docs/09 §4.2：Pre 在审批门前；Post 只在工具真正跑过之后。 */
+export type ToolHookGate = {
+  runPreToolUse(
+    req: { name: string; toolUseId: string; input: unknown },
+    onEvent?: (event: TurnEvent) => void,
+  ): Promise<{ action: "allow" | "block"; reason?: string }>;
+  runPostToolUse(
+    req: { name: string; toolUseId: string; input: unknown; result: ToolResult },
+    onEvent?: (event: TurnEvent) => void,
+  ): Promise<void>;
+};
+
 export class ToolExecutor {
   private toolTx: ToolTxController | undefined;
   private onTxEvent: ToolTxEventSink | undefined;
+  private hooks?: ToolHookGate;
+  private onHookEvent?: (event: TurnEvent) => void;
 
   constructor(
     private readonly registry: ToolRegistry,
@@ -99,6 +114,7 @@ export class ToolExecutor {
     private executionBroker?: ExecutionBroker,
     /** 单个 tool_result 进正史前的字符上限；缺省 DEFAULT_TOOL_RESULT_MAX_CHARS */
     private readonly toolResultMaxChars: number = DEFAULT_TOOL_RESULT_MAX_CHARS,
+    private readonly writeRoots?: string[],
   ) {}
 
   /**
@@ -115,6 +131,12 @@ export class ToolExecutor {
   setToolTx(controller?: ToolTxController, onTxEvent?: ToolTxEventSink): void {
     this.toolTx = controller;
     this.onTxEvent = onTxEvent;
+  }
+
+  /** 外部 hooks。onEvent 按次传入，并行 loop 共享 runtime 也不会抢 sink。 */
+  setHooks(hooks?: ToolHookGate, onEvent?: (event: TurnEvent) => void): void {
+    this.hooks = hooks;
+    this.onHookEvent = onEvent;
   }
 
   /**
@@ -221,6 +243,27 @@ export class ToolExecutor {
       return { content: invalid, isError: true };
     }
 
+    /**
+     * PreToolUse 在审批门之前（与 validateToolInput 同一条理由）：
+     * 已被 hook 阻断的调用不该去打扰人做授权决定。
+     * hook allow 不能推翻后面的 permission=deny / 圈禁。
+     */
+    if (this.hooks) {
+      const decision = await this.hooks.runPreToolUse(
+        { name: block.name, toolUseId: block.id, input: block.input },
+        this.onHookEvent,
+      );
+      if (decision.action === "block") {
+        const reason = decision.reason?.trim();
+        return {
+          content: reason
+            ? `Hook blocked "${block.name}". ${reason} Adjust your approach or ask the user how to proceed.`
+            : `Hook blocked "${block.name}". Adjust your approach or ask the user how to proceed.`,
+          isError: true,
+        };
+      }
+    }
+
     if (tool.permission === "deny") {
       return {
         content:
@@ -241,26 +284,46 @@ export class ToolExecutor {
       }
     }
 
-    const sideEffect = isSideEffectTool(tool.name) && this.toolTx;
+    const sideEffect = isSideEffectTool(tool) && this.toolTx;
     if (!sideEffect) {
       try {
-        return await tool.execute(block.input, {
-          workdir: this.workdir,
-          ...(this.readRoots?.length ? { readRoots: this.readRoots } : {}),
-          toolUseId: block.id,
-          signal,
-          ...(this.executionBroker ? { executionBroker: this.executionBroker } : {}),
-        });
+        const result = await this.runTool(tool, block, signal);
+        await this.emitPost(block, result);
+        return result;
       } catch (err) {
         if (err instanceof ToolTxCrashError) throw err;
-        return {
+        if (signal.aborted) {
+          return { content: `Tool "${block.name}" aborted during execution.`, isError: true };
+        }
+        const result = {
           content: `Tool "${block.name}" failed: ${err instanceof Error ? err.message : String(err)}`,
           isError: true,
         };
+        await this.emitPost(block, result);
+        return result;
       }
     }
 
     return this.executeSideEffect(tool, block, signal);
+  }
+
+  /** 工具本体；abort 与 execute 赛跑，避免「已发出停止还在等 bash/MCP」 */
+  private runTool(
+    tool: Tool,
+    block: Anthropic.ToolUseBlock,
+    signal: AbortSignal,
+  ): Promise<ToolResult> {
+    return rejectWhenAborted(
+      tool.execute(block.input, {
+        workdir: this.workdir,
+        ...(this.readRoots?.length ? { readRoots: this.readRoots } : {}),
+        ...(this.writeRoots?.length ? { writeRoots: this.writeRoots } : {}),
+        toolUseId: block.id,
+        signal,
+        ...(this.executionBroker ? { executionBroker: this.executionBroker } : {}),
+      }),
+      signal,
+    );
   }
 
   /**
@@ -298,7 +361,7 @@ export class ToolExecutor {
           name: tool.name,
           inputHash,
           status: "failed" as const,
-          retryPolicy: retryPolicyForTool(tool.name),
+          retryPolicy: retryPolicyForTool(tool),
           preparedAt: Date.now(),
           updatedAt: Date.now(),
         } satisfies DurableToolTx);
@@ -321,7 +384,7 @@ export class ToolExecutor {
       name: tool.name,
       inputHash,
       status: "prepared",
-      retryPolicy: retryPolicyForTool(tool.name),
+      retryPolicy: retryPolicyForTool(tool),
       preparedAt: existing?.preparedAt ?? now,
       updatedAt: now,
     };
@@ -345,13 +408,8 @@ export class ToolExecutor {
     await ctrl.notify("running", running);
 
     try {
-      const result = await tool.execute(block.input, {
-        workdir: this.workdir,
-        ...(this.readRoots?.length ? { readRoots: this.readRoots } : {}),
-        toolUseId: block.id,
-        signal,
-        ...(this.executionBroker ? { executionBroker: this.executionBroker } : {}),
-      });
+      const result = await this.runTool(tool, block, signal);
+      await this.emitPost(block, result);
       const committed: DurableToolTx = {
         ...running,
         status: "committed",
@@ -380,11 +438,21 @@ export class ToolExecutor {
       };
       await this.emitTx("tool_failed", failed, { reason });
       await ctrl.notify("failed", failed, { reason });
-      return {
+      const result = {
         content: `Tool "${block.name}" failed: ${reason}`,
         isError: true,
       };
+      await this.emitPost(block, result);
+      return result;
     }
+  }
+
+  private async emitPost(block: Anthropic.ToolUseBlock, result: ToolResult): Promise<void> {
+    if (!this.hooks) return;
+    await this.hooks.runPostToolUse(
+      { name: block.name, toolUseId: block.id, input: block.input, result },
+      this.onHookEvent,
+    );
   }
 
   private async emitTx(

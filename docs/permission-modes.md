@@ -22,7 +22,10 @@
  * - 求值：`resolveToolPermission` / `resolveMcpToolPermission`
  * - 执行器：`ToolExecutor` 在审批门前拦截 `deny`
  * - CLI 启动行打印展开后的开关值（不许只报模式名）
- * - Web：`permissionMode` 选择器 + `run_config.permission` 装配条展开真实开关
+ * - Web：`permissionMode` 选择器 + 装配条 / composer 一行人话（哪一档、会不会自动放行 ask）；
+ *   展开开关仍在 why 里。`mode` 只跟实际开关反推，不跟点过的标签（追问改编排后对不上 → 自定义）
+ * - 台账：`permissionMode` 记实际开关反推的档（自定义 → null），不是点过的标签；
+ *   `approvals{asked,auto,denied}` 记工具审批结局（计划门不计）
  */
 
 export {};

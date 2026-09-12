@@ -143,7 +143,9 @@ export function endSpan(
 
 /**
  * 从 TurnEvent 投影 tool/model 相关 span 片段。
- * tool_call 开 span（running）；tool_result 关 span；done 记 model 段摘要。
+ * tool_call 开 span（running）；tool_result 关 span；
+ * model_call_start/end 开闭 `model_send`；done 记 segment 摘要；
+ * api_retry / model_fallback 仍是瞬时注解（不是 send 本体）。
  * 返回 0..n 条应追加的完整 span 行（调用方负责 parent 关联）。
  */
 export function projectTurnEventToSpans(opts: {
@@ -152,11 +154,14 @@ export function projectTurnEventToSpans(opts: {
   event: TurnEvent;
   parentSpanId: string | null;
   openTools: Map<string, TraceSpan>;
+  openModels?: Map<string, TraceSpan>;
   ts?: number;
 }): TraceSpan[] {
   const { runId, source, event, parentSpanId, openTools } = opts;
+  const openModels = opts.openModels ?? new Map<string, TraceSpan>();
   const ts = opts.ts ?? Date.now();
   const out: TraceSpan[] = [];
+  const modelKey = (turn: number, attempt: number) => `${source}:${turn}:${attempt}`;
 
   if (event.type === "tool_call") {
     const span = startSpan({
@@ -194,6 +199,31 @@ export function projectTurnEventToSpans(opts: {
           ts,
         ),
       );
+    }
+    return out;
+  }
+
+  if (event.type === "model_call_start") {
+    const span = startSpan({
+      kind: "model",
+      name: "model_send",
+      runId,
+      parentSpanId,
+      source,
+      ts,
+      attrs: { turn: event.turn, attempt: event.attempt },
+    });
+    openModels.set(modelKey(event.turn, event.attempt), span);
+    out.push(span);
+    return out;
+  }
+
+  if (event.type === "model_call_end") {
+    const key = modelKey(event.turn, event.attempt);
+    const open = openModels.get(key);
+    if (open) {
+      openModels.delete(key);
+      out.push(endSpan(open, event.status === "ok" ? "ok" : "error", { durationMs: event.durationMs }, ts));
     }
     return out;
   }

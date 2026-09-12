@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { resolve } from "node:path";
 import { adaptMcpTool, loadMcpConfig, type McpCaller } from "../src/mcp.js";
+import { GITHUB_MCP_READ_TOOLS, GITHUB_MCP_WRITE_TOOLS } from "../src/mcp-github.js";
 import { PACKS, selectPackTools } from "../src/presets.js";
 import { ToolExecutor, ToolRegistry } from "../src/tools/registry.js";
 import { toolUseBlock } from "./helpers.js";
@@ -146,5 +147,55 @@ describe("MCP 最终权限面", () => {
     expect(approvals).toBe(2);
     expect(calls).toEqual(["read_memory", "reset_target"]);
     expect(allowed[0]?.is_error).toBeUndefined();
+  });
+
+  it("ts-coding 只收 GitHub 工具：读 auto、写 ask，硬件工具进不了面", () => {
+    const caller: McpCaller = async () => ({ content: "ok", isError: false });
+    const pool = [
+      ...GITHUB_MCP_READ_TOOLS.map((name) =>
+        adaptMcpTool("github", { name }, caller, { permission: "ask", parallelSafe: true }),
+      ),
+      ...GITHUB_MCP_WRITE_TOOLS.map((name) =>
+        adaptMcpTool("github", { name }, caller, { permission: "ask", parallelSafe: true }),
+      ),
+      adaptMcpTool("stm32", { name: "flash_firmware" }, caller, { permission: "auto", parallelSafe: false }),
+    ];
+    const selected = selectPackTools(PACKS["ts-coding"], [], pool);
+    const names = selected.map((tool) => tool.name);
+    expect(names).toContain("github__get_file_contents");
+    expect(names).toContain("github__create_pull_request");
+    expect(names).not.toContain("stm32__flash_firmware");
+    const permissions = Object.fromEntries(
+      selected.map((tool) => [tool.name.replace(/^github__/, ""), tool.permission]),
+    );
+    expect(permissions.get_file_contents).toBe("auto");
+    expect(permissions.create_pull_request).toBe("ask");
+    expect(permissions.merge_pull_request).toBeUndefined();
+  });
+
+  it("python-coding 声明 mcp:false 仍叠 GitHub，硬件工具进不了面", () => {
+    const caller: McpCaller = async () => ({ content: "ok", isError: false });
+    const pool = [
+      adaptMcpTool("github", { name: "get_file_contents" }, caller, { permission: "ask" }),
+      adaptMcpTool("github", { name: "create_pull_request" }, caller, { permission: "ask" }),
+      adaptMcpTool("stm32", { name: "flash_firmware" }, caller, { permission: "auto" }),
+    ];
+    const selected = selectPackTools(PACKS["python-coding"], [], pool);
+    const names = selected.map((tool) => tool.name);
+    expect(names).toContain("github__get_file_contents");
+    expect(names).toContain("github__create_pull_request");
+    expect(names).not.toContain("stm32__flash_firmware");
+    expect(selected.find((tool) => tool.name === "github__get_file_contents")?.permission).toBe("auto");
+    expect(selected.find((tool) => tool.name === "github__create_pull_request")?.permission).toBe("ask");
+  });
+
+  it("stm32-debug 不会因为 mcp.json 多了 github 就带上 GitHub 工具", () => {
+    const caller: McpCaller = async () => ({ content: "ok", isError: false });
+    const pool = [
+      adaptMcpTool("github", { name: "create_pull_request" }, caller, { permission: "ask" }),
+      adaptMcpTool("stm32", { name: "read_memory" }, caller, { permission: "auto" }),
+    ];
+    const selected = selectPackTools(PACKS["stm32-debug"], [], pool);
+    expect(selected.map((tool) => tool.name)).toEqual(["stm32__read_memory"]);
   });
 });

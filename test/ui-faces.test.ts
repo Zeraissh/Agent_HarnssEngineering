@@ -20,8 +20,13 @@ import {
   buildFactorCards,
   derivePlanFace,
   deriveAssemblyBar,
+  deriveSpinState,
+  deriveCostWarning,
+  describePermissionStance,
   normalizeTab,
   filterRunsByQuery,
+  filterRunsByComposerWorkdir,
+  sameWorkdirPath,
   whitelistSourceLabel,
   VERDICT_PARSE_FAIL,
   normalizeContextConfig,
@@ -128,6 +133,44 @@ describe("deriveLoopFace", () => {
   it("逼近轮次护栏时置 nearLimit", () => {
     const s = feed([ev("main", { type: "turn_start", turn: 33 })]);
     expect(deriveLoopFace(s, HARNESS).nearLimit).toBe(true);
+  });
+
+  it("空转决策在对话还没进展时派生为可停止", () => {
+    const s = feed([
+      ev("main", { type: "turn_start", turn: 1 }),
+      ev("main", {
+        type: "recovery_decision",
+        reason: "end_turn_without_completion",
+        action: "request_completion",
+        detail: "没有工具也没有完成声明",
+      }),
+    ]);
+    expect(deriveSpinState(s)).toMatchObject({ label: "空转 · 可停止" });
+    const progressed = feed([
+      ev("main", {
+        type: "recovery_decision",
+        reason: "stagnation",
+        action: "change_strategy",
+        detail: "重复观察",
+      }),
+      ev("main", { type: "tool_call", toolUseId: "t1", name: "read_file", input: { path: "a.ts" } }),
+    ]);
+    expect(deriveSpinState(progressed)).toBeNull();
+  });
+
+  it("接近预算或本轮很贵时给出成本预警", () => {
+    const near = feed([ev("main", { type: "turn_start", turn: 33 })]);
+    expect(deriveCostWarning(near, HARNESS)?.label).toMatch(/轮次已用 33\/40/);
+    const idle = feed([ev("main", { type: "turn_start", turn: 1 })]);
+    expect(deriveCostWarning(idle, HARNESS)).toBeNull();
+    const spend = feed([ev("main", { type: "turn_start", turn: 1 })]);
+    spend.usageByTurn = [{ turn: 1, input: 40_000, output: 2_000, cacheCreation: 0 }];
+    spend.runConfig = { guardrails: { maxTurns: 40, maxTokens: 50_000 } };
+    expect(deriveCostWarning(spend, null)?.detail).toMatch(/本轮已经很贵|token 已用/);
+  });
+
+  it("describePermissionStance 与装配条同一句人话", () => {
+    expect(describePermissionStance("auto", { autoYes: true })).toMatch(/自动.*ask 级会自动放行/);
   });
 
   it("返工裁决序列：F→P 的终点色可辨", () => {
@@ -269,6 +312,21 @@ describe("deriveToolsFace", () => {
     // 宿主快照新字段要真的到达派生层（host-lags 纪律：加字段同提交接宿主）
     expect(f.history).toEqual({ enabled: true, dir: "D:\\repo\\.agent-run-history", keep: 50 });
     expect(deriveToolsFace(s(), { ...HARNESS, history: undefined }).history).toBeNull();
+  });
+
+  it("run_config.readRoots 覆盖进程快照（逐 run 勾选的额外目录）", () => {
+    const state = feed([ev("host", {
+      type: "run_config",
+      workdir: "D:\\proj",
+      readRoots: ["D:\\refs"],
+      writeRoots: ["D:\\other"],
+      extraWorkdirs: ["D:\\other"],
+    })]);
+    expect(state.runConfig.readRoots).toEqual(["D:\\refs"]);
+    expect(state.runConfig.writeRoots).toEqual(["D:\\other"]);
+    expect(state.runConfig.extraWorkdirs).toEqual(["D:\\other"]);
+    expect(deriveToolsFace(state, HARNESS).readRoots).toEqual(["D:\\refs"]);
+    expect(deriveToolsFace(state, HARNESS).writeRoots).toEqual(["D:\\other"]);
   });
 
   it("run_config 的执行边界覆盖进程快照，report-only 必须成为 Tools 异常", () => {
@@ -505,6 +563,24 @@ describe("filterRunsByQuery（侧栏搜索）", () => {
 
   it("无匹配时返回空列表而不是全部", () => {
     expect(filterRunsByQuery(runs, "不存在的词")).toEqual([]);
+  });
+});
+
+describe("filterRunsByComposerWorkdir（侧栏当前项目）", () => {
+  const runs = [
+    { runId: "a", task: "规格", workdir: "D:\\proj\\alpha" },
+    { runId: "b", task: "幻灯", workdir: "D:/proj/alpha" },
+    { runId: "c", task: "别的", workdir: "D:\\proj\\beta" },
+  ];
+
+  it("正反斜杠视为同一目录；默认只留当前项目", () => {
+    expect(sameWorkdirPath("D:\\proj\\alpha", "D:/proj/alpha/")).toBe(true);
+    expect(filterRunsByComposerWorkdir(runs, "D:/proj/alpha").map((r) => r.runId)).toEqual(["a", "b"]);
+  });
+
+  it("全部项目不过滤；空 workdir 不过滤", () => {
+    expect(filterRunsByComposerWorkdir(runs, "D:/proj/alpha", true)).toBe(runs);
+    expect(filterRunsByComposerWorkdir(runs, "")).toBe(runs);
   });
 });
 
@@ -1290,7 +1366,7 @@ describe("MEM-01 上下文窗口（事实）与预算（策略）分离", () => 
   });
 
   it("来源标签全部有人话，未知不落成 undefined", () => {
-    for (const s of ["env", "learned", "registry", "run", "pack", "default"]) {
+    for (const s of ["env", "learned", "registry", "run", "pack", "window", "default"]) {
       expect(contextSourceLabel(s)).toBeTruthy();
     }
     expect(contextSourceLabel("unknown")).toBe("未知");

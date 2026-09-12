@@ -33,7 +33,7 @@
 | [x] | SAFE-03 | `fetch_url` SSRF/重定向防护 | 5/5/3 | 30 | 仅 HTTPS；拒绝本机/私网/link-local/保留地址；每次重定向重新验证；限制跳转；测试覆盖 DNS 与重定向路径 |
 | [~] | SAFE-04 | 参数级审批授权 | 5/5/4 | 20 | approval grant 绑定 run、tool、规范化 input hash、scope 与 expiry；不同 bash/path/device 参数不能复用旧授权；审批可恢复、可审计 |
 | [~] | SAFE-05 | OS/容器执行隔离 | 5/5/5 | 10 Gate | **WSL2 运输层 + 本机 13 canary skip=0（2026-09-08）**：`AGENT_EXECUTION_BACKEND=wsl2`；路径映射（含 `\\wsl$\`）；信任探针经临时 `.sh`；经 wsl 的脚本一律 stdin / 零 `$` argv（防宿主展开）；Windows 租约主人=Node（MachineGuid+CreationDate）；fixture=`npm run wsl2:oci-fixture`。**残余**：每 run worktree/UID、MCP managed worker、全平台隔离完成定义仍开 |
-| [~] | SAFE-06 | 工具副作用事务层 | 5/5/5 | 10 Gate | **Phase 1 + CLI durable + mid-tool 挂 loop + MCP 写类启发式（2026-09-08）**：内置 write/edit/bash/image 事务；MCP 名命中 flash_firmware/write_memory 等进 fail-closed 事务；CLI durable；mid-tool 续跑自动重放。**残余**：MCP 启发式漏检。**bash compensation：明确不做**（ADR-003——无通用 undo，避免假补偿） |
+| [~] | SAFE-06 | 工具副作用事务层 | 5/5/5 | 10 Gate | **Phase 1 + CLI durable + mid-tool 挂 loop + MCP 写类三层（2026-09-10）**：内置 write/edit/bash/image 事务；MCP ① `sideEffect` 声明（`sideEffectTools` / `destructiveHint`）② 写动词+`call`/`batch` 启发式 ③ 内置名；CLI durable；mid-tool 续跑自动重放。**残余**：未见过的动词仍靠声明。**bash compensation：明确不做**（ADR-003） |
 
 ### Phase 0 验收命令
 
@@ -87,7 +87,7 @@ OCI 逃逸 canary 由 Linux CI container job 承担（run #33461119575 全绿）
 
 | ID | 已取得证据 | 残余边界 |
 |---|---|---|
-| TEST-01a | 装 `@vitest/coverage-v8`；`vitest.config.ts` include `src/**`+`ui/*.ts`，reporters text-summary/lcov/json-summary。2026-09-02 本机基线 statements/lines **77.68%**、branches **81.2%**、functions **91.54%**；棘轮阈值 lines/statements **75**、branches **78**、functions **88**（实测下方约 2–3pt）。`scripts/mutation-smoke.mjs` 固定 8 个关键变异（瞬时判定恒假/恒真、审批门绕过、tool_choice none 映射丢、verdict fail-open、verifier 只读放行、台账空成功、credentialLike 恒假），每个必须把对应测试文件打红。CI `core` 改跑 `test:coverage` + `test:mutation-smoke` 并上传 `coverage/` artifact | 尚非 changed-line coverage、无 Stryker 全量 mutation score；OCI 用例在 Windows 本机 skipped，Linux CI 才计入分支覆盖。第二波再扩变异清单与差分覆盖 |
+| TEST-01a | 装 `@vitest/coverage-v8`；`vitest.config.ts` include `src/**`+`ui/*.ts`，reporters text-summary/lcov/json-summary。2026-09-02 本机基线 statements/lines **77.68%**、branches **81.2%**、functions **91.54%**；棘轮阈值 lines/statements **75**、branches **78**、functions **88**（实测下方约 2–3pt）。`scripts/mutation-smoke.mjs` 固定关键变异（每个必须把对应测试文件打红）。CI `core` 跑 `test:coverage` + `test:mutation-smoke` 并上传 `coverage/` artifact。**changed-line coverage（2026-09-10）**：`scripts/changed-line-coverage.mjs` 对 unified diff 的 `+` 行核对 lcov DA；改到且被插桩的行 hit 必须 > 0；无 DA 的注释/空行跳过；改了 include 文件但 lcov 没有该文件 → fail-closed。`npm run test:changed-coverage`；CI PR 在 coverage 之后跑，`--base origin/<base_ref>`，`fetch-depth: 0`。本地无 `--base` 跳过（exit 0），CI 缺 base fail-closed | 无 Stryker 全量 mutation score；OCI 用例在 Windows 本机 skipped，Linux CI 才计入分支覆盖。push 到默认分支不跑差分覆盖（没有 PR base） |
 | EVAL-02 前置 | 修台账 `error` 硬编码 null：`ledgerErrorClass`（classifyApiError 首行）+ Web/CLI 全路径写入；`buildLedgerEntry` 对 `stopReason=error` 漏传 fail-closed 为 `unclassified_error`。锁：源码不再 `error: null`、哨兵变异验证 | 历史台账里已写入的 null 不回改 |
 | EVAL-02 | `eval/stats.ts` + `npm run eval:stats`：读 ab-log + 台账；Wilson 95% / 无偏 pass@k / 首轮与修复率 / p50·p95 / 先写死的 11 值 taxonomy。22 单测钉已知值与映射；本机对 175+ 条 ab-log 跑通产出 `eval/stats-report.{md,json}`（gitignore）。**2026-09-03 修**：`parseAbLogLine` 只认 `durationMs` 而 `ab.ts` 落的是 `wallMs`，A/B 行 wall 分位数此前恒为 "—"；两名皆认，三向测试 | 重复次数是实验纪律不是代码门；held-out 集（EVAL-01）与 nightly 门尚未接此报告 |
 | EVAL-03a 仪器 | `eval/mock-provider.ts`：loopback HTTP 双 wire 流式（Anthropic Messages SSE + OpenAI chat.completions SSE）+ 脚本队列 + 故障注入（429/500/cut_stream/timeout/bad_json）。25 单测；变异验证故障注入与 alwaysFault | 已被 `eval/deterministic.ts` 接走；OpenAI wire 侧目前只有单测覆盖，场景门全部走 Anthropic wire |
@@ -101,32 +101,35 @@ OCI 逃逸 canary 由 Linux CI container job 承担（run #33461119575 全绿）
 
 | 状态 | ID | 优化项 | I/R/E | 优先分 | 完成定义 |
 |---|---|---|---:|---:|---|
-| [~] | RUN-01 | Durable RunState | 5/5/5 | 10 Gate | 持久化 plan DAG、segment、审批/提问、verifier/rework、预算与 tool transaction；进程重启从明确状态恢复。**Phase 1+2 已落地（2026-09-03）**：`state.json` + Web 迁移；崩溃→interrupted；**同 run 热恢复**（`sameRunResume` / `run_resumed`，idempotency=checkpoint 段边界）；预算与 grantAudit 进 state；UI 文案同提交。**SAFE-06 Phase 1**：`toolTx[]` 已进 state。**会话中心化（2026-09-03）**：`reopen` 迁移（终态→executing）取代"可追问的 completed 保持 executing"；检查点从执行者谱系（main+rework）取；`meta.outcome.judgedTurn`。**仍开**：CLI 对等 durable、mid-tool 自动重放 |
+| [~] | RUN-01 | Durable RunState | 5/5/5 | 10 Gate | 持久化 plan DAG、segment、审批/提问、verifier/rework、预算与 tool transaction；进程重启从明确状态恢复。**Phase 1+2 已落地（2026-09-03）**：`state.json` + Web 迁移；崩溃→interrupted；**同 run 热恢复**（`sameRunResume` / `run_resumed`，idempotency=checkpoint 段边界）；预算与 grantAudit 进 state；UI 文案同提交。**SAFE-06 Phase 1**：`toolTx[]` 已进 state。**会话中心化（2026-09-03）**：`reopen` 迁移（终态→executing）取代"可追问的 completed 保持 executing"；检查点从执行者谱系（main+rework）取；`meta.outcome.judgedTurn`。**CLI durable + mid-tool 重放已挂**。**半截 DAG（2026-09-10）**：`plan.nodes` 增量落盘；`canSameRunResume` 认节点事实（至少一枚 `passed`、无 `failed`、有 `pending`/`running`），不靠会话检查点；`runPlanned({plan,resume})` 跳过 passed；事件 `plan_resume`。**CLI 半截 DAG（2026-09-10）**：`--plan` 增量刷节点；`--resume-run <id>` 注入同一张图；Ctrl+C/`executing` 先 interrupt。**CLI 谱系预算（同日）**：`durableBudgetExhausted`；settle / SIGINT 写 `budget_snapshot`；续跑种子同一份 `lineageBudget`；耗尽则拒并点名 env。**CLI 单执行者同 run（同日）**：`executor_checkpoint` + `transcript.jsonl`；`--resume-run` 不绑 `--plan`；`runContinuation`；`--verify` 互斥。**CLI meta（同日）**：`meta.json` + 收尾 `run_end`；有检查点+账才写 Web `checkpoint`。**CLI 事件流（同日）**：`noteEvent` + 共用 `serializeTurnEventForArchive`；delta 不占 seq；`done` 不带正史；续跑接着 seq；mutation `cli-skips-turn-events`。**CLI 来源（同日）**：`meta.host=cli` + 列表 `host` + 侧栏徽章；旧档案缺字段保持 null；mutation `cli-skips-host-cli`。**CLI 宿主计划事件（同日）**：`noteHostEvent` + 共用 `hostPlanResumeEvent` / `hostPlanReplanEvent` / `hostPlanEvent` / `hostPlanResultEvent`；续发射不重写 `plan`；mutation `cli-skips-plan-resume-event` / `cli-skips-plan-result-event`。**仍开**：`plan_gated` 崩溃仍 close_archive；零进度（全 pending / 第一子任务中途）不能同 run；节点中途 / 飞行中无检查点不能同 run；无快照 fail-open；CLI 无「追加预算」旗标；完成态 plan 追问仍是单执行者 / fork，不是 DAG；CLI 无 `--replan` 入口；CLI 不写 `plan_warning` |
 | [~] | RUN-02 | 恢复与故障注入 | 5/5/4 | 20 | 在 model call、tool prepared/committed、审批等待和历史写入各点注入崩溃；不丢状态、不重复副作用、可安全 fork。**已落地（2026-09-03）**：原套件 + **SAFE-06**：`tool_prepared` 后崩溃 → 同 key 恢复不双写；write_file 事件与 state.toolTx 契约锁。**2026-09-08**：CLI durable + mid-tool 自动重放已挂 loop。**残余**：真实 SIGKILL 子进程 |
-| [~] | OBS-01 | 端到端 trace | 5/4/4 | 18 | run→segment→model/tool spans；记录 commit、模型、工具/schema/pack 版本与输入输出哈希；支持脱敏导出和离线 playback。**已落地（2026-09-02）**：`src/trace.ts` + `trace.jsonl` 旁路（扩展 history，无 OTel）；Web `GET /api/runs/:id/trace` 脱敏导出 + playback 摘要；事件投影 tool/model/segment。**仍开**：CLI 同等接线、完整 model span 起止（非 done 摘要）、跨进程统一 collector |
-| [~] | OBS-02 | 成本、延迟与 SLO | 4/4/3 | 24 | TTFT、模型/工具延迟、排队/审批等待、重试/错误、USD 成本和 provider/model/pack 归因；持久预算账与 p50/p95/p99 仪表盘。**延迟面已落地（a9ab8aa）**；**成本归因部分落地（2026-09-03）**：单价表 + Web/台账/metrics，未登记→null 纪律。**仍开**：持久日预算账、p50/p95/p99 视图、SLO 告警 |
-| [~] | OPS-01 | 备份、恢复与升级演练 | 5/4/4 | 18 | **RPO/RTO 已定义（docs/07）**；明文 `ops:backup-drill` + **异地加密** `ops:backup-drill:encrypted`（AES-256-GCM + 错口令 fail-closed，已进 CI core）。**残余**：版本迁移/回滚演练、在途任务升级、生产 sidecar 接密文异地 |
+| [~] | OBS-01 | 端到端 trace | 5/4/4 | 18 | run→segment→model/tool spans；记录 commit、模型、工具/schema/pack 版本与输入输出哈希；支持脱敏导出和离线 playback。**已落地（2026-09-02）**：`src/trace.ts` + `trace.jsonl` 旁路（扩展 history，无 OTel）；Web `GET /api/runs/:id/trace` 脱敏导出 + playback 摘要；事件投影 tool/model/segment。**CLI 接线（2026-09-10）**：`createCliDurable.beginTrace/noteTrace`，`noteForLedger` 旁路投影，收尾关根 span；`AGENT_CLI_DURABLE=0` 整机制不写。**model send 起止（2026-09-10）**：`model_call_start`/`model_call_end` 紧贴 `model.send`；trace `model_send` 开闭；CLI/Web 同提交接线。**仍开**：跨进程统一 collector、UI trace 面 |
+| [~] | OBS-02 | 成本、延迟与 SLO | 4/4/3 | 24 | TTFT、模型/工具延迟、排队/审批等待、重试/错误、USD 成本和 provider/model/pack 归因；持久预算账与 p50/p95/p99 仪表盘。**延迟面已落地（a9ab8aa）**；**成本归因部分落地（2026-09-03）**：单价表 + Web/台账/metrics，未登记→null 纪律。**分位数读数（2026-09-10）**：`histogramQuantile` + `Histogram.quantiles`；`GET /api/harness` 的 `latency`（执行者 modelCall/ttft + wait kinds）；没有样本是 null。**仍开**：持久日预算账、仪表盘 UI、SLO 告警 |
+| [~] | OPS-01 | 备份、恢复与升级演练 | 5/4/4 | 18 | **RPO/RTO 已定义（docs/07）**；明文 `ops:backup-drill` + **异地加密** `ops:backup-drill:encrypted`（AES-256-GCM + 错口令 fail-closed，已进 CI core）。**schema 演练（2026-09-10）**：`classifyDurableRunState` 把 `unsupported_version` 与 `malformed` 分开；`npm run ops:schema-migrate-drill`；未来 version 读不成 → 同 run 续跑拒。**未 bump** `RUN_STATE_VERSION`。**残余**：生产 sidecar 接密文异地；真回滚（把 v2 档案降回 v1）要等真有 v2 |
 
 ### Phase 2 实施记录（进行中）
 
 | ID | 已取得证据 | 残余边界 |
 |---|---|---|
-| OBS-01 | `src/trace.ts`：span 模型 + redact/hash + TurnEvent 投影 + JSONL playback；`RunHistoryWriter.appendTraceSpan` → `trace.jsonl`；Web 建 run 写根 span（harness/git/model/pack/toolSchemaHash），`pushEvent` 投影 tool/model/segment，收尾关根 span；`GET /api/runs/:id/trace` 返回脱敏导出 + playback 摘要。`test/trace.test.ts` 7 测。未引入 OTel | CLI 未接线；model span 仍是 done/api_retry/fallback 摘要而非逐 send 起止；无跨进程 collector；UI 未渲染 trace 面 |
+| OBS-01 | `src/trace.ts`：span 模型 + redact/hash + TurnEvent 投影 + JSONL playback；`RunHistoryWriter.appendTraceSpan` → `trace.jsonl`；Web 建 run 写根 span（harness/git/model/pack/toolSchemaHash），`pushEvent` 投影 tool/model/segment，收尾关根 span；`GET /api/runs/:id/trace` 返回脱敏导出 + playback 摘要。**CLI（2026-09-10）**：`beginTrace`/`noteTrace` 与 Web 同一投影函数。**model send（2026-09-10）**：`model_call_start`/`end` 紧贴 `send`（含 abort/overflow/retry）；`openModelSpans`/`openModels` 配对 `model_send`；`api_retry` 仍是瞬时注解。CLI 暗行 + Web 白名单投影。变异 `model-send-error-marked-ok` | 无跨进程 collector；UI 未渲染独立 trace 面（事件进日志） |
+| OBS-02 分位数 | `histogramQuantile`（Prom 插值；空/坏 q/`+Inf` → null）+ `Histogram.quantiles`；`/api/harness.latency` 报执行者 modelCall/ttft 与 wait kinds。变异 `histogram-quantile-zero-on-empty` | 无仪表盘 UI、无 SLO 告警、无持久日预算账 |
 | RUN-01 Phase 1 | ADR-003 + `src/run-state.ts`；`ui/history.ts` `writeState`/`readArchivedState`；`ui/server.ts` 迁移接线与崩溃收口；`test/run-state*.ts` + ui-server 两条；API 诚实字段 | 见 Phase 2 |
-| RUN-01 Phase 2 | `canSameRunResume` + `resume` 迁移；崩溃+checkpoint → `sameRunResume:true` / `continuationMode:same-run`；`startSameRunResume` 同 runId；预算/grantAudit 进 state；`run_resumed` 事件 + UI 三处；mutation `same-run-resume-allows-executing` | **SAFE-06 Phase 1 toolTx 已进 state**；**未** CLI 对等 durable；完成态归档仍走 fork；mid-tool 自动重放未做 |
-| RUN-02 | 原套件 + SAFE-06：`tool_prepared/committed` 事件与 `state.toolTx`；crash-after-prepared 同 key 不双写；noop 无事务契约锁 | mid-tool **自动重放**未完成轮；CLI 无对等 durable；进程内模拟硬崩溃，非真实 SIGKILL |
+| RUN-01 Phase 2 | `canSameRunResume` + `resume` 迁移；崩溃+checkpoint → `sameRunResume:true` / `continuationMode:same-run`；`startSameRunResume` 同 runId；预算/grantAudit 进 state；`run_resumed` 事件 + UI 三处；mutation `same-run-resume-allows-executing`。**CLI durable + mid-tool 重放已挂**。**半截 DAG（2026-09-10）**：`DurablePlanNode` + `plan_progress` + `planResumeFacts`；Web 增量刷节点；注入同一张图、不重跑 planner、不重开计划门；`plan_resume` + mutation `plan-resume-without-passed`。**CLI `--resume-run`**：`prepareCliPlanResume` + 节点落盘；mutation `cli-plan-resume-skips-crash-interrupt`。**谱系预算**：`durableBudgetExhausted` + settle/SIGINT 快照 + `seedDurableBudget`；mutation `cli-plan-resume-ignores-budget`。**CLI 单执行者**：`prepareCliSingleResume` + `noteExecutorCheckpoint` + `runContinuation`；mutation `cli-single-resume-without-checkpoint`。**CLI meta**：`cliMetaCheckpoint` + `loadArchivedMetas`；mutation `cli-skips-meta-json`。**CLI 事件流**：共用投影 + `noteForLedger` 接线；mutation `cli-skips-turn-events`。**CLI 来源**：`meta.host` + 侧栏徽章；mutation `cli-skips-host-cli`。**CLI 宿主计划事件**：共用投影 + `noteHostEvent`；mutation `cli-skips-plan-resume-event` / `cli-skips-plan-result-event` | 完成态归档仍走 fork；`plan_gated` close；零进度不续；节点中途 / 飞行中无检查点；无快照 fail-open；CLI 无追加预算旗标；CLI 无 `--replan` 入口；CLI 不写 `plan_warning`；旧档案缺 host 不标 |
+| RUN-02 | 原套件 + SAFE-06：`tool_prepared/committed` 事件与 `state.toolTx`；crash-after-prepared 同 key 不双写；noop 无事务契约锁。**CLI durable + mid-tool 自动重放已挂 loop** | 进程内模拟硬崩溃，非真实 SIGKILL |
 | SAFE-06 Phase 1 | `src/tool-tx.ts`；TurnEvent 五态；`write_file`/`bash`；内容级 unchanged；bash fail-closed；CLI+Web 渲染；`test/tool-tx.test.ts` + RUN-02 扩展；mutation `tool-tx-committed-must-skip`；ADR-003 附录 | CLI durable；MCP 写工具；bash undo；mid-tool 自动重放 |
 
 ## Phase 3：动态协作与扩展平台
 
 | 状态 | ID | 优化项 | I/R/E | 优先分 | 完成定义 |
 |---|---|---|---:|---:|---|
-| [ ] | AGENT-01 | 一等 `PlanState` 与重规划 | 4/3/4 | 14 | 节点有目标、证据、验收、状态和失败策略；仅在新证据/依赖变化时可审计地更新计划。**旁注（2026-09-03 会话中心化，不算本项进展）**：plan run 现可继续对话——下一轮以计划摘要为种子按**单执行者**跑，不是重规划、不改 DAG；`replan` 未做 |
-| [ ] | AGENT-02 | 动态多 Agent | 5/4/5 | 9 | supervisor/mailbox 支持 spawn、follow-up、cancel、重新分派和分支失败策略；handoff 使用结构化证据引用 |
-| [ ] | AGENT-03 | 每 Agent 隔离与路由 | 5/4/5 | 9 | 每 agent 独立 worktree/sandbox、工具、模型和预算；并发写不会污染共享 checkout |
-| [~] | MODEL-01 | Provider 能力注册与降级 | 4/4/4 | 16 | 以 endpoint+model capability probe 代替名称猜测；支持健康检查、熔断、fallback、成本/延迟路由与每角色绑定。**MODEL-01a（降级+熔断）+ MODEL-01b（探针+每角色+prefer_healthy stub）已落地**（见 Phase 3 实施记录）；**仍开**：真实成本/延迟路由、Web 启动同步探针回写 compat、链健康实时面、识图能力探针 |
-| [ ] | EXT-01 | 插件/Pack manifest 与 SDK | 4/3/4 | 14 | 版本化 manifest、权限声明、依赖、签名/来源、启停与兼容检查；DomainPack 不再只能硬编码发布 |
-| [ ] | EXT-02 | 完整 MCP 与公开协议 | 4/3/4 | 14 | 远程 transport、OAuth、resources/prompts/elicitation、lazy tool discovery；公开版本化 schema/SDK/webhook |
+| [~] | AGENT-01 | 一等 `PlanState` 与重规划 | 4/3/4 | 14 | 节点有目标、证据、验收、状态和失败策略；仅在新证据/依赖变化时可审计地更新计划。**切片（2026-09-10）**：`PlanNodeState` + `POST …/messages` `replan:true` → 再走 `runPlanned`，已 `passed` 且未改写的节点不重跑；事件 `plan_replan`（Web 三处 + CLI `onReplan`→档案；无 `--replan` 旗标）。未设 `replan` 时 plan 追问仍为单执行者。**半截 DAG 崩溃续发射（同日）**：节点状态进 `state.json`；同 run 注入原图跳过 passed；Web + CLI `--resume-run`；CLI 谱系预算门。**CLI 单执行者同 run（同日）**：检查点 + `runContinuation`。`plan_gated` 仍 close。**仍开**：完整失败策略一等字段；零进度 / 飞行中无检查点；无快照 fail-open |
+| [~] | AGENT-02 | 动态多 Agent | 5/4/5 | 9 | supervisor/mailbox 支持 spawn、follow-up、cancel、重新分派和分支失败策略；handoff 使用结构化证据引用。**切片（2026-09-10）**：默认关的 `spawn_task`（`AGENT_SPAWN_TASK=1`），回摘要/扣父谱系预算/深度 1/并发 cap=3；`withoutAskUser` 剥掉 verifier/planner；事件 `spawn_start`/`spawn_done`。**不是** supervisor/mailbox，也不是 `propose_handoff`。Windows 隔离仍是 report——不假装 AGENT-03 |
+| [ ] | AGENT-03 | 每 Agent 隔离与路由 | 5/4/5 | 9 | 每 agent 独立 worktree/sandbox、工具、模型和预算；并发写不会污染共享 checkout。**本波不做**（仍归 SAFE-05） |
+| [~] | MODEL-01 | Provider 能力注册与降级 | 4/4/4 | 16 | 以 endpoint+model capability probe 代替名称猜测；支持健康检查、熔断、fallback、成本/延迟路由与每角色绑定。**MODEL-01a/b + 2026-09-10 接线**：Web 探针回写 compat、只读 `endpointHealth[]`、识图探针闸 `describe_image`、`prefer_cheap`（按 `pricing.ts` 单价排备用，**不是**延迟+成本多目标）。**仍开**：真多目标路由、同步阻塞探针、tools 能力位 |
+| [~] | EXT-01 | 插件/Pack manifest 与 SDK | 4/3/4 | 14 | 版本化 manifest、权限声明、依赖、签名/来源、启停与兼容检查；DomainPack 不再只能硬编码发布。**切片（2026-09-10）**：文件包来源已有（draft→签字安装、权限只收窄）；`schemaVersion` 不认则 CLI exit 1 / Web `createUiServer` 抛。四个内置包继续硬编码。**未做**：签名、远程来源、builtin 退役、完整 plugin.json/skills |
+| [~] | HOOK-01 | 最小 command hooks（docs/09 §4.2） | 4/4/3 | 24 | **切片（2026-09-10）**：`PreToolUse`/`PostToolUse`/`Stop` + `command` handler；退出码 0 放行 / 2 阻断 / 其它与超时非阻断；Pre 在审批门前；verifier/planner/clarifier/router 不经外部 hooks；`AGENT_HOOKS_CONFIG` 默认关、缺文件 fail-closed；台账 `hooks{fired,blocked}\|null`；CLI+Web 同提交接线。**未做**：27 事件、prompt/http/agentic handler。不翻默认 |
+| [~] | GUIDE-01 | 分层 AGENT.md（docs/09 §4.7） | 4/4/3 | 20 | **切片（2026-09-10）**：`~/.agent/AGENT.md` + 项目 `AGENT.md` / `.agent/rules/*.md` + 工作区内子目录按需；user 上下文注入、不进 system；上限 16k 截断告警；`run_config` 报实际文件 +「指导不是执行」；包 prompt 优先级锁；测试宿主不读真实家目录；verifier/planner/clarifier/router 剥掉。**未做**：随 bash cwd 动态再加载、`/etc` managed、LLM memory scan |
+| [ ] | EXT-02 | 完整 MCP 与公开协议 | 4/3/4 | 14 | 远程 transport、OAuth、resources/prompts/elicitation、lazy tool discovery；公开版本化 schema/SDK/webhook。**本波不做** |
 
 ### Phase 3 实施记录（2026-09-02，MODEL-01a）
 
@@ -146,6 +149,25 @@ OCI 逃逸 canary 由 Linux CI container job 承担（run #33461119575 全绿）
 | MODEL-01b 能力探针 | `src/model-capability.ts`：端点身份键 + 粘性 TTL 缓存；Anthropic 路径带 `thinking/adaptive` 轻量 POST——原生 200→compat=false，compat 400→compat=true；OpenAI 路径只做健康检查。**fail-open**：探针失败/未触发 → 名称猜测。**仅 `AGENT_MODEL_PROBE=1` 触发**（loopback 不自动开——会吃掉确定性 eval 的 mock 脚本队列）。`createModelClientWithProbe` 写入 client 的 compat。mock provider 增 `rejectClaudeExtensions`。`test/model-capability.test.ts` **8 测试** | Web `createUiServer` 仍**同步**名称猜 compat；异步探针同样要 env=1 才跑。未做 tools/vision 能力位 |
 | MODEL-01b 每角色 fallback | `readRoleFallbackMode` / `createRoleFallbackClient`：`AGENT_<ROLE>_FALLBACK_MODEL`（own）或 `AGENT_<ROLE>_FALLBACK=inherit`。`CircuitBreakerRegistry` 按身份共享；装饰器实例按角色隔离。CLI + Web 同提交接线；`model_fallback` 事件带可选 `role`/`routing`；`run_config.fallbackChains` + `fallbackScope=roles\|executor\|null` | 台账仍只记执行者 `fallbackChain`（角色次数未分列）；inherit 只继承执行者**备用**端点，不把执行者 primary 塞进角色链 |
 | MODEL-01b 路由 stub | `AGENT_FALLBACK_ROUTING=prefer_healthy`：保持配置链原序，有健康候选时跳过粘性 `healthy=false`（reason=`probe_unhealthy`）；全不健康仍尝试。装配条/CLI 可见。mutation `prefer-healthy-never-skips` | **不是**成本/延迟路由——无 token 单价、无 p50 延迟模型、无多目标优化。下一步若做真路由，应另开 ID，勿在 stub 上堆 |
+
+### Phase 3 / 5 切片收口（2026-09-10）
+
+口径：做 docs/09 写过的切片，清单用 `[~]` 说实话，不把完成定义全文勾绿。本波明确不做 AGENT-03 / EXT-02 / MEM-01 七条残余 / 签名加密。
+
+| ID | 已取得证据 | 残余边界 |
+|---|---|---|
+| AGENT-01 | `PlanNodeState`/`diffPlansForReplan`/`buildReplanTask`；`runPlanned({replan})` 预置 passed 交接；Web `replan:true` + `plan_replan`；`runPlanned({plan,resume})` 跳过 passed；Web 崩溃后续发射 + `plan_resume`；CLI `--resume-run`：半截 DAG + 单执行者检查点；CLI `plan_resume`/`plan_replan` 进档案（共用投影）；`test/plan-replan.test.ts` + ui-server「半截 DAG」 + `test/cli-durable.test.ts` | 完整失败策略一等字段；`plan_gated` 仍 close；零进度 / 飞行中无检查点；无快照 fail-open；CLI 无 `--replan` 旗标 |
+| AGENT-02 | `src/tools/spawn-task.ts` + `src/spawn.ts`；`AGENT_SPAWN_TASK` 默认 0；共享 `SharedRunBudget`；深度 1；verifier/planner 剥掉；CLI/Web 事件；`test/spawn-task.test.ts` | 不是 supervisor；Windows 隔离仍 report（AGENT-03） |
+| MODEL-01 接线 | 探针回写 compat；`endpointHealth[]`；`probeVisionSupport` 闸识图；`prefer_cheap` 按单价排备用 | 真多目标路由；同步阻塞探针 |
+| EXT-01 | `schemaVersion` 不认 fail-closed（CLI 1 / createUiServer 抛）；文件包来源既有 | 签名/远程/builtin 退役 |
+| MEM-02/03 | `resolveMemoryDir`；嵌套 `/api/memory/…`；`test/memory-contract.test.ts` | 加密/同步/多租户/自动进记忆 |
+| GUIDE-01 | `src/agent-md.ts`；user 上下文注入；CLI 启动行 + Web `run_config`/`/api/harness`；台账 `agentMd{files,chars,truncated}\|null`；`test/agent-md.test.ts` + 宿主投影/渲染锁 | 不随 bash `cd` 再加载；无 managed 层 |
+| D3 台账 | `permissionMode`（实际开关反推，自定义 null）+ `approvals{asked,auto,denied}`；CLI 应答处 / Web `approval_resolved`·`expired` 旁路；`npm run ledger` 直方图 | 分类器未做；CLI `--plan` 无计划门，反推为自定义；不把 D3 整条勾绿 |
+| D3 装配条 | `run_config.permission.mode = matchPermissionMode(开关)`，不再 `run.permissionMode ??`；四开关展开；自定义「档 自定义」；变异 `run-config-permission-uses-stale-label` | 分类器未做 |
+| A1 工具名单 | `run_config.tools` ← `cfg.tools`（实际下发，含注入工具 / `ask_user`） | `/api/harness` 仍是进程快照；A1 整条不由此勾绿 |
+| OPS-01 schema | `classifyDurableRunState`；`ops:schema-migrate-drill`；v2 → `unsupported_version` | 未 bump 版本；无真 v2 回滚；sidecar 密文异地仍开 |
+| OBS-01 CLI | durable `trace.jsonl` 与 Web 同投影；`model_send` 开闭 | 跨进程 collector；独立 UI trace 面 |
+| OBS-02 分位数 | `histogramQuantile` + `/api/harness.latency`；空样本 null | 仪表盘 UI；SLO 告警；持久日预算账 |
 
 ### Phase 3 回归证据（2026-09-02）
 
@@ -175,9 +197,9 @@ npx tsc --noEmit                            passed
 
 | 状态 | ID | 优化项 | I/R/E | 优先分 | 完成定义 |
 |---|---|---|---:|---:|---|
-| [~] | MEM-01 | 语义化上下文压缩 | 5/4/4 | 18 | 保留用户约束、决策、失败尝试、证据引用和 side-effect ledger，不再只用占位符替换旧工具输出。**Phase A+B 已落地（2026-09-03）**：启发式 `[compact_ledger]` + 可选 LLM 摘要合并（`AGENT_COMPACT_SUMMARY=1`，默认关）；**Phase C 已落地（2026-09-03）**：入口截断 + tier 2 折叠旧轮 + 反应式硬压缩重发；见 Phase 5 实施记录 |
-| [ ] | MEM-02 | 分层、可治理记忆 | 4/4/5 | 8 | 原始事件→滚动摘要→artifact/reference store；按用户/项目/任务检索；记录来源、时间、置信度、冲突和删除范围 |
-| [ ] | MEM-03 | 跨宿主一致性 | 4/3/4 | 14 | CLI/Web/Electron 使用同一 memory contract；同步、权限、加密、删除和数据归属有端到端测试 |
+| [~] | MEM-01 | 语义化上下文压缩 | 5/4/4 | 18 | 保留用户约束、决策、失败尝试、证据引用和 side-effect ledger，不再只用占位符替换旧工具输出。**Phase A+B+C + 窗口/预算分离已落地**。**本波不收七条设计残余**（保护窗、首条 user、账本 20 条、折叠块不语义合并、system/tools 不压、原文不可恢复等）——清单维持 `[~]` |
+| [~] | MEM-02 | 分层、可治理记忆 | 4/4/5 | 8 | 原始事件→滚动摘要→artifact/reference store；按用户/项目/任务检索；记录来源、时间、置信度、冲突和删除范围。**切片（2026-09-10）**：`resolveMemoryDir` 单点；可选 frontmatter 不破首行摘要；嵌套路径可读。**未做**：分层检索、冲突、删除范围、加密、事件自动进记忆 |
+| [~] | MEM-03 | 跨宿主一致性 | 4/3/4 | 14 | CLI/Web/Electron 使用同一 memory contract；同步、权限、加密、删除和数据归属有端到端测试。**切片（2026-09-10）**：三宿主共用 `resolveMemoryDir`；`GET /api/memory/…` 与 `MemoryStore.NAME_RE` 对齐；`test/memory-contract.test.ts` 工具写入→Web list/read。**未做**：同步、加密、多租户 |
 
 ### Phase 5 实施记录（2026-09-03，MEM-01 Phase A + B）
 
@@ -189,9 +211,9 @@ npx tsc --noEmit                            passed
 
 | MEM-01 窗口 / 预算分离 | `contextTokenLimit` 一个数此前兼任"模型能装多少"与"我们在多少处压"，Phase C 的真端点复核把这笔债照了出来（窗口 1,048,576 而预算 150k = 在 11% 处压；128k 的模型则永远到不了主动压缩，只能白吃一次 400）。**窗口**（事实）`src/context-window.ts` 四级来源 env `AGENT_CONTEXT_WINDOW` > learned（`model-capability.ts`：撞 400 时 `parseContextWindowFromOverflowError` 只认两种见过的措辞，按 `provider|model|origin` 记，粘性 + TTL 30 天，落 `.agent-capabilities.json`，只存身份键与数字）> registry（`model-windows.ts`，每条带出处，**不认识就不猜**）> unknown；**预算**（策略）三级覆盖 run（Web 逐 run）> env > 包 > 默认 150k，再夹进 `maxBudget = window − maxTokens − margin`（`margin = max(4k, 2%)`），夹紧发告警且原值可见。loop 撞 400 先学窗口再硬压缩（`onContextWindowLearned` 钩子归宿主；编排层给独立 verifier / planner 剥掉——它们的 400 说的是自己的窗口）。两个宿主如实报数：CLI 启动行「预算 / 窗口（来源）」+ 夹紧 ⚠ 行 + 压缩行「学到窗口 …（下次运行生效）」；Web `run_config` / `/api/harness` 的 `context` 九字段投影、三段水位条（已用 / 预算 / 窗口，未知不画那一段）、到预算 80% 的「下一轮将压缩」、逐 run 预算控件（区间 `[32k, maxBudget]`，越界 **400 报区间**而非静默夹紧；>200k 成本忠告不阻断），逐 run 值随档案 meta 与派生 run 走；台账 `context { window, windowSource, budget, budgetSource }` + `npm run ledger` 来源直方图 / 预算分桶。测试：`test/context-window.test.ts` 21 条 + compact-tier2 / ledger / mock-provider 各若干 + Web 侧 9 条服务端契约 + 7 条渲染 / axe + 23 条派生与投影锁；确定性场景 `context-window-learned-across-runs`（二进程：第一跑学到 → 落盘 → 第二跑启动行报 learned）；变异 `context-budget-clamp-dropped` / `context-window-learn-dropped` + Web 侧 5 处（逐 run 校验 / 投影字段 / 80% 提示 / 水位边界 `>=`→`>` / 启动期 env 校验）全部 killed | **窗口只在撞过 400 或在登记表里时才知道**——首次跑一个陌生模型必然是"未知"，此时预算不夹紧，仍可能白吃一次 400（这一次的成本换来往后都知道）。登记表要人工维护，厂商升窗口后旧条目会过期（learned 优先于它可自愈，TTL 30 天）。夹紧只按 `maxTokens` 与固定边际算，**不读真实 token 计数**（token 是端点算的，我们只有上一轮读数）；预算**不随窗口自动抬高**是有意的策略选择，代价是大窗口模型上默认仍在 150k 处压。逐 run 预算不进台账的独立字段（只体现为 `budgetSource=run` + 生效数）。学到的窗口按端点身份记，同一模型换 baseURL 要重新学 |
 
-当前执行顺序（2026-09-08 单操作员产品化，本波已收）：
-`SAFE-05 WSL2[~]（本机 13 canary skip=0 已证）→ D3[~] → CLI durable + mid-tool→loop → GhostApproval 真实路径 → MCP 写类启发式`。
-仍开：OPS-01 版本迁移/在途升级演练；SAFE-06 MCP 启发式漏检。
-对照表见 `docs/permission-modes.md`；WSL2 fixture：`npm run wsl2:oci-fixture`；Electron：`npm run e2e:electron-lifecycle -- --build`；加密备份：`npm run ops:backup-drill:encrypted`。
+当前执行顺序（2026-09-10 单操作员产品化，本波已收）：
+`SAFE-05 WSL2[~] → D3[~]（台账判据 4 已收） → HOOK-01[~] → GUIDE-01[~]（分层 AGENT.md）`。
+仍开：OPS-01 生产 sidecar 密文异地；OBS-01 跨进程 collector；OBS-02 仪表盘/SLO；SAFE-06 未见过的动词仍靠 `sideEffectTools`；TEST-01 无 Stryker 全量。
+对照表见 `docs/permission-modes.md`；WSL2 fixture：`npm run wsl2:oci-fixture`；Electron：`npm run e2e:electron-lifecycle -- --build`；加密备份：`npm run ops:backup-drill:encrypted`；schema 演练：`npm run ops:schema-migrate-drill`。
 **bash compensation 已结案为不做**（见 ADR-003）。
 GOV-* 与 SAFE-05 Phase 2B（每 run UID/worktree）本波默认跳过。

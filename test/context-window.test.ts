@@ -2,7 +2,7 @@
  * MEM-01 窗口 / 预算分离（src/context-window.ts + model-windows.ts + model-capability.ts 的学习面）。
  *
  * 锁四件事：① 窗口四级来源的优先级；② 从真机 / SDK 形状的 400 报文里解析窗口；
- * ③ 夹紧算式（含 maxTokens 与边际）与"默认不自动抬高"；④ 逐 run 预算校验的区间与错误文案。
+ * ③ 夹紧算式（含 maxTokens 与边际）与"窗口已知则跟可用窗口"；④ 逐 run 水位校验的区间与错误文案。
  * 变异验证（手工，提交信息有数）：删夹紧分支 → 本文件红；删 loop 学习钩子 → compact-tier2 红。
  */
 import Anthropic from "@anthropic-ai/sdk";
@@ -191,23 +191,35 @@ describe("planContextBudget：三级覆盖 + 夹紧 = 窗口 − maxTokens − �
     expect(plan).toMatchObject({ budget: DEFAULT_CONTEXT_TOKEN_LIMIT, budgetSource: "default", maxBudget: null, clamped: false, warning: null });
   });
 
-  it("窗口 1M（deepseek 实测）：默认 150k **不**自动抬高——保守是设计，不是漏做", () => {
+  it("窗口 1M（deepseek 实测）：无覆盖时水位 = 可用窗口，不是另钉 150k", () => {
     const plan = planContextBudget({ window: 1_048_576, windowSource: "registry", maxTokens: 64_000 });
-    expect(plan.budget).toBe(150_000);
+    expect(plan.budget).toBe(963_605);
     expect(plan.maxBudget).toBe(963_605);
+    expect(plan.budgetSource).toBe("window");
     expect(plan.clamped).toBe(false);
   });
 
-  it("窗口 128k：150k 超过 59,904 → 夹到 59,904，带告警且原值可见；来源仍是 default", () => {
+  it("窗口 128k：无覆盖时水位就是 59,904，不必先写 150k 再夹", () => {
     const plan = planContextBudget({ window: 128_000, windowSource: "learned", maxTokens: 64_000 });
+    expect(plan.budget).toBe(59_904);
+    expect(plan.requestedBudget).toBe(59_904);
+    expect(plan.clamped).toBe(false);
+    expect(plan.budgetSource).toBe("window");
+    expect(describeContextPlan(plan)).toBe("上下文：水位 59k（跟窗口） / 窗口 128k（来源：learned）");
+  });
+
+  it("显式 150k 盖过窗口：128k 窗口装不下 → 夹到 59,904，原值可见", () => {
+    const plan = planContextBudget({
+      window: 128_000, windowSource: "learned", maxTokens: 64_000, envLimit: 150_000,
+    });
     expect(plan.budget).toBe(59_904);
     expect(plan.requestedBudget).toBe(150_000);
     expect(plan.clamped).toBe(true);
-    expect(plan.budgetSource).toBe("default");
+    expect(plan.budgetSource).toBe("env");
     expect(plan.warning).toContain("150k");
     expect(plan.warning).toContain("59k");
     expect(plan.warning).toContain("maxTokens 64k");
-    expect(describeContextPlan(plan)).toBe("上下文：预算 59k（由 150k 夹紧） / 窗口 128k（来源：learned）");
+    expect(describeContextPlan(plan)).toBe("上下文：水位 59k（由 150k 夹紧） / 窗口 128k（来源：learned）");
   });
 
   it("maxTokens 参与夹紧：同一窗口下 maxTokens 越大预算上限越小（变异：去掉 maxTokens 项这里就红）", () => {
@@ -233,11 +245,11 @@ describe("planContextBudget：三级覆盖 + 夹紧 = 窗口 − maxTokens − �
     expect(plan.warning).toContain("AGENT_MAX_TOKENS");
   });
 
-  it("CLI 启动行：默认预算不带来源、非默认带来源、窗口未知照实说", () => {
+  it("CLI 启动行：跟窗口带来源、显式覆盖带来源、窗口未知照实说", () => {
     expect(describeContextPlan(planContextBudget({ window: 1_048_576, windowSource: "learned", maxTokens: 64_000 })))
-      .toBe("上下文：预算 150k / 窗口 1,048k（来源：learned）");
+      .toBe("上下文：水位 963k（跟窗口） / 窗口 1,048k（来源：learned）");
     expect(describeContextPlan(planContextBudget({ window: null, windowSource: "unknown", maxTokens: 64_000, envLimit: 200_000 })))
-      .toBe("上下文：预算 200k（env） / 窗口未知");
+      .toBe("上下文：水位 200k（env） / 窗口未知");
     expect(formatTokensK(1_048_576)).toBe("1,048k");
     expect(formatTokensK(59_904)).toBe("59k");
   });

@@ -1067,6 +1067,8 @@ describe("deriveWrittenPaths — 事件流里的写入路径", () => {
   it("非写盘工具与缺路径的调用不算；去重；裸事件信封也认", () => {
     expect(deriveWrittenPaths(null, [call("t1", "", "bash")])).toEqual([]);
     expect(deriveWrittenPaths(null, [{ type: "tool_call", toolUseId: "t9", name: "memory_write", input: { file_path: "m.md" } }])).toEqual(["m.md"]);
+    expect(deriveWrittenPaths(null, [call("t8", "src/foo.ts", "edit_file")])).toEqual(["src/foo.ts"]);
+    expect(deriveWrittenPaths(null, [call("t3", "talk.pptx", "write_pptx")])).toEqual(["talk.pptx"]);
     const batch = [call("t1", "out/a.html"), call("t2", "out/a.html"), okResult("t1")];
     expect(deriveWrittenPaths(null, batch)).toEqual(["out/a.html"]);
   });

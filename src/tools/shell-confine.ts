@@ -228,9 +228,9 @@ function splitShellSegments(command: string): string[] {
   return segments;
 }
 
-function pathOutsideWorkdir(workdir: string, p: string): boolean {
+function pathOutsideWorkdir(workdir: string, p: string, extraRoots?: string[]): boolean {
   try {
-    resolveInWorkdir(workdir, p);
+    resolveInWorkdir(workdir, p, extraRoots);
     return false;
   } catch {
     return true;
@@ -241,7 +241,11 @@ function pathOutsideWorkdir(workdir: string, p: string): boolean {
  * 静态判定命令是否试图把 cwd 挪出 workdir，或把输出重定向到圈外路径。
  * 看不懂的构造（未闭合引号、命令替换拼路径）**不**在此拦——交给 SAFE-05。
  */
-export function confineShellCommand(command: string, workdir: string): ShellConfineResult {
+export function confineShellCommand(
+  command: string,
+  workdir: string,
+  extraRoots?: string[],
+): ShellConfineResult {
   const root = path.resolve(workdir);
 
   // 先查 cd：`cd .. && echo x > file` 的 redirect 目标相对初始 workdir 看似圈内，
@@ -256,7 +260,7 @@ export function confineShellCommand(command: string, workdir: string): ShellConf
       };
     }
     if (/[`$]/.test(cd) || cd.includes("$(")) continue;
-    if (pathOutsideWorkdir(root, cd)) {
+    if (pathOutsideWorkdir(root, cd, extraRoots)) {
       return {
         ok: false,
         reason:
@@ -269,7 +273,7 @@ export function confineShellCommand(command: string, workdir: string): ShellConf
   for (const target of extractWriteRedirectTargets(command)) {
     // 动态目标（含 `$` / `` ` `` / 命令替换）无法静态解析——放过，避免误杀
     if (/[`$]/.test(target) || target.includes("$(")) continue;
-    if (pathOutsideWorkdir(root, target)) {
+    if (pathOutsideWorkdir(root, target, extraRoots)) {
       return {
         ok: false,
         reason:

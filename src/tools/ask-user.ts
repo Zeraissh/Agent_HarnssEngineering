@@ -50,6 +50,8 @@
  * 触发条件上，而不是泛泛地说"可以提问"。
  */
 import type { Tool } from "../types.js";
+import { PROPOSE_HANDOFF_TOOL_NAME } from "./propose-handoff.js";
+import { SPAWN_TASK_TOOL_NAME } from "./spawn-task.js";
 
 export interface UserQuestion {
   /** 问题正文（模型写的） */
@@ -127,7 +129,15 @@ export const DEFAULT_MAX_ROUNDS = 3;
  * 这正是 P6：不变量靠 harness，不靠装配的人记得。
  */
 export function withoutAskUser<T extends { name: string }>(tools: T[]): T[] {
-  return tools.filter((t) => t.name !== ASK_USER_TOOL_NAME);
+  // 核查者 / 拆解者拿不到任何「对人说话」或「另开支线」的工具：
+  // ask_user 会把独立核查换成要答案；propose_handoff 会让它们越权提议换世界；
+  // spawn_task 会放大隔离缺口并可能死锁审批门（§4.5）。
+  return tools.filter(
+    (t) =>
+      t.name !== ASK_USER_TOOL_NAME
+      && t.name !== PROPOSE_HANDOFF_TOOL_NAME
+      && t.name !== SPAWN_TASK_TOOL_NAME,
+  );
 }
 
 export interface AskUserOptions {
@@ -258,7 +268,9 @@ export function createAskUserTool(opts: AskUserOptions): Tool {
       "② 只有委托方知道的事实——你**用尽工具也查不到**、只存在于对方脑子里的东西" +
       "（所在城市、用哪个账号、「我们的项目」指哪个仓库、他的偏好）。\n" +
       "**不该问的**：你自己查得到的事（文件内容、命令输出、代码现状——先去查）、" +
-      "进度汇报、征求许可、以及你其实已经有合理默认值的细节。\n" +
+      "进度汇报、征求许可、以及你其实已经有合理默认值的细节；" +
+      "本对话已有原任务时，不要把「它 / 再优化 / 继续」理解成工作目录里其它文件夹或其它会话——" +
+      "默认对象就是这场对话正在做的事，把邻居站点列成选项是串台。\n" +
       "**时机**：范围与选型类的问题要在**开工之前**问完。做到一半才问，代价已经付出去了。",
     inputSchema: {
       type: "object",

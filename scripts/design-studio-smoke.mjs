@@ -51,11 +51,33 @@ try {
   if (zip.subarray(0, 2).toString("utf8") !== "PK") throw new Error("not a zip");
   if (!zip.includes(Buffer.from("style.css"))) throw new Error("zip missing style.css");
 
+  const templates = await (await fetch(`${base}/api/design-templates`)).json();
+  if (!templates.templates?.some((t) => t.id === "deck-basic")) {
+    throw new Error("design-templates missing deck-basic");
+  }
+
+  const seed = await fetch(`${base}/api/runs/${runId}/seed-template`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ template: "landing-basic", dest: "landing-smoke" }),
+  });
+  if (!seed.ok) throw new Error(`seed ${seed.status}`);
+  const seeded = await seed.json();
+  if (seeded.entry !== "landing-smoke/index.html") throw new Error("bad seed entry");
+
+  const md = await (await fetch(`${base}/api/runs/${runId}/design-md`)).json();
+  if (!md.found || !md.palette?.colors?.length) throw new Error("design-md palette missing");
+
   // 对照模板源仍在磁盘
   const src = await readFile(join(dir, "deck", "index.html"), "utf8");
   if (!src.includes("class=\"slide\"")) throw new Error("workdir template broken");
 
-  console.log("design-studio-smoke OK", { runId, zipBytes: zip.length });
+  console.log("design-studio-smoke OK", {
+    runId,
+    zipBytes: zip.length,
+    seeded: seeded.dest,
+    colors: md.palette.colors.length,
+  });
 } finally {
   await handle.close();
   await rm(dir, { recursive: true, force: true });

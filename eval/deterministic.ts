@@ -507,7 +507,7 @@ const scenarios: Scenario[] = [
     guards:
       "MEM-01 窗口 / 预算分离：mock-model 不在登记表，第一跑启动行必须写「窗口未知」；撞 context_overflow" +
       "（报文 > 200000 maximum）除了反应式压缩还要把 200000 记进 .agent-capabilities.json；第二跑是**新进程**，" +
-      "启动行必须写「窗口 200k（来源：learned）」且默认预算 150k 不被夹（200000 − 4096 − 4096 = 191,808 ≥ 150k）；" +
+      "启动行必须写「窗口 200k（来源：learned）」且水位跟可用窗口走（200000 − 4096 − 4096 = 191,808）；" +
       "台账 context.windowSource=learned。请求 5 + 2 = 7",
     args: ["--yes"],
     env: { AGENT_MAX_RETRIES: "0" },
@@ -540,7 +540,7 @@ const scenarios: Scenario[] = [
       ],
       expect: {
         exitCode: 0,
-        includes: ["上下文：预算 150k / 窗口 200k（来源：learned）", "completed"],
+        includes: ["上下文：水位 191k（跟窗口） / 窗口 200k（来源：learned）", "completed"],
         excludes: ["窗口未知", "夹紧"],
       },
     },

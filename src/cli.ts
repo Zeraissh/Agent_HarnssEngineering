@@ -10,6 +10,9 @@
  *               每次提交 1~4 个问题，每题带 2~4 个候选，回车跳过单题
  *   --plan      三角编排：planner 拆解子任务（自选领域包+依赖图）→ 执行→核查→交接；
  *               互不依赖的子任务默认并发执行（并行度 auto = min(3, 计划层宽)）
+ *   --resume-run ID  同 run 续跑。不带 --plan：从已提交的 main 检查点续跑；
+ *                    带 --plan：半截 DAG 续发射（至少一枚 passed，不重跑 planner）。
+ *                    谱系预算已用尽则拒；不能与 --verify 同时用。
  *   --parallel=N  显式并行度覆盖 auto；=1 退回全串行
  *   --auto      调度单元路由领域包（单领域任务免手选；显式 AGENT_PACK 优先）
  *
@@ -31,9 +34,12 @@
  *   AGENT_VERIFIER_MODEL 可选，--verify 时 verifier 用的独立模型（应 ≥ 执行者强度）；
  *                       配套 AGENT_VERIFIER_PROVIDER / _BASE_URL / _API_KEY 可指向
  *                       不同端点，缺省沿用执行者的端点配置
+ *   AGENT_MODE          可选，design = 设计模式（推荐入口：锁定 design 包并做制品类型路由）。
+ *                       与 AGENT_PACK 同时出现时显式包优先；与 --plan 同时出现时 --plan 优先
  *   AGENT_PACK          可选，领域包名（stm32-coding / stm32-debug）：覆盖 system
  *                       prompt、内置工具面、MCP 接入与白名单、验证策略、护栏参数。
- *                       AGENT_PRESET 为兼容别名
+ *                       AGENT_PRESET 为兼容别名。AGENT_PACK=design 永久保留；
+ *                       未设 AGENT_MODE=design 时打印提示，不中断、不改包
  *   AGENT_EFFORT        可选，思考预算档 low|medium|high|xhigh|max，默认 high。
  *                       仅原生 Claude 端点生效（compat 模式下该参数不发送）
  *   AGENT_VERIFY_RUBRIC 可选，主观评分表（任务级注入,优先于领域包的 verify.rubric）：
@@ -57,10 +63,10 @@
  *   AGENT_READ_ROOTS    可选，额外只读根（分号/路径分隔符分隔的绝对路径）：
  *                       read_file 可读取这些目录（写类工具不受益）。用于工作区外的
  *                       领域素材库（如 KiCad 官方符号/封装库）
- *   AGENT_CONTEXT_LIMIT 可选，上下文 token **预算**（触发 compact 的水位分母），默认 150000。
+ *   AGENT_CONTEXT_LIMIT 可选，提前压缩的水位覆盖。不设时：窗口已知则跟可用窗口
+ *                       （窗口 − maxTokens − 边际）；窗口未知才回落 150000。
  *                       与模型窗口是两个概念：窗口按 AGENT_CONTEXT_WINDOW > 撞 400 学到的 >
- *                       登记表 > 未知 解析，预算会被夹在 窗口 − maxTokens − 边际 之内（夹紧有告警）。
- *                       默认不随窗口抬高——每轮成本与时延随上下文线性增长，抬预算是委托方的决定
+ *                       登记表 > 未知 解析。显式水位超过可用窗口会被夹紧并告警。
  *   AGENT_CONTEXT_WINDOW 可选，显式声明模型上下文窗口（token 数），压过学到的与登记表的值
  *   AGENT_CAPABILITY_CACHE 可选，学到的窗口等端点能力的落盘路径，默认 <cwd>/.agent-capabilities.json
  *   AGENT_TOOL_RESULT_MAX_CHARS 可选，单个 tool_result 进正史前的字符上限，默认 40000（≥1000）。
@@ -78,8 +84,14 @@
  *   AGENT_EXECUTION_OCI_RUNTIME_SHA256 与 runtime 成对的 64 位 SHA-256
  *   AGENT_EXECUTION_OCI_HOST 仅允许本机绝对 unix:// socket；缺省 /var/run/docker.sock
  *   AGENT_EXECUTION_OCI_NAMESPACE required+OCI 必填的稳定部署分区，用于 durable lease/reaper
+ *   AGENT_HOOKS_CONFIG  可选，指向 hooks JSON。不设 = 机制不存在。设了但文件缺失/非法则 exit 1。
+ *                       只认 PreToolUse / PostToolUse / Stop 的 command handler；退出码 2 阻断、1 不阻断。
+ *   AGENT_MD_MAX_CHARS  可选，AGENT.md 加载总量上限（默认 16000，≥1000）。非法值 exit 1。
+ *                       开关是文件本身：~/.agent/AGENT.md、项目 AGENT.md、.agent/rules/*.md
+ *                       都不在 = 机制不存在。这是指导不是执行，不能授予权限。
  */
 import { randomUUID } from "node:crypto";
+import { homedir } from "node:os";
 import path from "node:path";
 import readline from "node:readline/promises";
 import { createExecutionBroker, parseExecutionPolicy } from "./execution-broker.js";
@@ -91,7 +103,7 @@ import {
   formatStaticDoctor,
   parseCliArgs,
 } from "./cli-args.js";
-import { AgentLoop, DEFAULT_MAX_TOKENS, DEFAULT_MAX_TURNS } from "./loop.js";
+import { AgentLoop, createRunBudget, DEFAULT_MAX_TOKENS, DEFAULT_MAX_TURNS } from "./loop.js";
 import {
   describeContextPlan,
   formatTokensK,
@@ -104,18 +116,61 @@ import {
   capabilityStorePath,
   configureCapabilityStore,
   learnContextWindow,
+  probeVisionSupport,
   type EndpointIdentity,
 } from "./model-capability.js";
-import { connectMcpServers, loadMcpConfig } from "./mcp.js";
-import { createMemoryTools, MemoryStore } from "./memory.js";
+import { connectMcpServers, filterMcpConfigForPack, loadMcpConfig, mcpConfigHasRunnableServers } from "./mcp.js";
+import { packAcceptsHostGithub } from "./mcp-github.js";
+import { formatWorkspaceGitLine, probeWorkspaceGit } from "./workspace-git.js";
+import { createMemoryTools, MemoryStore, resolveMemoryDir } from "./memory.js";
+import {
+  createProjectStatusTool,
+  formatProjectStatusBlock,
+  isSharedMemoryDir,
+  readProjectStatus,
+  scopedMemoryIndex,
+} from "./project-status.js";
 import { AUTO_CONCURRENCY_CAP, plannedStopReason, planParallelWidth, runPlanned, runVerified } from "./orchestrate.js";
+import type { VerifiedRunResult } from "./orchestrate.js";
+import {
+  durableNodeFromPlanNode,
+  durablePlanFromPlan,
+  handoffsFromPlanNodes,
+  planFromNodes,
+  planNodesFromDurable,
+  planNodesFromSubtasks,
+  type PlanNodeState,
+} from "./planner.js";
+import { readArchivedState, readArchivedTranscript } from "../ui/history.js";
+import { seedDurableBudget, snapshotDurableBudget } from "./run-state.js";
 import { resolveVerifierReadOnlyCommands, type VerifyOutcome } from "./verifier.js";
-import { getPack, PACKS, DEFAULT_HOST_DISCIPLINES, selectPackTools, type DomainPack } from "./presets.js";
+import { allPacks, getPack, DEFAULT_HOST_DISCIPLINES, selectPackTools, type DomainPack } from "./presets.js";
+import { loadInstalledFilePacksSync, packsRootFromEnv } from "./pack-files.js";
+import {
+  DESIGN_CATALOG,
+  designPackLegacyHint,
+  installedFilePacksFrom,
+  parseDesignChoiceInput,
+  resolveDesignModeIntent,
+  routeDesignTask,
+  seedsToCopy,
+  shouldSeedDesignTemplate,
+  shouldWriteBlankDesignIndex,
+  writeBlankDesignIndex,
+  writeDesignBundleHub,
+  type DesignRoute,
+} from "./design-mode.js";
+import { copyDesignTemplate, designTemplatesRootFromRepo } from "../ui/design-templates.js";
+import { draftDomainPackTool } from "./tools/draft-domain-pack.js";
 import { resolveRecoveryPolicy } from "./recovery.js";
 import { routeToPack } from "./router.js";
 import { createFallbackClientIfConfigured, createRoleFallbackClient, executorBackupEndpoints, FallbackModelClient, sharedBreakerRegistry } from "./model-fallback.js";
 import { createModelClientFromEnv, createModelClientWithProbe } from "./provider.js";
 import { ASK_USER_TOOL_NAME, createAskUserTool } from "./tools/ask-user.js";
+import { createProposeHandoffTool } from "./tools/propose-handoff.js";
+import { createSpawnTaskTool } from "./tools/spawn-task.js";
+import { runSpawnedTask } from "./spawn.js";
+import { findPackHandoff } from "./handoff.js";
 import {
   FINISH_TASK_TOOL_NAME,
   withTaskCompletion,
@@ -132,6 +187,7 @@ import { globTool } from "./tools/glob.js";
 import { grepTool } from "./tools/grep.js";
 import { readFileTool } from "./tools/read-file.js";
 import { writeFileTool } from "./tools/write-file.js";
+import { writePptxTool } from "./tools/write-pptx.js";
 import { updateProgressTool } from "./tools/update-progress.js";
 import {
   appendRunLedger,
@@ -139,23 +195,55 @@ import {
   emptyCompactionTally,
   emptyRecoveryTally,
   ledgerErrorClass,
+  emptyApprovalsTally,
+  emptyHooksTally,
+  tallyApprovalOutcome,
   tallyCompaction,
+  tallyHookEvent,
   tallyRecoveryDecision,
   tallyToolCall,
+  type LedgerApprovalsTally,
+  type LedgerHooksTally,
   type ToolTally,
 } from "./ledger.js";
 import { warnEnvConflicts } from "./env-check.js";
 import { EFFORT_LEVELS } from "./types.js";
-import type { AgentConfig, Effort, ExecutionBroker, RecoveryPolicy, TurnEvent } from "./types.js";
+import type { AgentConfig, Effort, ExecutionBroker, ModelClient, RecoveryPolicy, SharedRunBudget, TurnEvent } from "./types.js";
 import {
   cliDurableEnabled,
   createCliDurable,
   ensureCliHistoryRoot,
+  lastExecutorTranscriptMessages,
+  prepareCliPlanResume,
+  prepareCliSingleResume,
+  readCliArchiveTask,
   type CliDurableHandle,
 } from "./cli-durable.js";
-import { permissionModeSwitches, resolvePermissionMode } from "./permission-mode.js";
+import {
+  hostPlanEvent,
+  hostPlanReplanEvent,
+  hostPlanResultEvent,
+  hostPlanResumeEvent,
+  hostPlanSubtaskViews,
+} from "./archive-event.js";
+import { describePermissionStance, matchPermissionMode, permissionModeSwitches, resolvePermissionMode } from "./permission-mode.js";
+import {
+  createHookRuntime,
+  resolveHooksFromEnv,
+  type NormalizedHookSpec,
+} from "./hooks.js";
+import {
+  DEFAULT_AGENT_MD_MAX_CHARS,
+  formatAgentMdStartupLine,
+  loadAgentMd,
+  mergeAgentMdContext,
+  resolveAgentMdMaxChars,
+  type AgentMdBundle,
+} from "./agent-md.js";
 
 let activeCliExecutionBroker: ExecutionBroker | undefined;
+let activeCliDurable: CliDurableHandle | undefined;
+let activeCliLineageBudget: SharedRunBudget | undefined;
 
 const c = {
   dim: (s: string) => `\x1b[2m${s}\x1b[0m`,
@@ -198,12 +286,127 @@ function formatApprovalPrompt(event: Extract<TurnEvent, { type: "approval_reques
   return `${base}\n  ⚠ ${hints}`;
 }
 
-const SYSTEM_PROMPT = `You are a capable autonomous agent operating in a local working directory.
-Complete the user's task end to end using the available tools.
-Ground every claim of progress in an actual tool result. When the task is done, summarize what you did in one or two sentences.
-Keep file outputs clean and well-structured. Respond in the language the user used.
+function evidenceFromVerifiedStep(result: VerifiedRunResult): string | undefined {
+  const parts: string[] = [];
+  const completion = result.main.completion;
+  if (completion?.summary) parts.push(completion.summary);
+  if (completion?.artifacts?.length) parts.push(`产物：${completion.artifacts.join("、")}`);
+  const verdict = result.verifications.at(-1)?.verdict;
+  if (verdict?.summary) parts.push(`裁决：${verdict.summary}`);
+  if (verdict?.issues?.length) parts.push(`问题：${verdict.issues.join("；")}`);
+  return parts.length ? parts.join(" · ") : undefined;
+}
 
-You have a persistent memory that survives across sessions. The current memory index is provided in the <context> block of the first message. Consult relevant memories (memory_read) before starting work. When you learn a durable fact, user preference, or lesson worth reusing — a correction you received, a project constant, an approach that worked — save it with memory_write (one fact per file, first line = summary). Update or delete memories that turn out to be wrong. Do not store transient task state or things already recorded in the repository.` + DEFAULT_HOST_DISCIPLINES;
+async function applyCliDesignSeed(route: DesignRoute, workdir: string): Promise<void> {
+  try {
+    if (shouldSeedDesignTemplate(route)) {
+      const templatesRoot = designTemplatesRootFromRepo(process.cwd());
+      for (const seed of seedsToCopy(route)) {
+        const result = await copyDesignTemplate({
+          templatesRoot,
+          templateId: seed,
+          destRoot: workdir,
+        });
+        console.log(c.dim(`design seed: ${result.entry}（${result.files} 个文件）`));
+      }
+      if (route.bundle === "spec-plus-deck") {
+        const hub = await writeDesignBundleHub(workdir);
+        console.log(c.dim(`design seed: ${hub}（规格+幻灯入口）`));
+      }
+      return;
+    }
+    if (shouldWriteBlankDesignIndex(route)) {
+      const path = await writeBlankDesignIndex(workdir);
+      console.log(c.dim(`design seed: ${path}（空白起步）`));
+    }
+  } catch (err) {
+    console.log(c.yellow(`design seed 未写入：${err instanceof Error ? err.message : String(err)}`));
+  }
+}
+
+async function promptDesignChoiceOnce(
+  pending: DesignRoute,
+  task: string,
+  compat: boolean,
+  model: ModelClient,
+  autoYes: boolean,
+): Promise<DesignRoute> {
+  if (autoYes) {
+    return {
+      kind: "r3",
+      id: null,
+      reason: "无人值守无法展示页签，已用 design 包从空白 index.html 起步",
+      seed: "blank",
+      pack: "design",
+    };
+  }
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    console.log(c.cyan("\n设计模式：请选择制品类型（回车则从空白 HTML 起步）"));
+    DESIGN_CATALOG.forEach((e, i) => {
+      console.log(c.dim(`   ${i + 1}) ${e.tab} · ${e.title}（${e.id}）`));
+    });
+    const raw = (await rl.question("> ")).trim();
+    if (!raw) {
+      return {
+        kind: "r3",
+        id: null,
+        reason: "未选择制品类型，已用 design 包从空白 index.html 起步",
+        seed: "blank",
+        pack: "design",
+      };
+    }
+    let hit = parseDesignChoiceInput(raw, { tabHint: pending.tab });
+    if (hit?.kind === "tab") {
+      const tab = hit.tab;
+      const entries = DESIGN_CATALOG.filter((e) => e.tab === tab);
+      console.log(c.cyan(`\n${tab}：请选择类型（回车则从空白 HTML 起步）`));
+      entries.forEach((e, i) => console.log(c.dim(`   ${i + 1}) ${e.title}（${e.id}）`)));
+      const raw2 = (await rl.question("> ")).trim();
+      hit = raw2 ? parseDesignChoiceInput(raw2, { tabHint: tab }) : null;
+    }
+    if (!hit || hit.kind === "tab") {
+      return {
+        kind: "r3",
+        id: null,
+        reason: "未选择制品类型，已用 design 包从空白 index.html 起步",
+        seed: "blank",
+        pack: "design",
+      };
+    }
+    return routeDesignTask({
+      cfg: { systemPrompt: SYSTEM_PROMPT, tools: [], workdir: process.cwd(), compat },
+      model,
+      task: task || raw,
+      explicitId: hit.kind === "id" ? hit.entry.id : hit.kind === "bundle" ? hit.bundle : undefined,
+      explicitFilePack: hit.kind === "file-pack" ? hit.packName : undefined,
+      installedFilePacks: installedFilePacksFrom(allPacks()),
+    });
+  } finally {
+    rl.close();
+  }
+}
+
+const SYSTEM_PROMPT = `You are a capable assistant in a local working directory.
+If the user is just talking, talk back in their language. If they asked you to do work, complete it with the available tools and ground claims of progress in tool results. When a task is done, summarize in one or two sentences.
+Keep file outputs clean and well-structured.
+
+You have a persistent memory that survives across sessions. The current memory index is provided in the <context> block of the first message and is scoped to this project (plus global lessons). When starting a task, or when a memory is likely relevant, consult it with memory_read. When you learn a durable fact, user preference, or lesson worth reusing — a correction you received, a project constant, an approach that worked — save it with memory_write (one fact per file, first line = summary). Update or delete memories that turn out to be wrong. Do not store transient task state in memory_write; use project_status for the in-progress board (who is waiting, next gate, open decisions). Do not store things already recorded in the repository.` + DEFAULT_HOST_DISCIPLINES;
+
+function persistCliExecutorCheckpoint(
+  durable: CliDurableHandle | undefined,
+  event: Extract<TurnEvent, { type: "done" }>,
+): void {
+  const messages = event.result.messages;
+  if (!durable || !messages?.length) return;
+  const usage = event.result.usage;
+  const fallback = usage.inputTokens + usage.cacheCreationTokens + usage.cacheReadTokens;
+  durable.noteExecutorCheckpoint({
+    messages,
+    contextInputTokens: event.result.contextInputTokens ?? fallback,
+    budget: event.result.runBudget ? snapshotDurableBudget(event.result.runBudget) : null,
+  });
+}
 
 async function main(): Promise<void> {
   // 参数与静态 doctor 必须先于 provider/MCP/execution broker。doctor 的契约是
@@ -227,6 +430,15 @@ async function main(): Promise<void> {
   // .env 被残留环境变量压掉时大声说出来（可能意味着凭据发往另一家端点）
   warnEnvConflicts();
 
+  // 文件领域包：只装 installed/。草稿不进 getPack。
+  // schemaVersion 未识别 → 抛错 → 下方 catch exit 1（同非法 context env）。
+  try {
+    loadInstalledFilePacksSync(packsRootFromEnv());
+  } catch (err) {
+    console.error(c.red(err instanceof Error ? err.message : String(err)));
+    process.exit(1);
+  }
+
   // 端点能力缓存（学到的上下文窗口）：与台账 / 记忆同一套 cwd 约定；坏了就当空表，不挡启动
   configureCapabilityStore({ file: capabilityStorePath() });
 
@@ -237,7 +449,22 @@ async function main(): Promise<void> {
   // --parallel N，且会消费分离值，避免把数字误拼进 task。
   const concurrency = parsedArgs.concurrency;
   const task = parsedArgs.task;
-  if (!task) {
+  const resumeRun = parsedArgs.resumeRun;
+  const designIntent = resolveDesignModeIntent({
+    plan: withPlan,
+    auto: withAuto,
+    agentMode: process.env.AGENT_MODE,
+    agentPack: withPlan ? undefined : (process.env.AGENT_PACK ?? process.env.AGENT_PRESET),
+  });
+  const legacyDesignHint = designPackLegacyHint({
+    agentMode: process.env.AGENT_MODE,
+    agentPack: process.env.AGENT_PACK,
+    agentPreset: process.env.AGENT_PRESET,
+  });
+  if (legacyDesignHint) {
+    console.log(c.yellow(legacyDesignHint));
+  }
+  if (!task && !resumeRun && designIntent.action !== "design") {
     console.error('Usage: npm run agent -- run [options] "task description"（旧入口 npm run cli -- 仍兼容）');
     process.exit(1);
   }
@@ -251,15 +478,39 @@ async function main(): Promise<void> {
   const packName = withPlan ? undefined : (process.env.AGENT_PACK ?? process.env.AGENT_PRESET);
   let pack = packName ? getPack(packName) : undefined;
   if (packName && !pack) {
-    console.error(`Unknown pack "${packName}". Available: ${Object.keys(PACKS).join(", ")}`);
+    console.error(`Unknown pack "${packName}". Available: ${allPacks().map((p) => p.name).join(", ")}`);
     process.exit(1);
   }
-  if (withAuto && !pack && !withPlan) {
+  let designRoute: DesignRoute | undefined;
+  if (designIntent.action === "design") {
+    designRoute = await routeDesignTask({
+      cfg: { systemPrompt: SYSTEM_PROMPT, tools: [], workdir: process.cwd(), compat },
+      model: resolvedClient,
+      task: task ?? "",
+      installedFilePacks: installedFilePacksFrom(allPacks()),
+    });
+    if (designRoute.kind === "r2") {
+      designRoute = await promptDesignChoiceOnce(
+        designRoute,
+        task ?? "",
+        compat,
+        resolvedClient,
+        autoYes,
+      );
+    }
+    pack = getPack(designRoute.pack) ?? getPack("design");
+    console.log(
+      c.dim(
+        `design: ${designRoute.kind} id=${designRoute.id ?? "—"} seed=${designRoute.seed} — ${designRoute.reason}`,
+      ),
+    );
+    await applyCliDesignSeed(designRoute, process.cwd());
+  } else if (withAuto && !pack && !withPlan) {
     const route = await routeToPack(
       { systemPrompt: SYSTEM_PROMPT, tools: [], workdir: process.cwd(), compat },
       resolvedClient,
       task,
-      Object.values(PACKS),
+      allPacks(),
     );
     if (route.decision.pack) {
       pack = getPack(route.decision.pack);
@@ -353,8 +604,8 @@ async function main(): Promise<void> {
       : {}),
   };
   /**
-   * 上下文窗口（事实）与预算（策略）分开解析（MEM-01）。窗口 env > learned > registry > unknown；
-   * 预算 env > 包 > 默认 150k，再夹进 窗口 − maxTokens − 边际。非法 env 当场退出（口径同其它护栏）。
+   * 上下文窗口（事实）与压缩水位（策略）分开解析（MEM-01）。窗口 env > learned > registry > unknown；
+   * 水位 run/env/包覆盖，否则窗口已知跟 maxBudget，未知回落 150k。非法 env 当场退出。
    */
   const contextPlanFor = (p?: DomainPack, tokens?: number): ContextPlan => {
     const windowInfo = resolveContextWindow(executorIdentity);
@@ -441,22 +692,22 @@ async function main(): Promise<void> {
   const recoveryFor = (p?: DomainPack) => resolveRecoveryPolicy({ explicit: envRecovery, pack: p?.recovery });
   const maxAskRounds = positiveEnv("AGENT_MAX_ASK_ROUNDS");
 
-  // 跨会话记忆（L5）：默认 <cwd>/.agent-memory，可用 AGENT_MEMORY_DIR 覆盖
-  const memory = new MemoryStore(
-    process.env.AGENT_MEMORY_DIR ?? path.join(process.cwd(), ".agent-memory"),
-  );
+  // 跨会话记忆（L5）：resolveMemoryDir = AGENT_MEMORY_DIR ?? <cwd>/.agent-memory
+  const memory = new MemoryStore(resolveMemoryDir(process.cwd()));
 
   // MCP 工具（可选）：./mcp.json 存在即连接，AGENT_MCP_CONFIG 覆盖路径；
   // 领域包可整体关闭（mcp: false）；白名单/审批策略在最终工具面
   // 由 selectPackTools 统一解析，不再先改 server 配置。这样 CLI/Web/计划子任务同口径。
-  const mcpConfig =
-    pack?.mcp === false
-      ? undefined
-      : await loadMcpConfig(process.env.AGENT_MCP_CONFIG ?? path.join(process.cwd(), "mcp.json"));
+  const mcpConfigRaw = await loadMcpConfig(process.env.AGENT_MCP_CONFIG ?? path.join(process.cwd(), "mcp.json"));
+  // 按包过滤要拉起的 server：ts-coding 只要 GitHub，不得顺带启动 stm32。
+  // GitHub 是工作区连接器——python-coding 这类 mcp:false 仍可单独拉起 github。
+  const mcpConfig = mcpConfigRaw
+    ? filterMcpConfigForPack(mcpConfigRaw, pack?.mcp, { hostGithub: packAcceptsHostGithub(pack) })
+    : undefined;
   const executionPolicy = parseExecutionPolicy();
   // required 的语义是“所有任意执行面都不得落宿主”。stdio MCP 当前是宿主长驻
   // 进程且跨 run 共享；在 managed-spawn/gateway 完成前必须先拒绝，不能连上后再说。
-  if (executionPolicy.mode === "required" && mcpConfig && Object.keys(mcpConfig.servers).length > 0) {
+  if (executionPolicy.mode === "required" && mcpConfigHasRunnableServers(mcpConfig)) {
     throw new Error(
       "AGENT_EXECUTION_ISOLATION=required cannot start stdio MCP in this release; " +
       "disable MCP or use a separately managed hardware/service gateway",
@@ -466,6 +717,9 @@ async function main(): Promise<void> {
   if (mcp) {
     for (const [server, count] of Object.entries(mcp.summary)) {
       console.log(c.dim(`mcp: connected "${server}" (${count} tools)`));
+    }
+    for (const [server, reason] of Object.entries(mcp.skipped)) {
+      console.log(c.dim(`mcp: skipped "${server}" (${reason})`));
     }
   }
 
@@ -484,7 +738,36 @@ async function main(): Promise<void> {
         ...(process.env.AGENT_VISION_API_KEY ? { apiKey: process.env.AGENT_VISION_API_KEY } : {}),
       })
     : undefined;
-  if (visionProvider) console.log(c.dim(`vision model: ${visionModelName}`));
+  /**
+   * 识图探针（MODEL-01）：AGENT_MODEL_PROBE=1 时对 vision 端点塞最小图。
+   * 明确不支持 → 不注册 describe_image（与"没配就不注册"同纪律）。
+   */
+  let visionSupportsVision = true;
+  if (visionProvider && visionModelName) {
+    const visionProbe = await probeVisionSupport({
+      identity: {
+        provider: visionProvider.provider,
+        model: visionModelName,
+        ...(process.env.AGENT_VISION_BASE_URL
+          ? { baseURL: process.env.AGENT_VISION_BASE_URL }
+          : {}),
+      },
+      ...(process.env.AGENT_VISION_API_KEY
+        ? { apiKey: process.env.AGENT_VISION_API_KEY }
+        : {}),
+    });
+    visionSupportsVision = visionProbe.supportsVision;
+    if (!visionSupportsVision) {
+      console.log(
+        c.yellow(
+          `vision model ${visionModelName} 不支持识图（${visionProbe.reason ?? "probe"}）——不注册 describe_image`,
+        ),
+      );
+    } else if (visionProbe.source === "probe") {
+      console.log(c.dim(`vision probe: supportsVision=true (${visionProbe.reason ?? "ok"})`));
+    }
+  }
+  if (visionProvider && visionSupportsVision) console.log(c.dim(`vision model: ${visionModelName}`));
 
   /**
    * 端点降级链（MODEL-01a/b）。执行者默认可配 AGENT_FALLBACK_*；
@@ -493,6 +776,7 @@ async function main(): Promise<void> {
    * 不配则不包装饰器。降级事件走唯一的 renderEvent。
    */
   let fallbackCount = 0;
+  let cliTokenSpend = 0;
   const onAnyFallback = (info: {
     from: string;
     to: string;
@@ -575,7 +859,7 @@ async function main(): Promise<void> {
         process.env.AGENT_PLANNER_BASE_URL,
       )
     : undefined;
-  const visionClient = visionProvider
+  const visionClient = visionProvider && visionSupportsVision
     ? wrapRole(
         "vision",
         visionModelName!,
@@ -630,10 +914,12 @@ async function main(): Promise<void> {
       fetchUrlTool,
       readFileTool,
       writeFileTool,
+      writePptxTool,
       editFileTool,
       globTool,
       grepTool,
       updateProgressTool,
+      draftDomainPackTool(),
       ...(webSearchTool ? [webSearchTool] : []),
       ...(visionTool ? [visionTool] : []),
       ...(imageTool ? [imageTool] : []),
@@ -746,7 +1032,11 @@ async function main(): Promise<void> {
     .map((s) => s.trim())
     .filter(Boolean);
 
-  const memTools = createMemoryTools(memory);
+  const memShared = isSharedMemoryDir(process.cwd(), memory.dir);
+  const memTools = [
+    ...createMemoryTools(memory),
+    createProjectStatusTool(() => memory, { sharedFor: () => memShared }),
+  ];
 
   /**
    * §5.2 需求澄清。**决定 1：默认关，逐 run 显式开**（`--ask`）。
@@ -798,14 +1088,166 @@ async function main(): Promise<void> {
         }),
       ]
     : [];
+  const proposeHandoffTools = pack?.handoffs?.length
+    ? [
+        createProposeHandoffTool({
+          resolveHandoff: (id) => findPackHandoff(pack, id),
+          onPropose: (proposal) => {
+            console.log(c.cyan(`\n◇ 下一步（不挡对话）：${proposal.label}`));
+            console.log(c.dim(`  ${proposal.summary}`));
+            console.log(c.dim(`  要拒绝就当没看见（${proposal.declineLabel}）。Web 宿主可点按钮开跑。`));
+          },
+        }),
+      ]
+    : [];
 
-  const cliRunId = `cli-${Date.now()}`;
+  /**
+   * AGENT-02：默认关。AGENT_SPAWN_TASK=1 才装。子支线扣同一份谱系预算、深度 1。
+   * Windows 隔离仍是 report（见 SAFE-05）——不假装 AGENT-03 完成。
+   */
+  const spawnEnabled = process.env.AGENT_SPAWN_TASK === "1";
+  const lineageBudget = createRunBudget({
+    ...(maxTotalTurns !== undefined ? { maxTurns: maxTotalTurns } : {}),
+    ...(maxTokensBudget !== undefined ? { maxTokens: maxTokensBudget } : {}),
+  });
+  // spawn 回调闭包读这份——须在 baseConfig 之后赋值（见下）
+  let spawnParentConfig: import("./types.js").AgentConfig | null = null;
+  const spawnTaskTools = spawnEnabled
+    ? [
+        createSpawnTaskTool({
+          depth: 0,
+          spawn: async (request) => {
+            if (!spawnParentConfig) {
+              return { summary: "", passed: false, error: "spawn 父配置尚未就绪" };
+            }
+            endStreamLine();
+            console.log(c.cyan(`\n⧉ 支线开始：${request.title}`));
+            return runSpawnedTask({
+              parentConfig: spawnParentConfig,
+              modelClient,
+              runBudget: lineageBudget,
+              request,
+              onEvent: async (event) => {
+                if (event.type === "tool_call") {
+                  console.log(c.dim(`  ║ → ${event.name}`));
+                } else if (event.type === "done") {
+                  console.log(
+                    c.dim(
+                      `  ║ 支线 ${event.result.stopReason}（${event.result.usage.turns} 轮）`,
+                    ),
+                  );
+                }
+              },
+            });
+          },
+          onDone: (_req, result) => {
+            endStreamLine();
+            console.log(
+              result.passed
+                ? c.green(`⧉ 支线完成：${result.summary.slice(0, 80)}`)
+                : c.yellow(`⧉ 支线未完成：${result.error ?? result.summary.slice(0, 80)}`),
+            );
+          },
+        }),
+      ]
+    : [];
+  if (spawnEnabled) {
+    console.log(c.dim(`spawn_task: on（深度 1，并发 cap=${AUTO_CONCURRENCY_CAP}，扣父谱系预算）`));
+  }
+
+  const cliArchive = {
+    task: task || (withPlan ? "接着跑半截计划" : "接着上次的检查点继续"),
+    mode: withPlan ? ("plan" as const) : ("single" as const),
+    verify: withVerify,
+    packName: pack?.name ?? null,
+    effort: effort ?? null,
+    workdir: process.cwd(),
+    askUser: parsedArgs.ask,
+    contextTokenLimit: contextTokenLimit ?? null,
+    rubric: envRubric ?? pack?.verify.rubric ?? null,
+  };
+  let cliRunId = `cli-${Date.now()}`;
   let cliDurable: CliDurableHandle | undefined;
-  if (cliDurableEnabled()) {
-    await ensureCliHistoryRoot(process.cwd());
-    cliDurable = createCliDurable({ runId: cliRunId, cwd: process.cwd() });
+  let cliPlanResume: (ReturnType<typeof prepareCliPlanResume> & { ok: true }) | undefined;
+  let cliSingleResume:
+    | {
+        state: import("./run-state.js").DurableRunState;
+        history: import("./types.js").AgentRunResult["messages"];
+        reopen?: boolean;
+        note?: string;
+      }
+    | undefined;
+  const historyRoot =
+    resumeRun || cliDurableEnabled() ? await ensureCliHistoryRoot(process.cwd()) : undefined;
+  if (resumeRun) {
+    if (!cliDurableEnabled()) {
+      console.error(c.red("--resume-run 需要 durable state（不要设 AGENT_CLI_DURABLE=0）"));
+      process.exit(1);
+    }
+    const archiveDir = path.join(historyRoot!, resumeRun);
+    const loaded = await readArchivedState(archiveDir);
+    if (withPlan) {
+      const archiveTask = readCliArchiveTask(archiveDir);
+      const decided = prepareCliPlanResume(loaded, {
+        hasTask: Boolean(String(task ?? "").trim() || archiveTask),
+      });
+      if (!decided.ok) {
+        console.error(c.red(`不能续跑 ${resumeRun}：${decided.reason}`));
+        process.exit(1);
+      }
+      if (decided.kind === "reopen") {
+        cliSingleResume = { state: decided.state, history: [], reopen: true, note: decided.note };
+      } else {
+        cliPlanResume = decided;
+      }
+    } else {
+      const history = lastExecutorTranscriptMessages(await readArchivedTranscript(archiveDir));
+      const archiveTask = readCliArchiveTask(archiveDir);
+      const decided = prepareCliSingleResume(loaded, {
+        hasHistory: Boolean(history?.length),
+        verify: parsedArgs.verify,
+        hasTask: Boolean(String(task ?? "").trim() || archiveTask),
+      });
+      if (!decided.ok) {
+        console.error(c.red(`不能续跑 ${resumeRun}：${decided.reason}`));
+        process.exit(1);
+      }
+      if (decided.kind === "reopen") {
+        cliSingleResume = { state: decided.state, history: [], reopen: true, note: decided.note };
+      } else if (!history?.length) {
+        console.error(c.red(`不能续跑 ${resumeRun}：同 run 恢复缺少正史`));
+        process.exit(1);
+      } else {
+        cliSingleResume = { state: decided.state, history };
+      }
+    }
+    const resumeState = cliPlanResume?.state ?? cliSingleResume?.state;
+    if (!resumeState) {
+      console.error(c.red(`不能续跑 ${resumeRun}：没有可恢复的状态`));
+      process.exit(1);
+    }
+    cliRunId = resumeRun;
+    cliDurable = createCliDurable({
+      runId: resumeRun,
+      cwd: process.cwd(),
+      existing: resumeState,
+      archive: cliArchive,
+    });
+    if (resumeState.budget) {
+      seedDurableBudget(lineageBudget, resumeState.budget);
+      console.log(
+        c.dim(
+          `durable resume budget: turns ${lineageBudget.usedTurns}${lineageBudget.maxTurns !== undefined ? `/${lineageBudget.maxTurns}` : ""} tokens ${lineageBudget.usedTokens}${lineageBudget.maxTokens !== undefined ? `/${lineageBudget.maxTokens}` : ""}`,
+        ),
+      );
+    }
+    console.log(c.dim(`durable resume: ${resumeRun} → .agent-run-history/${resumeRun}/state.json`));
+  } else if (cliDurableEnabled()) {
+    cliDurable = createCliDurable({ runId: cliRunId, cwd: process.cwd(), archive: cliArchive });
     console.log(c.dim(`durable: ${cliRunId} → .agent-run-history/${cliRunId}/state.json`));
   }
+  activeCliDurable = cliDurable;
+  activeCliLineageBudget = lineageBudget;
 
   let permissionModeLabel: import("./permission-mode.js").PermissionMode = "manual";
   try {
@@ -813,7 +1255,8 @@ async function main(): Promise<void> {
     const switches = permissionModeSwitches(permissionModeLabel);
     console.log(
       c.dim(
-        `permissionMode: ${permissionModeLabel} (approval=${switches.approvalDefault} plan=${switches.planMode} gate=${switches.planGate} yes=${switches.autoYes})`,
+        `permissionMode: ${describePermissionStance(permissionModeLabel, switches)}` +
+          ` (approval=${switches.approvalDefault} plan=${switches.planMode} gate=${switches.planGate} yes=${switches.autoYes})`,
       ),
     );
   } catch (err) {
@@ -821,14 +1264,52 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  let hookSpec: NormalizedHookSpec | null = null;
+  try {
+    hookSpec = resolveHooksFromEnv(process.env);
+  } catch (err) {
+    console.error(c.red(err instanceof Error ? err.message : String(err)));
+    process.exit(1);
+  }
+  const hookRuntime = hookSpec
+    ? createHookRuntime(hookSpec, { workdir: process.cwd() })
+    : undefined;
+  if (hookSpec) {
+    console.log(
+      c.dim(`hooks: PreToolUse/PostToolUse/Stop timeout=${hookSpec.timeoutMs}ms ← ${hookSpec.sourcePath}`),
+    );
+  }
+
+  let agentMdMaxChars = DEFAULT_AGENT_MD_MAX_CHARS;
+  try {
+    agentMdMaxChars = resolveAgentMdMaxChars(process.env);
+  } catch (err) {
+    console.error(c.red(err instanceof Error ? err.message : String(err)));
+    process.exit(1);
+  }
+  const agentMdBundle: AgentMdBundle | null = loadAgentMd({
+    workdir: process.cwd(),
+    userHome: homedir(),
+    maxChars: agentMdMaxChars,
+    onWarn: (message) => console.warn(c.yellow(message)),
+  });
+  const agentMdLine = formatAgentMdStartupLine(agentMdBundle);
+  if (agentMdLine) console.log(c.dim(agentMdLine));
+  const workspaceGit = await probeWorkspaceGit(process.cwd());
+  if (workspaceGit.present) console.log(c.dim(`git: ${formatWorkspaceGitLine(workspaceGit)}`));
+
   const baseConfig: AgentConfig = {
     systemPrompt: pack?.systemPrompt ?? SYSTEM_PROMPT,
     tools: [
       ...selectPackTools(pack, builtins, mcp?.tools ?? []),
       ...memTools,
       ...askUserTools,
+      ...proposeHandoffTools,
+      ...spawnTaskTools,
     ],
     workdir: process.cwd(),
+    ...(hookRuntime ? { hooks: hookRuntime } : {}),
+    runBudget: lineageBudget,
     // SAFE-06 + RUN-01：CLI durable 落 state.json；关 AGENT_CLI_DURABLE=0 退回纯内存
     runId: cliRunId,
     ...(cliDurable ? { toolTx: cliDurable.toolTx } : {}),
@@ -859,11 +1340,12 @@ async function main(): Promise<void> {
         }
       : {}),
     // 易变信息走 messages 注入（P3），system prompt 保持字节冻结
-    dynamicContext: {
+    dynamicContext: mergeAgentMdContext({
       date: new Date().toISOString().slice(0, 10),
       platform: process.platform,
       shell: SHELL_DESC,
       workdir: process.cwd(),
+      workspace_git: formatWorkspaceGitLine(workspaceGit),
       ...(executionStatus
         ? {
             execution_isolation:
@@ -871,14 +1353,16 @@ async function main(): Promise<void> {
           }
         : {}),
       ...(readRoots.length ? { read_only_roots: readRoots.join("; ") } : {}),
-      memory_index: await memory.indexBlock(),
-    },
+      memory_index: await scopedMemoryIndex(memory, process.cwd()),
+      project_status: formatProjectStatusBlock(await readProjectStatus(memory, process.cwd(), memShared)),
+    }, agentMdBundle),
   };
   // 主执行者默认走结构化完成门；设 AGENT_REQUIRE_FINISH_TASK=0 可为兼容端点退回旧语义。
   const taskCompletionEnabled = process.env.AGENT_REQUIRE_FINISH_TASK !== "0";
   const config: AgentConfig = taskCompletionEnabled
     ? withTaskCompletion(baseConfig, recoveryFor(pack).policy)
     : baseConfig;
+  spawnParentConfig = config;
   if (taskCompletionEnabled) {
     // 与 pack/verifier/planner 那几行同款：报数字带来源，装配变了这一行就变
     const r = recoveryFor(pack);
@@ -889,6 +1373,12 @@ async function main(): Promise<void> {
       ),
     );
   }
+  // OBS-01：工具面齐了再写根 span，否则 schema 哈希是空壳
+  cliDurable?.beginTrace({
+    tools: config.tools,
+    packName: pack?.name ?? null,
+    model,
+  });
   let streamingText = false;
   const endStreamLine = () => {
     if (streamingText) {
@@ -957,6 +1447,21 @@ async function main(): Promise<void> {
   const ledgerRecovery = emptyRecoveryTally();
   // 上下文压缩计数（全部角色）——反应式救回超长请求的代价此前只在事件流里可见
   const ledgerCompaction = emptyCompactionTally();
+  const ledgerHooks: LedgerHooksTally | null = hookSpec ? emptyHooksTally() : null;
+  const ledgerApprovals: LedgerApprovalsTally = emptyApprovalsTally();
+  const respondCliApproval = (
+    event: { respond: (decision: "allow" | "deny", reason?: string) => void },
+    decision: "allow" | "deny",
+    kind: "auto" | "user",
+    reason?: string,
+  ): void => {
+    tallyApprovalOutcome(ledgerApprovals, {
+      type: "approval_resolved",
+      actor: kind === "auto" ? "auto-run" : "user",
+      decision,
+    });
+    event.respond(decision, reason);
+  };
   let ledgerHitBudget = false;
   /** 三条路径各自把收尾事实归一到这里，最后统一写一行 */
   let ledgerFacts: {
@@ -969,9 +1474,12 @@ async function main(): Promise<void> {
   } | null = null;
   const ledgerStartedAt = Date.now();
   const noteForLedger = (source: string, event: TurnEvent): void => {
+    cliDurable?.noteTrace(source, event);
+    cliDurable?.noteEvent(source, event);
     if (event.type === "tool_call") tallyToolCall(ledgerTally, source, event.name);
     tallyRecoveryDecision(ledgerRecovery, source, event);
     tallyCompaction(ledgerCompaction, event);
+    if (ledgerHooks) tallyHookEvent(ledgerHooks, event);
     if (
       event.type === "done" &&
       source.includes("verifier") &&
@@ -981,17 +1489,19 @@ async function main(): Promise<void> {
     }
   };
 
-  if (withPlan) {
+  if (withPlan && !cliSingleResume?.reopen) {
     // 三角编排：planner 拆解 → 逐子任务(执行→核查→返工) → 交接下游
     const builtinPool = [
       bashTool,
       fetchUrlTool,
       readFileTool,
       writeFileTool,
+      writePptxTool,
       editFileTool,
       globTool,
       grepTool,
       updateProgressTool,
+      draftDomainPackTool(),
       ...(webSearchTool ? [webSearchTool] : []),
       ...(visionTool ? [visionTool] : []),
       ...(imageTool ? [imageTool] : []),
@@ -1027,19 +1537,29 @@ async function main(): Promise<void> {
           if (isVerifier) break; // verifier 审批由其内部自答，仅供观察，不提示
           if (autoYes || !rl) {
             console.log(c.yellow(`${tag} ⚠ auto-approved: ${formatApprovalPrompt(event)}`));
-            event.respond("allow");
+            respondCliApproval(event, "allow", "auto");
             break;
           }
           const answer = await rl.question(
             c.yellow(`${tag} ⚠ ${formatApprovalPrompt(event)}? [y/N] `),
           );
-          if (answer.trim().toLowerCase() === "y") event.respond("allow");
-          else event.respond("deny", (await rl.question(c.dim("  reason (optional): "))).trim() || undefined);
+          if (answer.trim().toLowerCase() === "y") respondCliApproval(event, "allow", "user");
+          else respondCliApproval(event, "deny", "user", (await rl.question(c.dim("  reason (optional): "))).trim() || undefined);
           break;
         }
         case "compaction":
           console.log(c.yellow(`${tag} ${describeCompaction(event)}`));
           break;
+        case "hook": {
+          const who = event.tool ? `${event.hook} ${event.tool}` : event.hook;
+          const extra = [
+            event.timedOut ? "timeout" : event.exitCode != null ? `exit ${event.exitCode}` : null,
+            event.detail,
+          ].filter(Boolean).join(" · ");
+          const line = extra ? `${tag} ‡ ${who} ${event.outcome}（${extra}）` : `${tag} ‡ ${who} ${event.outcome}`;
+          console.log(event.outcome === "allow" ? c.dim(line) : c.yellow(line));
+          break;
+        }
         case "progress": {
           const done = event.items.filter((i) => i.status === "done").length;
           console.log(
@@ -1052,14 +1572,27 @@ async function main(): Promise<void> {
             c.yellow(`${tag} ⟳ API 瞬时错误，同轮重试 #${event.attempt}（等待 ${event.backoffMs}ms）`),
           );
           break;
+        case "model_call_start":
+          console.log(c.dim(`${tag} ▷ 模型请求 #${event.attempt}（第 ${event.turn} 轮）`));
+          break;
+        case "model_call_end":
+          console.log(
+            c.dim(
+              `${tag} ${event.status === "ok" ? "■" : "✗"} 模型请求 ${event.status} ${event.durationMs}ms`,
+            ),
+          );
+          break;
         case "segment_resume":
           console.log(
             c.yellow(`${tag} ⟲ 整段因瞬时故障终止，带 ${event.priorTurns} 轮正史续跑：${event.reason}`),
           );
           break;
-        case "recovery_decision":
-          console.log(c.yellow(`${tag} ⤷ ${event.detail}`));
+        case "recovery_decision": {
+          const stall =
+            event.reason === "end_turn_without_completion" || event.reason === "stagnation";
+          console.log(c.yellow(`${tag} ${stall ? "⚠ 空转 · " : "⤷ "}${event.detail}`));
           break;
+        }
         case "done": {
           const u = event.result.usage;
           console.log(
@@ -1076,19 +1609,72 @@ async function main(): Promise<void> {
     let planReadyAt = startedAt; // onPlan 时刻：并行节省只对子任务阶段计算，不混入 planner 耗时
     // auto 并行度在计划就绪时才能解析（依赖计划层宽）；渲染模式随之切换
     let effectiveConcurrency = typeof concurrency === "number" ? concurrency : 1;
-    const outcome = await runPlanned(config, modelClient, task, {
-      packs: Object.values(PACKS),
+    let livePlanNodes: PlanNodeState[] = cliPlanResume
+      ? planNodesFromDurable(cliPlanResume.nodes)
+      : [];
+    const persistLivePlanNodes = () => {
+      if (!cliDurable || !livePlanNodes.length) return;
+      cliDurable.apply({ type: "plan_progress", nodes: livePlanNodes.map(durableNodeFromPlanNode) });
+    };
+    const plannedTask = task || "接着跑半截计划";
+    if (cliPlanResume) {
+      cliDurable?.apply({ type: "resume", at: Date.now() });
+      const kept = livePlanNodes.filter((n) => n.status === "passed").map((n) => n.id);
+      const remaining = livePlanNodes
+        .filter((n) => n.status === "pending" || n.status === "running")
+        .map((n) => n.id);
+      console.log(c.cyan(`\n↺ 半截 DAG 续跑 kept=${kept.join(",")} remaining=${remaining.join(",")}`));
+      cliDurable?.noteHostEvent(hostPlanResumeEvent({ kept, remaining, reason: plannedTask }));
+    } else {
+      cliDurable?.apply({ type: "plan_begin" });
+    }
+    const outcome = await runPlanned(config, modelClient, plannedTask, {
+      packs: allPacks(),
       concurrency,
       plannerProtocol: planProtocol,
       ...(envPlanMaxTurns !== undefined ? { planMaxTurns: envPlanMaxTurns } : {}),
       ...(plannerProvider && plannerClient
         ? { plannerModel: { client: plannerClient, compat: plannerProvider.compat } }
         : {}),
+      ...(cliPlanResume
+        ? {
+            plan: planFromNodes(livePlanNodes),
+            resume: {
+              nodes: livePlanNodes,
+              handoffs: handoffsFromPlanNodes(livePlanNodes),
+            },
+          }
+        : {}),
+      onReplan: (diff) => {
+        console.log(
+          c.cyan(
+            `\n⧉ 重规划 kept=${diff.kept.join(",")} added=${diff.added.join(",")} dropped=${diff.dropped.join(",")}`,
+          ),
+        );
+        cliDurable?.noteHostEvent(hostPlanReplanEvent(diff));
+      },
       onPlan: (plan) => {
         planRef = plan;
         planReadyAt = Date.now();
         if (concurrency === "auto") {
           effectiveConcurrency = Math.min(AUTO_CONCURRENCY_CAP, planParallelWidth(plan.subtasks));
+        }
+        if (!cliPlanResume) {
+          livePlanNodes = planNodesFromSubtasks(plan.subtasks, "pending");
+          cliDurable?.apply({
+            type: "plan_ready",
+            plan: durablePlanFromPlan(plan, planProtocol, livePlanNodes),
+            gated: false,
+          });
+          cliDurable?.noteHostEvent(
+            hostPlanEvent({
+              concurrency: effectiveConcurrency,
+              concurrencyMode: concurrency === "auto" ? "auto" : "fixed",
+              plannerMs: planReadyAt - startedAt,
+              subtasks: hostPlanSubtaskViews(plan.subtasks, (name) => getPack(name)?.resources),
+              gated: false,
+            }),
+          );
         }
         endStreamLine();
         console.log(
@@ -1102,6 +1688,29 @@ async function main(): Promise<void> {
           for (const a of s.acceptance) console.log(c.dim(`    验收: ${a}`));
         }
       },
+      onSubtaskStart: (sub) => {
+        livePlanNodes = livePlanNodes.map((n) =>
+          n.id === sub.id ? { ...n, status: "running" as const } : n,
+        );
+        persistLivePlanNodes();
+      },
+      onSubtaskSettled: (sub, result) => {
+        const evidence = evidenceFromVerifiedStep(result);
+        livePlanNodes = livePlanNodes.map((n) =>
+          n.id === sub.id
+            ? {
+                ...n,
+                status: result.finalPassed ? ("passed" as const) : ("failed" as const),
+                ...(evidence ? { evidenceSummary: evidence } : {}),
+              }
+            : n,
+        );
+        persistLivePlanNodes();
+        const budget = result.main.runBudget;
+        if (budget) {
+          cliDurable?.apply({ type: "budget_snapshot", budget: snapshotDurableBudget(budget) });
+        }
+      },
       resolveSubtask: (sub) => {
         const p = sub.pack ? getPack(sub.pack) : undefined;
         if (sub.pack && !p) console.log(c.yellow(`⚠ 未知领域包 "${sub.pack}"，子任务 ${sub.id} 用默认配置执行`));
@@ -1109,6 +1718,17 @@ async function main(): Promise<void> {
         const controlTools = config.tools.filter(
           (tool) => tool.name === ASK_USER_TOOL_NAME || tool.name === FINISH_TASK_TOOL_NAME,
         );
+        const proposeForSub = p?.handoffs?.length
+          ? [
+              createProposeHandoffTool({
+                resolveHandoff: (id) => findPackHandoff(p, id),
+                onPropose: (proposal) => {
+                  console.log(c.cyan(`\n◇ 下一步（不挡对话）：${proposal.label}`));
+                  console.log(c.dim(`  ${proposal.summary}`));
+                },
+              }),
+            ]
+          : [];
         return {
           cfg: {
             ...config,
@@ -1117,6 +1737,7 @@ async function main(): Promise<void> {
               ...selectPackTools(p, builtinPool, mcpPool),
               ...memTools,
               ...controlTools,
+              ...proposeForSub,
             ].filter((tool, i, all) => all.findIndex((candidate) => candidate.name === tool.name) === i),
             ...(p?.guardrails?.maxTurns !== undefined ? { maxTurns: p.guardrails.maxTurns } : {}),
             ...(p?.guardrails?.maxTokens !== undefined && !process.env.AGENT_MAX_TOKENS
@@ -1187,8 +1808,10 @@ async function main(): Promise<void> {
         await renderEvent(event);
       },
     });
-    const totalWallMs = Date.now() - startedAt;
-    const wallMs = Date.now() - planReadyAt; // 子任务阶段墙钟（排除 planner）
+    const finishedAt = Date.now();
+    const totalWallMs = finishedAt - startedAt;
+    const wallMs = finishedAt - planReadyAt; // 子任务阶段墙钟（排除 planner）
+    cliDurable?.noteHostEvent(hostPlanResultEvent(outcome, { startedAt, planReadyAt, finishedAt }));
     console.log(c.cyan("\n═══ 三角编排结果 ═══"));
     // 记账不分分支：计划不可解析（fail-closed）也是一次要归档的失败，只在
     // plan 存在的分支赋值会让这类失败在台账里落 stopReason=null。
@@ -1237,6 +1860,78 @@ async function main(): Promise<void> {
           : c.red("\n✘ 编排未完成（快速失败）") + c.dim(`（${wallNote}）`),
       );
     }
+    if (outcome.completed) cliDurable?.markCompleted();
+    else cliDurable?.markFailed();
+  } else if (cliSingleResume?.reopen) {
+    const loop = new AgentLoop(config, modelClient);
+    const reopenTask = String(task ?? "").trim() || readCliArchiveTask(path.join(historyRoot!, resumeRun!));
+    cliDurable?.apply({ type: "reopen" });
+    console.log(c.yellow(`\n⚠ ${cliSingleResume.note ?? "没有检查点。从任务正文重开一轮。"}`));
+    try {
+      for await (const event of loop.run(reopenTask)) {
+        noteForLedger("main", event);
+        if (event.type === "done") {
+          persistCliExecutorCheckpoint(cliDurable, event);
+          ledgerFacts = {
+            stopReason: event.result.stopReason,
+            error:
+              event.result.stopReason === "error" && event.result.error
+                ? ledgerErrorClass(event.result.error)
+                : event.result.stopReason === "error"
+                  ? ledgerErrorClass("error")
+                  : null,
+            turns: event.result.usage.turns,
+            reworks: null,
+            finalPassed: null,
+            verifications: [],
+          };
+          if (event.result.stopReason === "error" || event.result.stopReason === "aborted") {
+            cliDurable?.markInterrupted();
+          } else {
+            cliDurable?.markCompleted();
+          }
+        }
+        await renderEvent(event);
+      }
+    } catch (err) {
+      cliDurable?.markFailed();
+      throw err;
+    }
+  } else if (cliSingleResume) {
+    const loop = new AgentLoop(config, modelClient);
+    const feedback = task || "接着上次的检查点继续";
+    cliDurable?.apply({ type: "resume", at: Date.now() });
+    console.log(c.cyan("\n↺ 同 run 热恢复：从最后提交的 main 检查点续跑（不恢复 active grant）"));
+    try {
+      for await (const event of loop.runContinuation(cliSingleResume.history, feedback)) {
+        noteForLedger("main", event);
+        if (event.type === "done") {
+          persistCliExecutorCheckpoint(cliDurable, event);
+          ledgerFacts = {
+            stopReason: event.result.stopReason,
+            error:
+              event.result.stopReason === "error" && event.result.error
+                ? ledgerErrorClass(event.result.error)
+                : event.result.stopReason === "error"
+                  ? ledgerErrorClass("error")
+                  : null,
+            turns: event.result.usage.turns,
+            reworks: null,
+            finalPassed: null,
+            verifications: [],
+          };
+          if (event.result.stopReason === "error" || event.result.stopReason === "aborted") {
+            cliDurable?.markInterrupted();
+          } else {
+            cliDurable?.markCompleted();
+          }
+        }
+        await renderEvent(event);
+      }
+    } catch (err) {
+      cliDurable?.markFailed();
+      throw err;
+    }
   } else if (withVerify) {
     const outcome = await runVerified(config, modelClient, task, {
       ...(pack?.verify.instructions ? { verifyInstructions: pack.verify.instructions } : {}),
@@ -1280,6 +1975,7 @@ async function main(): Promise<void> {
       for await (const event of loop.run(task)) {
         noteForLedger("main", event);
         if (event.type === "done") {
+          persistCliExecutorCheckpoint(cliDurable, event);
           ledgerFacts = {
             stopReason: event.result.stopReason,
             error:
@@ -1339,6 +2035,19 @@ async function main(): Promise<void> {
       recoveryPolicy: taskCompletionEnabled ? recoveryFor(pack).policy : null,
       recovery: ledgerRecovery,
       compaction: ledgerCompaction,
+      hooks: ledgerHooks,
+      agentMd: agentMdBundle
+        ? { files: agentMdBundle.files.length, chars: agentMdBundle.chars, truncated: agentMdBundle.truncated }
+        : null,
+      // 档位跟实际开关走，不跟 AGENT_PERMISSION_MODE 标签：CLI --plan 没有计划确认门，
+      // 对不上 plan 预设就记 null（自定义），不许把标签抄进台账。
+      permissionMode: matchPermissionMode({
+        approvalDefault: autoYes ? "auto" : "ask",
+        planMode: withPlan,
+        planGate: false,
+        autoYes,
+      }),
+      approvals: ledgerApprovals,
       // 窗口 / 预算各带来源：事后才能回答"这次运行的压缩阈值到底是谁定的、离窗口多远"
       context: {
         window: contextPlan.window,
@@ -1352,6 +2061,8 @@ async function main(): Promise<void> {
   rl?.close();
   await executionBroker?.dispose?.();
   activeCliExecutionBroker = undefined;
+  activeCliDurable = undefined;
+  activeCliLineageBudget = undefined;
   await mcp?.close();
 
   async function renderEvent(event: TurnEvent): Promise<void> {
@@ -1412,27 +2123,47 @@ async function main(): Promise<void> {
         endStreamLine();
         if (autoYes || !rl) {
           console.log(c.yellow(`⚠ auto-approved: ${formatApprovalPrompt(event)}`));
-          event.respond("allow");
+          respondCliApproval(event, "allow", "auto");
           break;
         }
         const answer = await rl.question(
           c.yellow(`⚠ ${formatApprovalPrompt(event)}? [y/N] `),
         );
         if (answer.trim().toLowerCase() === "y") {
-          event.respond("allow");
+          respondCliApproval(event, "allow", "user");
         } else {
           const reason = await rl.question(c.dim("  reason for the model (optional): "));
-          event.respond("deny", reason.trim() || undefined);
+          respondCliApproval(event, "deny", "user", reason.trim() || undefined);
         }
         break;
       }
-      case "usage":
+      case "usage": {
+        const turnTokens =
+          Number(event.usage.input_tokens ?? 0) +
+          Number(event.usage.output_tokens ?? 0) +
+          Number(event.usage.cache_creation_input_tokens ?? 0);
+        cliTokenSpend += turnTokens;
         console.log(
           c.dim(
             `  tokens: in=${event.usage.input_tokens} cacheW=${event.usage.cache_creation_input_tokens ?? 0} cacheR=${event.usage.cache_read_input_tokens ?? 0} out=${event.usage.output_tokens}`,
           ),
         );
+        const turnCap = config.maxTurns;
+        const tokenCap = config.maxTokensBudget ?? maxTokensBudget;
+        const nearTurns = Boolean(turnCap && event.turn / turnCap >= 0.8);
+        const nearTokens = Boolean(tokenCap && cliTokenSpend / tokenCap >= 0.8);
+        const expensiveFloor = tokenCap ? Math.max(32_000, tokenCap * 0.2) : 32_000;
+        const turnExpensive = turnTokens >= expensiveFloor;
+        if (nearTurns || nearTokens || turnExpensive) {
+          const bits = [
+            nearTurns ? `轮次 ${event.turn}/${turnCap}` : null,
+            nearTokens ? `token 已用约 ${cliTokenSpend}/${tokenCap}` : null,
+            turnExpensive ? `本轮已经很贵（约 ${turnTokens}）` : null,
+          ].filter(Boolean);
+          console.log(c.yellow(`⚠ 成本预警：${bits.join(" · ")}。还没用尽，但下一轮会继续烧。`));
+        }
         break;
+      }
       case "progress": {
         const done = event.items.filter((i) => i.status === "done").length;
         console.log(c.dim(`  ▣ Progress ${done}/${event.items.length}`));
@@ -1442,6 +2173,18 @@ async function main(): Promise<void> {
         endStreamLine();
         console.log(
           c.yellow(`⟳ API 瞬时错误，同轮重试 #${event.attempt}（等待 ${event.backoffMs}ms）：${event.reason}`),
+        );
+        break;
+      case "model_call_start":
+        endStreamLine();
+        console.log(c.dim(`▷ 模型请求 #${event.attempt}（第 ${event.turn} 轮）`));
+        break;
+      case "model_call_end":
+        endStreamLine();
+        console.log(
+          c.dim(
+            `${event.status === "ok" ? "■" : "✗"} 模型请求 ${event.status} ${event.durationMs}ms`,
+          ),
         );
         break;
       case "model_fallback":
@@ -1471,14 +2214,28 @@ async function main(): Promise<void> {
           c.yellow(`⟲ 整段因瞬时故障终止，带 ${event.priorTurns} 轮正史续跑（不是从头重来）：${event.reason}`),
         );
         break;
-      case "recovery_decision":
+      case "recovery_decision": {
         endStreamLine();
-        console.log(c.yellow(`⤷ 恢复决策：${event.detail}`));
+        const stall =
+          event.reason === "end_turn_without_completion" || event.reason === "stagnation";
+        console.log(c.yellow(`${stall ? "⚠ 空转 · " : "⤷ 恢复决策："}${event.detail}`));
         break;
+      }
       case "compaction":
         endStreamLine();
         console.log(c.yellow(describeCompaction(event)));
         break;
+      case "hook": {
+        endStreamLine();
+        const who = event.tool ? `${event.hook} ${event.tool}` : event.hook;
+        const extra = [
+          event.timedOut ? "timeout" : event.exitCode != null ? `exit ${event.exitCode}` : null,
+          event.detail,
+        ].filter(Boolean).join(" · ");
+        const line = extra ? `‡ ${who} ${event.outcome}（${extra}）` : `‡ ${who} ${event.outcome}`;
+        console.log(event.outcome === "allow" ? c.dim(line) : c.yellow(line));
+        break;
+      }
       case "done": {
         endStreamLine();
         const u = event.result.usage;
@@ -1517,6 +2274,13 @@ async function main(): Promise<void> {
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.once(signal, () => {
+    if (activeCliLineageBudget) {
+      activeCliDurable?.apply({
+        type: "budget_snapshot",
+        budget: snapshotDurableBudget(activeCliLineageBudget),
+      });
+    }
+    activeCliDurable?.markInterrupted();
     const cleanup = activeCliExecutionBroker?.dispose?.();
     if (!cleanup) {
       process.exit(signal === "SIGINT" ? 130 : 143);

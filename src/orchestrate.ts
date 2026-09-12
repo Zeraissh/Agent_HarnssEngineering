@@ -10,7 +10,10 @@ import {
   runPlanner,
   runStructuredPlanner,
   validatePlanGraph,
+  buildReplanTask,
+  diffPlansForReplan,
   type Plan,
+  type PlanNodeState,
   type PlanOutcome,
   type SplitRule,
   type SubTask,
@@ -531,6 +534,43 @@ export interface PlannedRunOptions {
    * `resolvePlannerMaxTurns`。opts.plan 存在时此项无效（planner 不运行）。
    */
   planMaxTurns?: number;
+  /**
+   * AGENT-01 重规划：带着上一份节点状态再跑 planner，新图里 id 相同且已
+   * passed、且 description/acceptance 未改的节点不重跑（预置 handoff）。
+   * 与 opts.plan 互斥——重规划必须再拆一遍，不能跳过 planner。
+   */
+  replan?: {
+    originalTask: string;
+    feedback: string;
+    nodes: PlanNodeState[];
+    /** 已通过节点的交接摘要（id → 文本） */
+    handoffs: Record<string, string>;
+  };
+  /**
+   * RUN-01 / AGENT-01：半截 DAG 续发射。必须配合 opts.plan（同一张图，不跑 planner）。
+   * passed 节点预置交接后跳过；pending/running 照常发射；与 replan 互斥。
+   */
+  resume?: {
+    nodes: PlanNodeState[];
+    handoffs?: Record<string, string>;
+  };
+  /**
+   * 追问续跑已经有本对话任务，再跑澄清门会把「继续未完成」听成
+   * 「工作目录里选一个邻居项目」并 ask_user 串台。
+   */
+  skipClarifier?: boolean;
+  /** 子任务刚进发射队列（尚未 runVerified） */
+  onSubtaskStart?: (sub: SubTask) => void | Promise<void>;
+  /** 子任务 runVerified 结束（passed 或 failed） */
+  onSubtaskSettled?: (sub: SubTask, result: VerifiedRunResult) => void | Promise<void>;
+  /** 新计划相对上一份的差分（在 onPlan 之前发射，便于宿主落 plan_replan） */
+  onReplan?: (diff: {
+    kept: string[];
+    added: string[];
+    dropped: string[];
+    changed: string[];
+    reason: string;
+  }) => void | Promise<void>;
 }
 
 export interface PlannedStepResult {
@@ -592,6 +632,22 @@ export async function runPlanned(
   const packs = opts.packs ?? [];
   let planOutcome: PlanOutcome;
   let clarification: ClarificationOutcome | undefined;
+  if (opts.replan && opts.plan) {
+    throw new Error("replan 与注入计划互斥：重规划必须再跑 planner");
+  }
+  if (opts.resume && opts.replan) {
+    throw new Error("resume 与 replan 互斥：半截 DAG 续发射不重拆");
+  }
+  if (opts.resume && !opts.plan) {
+    throw new Error("resume 必须配合注入计划：同一张图续发射，不跑 planner");
+  }
+  const plannerTask = opts.replan
+    ? buildReplanTask({
+        originalTask: opts.replan.originalTask,
+        feedback: opts.replan.feedback,
+        nodes: opts.replan.nodes,
+      })
+    : task;
   if (opts.plan) {
     if (!validatePlanGraph(opts.plan.subtasks)) {
       throw new Error("注入的计划依赖图非法（id 重复/悬空引用/成环）");
@@ -606,22 +662,26 @@ export async function runPlanned(
           ...(opts.plannerModel.compat !== undefined ? { compat: opts.plannerModel.compat } : {}),
         }
       : baseCfg;
-    clarification = await runClarificationGate(
-      plannerCfg,
-      plannerClient,
-      task,
-      (e) => opts.onEvent?.("clarifier", e),
-      { ...(opts.signal ? { signal: opts.signal } : {}) },
-    );
-    const clarifiedTask = [
-      clarification.task,
-      ...(clarification.acceptance.length > 0
-        ? [`【已明确的验收标准】\n${clarification.acceptance.map((item, i) => `${i + 1}. ${item}`).join("\n")}`]
-        : []),
-      ...(clarification.assumptions.length > 0
-        ? [`【未获答复时采用的假设】\n${clarification.assumptions.map((item, i) => `${i + 1}. ${item}`).join("\n")}`]
-        : []),
-    ].join("\n\n");
+    clarification = opts.skipClarifier
+      ? undefined
+      : await runClarificationGate(
+        plannerCfg,
+        plannerClient,
+        plannerTask,
+        (e) => opts.onEvent?.("clarifier", e),
+        { ...(opts.signal ? { signal: opts.signal } : {}) },
+      );
+    const clarifiedTask = clarification
+      ? [
+          clarification.task,
+          ...(clarification.acceptance.length > 0
+            ? [`【已明确的验收标准】\n${clarification.acceptance.map((item, i) => `${i + 1}. ${item}`).join("\n")}`]
+            : []),
+          ...(clarification.assumptions.length > 0
+            ? [`【未获答复时采用的假设】\n${clarification.assumptions.map((item, i) => `${i + 1}. ${item}`).join("\n")}`]
+            : []),
+        ].join("\n\n")
+      : plannerTask;
     const onPlannerEvent = (e: TurnEvent) => opts.onEvent?.("planner", e);
     const plannerOpts = opts.planMaxTurns !== undefined ? { maxTurns: opts.planMaxTurns } : undefined;
     planOutcome =
@@ -639,6 +699,38 @@ export async function runPlanned(
     };
   }
   const plan = planOutcome.plan;
+
+  /** AGENT-01：预置已通过且内容未变的节点，避免整场 DAG 白跑 */
+  const replanKept = new Set<string>();
+  const handoffs = new Map<string, string>();
+  if (opts.replan) {
+    const previous = planFromNodesLocal(opts.replan.nodes);
+    const passedIds = new Set(
+      opts.replan.nodes.filter((n) => n.status === "passed").map((n) => n.id),
+    );
+    const diff = diffPlansForReplan(previous, plan, passedIds);
+    for (const id of diff.kept) {
+      replanKept.add(id);
+      const text = opts.replan.handoffs[id];
+      if (text) handoffs.set(id, text);
+      else handoffs.set(id, "(上一轮已通过，无文字交接)");
+    }
+    await opts.onReplan?.({
+      ...diff,
+      reason: opts.replan.feedback.slice(0, 200),
+    });
+  } else if (opts.resume) {
+    const planIds = new Set(plan.subtasks.map((s) => s.id));
+    for (const n of opts.resume.nodes) {
+      if (n.status !== "passed" || !planIds.has(n.id)) continue;
+      replanKept.add(n.id);
+      handoffs.set(
+        n.id,
+        opts.resume.handoffs?.[n.id] || n.evidenceSummary || "(上一轮已通过，无文字交接)",
+      );
+    }
+  }
+
   await opts.onPlan?.(plan);
 
   const concurrency =
@@ -647,11 +739,11 @@ export async function runPlanned(
       : Math.max(1, Math.floor(opts.concurrency ?? 1));
   const byId = new Map(plan.subtasks.map((s) => [s.id, s]));
   const stepsById = new Map<string, PlannedStepResult>();
-  const handoffs = new Map<string, string>();
-  const passed = new Set<string>();
+  const passed = new Set<string>(replanKept);
   const running = new Map<string, Promise<void>>();
-  const queue = [...plan.subtasks]; // 未发射的子任务，保持计划顺序
-  let aborted = false; // 首个失败后停止发射（在飞的跑完）
+  // 已 kept 的节点不进发射队列
+  const queue = plan.subtasks.filter((s) => !replanKept.has(s.id));
+  let aborted = Boolean(opts.resume?.nodes.some((n) => n.status === "failed")); // 首个失败后停止发射（在飞的跑完）
   let schedulerError: unknown;
 
   /**
@@ -701,6 +793,7 @@ export async function runPlanned(
           : {}),
       });
       stepsById.set(sub.id, { sub, result, durationMs: Date.now() - startedAt });
+      await opts.onSubtaskSettled?.(sub, result);
       if (result.finalPassed) {
         passed.add(sub.id);
         handoffs.set(sub.id, reportFromResult(result.main) || "(上游没有留下文字或结构化报告)");
@@ -751,6 +844,7 @@ export async function runPlanned(
           observeWaitSeconds("resource", Date.now() - waitedFrom);
         }
         queue.splice(queue.indexOf(sub), 1);
+        await opts.onSubtaskStart?.(sub);
         running.set(sub.id, launch(sub));
       }
     }
@@ -762,6 +856,28 @@ export async function runPlanned(
     ]);
   }
   if (schedulerError) throw schedulerError;
+
+  // AGENT-01：kept 节点没有走过 runVerified，补一条"上一轮已通过"的步骤，避免被当成 skipped
+  for (const id of replanKept) {
+    if (stepsById.has(id)) continue;
+    const sub = byId.get(id);
+    if (!sub) continue;
+    stepsById.set(id, {
+      sub,
+      durationMs: 0,
+      result: {
+        main: {
+          messages: [],
+          stopReason: "completed",
+          usage: ZERO_USAGE,
+        },
+        verifications: [],
+        reworks: 0,
+        finalPassed: true,
+        executionUsage: ZERO_USAGE,
+      },
+    });
+  }
 
   const steps = plan.subtasks
     .map((s) => stepsById.get(s.id))
@@ -775,6 +891,21 @@ export async function runPlanned(
     skipped,
     completed,
     ...(clarification && !clarification.skipped ? { clarification } : {}),
+  };
+}
+
+/** 本地：PlanNodeState[] → Plan（避免与 planner 循环时的命名冲突） */
+function planFromNodesLocal(nodes: PlanNodeState[]): Plan {
+  return {
+    subtasks: nodes.map((n) => ({
+      id: n.id,
+      title: n.title,
+      pack: n.pack ?? null,
+      description: n.description,
+      acceptance: [...n.acceptance],
+      dependsOn: [...n.dependsOn],
+      ...(n.resources ? { resources: [...n.resources] } : {}),
+    })),
   };
 }
 

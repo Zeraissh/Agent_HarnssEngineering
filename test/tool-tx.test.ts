@@ -66,6 +66,14 @@ describe("SAFE-06 tool-tx pure helpers", () => {
     expect(isSideEffectTool("stm32__flash_firmware")).toBe(true);
     expect(retryPolicyForTool("stm32__flash_firmware")).toBe("fail_closed_no_retry");
     expect(isSideEffectTool("update_progress")).toBe(false);
+    expect(isSideEffectTool("stm32__read_memory")).toBe(false);
+    // 启发式漏检的旧形态：erase / reset / 分发器 call
+    expect(isSideEffectTool("stm32__erase_flash")).toBe(true);
+    expect(isSideEffectTool("stm32__reset_target")).toBe(true);
+    expect(isSideEffectTool("stm32__call")).toBe(true);
+    expect(isSideEffectTool("lab__put_secret")).toBe(false);
+    expect(isSideEffectTool({ name: "lab__put_secret", sideEffect: true })).toBe(true);
+    expect(retryPolicyForTool({ name: "lab__put_secret", sideEffect: true })).toBe("fail_closed_no_retry");
     const preparedBash: DurableToolTx = {
       idempotencyKey: "r:t",
       toolUseId: "t",
@@ -316,5 +324,37 @@ describe("SAFE-06 bash fail-closed residual", () => {
     expect(r!.is_error).toBe(true);
     expect(r!.content).toMatch(/fail-closed|must not be retried/i);
     expect(events.some((e) => e.type === "tool_failed")).toBe(true);
+  });
+
+  it("名字认不出的 MCP 写工具：无 sideEffect 不进事务；声明了才进", async () => {
+    const make = (sideEffect?: boolean): Tool => ({
+      name: "lab__put_secret",
+      description: "x",
+      inputSchema: { type: "object", properties: {} },
+      permission: "auto",
+      parallelSafe: false,
+      ...(sideEffect ? { sideEffect: true } : {}),
+      execute: async () => ({ content: "ok" }),
+    });
+    const run = async (tool: Tool) => {
+      const reg = new ToolRegistry();
+      reg.register(tool);
+      const exec = new ToolExecutor(reg, process.cwd());
+      const { ctrl, events } = memoryController("run-decl");
+      exec.setToolTx(ctrl, async (e) => {
+        events.push(e);
+      });
+      await exec.executeAll(
+        [block("tu_secret", "lab__put_secret", {})],
+        new AbortController().signal,
+        async () => ({ decision: "allow" }),
+      );
+      return events;
+    };
+    const missed = await run(make());
+    expect(missed.some((e) => e.type === "tool_prepared")).toBe(false);
+    const declared = await run(make(true));
+    expect(declared.some((e) => e.type === "tool_prepared")).toBe(true);
+    expect(declared.some((e) => e.type === "tool_committed")).toBe(true);
   });
 });

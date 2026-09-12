@@ -34,6 +34,17 @@ import { formatRelTime } from "./notifications.js";
 export function normalizeMemoryList(payload) {
   const obj = payload && typeof payload === "object" ? /** @type {any} */ (payload) : {};
   const dir = typeof obj.dir === "string" ? obj.dir : null;
+  const project = typeof obj.project === "string" ? obj.project : null;
+  const shared = obj.shared === true;
+  const rawStatus = obj.status && typeof obj.status === "object" ? obj.status : null;
+  const status = rawStatus && typeof rawStatus.summary === "string" && rawStatus.summary
+    ? {
+        summary: rawStatus.summary,
+        waiting: Array.isArray(rawStatus.waiting) ? rawStatus.waiting.map(String) : [],
+        nextGate: typeof rawStatus.nextGate === "string" ? rawStatus.nextGate : "",
+        decisions: Array.isArray(rawStatus.decisions) ? rawStatus.decisions.map(String) : [],
+      }
+    : null;
   const raw = Array.isArray(obj.entries) ? obj.entries : [];
   /** @type {MemoryEntry[]} */
   const entries = [];
@@ -44,9 +55,10 @@ export function normalizeMemoryList(payload) {
       summary: typeof e.summary === "string" ? e.summary : "",
       sizeBytes: Number.isFinite(Number(e.sizeBytes)) ? Number(e.sizeBytes) : 0,
       mtimeMs: Number.isFinite(Number(e.mtimeMs)) ? Number(e.mtimeMs) : null,
+      scope: typeof e.scope === "string" ? e.scope : null,
     });
   }
-  return { dir, entries };
+  return { dir, project, shared, status, entries };
 }
 
 /**
@@ -98,6 +110,7 @@ const PANEL_ID = "memory-panel";
  *
  * host 回调：
  *   onAnnounce(msg) → aria-live 播报（可选）
+ *   getWorkdir() → 当前作曲栏工作目录（可选；有则带 ?workdir=）
  *
  * env（测试注入）：doc / fetchFn / now
  *
@@ -122,6 +135,10 @@ export function initMemoryPanel(host = {}, env = {}) {
   let dir = null;
   /** @type {MemoryEntry[]} */
   let entries = [];
+  /** @type {{ summary:string, waiting:string[], nextGate:string, decisions:string[] }|null} */
+  let board = null;
+  /** @type {"current"|"all"} */
+  let listScope = "current";
   /** @type {string|null} */
   let selectedName = null;
   /** @type {"loading"|"ready"|"error"} */
@@ -162,8 +179,26 @@ export function initMemoryPanel(host = {}, env = {}) {
   closeBtn.className = "mem-close icon-btn";
   closeBtn.setAttribute("aria-label", "关闭记忆面板");
   closeBtn.innerHTML = '<i class="ph ph-x" aria-hidden="true"></i>';
+  const scopeRow = doc.createElement("div");
+  scopeRow.className = "mem-scope";
+  scopeRow.setAttribute("role", "tablist");
+  scopeRow.setAttribute("aria-label", "记忆范围");
+  const scopeCurrent = doc.createElement("button");
+  scopeCurrent.type = "button";
+  scopeCurrent.className = "mem-scope-btn";
+  scopeCurrent.dataset.scope = "current";
+  scopeCurrent.textContent = "本项目";
+  const scopeAll = doc.createElement("button");
+  scopeAll.type = "button";
+  scopeAll.className = "mem-scope-btn";
+  scopeAll.dataset.scope = "all";
+  scopeAll.textContent = "全部";
+  scopeRow.appendChild(scopeCurrent);
+  scopeRow.appendChild(scopeAll);
+
   head.appendChild(title);
   head.appendChild(dirLabel);
+  head.appendChild(scopeRow);
   head.appendChild(refreshBtn);
   head.appendChild(closeBtn);
 
@@ -172,10 +207,14 @@ export function initMemoryPanel(host = {}, env = {}) {
 
   const listCol = doc.createElement("div");
   listCol.className = "mem-list-col";
+  const boardCard = doc.createElement("div");
+  boardCard.className = "mem-board";
+  boardCard.hidden = true;
   const list = doc.createElement("ul");
   list.className = "mem-list";
   list.setAttribute("role", "listbox");
   list.setAttribute("aria-label", "记忆文件");
+  listCol.appendChild(boardCard);
   listCol.appendChild(list);
 
   const preview = doc.createElement("div");
@@ -212,6 +251,43 @@ export function initMemoryPanel(host = {}, env = {}) {
   doc.body.appendChild(overlay);
 
   // ---- 渲染 ----
+  function memoryListUrl() {
+    const params = new URLSearchParams();
+    if (listScope === "all") params.set("scope", "all");
+    const wd = typeof host.getWorkdir === "function" ? String(host.getWorkdir() ?? "").trim() : "";
+    if (wd) params.set("workdir", wd);
+    const q = params.toString();
+    return q ? `/api/memory?${q}` : "/api/memory";
+  }
+
+  function renderBoard() {
+    boardCard.hidden = !board;
+    if (!board) {
+      boardCard.replaceChildren();
+      return;
+    }
+    const waiting = board.waiting.length ? board.waiting.join("；") : "（无）";
+    const decisions = board.decisions.length ? board.decisions.join("；") : "（无）";
+    boardCard.replaceChildren();
+    const titleEl = doc.createElement("p");
+    titleEl.className = "mem-board-title";
+    titleEl.textContent = "进行中";
+    const summaryEl = doc.createElement("p");
+    summaryEl.className = "mem-board-summary";
+    summaryEl.textContent = board.summary;
+    const metaEl = doc.createElement("p");
+    metaEl.className = "mem-board-meta";
+    metaEl.textContent = `谁在等：${waiting} · 下一门：${board.nextGate || "（未指定）"} · 未决：${decisions}`;
+    boardCard.append(titleEl, summaryEl, metaEl);
+  }
+
+  function renderScope() {
+    scopeCurrent.setAttribute("aria-selected", String(listScope === "current"));
+    scopeAll.setAttribute("aria-selected", String(listScope === "all"));
+    scopeCurrent.classList.toggle("mem-scope-btn--active", listScope === "current");
+    scopeAll.classList.toggle("mem-scope-btn--active", listScope === "all");
+  }
+
   function renderList() {
     list.innerHTML = "";
     for (const entry of entries) {
@@ -265,15 +341,21 @@ export function initMemoryPanel(host = {}, env = {}) {
       dirLabel.title = dir;
     }
     const hasEntries = listStatus === "ready" && entries.length > 0;
-    body.hidden = !hasEntries;
-    empty.hidden = !(listStatus === "ready" && entries.length === 0);
+    const hasBoard = listStatus === "ready" && Boolean(board);
+    body.hidden = !hasEntries && !hasBoard;
+    empty.hidden = !(listStatus === "ready" && entries.length === 0 && !board);
     errorBox.hidden = listStatus !== "error";
     if (listStatus === "error") errorText.textContent = listError;
     if (listStatus === "loading") {
       body.hidden = false;
       renderPreviewPlaceholder("加载中…");
     }
-    if (hasEntries) renderList();
+    if (hasEntries || board) {
+      body.hidden = false;
+      renderBoard();
+      if (hasEntries) renderList();
+    }
+    renderScope();
   }
 
   // ---- 数据 ----
@@ -283,7 +365,7 @@ export function initMemoryPanel(host = {}, env = {}) {
     render();
     let response;
     try {
-      response = await fetchFn("/api/memory");
+      response = await fetchFn(memoryListUrl());
     } catch {
       listStatus = "error";
       listError = "记忆列表加载失败（网络错误）";
@@ -298,6 +380,7 @@ export function initMemoryPanel(host = {}, env = {}) {
     }
     const payload = normalizeMemoryList(await response.json().catch(() => null));
     dir = payload.dir;
+    board = payload.status;
     entries = payload.entries;
     listStatus = "ready";
     if (selectedName && !entries.some((e) => e.name === selectedName)) {
@@ -376,6 +459,14 @@ export function initMemoryPanel(host = {}, env = {}) {
   // ---- 事件 ----
   trigger?.addEventListener("click", () => (open ? closePanel() : openPanel()));
   closeBtn.addEventListener("click", () => closePanel());
+  scopeCurrent.addEventListener("click", () => {
+    listScope = "current";
+    void loadList();
+  });
+  scopeAll.addEventListener("click", () => {
+    listScope = "all";
+    void loadList();
+  });
   refreshBtn.addEventListener("click", () => { void loadList(); });
   retryBtn.addEventListener("click", () => { void loadList(); });
   overlay.addEventListener("pointerdown", (event) => {
@@ -397,6 +488,6 @@ export function initMemoryPanel(host = {}, env = {}) {
     /** 测试与诊断用 */
     refresh: () => loadList(),
     select: (name) => selectEntry(name),
-    getState: () => ({ dir, entries, selectedName, listStatus, listError }),
+    getState: () => ({ dir, entries, board, listScope, selectedName, listStatus, listError }),
   };
 }

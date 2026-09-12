@@ -28,6 +28,12 @@ describe("aggregateUsage", () => {
     expect(pro?.usd).toBeNull();
     expect(pro?.unpricedRuns).toBe(1);
     expect(report.byDay[0]?.day).toBe("2026-09-02");
+    const day1Flash = report.byDayModel.find((r) => r.day === "2026-09-01" && r.model === "flash");
+    expect(day1Flash?.turns).toBe(3);
+    expect(day1Flash?.usd).toBe(0);
+    const day1Pro = report.byDayModel.find((r) => r.day === "2026-09-01" && r.model === "pro");
+    expect(day1Pro?.usd).toBeNull();
+    expect(day1Pro?.unpricedRuns).toBe(1);
   });
 
   it("空台账不是 0 元", () => {
@@ -38,6 +44,7 @@ describe("aggregateUsage", () => {
       unpricedRuns: 0,
       byDay: [],
       byModel: [],
+      byDayModel: [],
     });
   });
 });

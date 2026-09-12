@@ -1,7 +1,7 @@
 import { createBatcher } from "./core/batch.js";
 import { diffKeyed, signature } from "./core/diff.js";
 import { extractLocalPathRef, isLocalPathCandidate, renderMarkdown, renderMarkdownInline } from "./core/markdown.js";
-import { artifactRendererKind } from "./features/artifact-canvas.js";
+import { artifactRendererKind, parseBrowserUrl } from "./features/artifact-canvas.js";
 import {
   patchList,
   appendOnly,
@@ -11,6 +11,7 @@ import {
   keepScrollAnchored,
   withFocusPreserved,
 } from "./dom/patch.js";
+import { formatWorkdirTriggerLabel, parseWorkdirExtrasAttr } from "./features/workdir-picker.js";
 
 // 桶文件转出：现有 import 路径（测试与控制器都从 /app.js 取）保持不变
 export { createBatcher, diffKeyed, signature, patchList, appendOnly, setText, setAttr, setClass, keepScrollAnchored, withFocusPreserved };
@@ -90,6 +91,7 @@ export { createBatcher, diffKeyed, signature, patchList, appendOnly, setText, se
  *   decidedAt?: number,
  *   requestSeq?: number,
  *   approvalId?: string,
+ *   source?: string,
  *   grantPolicy?: {maxScope:"once"|"exact-input",maxTtlMs:number,maxUses:number}
  * }} PendingApproval
  *
@@ -138,6 +140,7 @@ export function createInitialState(runId, task, verify, metadata = {}) {
     status: "running",
     verify,
     archived: Boolean(metadata.archived),
+    createdAt: Number.isFinite(Number(metadata.createdAt)) ? Number(metadata.createdAt) : undefined,
     timeline: [],
     verifierTimeline: [],
     /** 本次对话内精确输入放行规则（见 deriveAssemblyBar 的 autoAllow 那一格） */
@@ -167,6 +170,7 @@ export function createInitialState(runId, task, verify, metadata = {}) {
     /** V-27 编排：计划、调度结果、降级告警 */
     plan: null,
     planResult: null,
+    planReplan: null,
     planWarnings: [],
     /**
      * 计划确认门（backlog §5.1）。null = 本 run 没开门。
@@ -176,6 +180,11 @@ export function createInitialState(runId, task, verify, metadata = {}) {
     // §5.2 需求澄清：当前挂起的提问（null = 没有）+ 已决记录（审计）
     question: null,
     questionLog: [],
+    /**
+     * 下一步提议（不挡对话）。null = 没有。
+     * status: pending | accepted | declined
+     */
+    handoff: null,
     /** V-28：已进行的对话轮数（第 1 轮 = 建 run 时那次提交） */
     conversationTurn: 1,
     /** 执行者 update_progress 整表；null = 还没拆过步 */
@@ -185,6 +194,9 @@ export function createInitialState(runId, task, verify, metadata = {}) {
      * composer 上方的 chips 唯一数据源；插队（steer）不可撤，不进这里。
      */
     queuedMessages: [],
+    /** write_file 等调用前的 before 镜像，回退对话框用来数「能还原几份」 */
+    fileRewindSnapshots: [],
+    rewindFrom: null,
   };
 }
 
@@ -313,7 +325,36 @@ export function normalizeRecoveryConfig(raw) {
 
 /** 窗口来源四值 / 预算来源四值——宿主之外的字符串一律归 unknown / null，不让界面替宿主编来源 */
 const CONTEXT_WINDOW_SOURCES = new Set(["env", "learned", "registry", "unknown"]);
-const CONTEXT_BUDGET_SOURCES = new Set(["run", "env", "pack", "default"]);
+const CONTEXT_BUDGET_SOURCES = new Set(["run", "env", "pack", "window", "default"]);
+
+/** 工作区 git 投影：不带 remote URL。absent / 形状不对 → null（条上不画）。 */
+export function normalizeWorkspaceGit(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  if (raw.present !== true) return { present: false };
+  const github = raw.github && typeof raw.github === "object" && raw.github.owner && raw.github.repo
+    ? { owner: String(raw.github.owner), repo: String(raw.github.repo) }
+    : null;
+  return {
+    present: true,
+    root: raw.root ? String(raw.root) : undefined,
+    branch: raw.branch == null ? null : String(raw.branch),
+    detached: raw.detached === true,
+    dirty: raw.dirty === true,
+    github,
+    branches: Array.isArray(raw.branches) ? raw.branches.map(String) : [],
+  };
+}
+
+/** composer / 装配条共用的短标签：`main` / `main *` / `detached abc123`。无仓库 → null。 */
+export function formatWorkspaceGitChip(git, opts = {}) {
+  if (!git || git.present !== true) return null;
+  const head = git.detached ? `detached ${git.branch || "HEAD"}` : (git.branch || "HEAD");
+  const dirty = git.dirty ? " *" : "";
+  if (opts.withRepo && git.github?.owner && git.github.repo) {
+    return `${head}${dirty} · ${git.github.owner}/${git.github.repo}`;
+  }
+  return `${head}${dirty}`;
+}
 
 /**
  * 上下文窗口 / 预算投影（run_config.context / harness.context 同形，MEM-01 窗口 / 预算分离）。
@@ -349,6 +390,20 @@ export function normalizeContextConfig(raw) {
  * @param {{seq:number, source:string, event:Record<string,unknown>}} sseEvent
  * @returns {RunState}
  */
+/** 消息时间：事件自带 at，否则用 SSE 信封 ts。 */
+export function eventAt(sseEvent) {
+  const fromEvent = Number(sseEvent?.event?.at);
+  if (Number.isFinite(fromEvent)) return fromEvent;
+  const fromTs = Number(sseEvent?.ts);
+  if (Number.isFinite(fromTs)) return fromTs;
+  return undefined;
+}
+
+function stampAt(entry, sseEvent) {
+  const at = eventAt(sseEvent);
+  return at == null ? entry : { ...entry, at };
+}
+
 export function reduceEvent(state, sseEvent) {
   const { seq, source, event } = sseEvent;
   const type = /** @type {string} */ (event.type);
@@ -528,6 +583,8 @@ export function reduceEvent(state, sseEvent) {
           ...(typeof event.verify === "boolean" ? { verify: event.verify } : {}),
           // 这一轮接的是什么：history / plan-summary / fresh（旧事件没有，缺省不显示）
           ...(typeof event.continues === "string" ? { continues: event.continues } : {}),
+          ...(event.executorSwitched === true ? { executorSwitched: true } : {}),
+          ...(eventAt(sseEvent) != null ? { at: eventAt(sseEvent) } : {}),
         },
       ],
     };
@@ -646,6 +703,34 @@ export function reduceEvent(state, sseEvent) {
       questionLog: [...state.questionLog, { ...state.question, status: "expired", answers: [] }],
     };
   }
+  if (type === "handoff_proposal") {
+    return {
+      ...state,
+      handoff: {
+        status: "pending",
+        id: String(event.id ?? seq),
+        handoffId: String(event.handoffId ?? ""),
+        summary: String(event.summary ?? ""),
+        label: String(event.label ?? "按这个根因改固件，再上板复测"),
+        declineLabel: String(event.declineLabel ?? "先不用"),
+        seq,
+        at: Number(event.at ?? 0),
+      },
+    };
+  }
+  if (type === "handoff_resolved") {
+    if (!state.handoff) return state;
+    return {
+      ...state,
+      handoff: {
+        ...state.handoff,
+        status: event.decision === "accept" ? "accepted" : "declined",
+        seq: Number(event.requestSeq ?? seq),
+        at: Number(event.at ?? 0),
+        ...(typeof event.childRunId === "string" ? { childRunId: String(event.childRunId) } : {}),
+      },
+    };
+  }
   // 9.8 段级续跑：整段因瞬时错误死掉后带着正史接着跑。必须显式呈现——
   // 否则宿主看到一个 done(error) 之后又冒出一堆事件，完全读不懂
   if (type === "segment_resume") {
@@ -669,6 +754,74 @@ export function reduceEvent(state, sseEvent) {
   }
   if (type === "plan_result") {
     return { ...state, planResult: { ...event, type: undefined } };
+  }
+  if (type === "plan_replan") {
+    return {
+      ...state,
+      planReplan: {
+        kept: Array.isArray(event.kept) ? event.kept.map(String) : [],
+        added: Array.isArray(event.added) ? event.added.map(String) : [],
+        dropped: Array.isArray(event.dropped) ? event.dropped.map(String) : [],
+        changed: Array.isArray(event.changed) ? event.changed.map(String) : [],
+        reason: String(event.reason ?? ""),
+      },
+      timeline: [
+        ...state.timeline,
+        {
+          seq,
+          source,
+          type: "plan_replan",
+          kept: Array.isArray(event.kept) ? event.kept.map(String) : [],
+          added: Array.isArray(event.added) ? event.added.map(String) : [],
+          dropped: Array.isArray(event.dropped) ? event.dropped.map(String) : [],
+          changed: Array.isArray(event.changed) ? event.changed.map(String) : [],
+          reason: String(event.reason ?? ""),
+        },
+      ],
+    };
+  }
+  if (type === "plan_resume") {
+    return {
+      ...state,
+      planResume: {
+        kept: Array.isArray(event.kept) ? event.kept.map(String) : [],
+        remaining: Array.isArray(event.remaining) ? event.remaining.map(String) : [],
+        reason: String(event.reason ?? ""),
+      },
+      timeline: [
+        ...state.timeline,
+        {
+          seq,
+          source,
+          type: "plan_resume",
+          kept: Array.isArray(event.kept) ? event.kept.map(String) : [],
+          remaining: Array.isArray(event.remaining) ? event.remaining.map(String) : [],
+          reason: String(event.reason ?? ""),
+        },
+      ],
+    };
+  }
+  if (type === "spawn_start" || type === "spawn_done") {
+    return {
+      ...state,
+      timeline: [
+        ...state.timeline,
+        {
+          seq,
+          source,
+          type,
+          title: String(event.title ?? ""),
+          ...(type === "spawn_done"
+            ? {
+                passed: event.passed === true,
+                summary: String(event.summary ?? ""),
+                ...(event.error ? { error: String(event.error) } : {}),
+                ...(typeof event.turns === "number" ? { turns: event.turns } : {}),
+              }
+            : {}),
+        },
+      ],
+    };
   }
   if (type === "plan_warning") {
     return {
@@ -717,6 +870,22 @@ export function reduceEvent(state, sseEvent) {
         fallbackScope: event.fallbackScope ? String(event.fallbackScope) : null,
         fallbackRouting: event.fallbackRouting ? String(event.fallbackRouting) : null,
         compatSource: event.compatSource ? String(event.compatSource) : null,
+        // MODEL-01 残余：链健康只读面——新字段不列出会被白名单投影静默丢弃
+        endpointHealth: Array.isArray(event.endpointHealth)
+          ? event.endpointHealth.map((row) => ({
+              model: String(row?.model ?? ""),
+              healthy: row?.healthy !== false,
+              circuit: String(row?.circuit ?? "closed"),
+              ...(row?.latencyMs != null && Number.isFinite(Number(row.latencyMs))
+                ? { latencyMs: Number(row.latencyMs) }
+                : {}),
+              ...(row?.reason ? { reason: String(row.reason) } : {}),
+            })).filter((row) => row.model)
+          : null,
+        supportsVision:
+          event.supportsVision === true || event.supportsVision === false
+            ? event.supportsVision
+            : null,
         guardrails: event.guardrails ?? null,
         // 上下文窗口（事实）/ 预算（策略）各带来源（MEM-01 窗口 / 预算分离）——三段水位条的唯一数据源
         context: normalizeContextConfig(event.context),
@@ -736,6 +905,48 @@ export function reduceEvent(state, sseEvent) {
               reason: String(event.packRoute.reason ?? ""),
             }
           : null,
+        // 设计模式门面：mode + designRoute 必须进白名单，否则装配条静默丢弃
+        mode: event.mode == null ? null : String(event.mode),
+        designRoute: event.designRoute && typeof event.designRoute === "object"
+          ? {
+              id: event.designRoute.id == null ? null : String(event.designRoute.id),
+              reason: String(event.designRoute.reason ?? ""),
+              seed: String(event.designRoute.seed ?? "blank"),
+              kind: String(event.designRoute.kind ?? ""),
+              bundle: event.designRoute.bundle == null ? null : String(event.designRoute.bundle),
+              extraSeeds: Array.isArray(event.designRoute.extraSeeds)
+                ? event.designRoute.extraSeeds.map(String)
+                : [],
+            }
+          : null,
+        // 逐 run 只读根 / 可写根。不列出就会静默丢弃。
+        readRoots: Array.isArray(event.readRoots) ? event.readRoots.map(String) : null,
+        writeRoots: Array.isArray(event.writeRoots) ? event.writeRoots.map(String) : [],
+        extraWorkdirs: Array.isArray(event.extraWorkdirs) ? event.extraWorkdirs.map(String) : [],
+        // docs/09 §4.2：null = 未武装，与空对象不是一回事
+        hooks: event.hooks && typeof event.hooks === "object"
+          ? {
+              timeoutMs: Number(event.hooks.timeoutMs ?? 0),
+              events: Array.isArray(event.hooks.events) ? event.hooks.events.map(String) : [],
+            }
+          : null,
+        // docs/09 §4.7：null = 本 run 没加载任何 AGENT.md。guidance 必须保住。
+        agentMd: event.agentMd && typeof event.agentMd === "object" && Array.isArray(event.agentMd.files)
+          ? {
+              files: event.agentMd.files.map((f) => ({
+                path: String(f?.path ?? ""),
+                layer: String(f?.layer ?? "project"),
+                chars: Number(f?.chars ?? 0),
+                truncated: f?.truncated === true,
+              })).filter((f) => f.path),
+              chars: Number(event.agentMd.chars ?? 0),
+              truncated: event.agentMd.truncated === true,
+              maxChars: Number(event.agentMd.maxChars ?? 0),
+              guidance: true,
+            }
+          : null,
+        // 工作区 git 身份：跟 workdir 走。不列出就会被白名单投影静默丢弃。
+        workspaceGit: normalizeWorkspaceGit(event.workspaceGit),
       },
     };
   }
@@ -758,9 +969,38 @@ export function reduceEvent(state, sseEvent) {
   if (type === "verification") {
     return applyVerification(state, seq, event);
   }
+  if (type === "file_rewind_snapshot") {
+    const snap = {
+      seq,
+      toolUseId: String(event.toolUseId ?? ""),
+      tool: String(event.tool ?? ""),
+      path: String(event.path ?? ""),
+      existed: event.existed === true,
+      bytes: Number(event.bytes ?? 0),
+      ...(event.skipped ? { skipped: String(event.skipped) } : {}),
+    };
+    const entry = stampAt(buildTimelineEntry(seq, source, type, event), sseEvent);
+    return {
+      ...state,
+      fileRewindSnapshots: [...(state.fileRewindSnapshots ?? []), snap],
+      timeline: [...state.timeline, entry],
+    };
+  }
+  if (type === "conversation_rewound") {
+    const entry = stampAt(buildTimelineEntry(seq, source, type, event), sseEvent);
+    return {
+      ...state,
+      rewindFrom: {
+        parentRunId: String(event.parentRunId ?? ""),
+        seq: Number(event.seq ?? -1),
+        revertFiles: event.revertFiles === true,
+      },
+      timeline: [...state.timeline, entry],
+    };
+  }
 
   // 其余事件进入时间线
-  const entry = buildTimelineEntry(seq, source, type, event);
+  const entry = stampAt(buildTimelineEntry(seq, source, type, event), sseEvent);
   const isVerifier = isVerifierSource(source);
 
   // V-12：tool_result 事件不带工具名（src/loop.ts 只发 toolUseId），日志里就成了
@@ -916,7 +1156,7 @@ export function deriveContextUsage(state, contextTokenLimit) {
  */
 export function reduceEvents(state, sseEvents) {
   let next = state;
-  for (const e of sseEvents) {
+  for (const e of annotateResolvedApprovals(sseEvents)) {
     if (typeof e.seq === "number" && e.seq <= next.lastSeq) continue;
     next = reduceEvent(next, e);
     if (typeof e.seq === "number" && e.seq > next.lastSeq) {
@@ -926,9 +1166,314 @@ export function reduceEvents(state, sseEvents) {
   return next;
 }
 
+/**
+ * 同一批里已经有对应的 approval_resolved / expired 时，把 request 标成
+ * autoResolved。切对话重放、或自动放行的 request+resolved 分两帧到达前，
+ * 都不应先画出一张「待你决定」再闪没。
+ *
+ * requestSeq 对得上优先；对不上时若该 toolUseId 只有一条已决，也认——
+ * 旧档案 / 缺字段的 expired 帧否则会留下一张点不掉的幽灵卡。
+ */
+export function annotateResolvedApprovals(queue) {
+  if (!Array.isArray(queue) || queue.length === 0) return queue ?? [];
+  const resolved = new Map();
+  const byTool = new Map();
+  for (const item of queue) {
+    const ev = item?.event;
+    if (!ev || (ev.type !== "approval_resolved" && ev.type !== "approval_expired")) continue;
+    const toolUseId = String(ev.toolUseId ?? "");
+    if (!toolUseId) continue;
+    const requestSeq = Number(ev.requestSeq);
+    if (Number.isFinite(requestSeq)) resolved.set(`${toolUseId}#${requestSeq}`, ev);
+    else {
+      // 旧档案缺 requestSeq：仅在该 toolUseId 唯一时兜底，避免返工轮复用 id 串卡。
+      const list = byTool.get(toolUseId) ?? [];
+      list.push(ev);
+      byTool.set(toolUseId, list);
+    }
+  }
+  if (resolved.size === 0 && byTool.size === 0) return queue;
+  let changed = false;
+  const next = queue.map((item) => {
+    const ev = item?.event;
+    if (!ev || ev.type !== "approval_request" || ev.autoResolved === true) return item;
+    const toolUseId = String(ev.toolUseId ?? "");
+    const exact = resolved.get(`${toolUseId}#${item.seq}`);
+    const fallback = byTool.get(toolUseId);
+    const hit = exact ?? (fallback?.length === 1 ? fallback[0] : undefined);
+    if (!hit) return item;
+    changed = true;
+    return {
+      ...item,
+      event: {
+        ...ev,
+        autoResolved: true,
+        decision: hit.type === "approval_expired" ? "deny" : (hit.decision ?? "allow"),
+        actor: hit.actor,
+        ...(hit.type === "approval_expired" ? { expired: true } : {}),
+      },
+    };
+  });
+  return changed ? next : queue;
+}
+
+/**
+ * 还没对上 resolved/expired 的 approval_request 先扣下。
+ * 跨 rAF 的自动放行、以及 replay 超时切批，都靠这一层避免先画待决卡。
+ */
+export function partitionSettledApprovals(queue) {
+  const annotated = annotateResolvedApprovals(queue);
+  /** @type {any[]} */
+  const ready = [];
+  /** @type {any[]} */
+  const hold = [];
+  for (const item of annotated) {
+    const ev = item?.event;
+    if (ev?.type === "approval_request" && ev.autoResolved !== true) hold.push(item);
+    else ready.push(item);
+  }
+  return { ready, hold };
+}
+
+/** 真人闸门才亮卡；配对窗口刻意短，免得真审批被挡住。 */
+export const APPROVAL_SETTLE_MS = 160;
+
+/**
+ * 跨批扣住未配对的 approval_request。
+ * `force` 或超过 settleMs 才放行——那才是真的要人点的卡。
+ */
+export function createApprovalSettleGate(opts = {}) {
+  const settleMs = Number.isFinite(opts.settleMs) ? Number(opts.settleMs) : APPROVAL_SETTLE_MS;
+  /** @type {Map<string, { items: any[], since: number }>} */
+  const byRun = new Map();
+  return {
+    /**
+     * @param {string} runId
+     * @param {any[]} queue
+     * @param {{ now?: number, force?: boolean }} [t]
+     */
+    ingest(runId, queue, t = {}) {
+      const now = Number.isFinite(t.now) ? Number(t.now) : Date.now();
+      const prev = byRun.get(runId);
+      const { ready, hold } = partitionSettledApprovals([...(prev?.items ?? []), ...(queue ?? [])]);
+      if (hold.length === 0) {
+        byRun.delete(runId);
+        return { ready, hold: [], settleInMs: null };
+      }
+      const since = prev?.items?.length ? prev.since : now;
+      if (t.force === true || now - since >= settleMs) {
+        byRun.delete(runId);
+        return { ready: [...ready, ...hold], hold: [], settleInMs: null };
+      }
+      byRun.set(runId, { items: hold, since });
+      return { ready, hold, settleInMs: Math.max(0, settleMs - (now - since)) };
+    },
+    pending(runId) {
+      return byRun.get(runId)?.items ?? [];
+    },
+    clear(runId) {
+      byRun.delete(runId);
+    },
+  };
+}
+
+/**
+ * 首订 EventSource 时先攒历史帧，等 replay_done（或超时）再一次交给 batcher。
+ * 切会话重放若按 rAF 切开，审批卡会先待决再消失。
+ */
+export function createReplayGate() {
+  let released = false;
+  /** @type {any[]} */
+  const held = [];
+  return {
+    get released() {
+      return released;
+    },
+    /**
+     * @param {any} item
+     * @returns {any[] | null} 已放行则把这条立刻交出去；仍在攒则 null
+     */
+    hold(item) {
+      if (released) return [item];
+      held.push(item);
+      return null;
+    },
+    /** @returns {any[]} */
+    release() {
+      if (released) return [];
+      released = true;
+      return held.splice(0, held.length);
+    },
+    /** 超时放行前：还在攒着未配对的审批就再等 replay_done，避免先画幽灵卡。 */
+    hasUnpairedApprovalRequest() {
+      return partitionSettledApprovals(held).hold.length > 0;
+    },
+  };
+}
+
 /** 来源是否属于 verifier（放开为字符串后要兼容 "s1/verifier" 这类编排来源） */
 function isVerifierSource(source) {
   return source === "verifier" || (typeof source === "string" && source.endsWith("/verifier"));
+}
+
+/** planner/verifier 都在内部自答；宿主不得再挂一张「待你决定」。 */
+export function isInternallyResolvedApprovalSource(source) {
+  const s = String(source ?? "");
+  return s === "verifier" || s.endsWith("/verifier") || s === "planner" || s.endsWith("/planner");
+}
+
+/** 已收工的 run 不能再有活人闸门——残留 pending 就是切会话时的幽灵卡。 */
+export function runHasClosed(state) {
+  return Boolean(state?.status === "done" || state?.archived || state?.runEnd);
+}
+
+/**
+ * 主坞真正该亮的待决审批。已结束 / 子代理 / 内部自答一律不算。
+ * @param {RunState} state
+ */
+export function visiblePendingApprovals(state) {
+  if (!state || runHasClosed(state)) return [];
+  return (state.pendingApprovals ?? []).filter(
+    (a) =>
+      a.status === "pending" &&
+      !isChildAgentSource(a.source) &&
+      !isInternallyResolvedApprovalSource(a.source),
+  );
+}
+
+const PARENT_EVENT_SOURCES = new Set(["main", "rework", "planner", "verifier", "host", "model"]);
+
+/**
+ * 并行子代理的聚合键。
+ *   spawn/查寄存器  → 一条 spawn 支线
+ *   s1/main、s1/verifier → 编排子任务 s1
+ * 主对话只认 main/rework/planner/verifier/host，其余都进「子代理工作中」。
+ */
+export function childAgentKey(source) {
+  const s = String(source ?? "");
+  if (!s) return null;
+  if (s.startsWith("spawn/")) return s;
+  const slash = s.indexOf("/");
+  if (slash <= 0) return null;
+  const head = s.slice(0, slash);
+  if (PARENT_EVENT_SOURCES.has(head)) return null;
+  return head;
+}
+
+export function isChildAgentSource(source) {
+  return childAgentKey(source) != null;
+}
+
+/**
+ * 直播思考/正文只跟执行者。规划者/核查者的增量不抢主对话。
+ * 编排子任务的执行者是 `s1/main`，spawn 支线是 `spawn/…`——只认 `main`
+ * 会让计划模式下整段 Thinking 消失（增量在，界面没有）。
+ */
+export function isLiveDeltaSource(source) {
+  const s = String(source ?? "");
+  if (s === "main" || s === "rework") return true;
+  if (s === "planner" || s === "verifier") return false;
+  if (s.endsWith("/planner") || s.endsWith("/verifier")) return false;
+  if (s.endsWith("/main")) return true;
+  if (s.startsWith("spawn/")) return true;
+  return false;
+}
+
+export function spawnAgentId(title) {
+  return `spawn/${String(title ?? "").slice(0, 40)}`;
+}
+
+/**
+ * 从时间线收出当前 run 的子代理列表（编排子任务 + spawn 支线）。
+ * 没开跑的计划节点不进这里——计划卡已经有它们。
+ */
+export function deriveChildAgents(state) {
+  const byId = new Map();
+  const ensure = (id, extras = {}) => {
+    if (!byId.has(id)) {
+      byId.set(id, {
+        id,
+        title: extras.title || String(id).replace(/^spawn\//, ""),
+        kind: extras.kind || (String(id).startsWith("spawn/") ? "spawn" : "plan"),
+        status: extras.status || "running",
+        pendingApprovals: 0,
+        lastText: "",
+        peek: "",
+        seq: extras.seq ?? 0,
+        started: extras.started === true,
+      });
+    }
+    const row = byId.get(id);
+    if (extras.title && !row.title) row.title = extras.title;
+    if (Number.isFinite(extras.seq) && (row.seq === 0 || extras.seq < row.seq)) row.seq = extras.seq;
+    if (extras.started) row.started = true;
+    return row;
+  };
+
+  for (const t of state?.plan?.subtasks ?? []) {
+    if (t?.id) ensure(String(t.id), { title: String(t.title ?? t.id), kind: "plan", status: "pending", started: false });
+  }
+
+  for (const e of state?.timeline ?? []) {
+    if (e.type === "spawn_start") {
+      const id = spawnAgentId(e.title);
+      const a = ensure(id, { title: String(e.title ?? ""), kind: "spawn", seq: e.seq, started: true });
+      a.status = "running";
+      continue;
+    }
+    if (e.type === "spawn_done") {
+      const id = spawnAgentId(e.title);
+      const a = ensure(id, { title: String(e.title ?? ""), kind: "spawn", seq: e.seq, started: true });
+      a.status = e.passed === true ? "done" : "error";
+      a.lastText = String(e.summary || e.error || "");
+      continue;
+    }
+    const key = childAgentKey(e.source);
+    if (!key) continue;
+    const planTitle = (state?.plan?.subtasks ?? []).find((t) => t.id === key)?.title;
+    const a = ensure(key, {
+      title: planTitle || key,
+      kind: key.startsWith("spawn/") ? "spawn" : "plan",
+      seq: e.seq,
+      started: true,
+    });
+    // 计划先把节点写成 pending；子任务一开始干活必须翻成 running，
+    // 否则主对话卡一直显示「等待」，动态效果也挂不上。
+    if (a.status === "pending") a.status = "running";
+    if (e.type === "assistant_text") {
+      const text = String(e.text ?? "").trim();
+      if (text) a.lastText = text;
+    }
+    if (e.type === "tool_call") a.peek = String(e.name ?? "");
+    if (e.type === "done") {
+      const reason = String(e.stopReason ?? "");
+      a.status = reason === "error" || reason === "aborted" ? "error" : "done";
+    }
+  }
+
+  for (const st of state?.planResult?.steps ?? []) {
+    const id = String(st?.id ?? "");
+    if (!id) continue;
+    const planTitle = (state?.plan?.subtasks ?? []).find((t) => t.id === id)?.title;
+    const a = ensure(id, { title: planTitle || id, kind: "plan", started: true });
+    a.status = st.passed === false ? "error" : "done";
+  }
+
+  if (state.status === "done") {
+    for (const a of byId.values()) {
+      if (a.status === "running") a.status = "done";
+    }
+  }
+
+  for (const a of state?.pendingApprovals ?? []) {
+    if (a.status !== "pending") continue;
+    const key = childAgentKey(a.source);
+    if (!key) continue;
+    const agent = byId.get(key);
+    if (agent) agent.pendingApprovals += 1;
+  }
+
+  return [...byId.values()].filter((a) => a.started || a.pendingApprovals > 0);
 }
 
 // ---------------------------------------------------------------
@@ -983,7 +1528,11 @@ function buildTimelineEntry(seq, source, type, event) {
         durationMs: /** @type {number} */ (event.durationMs),
       };
     case "assistant_text":
-      return { ...base, text: /** @type {string} */ (event.text) };
+      return {
+        ...base,
+        text: /** @type {string} */ (event.text),
+        ...(Number.isFinite(Number(event.at)) ? { at: Number(event.at) } : {}),
+      };
     case "assistant_thinking":
       // 逐字段白名单投影：新字段不列出就静默丢弃（本轮第四次踩到这条）
       return {
@@ -1001,6 +1550,20 @@ function buildTimelineEntry(seq, source, type, event) {
         // 抖动上线后同一 attempt 的等待不再是定值；旧 run 没有这个字段，
         // 只在存在时带上（渲染层据此决定显不显示，不能显示 undefined）
         ...(typeof event.backoffMs === "number" ? { backoffMs: event.backoffMs } : {}),
+      };
+    case "model_call_start":
+      return {
+        ...base,
+        turn: /** @type {number} */ (event.turn),
+        attempt: /** @type {number} */ (event.attempt),
+      };
+    case "model_call_end":
+      return {
+        ...base,
+        turn: /** @type {number} */ (event.turn),
+        attempt: /** @type {number} */ (event.attempt),
+        status: event.status === "ok" ? "ok" : "error",
+        durationMs: /** @type {number} */ (event.durationMs),
       };
     // MODEL-01a 端点降级。逐字段白名单投影：不在这里列出的字段静默消失，
     // 而"少显示一行"在界面上看不出来（host-lags 那条纪律的第 N 次现身）
@@ -1021,6 +1584,27 @@ function buildTimelineEntry(seq, source, type, event) {
         action: String(event.action ?? ""),
         detail: String(event.detail ?? ""),
         ...(typeof event.extraTurns === "number" ? { extraTurns: event.extraTurns } : {}),
+      };
+    case "file_rewind_snapshot":
+      return {
+        ...base,
+        toolUseId: String(event.toolUseId ?? ""),
+        tool: String(event.tool ?? ""),
+        path: String(event.path ?? ""),
+        existed: event.existed === true,
+        bytes: Number(event.bytes ?? 0),
+        ...(event.skipped ? { skipped: String(event.skipped) } : {}),
+      };
+    case "conversation_rewound":
+      return {
+        ...base,
+        parentRunId: String(event.parentRunId ?? ""),
+        rewindSeq: Number(event.seq ?? -1),
+        revertFiles: event.revertFiles === true,
+        restored: Array.isArray(event.restored) ? event.restored.map(String) : [],
+        deleted: Array.isArray(event.deleted) ? event.deleted.map(String) : [],
+        gitRestored: Array.isArray(event.gitRestored) ? event.gitRestored.map(String) : [],
+        skipped: Array.isArray(event.skipped) ? event.skipped : [],
       };
     case "run_forked":
       return {
@@ -1059,6 +1643,17 @@ function buildTimelineEntry(seq, source, type, event) {
         collapsedTurns: typeof event.collapsedTurns === "number" ? event.collapsedTurns : 0,
         reactive: event.reactive === true,
       };
+    case "hook":
+      return {
+        ...base,
+        hook: String(event.hook ?? ""),
+        outcome: String(event.outcome ?? ""),
+        ...(event.tool ? { tool: String(event.tool) } : {}),
+        ...(event.toolUseId ? { toolUseId: String(event.toolUseId) } : {}),
+        ...(event.exitCode !== undefined ? { exitCode: event.exitCode } : {}),
+        timedOut: event.timedOut === true,
+        ...(event.detail ? { detail: String(event.detail) } : {}),
+      };
     default:
       return base;
   }
@@ -1075,17 +1670,27 @@ function applyApproval(state, seq, source, event) {
     entry.resolvedTargets = event.resolvedTargets;
   }
 
-  // F2: verifier 审批不进 pendingApprovals（内部已自答，HTTP 不应再应答）
-  if (isVerifierSource(source)) {
+  // planner/verifier 在 drain 里自答 deny，事件只作审计。进待决坞就是幽灵卡。
+  if (isInternallyResolvedApprovalSource(source)) {
+    if (isVerifierSource(source)) {
+      return {
+        ...state,
+        verifierTimeline: [...state.verifierTimeline, entry],
+      };
+    }
     return {
       ...state,
-      verifierTimeline: [...state.verifierTimeline, entry],
+      timeline: [...state.timeline, entry],
     };
   }
 
   // main/rework 审批：进时间线 + 挂起审批列表。
   // requestSeq 是这张卡的身份：返工轮会复用同一个 toolUseId，只有请求序号
   // 能区分"这是第几轮的那次审批"——否则一次点击会改写历史卡（V-03）。
+  const autoResolved = event.autoResolved === true;
+  const status = autoResolved
+    ? (event.expired === true ? "expired" : event.decision === "deny" ? "denied" : "allowed")
+    : "pending";
   return {
     ...state,
     timeline: [...state.timeline, entry],
@@ -1095,9 +1700,11 @@ function applyApproval(state, seq, source, event) {
         toolUseId,
         name,
         input,
-        status: "pending",
+        status,
         requestSeq: seq,
         approvalId: `${toolUseId}#${seq}`,
+        source,
+        ...(autoResolved && event.actor ? { actor: String(event.actor) } : {}),
         ...(Array.isArray(event.resolvedTargets) ? { resolvedTargets: event.resolvedTargets } : {}),
         ...(event.grantPolicy && typeof event.grantPolicy === "object"
           ? { grantPolicy: event.grantPolicy }
@@ -1359,10 +1966,10 @@ function expireAll(approvals) {
 export const VERDICT_PARSE_FAIL = "verifier 输出无法解析为 JSON 裁决";
 
 /** 写类工具：会改变外部世界的那些，用于识别"零写入返工" */
-const WRITE_TOOLS = new Set(["write_file", "memory_write", "bash"]);
+const WRITE_TOOLS = new Set(["write_file", "write_pptx", "memory_write", "bash"]);
 
 /** 能从入参直接读出产物路径的写类工具。bash 不在其中——见 deriveArtifacts 的说明 */
-const ARTIFACT_TOOLS = new Set(["write_file", "memory_write"]);
+const ARTIFACT_TOOLS = new Set(["write_file", "write_pptx", "edit_file", "memory_write"]);
 
 /** source → 角色。前缀式来源（"s1/main"）为并行编排预留 */
 function segmentRole(source) {
@@ -1565,6 +2172,8 @@ export function deriveLoopFace(state, harness) {
     // 与它管着的那几条 recovery_decision 放在同一个面上——策略与它的触发记录并排
     recovery: rc?.recovery ?? normalizeRecoveryConfig(harness?.recovery) ?? null,
     recoveryDecisions: state.timeline.filter((e) => e.type === "recovery_decision"),
+    hooks: rc?.hooks ?? null,
+    hookEvents: state.timeline.filter((e) => e.type === "hook"),
   };
 }
 
@@ -1585,6 +2194,70 @@ export function describeRecoveryPolicy(recovery) {
     ` · 换策略 ${recovery.maxStagnationRecoveries} 次${src("maxStagnationRecoveries")}` +
     (allDefault ? "（默认）" : "")
   );
+}
+
+/**
+ * 卡住空转要当场看得见，不能只进台账。
+ * 最近一条 stagnation / end_turn_without_completion 之后还没有工具或正文，才算仍在空转。
+ */
+export function deriveSpinState(state) {
+  if (state.status !== "running") return null;
+  const timeline = state.timeline ?? [];
+  let last = -1;
+  for (let i = timeline.length - 1; i >= 0; i -= 1) {
+    if (timeline[i].type === "recovery_decision") {
+      last = i;
+      break;
+    }
+  }
+  if (last < 0) return null;
+  const ev = timeline[last];
+  const stall = ev.reason === "end_turn_without_completion" || ev.reason === "stagnation";
+  if (!stall) return null;
+  const after = timeline.slice(last + 1);
+  if (after.some((e) => e.type === "tool_call" || e.type === "assistant_text" || e.type === "done")) {
+    return null;
+  }
+  return {
+    reason: ev.reason,
+    action: ev.action,
+    detail: String(ev.detail ?? ""),
+    label: "空转 · 可停止",
+  };
+}
+
+function costTokensOfTurn(row) {
+  return Number(row?.input ?? 0) + Number(row?.output ?? 0) + Number(row?.cacheCreation ?? 0);
+}
+
+/**
+ * 烧起来之前的预警：接近轮次/token 预算，或本轮已经很贵。
+ * 不是新账单。运行结束后改由 deriveCostFace 报账。
+ */
+export function deriveCostWarning(state, harness) {
+  if (state.status !== "running") return null;
+  const loop = deriveLoopFace(state, harness);
+  const g = state.runConfig?.guardrails ?? harness?.guardrails ?? null;
+  const maxTokens = typeof g?.maxTokens === "number" && g.maxTokens > 0 ? g.maxTokens : null;
+  const bits = [];
+  if (loop.nearLimit && loop.maxTurns) {
+    bits.push(`轮次已用 ${loop.turn}/${loop.maxTurns}`);
+  }
+  const used = (state.usageByTurn ?? []).reduce((n, row) => n + costTokensOfTurn(row), 0);
+  const last = (state.usageByTurn ?? []).at(-1);
+  const lastTokens = last ? costTokensOfTurn(last) : 0;
+  if (maxTokens && used / maxTokens >= 0.8) {
+    bits.push(`token 已用约 ${used}/${maxTokens}`);
+  }
+  const expensiveFloor = maxTokens ? Math.max(32_000, maxTokens * 0.2) : 32_000;
+  if (lastTokens >= expensiveFloor) {
+    bits.push(`本轮已经很贵（约 ${lastTokens}）`);
+  }
+  if (!bits.length) return null;
+  return {
+    label: `成本预警 · ${bits[0]}`,
+    detail: `${bits.join(" · ")}。还没用尽，但下一轮会继续烧。`,
+  };
 }
 
 /**
@@ -1672,6 +2345,7 @@ export function deriveContextFace(state, harness) {
       const last = state.usageByTurn[state.usageByTurn.length - 1];
       return last?.breakdown ?? null;
     })(),
+    agentMd: state.runConfig?.agentMd ?? null,
   };
 }
 
@@ -1735,7 +2409,10 @@ export function deriveToolsFace(state, harness) {
     // 逐 run 可换工作目录，Tools 面必须报本 run 真正用的那个
     workdir: rc?.workdir ?? harness?.workdir ?? null,
     roleModels: rc?.roleModels ?? null,
-    readRoots: harness?.readRoots ?? [],
+    readRoots: Array.isArray(rc?.readRoots) ? rc.readRoots : (harness?.readRoots ?? []),
+    writeRoots: Array.isArray(rc?.writeRoots)
+      ? rc.writeRoots
+      : (Array.isArray(rc?.extraWorkdirs) ? rc.extraWorkdirs : []),
     // 运行历史的真实落点是进程级装配（不逐 run 变），只来自宿主快照
     history: harness?.history ?? null,
     mcp: harness?.mcp ?? null,
@@ -1836,6 +2513,33 @@ export function deriveVerificationFace(state, harness) {
 // 统一输入框（composer）：新建任务与追加指令共用同一个框
 // ================================================================
 
+/** 工作目录的末段名。空路径不猜。 */
+export function composerFolderName(path) {
+  const raw = String(path ?? "").trim().replace(/[\\/]+$/, "");
+  if (!raw) return "";
+  const parts = raw.split(/[\\/]/).filter(Boolean);
+  return parts[parts.length - 1] ?? "";
+}
+
+/** 发送快捷键写在 title，不占 placeholder。 */
+export const COMPOSER_SEND_HINT = "Enter 发送，Shift+Enter 换行";
+
+/**
+ * 新建对话的 placeholder：框上已经选了目录，就不要再写「问任何问题」。
+ * 设计模式问稿，不问仓库文件夹名——否则会看见「要「Agent_Design」做什么…」。
+ *
+ * @param {string|null|undefined} workdir
+ * @param {{ designMode?: boolean, designTitle?: string|null }} [opts]
+ */
+export function newRunPlaceholder(workdir, opts) {
+  if (opts?.designMode) {
+    const title = String(opts.designTitle ?? "").trim();
+    return title ? `要「${title}」做什么…` : "要这份稿做什么…";
+  }
+  const name = composerFolderName(workdir);
+  return name ? `要「${name}」做什么…` : "要这个目录做什么…";
+}
+
 /**
  * 一个框、四个模式。模式**只由"当前选中哪个运行"派生**。
  *
@@ -1858,12 +2562,19 @@ export function deriveVerificationFace(state, harness) {
  *   submitting?: boolean,        // 提交在飞：服务端还没回、列表也还没更新
  *   stopping?: boolean,          // 人已经按了停止，等当前这一步收口
  *   error?: string|null,
+ *   workdir?: string|null,       // 新建态：当前选中的工作目录（不在 info 里）
+ *   draft?: string|null,         // 输入框当前草稿：运行中有字 → 立即插入，空 → 停止
+ *   designMode?: boolean,        // 设计模式新建：placeholder 用稿名，不用文件夹名
+ *   designTitle?: string|null,   // 当前样例 / 注册表标题
  * }} input
  */
-export function deriveComposerMode({ info, localStatus, submitting, error, stopping } = {}) {
+export function deriveComposerMode({ info, localStatus, submitting, error, stopping, workdir, draft, designMode, designTitle } = {}) {
   const base = {
     runId: info?.runId ?? null,
-    workdir: info?.workdir ?? null,
+    workdir: info?.workdir ?? workdir ?? null,
+    // 已打开的对话：路径是那场会话的圈禁根，输入栏只展示、不能改。
+    // 开新对话才用下拉选目录——跟 Cursor「切聊天 = 切到该聊天的工作区」同构。
+    workdirLocked: Boolean(info),
     error: error ?? null,
     optionsEnabled: true,
     canExtendBudget: false,
@@ -1903,7 +2614,7 @@ export function deriveComposerMode({ info, localStatus, submitting, error, stopp
       kind: "new",
       buttonLabel: "运行任务",
       labelText: "任务描述",
-      placeholder: "输入新任务描述…（Enter 发送，Shift+Enter 换行）",
+      placeholder: newRunPlaceholder(base.workdir, { designMode, designTitle }),
       note: "",
       canSubmit: true,
     };
@@ -1933,32 +2644,29 @@ export function deriveComposerMode({ info, localStatus, submitting, error, stopp
         kind: null,
         buttonLabel: "正在停止…",
         labelText: "任务描述",
-        placeholder: "正在停止，当前这一步结束后才会收尾…",
-        note: "已发出停止。当前模型请求或工具跑完后才会收尾，已完成的写入不会回滚。",
+        placeholder: "正在停止…",
+        note: "已发出停止，正在收尾。已完成的写入不会回滚。",
         canSubmit: false,
         optionsEnabled: false,
         verifyToggle: { ...base.verifyToggle, enabled: false },
       };
     }
+    const hasDraft = Boolean(String(draft ?? "").trim());
     return {
       ...base,
       mode: "running",
-      kind: "stop",
+      kind: hasDraft ? "steer" : "stop",
       /**
-       * 运行中这个位置变成「停止」，而不是再加一个按钮。
-       *
-       * 理由是此刻它本来就没别的事可做（既不能新建也不能追加），
-       * 空着一个灰按钮 + 旁边再摆一个停止键，是把一个位置的两种状态
-       * 画成了两个控件。
+       * 有草稿 = 立即插入（下一轮模型调用前注入正史）；空框 = 停止。
+       * 不要再并排两个「插队 / 排队」键——发送本身就是插入。
        */
-      buttonLabel: "停止",
+      buttonLabel: hasDraft ? "立即插入" : "停止",
       labelText: "任务描述",
-      // 不禁用输入框：把"先把下一条想好"的能力也没收掉是过度反应
-      placeholder: "运行进行中，可以先把下一条指令打好…",
+      placeholder: "运行进行中，直接发送会立即插入…",
       note: "",
       canSubmit: true,
-      optionsEnabled: false,
-      verifyToggle: { ...base.verifyToggle, enabled: false },
+      optionsEnabled: true,
+      verifyToggle: { ...base.verifyToggle, enabled: true },
     };
   }
 
@@ -1972,10 +2680,38 @@ export function deriveComposerMode({ info, localStatus, submitting, error, stopp
         kind: "append",
         buttonLabel: "继续对话",
         labelText: "追加指令",
-        placeholder: "接着说…（Enter 发送，Shift+Enter 换行）",
+        placeholder: "接着说…",
         note: "",
         canSubmit: true,
-        optionsEnabled: false,
+        optionsEnabled: true,
+        verifyToggle,
+      };
+    }
+    if (info.continuationMode === "restore-gate") {
+      return {
+        ...base,
+        mode: "restore-gate",
+        kind: "append",
+        buttonLabel: "继续对话",
+        labelText: "追加指令",
+        placeholder: "接着说…",
+        note: "计划还在确认门上。发送后回到门上批准，不会假装已经跑过子任务。",
+        canSubmit: true,
+        optionsEnabled: true,
+        verifyToggle,
+      };
+    }
+    if (info.continuationMode === "reopen") {
+      return {
+        ...base,
+        mode: "reopen",
+        kind: "append",
+        buttonLabel: "继续对话",
+        labelText: "追加指令",
+        placeholder: "接着说…",
+        note: "没有可热续的检查点。发送会从任务正文重开一轮，不重放飞行中的工具。",
+        canSubmit: true,
+        optionsEnabled: true,
         verifyToggle,
       };
     }
@@ -1986,10 +2722,10 @@ export function deriveComposerMode({ info, localStatus, submitting, error, stopp
         kind: "append",
         buttonLabel: "继续对话",
         labelText: "追加指令",
-        placeholder: "接着说…（Enter 发送，Shift+Enter 换行）",
+        placeholder: "接着说…",
         note: "",
         canSubmit: true,
-        optionsEnabled: false,
+        optionsEnabled: true,
         verifyToggle,
       };
     }
@@ -1999,10 +2735,10 @@ export function deriveComposerMode({ info, localStatus, submitting, error, stopp
       kind: "append",
       buttonLabel: "继续对话",
       labelText: "追加指令",
-      placeholder: "接着说…（Enter 发送，Shift+Enter 换行）",
+      placeholder: "接着说…",
       note: "",
       canSubmit: true,
-      optionsEnabled: false,
+      optionsEnabled: true,
       verifyToggle,
     };
   }
@@ -2017,10 +2753,10 @@ export function deriveComposerMode({ info, localStatus, submitting, error, stopp
     kind: "append",
     buttonLabel: "继续对话",
     labelText: "追加指令",
-    placeholder: "接着说…（Enter 发送，Shift+Enter 换行）",
+    placeholder: "接着说…",
     note: "",
     canSubmit: true,
-    optionsEnabled: false,
+    optionsEnabled: true,
     verifyToggle: { enabled: true, defaultChecked: Boolean(info.verify), label: "本轮独立核查" },
     budgetExhausted: Boolean(info.budgetExhausted || info.canExtendBudget),
     canExtendBudget: Boolean(info.canExtendBudget),
@@ -2052,7 +2788,14 @@ function blockedReason(info) {
  * autoApprove 也必须显式带上——归档派生 / 续跑是新的执行，不继承父 run 的活权限。
  * 勾着「自动放行」却不发这个字段，界面看起来开着、服务端仍会逐条问。
  */
-export function buildFollowUpRequest({ text, verify, autoApprove, planMode, multiAgent, effort }) {
+export function buildFollowUpRequest({
+  text, verify, autoApprove, planMode, multiAgent, effort,
+  workdir, extraWorkdirs, pack, autoPack, permissionMode, rubric,
+} = {}) {
+  const extras = Array.isArray(extraWorkdirs)
+    ? [...new Set(extraWorkdirs.map(String).filter((p) => p && p !== workdir))]
+    : [];
+  const trimmedRubric = String(rubric ?? "").trim();
   return {
     text: String(text ?? ""),
     ...(typeof verify === "boolean" ? { verify } : {}),
@@ -2060,19 +2803,25 @@ export function buildFollowUpRequest({ text, verify, autoApprove, planMode, mult
     ...(planMode === true ? { planMode: true } : {}),
     ...(multiAgent === true ? { multiAgent: true } : {}),
     ...(effort ? { effort } : {}),
+    ...(workdir ? { workdir } : {}),
+    ...(extras.length ? { extraWorkdirs: extras } : {}),
+    ...(typeof pack === "string" ? { pack } : {}),
+    ...(autoPack === true ? { autoPack: true } : {}),
+    ...(permissionMode ? { permissionMode } : {}),
+    ...(trimmedRubric ? { rubric: trimmedRubric } : {}),
   };
 }
 
 /**
  * 提交意图。纯函数——路由决策与 DOM、网络无关，所以它可测。
- * @returns {{kind:"new"|"append", runId:string|null, text:string}|null} null = 不该提交
+ * @returns {{kind:"new"|"append"|"stop"|"steer", runId:string|null, text:string}|null} null = 不该提交
  */
 export function composerSubmitPlan(mode, rawText) {
   if (!mode || !mode.canSubmit || !mode.kind) return null;
-  // 停止不需要文本——框里那半截草稿是给下一轮准备的，不该拦着人叫停
+  // 停止不需要文本——空框点发送才是叫停
   if (mode.kind === "stop") return { kind: "stop", runId: mode.runId, text: "" };
   const text = String(rawText ?? "").trim();
-  if (!text) return null;
+  if (!text) return mode.kind === "steer" ? { kind: "stop", runId: mode.runId, text: "" } : null;
   return { kind: mode.kind, runId: mode.runId, text };
 }
 
@@ -2130,10 +2879,26 @@ export function matchPermissionMode(switches) {
 }
 
 /**
+ * 装配条 / composer 一行人话：现在在哪一档，会不会自动放行危险动作。
+ * 与 `src/permission-mode.ts` 的 describePermissionStance 同文案。
+ */
+export function describePermissionStance(mode, switches) {
+  const auto = switches?.autoYes === true;
+  const danger = auto
+    ? "ask 级会自动放行；deny / 圈禁 / 硬拒仍拦住"
+    : "危险动作会先问你，不会自动放行";
+  if (mode === "manual") return `手动 · ${danger}`;
+  if (mode === "plan") return `计划 · 先出计划再动手；${danger}`;
+  if (mode === "auto") return `自动 · ${danger}`;
+  return `自定义 · ${danger}`;
+}
+
+/**
  * 新建运行的网络载荷。保持为纯函数，避免某个 UI 开关只在特定分支里“看起来接上”。
  * `askUser` 是执行方式，不是 plan 专属能力：single 任务遇到地点、环境或交付边界
  * 不明确时同样需要先问人。
- * `permissionMode` 若给出，会覆盖 planMode/planGate/autoApprove 为该档预设值。
+ * `permissionMode` 只填没写明的旋钮；显式 planMode / planGate / autoApprove 优先。
+ * 计划编排与自动放行是正交的——选了 plan 档不得把自动放行盖掉。
  */
 export function buildNewRunRequest({
   task,
@@ -2149,13 +2914,18 @@ export function buildNewRunRequest({
   lineageBudget = false,
   dailyBudget = true,
   askUser = true,
-  autoApprove = true,
+  autoApprove,
   workdir,
   useVerifierModel = true,
   usePlannerModel = true,
   contextTokenLimit,
   autoPack = false,
   permissionMode,
+  extraWorkdirs,
+  designId,
+  designTab,
+  designTemplate,
+  designFilePack,
 } = {}) {
   const trimmedRubric = String(rubric ?? "").trim();
   // 逐 run 上下文预算：空 / 非数字不传（沿用 env > 包 > 默认）；填了就原样交给宿主校验区间——
@@ -2167,11 +2937,15 @@ export function buildNewRunRequest({
     permissionMode && PERMISSION_MODE_TABLE[permissionMode]
       ? permissionModeSwitches(permissionMode)
       : null;
-  const effectivePlanMode = preset ? preset.planMode : planMode;
-  const effectivePlanGate = preset ? preset.planGate : planGate;
-  const effectiveAutoApprove = preset
-    ? preset.autoYes || preset.approvalDefault === "auto"
-    : autoApprove;
+  const effectivePlanMode = planMode !== undefined
+    ? Boolean(planMode)
+    : (preset ? preset.planMode : planMode);
+  const effectivePlanGate = planGate !== undefined
+    ? Boolean(planGate)
+    : (preset ? preset.planGate : planGate);
+  const effectiveAutoApprove = autoApprove !== undefined
+    ? Boolean(autoApprove)
+    : (preset ? (preset.autoYes || preset.approvalDefault === "auto") : true);
   // 正交旋钮：计划模式 = 确认门；多 agent = DAG 并行。任一为真即编排。
   // 兼容旧契约：只传 mode=plan 且未显式 planGate:false → 仍开确认门。
   const wantPlanGate =
@@ -2180,6 +2954,7 @@ export function buildNewRunRequest({
     (mode === "plan" && effectivePlanGate !== false && effectivePlanMode === undefined);
   const wantMulti = multiAgent === true;
   const orchestrate = mode === "plan" || wantPlanGate || wantMulti;
+  const wantDesign = mode === "design" && !orchestrate;
   const effectiveConcurrency =
     concurrency !== undefined && concurrency !== null && concurrency !== ""
       ? concurrency
@@ -2191,8 +2966,8 @@ export function buildNewRunRequest({
   return {
     task: String(task ?? ""),
     verify: Boolean(verify),
-    ...(pack && !autoPack ? { pack } : {}),
-    ...(autoPack ? { autoPack: true } : {}),
+    ...(pack && !autoPack && !wantDesign ? { pack } : {}),
+    ...(autoPack && !wantDesign ? { autoPack: true } : {}),
     ...(effort ? { effort } : {}),
     ...(trimmedRubric ? { rubric: trimmedRubric } : {}),
     ...(budget !== undefined && Number.isFinite(budget) ? { contextTokenLimit: budget } : {}),
@@ -2204,12 +2979,23 @@ export function buildNewRunRequest({
           ...(wantPlanGate ? { planGate: true } : {}),
           ...(wantMulti ? { multiAgent: true } : {}),
         }
-      : {}),
+      : wantDesign
+        ? {
+            mode: "design",
+            ...(designId ? { designId: String(designId) } : {}),
+            ...(designTab ? { designTab: String(designTab) } : {}),
+            ...(designTemplate ? { designTemplate: String(designTemplate) } : {}),
+            ...(designFilePack ? { designFilePack: String(designFilePack) } : {}),
+          }
+        : {}),
     ...(lineageBudget === false ? { lineageBudget: false } : {}),
     ...(dailyBudget === false ? { dailyBudget: false } : {}),
     ...(askUser ? { askUser: true } : {}),
     ...(effectiveAutoApprove ? { autoApprove: true } : {}),
     ...(workdir ? { workdir } : {}),
+    ...(Array.isArray(extraWorkdirs) && extraWorkdirs.filter((p) => p && p !== workdir).length
+      ? { extraWorkdirs: [...new Set(extraWorkdirs.map(String).filter((p) => p && p !== workdir))] }
+      : {}),
     // 与宿主既有契约一致：角色模型默认启用，只有显式关闭才传 false。
     ...(!useVerifierModel ? { useVerifierModel: false } : {}),
     ...(!usePlannerModel ? { usePlannerModel: false } : {}),
@@ -2323,21 +3109,17 @@ export function patchComposer(mode, root = document) {
     const stopping = mode.mode === "running" && !mode.canSubmit;
     const icon = stopping || mode.mode === "submitting"
       ? "ph-spinner-gap"
-      : mode.mode === "running"
-        ? "ph-stop"
-        : "ph-paper-plane-right";
+      : mode.kind === "steer"
+        ? "ph-arrow-up"
+        : mode.mode === "running"
+          ? "ph-stop"
+          : "ph-arrow-up";
     btnIcon.className = `ph ${icon}${stopping || mode.mode === "submitting" ? " is-spinning" : ""}`;
     setAttr(btn, "aria-busy", stopping ? "true" : null);
   }
-  /**
-   * 信息队列（委托方："可以选择插队重新让 agent 重新思考，或者等待队列结束后再发送"）：
-   * 运行中且未在停止中（kind === "stop"）时亮出「插队重想 / 排队等待」两个按钮，
-   * 输入框保持可用（placeholder 本来就邀请"先把下一条指令打好"）。其余模式藏起来——
-   * 非运行态这两个动作没有语义（追加走主按钮），留着只会画出两个必 409 的键。
-   */
-  const queueActionsOn = mode.mode === "running" && mode.kind === "stop";
+  // 旧的「插队重想 / 排队等待」已退役：发送即插入，闪电在胶囊上方。
   for (const actionBtn of [q("#steer-btn"), q("#queue-btn")]) {
-    if (actionBtn) setAttr(actionBtn, "hidden", queueActionsOn ? null : "");
+    if (actionBtn) setAttr(actionBtn, "hidden", "");
   }
   if (modeLabel) {
     const text = {
@@ -2355,6 +3137,7 @@ export function patchComposer(mode, root = document) {
   if (label) setText(label, mode.labelText);
   if (input) {
     setAttr(input, "placeholder", mode.placeholder);
+    setAttr(input, "title", COMPOSER_SEND_HINT);
     // 说明行不是 live region，靠 aria-describedby 在聚焦输入框时被读到——
     // disabled 的按钮不可聚焦，读屏用户否则无从得知它为什么是死的
     setAttr(input, "aria-describedby", mode.note ? "composer-note" : null);
@@ -2386,18 +3169,21 @@ export function patchComposer(mode, root = document) {
    *    让后台事件（run 收尾 → loadRuns → syncComposer）去强行折叠它，会把焦点
    *    正在 `#rubric-input` 里的用户直接踢回 body。
    * ② 不改 checkbox 的 checked：避免 sync 把用户刚拨的开关拨回去。
-   * ③ 计划模式 / 多 agent / 思考强度与核查一样是**逐轮选项**——第一轮没开，后面仍可选。
-   *    运行中 / 提交中照常锁死。
+   * ③ 装配项（模型 / 领域包 / 权限 / 计划 / 多 agent / 思考强度 / 评分表）
+   *    追加与运行中都可选；工作目录除外——它跟对话绑定，见下方 workdirLocked。
+   *    提交中 / 正在停止仍锁。
+   * ④ `#auto-approve-toggle` 不进这张禁用表：放行是活开关，运行中改了要立刻 post。
    */
   const knobs = [
     ...(q("#composer-scopebar")
-      ? q("#composer-scopebar").querySelectorAll("input, select")
+      ? [...q("#composer-scopebar").querySelectorAll("input, select, #workdir-trigger, #executor-model-trigger")]
+          .filter((el) => el.id !== "workdir-trigger" && el.id !== "workdir-select")
       : []),
     ...(q("#effort-select") ? [q("#effort-select")] : []),
     ...(q("#run-knobs") ? q("#run-knobs").querySelectorAll("input, select, textarea, button") : []),
-  ].filter(Boolean);
+  ].filter((el) => el && el.id !== "auto-approve-toggle");
   const persistIds = new Set(["plan-mode-toggle", "multi-agent-toggle", "effort-select"]);
-  const persistOpen = mode.kind === "append";
+  const persistOpen = mode.kind === "append" || mode.kind === "steer" || mode.kind === "stop";
   const active = root.activeElement ?? document.activeElement;
   for (const el of knobs) {
     const fixed = el.getAttribute?.("data-fixed") === "true";
@@ -2451,18 +3237,38 @@ export function patchComposer(mode, root = document) {
   }
 
   const workdirEl = q("#workdir-select");
+  const workdirTrigger = q("#workdir-trigger");
+  const workdirField = q("#workdir-combobox");
   if (workdirEl instanceof HTMLSelectElement) {
-    if (mode.kind === "append" && mode.workdir) {
-      if (form?.dataset.workdirRun !== String(mode.runId ?? "")) {
-        if ([...workdirEl.options].some((o) => o.value === mode.workdir)) {
-          workdirEl.value = mode.workdir;
-          workdirEl.title = mode.workdir;
-        }
-        if (form) form.dataset.workdirRun = String(mode.runId ?? "");
+    const locked = mode.workdirLocked === true;
+    if (locked && mode.workdir) {
+      if (![...workdirEl.options].some((o) => o.value === mode.workdir)) {
+        const opt = workdirEl.ownerDocument.createElement("option");
+        opt.value = mode.workdir;
+        opt.textContent = mode.workdir;
+        opt.title = mode.workdir;
+        workdirEl.insertBefore(opt, workdirEl.firstChild);
       }
-    } else if (mode.kind === "new" && form?.dataset.workdirRun) {
+      workdirEl.value = mode.workdir;
+      workdirEl.title = mode.workdir;
+      workdirEl.dataset.extras = "[]";
+      if (form) form.dataset.workdirRun = String(mode.runId ?? "");
+    } else if (!locked && form?.dataset.workdirRun) {
       delete form.dataset.workdirRun;
     }
+    const triggerText = q("#workdir-trigger-text");
+    if (triggerText) {
+      const extras = locked ? [] : parseWorkdirExtrasAttr(workdirEl.dataset.extras);
+      triggerText.textContent = formatWorkdirTriggerLabel(workdirEl.value || mode.workdir, extras);
+    }
+    setAttr(workdirEl, "disabled", locked ? "" : null);
+    if (workdirTrigger) {
+      setAttr(workdirTrigger, "disabled", locked ? "" : null);
+      workdirTrigger.title = locked
+        ? `本对话的工作目录：${mode.workdir ?? workdirEl.value}（开新对话时可另选）`
+        : (workdirEl.value || "选择目录");
+    }
+    if (workdirField) setClass(workdirField, "scope-field--locked", locked);
   }
 }
 
@@ -2473,21 +3279,29 @@ export function patchComposer(mode, root = document) {
  * @param {unknown} queuedMessages
  * @returns {string} 空串 = 没有排队消息（调用方据此隐藏容器）
  */
-export function renderQueueChips(queuedMessages) {
+export function renderQueueChips(queuedMessages, opts = {}) {
   const items = Array.isArray(queuedMessages) ? queuedMessages.map(String).filter((t) => t.trim()) : [];
-  if (!items.length) return "";
-  return (
-    `<span class="queue-chips-label">排队中 · 本轮结束后自动发送</span>` +
-    items
-      .map(
-        (text, i) =>
-          `<span class="queue-chip" title="${esc(text)}">` +
-          `<span class="queue-chip-text">${esc(truncate(text, 40))}</span>` +
-          `<button type="button" class="queue-chip-cancel" data-index="${i}" aria-label="取消这条排队消息">✕</button>` +
-          `</span>`,
-      )
-      .join("")
-  );
+  const insertNow = opts.insertNow === true;
+  if (!items.length && !insertNow) return "";
+  const insertBtn = insertNow
+    ? `<button type="button" class="insert-now-btn" data-insert-now="1" title="立即插入当前输入，下一轮模型调用前生效">` +
+      `<i class="ph ph-lightning" aria-hidden="true"></i><span>立即插入</span></button>`
+    : "";
+  const chips = items.length
+    ? `<span class="queue-chips-label">排队中</span>` +
+      items
+        .map(
+          (text, i) =>
+            `<span class="queue-chip" title="${esc(text)}">` +
+            `<span class="queue-chip-text">${esc(truncate(text, 40))}</span>` +
+            `<button type="button" class="queue-chip-insert" data-steer-index="${i}" aria-label="立即插入这条">` +
+            `<i class="ph ph-lightning" aria-hidden="true"></i></button>` +
+            `<button type="button" class="queue-chip-cancel" data-index="${i}" aria-label="取消这条排队消息">✕</button>` +
+            `</span>`,
+        )
+        .join("")
+    : "";
+  return insertBtn + chips;
 }
 
 /**
@@ -2517,7 +3331,13 @@ export function shouldShowReconnecting({ info, localStatus } = {}) {
  * （V-16：此前概览的"裁决卡"与"需介入事项"把它列了两遍）。
  */
 export function deriveActionState(state) {
-  const pending = state.pendingApprovals.filter((a) => a.status === "pending");
+  const pendingAll = runHasClosed(state)
+    ? []
+    : state.pendingApprovals.filter((a) => a.status === "pending");
+  const pending = pendingAll.filter(
+    (a) => !isChildAgentSource(a.source) && !isInternallyResolvedApprovalSource(a.source),
+  );
+  const childPending = pendingAll.filter((a) => isChildAgentSource(a.source));
   const unverified = state.verdict ? state.verdict.unverified : [];
   // 计划确认门（§5.1）：签字位也是"需你决定"，而且是最靠前的那一件——
   // 它挂起时一个子任务都还没发射，此刻的决定成本最低
@@ -2528,17 +3348,26 @@ export function deriveActionState(state) {
    * 而界面上什么都没有（V-01/V-05 那一族）。
    */
   const questionPending = state.question?.status === "pending";
+  const handoffPending = state.handoff?.status === "pending";
   const blockers = Array.isArray(state.completion?.blockers) ? state.completion.blockers : [];
   return {
     pendingApprovals: pending,
+    childApprovalCount: childPending.length,
     unverifiedItems: unverified,
     planApproval: state.planApproval ?? null,
     awaitingPlan: planPending,
     question: state.question ?? null,
     awaitingQuestion: questionPending,
+    handoff: state.handoff ?? null,
+    awaitingHandoff: handoffPending,
     blockers,
     needsAttention:
-      planPending || questionPending || pending.length > 0 || blockers.length > 0,
+      planPending ||
+      questionPending ||
+      handoffPending ||
+      pending.length > 0 ||
+      childPending.length > 0 ||
+      blockers.length > 0,
   };
 }
 
@@ -2554,13 +3383,11 @@ export function deriveActionState(state) {
 export function deriveOverview(state) {
   // 结果摘要：时间线中最后一条 assistant_text
   const lastAssistant = [...state.timeline].reverse().find(
-    (e) => e.type === "assistant_text",
+    (e) => e.type === "assistant_text" && !isChildAgentSource(e.source),
   );
 
-  // 待介入事项
-  const pendingApprovals = state.pendingApprovals.filter(
-    (a) => a.status === "pending",
-  );
+  // 待介入事项：子代理的审批挂在子代理卡片上，不进主坞清单
+  const pendingApprovals = visiblePendingApprovals(state);
   // 已处理审批（allow/deny/expired）：保留为只读记录，不得静默丢失
   const resolvedApprovals = state.pendingApprovals.filter(
     (a) => a.status !== "pending",
@@ -2622,14 +3449,17 @@ function defaultCollapsed(entry) {
   if (entry.type === "approval_request") return false;
   // API 重试 → 展开
   if (entry.type === "api_retry") return false;
+  if (entry.type === "model_call_end" && entry.status === "error") return false;
   // 换端点 → 展开：这一行解释了后面所有轮次是谁应答的，折起来等于藏了变量
   if (entry.type === "model_fallback") return false;
   if (entry.type === "segment_resume") return false;
   if (entry.type === "recovery_decision") return false;
   if (entry.type === "run_forked") return false;
   if (entry.type === "run_resumed") return false;
+  if (entry.type === "plan_resume") return false;
   // 上下文压缩 → 展开
   if (entry.type === "compaction") return false;
+  if (entry.type === "hook" && (entry.outcome === "block" || entry.outcome === "error")) return false;
   // 信息队列：人发出的插队/排队指令 → 展开（这是"我做了什么"，折起来等于藏了变量）
   if (entry.type === "steering" || entry.type === "message_queued") return false;
   // 其余（turn_start、tool_call、成功 tool_result、assistant_text）→ 折叠
@@ -2719,13 +3549,62 @@ function clip(text, max) {
  * 只上传附件、没写文字时特殊处理：拿文件名当标题，
  * 因为 `附件：uploads/<32 位哈希>.jpg` 里唯一有信息量的就是那个扩展名与前几位。
  */
+export function titleSourceText(task) {
+  const lines = String(task ?? "").split(NEWLINE_RE).map((l) => l.trim()).filter(Boolean);
+  return lines.find((l) => !ATTACH_RE.test(l)) ?? "";
+}
+
+/**
+ * 存盘标题必须能对上用户原话。模型润色常把「给仓库 UI 设计标题」
+ * 收成方案名（「流光·智能仓储中枢」），侧栏就变成交付物。
+ */
+export function titleReflectsTask(title, task) {
+  const t = String(title ?? "").trim();
+  const source = titleSourceText(task);
+  if (!t || !source) return false;
+  const src = source.toLocaleLowerCase();
+  const compact = t.replace(/[\s"'「」『』“”·\-_|]/g, "").toLocaleLowerCase();
+  if (!compact) return false;
+  if (src.includes(compact) || compact.includes(src.slice(0, Math.min(8, src.length)))) return true;
+  const hay = new Set(titleContentPieces(source));
+  return titleContentPieces(t).some((p) => hay.has(p) || src.includes(p));
+}
+
+function titleContentPieces(text) {
+  const s = String(text ?? "").toLocaleLowerCase();
+  const out = [];
+  for (const w of s.match(/[a-z]{2,}/g) ?? []) out.push(w);
+  const cjk = [...s.replace(/[^\u4e00-\u9fff]/g, "")];
+  for (let i = 0; i < cjk.length - 1; i++) out.push(cjk[i] + cjk[i + 1]);
+  return out;
+}
+
+export function resolveDisplayedTitle(stored, task, max = 24) {
+  const t = String(stored ?? "").trim();
+  if (t && titleReflectsTask(t, task)) return clip(t, max);
+  return deriveRunTitle(task, max);
+}
+
+/** 页内眉标：FATHOM · RUN + runId 前 6 位大写（去连字符）。 */
+export function formatRunKicker(runId) {
+  const raw = String(runId ?? "").replace(/-/g, "");
+  const short = raw.slice(0, 6).toUpperCase() || "------";
+  return `FATHOM · RUN ${short}`;
+}
+
+const PLUMB_KICKER_SVG =
+  '<svg class="fathom-plumb" width="13" height="13" viewBox="0 0 24 24" aria-hidden="true">' +
+  '<line class="fathom-line" x1="13" y1="3" x2="13" y2="16" stroke-width="2.6"/>' +
+  '<circle class="fathom-bob" cx="13" cy="19" r="2.2"/>' +
+  "</svg>";
+
 export function deriveRunTitle(task, max = 24) {
   const raw = String(task ?? "").trim();
   if (!raw) return "未命名任务";
 
   const lines = raw.split(NEWLINE_RE).map((l) => l.trim()).filter(Boolean);
   // 优先取第一条**不是附件行**的内容——附件是补充材料，不是任务本身
-  const meaningful = lines.find((l) => !ATTACH_RE.test(l));
+  const meaningful = titleSourceText(raw);
   if (!meaningful) {
     const m = ATTACH_CAPTURE_RE.exec(lines[0] ?? "");
     const file = (m?.[1] ?? "").split(PATH_SEP_RE).pop() ?? "";
@@ -2803,9 +3682,7 @@ export function deriveThreadTitle(runs, runId, max = 24) {
   const rootId = conversationRootId(runs, runId);
   const root = (runs ?? []).find((r) => r.runId === rootId);
   const tip = (runs ?? []).find((r) => r.runId === runId);
-  const stored = String(root?.title || tip?.title || "").trim();
-  if (stored) return clip(stored, max);
-  return deriveRunTitle(root?.task ?? tip?.task, max);
+  return resolveDisplayedTitle(root?.title || tip?.title, root?.task ?? tip?.task, max);
 }
 
 function firstSentence(text) {
@@ -2949,6 +3826,17 @@ function fileBasename(path) {
   return s.split("/").pop() || s;
 }
 
+const ARTIFACT_NOISE_RE =
+  /(?:^|[\\/])(?:node_modules|\.git)(?:[\\/]|$)|(?:^|[\\/])\.polish-artifacts(?:[\\/]|$)/i;
+const ARTIFACT_HELPER_RE =
+  /(?:^|[\\/])(?:capture|jpgsize|parse-[\w-]+|run-layout-check|verify-[\w-]+)\.(?:mjs|cjs|js)$/i;
+
+/** 核查脚本、临时目录、依赖树——不是这场对话要交付的东西 */
+export function isNoiseArtifact(path) {
+  const p = String(path ?? "").replace(/\\/g, "/");
+  return ARTIFACT_NOISE_RE.test(p) || ARTIFACT_HELPER_RE.test(p);
+}
+
 /** 卡片标题：太长就留末两段，避免把整条绝对路径铺满。 */
 export function fileShortPath(path) {
   const s = String(path ?? "").replace(/\\/g, "/");
@@ -2980,8 +3868,8 @@ function artifactKindIcon(label) {
 }
 
 /**
- * 从用户消息里拆出正文与附件行。附件行仍留在正文里给模型看；
- * 渲染层另画缩略图，避免只剩一行 `附件：uploads/….jpg`。
+ * 从用户消息里拆出正文与附件行。`body` 仍含附件行（模型看到的原文）；
+ * `displayBody` 去掉附件行，给气泡右侧正文用——左侧已经有预览和「附件：」标注。
  */
 export function splitUserMessageAttachments(text) {
   const lines = String(text ?? "").split(/\r?\n/);
@@ -2989,6 +3877,8 @@ export function splitUserMessageAttachments(text) {
   const attachments = [];
   /** @type {string[]} */
   const body = [];
+  /** @type {string[]} */
+  const display = [];
   for (const line of lines) {
     const m = line.match(ATTACH_CAPTURE_RE);
     if (m) {
@@ -2996,9 +3886,14 @@ export function splitUserMessageAttachments(text) {
       body.push(line);
     } else {
       body.push(line);
+      display.push(line);
     }
   }
-  return { body: body.join("\n"), attachments };
+  return {
+    body: body.join("\n"),
+    displayBody: display.join("\n").trim(),
+    attachments,
+  };
 }
 
 /**
@@ -3116,6 +4011,26 @@ export function filterRunsByQuery(runs, query) {
   const q = String(query ?? "").trim().toLowerCase();
   if (!q) return runs;
   return runs.filter((r) => String(r.task ?? "").toLowerCase().includes(q));
+}
+
+/** 工作目录比较：正反斜杠与尾部分隔符无关。 */
+export function sameWorkdirPath(a, b) {
+  const norm = (p) => String(p ?? "").trim().replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+  const left = norm(a);
+  const right = norm(b);
+  if (!left || !right) return false;
+  return left === right;
+}
+
+/**
+ * 侧栏默认只看当前作曲栏工作目录。allProjects 才摊开全部项目。
+ * 空 workdir 不过滤（还没选目录时不要把列表藏空）。
+ */
+export function filterRunsByComposerWorkdir(runs, workdir, allProjects = false) {
+  if (allProjects) return runs;
+  const cur = String(workdir ?? "").trim();
+  if (!cur) return runs;
+  return runs.filter((r) => sameWorkdirPath(r.workdir, cur));
 }
 
 // ---------------------------------------------------------------
@@ -3342,6 +4257,7 @@ function patchRunItems(host, runs, metaMap, selectedRunId, onSelect, onDelete) {
         // 未读星：跑完了但还没看过。放在状态行最前，扫一眼列表就知道哪条有新结果
         '<span class="run-item-unread" hidden aria-label="已完成，尚未查看"><i class="ph ph-sparkle" aria-hidden="true"></i></span>' +
         '<span class="verify-badge" hidden>核查</span>' +
+        '<span class="host-badge" hidden>CLI</span>' +
         '<span class="run-item-state-label"></span>' +
         "</div>" +
         '<div class="run-item-task"></div>' +
@@ -3394,6 +4310,9 @@ function updateRunItem(el, r, metaMap, selectedRunId, onDelete) {
   const verifyBadge = el.querySelector(".verify-badge");
   setAttr(verifyBadge, "hidden", r.verify ? null : "");
 
+  const hostBadge = el.querySelector(".host-badge");
+  setAttr(hostBadge, "hidden", r.host === "cli" ? null : "");
+
   const verdictEl = el.querySelector(".run-item-verdict");
   if (verdictEl) setAttr(verdictEl, "hidden", "");
 
@@ -3403,8 +4322,9 @@ function updateRunItem(el, r, metaMap, selectedRunId, onDelete) {
   const stateLabel = el.querySelector(".run-item-state-label");
   setText(stateLabel, r.status === "running" ? "运行中" : "已完成");
   setClass(stateLabel, "thinking-shimmer", r.status === "running");
+  setClass(el, "run-item--running", r.status === "running");
   // 标题是算出来的短句；完整任务原文挂 title，鼠标停一下就能看全
-  setText(el.querySelector(".run-item-task"), String(r.title || "").trim() || deriveRunTitle(r.task));
+  setText(el.querySelector(".run-item-task"), resolveDisplayedTitle(r.title, r.task));
   setAttr(el.querySelector(".run-item-task"), "title", r.task);
   const recap = String(meta?.recap || r.recap || "").trim();
   const recapEl = el.querySelector(".run-item-recap");
@@ -3435,6 +4355,7 @@ function updateRunItem(el, r, metaMap, selectedRunId, onDelete) {
  *   onReveal?:(path:string)=>void,
  *   onOpenCanvas?:(path:string)=>void,
  *   onPreviewPath?:(path:string)=>void,
+ *   onOpenBrowser?:(url:string)=>void,
  *   inspectPaths?:(paths:string[])=>Promise<any[]>
  * }} callbacks
  */
@@ -3475,15 +4396,21 @@ export function renderRunDetail(state, callbacks) {
    */
   patchUserQuestion(parts, faces, callbacks);
   patchPlanGate(parts, state, faces, callbacks);
+  patchHandoffRail(parts, state, faces, callbacks);
   patchApprovalRail(parts, state, isRunning, callbacks);
   patchUnverifiedRail(parts, faces, callbacks);
-  patchLiveStrip(parts, state, isRunning, callbacks.liveText ?? "", callbacks.liveThinking ?? "");
+  patchLiveStrip(parts, state, isRunning, callbacks.liveText ?? "", callbacks.liveThinking ?? "", harness);
   patchConversation(
     parts,
     state,
     { text: callbacks.liveText, thinking: callbacks.liveThinking },
     callbacks,
   );
+  patchAgentOverlay(parts, state, callbacks, {
+    text: callbacks.liveText,
+    thinking: callbacks.liveThinking,
+  });
+  patchChildApprovalHint(parts, state, callbacks);
   patchDetailRail(parts, state, faces, callbacks);
   patchOutcomeCard(parts, state, overview, faces, callbacks);
   patchFactorGrid(parts, faces, activeTab, callbacks);
@@ -3518,7 +4445,7 @@ export function normalizeTab(tab) {
  */
 function ensureActionDock() {
   const dock = document.getElementById("action-dock");
-  if (!dock) return { actionRail: null, userQuestion: null, planGate: null, approvals: null, approvalsDone: null, unverified: null };
+  if (!dock) return { actionRail: null, userQuestion: null, planGate: null, handoff: null, approvals: null, approvalsDone: null, childApprovalHint: null, unverified: null };
   if (!dock.querySelector(".action-rail")) {
     dock.innerHTML =
       '<div class="action-rail" hidden>' +
@@ -3526,19 +4453,40 @@ function ensureActionDock() {
       '<div class="user-question" hidden></div>' +
       // 签字位排在审批卡之前：它挂起时一个子任务都还没发射，此刻决定成本最低
       '<div class="plan-gate" hidden></div>' +
+      // 下一步提议：不挡对话，输入框照常用
+      '<div class="handoff-rail" hidden></div>' +
       '<div class="approval-cards" hidden></div>' +
       // 已处理的折叠成一行，不与待处理的混排
       '<div class="approval-cards-done" hidden></div>' +
+      '<button type="button" class="child-approval-hint" hidden></button>' +
       '<div class="unverified-rail" hidden></div>' +
       "</div>";
+  } else if (!dock.querySelector(".child-approval-hint")) {
+    const hint = document.createElement("button");
+    hint.type = "button";
+    hint.className = "child-approval-hint";
+    hint.hidden = true;
+    const after = dock.querySelector(".approval-cards-done");
+    if (after) after.after(hint);
+    else dock.querySelector(".action-rail")?.appendChild(hint);
+  }
+  if (!dock.querySelector(".handoff-rail")) {
+    const gate = dock.querySelector(".plan-gate");
+    const el = document.createElement("div");
+    el.className = "handoff-rail";
+    el.hidden = true;
+    if (gate) gate.after(el);
+    else dock.querySelector(".action-rail")?.appendChild(el);
   }
   return {
     dock,
     actionRail: dock.querySelector(".action-rail"),
     userQuestion: dock.querySelector(".user-question"),
     planGate: dock.querySelector(".plan-gate"),
+    handoff: dock.querySelector(".handoff-rail"),
     approvals: dock.querySelector(".approval-cards"),
     approvalsDone: dock.querySelector(".approval-cards-done"),
+    childApprovalHint: dock.querySelector(".child-approval-hint"),
     unverified: dock.querySelector(".unverified-rail"),
   };
 }
@@ -3548,6 +4496,7 @@ function ensureDetailSkeleton(mainEl, state, callbacks) {
   const intact = mainEl.__parts
     && mainEl.querySelector(".detail-layout")
     && mainEl.querySelector(".chat-title")
+    && mainEl.querySelector("#agent-overlay")
     && !mainEl.querySelector(".detail-header")
     && !mainEl.querySelector(".chat-process-bar");
   if (intact && mainEl.__runId === state.runId && mainEl.__showBack === showBack) {
@@ -3559,13 +4508,20 @@ function ensureDetailSkeleton(mainEl, state, callbacks) {
     return mainEl.__parts;
   }
 
-  // 对话是主干。顶栏只留标题；返回列表藏在标题点击里（窄屏）。
+  // 对话是主干。顶栏：眉标（FATHOM · RUN）+ 标题；返回列表藏在标题点击里（窄屏）。
   // 上下文圆环钉在 #submit-form 右下角（index.html），不占对话顶栏。
+  const chatHead =
+    '<span class="chat-head">' +
+    `<span class="dh-kicker">${PLUMB_KICKER_SVG}<span class="dh-kicker-text"></span></span>` +
+    '<span class="chat-title" id="chat-title"></span>' +
+    "</span>";
   mainEl.innerHTML =
     '<div class="back-bar">' +
     (showBack
-      ? '<button type="button" class="btn back-btn" id="back-to-list-btn" aria-label="返回对话列表"><span class="back-chevron" aria-hidden="true">←</span> <span class="chat-title"></span></button>'
-      : '<div class="chat-title" id="chat-title"></div>') +
+      ? '<button type="button" class="btn back-btn" id="back-to-list-btn" aria-label="返回对话列表"><span class="back-chevron" aria-hidden="true">←</span> ' +
+        chatHead +
+        "</button>"
+      : chatHead) +
     "</div>" +
     '<h2 class="sr-only">本次对话</h2>' +
     // 兼容旧选择器：隐藏的文字水位仍挂着，归档/测试可读
@@ -3591,7 +4547,10 @@ function ensureDetailSkeleton(mainEl, state, callbacks) {
      * 产物文件也落这里。无步骤时显示「等待拆步…」而不是整栏消失。
      */
     '<div class="detail-layout">' +
+    '<div class="conversation-stack">' +
     '<div class="conversation" id="conversation"></div>' +
+    '<div class="agent-overlay" id="agent-overlay" hidden></div>' +
+    "</div>" +
     '<aside class="detail-rail" id="detail-rail" aria-label="会话侧栏">' +
     '<button type="button" class="rail-toggle" id="rail-toggle" aria-expanded="true" aria-controls="rail-body">Progress ⟩</button>' +
     '<div class="rail-body" id="rail-body">' +
@@ -3645,6 +4604,7 @@ function ensureDetailSkeleton(mainEl, state, callbacks) {
     ...ensureActionDock(),
     liveStrip: mainEl.querySelector(".live-strip"),
     conversation: mainEl.querySelector(".conversation"),
+    agentOverlay: mainEl.querySelector("#agent-overlay"),
     rail: mainEl.querySelector(".detail-rail"),
     railBoard: mainEl.querySelector(".detail-rail .plan-board"),
     progressPanel: mainEl.querySelector(".detail-rail .progress-panel"),
@@ -3666,6 +4626,8 @@ function patchDetailHeader(parts, state, isRunning, faces) {
   const title = deriveRunTitle(state.task, 40);
   const titleEl = parts.root.querySelector(".chat-title");
   if (titleEl) setText(titleEl, title);
+  const kickerEl = parts.root.querySelector(".dh-kicker-text");
+  if (kickerEl) setText(kickerEl, formatRunKicker(state.runId));
   const backBtn = parts.root.querySelector("#back-to-list-btn");
   if (backBtn) setAttr(backBtn, "aria-label", `返回列表：${title}`);
   patchContextGauge(parts, faces.context);
@@ -3898,6 +4860,26 @@ export function deriveAssemblyBar(state, harness) {
       "改成结构化拆分协议才做到 5/5 零方差）就是靠这一点做出来的。这一格是记录，不是旋钮。",
   );
 
+  // 设计模式：门面芯片必须看得见匹配结果，不能只改后端
+  const designRoute = cfg.designRoute && typeof cfg.designRoute === "object" ? cfg.designRoute : null;
+  if (cfg.mode === "design" || designRoute) {
+    const bundle = designRoute?.bundle === "spec-plus-deck";
+    const extra = Array.isArray(designRoute?.extraSeeds) ? designRoute.extraSeeds.filter(Boolean) : [];
+    const seedBits = [designRoute?.seed, ...extra].filter(Boolean);
+    const uniqueSeeds = [...new Set(seedBits)];
+    const idPart = bundle ? "规格+幻灯" : (designRoute?.id || "未指定类型");
+    const seedPart = uniqueSeeds.length ? ` · ${uniqueSeeds.join(" + ")}` : "";
+    push(
+      "design",
+      `设计模式 · ${idPart}${seedPart}`,
+      (designRoute?.reason ? `${designRoute.reason}。` : "") +
+        (bundle
+          ? "这是命名路径「规格 + 幻灯」，不是通用多命中拆分。"
+          : "设计模式是门面：后端包仍是 design（除非点了已安装文件包），制品类型来自注册表。" +
+            "自动路由给不出唯一类型时不猜测，回到页签 chip。"),
+    );
+  }
+
   // 领域包：本项目最独特的装配单位
   const routed = cfg.packRoute && typeof cfg.packRoute === "object" ? cfg.packRoute : null;
   const packName = pack?.name ?? null;
@@ -3917,7 +4899,7 @@ export function deriveAssemblyBar(state, harness) {
   // D3：装配条展开真实开关——模式名不得替代它们
   const perm = cfg.permission && typeof cfg.permission === "object" ? cfg.permission : null;
   if (perm) {
-    const modeLabel = perm.mode ? `档 ${perm.mode}` : "档 自定义";
+    const stance = describePermissionStance(perm.mode ?? null, perm);
     const bits = [
       `审批缺省 ${perm.approvalDefault === "auto" ? "auto" : "ask"}`,
       perm.planMode ? "计划编排开" : "计划编排关",
@@ -3926,9 +4908,18 @@ export function deriveAssemblyBar(state, harness) {
     ];
     push(
       "permission",
-      `${modeLabel} · ${bits.join(" · ")}`,
-      "D3 三档只是既有开关的预设（manual/plan/auto）。条上展开的才是本 run 真实装配；" +
+      stance,
+      `本 run 真实开关：${bits.join(" · ")}。D3 三档只是预设（manual/plan/auto）；` +
         "`permission: deny`、圈禁与 SSRF 硬拒不受三档与 --yes 影响——见 docs/permission-modes.md。",
+    );
+  }
+
+  const costWarn = deriveCostWarning(state, harness);
+  if (costWarn) {
+    push(
+      "costWarn",
+      costWarn.label,
+      `${costWarn.detail} 撞上限核查也救不了。`,
     );
   }
 
@@ -3954,11 +4945,11 @@ export function deriveAssemblyBar(state, harness) {
     ctxCfg
       ? `上下文 ${Math.round(ctxCfg.budget / 1000)}k${ctxCfg.clamped ? "↓" : ""} / ${ctxCfg.window ? `窗口 ${Math.round(ctxCfg.window / 1000)}k` : "窗口未知"}`
       : null,
-    "预算是**策略**（最近一轮输入超过它的 80% 就压缩，默认 150k），窗口是**事实**（端点在多大处拒收；来源 " +
-      `${ctxCfg ? contextSourceLabel(ctxCfg.windowSource) : "未知"}）。预算会被夹在 窗口 − maxTokens − 边际 之内` +
-      `${ctxCfg?.clamped ? `（本次由 ${Math.round(ctxCfg.requestedBudget / 1000)}k 夹到 ${Math.round(ctxCfg.budget / 1000)}k）` : ""}，` +
-      "但**默认不随窗口抬高**：每轮成本与时延随上下文线性增长，压缩的质量损失有账本与摘录兜着，抬预算是委托方按任务权衡的决定。" +
-      "窗口未知的模型撞一次 400 之后端点会说出窗口，下一次运行就按它算。",
+    "压缩水位是**策略**（最近一轮输入超过它的 80% 就压缩），窗口是**事实**（端点在多大处拒收；来源 " +
+      `${ctxCfg ? contextSourceLabel(ctxCfg.windowSource) : "未知"}）。水位默认跟可用窗口走（窗口 − maxTokens − 边际）` +
+      `${ctxCfg?.clamped ? `（本次由 ${Math.round(ctxCfg.requestedBudget / 1000)}k 夹到 ${Math.round(ctxCfg.budget / 1000)}k）` : ""}。` +
+      "想提前压缩再填 AGENT_CONTEXT_LIMIT 或本次覆盖。日消耗封顶是另一道闸，跟这里无关。" +
+      "窗口未知才回落 150k；撞一次 400 之后端点会说出窗口，下一次运行就按它算。",
   );
 
   // 核查：三值裁决 + 独立上下文，这是与别家最明显的分野
@@ -3990,6 +4981,14 @@ export function deriveAssemblyBar(state, harness) {
     cfg.workdir ? shortPath(cfg.workdir) : null,
     "工具的写入圈禁根。路径校验在**宿主**这一侧做，不靠提示词让模型自觉——" +
       "模型给出的路径是不可信输入，`..` 逃逸与工作区外的绝对路径一律在执行前被拒。",
+  );
+
+  // 仓库/分支是工作区事实，换包不消失。没检出就不占格子。
+  push(
+    "git",
+    formatWorkspaceGitChip(cfg.workspaceGit, { withRepo: true }),
+    "当前工作目录的 git 身份（分支与 GitHub owner/repo）。它跟目录走，不是领域包能力——" +
+      "换 ts-coding / design / 无包都还在；stm32-debug 不叠远端 GitHub 工具，但本地分支照样看得见。",
   );
 
   // RUN-01 Phase 2：同 run 恢复痕迹（来自 run_resumed 事件，重放可复原）
@@ -4025,10 +5024,24 @@ export function deriveAssemblyBar(state, harness) {
   const visionName =
     (typeof visionRun === "string" && visionRun) ||
     (visionCfg && visionCfg.configured ? visionCfg.model ?? "已配" : null);
+  // supportsVision=false：端点配了但探针拒图 → 工具已卸，条上不能再说"识图 xxx"
+  const supportsVision =
+    cfg.supportsVision !== undefined && cfg.supportsVision !== null
+      ? cfg.supportsVision
+      : harness?.supportsVision;
+  const visionChip =
+    visionName && supportsVision === false
+      ? "识图 不可用"
+      : visionName
+        ? `识图 ${visionName}`
+        : "识图 未配";
   push(
     "vision",
-    visionName ? `识图 ${visionName}` : "识图 未配",
-    visionName
+    visionChip,
+    visionName && supportsVision === false
+      ? "配了视觉模型，但能力探针（AGENT_MODEL_PROBE=1）判定端点不接受图像——" +
+        "`describe_image` 已不进工具面（与没配同纪律）。"
+      : visionName
       ? "配了视觉模型，`describe_image` 才在工具面上。图片走独立角色模型，与执行者解耦——" +
         "执行模型不必自己支持视觉。"
       : "没配视觉模型（`AGENT_VISION_MODEL`），所以 `describe_image` **根本不进工具面**——" +
@@ -4071,15 +5084,47 @@ export function deriveAssemblyBar(state, harness) {
     if (chainsCfg?.vision?.length > 1) roleBits.push(`视觉 ${chainsCfg.vision.join("→")}`);
     const scopeLabel =
       scopeCfg === "roles" ? "多角色" : "主执行者";
+    const routingLabel =
+      routingCfg === "prefer_healthy"
+        ? "·偏好健康"
+        : routingCfg === "prefer_cheap"
+          ? "·偏好廉价"
+          : "";
     push(
       "fallback",
-      `降级链 ${chainCfg.join(" → ")}${fellBack ? "·已降级" : ""}${routingCfg === "prefer_healthy" ? "·偏好健康" : ""}`,
+      `降级链 ${chainCfg.join(" → ")}${fellBack ? "·已降级" : ""}${routingLabel}`,
       `${scopeLabel}端点降级：瞬时错误（网络/超时/429/5xx）耗尽后换下一家再试，各端点按身份共享熔断器。` +
         (scopeCfg === "roles"
           ? `角色可自配 AGENT_<ROLE>_FALLBACK_* 或 inherit。${roleBits.length ? ` 已装配：${roleBits.join("；")}。` : ""}`
           : "角色默认不进执行者链——要保底须显式配置或 inherit。") +
-        " 认证失败、400 一律原样上抛。prefer_healthy 只是粘性探针证据上的排序 stub，不是成本路由。",
+        " 认证失败、400 一律原样上抛。prefer_healthy 只是粘性探针证据上的排序 stub；" +
+        "prefer_cheap 只按定价表单价排备用端点——都不是延迟+成本多目标路由。",
     );
+  }
+
+  /**
+   * 链健康只读面（MODEL-01）。有探针/熔断证据才上条——全是 unprobed+closed
+   * 时摆一格只是噪声。不改路由，只让委托方看见粘性健康位与熔断态。
+   */
+  const healthRows = cfg.endpointHealth ?? harness?.endpointHealth ?? null;
+  if (Array.isArray(healthRows) && healthRows.length > 0) {
+    const interesting = healthRows.filter(
+      (row) => row.healthy === false || row.circuit !== "closed" || row.reason && row.reason !== "unprobed",
+    );
+    if (interesting.length > 0 || healthRows.some((row) => row.reason && row.reason !== "unprobed")) {
+      const bits = healthRows.map((row) => {
+        const tags = [];
+        if (row.healthy === false) tags.push("不健康");
+        if (row.circuit && row.circuit !== "closed") tags.push(`熔断:${row.circuit}`);
+        if (row.latencyMs != null) tags.push(`${row.latencyMs}ms`);
+        return tags.length ? `${row.model}(${tags.join(",")})` : row.model;
+      });
+      push(
+        "endpointHealth",
+        `端点健康 ${bits.join(" · ")}`,
+        "粘性探针与熔断器的只读快照。prefer_healthy 会读健康位；本条本身不改路由顺序。",
+      );
+    }
   }
 
   /** 精确输入 grant 必须可见：active 与历史审计不能混成一个状态。 */
@@ -4455,11 +5500,55 @@ function patchPlanGate(parts, state, faces, callbacks) {
     .addEventListener("click", () => callbacks.onPlanDecision?.("reject"));
 }
 
+function patchHandoffRail(parts, state, faces, callbacks) {
+  if (!parts.handoff) return;
+  const offer = faces.action.handoff;
+  if (!offer || offer.status !== "pending") {
+    setAttr(parts.handoff, "hidden", "");
+    parts.sig.handoff = null;
+    parts.handoff.innerHTML = "";
+    return;
+  }
+  const running = state.status === "running";
+  const sig = signature(["pending", offer.id, offer.summary, offer.label, running]);
+  if (parts.sig.handoff === sig) return;
+  parts.sig.handoff = sig;
+  setAttr(parts.handoff, "hidden", null);
+
+  const acceptDisabled = running
+    ? " disabled aria-disabled=\"true\""
+    : "";
+  const hint = running
+    ? '<p class="rail-note">对话继续。等这次调试结束再换段。</p>'
+    : '<p class="rail-note">对话不暂停。点了才开下一场；先不用就收起这张卡。</p>';
+
+  parts.handoff.innerHTML =
+    '<div class="handoff-card">' +
+    '<h3 class="rail-title">要不要接着做？</h3>' +
+    `<p class="handoff-summary">${esc(offer.summary)}</p>` +
+    hint +
+    '<div class="handoff-actions">' +
+    `<button class="btn btn--allow" data-action="accept"${acceptDisabled}>${esc(offer.label)}</button>` +
+    `<button class="btn" data-action="decline">${esc(offer.declineLabel)}</button>` +
+    "</div></div>";
+  parts.handoff
+    .querySelector("[data-action='accept']")
+    ?.addEventListener("click", () => {
+      if (state.status === "running") return;
+      callbacks.onHandoffDecision?.("accept");
+    });
+  parts.handoff
+    .querySelector("[data-action='decline']")
+    ?.addEventListener("click", () => callbacks.onHandoffDecision?.("decline"));
+}
+
 function patchUnverifiedRail(parts, faces, callbacks = {}) {
   const leftover =
     faces.action.awaitingPlan ||
     faces.action.awaitingQuestion ||
+    faces.action.awaitingHandoff ||
     (faces.action.pendingApprovals?.length ?? 0) > 0 ||
+    (faces.action.childApprovalCount ?? 0) > 0 ||
     (faces.action.blockers?.length ?? 0) > 0;
   setAttr(parts.actionRail, "hidden", leftover ? null : "");
   if (parts.dock) setAttr(parts.dock, "hidden", leftover ? null : "");
@@ -4481,7 +5570,7 @@ function patchUnverifiedRail(parts, faces, callbacks = {}) {
  * assistant_text 都是已经发生完的。控制器在 turn_start / tool_call / done
  * 时清空缓冲，所以文本阶段一结束就自动让位给工具标签。
  */
-function patchLiveStrip(parts, state, isRunning, liveText = "", liveThinking = "") {
+function patchLiveStrip(parts, state, isRunning, liveText = "", liveThinking = "", harness = null) {
   if (!isRunning) {
     setAttr(parts.liveStrip, "hidden", "");
     parts.sig.live = null;
@@ -4514,16 +5603,27 @@ function patchLiveStrip(parts, state, isRunning, liveText = "", liveThinking = "
     parts.sig.live = null;
     return;
   }
-  const label = text
-    ? String(text.text ?? "").slice(0, 80)
-    : "等待模型响应…";
+  const spin = deriveSpinState(state);
+  const costWarn = deriveCostWarning(state, harness);
+  const label = spin
+    ? spin.label
+    : costWarn
+      ? costWarn.label
+      : text
+        ? String(text.text ?? "").slice(0, 80)
+        : "等待模型响应…";
 
-  const sig = signature([label]);
+  const sig = signature([label, spin ? "stall" : "", costWarn ? "cost" : ""]);
   if (parts.sig.live === sig) return;
   parts.sig.live = sig;
   setAttr(parts.liveStrip, "hidden", null);
+  setClass(parts.liveStrip, "live-strip--stall", Boolean(spin));
+  setClass(parts.liveStrip, "live-strip--cost", Boolean(!spin && costWarn));
   parts.liveStrip.innerHTML = '<span class="live-text thinking-shimmer"></span>';
   setText(parts.liveStrip.querySelector(".live-text"), label);
+  if (spin?.detail || costWarn?.detail) {
+    setAttr(parts.liveStrip, "title", spin?.detail || costWarn?.detail || "");
+  }
 }
 
 /**
@@ -4582,7 +5682,7 @@ function patchApprovalRail(parts, state, isRunning, callbacks) {
    * 折中：已决的折叠成一行摘要留在 rail 底部，展开是紧凑列表而不是完整卡片。
    */
   bindApprovalActions(parts.approvals ?? parts.actionRail, callbacks);
-  const list = state.pendingApprovals.filter((a) => a.status === "pending");
+  const list = visiblePendingApprovals(state);
   patchResolvedSummary(parts);
 
   setAttr(parts.approvals, "hidden", list.length > 0 ? null : "");
@@ -4668,23 +5768,26 @@ function updateApprovalCard(card, a, isRunning) {
   setText(card.querySelector(".approval-input"), formatInput(a.input));
   const resolvedEl = card.querySelector(".approval-resolved");
   const targets = Array.isArray(a.resolvedTargets) ? a.resolvedTargets : [];
-  const attention = targets.filter((t) => t && (t.diverges || t.error));
-  if (attention.length > 0) {
+  if (targets.length > 0) {
+    const warn = targets.some((t) => t && (t.diverges || t.error));
     setAttr(resolvedEl, "hidden", null);
-    setClass(resolvedEl, "approval-resolved--warn", true);
-    resolvedEl.innerHTML = attention
+    setClass(resolvedEl, "approval-resolved--warn", warn);
+    resolvedEl.innerHTML = targets
       .map((t) => {
+        if (!t) return "";
         if (t.error) {
           return `<strong>真实目标不可用</strong>（${esc(t.field)}=${esc(t.requested)}）：${esc(t.error)}`;
         }
+        const real = t.real ?? t.lexical ?? t.requested;
         return (
-          `<strong>真实写入目标</strong>（${esc(t.field)}）：` +
-          `<code>${esc(t.requested)}</code> → <code>${esc(t.real)}</code>`
+          `<strong>请求 → 真实</strong>（${esc(t.field)}）：` +
+          `<code>${esc(t.requested)}</code> → <code>${esc(real)}</code>`
         );
       })
       .join("<br>");
   } else {
     setAttr(resolvedEl, "hidden", "");
+    setClass(resolvedEl, "approval-resolved--warn", false);
     resolvedEl.innerHTML = "";
   }
   card.querySelector(".deny-reason").setAttribute(
@@ -4794,22 +5897,21 @@ function decorateLocalPathCode(code, hit, runId, callbacks) {
     const link = document.createElement("a");
     link.className = "local-path-link";
     link.href = href;
-    link.target = "_blank";
     link.rel = "noopener noreferrer";
-    link.title = `打开文件：${hit.path}`;
+    link.dataset.previewPath = hit.path;
+    link.title = `在右侧预览：${hit.path}`;
     code.parentNode.insertBefore(shell, code);
     link.append(code, makePathIcon("arrow-square-out"));
     shell.append(link);
 
-    // V-35：可预览类型（md/html/图片/csv/代码/文本）在链接旁给一个小预览钮，
-    // 点开应用内覆盖层；二进制不给（预览层也只能画降级信息卡，没意义）。
-    // 原「在文件夹中显示」保留为旁边的次级操作，两处互不抢。
-    if (typeof callbacks?.onPreviewPath === "function" && artifactRendererKind(hit.path) !== "binary") {
+    // 眼睛与文件名同一条路：都进右侧画布。二进制不给钮（画布也只能画降级卡）。
+    if ((typeof callbacks?.onOpenCanvas === "function" || typeof callbacks?.onPreviewPath === "function")
+      && artifactRendererKind(hit.path) !== "binary") {
       const preview = document.createElement("button");
       preview.type = "button";
       preview.className = "local-path-preview";
       preview.dataset.pathPreview = hit.path;
-      preview.title = "预览文件";
+      preview.title = "在右侧预览";
       preview.setAttribute("aria-label", `预览 ${hit.path}`);
       preview.append(makePathIcon("eye"));
       shell.append(preview);
@@ -4841,16 +5943,26 @@ function bindLocalPathActions(host, callbacks) {
   if (!host) return;
   host.__pathReveal = callbacks?.onReveal;
   host.__pathPreview = callbacks?.onPreviewPath;
+  host.__pathCanvas = callbacks?.onOpenCanvas;
   if (host.__pathActionBound) return;
   host.__pathActionBound = true;
   host.addEventListener("click", (event) => {
+    const fileLink = event.target instanceof Element
+      ? event.target.closest("a.local-path-link[data-preview-path]")
+      : null;
+    if (fileLink && isPlainLeftClick(event)) {
+      event.preventDefault();
+      const path = fileLink.getAttribute("data-preview-path");
+      (host.__pathCanvas ?? host.__pathPreview)?.(path);
+      return;
+    }
     const target = event.target instanceof Element
       ? event.target.closest("[data-path-preview], [data-path-reveal]")
       : null;
     if (!target) return;
     event.preventDefault();
     const previewPath = target.getAttribute("data-path-preview");
-    if (previewPath) host.__pathPreview?.(previewPath);
+    if (previewPath) (host.__pathCanvas ?? host.__pathPreview)?.(previewPath);
     else host.__pathReveal?.(target.getAttribute("data-path-reveal"));
   });
 }
@@ -4895,20 +6007,43 @@ async function hydrateLocalPathLinks(host, state, callbacks) {
 /**
  * 产物卡的 stat 验证：卡片按声明/工具记录先画出来，再异步确认文件还在不在。
  *
- * 模型声明的产物可能从未落盘（或被后来的步骤删掉）。验证不过的卡**降级显示**：
- * 标注「未找到」、摘掉一切可点操作——不是点了才弹 Artifact not found。
+ * 模型声明的产物可能从未落盘（或被后来的步骤删掉）。验证不过的卡**直接拿掉**——
+ * 虚线「未找到」卡夹在真文件中间比没有更突兀，点了也只会再弹一次 404。
  * 与 hydrateLocalPathLinks 同一份 inspectPaths 渐进增强：宿主不可达时卡片
- * 维持原样可点，不会因为一次网络抖动把真文件标成未找到。
+ * 维持原样可点，不会因为一次网络抖动把真文件藏掉。
  */
+function bindArtifactCardPath(node, resolved, runId) {
+  if (!node || !resolved) return;
+  node.setAttribute("data-artifact-path", resolved);
+  const href = `/api/runs/${encodeURIComponent(runId)}/artifact?path=${encodeURIComponent(resolved)}`;
+  for (const a of node.querySelectorAll("a")) {
+    const old = a.getAttribute("href") ?? "";
+    if (!old.includes("/artifact")) continue;
+    a.setAttribute("href", old.includes("download=1") ? `${href}&download=1` : href);
+    if (a.classList.contains("artifact-name") || a.classList.contains("chat-artifact-name")) {
+      a.title = resolved;
+      a.textContent = fileShortPath(resolved);
+    }
+  }
+  for (const el of node.querySelectorAll("[data-canvas-open]")) el.setAttribute("data-canvas-open", resolved);
+  for (const el of node.querySelectorAll("[data-reveal]")) el.setAttribute("data-reveal", resolved);
+}
+
 async function hydrateArtifactCards(host, state, callbacks) {
   if (!host || typeof callbacks?.inspectPaths !== "function") return;
   const nodes = [...host.querySelectorAll("[data-artifact-path]:not([data-artifact-state])")];
   if (nodes.length === 0) return;
   for (const node of nodes) node.setAttribute("data-artifact-state", "checking");
-  const paths = [...new Set(nodes.map((n) => n.getAttribute("data-artifact-path") ?? "").filter(Boolean))];
+  const labels = [...new Set(nodes.map((n) => n.getAttribute("data-artifact-path") ?? "").filter(Boolean))];
+  const known = [];
+  if (state?.timeline) known.push(...deriveArtifacts(state).map((a) => a.path));
+  for (const f of state?.files ?? []) if (f?.path) known.push(f.path);
+  for (const f of callbacks?.previewFiles ?? []) if (f?.path) known.push(f.path);
+  for (const f of callbacks?.threadFiles ?? []) if (f?.path) known.push(f.path);
+  const plan = buildLocalPathProbePlan(labels, known);
   let inspected = [];
   try {
-    inspected = await callbacks.inspectPaths(paths.slice(0, 64));
+    inspected = await callbacks.inspectPaths(plan.probes.slice(0, 64));
   } catch {
     for (const node of nodes) node.removeAttribute("data-artifact-state");
     return;
@@ -4916,26 +6051,46 @@ async function hydrateArtifactCards(host, state, callbacks) {
   const byInput = new Map(
     (Array.isArray(inspected) ? inspected : [])
       .filter((item) => item && item.input)
-      .map((item) => [String(item.input), item]),
+      .map((item) => [String(item.input).toLocaleLowerCase(), item]),
+  );
+  const choiceByLabel = new Map(
+    plan.entries.map((entry) => [
+      entry.label,
+      entry.choices.map((choice) => byInput.get(choice.toLocaleLowerCase())).find((item) => item?.exists) ?? null,
+    ]),
   );
   for (const node of nodes) {
     if (!host.contains(node) || node.getAttribute("data-artifact-state") !== "checking") continue;
     const path = node.getAttribute("data-artifact-path") ?? "";
-    const hit = byInput.get(path);
+    const hit = choiceByLabel.get(path) ?? byInput.get(path.toLocaleLowerCase());
     if (hit && hit.exists) {
+      bindArtifactCardPath(node, hit.path || path, state?.runId ?? "");
       node.setAttribute("data-artifact-state", "ok");
       continue;
     }
-    node.setAttribute("data-artifact-state", "missing");
-    node.classList.add("chat-artifact--missing", "artifact--missing");
-    // 摘掉可点操作：链接去 href、按钮禁用，统一换成「未找到」标注
-    for (const a of node.querySelectorAll("a")) a.removeAttribute("href");
-    for (const b of node.querySelectorAll("button")) b.disabled = true;
-    const cta = node.querySelector(".chat-artifact-cta, .artifact-actions");
-    if (cta) {
-      cta.innerHTML = `<span class="artifact-missing-note"><i class="ph ph-warning" aria-hidden="true"></i> 未找到</span>`;
-    }
+    dismissMissingArtifactCard(node);
   }
+  if (host && !host.querySelector("[data-artifact-path]")) {
+    const rail = host.closest(".artifacts") ?? (host.classList.contains("artifacts") ? host : null);
+    if (rail) rail.setAttribute("hidden", "");
+  }
+}
+
+/** 没落盘的声明从清单里摘掉，并改分组计数；整组空了就一并拿掉。 */
+function dismissMissingArtifactCard(node) {
+  if (!node) return;
+  const section = node.closest(".rail-section");
+  const chatGroup = node.closest(".chat-artifacts");
+  const rest = node.closest(".chat-artifacts-rest");
+  node.remove();
+  if (section) {
+    const remaining = section.querySelectorAll("[data-artifact-path]").length;
+    const peek = section.querySelector(".rail-section-title .aside-peek");
+    if (peek) peek.textContent = String(remaining);
+    if (remaining === 0) section.remove();
+  }
+  if (rest && !rest.querySelector("[data-artifact-path]")) rest.remove();
+  if (chatGroup && !chatGroup.querySelector("[data-artifact-path]")) chatGroup.remove();
 }
 
 /**
@@ -5016,20 +6171,170 @@ function patchConversation(parts, state, live, callbacks) {
   });
   });
   // 对话内产物卡的「在文件夹中显示」与「打开」（T10 画布）——与右栏同一委托
+  host.__chatCallbacks = callbacks;
   if (!host.__revealBound) {
     host.__revealBound = true;
     host.addEventListener("click", (e) => {
+      const cb = host.__chatCallbacks ?? {};
       const canvasBtn = e.target instanceof Element ? e.target.closest("[data-canvas-open]") : null;
       if (canvasBtn) {
-        callbacks?.onOpenCanvas?.(canvasBtn.getAttribute("data-canvas-open"));
+        if (!isPlainLeftClick(e)) return;
+        e.preventDefault();
+        cb.onOpenCanvas?.(canvasBtn.getAttribute("data-canvas-open"));
         return;
       }
+      const ext = e.target instanceof Element ? e.target.closest("a[href]") : null;
+      if (ext && isPlainLeftClick(e) && typeof cb.onOpenBrowser === "function") {
+        const href = parseBrowserUrl(ext.getAttribute("href") || ext.href);
+        if (href) {
+          try {
+            if (new URL(href).origin !== location.origin) {
+              e.preventDefault();
+              cb.onOpenBrowser(href);
+              return;
+            }
+          } catch { /* 非法网址按普通链接 */ }
+        }
+      }
+      const agentBtn = e.target instanceof Element ? e.target.closest("[data-agent-id]") : null;
+      if (agentBtn) {
+        const id = agentBtn.getAttribute("data-agent-id");
+        if (id) cb.onOpenAgent?.(id);
+        return;
+      }
+      const actionBtn = e.target instanceof Element ? e.target.closest("[data-chat-action]") : null;
+      if (actionBtn) {
+        const action = actionBtn.getAttribute("data-chat-action");
+        const runId = actionBtn.getAttribute("data-run-id") || state.runId;
+        const seqRaw = actionBtn.getAttribute("data-seq");
+        const seq = seqRaw === "" || seqRaw == null ? null : Number(seqRaw);
+        const itemNode = actionBtn.closest(".chat-item");
+        if (action === "copy") {
+          cb.onCopyChat?.(chatTextFromNode(itemNode));
+          return;
+        }
+        if (action === "fork") {
+          cb.onForkChat?.(runId);
+          return;
+        }
+        if (action === "rewind") {
+          cb.onRewindChat?.(runId, Number.isFinite(seq) ? seq : -1);
+          return;
+        }
+        if ((action === "up" || action === "down") && runId != null && Number.isFinite(seq)) {
+          const prev = readChatRating(runId, seq);
+          if (prev === action) return;
+          const next = writeChatRating(runId, seq, action);
+          if (next !== action) return;
+          const bar = actionBtn.closest(".chat-msg-actions");
+          if (bar) {
+            for (const btn of bar.querySelectorAll("[data-chat-action=up], [data-chat-action=down]")) {
+              const on = btn.getAttribute("data-chat-action") === next;
+              btn.classList.toggle("is-on", on);
+              btn.setAttribute("aria-pressed", on ? "true" : "false");
+            }
+          }
+          cb.onRateChat?.(runId, seq, next, chatTextFromNode(itemNode));
+          return;
+        }
+      }
       const btn = e.target instanceof Element ? e.target.closest("[data-reveal]") : null;
-      if (btn) callbacks?.onReveal?.(btn.getAttribute("data-reveal"));
+      if (btn) cb.onReveal?.(btn.getAttribute("data-reveal"));
     });
   }
   void hydrateLocalPathLinks(host, state, callbacks);
   void hydrateArtifactCards(host, state, callbacks);
+}
+
+function patchChildApprovalHint(parts, state, callbacks) {
+  const hint = parts.childApprovalHint;
+  if (!hint) return;
+  const agents = deriveChildAgents(state).filter((a) => a.pendingApprovals > 0);
+  if (agents.length === 0) {
+    hint.hidden = true;
+    hint.textContent = "";
+    return;
+  }
+  const n = agents.reduce((sum, a) => sum + a.pendingApprovals, 0);
+  hint.hidden = false;
+  hint.setAttribute("data-agent-id", agents[0].id);
+  hint.textContent = agents.length === 1
+    ? `子代理待批准：${agents[0].title}`
+    : `${agents.length} 个子代理共 ${n} 项待批准`;
+  if (!hint.__bound) {
+    hint.__bound = true;
+    hint.addEventListener("click", () => {
+      const id = hint.getAttribute("data-agent-id");
+      if (id) callbacks?.onOpenAgent?.(id);
+    });
+  }
+}
+
+function patchAgentOverlay(parts, state, callbacks, live = null) {
+  const host = parts.agentOverlay;
+  if (!host) return;
+  const agentId = typeof callbacks.selectedAgentId === "string" ? callbacks.selectedAgentId : "";
+  if (!agentId) {
+    host.hidden = true;
+    host.innerHTML = "";
+    host.__agentId = "";
+    return;
+  }
+  const agents = deriveChildAgents(state);
+  const agent = agents.find((a) => a.id === agentId);
+  const title = agent?.title || agentId.replace(/^spawn\//, "");
+  const running = agent?.status === "running";
+  const items = deriveChatItems(state, running ? live : null, { agentId });
+  const pending = (state.pendingApprovals ?? []).filter(
+    (a) => a.status === "pending" && childAgentKey(a.source) === agentId,
+  );
+  host.hidden = false;
+  host.setAttribute("role", "dialog");
+  host.setAttribute("aria-label", `子代理 ${title}`);
+  const liveSig = running
+    ? `${String(live?.text ?? "").length}:${String(live?.thinking ?? "").length}`
+    : "0";
+  const sig = `${items.length}:${pending.length}:${items.at(-1)?.key ?? ""}:${liveSig}`;
+  if (host.__agentId !== agentId || host.__sig !== sig) {
+    host.__agentId = agentId;
+    host.__sig = sig;
+    let html =
+      `<div class="agent-overlay-head">` +
+      `<button type="button" class="agent-overlay-back" data-agent-back>返回主对话</button>` +
+      `<strong class="agent-overlay-title">${esc(title)}</strong>` +
+      `<span class="agent-overlay-meta${running ? " thinking-shimmer" : ""}">${esc(running ? "工作中" : agent?.status === "error" ? "未完成" : "已完成")}</span>` +
+      `</div><div class="agent-overlay-chat">`;
+    html += items.map((it) => `<div class="chat-item">${renderChatItem(it, thinkingPrefOpen())}</div>`).join("");
+    html += "</div>";
+    if (pending.length > 0) {
+      html += `<div class="agent-overlay-approvals" role="region" aria-label="子代理审批">`;
+      for (const a of pending) {
+        html +=
+          `<div class="approval-card" data-approval-id="${esc(a.approvalId || a.toolUseId)}" data-tool-name="${esc(a.name ?? "")}">` +
+          `<div class="approval-card-header"><span class="approval-tool-name">${esc(a.name ?? "工具")}</span></div>` +
+          `<pre class="approval-input">${esc(typeof a.input === "string" ? a.input : JSON.stringify(a.input ?? {}, null, 2))}</pre>` +
+          `<div class="approval-actions">` +
+          `<button type="button" class="btn btn--allow" data-action="allow">允许本次</button>` +
+          `<button type="button" class="btn btn--allow-always" data-action="allow-always">短期允许相同参数</button>` +
+          `<button type="button" class="btn btn--deny" data-action="deny">拒绝并说明</button>` +
+          `<input class="deny-reason" placeholder="拒绝理由（可选）" />` +
+          `</div></div>`;
+      }
+      html += "</div>";
+    }
+    host.innerHTML = html;
+  }
+  if (!host.__bound) {
+    host.__bound = true;
+    host.addEventListener("click", (e) => {
+      if (!(e.target instanceof Element)) return;
+      if (e.target.closest("[data-agent-back]")) {
+        callbacks?.onCloseAgent?.();
+      }
+    });
+    bindApprovalActions(host, callbacks);
+  }
+  host.__approvalCallbacks = callbacks;
 }
 
 /**
@@ -5042,8 +6347,8 @@ function patchConversation(parts, state, live, callbacks) {
  * @returns {boolean} 是否已就地更新完毕
  */
 export function updateLiveNode(node, it) {
-  const wantThinking = Boolean(it.thinking.trim());
-  const wantText = Boolean(it.text.trim());
+  const wantThinking = Boolean(String(it.thinking ?? "").trim()) || Boolean(it.waiting);
+  const wantText = Boolean(String(it.text ?? "").trim());
   const thinkEl = node.querySelector("details.chat-thinking--live");
   const textEl = node.querySelector(".chat-msg--live");
   // 结构与需求不一致 = 有新块要出现，只能重建一次
@@ -5077,8 +6382,14 @@ function chatItemSig(it) {
       return `verdict:${JSON.stringify(it.verdict)}`;
     case "artifacts":
       return `artifacts:${(it.files ?? []).map((f) => f.path).join("|")}`;
+    case "plan":
+      return `plan:${it.folded ? 1 : 0}:${(it.plan?.nodes ?? []).map((n) => `${n.id}:${n.status}`).join("|")}`;
+    case "agents":
+      return `agents:${it.folded ? 1 : 0}:${(it.agents ?? []).map((a) => `${a.id}:${a.status}:${a.pendingApprovals}:${(a.lastText ?? "").length}:${a.peek ?? ""}`).join("|")}`;
+    case "text":
+      return `text:${(it.text ?? "").length}:${it.at ?? ""}:${it.showActions ? 1 : 0}:${readChatRating(it.runId, it.seq)}:${(it.verification ?? []).length}:${(it.assumptions ?? []).length}`;
     default:
-      return `${it.kind}:${(it.text ?? "").length}`;
+      return `${it.kind}:${(it.text ?? "").length}:${it.at ?? ""}:${it.showActions ? 1 : 0}:${it.kind === "text" ? readChatRating(it.runId, it.seq) : ""}`;
   }
 }
 
@@ -5218,9 +6529,11 @@ function patchDetailRail(parts, state, faces, callbacks) {
   if (!parts.rail) return;
   const plan = faces.plan;
   const progress = faces.progress;
-  const files = Array.isArray(callbacks.threadFiles) && callbacks.threadFiles.length
-    ? callbacks.threadFiles
-    : deriveSessionFiles(state);
+  const files = Array.isArray(callbacks.previewFiles) && callbacks.previewFiles.length
+    ? callbacks.previewFiles
+    : Array.isArray(callbacks.threadFiles) && callbacks.threadFiles.length
+      ? callbacks.threadFiles
+      : deriveSessionFiles(state);
   const showFiles = files.length > 0;
   // 右栏只在有内容时占位：编排子任务、产物文件、或执行者拆步清单。
   // 三者皆空时整条收起——空着一条「等待拆步…」的侧栏是在占位说谎。
@@ -5233,9 +6546,13 @@ function patchDetailRail(parts, state, faces, callbacks) {
     toggle.textContent = "Progress ⟩";
   }
   patchProgressPanel(parts, progress);
-  // 编排细节仍可下钻到旧 plan-board（层号/甘特）；默认收进 Progress 内联摘要
-  setAttr(parts.railBoard, "hidden", "");
+  // 编排细节：对话里已有分层卡；右栏 plan-board 作 Progress 下钻（层号 / 耗时条）
   if (plan) patchPlanBoard(parts, parts.railBoard, plan);
+  else {
+    setAttr(parts.railBoard, "hidden", "");
+    if (parts.railBoard) parts.railBoard.innerHTML = "";
+    parts.sig.plan = null;
+  }
   patchArtifacts(parts, showFiles ? files : [], state.runId, callbacks);
 }
 
@@ -5276,7 +6593,7 @@ function patchProgressPanel(parts, progress) {
       html +=
         `<li class="${cls}">` +
         `<span class="progress-mark" aria-hidden="true">${mark}</span>` +
-        `<span class="progress-title">${esc(it.title)}</span>` +
+        `<span class="progress-title${running ? " thinking-shimmer" : ""}">${esc(it.title)}</span>` +
         "</li>";
     }
     html += "</ul>";
@@ -5303,7 +6620,7 @@ function patchProgressPanel(parts, progress) {
       html +=
         `<li class="${cls}">` +
         `<span class="progress-mark" aria-hidden="true">${mark}</span>` +
-        `<span class="progress-title">${esc(n.title || n.id)}</span>` +
+        `<span class="progress-title${running ? " thinking-shimmer" : ""}">${esc(n.title || n.id)}</span>` +
         "</li>";
     }
     html += "</ul></div>";
@@ -5338,14 +6655,14 @@ function patchArtifacts(parts, files, runId, callbacks) {
     const times = (f.writes ?? 0) > 1 ? `改 ${f.writes} 次` : kind;
     const image = isImagePath(f.path);
     const thumb = image
-      ? `<a class="artifact-thumb-link" href="${esc(href)}" target="_blank" rel="noopener noreferrer" title="${esc(f.path)}">` +
+      ? `<a class="artifact-thumb-link" href="${esc(href)}" data-canvas-open="${esc(f.path)}" title="${esc(f.path)}">` +
         `<img class="artifact-thumb" src="${esc(href)}" alt="${esc(fileBasename(f.path))}" loading="lazy" /></a>`
       : "";
     return (
       `<div class="artifact${image ? " artifact--image" : ""}" data-artifact-path="${esc(f.path)}">` +
       thumb +
       '<div class="artifact-body">' +
-      `<a class="artifact-name" href="${esc(href)}" target="_blank" rel="noopener noreferrer" title="${esc(f.path)}">${esc(fileBasename(f.path))}</a>` +
+      `<a class="artifact-name" href="${esc(href)}" data-canvas-open="${esc(f.path)}" title="${esc(f.path)}">${esc(fileShortPath(f.path))}</a>` +
       `<div class="artifact-actions">` +
       `<span class="aside-peek">${esc(times)}</span>` +
       `<button type="button" class="artifact-btn" data-canvas-open="${esc(f.path)}">预览</button>` +
@@ -5369,6 +6686,8 @@ function patchArtifacts(parts, files, runId, callbacks) {
     host.addEventListener("click", (e) => {
       const canvasBtn = e.target instanceof Element ? e.target.closest("[data-canvas-open]") : null;
       if (canvasBtn) {
+        if (!isPlainLeftClick(e)) return;
+        e.preventDefault();
         callbacks.onOpenCanvas?.(canvasBtn.getAttribute("data-canvas-open"));
         return;
       }
@@ -5376,8 +6695,8 @@ function patchArtifacts(parts, files, runId, callbacks) {
       if (btn) callbacks.onReveal?.(btn.getAttribute("data-reveal"));
     });
   }
-  // 右栏产物卡同样做 stat 验证——声明了但没落盘的，标「未找到」而不是点了才报错
-  void hydrateArtifactCards(host, { runId }, callbacks);
+  // 右栏产物卡同样做 stat 验证——声明了但没落盘的，从清单拿掉
+  void hydrateArtifactCards(host, { runId, files }, callbacks);
 }
 
 function patchOutcomeCard(parts, state, overview, faces, callbacks = {}) {
@@ -5546,7 +6865,20 @@ export function buildFactorCards(faces) {
   const recoveryLine = describeRecoveryPolicy(loop.recovery);
   if (recoveryLine) loopLines.push(recoveryLine);
   if ((loop.recoveryDecisions?.length ?? 0) > 0) {
-    loopLines.push(`⤷ 恢复决策 ${loop.recoveryDecisions.length} 次`);
+    const stalling = (loop.recoveryDecisions ?? []).some(
+      (e) => e.reason === "end_turn_without_completion" || e.reason === "stagnation",
+    );
+    loopLines.push(stalling ? "⚠ 空转 · 可停止" : `⤷ 恢复决策 ${loop.recoveryDecisions.length} 次`);
+  }
+  if (loop.hooks) {
+    const fired = loop.hookEvents?.length ?? 0;
+    const blocked = (loop.hookEvents ?? []).filter((e) => e.outcome === "block").length;
+    const errors = (loop.hookEvents ?? []).filter((e) => e.outcome === "error").length;
+    loopLines.push(
+      `hooks：${fired} 次` +
+        (blocked ? ` · 阻断 ${blocked}` : "") +
+        (errors ? ` · 错误 ${errors}` : ""),
+    );
   }
 
   const ctxLines = [];
@@ -5567,13 +6899,25 @@ export function buildFactorCards(faces) {
           : ""),
     );
   }
+  if (context.agentMd) {
+    ctxLines.push(
+      `AGENT.md ${context.agentMd.files.length} 个文件 · ${context.agentMd.chars}/${context.agentMd.maxChars}` +
+        (context.agentMd.truncated ? " · 已截断" : "") +
+        " · 指导不是执行",
+    );
+  }
 
   const toolLines = [];
   toolLines.push(tools.pack?.name ? `包 ${tools.pack.name}` : "无领域包");
   toolLines.push(`${tools.tools.length} 个工具 · 调用 ${tools.totalCalls} 次`);
   if (tools.totalErrors > 0) toolLines.push(`✗ 失败 ${tools.totalErrors} 次`);
   if (tools.denials.length > 0) toolLines.push(`⊘ 被拒 ${tools.denials.length} 次`);
-  if (tools.readRoots.length > 0) toolLines.push(`只读根 ${tools.readRoots.length} 个`);
+  if (tools.writeRoots?.length > 0) toolLines.push(`可写根 ${tools.writeRoots.length} 个`);
+  {
+    const writeSet = new Set(tools.writeRoots ?? []);
+    const readonlyOnly = (tools.readRoots ?? []).filter((root) => !writeSet.has(root));
+    if (readonlyOnly.length > 0) toolLines.push(`只读根 ${readonlyOnly.length} 个`);
+  }
   if (tools.executionIsolation) {
     const state = tools.executionIsolation.effectiveState;
     toolLines.push(
@@ -5601,7 +6945,10 @@ export function buildFactorCards(faces) {
   const cards = [
     {
       id: "loop", title: "Loop 循环", lines: loopLines,
-      abnormal: Boolean(loop.stopReason && loop.stopReason.tone !== "ok") || loop.nearLimit,
+      abnormal: Boolean(loop.stopReason && loop.stopReason.tone !== "ok") || loop.nearLimit
+        || (loop.recoveryDecisions ?? []).some(
+          (e) => e.reason === "end_turn_without_completion" || e.reason === "stagnation",
+        ),
     },
     {
       id: "context", title: "Context 上下文", lines: ctxLines,
@@ -5740,6 +7087,18 @@ export function foldChain(chain) {
   return out;
 }
 
+/** Tools 面 MCP 行：已连 / 跳过 / 失败都照实说，不把「没 token」写成「未连接」。 */
+export function formatMcpServersLine(mcp) {
+  if (!mcp) return "";
+  const servers = mcp.servers ?? [];
+  if (!servers.length) return mcp.configured ? "已配置但未连接" : "未配置";
+  return servers.map((s) => {
+    const count = s.toolCount != null ? `，${s.toolCount} 工具` : s.tools != null ? `，${s.tools} 工具` : "";
+    const why = s.reason ? `：${s.reason}` : "";
+    return `${s.name}（${s.status ?? "unknown"}${count}${why}）`;
+  }).join("；");
+}
+
 /** 窗口来源的人话（数字必须带来源，否则无从判断"这是不是我要的那个值"） */
 export function contextSourceLabel(source) {
   switch (source) {
@@ -5748,6 +7107,7 @@ export function contextSourceLabel(source) {
     case "registry": return "登记表";
     case "run": return "本次指定";
     case "pack": return "领域包";
+    case "window": return "跟窗口";
     case "default": return "默认";
     default: return "未知";
   }
@@ -5800,7 +7160,7 @@ function renderContextTab(ctx) {
     }
     html += `<p class="meter-note">最近一轮输入 ${formatTokens(ctx.lastInputTokens)} / 预算 ${formatTokens(ctx.limit)}（${pct}%），超过 ${Math.round(ctx.watermark * 100)}% 触发压缩。<strong>口径是最近一轮，不是全程累计</strong>——压缩判据取的就是单轮输入。` +
       (ctx.window
-        ? `预算是策略、窗口是事实：窗口 ${formatTokens(ctx.window)} 来自${contextSourceLabel(ctx.windowSource)}${ctx.maxBudget ? `，预算上限 ${formatTokens(ctx.maxBudget)}（窗口 − maxTokens ${formatTokens(ctx.maxTokens ?? 0)} − 边际）` : ""}。默认预算不随窗口自动抬高——每轮成本与时延随上下文线性增长，抬预算是委托方的决定。`
+        ? `压缩水位跟窗口走：窗口 ${formatTokens(ctx.window)} 来自${contextSourceLabel(ctx.windowSource)}${ctx.maxBudget ? `，可用上限 ${formatTokens(ctx.maxBudget)}（窗口 − maxTokens ${formatTokens(ctx.maxTokens ?? 0)} − 边际）` : ""}。显式覆盖才会提前压缩。`
         : "窗口未知：登记表里没有这个模型、也还没撞过 400；撞到一次端点会说出窗口，下一次运行就按它算上限。") +
       "</p>";
   } else {
@@ -5916,7 +7276,12 @@ function renderToolsTab(tools) {
     html += row("视觉模型", rm.vision ?? "（未配置：本次运行看不了图）");
     html += row("生图模型", rm.image ?? "（未配置：本次运行不能生图）");
   }
-  html += row("额外只读根", tools.readRoots.length ? tools.readRoots.join("；") : "（无）");
+  html += row("可写根", tools.writeRoots?.length ? tools.writeRoots.join("；") : "（无）");
+  {
+    const writeSet = new Set(tools.writeRoots ?? []);
+    const readonlyOnly = (tools.readRoots ?? []).filter((root) => !writeSet.has(root));
+    html += row("只读根", readonlyOnly.length ? readonlyOnly.join("；") : "（无）");
+  }
   if (tools.history) {
     // 报实际落点：重启后能不能接着这场对话，取决于档案存在哪、留几个
     html += row(
@@ -5938,13 +7303,7 @@ function renderToolsTab(tools) {
     );
   }
   if (tools.mcp) {
-    const servers = tools.mcp.servers ?? [];
-    html += row(
-      "MCP",
-      servers.length
-        ? servers.map((s) => `${s.name}（${s.status}${s.toolCount != null ? `，${s.toolCount} 工具` : ""}）`).join("；")
-        : tools.mcp.configured ? "已配置但未连接" : "未配置",
-    );
+    html += row("MCP", formatMcpServersLine(tools.mcp));
   }
   html += "</dl>";
 
@@ -6143,10 +7502,39 @@ function patchPlanBoard(parts, host, plan) {
 }
 
 /** @returns {string} */
+function renderAgentsCard(agents) {
+  const list = agents ?? [];
+  const running = list.filter((a) => a.status === "running").length;
+  const pending = list.reduce((n, a) => n + (Number(a.pendingApprovals) || 0), 0);
+  const title = running > 0
+    ? (running === 1 ? "子代理工作中" : `${running} 个子代理工作中`)
+    : "子代理";
+  let html =
+    `<div class="chat-agents${running > 0 ? " chat-agents--busy" : ""}" role="group" aria-label="${esc(title)}">` +
+    `<div class="chat-agents-head"><strong class="chat-agents-title${running > 0 ? " thinking-shimmer" : ""}">${esc(title)}</strong>` +
+    (pending > 0 ? `<span class="chat-agents-pending">需批准 ${pending}</span>` : "") +
+    `</div><ul class="chat-agents-list">`;
+  for (const a of list) {
+    const status = a.status === "running" ? "工作中" : a.status === "error" ? "未完成" : a.status === "pending" ? "等待" : "已完成";
+    const peek = String(a.lastText || a.peek || "").replace(/\s+/g, " ").trim();
+    html +=
+      `<li><button type="button" class="chat-agent chat-agent--${esc(a.status)}" data-agent-id="${esc(a.id)}">` +
+      `<span class="chat-agent-mark" aria-hidden="true"></span>` +
+      `<span class="chat-agent-copy">` +
+      `<span class="chat-agent-title">${esc(a.title)}</span>` +
+      `<span class="chat-agent-meta">${esc(status)}${a.pendingApprovals > 0 ? " · 需批准" : ""}</span>` +
+      (peek ? `<span class="chat-agent-peek">${esc(truncate(peek, 80))}</span>` : "") +
+      `</span></button></li>`;
+  }
+  html += "</ul></div>";
+  return html;
+}
+
 function renderPlanNode(n, maxDuration) {
   const mark = { passed: "✔", failed: "✘", skipped: "－", running: "●", pending: "○" }[n.status];
   const pct = n.durationMs ? Math.max(2, Math.round((n.durationMs / maxDuration) * 100)) : 0;
-  let html = `<div class="plan-node plan-node--${n.status}">`;
+  const openable = n.status !== "pending";
+  let html = `<div class="plan-node plan-node--${n.status}${openable ? " plan-node--openable" : ""}"${openable ? ` data-agent-id="${esc(n.id)}" role="button" tabindex="0"` : ""}>`;
   html += `<div class="plan-node-head"><span class="plan-node-mark">${mark}</span>`;
   html += `<code class="plan-node-id">${esc(n.id)}</code> <span class="plan-node-title">${esc(n.title)}</span></div>`;
   html += '<div class="plan-node-meta">';
@@ -6190,6 +7578,40 @@ function patchLoopView(parts, container, state, logEntries, callbacks) {
  *
  * @returns {{kind:string,[k:string]:any}[]}
  */
+/** 主对话滤掉了子代理事件；没有 live 时把当前执行者最后一段思考捞回来。 */
+function latestExecutorThinkingText(state, afterSeq) {
+  let source = "";
+  const parts = [];
+  for (const e of state?.timeline ?? []) {
+    if (e.type !== "assistant_thinking") continue;
+    if (!(e.seq > afterSeq)) continue;
+    const role = segmentRole(e.source);
+    if (role === "planner" || role === "verifier") continue;
+    const text = String(e.text ?? "").trim();
+    if (!text) continue;
+    if (e.source !== source) {
+      source = e.source;
+      parts.length = 0;
+    }
+    parts.push(text);
+  }
+  return parts.join("\n\n");
+}
+
+function overlayAgentRunning(state, agentId) {
+  return deriveChildAgents(state).some((a) => a.id === agentId && a.status === "running");
+}
+
+/** 追问之后、或计划已收官：骨架收成一行，不再每轮摊开。 */
+function conversationChromeFolded(state, face, agents) {
+  const livePlan = (face?.nodes ?? []).some((n) => n.status === "running" || n.status === "pending");
+  const liveAgent = (agents ?? []).some((a) => a.status === "running");
+  if (livePlan || liveAgent) return false;
+  const followUp = lastUserMessageSeq(state);
+  if (Number.isFinite(followUp) && followUp >= 0) return true;
+  return state.status !== "running";
+}
+
 function lastUserMessageSeq(state) {
   let seq = Number.NEGATIVE_INFINITY;
   for (const e of state?.timeline ?? []) {
@@ -6230,12 +7652,77 @@ export function ancestorRunIds(runs, tipId) {
 }
 
 /**
+ * 回退快照已经带着裁过的前缀。再往前拼父 run，会把裁掉的后半段又贴回来。
+ */
+export function ancestorRunIdsForChat(runs, tipId) {
+  const ids = ancestorRunIds(runs, tipId);
+  const byId = new Map((runs ?? []).map((r) => [r.runId, r]));
+  const cut = ids.findIndex((id) => byId.get(id)?.rewindFrom);
+  return cut > 0 ? ids.slice(cut) : ids;
+}
+
+/**
+ * 可重复的交付条目指纹。用户话不去重——同一句追问也可能是新一轮。
+ * 正文 / 思考 / 产物 / 裁决按内容认：谱系里整段克隆的子 run 会把同一段
+ * 答案再贴一遍，这是「重复答案」的根。
+ */
+export function chatRepeatKey(it) {
+  if (!it || typeof it !== "object") return null;
+  const compact = (s) => String(s ?? "").replace(/\s+/g, " ").trim();
+  if (it.kind === "text") {
+    const body = compact(it.text);
+    return body ? `text:${body}` : null;
+  }
+  if (it.kind === "thinking") {
+    const body = compact(it.text);
+    return body ? `thinking:${body}` : null;
+  }
+  if (it.kind === "artifacts") {
+    const paths = (it.files ?? [])
+      .map((f) => String(f?.path ?? "").replace(/\\/g, "/"))
+      .filter(Boolean)
+      .sort();
+    return paths.length ? `artifacts:${paths.join("|")}` : null;
+  }
+  if (it.kind === "verdict") {
+    return `verdict:${it.round ?? ""}:${JSON.stringify(it.verdict ?? null)}`;
+  }
+  return null;
+}
+
+function chatItemRicher(next, prev) {
+  if (next.fromCompletion && !prev.fromCompletion) return true;
+  if (!next.fromCompletion && prev.fromCompletion) return false;
+  const extra = (it) =>
+    (Array.isArray(it.verification) ? it.verification.length : 0)
+    + (Array.isArray(it.assumptions) ? it.assumptions.length : 0)
+    + (Array.isArray(it.files) ? it.files.length : 0);
+  return extra(next) > extra(prev);
+}
+
+/** 同一段交付只留一份；有折叠块 / 产物更多的那份优先。 */
+export function collapseRepeatChatItems(items) {
+  const list = items ?? [];
+  const keep = new Map();
+  list.forEach((it, i) => {
+    const fp = chatRepeatKey(it);
+    if (!fp) return;
+    const prev = keep.get(fp);
+    if (prev === undefined || chatItemRicher(it, list[prev])) keep.set(fp, i);
+  });
+  return list.filter((it, i) => {
+    const fp = chatRepeatKey(it);
+    return !fp || keep.get(fp) === i;
+  });
+}
+
+/**
  * 一场对话谱系拼成一条聊天：祖先 run 一律收官形态，只有当前这一头可以直播。
  * 续跑 fort 后子 run 时间线只有最后一轮——不拼的话，更早的轮次要么消失，
  * 要么还停在当初展开的过程视图里。
  */
 export function deriveThreadChatItems(runs, runStates, tipId, live, opts = {}) {
-  const ids = ancestorRunIds(runs, tipId);
+  const ids = ancestorRunIdsForChat(runs, tipId);
   const loaded = ids
     .map((id) => ({ id, state: runStates instanceof Map ? runStates.get(id) : null }))
     .filter((row) => row.state);
@@ -6257,6 +7744,8 @@ export function deriveThreadChatItems(runs, runStates, tipId, live, opts = {}) {
     for (const it of part) {
       if (skipLead && it.kind === "user" && it.seq === -1) continue;
       if (skipLead && it.kind === "recap") continue;
+      // 编排计划 / 子代理是整场对话一份骨架，不能每个续跑 run 再贴一张。
+      if (skipLead && (it.kind === "plan" || it.kind === "agents")) continue;
       out.push({
         ...it,
         key: (it.kind === "live" || it.kind === "activity")
@@ -6265,7 +7754,7 @@ export function deriveThreadChatItems(runs, runStates, tipId, live, opts = {}) {
       });
     }
   }
-  return out;
+  return collapseRepeatChatItems(out);
 }
 
 function applyDeliveryKeepingCurrentTurn(items, state, files, running) {
@@ -6286,13 +7775,33 @@ export function deriveChatItems(state, live, opts = {}) {
   const hideTools = opts.showProcess === false || opts.showProcess === "off";
   const showBoundaries = flatTools;
   const trackTools = !hideTools;
+  const agentId = typeof opts.agentId === "string" && opts.agentId ? opts.agentId : null;
   const items = [];
   /**
    * 开场白：**任务本身就是第一条用户消息**。
    * 它不在事件流里（它是 run 的入参，不是事件），所以要显式补上。
+   * 点开某个子代理时，主任务换成这条支线的标题——那才是它的对话。
    */
-  if (state.task) items.push({ kind: "user", text: state.task, seq: -1, runId: state.runId ?? null });
-  const priorRecap = String(state.lineage?.priorRecap ?? "").trim();
+  if (agentId) {
+    const agents = deriveChildAgents(state);
+    const agent = agents.find((a) => a.id === agentId);
+    items.push({
+      kind: "user",
+      text: agent?.title || agentId.replace(/^spawn\//, ""),
+      seq: -1,
+      runId: state.runId ?? null,
+    });
+  } else if (state.task) {
+    const taskAt = pickTaskAt(state);
+    items.push({
+      kind: "user",
+      text: state.task,
+      seq: -1,
+      runId: state.runId ?? null,
+      ...(taskAt != null ? { at: taskAt } : {}),
+    });
+  }
+  const priorRecap = agentId ? "" : String(state.lineage?.priorRecap ?? "").trim();
   if (priorRecap) {
     const priorTurns = Number(state.lineage?.priorTurns ?? 0);
     items.push({
@@ -6314,6 +7823,11 @@ export function deriveChatItems(state, live, opts = {}) {
     (a, b) => a.seq - b.seq,
   );
   for (const e of all) {
+    if (agentId) {
+      if (childAgentKey(e.source) !== agentId) continue;
+    } else if (isChildAgentSource(e.source)) {
+      continue;
+    }
     if (showBoundaries && e.source !== lastSource && CHAT_SOURCED.has(e.type)) {
       items.push({ kind: "boundary", source: e.source, role: segmentRole(e.source), seq: e.seq });
       lastSource = e.source;
@@ -6327,12 +7841,21 @@ export function deriveChatItems(state, live, opts = {}) {
           ...(e.turn ? { turn: e.turn } : {}),
           ...(typeof e.verify === "boolean" ? { verify: e.verify } : {}),
           ...(e.continues ? { continues: e.continues } : {}),
+          ...(e.executorSwitched ? { executorSwitched: true } : {}),
+          ...(Number.isFinite(e.at) ? { at: e.at } : {}),
         });
         break;
       case "steering":
         // 插队指令：用户气泡 + 「插队指令」标注（renderChatItem 认 steering 位）
         if (String(e.text ?? "").trim()) {
-          items.push({ kind: "user", text: e.text, seq: e.seq, runId: state.runId ?? null, steering: true });
+          items.push({
+            kind: "user",
+            text: e.text,
+            seq: e.seq,
+            runId: state.runId ?? null,
+            steering: true,
+            ...(Number.isFinite(e.at) ? { at: e.at } : {}),
+          });
         }
         break;
       case "message_queued":
@@ -6359,31 +7882,47 @@ export function deriveChatItems(state, live, opts = {}) {
         }
         break;
       case "assistant_thinking": {
-        // Cursor 式：当前轮进行中只靠 live Thinking；历史轮的思考仍保留。
+        // 有 live 思考时，当前轮落定块不重复占位；没有 live 时必须看见——
+        // 编排子任务的增量来源不是 main，以前会整段 Thinking 消失。
         // 规划者 / 核查者不进主对话。
-        if (state.status === "running" && e.seq > followUpSeq) break;
+        const liveThinkingNow = String(live?.thinking ?? "").trim();
+        if (state.status === "running" && e.seq > followUpSeq && liveThinkingNow) break;
         const role = segmentRole(e.source);
         if (role === "verifier" || role === "planner") break;
         const text = String(e.text ?? "");
         const redacted = Boolean(e.redacted);
         if (!text.trim() && !redacted) break;
+        const liveTurn = state.status === "running" && e.seq > followUpSeq;
         const last = items[items.length - 1];
         if (last?.kind === "thinking" && last.role === role && !last.redacted && !redacted) {
           items[items.length - 1] = {
             ...last,
             text: [last.text, text].filter(Boolean).join("\n\n"),
             seq: e.seq,
+            live: Boolean(last.live || liveTurn),
           };
         } else {
-          items.push({ kind: "thinking", text, seq: e.seq, role, redacted });
+          items.push({ kind: "thinking", text, seq: e.seq, role, redacted, live: liveTurn });
         }
         break;
       }
-      case "assistant_text":
-        if (String(e.text ?? "").trim()) {
-          items.push({ kind: "text", text: e.text, seq: e.seq, role: segmentRole(e.source) });
-        }
+      case "assistant_text": {
+        const text = String(e.text ?? "").trim();
+        if (!text) break;
+        const role = segmentRole(e.source);
+        // 正式 plan 事件已到时，契约 JSON 改由下方 plan 卡承载（带执行态），
+        // 不再在对话里再堆一面墙。
+        if (state.plan && role === "planner" && isPlanShapedAssistantText(text)) break;
+        items.push({
+          kind: "text",
+          text: e.text,
+          seq: e.seq,
+          role,
+          runId: state.runId ?? null,
+          ...(Number.isFinite(e.at) ? { at: e.at } : {}),
+        });
         break;
+      }
       case "tool_call":
         latestTool = { name: e.name, input: e.input, toolUseId: e.toolUseId, status: "running", seq: e.seq };
         if (!trackTools) break;
@@ -6422,6 +7961,18 @@ export function deriveChatItems(state, live, opts = {}) {
         else items.push({ kind: "gate", name: e.name, seq: e.seq });
         break;
       }
+      case "recovery_decision": {
+        const stall = e.reason === "end_turn_without_completion" || e.reason === "stagnation";
+        items.push({
+          kind: "notice",
+          tone: stall ? "stall" : "recovery",
+          text: stall ? "空转 · 可停止" : "恢复决策",
+          peek: String(e.detail ?? ""),
+          live: state.status === "running" && stall,
+          seq: e.seq,
+        });
+        break;
+      }
       case "compaction":
         items.push({
           kind: "notice",
@@ -6441,7 +7992,30 @@ export function deriveChatItems(state, live, opts = {}) {
     }
   }
 
-  const verdictItems = (state.verifications ?? []).map((v) => ({
+  // 编排计划 / 子代理：整场对话只贴开场任务后面一份。
+  // 追问或收官后收成一行，避免每一轮都再占一屏。
+  if (!agentId && !opts.omitConversationChrome) {
+    const face = state.plan ? derivePlanFace(state) : null;
+    const agents = deriveChildAgents(state);
+    const folded = conversationChromeFolded(state, face, agents);
+    const openAt = items.findIndex((it) => it.kind === "user" && it.seq === -1);
+    const userAt = openAt >= 0 ? openAt : items.findIndex((it) => it.kind === "user");
+    const insertAt = userAt >= 0 ? userAt + 1 : 0;
+    if (face?.nodes?.length) {
+      items.splice(insertAt, 0, { kind: "plan", plan: face, seq: null, folded });
+    }
+    if (agents.length > 0) {
+      const after = items.findIndex((it) => it.kind === "plan");
+      items.splice(after >= 0 ? after + 1 : insertAt, 0, {
+        kind: "agents",
+        agents,
+        seq: Math.min(...agents.map((a) => Number(a.seq) || 0)),
+        folded,
+      });
+    }
+  }
+
+  const verdictItems = (agentId ? [] : (state.verifications ?? [])).map((v) => ({
     kind: "verdict",
     round: v.round,
     judgedTurn: v.judgedTurn ?? null,
@@ -6462,9 +8036,20 @@ export function deriveChatItems(state, live, opts = {}) {
   const liveText = String(live?.text ?? "");
   const liveThinking = String(live?.thinking ?? "");
   const streaming = Boolean(liveText.trim() || liveThinking.trim());
-  if (state.status === "running" && streaming) {
+  const overlayRunning = Boolean(agentId && overlayAgentRunning(state, agentId));
+  if (state.status === "running" && streaming && (!agentId || overlayRunning)) {
     items.push({ kind: "live", text: liveText, thinking: liveThinking, role: "main" });
-  } else if (hideTools && state.status === "running" && latestTool?.status === "running") {
+  } else if (!agentId && state.status === "running" && !items.some((it) => it.kind === "thinking")) {
+    const fallback = latestExecutorThinkingText(state, followUpSeq);
+    if (fallback) {
+      items.push({ kind: "thinking", text: fallback, live: true, role: "main" });
+    } else if (latestTool?.status !== "running" && !deriveChildAgents(state).some((a) => a.status === "running")) {
+      items.push({ kind: "live", text: "", thinking: "", waiting: true, role: "main" });
+    }
+  } else if (overlayRunning && !streaming && !items.some((it) => it.kind === "thinking") && latestTool?.status !== "running") {
+    items.push({ kind: "live", text: "", thinking: "", waiting: true, role: "main" });
+  }
+  if (!agentId && hideTools && state.status === "running" && latestTool?.status === "running") {
     items.push({
       kind: "activity",
       name: latestTool.name,
@@ -6490,7 +8075,9 @@ export function deriveChatItems(state, live, opts = {}) {
   const files = Array.isArray(opts.threadFiles) && opts.threadFiles.length
     ? opts.threadFiles
     : deriveSessionFiles(state);
-  keyed = applyDeliveryKeepingCurrentTurn(keyed, state, files, state.status === "running");
+  if (!agentId) {
+    keyed = applyDeliveryKeepingCurrentTurn(keyed, state, files, state.status === "running");
+  }
   for (const it of keyed) {
     it.key =
       it.kind === "live" ? "live"
@@ -6500,10 +8087,55 @@ export function deriveChatItems(state, live, opts = {}) {
       : it.kind === "tools" ? ("tools:" + (it.tools?.[0]?.toolUseId ?? it.seq ?? "x"))
       : it.kind === "verdict" ? ("verdict:" + (it.judgedTurn ?? "x") + ":" + it.round)
       : it.kind === "artifacts" ? "artifacts"
+      : it.kind === "plan" ? "plan"
+      : it.kind === "agents" ? "agents"
       : it.kind === "tool" ? ("tool:" + (it.toolUseId ?? it.seq ?? "x"))
       : (it.kind + ":" + (it.seq ?? "x"));
   }
+  keyed = collapseRepeatChatItems(keyed);
+  markSettledTurnActions(keyed, state.status === "running");
   return keyed;
+}
+
+/**
+ * 操作条只挂在**已经收官的一轮**上：该轮用户话 + 最后一段执行者正文。
+ * 思考、工具、中间进度句、以及还在跑的当前轮都不挂——那是过程，不是一轮对话。
+ */
+export function markSettledTurnActions(items, running) {
+  const list = items ?? [];
+  for (const it of list) it.showActions = false;
+  const bounds = [];
+  let start = 0;
+  for (let i = 0; i < list.length; i++) {
+    if (list[i].kind === "user" && i > 0) {
+      bounds.push([start, i - 1]);
+      start = i;
+    }
+  }
+  bounds.push([start, list.length - 1]);
+  for (let t = 0; t < bounds.length; t++) {
+    if (running && t === bounds.length - 1) continue;
+    const [from, to] = bounds[t];
+    if (list[from]?.kind === "user") list[from].showActions = true;
+    for (let i = to; i > from; i--) {
+      if (list[i].kind === "text" && list[i].role !== "verifier" && list[i].role !== "planner") {
+        list[i].showActions = true;
+        break;
+      }
+    }
+  }
+  return list;
+}
+
+/** assistant_text 是否已是可解析的计划契约（用于去重） */
+function isPlanShapedAssistantText(text) {
+  const t = String(text ?? "").trim();
+  if (!t.startsWith("{")) return false;
+  try {
+    return looksLikePlanPayload(JSON.parse(t));
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -6531,6 +8163,7 @@ function mergeThinkingItems(thinkings) {
     ...first,
     text: thinkings.map((t) => t.text).filter(Boolean).join("\n\n"),
     redacted: thinkings.some((t) => t.redacted),
+    live: thinkings.some((t) => t.live),
     seq: thinkings.at(-1).seq,
   };
 }
@@ -6625,6 +8258,7 @@ export function collapseFinishedChat(items) {
     if (it.kind === "tools" || it.kind === "tool" || it.kind === "notice" || it.kind === "activity" || it.kind === "gate") {
       continue;
     }
+    // 编排计划卡在收官后仍保留——它是交付骨架，不是过程噪声
     flush();
     out.push(it);
   }
@@ -6693,8 +8327,8 @@ export function splitCompletionFollowUps(completion) {
 }
 
 /**
- * 收官之后还在不在跑、会不会自动续聊。没有 spawn_task：finish_task 结束的是
- * 这一段执行者；核查/返工/编排里还在飞的子任务才会自动接着走。
+ * 收官之后还在不在跑、会不会自动续聊。没有明确后续段时不要许诺「自动回到对话」——
+ * finish_task 只结束这一段执行者；核查/返工/编排子任务/活着的 spawn 才会自动接着走。
  */
 export function deriveRunFollowUp(state) {
   const plan = state?.plan ? derivePlanFace(state) : null;
@@ -6702,17 +8336,15 @@ export function deriveRunFollowUp(state) {
   const pendingNodes = (plan?.nodes ?? []).filter((n) => n.status === "pending");
   const failed = (plan?.nodes ?? []).some((n) => n.status === "failed");
   const skipped = (plan?.nodes ?? []).some((n) => n.status === "skipped");
-  const results = new Set(
-    (state?.timeline ?? []).filter((e) => e.type === "tool_result").map((e) => e.toolUseId),
-  );
-  const liveTools = (state?.timeline ?? []).filter(
-    (e) => e.type === "tool_call" && e.toolUseId && !results.has(e.toolUseId),
-  );
+  const spawnStarts = (state?.timeline ?? []).filter((e) => e.type === "spawn_start");
+  const spawnDones = (state?.timeline ?? []).filter((e) => e.type === "spawn_done").length;
+  const liveSpawns = Math.max(0, spawnStarts.length - spawnDones);
   const sourced = [...(state?.timeline ?? []), ...(state?.verifierTimeline ?? [])]
     .filter((e) => CHAT_SOURCED.has(e.type))
     .at(-1);
   const lastRole = sourced ? segmentRole(sourced.source) : "main";
   const running = state?.status === "running";
+  const hasCompletion = Boolean(state?.completion && typeof state.completion === "object");
 
   if (!running) {
     return {
@@ -6738,6 +8370,15 @@ export function deriveRunFollowUp(state) {
       text: "结束后会自动回到对话，不必再发消息。",
     };
   }
+  if (liveSpawns > 0) {
+    const title = spawnStarts[spawnStarts.length - 1]?.title;
+    return {
+      live: true,
+      autoContinue: true,
+      title: title ? `支线还在跑：${title}` : "支线还在跑",
+      text: "支线结束后结论会回到本对话，不必再发消息。",
+    };
+  }
   if (runningNodes.length > 0) {
     const names = runningNodes.map((n) => n.title || n.id).join("、");
     if (failed || skipped) {
@@ -6757,19 +8398,45 @@ export function deriveRunFollowUp(state) {
         : "跑完后会自动收尾，不必再发消息。",
     };
   }
-  if (liveTools.length > 0) {
+  if (pendingNodes.length > 0) {
+    if (failed || skipped) {
+      return {
+        live: true,
+        autoContinue: false,
+        title: "编排已停下",
+        text: "还有未发射的子任务，但编排不会自动继续。要接着做，需再发一条。",
+      };
+    }
     return {
       live: true,
       autoContinue: true,
-      title: `还有工具在跑：${liveTools[0].name}`,
-      text: "结束后会回到对话。",
+      title: "下一步即将开始",
+      text: "调度器正在发射下一子任务，不必再发消息。",
+    };
+  }
+  // 已 finish_task、本轮勾了核查，但核查段事件还没进流——短窗口，别写成含糊的「任务仍在进行」
+  if (hasCompletion && state.verify) {
+    return {
+      live: true,
+      autoContinue: true,
+      title: "核查即将开始",
+      text: "执行者已收官；核查结束后会自动给出裁决，不必再发消息。",
+    };
+  }
+  // 已收官但本地仍显示 running（多半在等 run_end）——不许诺「自动续聊」
+  if (hasCompletion) {
+    return {
+      live: true,
+      autoContinue: false,
+      title: "正在收尾",
+      text: "完成声明已提交，正在写入结束状态。若有未完成项，结束后需再发一条才会继续。",
     };
   }
   return {
     live: true,
     autoContinue: true,
     title: "任务仍在进行",
-    text: "结束后会自动回到对话。",
+    text: "模型还在推进；有结果后会回到对话。",
   };
 }
 
@@ -6790,8 +8457,7 @@ export function formatCompletionChatText(completion) {
     lines.push("", `**${title}**`);
     for (const item of arr) lines.push(`- ${String(item)}`);
   };
-  pushGroup("验证", completion.verification);
-  pushGroup("假设与前提", completion.assumptions);
+  // 验证 / 假设与前提改走折叠块，不摊在气泡正文里。
   pushGroup("未完成", unfinished);
   pushGroup("阻塞", blocked);
   return lines.join("\n");
@@ -6807,8 +8473,6 @@ export function formatCompletionExtras(completion) {
     lines.push("", `**${title}**`);
     for (const item of arr) lines.push(`- ${String(item)}`);
   };
-  pushGroup("验证", completion.verification);
-  pushGroup("假设与前提", completion.assumptions);
   pushGroup("未完成", unfinished);
   pushGroup("阻塞", blocked);
   return lines.join("\n");
@@ -6831,12 +8495,69 @@ export function pickCompletionChatText(completion, lastExecutorText) {
   return `${last}${extras}`;
 }
 
+const FOLDABLE_COMPLETION_HEADINGS = {
+  "验证": "verification",
+  "假设与前提": "assumptions",
+  "假设": "assumptions",
+};
+
+/**
+ * 从收官正文里拆出「验证 / 假设与前提」——这两项改成可展开，不占主气泡。
+ * 执行者自己写成 **验证** 列表时也要拆，避免折叠块和正文重复。
+ */
+export function splitFoldableCompletionSections(text) {
+  const groups = { verification: [], assumptions: [] };
+  const kept = [];
+  let current = null;
+  for (const line of String(text ?? "").split("\n")) {
+    const heading = line.trim().match(/^\*\*(验证|假设与前提|假设)\*\*$/);
+    if (heading) {
+      current = FOLDABLE_COMPLETION_HEADINGS[heading[1]];
+      continue;
+    }
+    if (current && /^\*\*.+\*\*$/.test(line.trim())) current = null;
+    if (current) {
+      const item = line.match(/^\s*[-*]\s+(.*)$/);
+      if (item) {
+        groups[current].push(item[1]);
+        continue;
+      }
+      if (!line.trim()) continue;
+      current = null;
+    }
+    kept.push(line);
+  }
+  return {
+    text: kept.join("\n").replace(/\n{3,}/g, "\n\n").trim(),
+    verification: groups.verification,
+    assumptions: groups.assumptions,
+  };
+}
+
+function stringList(arr) {
+  return Array.isArray(arr) ? arr.map((item) => String(item)).filter((item) => item.trim()) : [];
+}
+
+/** 折叠块数据：契约字段优先，正文里拆出的列表兜底。 */
+export function completionFoldGroups(completion, text) {
+  const split = splitFoldableCompletionSections(text);
+  const verification = stringList(completion?.verification);
+  const assumptions = stringList(completion?.assumptions);
+  return {
+    text: split.text,
+    verification: verification.length ? verification : split.verification,
+    assumptions: assumptions.length ? assumptions : split.assumptions,
+  };
+}
+
 /**
  * 把 finish_task.artifacts 声明与会话写出文件对齐。
- * 声明优先；工具实际写出但不在声明里的仍补上，避免漏交付。
+ * 声明优先；basename 只在唯一命中时对上，重名不猜。
+ * extras: "all"（默认，兼容旧测试）| "delivery"（滤掉核查脚本）| "none"
  */
-export function mergeCompletionArtifactFiles(declared, sessionFiles) {
+export function mergeCompletionArtifactFiles(declared, sessionFiles, opts = {}) {
   const session = (sessionFiles ?? []).filter((f) => f && f.path && f.kind !== "upload");
+  const extras = opts.extras ?? "all";
   const norm = (p) => String(p ?? "").replace(/\\/g, "/").trim();
   const byNorm = new Map(session.map((f) => [norm(f.path), f]));
   const out = [];
@@ -6850,12 +8571,25 @@ export function mergeCompletionArtifactFiles(declared, sessionFiles) {
       if (!path) continue;
       let hit = byNorm.get(path);
       if (!hit) {
-        const base = fileBasename(path);
-        hit = session.find((f) => {
+        const suffixHits = session.filter((f) => {
           const fp = norm(f.path);
-          return fp === path || fp.endsWith("/" + path) || path.endsWith("/" + fp)
-            || fileBasename(fp) === base;
+          return fp.endsWith("/" + path) || path.endsWith("/" + fp);
         });
+        if (suffixHits.length === 1) hit = suffixHits[0];
+      }
+      if (!hit) {
+        const base = fileBasename(path).toLowerCase();
+        const baseHits = session.filter((f) => fileBasename(norm(f.path)).toLowerCase() === base);
+        if (baseHits.length === 1) hit = baseHits[0];
+        else if (baseHits.length > 1) {
+          for (const f of baseHits) {
+            const key = norm(f.path);
+            if (used.has(key)) continue;
+            out.push(f);
+            used.add(key);
+          }
+          continue;
+        }
       }
       if (hit) {
         if (used.has(norm(hit.path))) continue;
@@ -6866,9 +8600,101 @@ export function mergeCompletionArtifactFiles(declared, sessionFiles) {
       }
     }
   }
+  if (extras === "none") return out;
   for (const f of session) {
     const key = norm(f.path);
-    if (!used.has(key)) out.push(f);
+    if (used.has(key)) continue;
+    if (extras === "delivery" && isNoiseArtifact(f.path)) continue;
+    out.push(f);
+  }
+  return out;
+}
+
+/** 一场对话该看见的产物：声明优先，滤掉核查脚本与别的目录噪音 */
+export function selectConversationArtifacts(files, { declared = [], task = "" } = {}) {
+  const clean = (declared ?? []).flatMap((d) => extractArtifactPaths(d));
+  const uploads = (files ?? []).filter((f) => f && f.kind === "upload");
+  const artifacts = (files ?? []).filter((f) => f && f.path && f.kind !== "upload");
+  const merged = clean.length
+    ? mergeCompletionArtifactFiles(clean, artifacts, { extras: "delivery" })
+    : artifacts.filter((f) => !isNoiseArtifact(f.path));
+  void task;
+  return [...uploads, ...merged];
+}
+
+/**
+ * 预览坞用的清单：这场对话里出现过的文件都进，不按交付声明裁路径。
+ * 核查脚本 / node_modules 仍排除——那些不是给人看的。
+ */
+export function selectPreviewArtifacts(files) {
+  return (files ?? []).filter((f) => f && f.path && !isNoiseArtifact(f.path));
+}
+
+/**
+ * 把路径并进预览清单：已在里面就回原位，否则追加到末尾。
+ * 空路径不改清单。调用方负责把追加项记住，否则下一帧又丢。
+ * @param {{path?:string}[]} list
+ * @param {string} path
+ * @returns {{ list:{path:string, kind?:string}[], index:number }}
+ */
+export function ensurePreviewArtifact(list, path) {
+  const want = String(path ?? "");
+  const cur = Array.isArray(list) ? list.filter((a) => a && a.path) : [];
+  if (!want) return { list: cur, index: -1 };
+  const index = cur.findIndex((a) => String(a.path) === want);
+  if (index >= 0) return { list: cur, index };
+  return { list: [...cur, { path: want, kind: "preview" }], index: cur.length };
+}
+
+/**
+ * 点路径打开预览：一律走右侧画布。清单里没有的先并进去再开。
+ * @param {{path?:string}[]} list
+ * @param {string} path
+ */
+export function resolveArtifactOpen(list, path) {
+  const { index } = ensurePreviewArtifact(list, path);
+  return index >= 0 ? { mode: "canvas", index } : { mode: "none" };
+}
+
+/** 左键单击且无修饰键——Ctrl/中键仍走链接自己的 href（下载/新标签）。 */
+function isPlainLeftClick(event) {
+  const button = event?.button;
+  return (button == null || button === 0)
+    && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey;
+}
+
+export const SIDEBAR_COLLAPSED_KEY = "agent-ui-sidebar-collapsed";
+
+export function readSidebarCollapsed(storage) {
+  try {
+    return storage?.getItem?.(SIDEBAR_COLLAPSED_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+export function writeSidebarCollapsed(storage, collapsed) {
+  try {
+    if (collapsed) storage?.setItem?.(SIDEBAR_COLLAPSED_KEY, "1");
+    else storage?.removeItem?.(SIDEBAR_COLLAPSED_KEY);
+  } catch { /* 偏好写失败不影响显隐 */ }
+}
+
+export function deriveThreadDeclaredArtifacts(runs, runStates, tipId) {
+  const byId = new Map((runs ?? []).map((r) => [r.runId, r]));
+  const ids = [];
+  const seen = new Set();
+  let cur = tipId;
+  while (cur && !seen.has(cur)) {
+    seen.add(cur);
+    ids.unshift(cur);
+    cur = byId.get(cur)?.continuedFrom;
+  }
+  const out = [];
+  for (const id of ids) {
+    const st = runStates instanceof Map ? runStates.get(id) : null;
+    const arts = st?.completion?.artifacts;
+    if (Array.isArray(arts)) out.push(...arts);
   }
   return out;
 }
@@ -6895,12 +8721,15 @@ export function applyStructuredDelivery(items, state, sessionFiles) {
     }
     const text = pickCompletionChatText(completion, lastExecutorText);
     if (text) {
+      const folds = completionFoldGroups(completion, text);
       const summaryItem = {
         kind: "text",
-        text,
+        text: folds.text,
         role: "main",
         fromCompletion: true,
         seq: null,
+        ...(folds.verification.length ? { verification: folds.verification } : {}),
+        ...(folds.assumptions.length ? { assumptions: folds.assumptions } : {}),
       };
       if (textAt >= 0) {
         out[textAt] = { ...out[textAt], ...summaryItem, seq: out[textAt].seq };
@@ -6934,8 +8763,8 @@ export function applyStructuredDelivery(items, state, sessionFiles) {
   // 排序用的声明清单同样先提取干净路径——带注释的原文连 basename 都对不上
   const declaredClean = declared.flatMap((d) => extractArtifactPaths(d));
   const files = completion
-    ? mergeCompletionArtifactFiles(declared, sessionFiles)
-    : (sessionFiles ?? []).filter((f) => f && f.kind !== "upload");
+    ? mergeCompletionArtifactFiles(declared, sessionFiles, { extras: "delivery" })
+    : (sessionFiles ?? []).filter((f) => f && f.path && f.kind !== "upload" && !isNoiseArtifact(f.path));
   const ranked = rankDeliveryArtifacts(files, { task: state?.task ?? "", declared: declaredClean });
   return weaveDeliveryArtifacts(out, ranked, state?.runId ?? null);
 }
@@ -7055,22 +8884,142 @@ export function renderChatStream(items, state) {
 }
 
 /**
- * 模型正文的渲染入口：散文走 Markdown，**纯 JSON 输出走代码块**。
+ * 是否像编排计划契约：`{ subtasks: [{ id, title, ... }] }`。
+ * 判据按内容不按来源——planner 落进对话的裸 JSON 与日后别处同形状一并受益。
+ */
+export function looksLikePlanPayload(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const subs = value.subtasks;
+  if (!Array.isArray(subs) || subs.length === 0) return false;
+  return subs.every(
+    (t) =>
+      t &&
+      typeof t === "object" &&
+      typeof t.id === "string" &&
+      t.id.length > 0 &&
+      typeof t.title === "string",
+  );
+}
+
+/** 流式半截是否像在吐计划 JSON（宁可多判，也不要再铺一面墙） */
+export function looksLikePlanJsonStream(text) {
+  const t = String(text ?? "").trimStart();
+  if (!t.startsWith("{")) return false;
+  return /"subtasks"\s*:/.test(t.slice(0, 400));
+}
+
+/**
+ * 从计划契约对象派生与 `derivePlanFace` 同形的「草稿面」——全部 pending，
+ * 供对话卡在正式 `plan` 事件到达前也能画分层图。
+ */
+export function buildPlanDraftFace(parsed) {
+  if (!looksLikePlanPayload(parsed)) return null;
+  const subs = parsed.subtasks.map((t) => ({
+    id: String(t.id),
+    title: String(t.title ?? t.id),
+    pack: t.pack == null ? null : String(t.pack),
+    description: typeof t.description === "string" ? t.description : "",
+    acceptance: Array.isArray(t.acceptance) ? t.acceptance.map(String) : [],
+    dependsOn: Array.isArray(t.dependsOn) ? t.dependsOn.map(String) : [],
+    resources: Array.isArray(t.resources) ? t.resources.map(String) : [],
+  }));
+  const byId = new Map(subs.map((t) => [t.id, t]));
+  const depth = new Map();
+  const computing = new Set();
+  const depthOf = (id) => {
+    if (depth.has(id)) return depth.get(id);
+    if (computing.has(id)) return 0;
+    computing.add(id);
+    const t = byId.get(id);
+    const d = !t || t.dependsOn.length === 0
+      ? 0
+      : Math.max(...t.dependsOn.map((p) => depthOf(p) + 1));
+    computing.delete(id);
+    depth.set(id, d);
+    return d;
+  };
+  const nodes = subs.map((t) => ({
+    ...t,
+    depth: depthOf(t.id),
+    status: "pending",
+    durationMs: null,
+    reworks: null,
+    verdict: null,
+  }));
+  const layers = [];
+  for (const n of nodes) (layers[n.depth] ??= []).push(n);
+  return {
+    concurrency: Number(parsed.concurrency ?? 1) || 1,
+    concurrencyMode: String(parsed.concurrencyMode ?? "fixed"),
+    plannerMs: 0,
+    nodes,
+    layers: layers.map((l) => l ?? []),
+    parallelWidth: Math.max(1, ...layers.map((l) => (l ?? []).length)),
+    maxDuration: 1,
+    timing: null,
+    completed: null,
+    planned: true,
+    plannerRaw: null,
+    plannerRecovery: null,
+    plannerFailure: null,
+    warnings: [],
+    skipped: [],
+    gate: null,
+  };
+}
+
+/**
+ * 对话内的编排计划卡：分层 = 可并发语义；甘特条在有耗时时由 `renderPlanNode` 画出。
+ * 原始 JSON 收进 `<details>`，默认不占视线。
+ */
+export function renderPlanChatCard(plan, { live = false, rawJson = null } = {}) {
+  if (!plan || !plan.nodes?.length) return "";
+  let html =
+    `<div class="chat-plan${live ? " chat-plan--live" : ""}" role="group" aria-label="编排计划">` +
+    `<div class="chat-plan-head">` +
+    `<strong class="chat-plan-title">${live ? "正在整理编排计划" : "编排计划"}</strong>` +
+    `<span class="chat-plan-meta">` +
+    `${plan.nodes.length} 步 · 层宽 ${plan.parallelWidth}` +
+    `${plan.concurrency ? ` · 并行度 ${plan.concurrency}` : ""}` +
+    `</span></div>`;
+  html += '<ol class="plan-layers chat-plan-layers">';
+  plan.layers.forEach((layer, i) => {
+    html += `<li class="plan-layer"><span class="plan-layer-label">第 ${i + 1} 层${
+      layer.length > 1 ? `（${layer.length} 个可并发）` : ""
+    }</span>`;
+    html += '<div class="plan-nodes">';
+    for (const n of layer) html += renderPlanNode(n, plan.maxDuration);
+    html += "</div></li>";
+  });
+  html += "</ol>";
+  if (rawJson) {
+    html +=
+      `<details class="chat-aside chat-plan-raw"><summary>查看原始 JSON</summary>` +
+      `<pre class="md-code chat-plan-raw-pre">${esc(rawJson)}</pre></details>`;
+  }
+  html += "</div>";
+  return html;
+}
+
+/**
+ * 模型正文的渲染入口：散文走 Markdown；**编排计划契约走分层卡**；
+ * 其余纯 JSON 仍走代码块 pretty-print。
  *
- * 动机（委托方反馈："只有 planner 的输出没做成 markdown，很突兀"）：
- * planner / verifier 的输出契约是**裸 JSON**（不带围栏），Markdown 渲染器对它
- * 无事可做，于是一面墙的原始 JSON 以正文段落的样子杵在对话里。根因不在
- * 渲染分支——所有来源本就走同一支 renderMarkdown——在内容本身。
- *
- * 判据是【内容】不是【来源】：整体 JSON.parse 得过的对象/数组才算，
- * 散文零误伤；这样 verifier 若有裸 JSON 落进对话也一并受益。
- * pretty-print 只发生在展示层，事件流里的原文一字未动（审计面不受影响）。
+ * 动机演进：先是「裸 JSON 别当散文墙」（代码块）；委托方进一步要求
+ * 「计划不要直接露 JSON，要流程图/甘特式可视化」——计划形状单独分支。
+ * pretty-print / 卡片只发生在展示层，事件流原文不动。
  */
 function renderAssistantText(text) {
   const t = String(text ?? "").trim();
   if (t.startsWith("{") || t.startsWith("[")) {
     try {
       const parsed = JSON.parse(t);
+      const draft = buildPlanDraftFace(parsed);
+      if (draft) {
+        return renderPlanChatCard(draft, {
+          rawJson: JSON.stringify(parsed, null, 2),
+        });
+      }
       return renderMarkdown("```json\n" + JSON.stringify(parsed, null, 2) + "\n```");
     } catch {
       // 不是纯 JSON（散文里恰好以花括号开头）——按散文走
@@ -7080,13 +9029,25 @@ function renderAssistantText(text) {
 }
 
 /**
- * 直播文本的渲染：与落定条目同一支 Markdown，外加一个流式特化——
- * 开头就像 JSON 的流（planner/verifier 的契约输出）直接套上 json 围栏，
- * 借渲染器"缺收尾围栏也成块"的既有容忍，让它**从第一个字起就以代码块的
- * 样子流入**；整轮落定后由 renderAssistantText 接手 pretty-print，形态连续。
+ * 直播文本：计划 JSON 流先出「整理中」卡，能 parse 后立刻换成分层图；
+ * 其它 JSON 流仍走代码块围栏；散文走 Markdown。
  */
 function renderLiveText(text) {
   const t = String(text ?? "");
+  if (looksLikePlanJsonStream(t)) {
+    try {
+      const parsed = JSON.parse(t.trim());
+      const draft = buildPlanDraftFace(parsed);
+      if (draft) return renderPlanChatCard(draft, { live: true });
+    } catch {
+      // 半截 JSON
+    }
+    return (
+      `<div class="chat-plan chat-plan--live" role="status">` +
+      `<div class="chat-plan-head"><strong class="chat-plan-title">正在整理编排计划…</strong></div>` +
+      `</div>`
+    );
+  }
   if (/^\s*[{[]/.test(t)) return renderMarkdown("```json\n" + t);
   return renderMarkdown(t);
 }
@@ -7100,14 +9061,14 @@ function renderArtifactCard(f, runId) {
   const image = isImagePath(f.path);
   const primaryOpen = image || /\.html?$/i.test(f.path);
   const thumb = image
-    ? `<a class="chat-artifact-thumb" href="${esc(href)}" target="_blank" rel="noopener noreferrer">` +
+    ? `<a class="chat-artifact-thumb" href="${esc(href)}" data-canvas-open="${esc(f.path)}">` +
       `<img src="${esc(href)}" alt="${esc(name)}" loading="lazy" /></a>`
     : `<span class="chat-artifact-icon" aria-hidden="true"><i class="ph ${icon}"></i></span>`;
   const primary = primaryOpen
     ? `<button type="button" class="chat-artifact-primary" data-canvas-open="${esc(f.path)}">打开</button>`
     : `<button type="button" class="chat-artifact-primary" data-reveal="${esc(f.path)}">在文件夹中显示</button>`;
   const menu = [
-    primaryOpen ? "" : `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer">打开</a>`,
+    primaryOpen ? "" : `<button type="button" data-canvas-open="${esc(f.path)}">打开</button>`,
     `<a href="${esc(href)}&download=1">下载</a>`,
     primaryOpen ? `<button type="button" data-reveal="${esc(f.path)}">在文件夹中显示</button>` : "",
   ].filter(Boolean).join("");
@@ -7115,7 +9076,7 @@ function renderArtifactCard(f, runId) {
     `<div class="chat-artifact" data-artifact-path="${esc(f.path)}">` +
     thumb +
     `<div class="chat-artifact-body">` +
-    `<a class="chat-artifact-name" href="${esc(href)}" target="_blank" rel="noopener noreferrer" title="${esc(f.path)}">${esc(short)}</a>` +
+    `<a class="chat-artifact-name" href="${esc(href)}" data-canvas-open="${esc(f.path)}" title="${esc(f.path)}">${esc(short)}</a>` +
     `<span class="chat-artifact-kind">${esc(kind)}</span>` +
     `</div>` +
     `<div class="chat-artifact-cta">` +
@@ -7152,9 +9113,34 @@ function renderChatArtifacts(it) {
   );
 }
 
-/**
- * Thinking 折叠块：点开看过程，再点一次收起。偏好记在 THINKING_PREF_KEY。
- */
+/** 收官后的编排计划 / 子代理：默认收成一行，点开看原卡。 */
+function renderFoldedConversationChrome(folded, summary, inner) {
+  if (!folded) return inner;
+  return (
+    `<details class="chat-aside chat-chrome-fold">` +
+    `<summary>${esc(summary)}</summary>` +
+    `<div class="chat-chrome-fold-body">${inner}</div></details>`
+  );
+}
+
+function renderCompletionFolds(it) {
+  const blocks = [
+    ["验证", it.verification],
+    ["假设与前提", it.assumptions],
+  ];
+  let html = "";
+  for (const [title, items] of blocks) {
+    if (!Array.isArray(items) || items.length === 0) continue;
+    html +=
+      `<details class="chat-aside chat-completion-fold">` +
+      `<summary>${esc(title)} · ${items.length}</summary>` +
+      `<ul class="chat-completion-fold-list">` +
+      items.map((item) => `<li>${esc(item)}</li>`).join("") +
+      `</ul></details>`;
+  }
+  return html;
+}
+
 function renderThinkingDetails(text, { open = false, live = false, redacted = false } = {}) {
   const cls = [
     "chat-thinking",
@@ -7188,34 +9174,65 @@ export function renderChatItem(it, thinkingOpen = false) {
         html += renderSegmentBoundary({ role: it.role, round: it.round ?? 0, source: it.source });
         break;
       case "user": {
-        const { body, attachments } = splitUserMessageAttachments(it.text);
+        const { displayBody, attachments } = splitUserMessageAttachments(it.text);
         const runId = it.runId ?? null;
-        const thumbs = attachments
-          .filter((p) => isImagePath(p) && runId)
+        const imageAtts = attachments.filter((p) => isImagePath(p) && runId);
+        const previews = imageAtts
           .map((p) => {
             const href = `/api/runs/${encodeURIComponent(runId)}/artifact?path=${encodeURIComponent(p)}`;
             return (
-              `<a class="chat-attach-thumb" href="${esc(href)}" target="_blank" rel="noopener noreferrer" title="${esc(p)}">` +
+              `<a class="chat-attach-preview" href="${esc(href)}" data-canvas-open="${esc(p)}" title="${esc(p)}">` +
               `<img src="${esc(href)}" alt="${esc(p)}" loading="lazy" /></a>`
             );
           })
           .join("");
+        const captions = attachments
+          .map((p) => `<div class="chat-attach-caption">附件：${esc(p)}</div>`)
+          .join("");
+        const bodyHtml = displayBody
+          ? `<div class="chat-body chat-body--text md">${renderMarkdown(displayBody)}</div>`
+          : "";
+        const media = previews.length > 0;
         html +=
-          `<div class="chat-msg chat-msg--user">` +
+          `<div class="chat-msg chat-msg--user${media ? " chat-msg--user-media" : ""}">` +
           // 信息队列：运行中插队进来的指令，与正常追加区分开——它是"打断当前的思考"
           (it.steering ? `<div class="chat-msg-tag">插队指令</div>` : "") +
-          (thumbs ? `<div class="chat-attach-row">${thumbs}</div>` : "") +
-          `<div class="chat-body chat-body--text md">${renderMarkdown(body)}</div></div>`;
+          (looksLikeChatFeedback(it.text) ? `<div class="chat-msg-tag">反馈</div>` : "") +
+          (it.executorSwitched ? `<div class="chat-msg-tag">已切换模型 · 正史已接上</div>` : "") +
+          (previews ? `<div class="chat-attach-previews">${previews}</div>` : "") +
+          (media || captions
+            ? `<div class="chat-msg-user-copy">${captions}${bodyHtml}</div>`
+            : bodyHtml) +
+          `</div>`;
         break;
       }
-      case "text":
+      case "text": {
+        const planShaped = isPlanShapedAssistantText(it.text);
         html +=
-          `<div class="chat-msg chat-msg--assistant">` +
-          `<div class="chat-body chat-body--text md">${renderAssistantText(it.text)}</div></div>`;
+          `<div class="chat-msg chat-msg--assistant${planShaped ? " chat-msg--plan" : ""}">` +
+          `<div class="chat-body${planShaped ? "" : " chat-body--text md"}">${renderAssistantText(it.text)}</div>` +
+          renderCompletionFolds(it) +
+          `</div>`;
+        break;
+      }
+      case "plan":
+        html += renderFoldedConversationChrome(
+          it.folded,
+          `编排计划 · ${(it.plan?.nodes ?? []).length} 步`,
+          `<div class="chat-msg chat-msg--assistant chat-msg--plan"><div class="chat-body">${renderPlanChatCard(it.plan)}</div></div>`,
+        );
+        break;
+      case "agents":
+        html += renderFoldedConversationChrome(
+          it.folded,
+          `子代理 · ${(it.agents ?? []).length}`,
+          renderAgentsCard(it.agents ?? []),
+        );
         break;
       case "thinking":
         html += renderThinkingDetails(it.text, {
           open: thinkingOpen,
+          live: Boolean(it.live),
           redacted: Boolean(it.redacted),
         });
         break;
@@ -7232,16 +9249,17 @@ export function renderChatItem(it, thinkingOpen = false) {
        * 才变换——这与最终形态是同向收敛，不是抖动。
        */
       case "live":
-        if (it.thinking.trim()) {
+        if (String(it.thinking ?? "").trim() || it.waiting) {
           html += renderThinkingDetails(it.thinking, {
             open: thinkingOpen,
             live: true,
           });
         }
-        if (it.text.trim()) {
+        if (String(it.text ?? "").trim()) {
+          const planLive = looksLikePlanJsonStream(it.text);
           html +=
-            `<div class="chat-msg chat-msg--assistant chat-msg--live">` +
-            `<div class="chat-body chat-body--text md chat-live-text">${renderLiveText(it.text)}</div></div>`;
+            `<div class="chat-msg chat-msg--assistant chat-msg--live${planLive ? " chat-msg--plan" : ""}">` +
+            `<div class="chat-body${planLive ? "" : " chat-body--text md chat-live-text"}">${renderLiveText(it.text)}</div></div>`;
         }
         break;
       case "activity":
@@ -7295,6 +9313,7 @@ export function renderChatItem(it, thinkingOpen = false) {
       default:
         break;
     }
+    if ((it.kind === "user" || it.kind === "text") && it.showActions) html += renderChatMsgActions(it);
     return html;
   }
 }
@@ -7431,6 +9450,7 @@ const BASH_FLAG_WITH_ARG = new Set([
 const TOOL_VERB = {
   read_file: "read",
   write_file: "write",
+  write_pptx: "write",
   fetch_url: "fetch",
   describe_image: "看图",
   generate_image: "生图",
@@ -7873,11 +9893,13 @@ function renderLogEntry(e) {
   if (e.type === "tool_result" && e.resultIsError) cls += " log-entry--error";
   if (e.type === "approval_request") cls += " log-entry--approval";
   if (e.type === "api_retry") cls += " log-entry--warning";
+  if (e.type === "model_call_end" && e.status === "error") cls += " log-entry--warning";
   if (e.type === "model_fallback") cls += " log-entry--warning";
   if (e.type === "recovery_decision") cls += " log-entry--warning";
   if (e.type === "run_forked") cls += " log-entry--warning";
   if (e.type === "run_resumed") cls += " log-entry--warning";
   if (e.type === "compaction") cls += " log-entry--warning";
+  if (e.type === "hook" && (e.outcome === "error" || e.outcome === "block")) cls += " log-entry--warning";
   if (collapsed) cls += " log-entry--collapsed";
 
   // 折叠的工具调用也必须看得到路径入口：路径条独立于 body，避免用户为了打开
@@ -7946,12 +9968,42 @@ function renderLogEntryBody(e) {
         : `<div class="log-entry-body log-thinking md">${renderMarkdown(e.text ?? "")}</div>`;
     case "segment_resume":
       return `<div class="log-entry-body">整段因瞬时故障终止，已带着之前 ${esc(String(e.priorTurns ?? "?"))} 轮的会话正史接着跑（不是从头重来）。<br>原因：${esc(e.reason ?? "")}</div>`;
+    case "plan_replan": {
+      const bits = [
+        e.kept?.length ? `保留 ${e.kept.length}` : null,
+        e.added?.length ? `新增 ${e.added.length}` : null,
+        e.changed?.length ? `改写 ${e.changed.length}` : null,
+        e.dropped?.length ? `删掉 ${e.dropped.length}` : null,
+      ].filter(Boolean);
+      return `<div class="log-entry-body">按委托方新要求重规划${bits.length ? `（${esc(bits.join(" · "))}）` : ""}。<br>原因：${esc(e.reason ?? "")}</div>`;
+    }
+    case "plan_resume": {
+      const bits = [
+        e.kept?.length ? `跳过已通过 ${e.kept.length}` : null,
+        e.remaining?.length ? `续发射 ${e.remaining.length}` : null,
+      ].filter(Boolean);
+      return `<div class="log-entry-body">按落盘节点续发射半截计划${bits.length ? `（${esc(bits.join(" · "))}）` : ""}。<br>已通过：${esc((e.kept ?? []).join("、") || "无")}；待跑：${esc((e.remaining ?? []).join("、") || "无")}</div>`;
+    }
+    case "spawn_start":
+      return `<div class="log-entry-body">开调查支线：${esc(e.title ?? "")}（扣本 run 谱系预算，深度 1）</div>`;
+    case "spawn_done":
+      return `<div class="log-entry-body">${e.passed ? "支线完成" : "支线未完成"}：${esc(e.title ?? "")}${
+        e.summary ? `<br>${esc(String(e.summary).slice(0, 240))}` : ""
+      }${e.error ? `<br>错误：${esc(e.error)}` : ""}${
+        typeof e.turns === "number" ? `<br>轮次：${esc(String(e.turns))}` : ""
+      }</div>`;
     case "api_retry":
       // 等待时长要看得见：抖动之后同一 attempt 的等待不再是定值，
       // 只显示"第几次重试"会让人以为退避是固定的
       return `<div class="log-entry-body">原因：${esc(e.reason ?? "")}${
         typeof e.backoffMs === "number" ? `<br>退避等待：${esc(formatDuration(e.backoffMs))}（含抖动）` : ""
       }</div>`;
+    case "model_call_start":
+      return `<div class="log-entry-body">第 ${esc(String(e.turn ?? "?"))} 轮 · 第 ${esc(String((e.attempt ?? 0) + 1))} 次发送</div>`;
+    case "model_call_end":
+      return `<div class="log-entry-body">${e.status === "ok" ? "成功" : "失败"} · ${esc(
+        typeof e.durationMs === "number" ? formatDuration(e.durationMs) : "?",
+      )}</div>`;
     case "model_fallback":
       // 三件事都要写出来：换到了哪家、为什么离开上一家、这之后的输出归谁。
       {
@@ -7966,6 +10018,20 @@ function renderLogEntryBody(e) {
       return `<div class="log-entry-body">${esc(e.detail ?? "")}${
         typeof e.extraTurns === "number" ? `<br>追加额度：${esc(String(e.extraTurns))} 轮` : ""
       }</div>`;
+    case "file_rewind_snapshot":
+      return `<div class="log-entry-body">${esc(e.path ?? "")}` +
+        `${e.existed ? ` · ${esc(String(e.bytes ?? 0))} 字节` : " · 当时还不存在"}` +
+        `${e.skipped ? ` · 未存镜像（${esc(e.skipped)}）` : ""}</div>`;
+    case "conversation_rewound": {
+      const bits = [];
+      if (e.revertFiles) bits.push("连改动一起退");
+      if (e.restored?.length) bits.push(`还原 ${e.restored.length} 个`);
+      if (e.deleted?.length) bits.push(`删除 ${e.deleted.length} 个`);
+      if (e.gitRestored?.length) bits.push(`git 退回 ${e.gitRestored.length} 个`);
+      if (e.skipped?.length) bits.push(`未还原 ${e.skipped.length} 个`);
+      return `<div class="log-entry-body">父运行 <code>${esc(e.parentRunId ?? "")}</code> · 裁到 seq ${esc(String(e.rewindSeq ?? ""))}` +
+        `${bits.length ? `<br>${esc(bits.join("；"))}` : ""}</div>`;
+    }
     case "run_forked": {
       const budget = e.inheritedBudget ?? {};
       const budgetText = [
@@ -7995,6 +10061,11 @@ function renderLogEntryBody(e) {
         (typeof e.ledgerEntries === "number" ? ` · 账本 ${e.ledgerEntries} 条` : "") +
         (e.summaryApplied ? " · 已合并 LLM 摘要" : "") +
         `</div>`;
+    case "hook":
+      return `<div class="log-entry-body">${esc(e.hook ?? "")}${e.tool ? ` · ${esc(e.tool)}` : ""} · ${esc(e.outcome ?? "")}` +
+        (e.timedOut ? " · 超时" : e.exitCode != null ? ` · exit ${esc(String(e.exitCode))}` : "") +
+        (e.detail ? `<br>${esc(e.detail)}` : "") +
+        `</div>`;
     default:
       return "";
   }
@@ -8023,14 +10094,23 @@ function entryIcon(type, isError) {
     case "assistant_thinking": return "✽"; // 与对话视图同款，自成语域
     case "approval_request": return "⚠"; // cli.ts:539
     case "api_retry": return "⟳";        // cli.ts:563
+    case "model_call_start": return "▷";
+    case "model_call_end": return "■";
     case "segment_resume": return "⟲";   // 与 ⟳(同轮重试) 区分：这是整段续跑
+    case "plan_replan": return "⧉";
+    case "plan_resume": return "↺";
+    case "spawn_start": return "⧉";
+    case "spawn_done": return "⧉";
     case "model_fallback": return "⇄";   // 前两个换的是时机，这个换的是端点（cli.ts 同款）
     case "recovery_decision": return "⤷";
     case "run_forked": return "↗";
+    case "conversation_rewound": return "↩";
+    case "file_rewind_snapshot": return "▣";
     case "run_resumed": return "↺";
     // CLI 对压缩也用 ⚠，这里刻意分开：V-19 要求不可逆自成语域，
     // 与普通警告共用符号会让人对它脱敏
     case "compaction": return "⊟";
+    case "hook": return "‡";
     case "user_message": return "✎";
     // 信息队列：插队是"插到正在想的这一轮前面"，排队是"排在这一轮后面"
     case "steering": return "⇢";
@@ -8061,7 +10141,27 @@ function entryActionLabel(e) {
       return e.redacted ? "思考过程（已加密）" : `思考过程（${(e.text ?? "").length} 字）`;
     case "approval_request": return `审批请求：${e.name ?? ""}`;
     case "api_retry": return `API 重试（第${e.attempt ?? "?"}次）`;
+    case "model_call_start": return `模型请求开始（第${(e.attempt ?? 0) + 1}次）`;
+    case "model_call_end": return e.status === "error" ? "模型请求失败" : "模型请求结束";
     case "segment_resume": return `瞬时失败后带正史续跑（已完成 ${e.priorTurns ?? "?"} 轮）`;
+    case "plan_replan": {
+      const bits = [
+        e.kept?.length ? `保留 ${e.kept.length}` : null,
+        e.added?.length ? `新增 ${e.added.length}` : null,
+        e.changed?.length ? `改写 ${e.changed.length}` : null,
+        e.dropped?.length ? `删掉 ${e.dropped.length}` : null,
+      ].filter(Boolean);
+      return `重规划${bits.length ? `（${bits.join(" · ")}）` : ""}`;
+    }
+    case "plan_resume": {
+      const bits = [
+        e.kept?.length ? `跳过 ${e.kept.length}` : null,
+        e.remaining?.length ? `续跑 ${e.remaining.length}` : null,
+      ].filter(Boolean);
+      return `半截计划续发射${bits.length ? `（${bits.join(" · ")}）` : ""}`;
+    }
+    case "spawn_start": return `支线开始：${e.title ?? ""}`;
+    case "spawn_done": return `支线${e.passed ? "完成" : "未完成"}：${e.title ?? ""}`;
     case "model_fallback": return `端点降级${e.role && e.role !== "executor" ? `[${e.role}]` : ""}：${e.from ?? "?"} → ${e.to ?? "?"}`;
     case "recovery_decision": {
       const labels = {
@@ -8073,8 +10173,16 @@ function entryActionLabel(e) {
       return labels[e.action] ?? "恢复路由";
     }
     case "run_forked": return "从归档检查点派生";
+    case "conversation_rewound": return e.revertFiles ? "已回退对话和改动" : "已回退对话";
+    case "file_rewind_snapshot": return e.existed ? `记下改前文件 ${e.path ?? ""}` : `记下新建文件 ${e.path ?? ""}`;
     case "run_resumed": return "同运行热恢复";
     case "compaction": return "上下文压缩";
+    case "hook": {
+      const who = e.tool ? `${e.hook ?? "hook"} ${e.tool}` : (e.hook ?? "hook");
+      if (e.outcome === "block") return `${who} 阻断`;
+      if (e.outcome === "error") return `${who} 错误`;
+      return `${who} 放行`;
+    }
     case "usage": return "本轮用量";
     case "user_message":
       return `追加指令（第 ${e.turn ?? "?"} 轮对话${e.verify === true ? "，本轮核查" : e.verify === false ? "，本轮不核查" : ""}）`;
@@ -8119,6 +10227,10 @@ function entryDetail(e) {
       return truncate(formatInput(e.input), 60);
     case "api_retry":
       return e.reason ?? "";
+    case "model_call_start":
+      return `第 ${e.turn ?? "?"} 轮`;
+    case "model_call_end":
+      return e.status === "error" ? "失败" : "成功";
     case "model_fallback":
       return fallbackReasonText(e.reason);
     case "recovery_decision":
@@ -8127,6 +10239,8 @@ function entryDetail(e) {
       return e.boundary ?? "";
     case "run_resumed":
       return e.boundary ?? "";
+    case "plan_resume":
+      return (e.remaining ?? []).join("、") || (e.kept ?? []).join("、");
     case "user_message":
       return truncate(e.text ?? "", 80);
     case "steering":
@@ -8135,6 +10249,8 @@ function entryDetail(e) {
       return truncate(e.text ?? "", 60);
     case "message_queue_updated":
       return e.sendError ?? "";
+    case "hook":
+      return e.detail ?? (e.timedOut ? "超时" : e.outcome === "block" ? "阻断" : "");
     default:
       return "";
   }
@@ -8310,42 +10426,599 @@ function renderVerdictCard(v) {
  * 让人看清自己要提交什么，是这个 harness 一贯的做法。
  */
 export const EXAMPLE_TASKS = [
-  { label: "问一个问题", text: "用三句话解释什么是 PID 控制器。不要调用工具。" },
-  { label: "读一读这个项目", text: "看看当前工作目录里有哪些源文件，用一段话总结这个项目在做什么。" },
-  { label: "写个文件（会问你要不要放行）", text: "在工作目录下创建 hello.md，写一段这个项目的简介。" },
+  { label: "问", hint: "纯问答，不调用工具", text: "用三句话解释什么是 PID 控制器。不要调用工具。" },
+  { label: "读", hint: "总结当前工作目录", text: "看看当前工作目录里有哪些源文件，用一段话总结这个项目在做什么。" },
+  { label: "写", hint: "创建文件（会问审批）", text: "在工作目录下创建 hello.md，写一段这个项目的简介。" },
   { label: "带独立核查的交付", text: "写一个 TypeScript 函数 clamp(n, min, max) 并配 vitest 测试，跑通后告诉我结果。" },
 ];
 
-export function renderEmptyState(hasRuns) {
+/** 空态画廊只露出前三条。 */
+export const STARTER_EXAMPLE_TASKS = EXAMPLE_TASKS.slice(0, 3);
+
+/** 开会话时选的 design 模板（画布顶条不再放模板） */
+export const DESIGN_STARTER_TEMPLATES = [
+  {
+    id: "deck-basic",
+    title: "多页幻灯",
+    hint: "一页一个主张，适合介绍与汇报",
+    prompt: "用多页幻灯做一套介绍：主题自拟，一页一个主张。",
+  },
+  {
+    id: "social-basic",
+    title: "社媒方图",
+    hint: "三张 1080，可发朋友圈",
+    prompt: "做三张 1080 方图，适合朋友圈或社媒轮播。",
+  },
+  {
+    id: "landing-basic",
+    title: "单页落地",
+    hint: "单页网站，适合产品或活动介绍",
+    prompt: "用落地页做一页介绍：主题自拟，不要外链。",
+  },
+];
+
+export function designTemplateById(id) {
+  return DESIGN_STARTER_TEMPLATES.find((t) => t.id === id) ?? null;
+}
+
+export const DESIGN_LOOKS = Object.freeze([
+  Object.freeze({ id: "ink", label: "墨水", prompt: "墨水 / ink", bg: "#0f1419", fg: "#f4f1ea", accent: "#3b82f6" }),
+  Object.freeze({ id: "paper", label: "暖纸", prompt: "暖纸 / paper", bg: "#f4f1ea", fg: "#1a1814", accent: "#b0522f" }),
+  Object.freeze({ id: "night", label: "夜色", prompt: "夜色 / night", bg: "#0b1020", fg: "#e8eefc", accent: "#7dd3fc" }),
+  Object.freeze({ id: "meadow", label: "草地", prompt: "草地 / meadow", bg: "#f3f6ef", fg: "#1e2a1c", accent: "#3f7d4e" }),
+  Object.freeze({ id: "terracotta", label: "陶土", prompt: "陶土 / terracotta", bg: "#2a1812", fg: "#f6ebe4", accent: "#c15f3c" }),
+]);
+
+const LOOK_CLAUSE_RE = /\s*色板用「[^」]+」。\s*$/;
+
+export function designLookById(id) {
+  return DESIGN_LOOKS.find((l) => l.id === id) ?? null;
+}
+
+export function stripLookClause(text) {
+  return String(text ?? "").replace(LOOK_CLAUSE_RE, "").trimEnd();
+}
+
+export function sampleTakesLook(sample) {
+  return sample?.template === "deck-basic" || sample?.template === "social-basic";
+}
+
+export function promptTakesLook(text) {
+  const t = stripLookClause(text);
+  return /deck-basic|social-basic|data-look|多页幻灯|介绍幻灯|封面主张|杂志风幻灯|三点汇报|社媒方图|1080/.test(t);
+}
+
+export function composePromptWithLook(prompt, lookId) {
+  const base = stripLookClause(prompt).trim();
+  const look = designLookById(lookId);
+  if (!base || !look || !promptTakesLook(base)) return base;
+  return `${base} 色板用「${look.prompt}」。`;
+}
+
+export function isDesignTemplatePrompt(text) {
+  const t = stripLookClause(text).trim();
+  return DESIGN_STARTER_TEMPLATES.some((item) => item.prompt === t);
+}
+
+/**
+ * 新建对话空态：FATHOM hero（徽记 + 字标 + 主标语）。
+ * 模板与示例在 #starter-gallery（提交栏下方），由 renderStarterGallery 单独画。
+ */
+export function renderEmptyState(_hasRuns, _opts = {}) {
   const mainEl = document.getElementById("main-area");
   if (!mainEl) return;
-  const icons = ["ph-chats-circle", "ph-file-plus", "ph-code"];
+  const designClass = _opts.designModeActive ? " empty-state--design" : "";
   mainEl.innerHTML =
-    '<div class="empty-state empty-state--welcome">' +
-    '<div class="empty-icon" aria-hidden="true"><i class="ph ph-chat-centered-dots"></i></div>' +
-    '<span class="empty-eyebrow">HARNESS WORKSPACE</span>' +
-    `<h2>${hasRuns ? "开始一段新对话" : "从一个明确目标开始"}</h2>` +
-    `<p>${hasRuns
-      ? "工作目录决定工具可触碰的边界；选好项目与角色模型，再把目标交给 Agent。"
-      : "先选工作目录与角色模型，再描述目标。下面的例子只会填入输入框，由你确认后提交。"}</p>` +
-    '<div class="empty-hints">' +
-    '<button type="button" class="empty-workdir-hint" data-focus-workdir="1">' +
-    '<i class="ph ph-folder-simple" aria-hidden="true"></i>先选定这次任务的工作目录</button>' +
-    '<button type="button" class="empty-workdir-hint" data-replay-onboarding="1">' +
-    '<i class="ph ph-hand-waving" aria-hidden="true"></i>看看怎么用</button>' +
-    "</div>" +
-    '<ul class="example-tasks">' +
-    EXAMPLE_TASKS.map(
-      (e, index) =>
-        `<li><button type="button" class="example-task" data-example="${esc(e.text)}">` +
-        `<i class="ph ${icons[index] ?? "ph-chat"}" aria-hidden="true"></i>` +
-        '<span class="example-copy">' +
-        `<span class="example-label">${esc(e.label)}</span>` +
-        `<span class="example-text">${esc(e.text)}</span></span>` +
-        '<i class="ph ph-arrow-up-right example-arrow" aria-hidden="true"></i>' +
+    `<div class="empty-state empty-state--welcome${designClass}">` +
+    '<p class="empty-eyebrow">Agent Console</p>' +
+    '<span class="empty-mark" aria-hidden="true">' +
+    '<svg class="fathom-plumb" width="46" height="46" viewBox="0 0 24 24">' +
+    '<line class="fathom-tick" x1="6" y1="2.5" x2="6" y2="21.5" stroke-width="1"/>' +
+    '<line class="fathom-tick" x1="6" y1="5.2" x2="9.6" y2="5.2" stroke-width="1.1"/>' +
+    '<line class="fathom-tick" x1="6" y1="9.4" x2="9.6" y2="9.4" stroke-width="1.1"/>' +
+    '<line class="fathom-tick" x1="6" y1="13.6" x2="9.6" y2="13.6" stroke-width="1.1"/>' +
+    '<line class="fathom-tick" x1="6" y1="17.8" x2="9.6" y2="17.8" stroke-width="1.1"/>' +
+    '<line class="fathom-line" x1="16.6" y1="2.5" x2="16.6" y2="14" stroke-width="1.6"/>' +
+    '<circle class="fathom-bob" cx="16.6" cy="17.4" r="1.9"/>' +
+    "</svg></span>" +
+    '<p class="empty-brand">FATHOM<span class="fw-dot">.</span></p>' +
+    '<p class="empty-tagline">see every run to the bottom.</p>' +
+    '<p class="empty-tagline-cn">每一层都看得见。</p>' +
+    '<span class="empty-depthline" aria-hidden="true"></span>' +
+    "</div>";
+}
+
+/** 设计模式六页签。进入后先出页签 chip，再展开该页签下的样例卡。 */
+export const DESIGN_MODE_TABS = Object.freeze([
+  "Prototype",
+  "Live Artifact",
+  "Deck",
+  "Template",
+  "Media",
+  "Other",
+]);
+
+/** 页签内部值保持英文（路由 / data-design-tab）；界面只显示中文。 */
+export const DESIGN_MODE_TAB_LABELS = Object.freeze({
+  Prototype: "原型",
+  "Live Artifact": "实时产物",
+  Deck: "幻灯",
+  Template: "模板",
+  Media: "媒体",
+  Other: "其他",
+});
+
+export function designTabLabel(tab) {
+  return DESIGN_MODE_TAB_LABELS[tab] || tab;
+}
+
+/**
+ * 设计模式空态样例卡（UI only）。页签 3–5 张，缩略图用 CSS 迷你版式。
+ * designId 走现有注册表；template 填本地种子目录名。
+ */
+export const DESIGN_SAMPLE_CARDS = Object.freeze([
+  Object.freeze({
+    id: "proto-free",
+    tab: "Prototype",
+    title: "自由风格",
+    thumb: "blank",
+    designId: "web-prototype",
+    template: null,
+    prompt: "从空白做一页网页原型：主题自拟，相对 CSS，不要外链 CDN。",
+  }),
+  Object.freeze({
+    id: "proto-landing",
+    tab: "Prototype",
+    title: "落地主视觉",
+    thumb: "landing",
+    designId: "saas-landing",
+    template: "landing-basic",
+    prompt: "用 landing-basic 落地页模板做一页介绍：主题自拟，相对 CSS，不要外链 CDN。",
+  }),
+  Object.freeze({
+    id: "proto-mobile",
+    tab: "Prototype",
+    title: "移动应用",
+    thumb: "mobile",
+    designId: "mobile-app",
+    template: null,
+    prompt: "做一款移动应用原型：手机装框，启动后是主界面，相对 CSS，不要外链 CDN。",
+  }),
+  Object.freeze({
+    id: "proto-3d",
+    tab: "Prototype",
+    title: "三维对象",
+    thumb: "cube",
+    designId: "3d-object",
+    template: null,
+    prompt: "做一个可交互的三维对象页：自包含 HTML，shader 或 WebGL 场景，相对资源。",
+  }),
+  Object.freeze({
+    id: "live-free",
+    tab: "Live Artifact",
+    title: "自由风格",
+    thumb: "blank",
+    designId: "dashboard",
+    template: null,
+    prompt: "从空白做一块管理台：侧栏加主区，主题自拟，相对 CSS。",
+  }),
+  Object.freeze({
+    id: "live-ops",
+    tab: "Live Artifact",
+    title: "运营看板",
+    thumb: "dashboard",
+    designId: "dashboard",
+    template: null,
+    prompt: "做一块运营看板：关键指标、近期动态和一张简表，带侧栏。",
+  }),
+  Object.freeze({
+    id: "live-metrics",
+    tab: "Live Artifact",
+    title: "分析台",
+    thumb: "dashboard",
+    designId: "dashboard",
+    template: null,
+    prompt: "做一块分析台：趋势图占位、转化漏斗和分面筛选。",
+  }),
+  Object.freeze({
+    id: "live-monitor",
+    tab: "Live Artifact",
+    title: "监控墙",
+    thumb: "dashboard",
+    designId: "dashboard",
+    template: null,
+    prompt: "做一块监控墙：服务健康、延迟和告警列表。",
+  }),
+  Object.freeze({
+    id: "deck-free",
+    tab: "Deck",
+    title: "自由风格",
+    thumb: "blank",
+    designId: "html-ppt",
+    template: "deck-basic",
+    prompt: "做一套介绍幻灯：主题自拟，一页一个主张。",
+  }),
+  Object.freeze({
+    id: "deck-cover",
+    tab: "Deck",
+    title: "封面主张",
+    thumb: "deck",
+    designId: "guizang-ppt",
+    template: "deck-basic",
+    prompt: "做一套封面主张幻灯：大标题加一句导语，再补要点与收束。",
+  }),
+  Object.freeze({
+    id: "deck-magazine",
+    tab: "Deck",
+    title: "杂志风",
+    thumb: "magazine",
+    designId: "guizang-ppt",
+    template: "deck-basic",
+    prompt: "做一套杂志风幻灯：封面有刊头和大图，内页分栏。",
+  }),
+  Object.freeze({
+    id: "deck-bullets",
+    tab: "Deck",
+    title: "要点页",
+    thumb: "bullets",
+    designId: "html-ppt",
+    template: "deck-basic",
+    prompt: "做一套三点汇报幻灯：封面、要点、收束各一页。",
+  }),
+  Object.freeze({
+    id: "doc-free",
+    tab: "Template",
+    title: "空白文档",
+    thumb: "blank",
+    designId: null,
+    template: null,
+    prompt: "从空白写一份文档页：标题、目录和正文，HTML 可预览。",
+  }),
+  Object.freeze({
+    id: "doc-spec",
+    tab: "Template",
+    title: "产品规格",
+    thumb: "doc",
+    designId: "pm-spec",
+    template: "pm-spec",
+    prompt: "写一份产品规格：含目录、需求与决策日志，HTML 单页。",
+  }),
+  Object.freeze({
+    id: "doc-spec-deck",
+    tab: "Template",
+    title: "规格 + 幻灯",
+    thumb: "doc",
+    designId: "spec-plus-deck",
+    template: null,
+    prompt: "写一份产品规格，并做成三页汇报幻灯。",
+  }),
+  Object.freeze({
+    id: "doc-okr",
+    tab: "Template",
+    title: "团队 OKR",
+    thumb: "okr",
+    designId: "team-okrs",
+    template: "team-okrs",
+    prompt: "做一张团队 OKR 记分卡：目标、关键结果和进度。",
+  }),
+  Object.freeze({
+    id: "doc-finance",
+    tab: "Template",
+    title: "财务摘要",
+    thumb: "doc",
+    designId: "finance-report",
+    template: null,
+    prompt: "做一份管理层财务摘要：收入、支出和要点结论。",
+  }),
+  Object.freeze({
+    id: "media-free",
+    tab: "Media",
+    title: "社媒方图",
+    hint: "三张 1080，可发朋友圈",
+    thumb: "poster",
+    designId: "social-carousel",
+    template: "social-basic",
+    prompt: "做三张 1080 方图，适合朋友圈或社媒轮播。",
+  }),
+  Object.freeze({
+    id: "media-poster",
+    tab: "Media",
+    title: "杂志海报",
+    hint: "一张 1080 方图",
+    thumb: "poster",
+    designId: "magazine-poster",
+    template: "social-basic",
+    prompt: "做一张 1080 杂志海报：大标题加一句导语。",
+  }),
+  Object.freeze({
+    id: "media-email",
+    tab: "Media",
+    title: "营销邮件",
+    thumb: "email",
+    designId: "email-marketing",
+    template: null,
+    prompt: "做一封营销邮件：表格降级安全，有页头、正文和行动号召。",
+  }),
+  Object.freeze({
+    id: "media-motion",
+    tab: "Media",
+    title: "动效画幅",
+    thumb: "motion",
+    designId: "motion-frames",
+    template: null,
+    prompt: "做一段循环 CSS 动效主视觉：单页，不要外链库。",
+  }),
+  Object.freeze({
+    id: "other-free",
+    tab: "Other",
+    title: "自由风格",
+    thumb: "blank",
+    designId: "critique",
+    template: null,
+    prompt: "从空白做一张自评或清单页：主题自拟。",
+  }),
+  Object.freeze({
+    id: "other-critique",
+    tab: "Other",
+    title: "自评表",
+    thumb: "check",
+    designId: "critique",
+    template: null,
+    prompt: "做一张五维自评记分表：可勾选、有简短评语栏。",
+  }),
+  Object.freeze({
+    id: "other-tweaks",
+    tab: "Other",
+    title: "微调清单",
+    thumb: "check",
+    designId: "tweaks",
+    template: null,
+    prompt: "列一份微调面板清单：把可调的视觉参数写成控件列表。",
+  }),
+]);
+
+export function designSamplesForTab(tab) {
+  return DESIGN_SAMPLE_CARDS.filter((s) => s.tab === tab);
+}
+
+export function designSampleById(id) {
+  return DESIGN_SAMPLE_CARDS.find((s) => s.id === id) ?? null;
+}
+
+export function resolveDesignSampleChoice(sampleId) {
+  const sample = designSampleById(sampleId);
+  if (!sample) return null;
+  return {
+    sampleId: sample.id,
+    designId: sample.designId || null,
+    designTemplate: sample.template || null,
+    prompt: sample.prompt,
+  };
+}
+
+export function isDesignSamplePrompt(text) {
+  const t = stripLookClause(text).trim();
+  return DESIGN_SAMPLE_CARDS.some((item) => item.prompt === t);
+}
+
+/** 点样例卡之后的 composer 状态。输入已有人写的字不覆盖。 */
+export function nextDesignSampleState(sampleId, prev = {}, { toggle = false } = {}) {
+  const choice = resolveDesignSampleChoice(sampleId);
+  const prevPrompt = String(prev.prompt ?? "");
+  const prevLook = prev.selectedDesignLook ?? null;
+  if (!choice) {
+    return {
+      selectedDesignSample: prev.selectedDesignSample ?? null,
+      selectedDesignId: prev.selectedDesignId ?? null,
+      selectedDesignTemplate: prev.selectedDesignTemplate ?? null,
+      selectedDesignLook: prevLook,
+      prompt: prevPrompt,
+    };
+  }
+  if (toggle && prev.selectedDesignSample === sampleId) {
+    const clearPrompt = isDesignSamplePrompt(prevPrompt) || isDesignTemplatePrompt(prevPrompt);
+    return {
+      selectedDesignSample: null,
+      selectedDesignId: null,
+      selectedDesignTemplate: null,
+      selectedDesignLook: prevLook,
+      prompt: clearPrompt ? "" : prevPrompt,
+    };
+  }
+  const cur = prevPrompt.trim();
+  const replace = !cur || isDesignTemplatePrompt(cur) || isDesignSamplePrompt(cur);
+  return {
+    selectedDesignSample: choice.sampleId,
+    selectedDesignId: choice.designId,
+    selectedDesignTemplate: choice.designTemplate,
+    selectedDesignLook: prevLook,
+    prompt: replace ? composePromptWithLook(choice.prompt, prevLook) : prevPrompt,
+  };
+}
+
+export function nextDesignLookState(lookId, prev = {}, { toggle = false } = {}) {
+  const known = designLookById(lookId);
+  const prevLook = prev.selectedDesignLook ?? null;
+  const nextLook = toggle && prevLook === lookId ? null : (known ? known.id : prevLook);
+  const prevPrompt = String(prev.prompt ?? "");
+  const replace = !prevPrompt.trim() || isDesignSamplePrompt(prevPrompt) || isDesignTemplatePrompt(prevPrompt);
+  return {
+    selectedDesignLook: nextLook,
+    prompt: replace ? composePromptWithLook(prevPrompt, nextLook) : prevPrompt,
+  };
+}
+
+function renderSampleThumb(kind) {
+  switch (kind) {
+    case "landing":
+      return '<span class="dst-nav"><span></span><span></span><span></span></span>' +
+        '<span class="dst-hero"><span class="dst-bar"></span><span class="dst-title"></span><span class="dst-cta"></span></span>' +
+        '<span class="dst-feats"><span></span><span></span><span></span></span>';
+    case "mobile":
+      return '<span class="dst-phone"><span class="dst-notch"></span><span class="dst-status"></span>' +
+        '<span class="dst-title"></span><span class="dst-line"></span><span class="dst-line dst-line--short"></span>' +
+        '<span class="dst-dock"><span></span><span></span><span></span><span></span></span></span>';
+    case "cube":
+      return '<span class="dst-stage"></span><span class="dst-cube">' +
+        '<span class="dst-face dst-face-a"></span><span class="dst-face dst-face-b"></span><span class="dst-face dst-face-c"></span></span>';
+    case "dashboard":
+      return '<span class="dst-side"></span><span class="dst-main">' +
+        '<span class="dst-kicker"></span><span class="dst-grid"><span></span><span></span><span></span><span></span></span></span>';
+    case "deck":
+      return '<span class="dst-kicker"></span><span class="dst-title"></span><span class="dst-line"></span><span class="dst-line dst-line--short"></span>';
+    case "magazine":
+      return '<span class="dst-mast"></span><span class="dst-photo"></span><span class="dst-cols"><span></span><span></span></span>';
+    case "bullets":
+      return '<span class="dst-title"></span><span class="dst-bullets"><span></span><span></span><span></span></span>';
+    case "doc":
+      return '<span class="dst-title"></span><span class="dst-line"></span><span class="dst-line"></span><span class="dst-line"></span><span class="dst-line dst-line--short"></span>';
+    case "okr":
+      return '<span class="dst-title"></span><span class="dst-grid dst-grid--3"><span></span><span></span><span></span></span>';
+    case "poster":
+      return '<span class="dst-poster"><span class="dst-title"></span></span>';
+    case "email":
+      return '<span class="dst-head"></span><span class="dst-line"></span><span class="dst-line"></span><span class="dst-line dst-line--short"></span><span class="dst-cta"></span>';
+    case "motion":
+      return '<span class="dst-frames"><span></span><span></span><span></span></span>';
+    case "check":
+      return '<span class="dst-title"></span><span class="dst-checks"><span></span><span></span><span></span></span>';
+    case "blank":
+    default:
+      return '<span class="dst-blank-page"><span class="dst-line"></span><span class="dst-line"></span><span class="dst-line dst-line--short"></span></span>';
+  }
+}
+
+function renderDesignModeGallery(opts = {}) {
+  const tab = opts.selectedDesignTab && DESIGN_MODE_TABS.includes(opts.selectedDesignTab)
+    ? opts.selectedDesignTab
+    : "Prototype";
+  const selectedSample = opts.selectedDesignSample ? String(opts.selectedDesignSample) : "";
+  const selectedLook = opts.selectedDesignLook ? String(opts.selectedDesignLook) : "";
+  const selectedPack = opts.selectedDesignFilePack ? String(opts.selectedDesignFilePack) : "";
+  const showLooks = tab === "Deck" || tab === "Media";
+  const hint = opts.designRouteHint
+    ? `<p class="design-route-hint">${esc(String(opts.designRouteHint))}</p>`
+    : "";
+  const tabs = DESIGN_MODE_TABS.map((name) => {
+    const on = name === tab;
+    return (
+      `<li><button type="button" class="starter-tile design-tab-chip${on ? " is-selected" : ""}" ` +
+      `data-design-tab="${esc(name)}" aria-pressed="${on ? "true" : "false"}">` +
+      `<span class="starter-tile-title">${esc(designTabLabel(name))}</span>` +
+      "</button></li>"
+    );
+  });
+  const samples = designSamplesForTab(tab);
+  const previewLook = showLooks
+    ? (designLookById(selectedLook) || designLookById("ink"))
+    : null;
+  const sampleCards = samples.map((s) => {
+    const on = selectedSample ? s.id === selectedSample : false;
+    const caption = s.hint ? `${s.title}：${s.hint}` : s.title;
+    return (
+      `<li><button type="button" class="design-sample-card${on ? " is-selected" : ""}" ` +
+      `data-design-sample="${esc(s.id)}" ` +
+      (s.designId ? `data-design-id="${esc(s.designId)}" ` : "") +
+      (s.template ? `data-design-template="${esc(s.template)}" ` : "") +
+      `aria-pressed="${on ? "true" : "false"}" title="${esc(caption)}">` +
+      `<span class="design-sample-thumb design-sample-thumb--${esc(s.thumb)}" aria-hidden="true">` +
+      renderSampleThumb(s.thumb) +
+      "</span>" +
+      `<span class="design-sample-title">${esc(s.title)}</span>` +
+      (s.hint ? `<span class="design-sample-hint">${esc(s.hint)}</span>` : "") +
+      "</button></li>"
+    );
+  });
+  const packs = Array.isArray(opts.installedFilePacks) ? opts.installedFilePacks : [];
+  const packChips = packs.map((p) => {
+    const name = String(p?.name ?? "");
+    if (!name) return "";
+    const on = name === selectedPack;
+    return (
+      `<li><button type="button" class="starter-tile design-file-pack-chip${on ? " is-selected" : ""}" ` +
+      `data-design-file-pack="${esc(name)}" aria-pressed="${on ? "true" : "false"}"` +
+      (p.description ? ` title="${esc(p.description)}"` : "") + `>` +
+      `<span class="starter-tile-title">${esc(name)}</span>` +
+      (p.description ? `<span class="starter-tile-hint">${esc(p.description)}</span>` : "") +
+      "</button></li>"
+    );
+  }).filter(Boolean);
+  const packRow = packChips.length
+    ? `<p class="design-pack-label">已安装文件包</p><ul class="starter-tiles design-pack-row">${packChips.join("")}</ul>`
+    : "";
+  const lookChips = showLooks
+    ? DESIGN_LOOKS.map((look) => {
+      const on = look.id === selectedLook;
+      return (
+        `<li><button type="button" class="starter-tile design-look-chip${on ? " is-selected" : ""}" ` +
+        `data-design-look="${esc(look.id)}" aria-pressed="${on ? "true" : "false"}" ` +
+        `title="${esc(look.prompt)}">` +
+        `<span class="design-look-swatch" style="--look-bg:${esc(look.bg)};--look-accent:${esc(look.accent)}" aria-hidden="true"></span>` +
+        `<span class="starter-tile-title">${esc(look.label)}</span>` +
+        "</button></li>"
+      );
+    }).join("")
+    : "";
+  const lookRow = lookChips
+    ? `<p class="design-pack-label">色板</p><ul class="starter-tiles design-look-row">${lookChips}</ul>`
+    : "";
+  const back =
+    `<p class="design-mode-nav">` +
+    `<button type="button" class="design-mode-back" data-design-mode-exit="1">` +
+    `<span class="back-chevron" aria-hidden="true">←</span> 返回` +
+    `</button></p>`;
+  return (
+    hint +
+    back +
+    `<ul class="starter-tiles design-tab-row">${tabs.join("")}</ul>` +
+    lookRow +
+    (sampleCards.length
+      ? `<ul class="design-sample-row${previewLook ? " has-look" : ""}"${
+        previewLook
+          ? ` style="--look-bg:${esc(previewLook.bg)};--look-fg:${esc(previewLook.fg)};--look-accent:${esc(previewLook.accent)}"`
+          : ""
+      }>${sampleCards.join("")}</ul>`
+      : "") +
+    packRow
+  );
+}
+
+/** 模板 + 示例统一成一套 starter-tile，画在 #starter-gallery。 */
+export function renderStarterGallery(opts = {}) {
+  const root = document.getElementById("starter-gallery");
+  if (!root) return;
+  root.classList.toggle("starter-gallery--design", Boolean(opts.designModeActive));
+  if (opts.designModeActive) {
+    root.innerHTML = renderDesignModeGallery(opts);
+    return;
+  }
+  const selected = opts.selectedTemplate ? String(opts.selectedTemplate) : "";
+  const tiles = [
+    `<li><button type="button" class="starter-tile starter-tile--design-enter" data-design-mode-enter="1">` +
+    `<span class="starter-tile-title">设计模式</span>` +
+    `<span class="starter-tile-hint">做幻灯、海报、落地页</span>` +
+    "</button></li>",
+    ...DESIGN_STARTER_TEMPLATES.map((t) => {
+      const on = t.id === selected;
+      return (
+        `<li><button type="button" class="starter-tile${on ? " is-selected" : ""}" ` +
+        `data-design-template="${esc(t.id)}" aria-pressed="${on ? "true" : "false"}"` +
+        (t.hint ? ` title="${esc(t.hint)}"` : "") + `>` +
+        `<span class="starter-tile-title">${esc(t.title)}</span>` +
+        `<span class="starter-tile-hint">${esc(t.hint)}</span>` +
+        "</button></li>"
+      );
+    }),
+    ...STARTER_EXAMPLE_TASKS.map(
+      (e) =>
+        `<li><button type="button" class="starter-tile" data-example="${esc(e.text)}"` +
+        (e.hint ? ` title="${esc(e.hint)}"` : "") + `>` +
+        `<span class="starter-tile-title">${esc(e.label)}</span>` +
+        (e.hint ? `<span class="starter-tile-hint">${esc(e.hint)}</span>` : "") +
         "</button></li>",
-    ).join("") +
-    "</ul></div>";
+    ),
+  ];
+  root.innerHTML = `<ul class="starter-tiles">${tiles.join("")}</ul>`;
 }
 
 // ---------------------------------------------------------------
@@ -8385,6 +11058,234 @@ function formatInput(input) {
 function formatTokens(n) {
   if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
   return String(n);
+}
+
+const CHAT_RATING_KEY = "agent-ui-chat-rating";
+
+export function chatRatingStorageKey(runId, seq) {
+  return `${CHAT_RATING_KEY}:${runId}:${seq}`;
+}
+
+export function readChatRating(runId, seq, storage = globalThis.localStorage) {
+  if (!runId || seq == null || !storage) return "";
+  try {
+    const v = storage.getItem(chatRatingStorageKey(runId, seq));
+    return v === "up" || v === "down" ? v : "";
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * 赞/踩是发给模型的反馈，不是本地开关：同一侧再点不撤销（已经出手）。
+ * 换边才改口并再发一次。返回当前值（"" | "up" | "down"）。
+ */
+export function writeChatRating(runId, seq, rating, storage = globalThis.localStorage) {
+  if (!runId || seq == null || !storage) return "";
+  const wanted = rating === "up" || rating === "down" ? rating : "";
+  try {
+    const key = chatRatingStorageKey(runId, seq);
+    const cur = readChatRating(runId, seq, storage);
+    if (!wanted) {
+      storage.removeItem(key);
+      return "";
+    }
+    if (cur === wanted) return cur;
+    storage.setItem(key, wanted);
+    return wanted;
+  } catch {
+    return "";
+  }
+}
+
+/** 赞/踩真正喂给模型的那句话。空 rating 不发。 */
+export function buildChatFeedbackMessage(rating, excerpt) {
+  const clip = String(excerpt ?? "").replace(/\s+/g, " ").trim().slice(0, 240);
+  if (rating === "up") {
+    return clip
+      ? `【反馈】刚才这轮回答很好，请继续保持这个方向。针对的是：「${clip}」`
+      : "【反馈】刚才这轮回答很好，请继续保持这个方向。";
+  }
+  if (rating === "down") {
+    return clip
+      ? `【反馈】刚才这轮回答不理想，请按这个意见重新调整。针对的是：「${clip}」`
+      : "【反馈】刚才这轮回答不理想，请重新调整。";
+  }
+  return "";
+}
+
+export function looksLikeChatFeedback(text) {
+  return /^【反馈】/.test(String(text ?? "").trim());
+}
+
+export function chatPlainText(it) {
+  if (!it) return "";
+  if (it.kind === "user") {
+    return splitUserMessageAttachments(it.text).displayBody || String(it.text ?? "");
+  }
+  const extra = [];
+  for (const [title, items] of [["验证", it.verification], ["假设与前提", it.assumptions]]) {
+    if (!Array.isArray(items) || items.length === 0) continue;
+    extra.push("", `**${title}**`, ...items.map((item) => `- ${item}`));
+  }
+  return [String(it.text ?? ""), ...extra].join("\n").trim();
+}
+
+export function chatTextFromNode(node) {
+  if (!node) return "";
+  const scoped = node.querySelector(".chat-msg-user-copy .chat-body") || node.querySelector(".chat-body");
+  return String(scoped?.innerText ?? scoped?.textContent ?? "").trim();
+}
+
+/**
+ * 开场任务气泡的时间：取 run 创建时刻与时间线最早 at 的较小值。
+ * 快照分叉的子 run createdAt 是“现在”，但复制过来的事件仍是旧时间。
+ */
+export function pickTaskAt(state) {
+  const ats = [...(state?.timeline ?? []), ...(state?.verifierTimeline ?? [])]
+    .map((e) => e?.at)
+    .filter((n) => Number.isFinite(n));
+  const fromEvents = ats.length ? Math.min(...ats) : null;
+  const created = Number.isFinite(state?.createdAt) ? state.createdAt : null;
+  if (fromEvents != null && created != null) return Math.min(fromEvents, created);
+  return fromEvents ?? created;
+}
+
+/** Cursor 式相对时间：刚刚 / 4m ago / 3h ago / 2d ago */
+export function formatChatRelTime(at, now = Date.now()) {
+  if (!Number.isFinite(at)) return "";
+  const diff = Math.max(0, now - at);
+  if (diff < 45_000) return "刚刚";
+  if (diff < 3_600_000) return `${Math.max(1, Math.floor(diff / 60_000))}m ago`;
+  if (diff < 86_400_000) return `${Math.max(1, Math.floor(diff / 3_600_000))}h ago`;
+  if (diff < 7 * 86_400_000) return `${Math.max(1, Math.floor(diff / 86_400_000))}d ago`;
+  const d = new Date(at);
+  return `${d.getMonth() + 1}月${d.getDate()}日`;
+}
+
+export const REWIND_WRITE_TOOLS = new Set(["write_file", "edit_file", "write_pptx", "generate_image"]);
+
+/** 回退对话框：这条之后有多少写盘快照、多少没有镜像的写入 */
+export function deriveRewindFilePreview(state, seq) {
+  const cut = Number(seq);
+  const snapshots = (state?.fileRewindSnapshots ?? []).filter((s) =>
+    Number.isFinite(Number(s.seq)) && Number(s.seq) > cut && !s.skipped,
+  );
+  const snapped = new Set(snapshots.map((s) => s.toolUseId));
+  const unrestorable = (state?.timeline ?? [])
+    .filter((e) =>
+      e.type === "tool_call"
+      && REWIND_WRITE_TOOLS.has(e.name)
+      && Number(e.seq) > cut
+      && !snapped.has(e.toolUseId),
+    )
+    .map((e) => ({
+      path: String(e.input?.path ?? ""),
+      tool: String(e.name ?? ""),
+    }))
+    .filter((row) => row.path);
+  return { restorable: snapshots, unrestorable };
+}
+
+export function rewindDialogHtml(preview = {}) {
+  const restorable = preview.restorable ?? [];
+  const unrestorable = preview.unrestorable ?? [];
+  const n = restorable.length;
+  const u = unrestorable.length;
+  const fileHint = n > 0
+    ? `这条之后记下了 ${n} 个文件的改前内容，可以一并退回。`
+    : u > 0
+      ? `这条之后改过 ${u} 个文件，但没有改前快照。若工作区是 git，会尽量退回最后一次提交；bash 改过的不保证能退。`
+      : "这条之后没有记下可还原的写盘。选「对话和改动一起退」时，只会试 git 已跟踪的文件。";
+  return (
+    `<div class="rewind-dialog" role="dialog" aria-modal="true" aria-labelledby="rewind-dialog-title">` +
+    `<h2 id="rewind-dialog-title">回到这里？</h2>` +
+    `<p>对话会裁到这条消息，这条之后的回复不会带进新对话。原来的对话原样保留。</p>` +
+    `<p>${esc(fileHint)}</p>` +
+    `<p class="rewind-dialog-ask">要不要改动也一起退？</p>` +
+    `<div class="rewind-dialog-actions">` +
+    `<button type="button" class="btn" data-rewind-choice="cancel">取消</button>` +
+    `<button type="button" class="btn" data-rewind-choice="chat">只退对话</button>` +
+    `<button type="button" class="btn btn--allow" data-rewind-choice="files">对话和改动一起退</button>` +
+    `</div></div>`
+  );
+}
+
+export function closeRewindDialog(root = typeof document !== "undefined" ? document : null) {
+  root?.getElementById("rewind-dialog-root")?.remove();
+}
+
+/**
+ * @returns {Promise<"chat"|"files"|null>}
+ */
+export function askRewindChoice(preview, root = typeof document !== "undefined" ? document : null) {
+  if (!root) return Promise.resolve(null);
+  closeRewindDialog(root);
+  const host = root.createElement("div");
+  host.id = "rewind-dialog-root";
+  host.className = "rewind-dialog-backdrop";
+  host.innerHTML = rewindDialogHtml(preview);
+  root.body.appendChild(host);
+  const dialog = host.querySelector(".rewind-dialog");
+  const first = host.querySelector("[data-rewind-choice=cancel]");
+  first?.focus?.();
+  return new Promise((resolve) => {
+    const finish = (choice) => {
+      closeRewindDialog(root);
+      resolve(choice);
+    };
+    host.addEventListener("click", (e) => {
+      const btn = e.target instanceof Element ? e.target.closest("[data-rewind-choice]") : null;
+      if (!btn) {
+        if (e.target === host) finish(null);
+        return;
+      }
+      const choice = btn.getAttribute("data-rewind-choice");
+      finish(choice === "chat" || choice === "files" ? choice : null);
+    });
+    host.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") finish(null);
+    });
+    dialog?.addEventListener("keydown", (e) => {
+      if (e.key !== "Tab") return;
+      const buttons = [...host.querySelectorAll("[data-rewind-choice]")];
+      if (buttons.length === 0) return;
+      const i = buttons.indexOf(root.activeElement);
+      if (e.shiftKey && (i <= 0)) {
+        e.preventDefault();
+        buttons[buttons.length - 1].focus();
+      } else if (!e.shiftKey && (i === buttons.length - 1 || i < 0)) {
+        e.preventDefault();
+        buttons[0].focus();
+      }
+    });
+  });
+}
+
+function renderChatMsgActions(it) {
+  const runId = it.runId ?? "";
+  const seq = it.seq ?? "";
+  const rateable = it.kind === "text";
+  const rating = rateable ? readChatRating(runId, seq) : "";
+  const time = formatChatRelTime(it.at);
+  const btn = (action, icon, label, on = false) =>
+    `<button type="button" class="chat-action${on ? " is-on" : ""}" data-chat-action="${esc(action)}"` +
+    ` data-run-id="${esc(String(runId))}" data-seq="${esc(String(seq))}"` +
+    ` title="${esc(label)}" aria-label="${esc(label)}"` +
+    `${on ? ` aria-pressed="true"` : ""}>` +
+    `<i class="ph ${icon}" aria-hidden="true"></i></button>`;
+  return (
+    `<div class="chat-msg-actions" role="group" aria-label="消息操作">` +
+    (rateable
+      ? btn("up", "ph-thumbs-up", "有用，告诉模型继续保持", rating === "up") +
+        btn("down", "ph-thumbs-down", "不理想，告诉模型重新调整", rating === "down")
+      : "") +
+    btn("copy", "ph-copy", "复制") +
+    btn("rewind", "ph-clock-counter-clockwise", "回到这里") +
+    btn("fork", "ph-git-fork", "分叉对话") +
+    (time ? `<span class="chat-msg-time">${esc(time)}</span>` : "") +
+    `</div>`
+  );
 }
 
 /**

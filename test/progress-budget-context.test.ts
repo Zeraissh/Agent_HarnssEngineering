@@ -102,11 +102,12 @@ describe("buildNewRunRequest 正交旋钮", () => {
     expect(buildNewRunRequest({ task: "t", multiAgent: true })).not.toHaveProperty("planGate");
   });
 
-  it("D3 permissionMode=plan 覆盖为确认门开 + autoApprove 关", () => {
+  it("D3 permissionMode=plan 填确认门；显式 autoApprove 不被档名盖掉", () => {
     expect(buildNewRunRequest({ task: "t", permissionMode: "plan", autoApprove: true })).toMatchObject({
       mode: "plan",
       planGate: true,
       permissionMode: "plan",
+      autoApprove: true,
     });
     expect(buildNewRunRequest({ task: "t", permissionMode: "plan" })).not.toHaveProperty("autoApprove");
   });

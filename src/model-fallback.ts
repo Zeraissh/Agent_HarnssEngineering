@@ -17,7 +17,10 @@
  *   - verifier / planner / vision 可声明自己的 `AGENT_<ROLE>_FALLBACK_*`，
  *     或 `AGENT_<ROLE>_FALLBACK=inherit` 继承执行者备用端点（仍是独立装饰器实例）；
  *   - `prefer_healthy` 路由 stub：有粘性探针证据时把已知不健康的端点排后，
- *     全不健康仍尝试（fail-open）——不是成本模型，不假装聪明。
+ *     全不健康仍尝试（fail-open）——不是成本模型，不假装聪明；
+ *   - `prefer_cheap` 薄片：备用端点按 `src/pricing.ts` 单价表（input+output /1M）
+ *     升序排列，主端点仍居首。**不是**延迟+成本多目标路由——没有 p50、没有
+ *     加权打分；未登记单价的备用排最后。真要做 Fusion 式切换另开 ID。
  */
 import {
   endpointIdentityKey,
@@ -26,7 +29,13 @@ import {
   type ModelProviderKind,
 } from "./model-capability.js";
 import { isTransientApiError } from "./model-client.js";
+import {
+  buildPriceTable,
+  lookupModelPrice,
+  type PriceTable,
+} from "./pricing.js";
 import { createModelClientFromEnv } from "./provider.js";
+import type Anthropic from "@anthropic-ai/sdk";
 import type { ModelClient, ModelRequest, ModelTurn, StreamDelta } from "./types.js";
 
 export interface CircuitBreakerOptions {
@@ -43,7 +52,7 @@ export const DEFAULT_COOLDOWN_MS = 30_000;
 
 export type ModelRole = "executor" | "verifier" | "planner" | "vision";
 
-export type FallbackRouting = "sequential" | "prefer_healthy";
+export type FallbackRouting = "sequential" | "prefer_healthy" | "prefer_cheap";
 
 /**
  * 单端点熔断器。
@@ -172,8 +181,13 @@ export interface FallbackModelClientOptions {
   breakerRegistry?: CircuitBreakerRegistry;
   onFallback?: (info: FallbackInfo) => void;
   role?: ModelRole;
-  /** 缺省 sequential；prefer_healthy 是诚实 stub，不是成本路由 */
+  /** 缺省 sequential；prefer_healthy / prefer_cheap 都是诚实薄片，不是多目标路由 */
   routing?: FallbackRouting;
+  /**
+   * prefer_cheap 用的价表。缺省内置表；测试可注入。
+   * **不是**延迟+成本联合优化——只按登记单价排备用端点。
+   */
+  priceTable?: PriceTable | null;
 }
 
 /**
@@ -186,8 +200,10 @@ export interface FallbackModelClientOptions {
  * 深拷贝而非就地过滤：同一个 ModelRequest 可能还要发给下一个端点（也可能被调用方
  * 复用），改坏它就是把降级路径的副作用漏回主路径。
  */
-export function stripThinkingBlocks(req: ModelRequest): ModelRequest {
-  const messages = structuredClone(req.messages).map((msg) => {
+export function stripThinkingFromMessages(
+  messages: Anthropic.MessageParam[],
+): Anthropic.MessageParam[] {
+  return structuredClone(messages).map((msg) => {
     if (typeof msg.content === "string") return msg;
     const kept = msg.content.filter(
       (block) => block.type !== "thinking" && block.type !== "redacted_thinking",
@@ -200,7 +216,10 @@ export function stripThinkingBlocks(req: ModelRequest): ModelRequest {
       content: kept.length > 0 ? kept : [{ type: "text" as const, text: "[thinking omitted]" }],
     };
   });
-  return { ...req, messages };
+}
+
+export function stripThinkingBlocks(req: ModelRequest): ModelRequest {
+  return { ...req, messages: stripThinkingFromMessages(req.messages) };
 }
 
 function endpointKey(ep: FallbackEndpoint): string {
@@ -209,24 +228,47 @@ function endpointKey(ep: FallbackEndpoint): string {
 }
 
 /**
- * prefer_healthy stub：已知不健康的排后，未知与健康的保持相对顺序。
- * 全不健康时返回原序（仍会尝试）——探针不是准入闸门。
+ * 路由排序薄片：
+ *   - prefer_healthy：已知不健康的排后，未知与健康的保持相对顺序；
+ *     全不健康时返回原序（仍会尝试）——探针不是准入闸门。
+ *   - prefer_cheap：主端点固定居首；备用按单价（input+output /1M）升序。
+ *     未登记单价的备用排最后。这**不是**延迟+成本多目标路由。
+ *   - sequential / 其它：原序。
  */
 export function orderEndpointsForRouting(
   endpoints: FallbackEndpoint[],
   routing: FallbackRouting,
   now: () => number = Date.now,
+  priceTable: PriceTable | null = null,
 ): FallbackEndpoint[] {
-  if (routing !== "prefer_healthy" || endpoints.length <= 1) return endpoints;
-  const healthyOrUnknown: FallbackEndpoint[] = [];
-  const unhealthy: FallbackEndpoint[] = [];
-  for (const ep of endpoints) {
-    const id = ep.identity ?? { provider: "anthropic" as const, model: ep.name };
-    if (stickySaysUnhealthy(id, now())) unhealthy.push(ep);
-    else healthyOrUnknown.push(ep);
+  if (endpoints.length <= 1) return endpoints;
+  if (routing === "prefer_healthy") {
+    const healthyOrUnknown: FallbackEndpoint[] = [];
+    const unhealthy: FallbackEndpoint[] = [];
+    for (const ep of endpoints) {
+      const id = ep.identity ?? { provider: "anthropic" as const, model: ep.name };
+      if (stickySaysUnhealthy(id, now())) unhealthy.push(ep);
+      else healthyOrUnknown.push(ep);
+    }
+    if (unhealthy.length === 0 || healthyOrUnknown.length === 0) return endpoints;
+    return [...healthyOrUnknown, ...unhealthy];
   }
-  if (unhealthy.length === 0 || healthyOrUnknown.length === 0) return endpoints;
-  return [...healthyOrUnknown, ...unhealthy];
+  if (routing === "prefer_cheap") {
+    const table = priceTable ?? buildPriceTable();
+    const [primary, ...backups] = endpoints;
+    const ranked = [...backups].sort((a, b) => unitPriceRank(a, table) - unitPriceRank(b, table));
+    return [primary!, ...ranked];
+  }
+  return endpoints;
+}
+
+/** 未登记 = +∞，排在有价备用之后（宁可不优先猜价） */
+function unitPriceRank(ep: FallbackEndpoint, table: PriceTable): number {
+  const provider = ep.identity?.provider;
+  const model = ep.identity?.model ?? ep.name;
+  const price = lookupModelPrice(table, provider, model);
+  if (!price) return Number.POSITIVE_INFINITY;
+  return price.inputPer1M + price.outputPer1M;
 }
 
 /**
@@ -243,6 +285,7 @@ export class FallbackModelClient implements ModelClient {
   private readonly onFallback: ((info: FallbackInfo) => void) | undefined;
   private readonly role: ModelRole | undefined;
   private readonly routing: FallbackRouting;
+  private readonly priceTable: PriceTable | null;
   private turn = 0;
 
   constructor(opts: FallbackModelClientOptions) {
@@ -252,6 +295,7 @@ export class FallbackModelClient implements ModelClient {
     this.breakerOpts = opts.breaker ?? {};
     this.role = opts.role;
     this.routing = opts.routing ?? "sequential";
+    this.priceTable = opts.priceTable ?? (this.routing === "prefer_cheap" ? buildPriceTable() : null);
     if (!this.registry) {
       for (const ep of this.endpoints) {
         this.privateBreakers.set(endpointKey(ep), new CircuitBreaker(this.breakerOpts));
@@ -311,9 +355,13 @@ export class FallbackModelClient implements ModelClient {
      */
     let previous: { name: string; reason: string } | undefined;
     const skipped: string[] = [];
-    // 尝试顺序保持配置链原序（委托方眼里的优先级）；prefer_healthy 只决定
-    // "已知不健康时是否跳过"，不重排——重排会让"跳过"变成静默换首发，事件流丢决策。
-    const ordered = this.endpoints;
+    // prefer_healthy：保持配置链原序，只决定"已知不健康时是否跳过"——
+    // 重排会让"跳过"变成静默换首发，事件流丢决策。
+    // prefer_cheap：主端点居首，备用按单价升序（不是延迟+成本多目标）。
+    const ordered =
+      this.routing === "prefer_cheap"
+        ? orderEndpointsForRouting(this.endpoints, "prefer_cheap", Date.now, this.priceTable)
+        : this.endpoints;
 
     for (const ep of ordered) {
       const breaker = this.breakerFor(ep);
@@ -469,7 +517,10 @@ function readRouting(raw: string | undefined): FallbackRouting {
   const v = raw?.trim();
   if (!v || v === "sequential") return "sequential";
   if (v === "prefer_healthy") return "prefer_healthy";
-  throw new Error('AGENT_FALLBACK_ROUTING 无效：只能是 "sequential" 或 "prefer_healthy"');
+  if (v === "prefer_cheap") return "prefer_cheap";
+  throw new Error(
+    'AGENT_FALLBACK_ROUTING 无效：只能是 "sequential"、"prefer_healthy" 或 "prefer_cheap"',
+  );
 }
 
 function trimmed(value: string | undefined): string | undefined {

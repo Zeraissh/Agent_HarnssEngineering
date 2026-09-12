@@ -65,7 +65,7 @@ export function createDescribeImageTool(opts: DescribeImageOptions): Tool {
       properties: {
         path: {
           type: "string",
-          description: "Image path relative to the working directory (or an absolute path inside a read-only root)",
+          description: "Image path relative to the working directory, or an absolute path inside the working directory or a configured extra root",
         },
         question: {
           type: "string",

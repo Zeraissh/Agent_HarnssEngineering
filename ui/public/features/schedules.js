@@ -12,6 +12,8 @@
  * 不在前端维护第二份状态。
  */
 
+import { upgradeSelects } from "./theme-select.js";
+
 // ---------------------------------------------------------------
 // 常量
 // ---------------------------------------------------------------
@@ -695,6 +697,7 @@ export function initSchedulesView(host = {}, env = {}) {
   if (openBtn) {
     openBtn.addEventListener("click", () => host.onOpenSchedules?.());
   }
+  upgradeSelects(view);
 
   return {
     open: openView,

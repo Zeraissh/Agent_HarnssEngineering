@@ -18,6 +18,7 @@ import {
   SETTINGS_HASH,
   THEME_CHOICES,
   SETTINGS_SECTIONS,
+  parsePacksPayload,
   defaultSettings,
   parseSettings,
   loadSettings,
@@ -54,7 +55,7 @@ describe("设置读写与容错", () => {
   it("defaultSettings 形状完整", () => {
     const s = defaultSettings();
     expect(s.version).toBe(SETTINGS_SCHEMA_VERSION);
-    expect(s.defaults).toEqual({ effort: "", verify: false, autoApprove: true, predictiveInput: false });
+    expect(s.defaults).toEqual({ effort: "", verify: false, autoApprove: true });
     expect(s.badge).toBe(true);
   });
 
@@ -153,8 +154,8 @@ describe("旧键迁移与 composer 默认值派生", () => {
     const s = updateSettings(defaultSettings(), {
       defaults: { effort: "medium", verify: true, autoApprove: false },
     });
-    expect(composerDefaults(s)).toEqual({ effort: "medium", verify: true, autoApprove: false, predictiveInput: false });
-    expect(composerDefaults(defaultSettings())).toEqual({ effort: "", verify: false, autoApprove: true, predictiveInput: false });
+    expect(composerDefaults(s)).toEqual({ effort: "medium", verify: true, autoApprove: false });
+    expect(composerDefaults(defaultSettings())).toEqual({ effort: "", verify: false, autoApprove: true });
   });
 
   it("isValidEffort：空串恒合法；档位必须在服务端声明集合里", () => {
@@ -250,6 +251,26 @@ describe("路由判定与静态数据", () => {
     expect(badgeEnabled(defaultSettings())).toBe(true);
     expect(badgeEnabled(updateSettings(defaultSettings(), { badge: false }))).toBe(false);
     expect(badgeEnabled(null)).toBe(true);
+  });
+});
+
+describe("parsePacksPayload", () => {
+  it("坏形状 → null；缺 drafts 当空列表；不把 systemPrompt 带进视图", () => {
+    expect(parsePacksPayload(null)).toBeNull();
+    expect(parsePacksPayload("x")).toBeNull();
+    const parsed = parsePacksPayload({
+      drafts: [{ name: "thermo", description: "热电偶", systemPrompt: "SECRET" }],
+      installed: [{ name: "" }, { name: "ok", description: 1 }],
+      root: "/tmp/packs",
+    });
+    expect(parsed.drafts).toEqual([
+      { name: "thermo", description: "热电偶", measured: false, builtinTools: [], verifyEnabled: false },
+    ]);
+    expect(parsed.drafts[0]).not.toHaveProperty("systemPrompt");
+    expect(parsed.installed).toEqual([
+      { name: "ok", description: "", measured: false, builtinTools: [], verifyEnabled: false },
+    ]);
+    expect(parsed.root).toBe("/tmp/packs");
   });
 });
 
@@ -393,19 +414,6 @@ describe("initSettingsView 视图行为", () => {
     expect(host.onApplyComposerDefaults).toHaveBeenCalledWith({ autoApprove: false });
   });
 
-  it("输入补全默认关；打开后持久化并通知 composer", () => {
-    const env = makeEnv();
-    const host = makeHost();
-    const api = initSettingsView(host, env);
-    api.open();
-    const toggle = api.element.querySelector("#settings-predictive");
-    expect(toggle.checked).toBe(false);
-    toggle.checked = true;
-    toggle.dispatchEvent(new Event("change", { bubbles: true }));
-    expect(parseSettings(env.storage.getItem(SETTINGS_STORAGE_KEY)).defaults.predictiveInput).toBe(true);
-    expect(host.onApplyComposerDefaults).toHaveBeenCalledWith({ predictiveInput: true });
-  });
-
   it("关于：再看一遍新手引导走宿主回调", () => {
     const host = makeHost();
     const api = initSettingsView(host, makeEnv());
@@ -486,10 +494,47 @@ describe("initSettingsView 视图行为", () => {
       SETTINGS_SECTIONS.map((s) => s.id),
     );
     expect(SETTINGS_SECTIONS.some((s) => s.id === "settings-mcp")).toBe(true);
+    expect(SETTINGS_SECTIONS.some((s) => s.id === "settings-packs")).toBe(true);
+    expect(SETTINGS_SECTIONS.map((s) => s.id).indexOf("settings-packs")).toBe(
+      SETTINGS_SECTIONS.map((s) => s.id).indexOf("settings-mcp") + 1,
+    );
+    expect(SETTINGS_SECTIONS.some((s) => s.id === "settings-usage" && s.label === "消耗")).toBe(true);
+    expect(SETTINGS_SECTIONS.map((s) => s.id).indexOf("settings-usage")).toBeLessThan(
+      SETTINGS_SECTIONS.map((s) => s.id).indexOf("settings-about"),
+    );
     const defaultsBtn = navBtns.find((b) => b.getAttribute("data-section") === "settings-defaults");
     defaultsBtn.click();
     const target = document.getElementById("settings-defaults");
     expect(document.activeElement).toBe(target);
+  });
+
+  it("消耗分组：无 fetchUsage 仍有锚点；有则嵌进台账图", async () => {
+    const api = initSettingsView(makeHost(), makeEnv());
+    api.open();
+    expect(api.element.querySelector("#settings-usage")).toBeTruthy();
+    expect(api.element.querySelector("#settings-usage-cards")).toBeNull();
+    expect(api.element.querySelector("#settings-usage .settings-card-note")?.textContent).toContain("台账");
+
+    document.body.innerHTML = `<main id="main-panel"></main>`;
+    const host = makeHost({
+      nowUsage: () => Date.parse("2026-09-09T12:00:00"),
+      fetchUsage: async () => ({
+        totalRuns: 1,
+        totalTurns: 8,
+        totalUsd: 0.08,
+        unpricedRuns: 0,
+        byDay: [{ day: "2026-09-07", runs: 1, turns: 8, usd: 0.08, unpricedRuns: 0 }],
+        byModel: [{ model: "pro", runs: 1, turns: 8, usd: 0.08, unpricedRuns: 0 }],
+        byDayModel: [{ day: "2026-09-07", model: "pro", runs: 1, turns: 8, usd: 0.08, unpricedRuns: 0 }],
+      }),
+    });
+    const api2 = initSettingsView(host, makeEnv());
+    api2.open();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(api2.element.querySelector("#settings-usage-cards")?.textContent).toContain("pro");
+    expect(api2.element.querySelector("#settings-usage-cards")?.textContent).toContain("8 轮");
+    expect(api2.element.querySelectorAll("#settings-usage .usage-col")).toHaveLength(7);
   });
 
   it("open 时从存储重读：外部（composer）刚写过的值立刻反映到控件", () => {
@@ -502,5 +547,39 @@ describe("initSettingsView 视图行为", () => {
     );
     api.open();
     expect(api.element.querySelector("#settings-verify").checked).toBe(true);
+  });
+
+  it("领域包分组：列出草稿，安装后回调宿主刷新菜单", async () => {
+    const calls: Array<{ url: string; method?: string }> = [];
+    const fetchImpl = vi.fn(async (url, opts = {}) => {
+      calls.push({ url, method: opts.method });
+      if (String(url).includes("/install")) {
+        return { ok: true, status: 200, json: async () => ({ ok: true, drafts: [], installed: [{ name: "thermo", description: "热电偶" }] }) };
+      }
+      if (String(url).startsWith("/api/packs")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            drafts: [{ name: "thermo", description: "热电偶" }],
+            installed: [],
+            root: "D:\\\\packs",
+          }),
+        };
+      }
+      return { ok: true, status: 200, json: async () => ({ models: [], roles: { executor: null, planner: null, verifier: null, vision: null, image: null }, source: "env" }) };
+    });
+    const host = makeHost({ onPacksChanged: vi.fn() });
+    const api = initSettingsView(host, makeEnv({ fetchImpl }));
+    api.open();
+    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(api.element.querySelector("#settings-packs-drafts").textContent).toContain("thermo");
+    expect(api.element.querySelector("#settings-packs")).not.toBeNull();
+    api.element.querySelector("[data-pack-install='thermo']").click();
+    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(host.onPacksChanged).toHaveBeenCalled();
+    expect(calls.some((c) => c.method === "POST" && String(c.url).includes("/drafts/thermo/install"))).toBe(true);
   });
 });

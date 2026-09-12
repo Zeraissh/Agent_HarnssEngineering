@@ -12,6 +12,8 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import { AgentLoop, createRunBudget } from "./loop.js";
 import { withoutTaskCompletion } from "./task-completion.js";
+import { withoutAgentMd } from "./agent-md.js";
+import { withoutExternalHooks } from "./hooks.js";
 import { withoutAskUser } from "./tools/ask-user.js";
 import { withoutEditFile } from "./tools/edit-file.js";
 import type { AgentConfig, AggregateUsage, ModelClient, Tool, TurnEvent } from "./types.js";
@@ -275,7 +277,7 @@ export async function runVerifier(
   // 但解耦≠一个常数走天下（案例 #8）：15 是按软件域定的，真机域每条验收都要
   // 多次探针往返，装不下。领域包可用 verify.maxTurns 声明自己需要多少。
   const verifierMaxTurns = opts.maxTurns ?? DEFAULT_VERIFIER_MAX_TURNS;
-  const roleBase = withoutTaskCompletion(cfg);
+  const roleBase = withoutAgentMd(withoutExternalHooks(withoutTaskCompletion(cfg)));
   const verifierBudget = createRunBudget({
     ...(cfg.maxTotalTurns !== undefined ? { maxTurns: cfg.maxTotalTurns } : {}),
     ...(cfg.maxTokensBudget !== undefined ? { maxTokens: cfg.maxTokensBudget } : {}),

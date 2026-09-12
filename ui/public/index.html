@@ -3,7 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Agent Harness — Web UI</title>
+<title>FATHOM 控制台</title>
+<link rel="icon" href="/fathom-mark.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/vendor/phosphor/style.css">
 <link rel="stylesheet" href="/styles.css">
 <script>
@@ -25,16 +26,24 @@
      详情页头承担，故 sr-only 隐藏。必须包在 header（banner 地标）里——裸 h1
      游离于所有地标之外会触发 axe region 规则（页面内容须归属地标） -->
 <header class="sr-only">
-  <h1>Agent Harness 控制台</h1>
+  <h1>FATHOM 控制台</h1>
 </header>
 
 <!-- 侧栏：项目 → 对话 -->
 <aside class="sidebar" id="sidebar">
   <div class="sidebar-header">
     <div class="sidebar-brand">
-      <span class="sidebar-brand-mark" aria-hidden="true"><i class="ph ph-circles-four"></i></span>
+      <span class="sidebar-brand-mark" aria-hidden="true">
+        <svg class="fathom-plumb" width="18" height="18" viewBox="0 0 24 24">
+          <line class="fathom-tick" x1="6" y1="3" x2="6" y2="21" stroke-width="1.3"/>
+          <line class="fathom-tick" x1="6" y1="7.5" x2="9" y2="7.5" stroke-width="1.5"/>
+          <line class="fathom-tick" x1="6" y1="16.5" x2="9" y2="16.5" stroke-width="1.5"/>
+          <line class="fathom-line" x1="16.8" y1="3" x2="16.8" y2="14" stroke-width="2"/>
+          <circle class="fathom-bob" cx="16.8" cy="17" r="2.1"/>
+        </svg>
+      </span>
       <span class="sidebar-brand-copy">
-        <strong>Harness</strong>
+        <strong>FATHOM<span class="fw-dot">.</span></strong>
         <span>项目与对话</span>
       </span>
     </div>
@@ -84,13 +93,13 @@
         </button>
       </div>
     </div>
+    <button type="button" class="icon-btn sidebar-collapse-btn" id="sidebar-collapse"
+      aria-label="隐藏侧栏" title="隐藏侧栏（Ctrl+B）" aria-keyshortcuts="Control+B Meta+B"
+      aria-expanded="true">
+      <i class="ph ph-caret-left" aria-hidden="true"></i>
+    </button>
   </div>
   <div class="sidebar-search">
-    <button type="button" class="palette-open-btn" id="palette-open-btn" aria-label="打开命令面板（Ctrl+K）">
-      <i class="ph ph-command" aria-hidden="true"></i>
-      <span>命令面板</span>
-      <kbd class="palette-kbd" aria-hidden="true">⌘K</kbd>
-    </button>
     <!-- 指挥中心入口（T11）：点击走 hash 路由 #/board，由 features/command-center.js 绑定 -->
     <button type="button" class="palette-open-btn" id="board-open-btn" aria-label="打开指挥中心">
       <i class="ph ph-squares-four" aria-hidden="true"></i>
@@ -100,6 +109,11 @@
       <i class="ph ph-plus" aria-hidden="true"></i>
       <span>新建对话</span>
     </button>
+    <!-- 定时任务（T9）：放在新建对话下方。命令面板仍走 Ctrl+K，侧栏不再单列入口。 -->
+    <button type="button" class="settings-open-btn" id="schedules-open-btn" aria-label="打开定时任务">
+      <i class="ph ph-clock" aria-hidden="true"></i>
+      <span>定时任务</span>
+    </button>
     <div class="run-search-field">
       <i class="ph ph-magnifying-glass" aria-hidden="true"></i>
       <label for="run-search" class="sr-only">搜索对话</label>
@@ -107,6 +121,10 @@
     </div>
     <div class="sidebar-filter-row">
       <span class="sidebar-section-label">对话</span>
+      <label class="sidebar-project-filter">
+        <input type="checkbox" id="sidebar-all-projects" />
+        全部项目
+      </label>
       <!-- R-08 状态筛选 -->
       <select class="run-filter" id="run-filter" aria-label="按状态筛选对话">
         <option value="all">全部</option>
@@ -123,26 +141,22 @@
     <div class="run-list-empty">加载中…</div>
   </div>
   <!-- 设置中心入口（T7）：按钮在静态骨架里，视图与行为由 features/settings.js
-       初始化时挂载；点击走 hash 路由 #/settings。
-       定时任务入口（T9）同理：#/schedules。 -->
+       初始化时挂载；点击走 hash 路由 #/settings。消耗在设置分组里，不占侧栏。 -->
   <div class="sidebar-footer">
-    <button type="button" class="settings-open-btn" id="schedules-open-btn" aria-label="打开定时任务">
-      <i class="ph ph-clock" aria-hidden="true"></i>
-      <span>定时任务</span>
-    </button>
-    <button type="button" class="settings-open-btn" id="usage-open-btn" aria-label="打开消耗">
-      <i class="ph ph-chart-bar" aria-hidden="true"></i>
-      <span>消耗</span>
-    </button>
     <button type="button" class="settings-open-btn" id="settings-open-btn" aria-label="打开设置">
       <i class="ph ph-gear" aria-hidden="true"></i>
       <span>设置</span>
     </button>
   </div>
 </aside>
+<button type="button" class="sidebar-expand" id="sidebar-expand" hidden
+  aria-label="显示侧栏" title="显示侧栏（Ctrl+B）" aria-keyshortcuts="Control+B Meta+B"
+  aria-expanded="false">
+  <i class="ph ph-caret-right" aria-hidden="true"></i>
+</button>
 
 <!-- 主区 -->
-<main class="main" id="main-panel">
+<main class="main is-welcome" id="main-panel">
   <!-- R-05: aria-live 状态播报区域 -->
   <div id="status-announcer" class="sr-only" aria-live="polite" aria-atomic="true"></div>
 
@@ -156,10 +170,22 @@
   <div id="center-row" class="center-row">
     <div id="main-area" class="content-area">
       <div class="empty-state empty-state--welcome">
-        <div class="empty-icon" aria-hidden="true"><i class="ph ph-chat-centered-dots"></i></div>
-        <span class="empty-eyebrow">HARNESS WORKSPACE</span>
-        <h2>从一个明确目标开始</h2>
-        <p>选择左侧对话继续工作，或新建一次受工作目录约束的任务。</p>
+        <p class="empty-eyebrow">Agent Console</p>
+        <span class="empty-mark" aria-hidden="true">
+          <svg class="fathom-plumb" width="46" height="46" viewBox="0 0 24 24">
+            <line class="fathom-tick" x1="6" y1="2.5" x2="6" y2="21.5" stroke-width="1"/>
+            <line class="fathom-tick" x1="6" y1="5.2" x2="9.6" y2="5.2" stroke-width="1.1"/>
+            <line class="fathom-tick" x1="6" y1="9.4" x2="9.6" y2="9.4" stroke-width="1.1"/>
+            <line class="fathom-tick" x1="6" y1="13.6" x2="9.6" y2="13.6" stroke-width="1.1"/>
+            <line class="fathom-tick" x1="6" y1="17.8" x2="9.6" y2="17.8" stroke-width="1.1"/>
+            <line class="fathom-line" x1="16.6" y1="2.5" x2="16.6" y2="14" stroke-width="1.6"/>
+            <circle class="fathom-bob" cx="16.6" cy="17.4" r="1.9"/>
+          </svg>
+        </span>
+        <p class="empty-brand">FATHOM<span class="fw-dot">.</span></p>
+        <p class="empty-tagline">see every run to the bottom.</p>
+        <p class="empty-tagline-cn">每一层都看得见。</p>
+        <span class="empty-depthline" aria-hidden="true"></span>
       </div>
     </div>
   </div>
@@ -180,21 +206,57 @@
        共用一个框的理由：分开纯粹是实现遗留（一个打 /api/runs、一个打 /messages），
        对用户来说它们长得一样、位置也挨着。选中一个可续跑的运行 → 「继续对话」，
        没选中 → 「运行任务」；文案、placeholder、说明行、data-mode 四处一起变。
-       派生逻辑在 app.js 的 deriveComposerMode / patchComposer 里（因此可测）。 -->
+       派生逻辑在 app.js 的 deriveComposerMode / patchComposer 里（因此可测）。
+       新建对话时 #main-panel.is-welcome 把同一份表单抬到中央，不搬 DOM。
+       胶囊铬（chip / 图标发送 / 紧凑输入）对话态与欢迎态共用；欢迎只多居中和起步卡。 -->
   <form id="submit-form" class="submit-bar" autocomplete="off">
     <div class="composer-scopebar" id="composer-scopebar">
-      <div class="scope-field scope-field--workdir">
+      <div class="scope-field scope-field--workdir" id="workdir-combobox">
         <i class="ph ph-folder-simple" aria-hidden="true"></i>
-        <label for="workdir-select">工作目录</label>
-        <select id="workdir-select"></select>
+        <label id="workdir-label" class="sr-only" for="workdir-trigger">工作目录</label>
+        <select id="workdir-select" class="sr-only" tabindex="-1" aria-hidden="true"></select>
+        <button type="button" id="workdir-trigger" class="wd-trigger" aria-expanded="false" aria-controls="workdir-menu">
+          <span id="workdir-trigger-text" class="wd-trigger-text">选择目录</span>
+          <i class="ph ph-caret-down" aria-hidden="true"></i>
+        </button>
+        <div id="workdir-menu" class="wd-menu" hidden></div>
+      </div>
+      <div class="scope-field scope-field--git" id="workspace-git-chip" hidden>
+        <i class="ph ph-git-branch" aria-hidden="true"></i>
+        <label id="workspace-git-label" class="sr-only" for="workspace-git-trigger">当前分支</label>
+        <button type="button" id="workspace-git-trigger" class="wd-trigger"
+          aria-expanded="false" aria-controls="workspace-git-menu" aria-labelledby="workspace-git-label">
+          <span id="workspace-git-trigger-text" class="wd-trigger-text">—</span>
+          <i class="ph ph-caret-down" aria-hidden="true"></i>
+        </button>
+        <div id="workspace-git-menu" class="wd-menu git-menu" hidden></div>
+      </div>
+      <div class="model-picker" id="executor-model-picker">
+        <span class="composer-caption sr-only" id="executor-model-caption">模型</span>
+        <button type="button" id="executor-model-trigger" class="model-picker-trigger"
+          aria-haspopup="listbox" aria-expanded="false"
+          title="切换执行模型会按该模型的上下文窗口重算水位；进行中的这一轮不受影响">
+          <span id="executor-model-trigger-text" class="model-picker-value">加载中</span>
+          <i class="ph ph-caret-down" aria-hidden="true"></i>
+        </button>
+        <div id="executor-model-menu" class="model-picker-menu" hidden role="presentation">
+          <div class="model-picker-panel">
+            <input type="search" id="executor-model-search" class="model-picker-search"
+              placeholder="搜索模型…" autocomplete="off" aria-label="搜索模型" />
+            <ul id="executor-model-list" class="model-picker-list" role="listbox" aria-label="执行模型"></ul>
+            <button type="button" id="executor-model-manage" class="model-picker-manage">
+              <i class="ph ph-plus" aria-hidden="true"></i>
+              <span>管理模型…</span>
+            </button>
+          </div>
+          <aside id="executor-model-detail" class="model-picker-detail" hidden aria-live="polite"></aside>
+        </div>
+        <select id="executor-model-select" class="sr-only" tabindex="-1" aria-hidden="true"></select>
+        <span class="sr-only" id="executor-role-text">执行模型</span>
       </div>
       <div class="role-models" id="role-models-knob">
-        <span class="composer-caption" id="role-models-label">角色模型</span>
+        <span class="composer-caption" id="role-models-label">角色</span>
         <div class="role-toggles" role="group" aria-labelledby="role-models-label">
-          <span class="role-model-pill" id="executor-role-row">
-            <i class="ph ph-terminal" aria-hidden="true"></i>
-            <span id="executor-role-text">执行 · 加载中</span>
-          </span>
           <label class="role-model-pill role-model-pill--toggle" id="planner-role-row" hidden>
             <input type="checkbox" id="use-planner-model" checked />
             <span id="planner-role-text"></span>
@@ -222,9 +284,9 @@
         </div>
         <span class="sr-only" id="role-models-hint"></span>
       </div>
-      <button type="button" class="btn btn--ghost knobs-toggle" id="knobs-toggle" aria-expanded="false" aria-controls="run-knobs">
+      <button type="button" class="btn btn--ghost knobs-toggle" id="knobs-toggle" aria-expanded="false" aria-controls="run-knobs" aria-label="运行设置">
         <i class="ph ph-sliders-horizontal" aria-hidden="true"></i>
-        <span class="knobs-label">运行设置</span>
+        <span class="knobs-label sr-only">运行设置</span>
         <i class="ph ph-caret-down knobs-caret" aria-hidden="true"></i>
       </button>
     </div>
@@ -232,52 +294,38 @@
          内容全部由 message_queued / message_queue_updated 事件重放长出（renderQueueChips）。
          不能放进 .composer-input-row——它是 flex 行，chips 会被挤成内联一员 -->
     <div id="queue-chips" class="queue-chips" hidden></div>
+    <div class="composer-compose" id="composer-compose">
+    <div id="composer-media" class="composer-media" hidden></div>
+    <div class="composer-compose-main">
+    <ul id="upload-list" class="upload-list" hidden></ul>
     <div class="composer-input-row">
     <!-- 文案由 patchComposer 按模式改写（「任务描述」↔「追加指令」）。
          for/id 不许动：整页 axe 与文案闸门都钉着这一对。 -->
     <label for="task-input" class="task-label">任务描述</label>
-    <textarea id="task-input" placeholder="输入新任务描述…（Enter 发送，Shift+Enter 换行）" rows="1"></textarea>
+    <textarea id="task-input" placeholder="要这个目录做什么…" title="Enter 发送，Shift+Enter 换行" rows="1"></textarea>
     <!-- input **排在 label 之前**：它是 sr-only（宽高 1px + clip），焦点环会被
          整个裁掉，键盘用户 Tab 到附件时屏幕上没有任何反应。把它放前面，
          就能用最朴素的相邻兄弟选择器把环画到那个可见的 label 上
          （#file-upload:focus-visible + .upload-label）。 -->
     <input type="file" id="file-upload" class="sr-only" multiple />
     <label class="btn btn--ghost upload-label" for="file-upload" title="添加图片或文件">
-      <i class="ph ph-paperclip" aria-hidden="true"></i>
-      <span>附件</span>
+      <i class="ph ph-plus" aria-hidden="true"></i>
+      <span class="sr-only">附件</span>
     </label>
-    <!-- 信息队列：运行中亮出的两个动作（patchComposer 按模式显隐）。
-         主按钮此时是「停止」——三个键各司其职，互不兼任。 -->
-    <button type="button" class="btn btn--ghost queue-action" id="steer-btn" hidden>
-      <i class="ph ph-lightning" aria-hidden="true"></i>
-      <span>插队重想</span>
-    </button>
-    <button type="button" class="btn btn--ghost queue-action" id="queue-btn" hidden>
-      <i class="ph ph-queue" aria-hidden="true"></i>
-      <span>排队等待</span>
-    </button>
     <button type="submit" class="btn btn--primary submit-btn" id="submit-btn">
-      <span id="submit-btn-label">运行任务</span>
-      <i class="ph ph-paper-plane-right" aria-hidden="true"></i>
+      <span id="submit-btn-label" class="sr-only">运行任务</span>
+      <i class="ph ph-arrow-up" aria-hidden="true"></i>
     </button>
     </div>
-    <p id="composer-suggest" class="composer-suggest" hidden aria-live="polite"></p>
+    </div>
+    </div>
     <div class="composer-quickbar">
       <label class="checkbox-label verify-toggle-label">
         <input type="checkbox" id="verify-toggle" />
         <span>独立核查</span>
       </label>
-      <label class="checkbox-label auto-approve-label">
-        <input type="checkbox" id="auto-approve-toggle" checked />
-        <span>自动放行工具</span>
-      </label>
-      <label class="effort-field" for="effort-select">
-        <span>思考强度</span>
-        <select id="effort-select" title="控制模型想多深，不是 token 上限">
-          <option value="">默认</option>
-        </select>
-      </label>
-      <span class="composer-quick-hint"><i class="ph ph-shield-check" aria-hidden="true"></i> 写入仍受工作目录边界约束</span>
+      <button type="button" id="design-template-chip" class="design-template-chip" hidden></button>
+      <span class="composer-quick-hint sr-only">写入仍受工作目录边界约束</span>
       <!-- 上下文圆环：钉在提交栏右下角；面板向上展开，避免被视口裁切 -->
       <div class="ctx-ring-wrap ctx-ring-wrap--composer" id="ctx-ring-wrap">
         <button type="button" class="ctx-ring" id="ctx-ring" hidden
@@ -311,53 +359,71 @@
         <i class="ph ph-x" aria-hidden="true"></i>
       </button>
     </p>
-    <ul id="upload-list" class="upload-list" hidden></ul>
 
     <!-- V-24：harness 的旋钮此前只能靠重启换环境变量。默认折叠，不打扰
          "填个任务就跑"的主路径 -->
     <div class="run-knobs" id="run-knobs" hidden>
-      <div class="knob">
-        <label for="pack-select">领域包</label>
-        <select id="pack-select">
-          <option value="">（不用领域包）</option>
+      <div class="knob-row" id="pack-row" title="用默认提示与全部内置工具。选包后工具面和核查纪律跟着换。">
+        <span class="knob-row-name" id="pack-row-label">领域包</span>
+        <select id="pack-select" aria-labelledby="pack-row-label">
+          <option value="">不用领域包</option>
         </select>
-        <label class="knob-check">
-          <input type="checkbox" id="auto-pack-toggle" />
-          自动匹配领域包
-        </label>
-        <span class="knob-hint" id="auto-pack-hint">按任务内容路由到已注册的包；选了具体包时以手选为准</span>
       </div>
-      <div class="knob">
-        <label for="permission-mode-select">权限档</label>
-        <select id="permission-mode-select">
-          <option value="manual">manual · 逐次审批</option>
-          <option value="plan">plan · 计划确认门</option>
-          <option value="auto">auto · 自动放行 ask</option>
+      <label class="knob-row" id="auto-pack-row" title="按任务内容路由到已注册的包；选了具体包时以手选为准。">
+        <span class="knob-row-copy">
+          <span class="knob-row-name">自动匹配</span>
+          <span class="knob-row-desc" id="auto-pack-hint">按任务选已注册的包</span>
+        </span>
+        <input type="checkbox" id="auto-pack-toggle" />
+      </label>
+      <div class="knob-row" title="只改审批节奏。圈禁、硬拒与密钥门不受档位影响。">
+        <span class="knob-row-copy">
+          <span class="knob-row-name" id="permission-row-label">权限</span>
+          <span class="knob-row-desc" id="permission-stance">手动 · 危险动作会先问你，不会自动放行</span>
+        </span>
+        <select id="permission-mode-select" aria-labelledby="permission-row-label">
+          <option value="">自定义</option>
+          <option value="manual">逐次审批</option>
+          <option value="plan">计划确认门</option>
+          <option value="auto">自动放行 ask</option>
         </select>
-        <span class="knob-hint">D3 预设只捆既有开关；条上必须展开真实值，不得只报模式名</span>
       </div>
-      <div class="knob">
-        <label for="plan-mode-toggle">计划模式</label>
-        <label class="knob-check">
-          <input type="checkbox" id="plan-mode-toggle" />
-          确认门（拆解后等人批）
-        </label>
-        <span class="knob-hint" id="mode-hint">每一轮都可选。开 = planner 出图后等你批准再跑</span>
+      <label class="knob-row" id="plan-row" title="开 = planner 出图后等你批准再跑。可与多 agent 同时开。">
+        <span class="knob-row-copy">
+          <span class="knob-row-name">计划</span>
+          <span class="knob-row-desc" id="mode-hint">拆解后等人批准</span>
+        </span>
+        <input type="checkbox" id="plan-mode-toggle" />
+      </label>
+      <label class="knob-row" title="与计划正交：可只开并行，不设确认门。">
+        <span class="knob-row-copy">
+          <span class="knob-row-name">多 agent</span>
+          <span class="knob-row-desc">并行子任务，最多 3</span>
+        </span>
+        <input type="checkbox" id="multi-agent-toggle" />
+      </label>
+      <label class="knob-row" title="自动放行 ask 级工具。写入仍受工作目录边界约束。">
+        <span class="knob-row-copy">
+          <span class="knob-row-name">自动放行</span>
+          <span class="knob-row-desc">工具调用不再逐次问</span>
+        </span>
+        <input type="checkbox" id="auto-approve-toggle" checked />
+      </label>
+      <div class="knob-row" title="控制模型想多深，不是 token 上限">
+        <span class="knob-row-name" id="effort-row-label">思考强度</span>
+        <select id="effort-select" aria-labelledby="effort-row-label">
+          <option value="">默认</option>
+        </select>
       </div>
-      <div class="knob">
-        <label for="multi-agent-toggle">多 agent</label>
-        <label class="knob-check">
-          <input type="checkbox" id="multi-agent-toggle" />
-          并行子任务（auto，最多 3）
-        </label>
-        <span class="knob-hint">每一轮都可选。与计划模式正交：可只开多 agent（自动批、无确认门）</span>
-      </div>
-      <div class="knob knob--wide">
-        <label for="rubric-input">主观评分表</label>
-        <textarea id="rubric-input" rows="2" placeholder="逐条列出评分项，核查者按表评估进 advisory——不影响 passed，也不触发返工"></textarea>
-      </div>
+      <label class="knob-row" title="核查者按表评进 advisory，不影响通过，也不触发返工。">
+        <span class="knob-row-name">评分表</span>
+        <textarea id="rubric-input" rows="1" placeholder="可选"></textarea>
+      </label>
     </div>
   </form>
+
+  <!-- 新建对话模板/示例画廊：与提交栏同级，is-welcome 时贴在输入框下方 -->
+  <div id="starter-gallery" class="starter-gallery" hidden></div>
 
 </main>
 
@@ -381,24 +447,46 @@ import {
   nextCollapseOverride,
   deriveRunListItems,
   deriveThreadFiles,
+  deriveThreadDeclaredArtifacts,
   deriveSessionFiles,
+  selectConversationArtifacts,
+  selectPreviewArtifacts,
+  resolveArtifactOpen,
+  readSidebarCollapsed,
+  writeSidebarCollapsed,
   deriveWrittenPaths,
   conversationChainIds,
   ancestorRunIds,
   filterRunsByStatus,
   filterRunsByQuery,
+  filterRunsByComposerWorkdir,
   conversationTipId,
   renderRunList,
   readCollapsedWorkdirGroups,
   toggleCollapsedWorkdirGroup,
   renderRunDetail,
   renderEmptyState,
+  renderStarterGallery,
+  DESIGN_MODE_TABS,
   EXAMPLE_TASKS,
+  DESIGN_STARTER_TEMPLATES,
+  designTemplateById,
+  designLookById,
+  designSamplesForTab,
+  designSampleById,
+  isDesignTemplatePrompt,
+  isDesignSamplePrompt,
+  composePromptWithLook,
+  nextDesignSampleState,
+  nextDesignLookState,
   deriveComposerMode,
   composerSubmitPlan,
   buildNewRunRequest,
   buildFollowUpRequest,
   mergeForkedFollowUp,
+  askRewindChoice,
+  deriveRewindFilePreview,
+  buildChatFeedbackMessage,
   patchComposer,
   renderQueueChips,
   shouldShowReconnecting,
@@ -406,8 +494,14 @@ import {
   paceReveal,
   revealedWindow,
   foldLiveDelta,
+  isLiveDeltaSource,
   permissionModeSwitches,
   matchPermissionMode,
+  describePermissionStance,
+  annotateResolvedApprovals,
+  createReplayGate,
+  createApprovalSettleGate,
+  deriveChildAgents,
 } from "/app.js";
 import {
   loadSettings,
@@ -421,8 +515,7 @@ import {
   initSettingsView,
 } from "/features/settings.js";
 import { initOnboarding } from "/features/onboarding.js";
-import { initComposerComplete } from "/features/complete.js";
-import { appendReviewToInput } from "/features/review-mode.js";
+import { appendReviewToInput, attachDesignEditScope } from "/features/review-mode.js";
 import {
   isSchedulesRoute,
   SCHEDULES_HASH,
@@ -431,7 +524,11 @@ import {
 import {
   parseArtifactRoute,
   encodeArtifactHash,
+  artifactExitHash,
   initArtifactCanvas,
+  isBrowserPreviewPath,
+  wrapIndex,
+  indexAfterCloseTab,
 } from "/features/artifact-canvas.js";
 import {
   initFilePreview,
@@ -441,9 +538,12 @@ import {
 import {
   WORKDIR_ADD_VALUE,
   renderWorkdirOptions,
-  wireWorkdirSelect,
+  applyWorkdirSelection,
+  getWorkdirSelection,
+  initWorkdirCombobox,
   initWorkdirPicker,
 } from "/features/workdir-picker.js";
+import { initWorkspaceGitChip } from "/features/workspace-git.js";
 import {
   isCommandCenterRoute,
   COMMAND_CENTER_HASH,
@@ -454,11 +554,14 @@ import {
   USAGE_HASH,
   initUsageView,
 } from "/features/usage.js";
+import { upgradeSelects } from "/features/theme-select.js";
 
 // ---- 状态 ----
 /** @type {Map<string, import('/app.js').RunState>} */
 const runStates = new Map();
 let selectedRunId = /** @type {string|null} */ (null);
+/** @type {Map<string, string>} 当前打开的子代理详情，按 run 记 */
+const selectedAgentByRun = new Map();
 let runs = /** @type {{runId:string, task:string, status:string, verify:boolean, createdAt:number, finishedAt:number|null}[]} */ ([]);
 let eventSources = /** @type {Map<string, EventSource>} */ (new Map());
 
@@ -472,7 +575,6 @@ let notificationsApi = /** @type {null|{ ingest:(runId:string, sseEvent:any)=>vo
  */
 let settingsApi = /** @type {null|{ open:()=>void, close:()=>void, isOpen:()=>boolean, refresh:()=>void }} */ (null);
 let onboardingApi = /** @type {null|{ start:(opts?:{force?:boolean})=>boolean, replay:()=>boolean, isOpen:()=>boolean }} */ (null);
-let completeApi = /** @type {null|{ setEnabled:(on:boolean)=>void, isEnabled:()=>boolean }} */ (null);
 let usageApi = /** @type {null|{ open:()=>void, close:()=>void }} */ (null);
 
 /**
@@ -513,7 +615,7 @@ function syncChangesCommand() {
 // artifactCanvasApi 由文件末尾初始化（静态 import 的模块，try/catch 兜底）。
 // 数据口径与右栏「产物」区完全一致：deriveThreadFiles 优先、空则 deriveSessionFiles
 // ——画布清单换了数据源，就会出现"右栏点得到、画布里没有"的两张皮。
-let artifactCanvasApi = /** @type {null|{ open:(i:number,o?:{full?:boolean})=>boolean, close:()=>void, isOpen:()=>boolean, isExpanded:()=>boolean, setExpanded:(b:boolean)=>void, noteWrites:(p:string[])=>void, currentIndex:()=>number, currentPath:()=>string, element:HTMLElement }} */ (null);
+let artifactCanvasApi = /** @type {null|{ open:(i:number,o?:{full?:boolean})=>boolean, close:()=>void, isOpen:()=>boolean, isExpanded:()=>boolean, setExpanded:(b:boolean)=>void, noteWrites:(p:string[])=>void, currentIndex:()=>number, currentPath:()=>string, getEditScope:()=>({slide:string, path?:string}|null), element:HTMLElement }} */ (null);
 /** 深链待恢复：选中 run 的 state 可能要等 SSE 流到产物才够数据，先记账，渲染后补开 */
 let pendingArtifact = /** @type {null|{ runId:string, index:number, full?:boolean }} */ (null);
 /** 语义同 enteredSettingsFromApp：深链直达时「关闭」回 run 页而不是 history.back */
@@ -521,16 +623,68 @@ let enteredCanvasFromApp = false;
 let unregisterArtifactCommand = /** @type {null|(() => void)} */ (null);
 
 /** 当前会话的产物清单——与 patchDetailRail 的文件源同一口径 */
+function conversationArtifactFiles(runId) {
+  const state = runStates.get(runId);
+  const thread = deriveThreadFiles(runs, runStates, runId);
+  const files = thread.length ? thread : (state ? deriveSessionFiles(state) : []);
+  return selectConversationArtifacts(files, {
+    declared: deriveThreadDeclaredArtifacts(runs, runStates, runId),
+    task: state?.task ?? "",
+  });
+}
+
+/** 用户点开过的预览标签（网站或本地路径）。没打开过的文件不进标签条。 */
+const extraPreviewFiles = new Map();
+
+function rememberPreviewFile(runId, path) {
+  const want = String(path ?? "").trim();
+  if (!runId || !want) return;
+  const list = extraPreviewFiles.get(runId) ?? [];
+  if (list.some((f) => f.path === want)) return;
+  extraPreviewFiles.set(runId, [...list, {
+    path: want,
+    kind: isBrowserPreviewPath(want) ? "browser" : "preview",
+  }]);
+}
+
+function openedPreviewArtifacts(runId) {
+  return extraPreviewFiles.get(runId) ?? [];
+}
+
+function forgetPreviewFile(runId, path) {
+  const want = String(path ?? "").trim();
+  if (!runId || !want) return;
+  const next = (extraPreviewFiles.get(runId) ?? []).filter((f) => f.path !== want);
+  if (next.length) extraPreviewFiles.set(runId, next);
+  else extraPreviewFiles.delete(runId);
+}
+
+function closePreviewTab(index) {
+  if (!selectedRunId) return;
+  const list = openedPreviewArtifacts(selectedRunId);
+  const closed = list[index];
+  if (!closed) return;
+  const current = artifactCanvasApi?.currentIndex() ?? index;
+  forgetPreviewFile(selectedRunId, closed.path);
+  const remaining = openedPreviewArtifacts(selectedRunId).length;
+  const next = indexAfterCloseTab(current, index, remaining);
+  if (next < 0) {
+    closeArtifactRoute();
+    return;
+  }
+  openArtifactByIndex(selectedRunId, next);
+}
+
 function currentRunArtifacts(runId) {
   const state = runStates.get(runId);
-  if (!state) return [];
   const thread = deriveThreadFiles(runs, runStates, runId);
-  return thread.length ? thread : deriveSessionFiles(state);
+  const files = thread.length ? thread : (state ? deriveSessionFiles(state) : []);
+  return selectPreviewArtifacts(files);
 }
 
 /** 打开画布：走 hash 路由，浏览器前进/后退天然可用 */
 function openArtifactByIndex(runId, index) {
-  if (!runId || currentRunArtifacts(runId).length === 0) return;
+  if (!runId || openedPreviewArtifacts(runId).length === 0) return;
   enteredCanvasFromApp = true;
   const target = encodeArtifactHash(runId, index);
   if (location.hash === target) {
@@ -540,14 +694,20 @@ function openArtifactByIndex(runId, index) {
   location.hash = target;
 }
 
-/** 产物卡入口：按路径定位到清单序号 */
+/** 任何路径都进右侧画布：只把这一份记成标签，不把整场文件都展开。 */
 function openArtifactByPath(runId, path) {
-  const index = currentRunArtifacts(runId).findIndex((a) => a.path === path);
-  if (index < 0) {
+  const want = String(path ?? "").trim();
+  if (!runId || !want) {
     announceStatus("找不到该产物");
     return;
   }
-  openArtifactByIndex(runId, index);
+  rememberPreviewFile(runId, want);
+  const resolved = resolveArtifactOpen(openedPreviewArtifacts(runId), want);
+  if (resolved.mode === "canvas") {
+    openArtifactByIndex(runId, resolved.index);
+    return;
+  }
+  announceStatus("找不到该产物");
 }
 
 /** 深链/切换落点：数据够了就开，不够就留着 pending 等下一次渲染 */
@@ -555,18 +715,41 @@ function openPendingArtifact() {
   if (!pendingArtifact) return;
   const { runId, index, full } = pendingArtifact;
   if (runId !== selectedRunId) return;
-  if (currentRunArtifacts(runId).length === 0) return;
+  if (openedPreviewArtifacts(runId).length === 0) {
+    const catalog = currentRunArtifacts(runId);
+    if (catalog.length === 0) return;
+    const i = wrapIndex(index, catalog.length);
+    if (i < 0) return;
+    rememberPreviewFile(runId, catalog[i].path);
+    if (artifactCanvasApi?.open(0, { full: Boolean(full) })) pendingArtifact = null;
+    return;
+  }
   if (artifactCanvasApi?.open(index, { full: Boolean(full) })) pendingArtifact = null;
 }
 
-/** 画布的「关闭」：应用内进入 → 历史后退到来处；深链直达 → 回 run 页 */
+/** 关掉预览就是回会话，不沿着「上一份文件」往回退。 */
 function closeArtifactRoute() {
-  if (enteredCanvasFromApp && history.length > 1) {
-    history.back();
+  enteredCanvasFromApp = false;
+  const runId = selectedRunId;
+  const next = artifactExitHash(runId, normalizeTab(activeTabs.get(runId)));
+  if (location.hash === next) {
+    artifactCanvasApi?.close();
+    pendingArtifact = null;
     return;
   }
-  const runId = selectedRunId;
-  location.hash = runId ? `#/run/${runId}/${normalizeTab(activeTabs.get(runId))}` : "#/";
+  const url = new URL(location.href);
+  url.hash = next;
+  history.replaceState(null, "", url);
+  artifactCanvasApi?.close();
+  pendingArtifact = null;
+}
+
+function replaceArtifactHash(target) {
+  if (location.hash === target) return;
+  const url = new URL(location.href);
+  url.hash = target;
+  history.replaceState(null, "", url);
+  applyHash();
 }
 
 /** 「预览最近产物」只在有产物的会话里出现在命令面板（同 syncChangesCommand 纪律） */
@@ -579,11 +762,11 @@ function syncArtifactCommand() {
       unregisterArtifactCommand = palette.registerPaletteCommand({
         id: "preview-latest-artifact",
         label: "预览最近产物",
-        hint: "在画布中打开本次运行最近写出的产物（Esc 关闭，←/→ 切换）",
+        hint: "在画布中打开本次运行最近写出的产物（点标签切换）",
         icon: "ph-eye",
         run: () => {
           const list = selectedRunId ? currentRunArtifacts(selectedRunId) : [];
-          if (list.length > 0) openArtifactByIndex(selectedRunId, list.length - 1);
+          if (list.length > 0) openArtifactByPath(selectedRunId, list[list.length - 1].path);
         },
       });
     }).catch(() => { /* 命令面板注册失败不影响画布本体 */ });
@@ -679,16 +862,13 @@ function syncScrollNav() {
 }
 
 /**
- * 空态的示例任务：点一下**填进输入框**，不直接开跑。
- *
- * 让人看清自己要提交什么再按，是这个 harness 一贯的做法——
- * 同一条纪律在计划确认门、审批门上各出现过一次。
- * 用事件委托绑在 #main-area 上：空态会被重渲染，逐次绑会漏也会重。
+ * 空态的模板 / 示例：点一下填进输入框，不直接开跑。
+ * 挂在 #main-panel 上，同时覆盖 #main-area 与 #starter-gallery（会重渲染）。
  */
 (function bindExamples() {
-  const area = document.getElementById("main-area");
-  if (!area) return;
-  area.addEventListener("click", (e) => {
+  const panel = document.getElementById("main-panel");
+  if (!panel) return;
+  panel.addEventListener("click", (e) => {
     const workdirBtn = e.target.closest?.("[data-focus-workdir]");
     if (workdirBtn) {
       workdirSelect?.focus();
@@ -700,12 +880,82 @@ function syncScrollNav() {
       onboardingApi?.replay();
       return;
     }
+    const exitDesign = e.target.closest?.("[data-design-mode-exit]");
+    if (exitDesign) {
+      exitDesignMode();
+      return;
+    }
+    const enterDesign = e.target.closest?.("[data-design-mode-enter]");
+    if (enterDesign) {
+      designModeActive = true;
+      if (verifyToggle) verifyToggle.checked = false;
+      selectedDesignTab = selectedDesignTab && DESIGN_MODE_TABS.includes(selectedDesignTab)
+        ? selectedDesignTab
+        : "Prototype";
+      designRouteHint = null;
+      applyDesignTabDefaults(selectedDesignTab, { fillPrompt: false });
+      paintEmptyState();
+      syncComposer();
+      void ensureDesignDraftsWorkdir();
+      return;
+    }
+    const tabChip = e.target.closest?.("[data-design-tab]");
+    if (tabChip) {
+      selectedDesignTab = tabChip.getAttribute("data-design-tab");
+      selectedDesignFilePack = null;
+      designRouteHint = null;
+      applyDesignTabDefaults(selectedDesignTab, { fillPrompt: false });
+      if (isDesignSamplePrompt(taskInput.value) || isDesignTemplatePrompt(taskInput.value)) {
+        taskInput.value = "";
+        syncWelcomeComposerField();
+      }
+      paintEmptyState();
+      paintDesignTemplateChip();
+      return;
+    }
+    const sampleCard = e.target.closest?.("[data-design-sample]");
+    if (sampleCard) {
+      applyDesignSample(sampleCard.getAttribute("data-design-sample"), { toggle: true });
+      return;
+    }
+    const lookChip = e.target.closest?.("[data-design-look]");
+    if (lookChip) {
+      applyDesignLook(lookChip.getAttribute("data-design-look"), { toggle: true });
+      return;
+    }
+    const typeChip = e.target.closest?.("[data-design-id]");
+    if (typeChip) {
+      const id = typeChip.getAttribute("data-design-id");
+      selectedDesignId = selectedDesignId === id ? null : id;
+      selectedDesignSample = null;
+      selectedDesignFilePack = null;
+      designRouteHint = null;
+      paintEmptyState();
+      return;
+    }
+    const packChip = e.target.closest?.("[data-design-file-pack]");
+    if (packChip) {
+      const name = packChip.getAttribute("data-design-file-pack");
+      selectedDesignFilePack = selectedDesignFilePack === name ? null : name;
+      selectedDesignId = null;
+      selectedDesignSample = null;
+      designRouteHint = null;
+      paintEmptyState();
+      return;
+    }
+    const tpl = e.target.closest?.("[data-design-template]");
+    if (tpl) {
+      applyDesignTemplate(tpl.getAttribute("data-design-template"), { toggle: true });
+      return;
+    }
     const btn = e.target.closest?.("[data-example]");
     if (!btn) return;
+    applyDesignTemplate(null);
     taskInput.value = btn.getAttribute("data-example");
     taskInput.focus();
     // 光标放到末尾，人可以直接接着改
     taskInput.setSelectionRange(taskInput.value.length, taskInput.value.length);
+    syncWelcomeComposerField();
   });
 })();
 
@@ -751,6 +1001,18 @@ let composerMode = null;
 /** 提交在飞。**必须进模式**，不能命令式改 btn.disabled——服务端在返回响应
     之前就广播了 run_created，列表刷新会立刻把按钮重算成"可点" */
 let submitting = false;
+/** 开会话选中的 design 模板；提交后 seed，画布顶条不再放模板钮 */
+let selectedDesignTemplate = /** @type {string|null} */ (null);
+/** 空态设计模式门面：输入框 + 6 页签 chip + 样例卡 */
+let designModeActive = false;
+let selectedDesignTab = /** @type {string|null} */ (null);
+let selectedDesignId = /** @type {string|null} */ (null);
+let selectedDesignSample = /** @type {string|null} */ (null);
+let selectedDesignLook = /** @type {string|null} */ (null);
+let selectedDesignFilePack = /** @type {string|null} */ (null);
+let designRouteHint = /** @type {string|null} */ (null);
+let designCatalog = [];
+let designFilePacks = [];
 /** 与具体 run 无关的提交错误（新建路径） */
 let newRunError = null;
 
@@ -759,8 +1021,6 @@ const submitForm = /** @type {HTMLFormElement} */ (document.getElementById("subm
 const taskInput = /** @type {HTMLTextAreaElement} */ (document.getElementById("task-input"));
 const verifyToggle = /** @type {HTMLInputElement} */ (document.getElementById("verify-toggle"));
 const submitBtn = /** @type {HTMLButtonElement} */ (document.getElementById("submit-btn"));
-const steerBtn = /** @type {HTMLButtonElement} */ (document.getElementById("steer-btn"));
-const queueBtn = /** @type {HTMLButtonElement} */ (document.getElementById("queue-btn"));
 const queueChips = /** @type {HTMLElement} */ (document.getElementById("queue-chips"));
 const submitError = /** @type {HTMLElement} */ (document.getElementById("submit-error"));
 const themeToggle = /** @type {HTMLButtonElement} */ (document.getElementById("theme-toggle"));
@@ -778,11 +1038,18 @@ const multiAgentToggle = /** @type {HTMLInputElement|null} */ (document.getEleme
 const autoApproveToggle = /** @type {HTMLInputElement} */ (document.getElementById("auto-approve-toggle"));
 const permissionModeSelect = /** @type {HTMLSelectElement|null} */ (document.getElementById("permission-mode-select"));
 const workdirSelect = /** @type {HTMLSelectElement} */ (document.getElementById("workdir-select"));
+/** @type {null|{ paint:()=>void, open:()=>void, close:()=>void, isOpen:()=>boolean }} */
+let workdirComboboxApi = null;
+/** @type {null|{ paint:()=>void, refresh:()=>Promise<unknown>, checkout:(b:string)=>Promise<void>, close:()=>void }} */
+let workspaceGitChipApi = null;
 const useVerifierModel = /** @type {HTMLInputElement} */ (document.getElementById("use-verifier-model"));
 const usePlannerModel = /** @type {HTMLInputElement} */ (document.getElementById("use-planner-model"));
 const sidebar = /** @type {HTMLElement} */ (document.getElementById("sidebar"));
+const sidebarCollapseBtn = /** @type {HTMLButtonElement|null} */ (document.getElementById("sidebar-collapse"));
+const sidebarExpandBtn = /** @type {HTMLButtonElement|null} */ (document.getElementById("sidebar-expand"));
 const mainPanel = /** @type {HTMLElement} */ (document.getElementById("main-panel"));
 const runFilter = /** @type {HTMLSelectElement} */ (document.getElementById("run-filter"));
+upgradeSelects(document);
 const runSearch = /** @type {HTMLInputElement} */ (document.getElementById("run-search"));
 const statusAnnouncer = /** @type {HTMLElement} */ (document.getElementById("status-announcer"));
 const newChatBtn = /** @type {HTMLButtonElement} */ (document.getElementById("new-chat-btn"));
@@ -795,11 +1062,61 @@ function isNarrow() {
   return window.innerWidth <= NARROW_BP;
 }
 
+function sidebarIsHidden() {
+  return document.body.classList.contains("sidebar-collapsed")
+    || sidebar.classList.contains("narrow-hidden");
+}
+
+function syncSidebarChrome() {
+  const hidden = sidebarIsHidden();
+  if (sidebarExpandBtn) {
+    sidebarExpandBtn.hidden = !hidden;
+    sidebarExpandBtn.setAttribute("aria-expanded", String(!hidden));
+  }
+  if (sidebarCollapseBtn) {
+    sidebarCollapseBtn.setAttribute("aria-expanded", String(!hidden));
+  }
+}
+
+function setSidebarCollapsed(collapsed, { persist = true } = {}) {
+  document.body.classList.toggle("sidebar-collapsed", Boolean(collapsed));
+  if (persist) writeSidebarCollapsed(localStorage, Boolean(collapsed));
+  if (!collapsed) {
+    sidebar.classList.remove("narrow-hidden");
+    mainPanel.classList.remove("narrow-full");
+  }
+  syncSidebarChrome();
+}
+
+function toggleSidebar() {
+  if (isNarrow() && selectedRunId && !document.body.classList.contains("sidebar-collapsed")) {
+    const hide = !sidebar.classList.contains("narrow-hidden");
+    sidebar.classList.toggle("narrow-hidden", hide);
+    mainPanel.classList.toggle("narrow-full", hide);
+    syncSidebarChrome();
+    return;
+  }
+  setSidebarCollapsed(!document.body.classList.contains("sidebar-collapsed"));
+}
+
+setSidebarCollapsed(readSidebarCollapsed(localStorage), { persist: false });
+sidebarCollapseBtn?.addEventListener("click", () => setSidebarCollapsed(true));
+sidebarExpandBtn?.addEventListener("click", () => setSidebarCollapsed(false));
+document.addEventListener("keydown", (e) => {
+  if (!(e.ctrlKey || e.metaKey) || e.shiftKey || e.altKey) return;
+  if (e.key !== "b" && e.key !== "B") return;
+  const t = e.target;
+  if (t instanceof HTMLElement && (t.closest("input, textarea, select, [contenteditable='true']"))) return;
+  e.preventDefault();
+  toggleSidebar();
+});
+
 function enterDetailMode() {
   if (isNarrow()) {
     sidebar.classList.add("narrow-hidden");
     mainPanel.classList.add("narrow-full");
   }
+  syncSidebarChrome();
 }
 
 function exitDetailMode() {
@@ -807,6 +1124,7 @@ function exitDetailMode() {
     sidebar.classList.remove("narrow-hidden");
     mainPanel.classList.remove("narrow-full");
   }
+  syncSidebarChrome();
   /**
    * 清选中这件事**两种屏宽都要做**。
    *
@@ -817,7 +1135,7 @@ function exitDetailMode() {
    */
   selectedRunId = null;
   refreshRunListView();
-  renderEmptyState(runs.length > 0);
+  paintEmptyState();
   changesApi?.setRun(null); // T8：离开会话，变更分区随之收起
   syncChangesCommand();
   artifactCanvasApi?.close(); // T10：离开会话，画布与挂账的深链一并收起
@@ -837,9 +1155,178 @@ function announceStatus(msg) {
   }
 }
 
+function exitDesignMode() {
+  if (!designModeActive) return;
+  designModeActive = false;
+  paintEmptyState();
+  syncComposer();
+  announceStatus("已返回开始页");
+}
+
+function paintEmptyState() {
+  mainPanel.classList.add("is-welcome");
+  const gallery = document.getElementById("starter-gallery");
+  if (gallery) gallery.hidden = false;
+  renderEmptyState(runs.length > 0, {
+    selectedTemplate: selectedDesignTemplate,
+    designModeActive,
+  });
+  renderStarterGallery({
+    selectedTemplate: selectedDesignTemplate,
+    designModeActive,
+    selectedDesignTab: selectedDesignTab || "Prototype",
+    selectedDesignId,
+    selectedDesignSample,
+    selectedDesignLook,
+    selectedDesignFilePack,
+    catalog: designCatalog,
+    installedFilePacks: designFilePacks,
+    designRouteHint,
+  });
+  syncWelcomeComposerField();
+}
+
+function leaveWelcomeLayout() {
+  mainPanel.classList.remove("is-welcome");
+  const gallery = document.getElementById("starter-gallery");
+  if (gallery) {
+    gallery.hidden = true;
+    gallery.innerHTML = "";
+  }
+  syncWelcomeComposerField();
+}
+
+/** 输入框：空着压成一行，聚焦或有字再长高。欢迎态与对话态同一套。 */
+function syncWelcomeComposerField() {
+  const form = document.getElementById("submit-form");
+  if (form) form.classList.toggle("is-composing", Boolean(taskInput.value.trim()));
+  taskInput.style.height = "auto";
+  const expanded = Boolean(taskInput.value) || document.activeElement === taskInput;
+  const min = expanded ? 40 : 36;
+  const max = expanded ? 160 : 36;
+  taskInput.style.height = `${Math.min(Math.max(taskInput.scrollHeight, min), max)}px`;
+}
+
+function paintDesignTemplateChip() {
+  const chip = document.getElementById("design-template-chip");
+  if (!chip) return;
+  const spec = selectedDesignTemplate ? designTemplateById(selectedDesignTemplate) : null;
+  if (!spec || composerMode?.kind === "append" || composerMode?.kind === "stop") {
+    chip.hidden = true;
+    chip.textContent = "";
+    chip.classList.remove("is-active");
+    return;
+  }
+  chip.hidden = false;
+  chip.classList.add("is-active");
+  chip.textContent = `模板 · ${spec.title} ×`;
+  chip.title = "取消这次选用的模板";
+}
+
+function applyDesignTabDefaults(tab, { fillPrompt = false } = {}) {
+  const first = designSamplesForTab(tab)[0];
+  if (!first) {
+    selectedDesignSample = null;
+    selectedDesignId = null;
+    selectedDesignTemplate = null;
+    return;
+  }
+  selectedDesignSample = first.id;
+  selectedDesignId = first.designId;
+  selectedDesignTemplate = first.template;
+  if (fillPrompt && (!taskInput.value.trim() || isDesignSamplePrompt(taskInput.value) || isDesignTemplatePrompt(taskInput.value))) {
+    taskInput.value = composePromptWithLook(first.prompt, selectedDesignLook);
+    syncWelcomeComposerField();
+  }
+}
+
+function applyDesignLook(id, { toggle = false } = {}) {
+  const next = nextDesignLookState(id, {
+    selectedDesignLook,
+    prompt: taskInput.value,
+  }, { toggle });
+  selectedDesignLook = next.selectedDesignLook;
+  if (next.prompt !== taskInput.value) {
+    taskInput.value = next.prompt;
+    taskInput.focus();
+    taskInput.setSelectionRange(taskInput.value.length, taskInput.value.length);
+    syncWelcomeComposerField();
+  }
+  const spec = selectedDesignLook ? designLookById(selectedDesignLook) : null;
+  if (spec) announceStatus(`已选用色板：${spec.label}`);
+  paintEmptyState();
+  syncComposer();
+}
+
+function applyDesignSample(id, { toggle = false } = {}) {
+  const next = nextDesignSampleState(id, {
+    selectedDesignSample,
+    selectedDesignId,
+    selectedDesignTemplate,
+    selectedDesignLook,
+    prompt: taskInput.value,
+  }, { toggle });
+  selectedDesignSample = next.selectedDesignSample;
+  selectedDesignId = next.selectedDesignId;
+  selectedDesignTemplate = next.selectedDesignTemplate;
+  selectedDesignFilePack = null;
+  designRouteHint = null;
+  if (next.prompt !== taskInput.value) {
+    taskInput.value = next.prompt;
+    taskInput.focus();
+    taskInput.setSelectionRange(taskInput.value.length, taskInput.value.length);
+    syncWelcomeComposerField();
+  }
+  if (selectedDesignTemplate && packSelect && [...packSelect.options].some((o) => o.value === "design")) {
+    packSelect.value = "design";
+    if (autoPackToggle) autoPackToggle.checked = false;
+  }
+  const spec = selectedDesignSample ? designSamplesForTab(selectedDesignTab || "Prototype").find((s) => s.id === selectedDesignSample) : null;
+  if (spec) announceStatus(`已选用样例：${spec.title}`);
+  paintEmptyState();
+  paintDesignTemplateChip();
+  syncComposer();
+}
+
+function applyDesignTemplate(id, { toggle = false } = {}) {
+  const next = !id ? null : (toggle && selectedDesignTemplate === id ? null : String(id));
+  selectedDesignTemplate = next;
+  if (!next) selectedDesignSample = null;
+  const spec = next ? designTemplateById(next) : null;
+  if (spec) {
+    if (packSelect && [...packSelect.options].some((o) => o.value === "design")) {
+      packSelect.value = "design";
+    }
+    if (autoPackToggle) autoPackToggle.checked = false;
+    const cur = taskInput.value.trim();
+    if (!cur || isDesignTemplatePrompt(cur) || isDesignSamplePrompt(cur)) {
+      taskInput.value = composePromptWithLook(spec.prompt, selectedDesignLook);
+      taskInput.focus();
+      taskInput.setSelectionRange(taskInput.value.length, taskInput.value.length);
+      syncWelcomeComposerField();
+    }
+    announceStatus(`已选用模板：${spec.title}`);
+  } else if (isDesignTemplatePrompt(taskInput.value) || isDesignSamplePrompt(taskInput.value)) {
+    taskInput.value = "";
+    syncWelcomeComposerField();
+  }
+  const empty = document.querySelector(".empty-state--welcome");
+  if (empty) paintEmptyState();
+  paintDesignTemplateChip();
+}
+
 // ---- 运行列表刷新 ----
 function getFilteredRuns() {
-  return filterRunsByQuery(filterRunsByStatus(runs, runStates, currentFilter), currentQuery);
+  const allProjects = document.getElementById("sidebar-all-projects")?.checked === true;
+  const composerWorkdir = workdirSelect?.value ?? "";
+  return filterRunsByQuery(
+    filterRunsByStatus(
+      filterRunsByComposerWorkdir(runs, composerWorkdir, allProjects),
+      runStates,
+      currentFilter,
+    ),
+    currentQuery,
+  );
 }
 
 function refreshRunListView() {
@@ -860,7 +1347,7 @@ function refreshRunListView() {
     },
   });
   if (!selectedRunId) {
-    renderEmptyState(runs.length > 0);
+    paintEmptyState();
   }
   // 选中态、列表内容、run 状态三者任一变了底栏就可能换模式——这里是它们的汇合点
   syncComposer();
@@ -907,6 +1394,9 @@ runFilter.addEventListener("change", () => {
   currentFilter = runFilter.value;
   refreshRunListView();
 });
+document.getElementById("sidebar-all-projects")?.addEventListener("change", () => {
+  refreshRunListView();
+});
 
 // 搜索：列表用键控补丁更新，不重建节点，所以边打字边过滤不会打断输入焦点
 if (runSearch) {
@@ -917,7 +1407,7 @@ if (runSearch) {
 }
 
 // ---- 选择运行 ----
-function selectRun(runId) {
+function selectRun(runId, opts = {}) {
   if (selectedRunId === runId) return;
   selectedRunId = runId;
   unreadRuns.delete(runId); // 看了就算读过
@@ -931,7 +1421,8 @@ function selectRun(runId) {
   hydrateThreadAncestors(runId);
   renderDetailWithState(state);
   enterDetailMode();
-  writeHash(runId, activeTabs.get(runId));
+  // 产物深链选中会话时不许 writeHash：它会关画布并清 pending，右侧变空白。
+  if (!opts.keepHash) writeHash(runId, activeTabs.get(runId));
   announceStatus(`已选择运行：${state.task}`);
   ensureSubscription(runId);
   syncAutoApprove(runId);
@@ -951,15 +1442,26 @@ function ensureState(runId) {
   const existing = runStates.get(runId);
   const info = runs.find((r) => r.runId === runId);
   if (existing) {
+    let next = existing;
     if (info && existing.archived !== Boolean(info.archived)) {
-      const refreshed = { ...existing, archived: Boolean(info.archived) };
-      runStates.set(runId, refreshed);
-      return refreshed;
+      next = { ...next, archived: Boolean(info.archived) };
     }
-    return existing;
+    // 列表已收工：本地残留的 pending 是切会话幽灵卡，当场过期。
+    if (info?.status === "done") {
+      const leftover = (next.pendingApprovals ?? []).some((a) => a.status === "pending");
+      if (next.status !== "done" || leftover) {
+        next = expirePendingApprovals({ ...next, status: "done" });
+      }
+    }
+    if (next !== existing) runStates.set(runId, next);
+    return next;
   }
   if (!info) return null;
-  const state = createInitialState(runId, info.task, info.verify, { archived: Boolean(info.archived) });
+  const state = createInitialState(runId, info.task, info.verify, {
+    archived: Boolean(info.archived),
+    createdAt: info.createdAt,
+  });
+  if (info.status === "done") state.status = "done";
   runStates.set(runId, state);
   return state;
 }
@@ -1022,7 +1524,13 @@ function parseRoute() {
   return { kind: "run", runId: decodeURIComponent(m[1]), tab: normalizeTab(m[2]) };
 }
 
-/** 进入设置视图：走 hash，浏览器前进/后退天然可用 */
+async function fetchUsageReport() {
+  const res = await fetch("/api/usage");
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+/** 进入消耗视图：走 hash，浏览器前进/后退天然可用。侧栏入口已收进设置。 */
 function navigateToUsage() {
   if (isUsageRoute(location.hash || "")) {
     usageApi?.open();
@@ -1135,7 +1643,7 @@ function applyHash() {
     // full 跟随深链（?full = 放大态），刷新后形态不丢。
     pendingArtifact = { runId: route.runId, index: route.index, full: Boolean(route.full) };
     if (route.runId !== selectedRunId) {
-      selectRun(route.runId);
+      selectRun(route.runId, { keepHash: true });
       const target = encodeArtifactHash(route.runId, route.index, { full: Boolean(route.full) });
       if (location.hash !== target) {
         suppressHashHandling = true;
@@ -1192,6 +1700,7 @@ function handleToggleEntry(seq) {
 
 // ---- 渲染详情（统一入口） ----
 function renderDetailWithState(state) {
+  leaveWelcomeLayout();
   const runId = state.runId;
   const activeTab = normalizeTab(activeTabs.get(runId));
 
@@ -1216,10 +1725,29 @@ function renderDetailWithState(state) {
     liveText: revealedSlice(runId, liveTexts.get(runId) ?? "", false),
     liveThinking: revealedSlice(runId, liveThinking.get(runId) ?? "", true),
     onPlanDecision: (decision) => postPlanDecision(runId, decision),
+    onHandoffDecision: (decision) => postHandoffDecision(runId, decision),
     onAnswer: (answers) => postAnswer(runId, answers),
     onReveal: (path) => revealArtifact(runId, path),
+    onCopyChat: (text) => { void copyChatText(text); },
+    onForkChat: (id) => { void forkConversation(id || runId); },
+    onRewindChat: (id, seq) => { void rewindConversation(id || runId, seq); },
+    onRateChat: (id, _seq, rating, excerpt) => { void sendChatFeedback(id || runId, rating, excerpt); },
+    selectedAgentId: selectedAgentByRun.get(runId) ?? null,
+    onOpenAgent: (id) => {
+      if (!id) return;
+      selectedAgentByRun.set(runId, id);
+      const next = runStates.get(runId);
+      if (next) renderDetailWithState(next);
+    },
+    onCloseAgent: () => {
+      selectedAgentByRun.delete(runId);
+      const next = runStates.get(runId);
+      if (next) renderDetailWithState(next);
+    },
     onOpenCanvas: (path) => openArtifactByPath(runId, path),
-    onPreviewPath: (path) => previewLocalPath(runId, path),
+    onPreviewPath: (path) => openArtifactByPath(runId, path),
+    onOpenBrowser: (url) => openArtifactByPath(runId, url),
+    previewFiles: currentRunArtifacts(runId).filter((f) => f.kind !== "browser" && !isBrowserPreviewPath(f.path)),
     inspectPaths: (paths) => inspectRunPaths(runId, paths),
     unverifiedDismissed: dismissedUnverified.has(runId),
     onDismissUnverified: () => {
@@ -1228,10 +1756,10 @@ function renderDetailWithState(state) {
       if (next) renderDetailWithState(next);
     },
     onContinue: () => {
-      const text = taskInput.value.trim() || "继续";
+      const text = withCanvasEditScope(taskInput.value.trim() || "继续");
       void submitAppend({ runId, text });
     },
-    threadFiles: deriveThreadFiles(runs, runStates, runId),
+    threadFiles: conversationArtifactFiles(runId),
     runs,
     runStates,
   });
@@ -1306,9 +1834,28 @@ const stoppingRuns = new Set();
 /** 本页关掉的待复核条，按 run。刷新后还会再出现——那是新会话该看见的提醒。 */
 const dismissedUnverified = new Set();
 
+function revealDecisionDock(runId) {
+  selectRun(runId);
+  const state = runStates.get(runId);
+  const child = deriveChildAgents(state ?? {}).find((a) => a.pendingApprovals > 0);
+  if (child) {
+    selectedAgentByRun.set(runId, child.id);
+    if (state) renderDetailWithState(state);
+    return;
+  }
+  const dock = document.getElementById("action-dock");
+  if (!dock) return;
+  dock.classList.remove("action-dock--flash");
+  void dock.offsetWidth;
+  dock.classList.add("action-dock--flash");
+}
+
 function syncComposer() {
   const info = selectedRunId ? runs.find((r) => r.runId === selectedRunId) ?? null : null;
   if (info?.status === "done" && selectedRunId) stoppingRuns.delete(selectedRunId);
+  const welcomeWorkdir = workdirSelect?.value && workdirSelect.value !== WORKDIR_ADD_VALUE
+    ? workdirSelect.value
+    : null;
   composerMode = deriveComposerMode({
     info: info ? { ...info, runId: selectedRunId } : null,
     localStatus: selectedRunId ? runStates.get(selectedRunId)?.status ?? null : null,
@@ -1318,9 +1865,17 @@ function syncComposer() {
     // 刚发生的错误压过 run 上挂着的旧错；两者都按各自的时机清，
     // 所以切到另一个 run 时不会看见上一个 run 的 409
     error: newRunError ?? (selectedRunId ? followUpErrors.get(selectedRunId) ?? null : null),
+    workdir: welcomeWorkdir,
+    draft: taskInput?.value ?? "",
+    designMode: designModeActive,
+    designTitle: designComposerTitle(),
   });
   patchComposer(composerMode);
+  workdirComboboxApi?.paint();
+  void workspaceGitChipApi?.refresh();
+  paintDesignTemplateChip();
   syncQueueChips();
+  syncWelcomeComposerField();
 }
 
 // ---- 信息队列（运行中插队 / 排队）----
@@ -1331,7 +1886,9 @@ function syncComposer() {
  */
 function syncQueueChips() {
   const state = selectedRunId ? runStates.get(selectedRunId) : null;
-  const html = renderQueueChips(state?.queuedMessages ?? []);
+  const html = renderQueueChips(state?.queuedMessages ?? [], {
+    insertNow: composerMode?.mode === "running" && composerMode.kind === "steer",
+  });
   queueChips.innerHTML = html;
   queueChips.hidden = !html;
 }
@@ -1340,13 +1897,13 @@ function syncQueueChips() {
  * 运行中发消息：插队（下一轮模型调用前注入正史）或排队（本轮结束自动续跑）。
  * 服务端 202 = 已受理；消息何时生效由随后推来的 steering / user_message 事件宣告。
  */
-async function postRunningMessage(qMode) {
+async function postRunningMessage(qMode, textOverride) {
   const runId = composerMode?.runId;
-  const text = taskInput.value.trim();
-  if (!runId) return;
+  const text = withCanvasEditScope(String(textOverride ?? taskInput.value).trim());
+  if (!runId) return false;
   if (!text) {
     announceStatus("先输入指令内容再发送");
-    return;
+    return false;
   }
   try {
     const res = await fetch(`/api/runs/${encodeURIComponent(runId)}/messages`, {
@@ -1357,21 +1914,39 @@ async function postRunningMessage(qMode) {
     if (!res.ok) {
       const b = await res.json().catch(() => ({}));
       showSubmitError(b.error ?? `发送失败（HTTP ${res.status}）`);
-      return;
+      return false;
     }
-    taskInput.value = "";
-    clearUploads();
-    announceStatus(qMode === "steer" ? "已插队，将在下一轮模型调用前生效" : "已排队，本轮结束后自动发送");
+    if (textOverride === undefined) {
+      taskInput.value = "";
+      clearUploads();
+    }
+    announceStatus(qMode === "steer" ? "已立即插入，将在下一轮模型调用前生效" : "已排队，本轮结束后自动发送");
+    return true;
   } catch (err) {
     showSubmitError(`发送失败：${err.message ?? "网络错误"}`);
+    return false;
   }
 }
 
-steerBtn.addEventListener("click", () => void postRunningMessage("steer"));
-queueBtn.addEventListener("click", () => void postRunningMessage("queue"));
-
-/** chips 的 ✕：取消单条排队消息（事件委托，chip 每次同步都会重建） */
+/** 胶囊上方：立即插入当前草稿，或把某条排队消息提升为插队 */
 queueChips.addEventListener("click", (e) => {
+  const insertNow = /** @type {HTMLElement|null} */ (e.target)?.closest?.("[data-insert-now]");
+  if (insertNow) {
+    void postRunningMessage("steer");
+    return;
+  }
+  const promote = /** @type {HTMLElement|null} */ (e.target)?.closest?.("[data-steer-index]");
+  if (promote && selectedRunId) {
+    const state = runStates.get(selectedRunId);
+    const queued = Array.isArray(state?.queuedMessages) ? state.queuedMessages : [];
+    const text = String(queued[Number(promote.dataset.steerIndex)] ?? "").trim();
+    if (text) {
+      void postRunningMessage("steer", text).then((ok) => {
+        if (ok) void cancelQueuedMessage(selectedRunId, Number(promote.dataset.steerIndex));
+      });
+    }
+    return;
+  }
   const btn = /** @type {HTMLElement|null} */ (e.target)?.closest?.(".queue-chip-cancel");
   if (!btn || !selectedRunId) return;
   void cancelQueuedMessage(selectedRunId, Number(btn.dataset.index));
@@ -1394,6 +1969,100 @@ async function cancelQueuedMessage(runId, index) {
   }
 }
 
+async function copyChatText(text) {
+  const value = String(text ?? "");
+  try {
+    if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(value);
+    else {
+      const ta = document.createElement("textarea");
+      ta.value = value;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      ta.remove();
+    }
+    announceStatus("已复制");
+  } catch {
+    announceStatus("复制失败");
+  }
+}
+
+async function rewindConversation(runId, seq) {
+  if (!runId) return;
+  const state = runStates.get(runId);
+  const preview = deriveRewindFilePreview(state, seq);
+  const choice = await askRewindChoice(preview);
+  if (!choice) return;
+  try {
+    const res = await fetch(`/api/runs/${encodeURIComponent(runId)}/rewind`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ seq, revertFiles: choice === "files" }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      announceStatus(body.error ?? `回退失败（HTTP ${res.status}）`);
+      return;
+    }
+    const payload = await res.json();
+    const fork = mergeForkedFollowUp(runs, runId, payload, "");
+    if (!fork) {
+      announceStatus("回退未产生新对话");
+      return;
+    }
+    runs = fork.runs;
+    const merged = fork.summary;
+    if (!runStates.has(fork.targetRunId)) {
+      runStates.set(fork.targetRunId, createInitialState(fork.targetRunId, merged.task, Boolean(merged.verify), {
+        createdAt: merged.createdAt,
+      }));
+    }
+    activeTabs.set(fork.targetRunId, "loop");
+    refreshRunListView();
+    selectRun(fork.targetRunId);
+    ensureSubscription(fork.targetRunId);
+    announceStatus(choice === "files" ? "已回退对话和改动" : "已回退对话");
+  } catch (err) {
+    announceStatus(`回退失败：${err.message ?? "网络错误"}`);
+  }
+}
+
+async function forkConversation(runId) {
+  if (!runId) return;
+  try {
+    const res = await fetch(`/api/runs/${encodeURIComponent(runId)}/fork`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      announceStatus(body.error ?? `分叉失败（HTTP ${res.status}）`);
+      return;
+    }
+    const payload = await res.json();
+    const fork = mergeForkedFollowUp(runs, runId, payload, "");
+    if (!fork) {
+      announceStatus("分叉未产生新对话");
+      return;
+    }
+    runs = fork.runs;
+    const merged = fork.summary;
+    if (!runStates.has(fork.targetRunId)) {
+      runStates.set(fork.targetRunId, createInitialState(fork.targetRunId, merged.task, Boolean(merged.verify), {
+        createdAt: merged.createdAt,
+      }));
+    }
+    activeTabs.set(fork.targetRunId, "loop");
+    refreshRunListView();
+    selectRun(fork.targetRunId);
+    ensureSubscription(fork.targetRunId);
+    announceStatus("已分出新对话");
+  } catch (err) {
+    announceStatus(`分叉失败：${err.message ?? "网络错误"}`);
+  }
+}
+
 async function postFollowUp(runId, text, verify) {
   followUpErrors.delete(runId);
   try {
@@ -1408,6 +2077,10 @@ async function postFollowUp(runId, text, verify) {
         planMode: planModeToggle?.checked === true,
         multiAgent: multiAgentToggle?.checked === true,
         effort: effortSelect?.value,
+        pack: packSelect?.value ?? "",
+        autoPack: autoPackToggle?.checked === true,
+        permissionMode: permissionModeSelect?.value || undefined,
+        rubric: rubricInput?.value,
       })),
     });
     if (!res.ok) {
@@ -1419,7 +2092,7 @@ async function postFollowUp(runId, text, verify) {
       followUpErrors.set(runId, detail);
       const st = runStates.get(runId);
       if (st) renderDetailWithState(st);
-      return;
+      return false;
     }
     const payload = await res.json().catch(() => ({ runId }));
     const nextRunId = typeof payload.runId === "string" ? payload.runId : runId;
@@ -1432,14 +2105,16 @@ async function postFollowUp(runId, text, verify) {
       const merged = fork.summary;
 
       if (!runStates.has(fork.targetRunId)) {
-        runStates.set(fork.targetRunId, createInitialState(fork.targetRunId, merged.task, Boolean(merged.verify)));
+        runStates.set(fork.targetRunId, createInitialState(fork.targetRunId, merged.task, Boolean(merged.verify), {
+          createdAt: merged.createdAt,
+        }));
       }
       activeTabs.set(fork.targetRunId, "loop");
       refreshRunListView();
       selectRun(fork.targetRunId);
       ensureSubscription(fork.targetRunId);
       announceStatus("对话已接续");
-      return;
+      return true;
     }
 
     // run 从终态回到运行中：本地先置位再重订阅。事件流里的 user_message 会
@@ -1454,10 +2129,24 @@ async function postFollowUp(runId, text, verify) {
     syncAutoApprove(runId);
     const cur = runStates.get(runId);
     if (cur) renderDetailWithState(cur);
+    return true;
   } catch (err) {
     followUpErrors.set(runId, `追加失败：${err.message ?? "网络错误"}`);
     const st = runStates.get(runId);
     if (st) renderDetailWithState(st);
+    return false;
+  }
+}
+
+async function sendChatFeedback(runId, rating, excerpt) {
+  const text = buildChatFeedbackMessage(rating, excerpt);
+  if (!text || !runId) return;
+  const info = runs.find((r) => r.runId === runId);
+  const ok = info?.status === "running"
+    ? await postRunningMessage("steer", text)
+    : await postFollowUp(runId, text, runStates.get(runId)?.verify);
+  if (ok) {
+    announceStatus(rating === "up" ? "已告诉模型继续保持" : "已告诉模型重新调整");
   }
 }
 
@@ -1510,17 +2199,84 @@ async function inspectRunPaths(runId, paths) {
 // ---- 宿主真相快照（Tools/Context/Loop 面的数据源）----
 // 拉一次即可：它描述的是本次进程的装配，run 与 run 之间不变
 let harnessSnapshot = null;
+/** @type {{models: any[], roles: any, context?: any}|null} */
+let modelsSnapshot = null;
+let executorModelSwitchBusy = false;
+/** @type {ReturnType<typeof initExecutorModelPicker>|null} */
+let executorModelPickerApi = null;
+
+async function switchExecutorModel(nextId) {
+  if (!nextId || executorModelSwitchBusy) return;
+  if (modelsSnapshot?.roles?.executor === nextId) return;
+  const prevId = modelsSnapshot?.roles?.executor ?? "";
+  const select = document.getElementById("executor-model-select");
+  executorModelSwitchBusy = true;
+  executorModelPickerApi?.setDisabled(true);
+  try {
+    const res = await fetch("/api/models/roles", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ executor: nextId }),
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok) {
+      if (select) select.value = prevId;
+      executorModelPickerApi?.setPayload(modelsSnapshot);
+      showSubmitError(data?.error ?? `切换模型失败（HTTP ${res.status}）`);
+      return;
+    }
+    modelsSnapshot = data;
+    executorModelPickerApi?.setPayload(data);
+    await loadHarness();
+    const win = data?.context;
+    if (win?.window != null) {
+      const k = win.window >= 1000 ? `${Math.floor(win.window / 1000)}k` : String(win.window);
+      announceStatus(`已切换执行模型；窗口 ${k}（${win.windowSource ?? "unknown"}）`);
+    } else {
+      announceStatus("已切换执行模型；窗口未知——水位回落默认，撞 400 后会学到");
+    }
+  } catch {
+    if (select) select.value = prevId;
+    executorModelPickerApi?.setPayload(modelsSnapshot);
+    showSubmitError("切换模型请求未能发出");
+  } finally {
+    executorModelSwitchBusy = false;
+    syncComposer();
+  }
+}
+
+async function loadModelsForComposer() {
+  try {
+    const res = await fetch("/api/models");
+    if (!res.ok) return;
+    modelsSnapshot = await res.json();
+    executorModelPickerApi?.setPayload(modelsSnapshot);
+  } catch {
+    /* 模型库读不到时保留旧选项 */
+  }
+}
+
 async function loadHarness() {
   try {
     const res = await fetch("/api/harness");
     if (!res.ok) return;
     harnessSnapshot = await res.json();
+    if (harnessSnapshot?.designMode) {
+      designCatalog = Array.isArray(harnessSnapshot.designMode.catalog)
+        ? harnessSnapshot.designMode.catalog
+        : [];
+      designFilePacks = Array.isArray(harnessSnapshot.designMode.installedFilePacks)
+        ? harnessSnapshot.designMode.installedFilePacks
+        : [];
+    }
     populateKnobs(harnessSnapshot);
+    if (mainPanel.classList.contains("is-welcome")) paintEmptyState();
     // 快照到达前渲染过的详情要补一次——四决定因素的护栏/工具面全靠它
     if (selectedRunId) {
       const state = runStates.get(selectedRunId);
       if (state) renderDetailWithState(state);
     }
+    await loadModelsForComposer();
   } catch {
     // 拿不到就照实降级：Tools 面会显示"未获取到工具清单"
   }
@@ -1662,15 +2418,28 @@ function revealedSlice(runId, full, isThinking) {
   );
 }
 
-const batcher = createBatcher((batches) => {
-  for (const [runId, queue] of batches) {
+const approvalSettle = createApprovalSettleGate();
+/** @type {Map<string, ReturnType<typeof setTimeout>>} */
+const approvalSettleTimers = new Map();
+
+function scheduleApprovalSettle(runId, ms) {
+  if (approvalSettleTimers.has(runId)) return;
+  approvalSettleTimers.set(runId, setTimeout(() => {
+    approvalSettleTimers.delete(runId);
+    const late = approvalSettle.ingest(runId, [], { force: true });
+    if (late.ready.length) applySseBatch(runId, late.ready);
+  }, ms));
+}
+
+function applySseBatch(runId, queue) {
     const state = runStates.get(runId);
-    if (!state) continue;
+    if (!state) return;
+    const annotated = annotateResolvedApprovals(queue);
 
     // 通知中心（T4）：与 reducer 消费同一份信封，逐条喂给通知归约。
     // 模块未加载完成时静默跳过——它是增强项，不挡主流程。
     if (notificationsApi) {
-      for (const item of queue) notificationsApi.ingest(runId, item);
+      for (const item of annotated) notificationsApi.ingest(runId, item);
     }
     // 指挥中心（T11）：同一节拍末尾刷新——它读的是通知 store 与 run 列表，
     // 必须在 notifications.ingest 之后调，待决栏才不吃上一节的旧账。
@@ -1695,7 +2464,7 @@ const batcher = createBatcher((batches) => {
       }
     }
 
-    const next = reduceEvents(state, queue);
+    const next = reduceEvents(state, annotated);
     runStates.set(runId, next);
 
     // 产物画布「运行中自动刷新」（T10 升级）：本批写盘工具碰了正在预览的产物，
@@ -1711,27 +2480,40 @@ const batcher = createBatcher((batches) => {
       if (tip) renderDetailWithState(tip);
     }
 
-    // run_end 是唯一的"可以收工"信号：此时主动 close，浏览器才不会再自动重连
+    // run_end 才是可以收工并主动 close 的信号（段级 done 的单段快路径也会把
+    // status 写成 done——那时若立刻关流，会吃不到 run_end，更吃不到 finalize 之后
+    // 排队消息自动续跑推来的 user_message）。服务端在 run_end 后也会 end 掉 SSE；
+    // 自动续跑会把 run 再拉回 running，靠生命周期流重订（见 subscribeLifecycle）。
+    const sawRunEnd = queue.some((item) => item?.event?.type === "run_end");
     if (next.status === "done") {
       stoppingRuns.delete(runId);
       liveTexts.delete(runId); // 运行结束，直播条隐藏，缓冲没有留存意义
       liveThinking.delete(runId);
       liveTotals.delete(runId);
-      const es = eventSources.get(runId);
-      if (es) {
-        es.close();
-        eventSources.delete(runId);
-        // 收尾前多半已经吃过一次 error（服务端 res.end 先到、run_end 后 flush），
-        // 横幅正挂着。close 不触发任何事件，不在这儿落它就会一直挂到下次切换。
-        setConnectionState(runId, "live");
-        announceStatus(`运行已完成：${next.task}`);
-        refreshTranscriptIfWatching(runId);
-        // 不在看的那条跑完了 → 记一颗未读星（在看的那条不必提醒，你就在看）
-        if (selectedRunId !== runId) unreadRuns.add(runId);
-        // canContinue 由服务端算，run 收尾后要拉一次列表才知道能不能追加
-        void loadRuns();
+      if (sawRunEnd || next.runEnd) {
+        const es = eventSources.get(runId);
+        if (es) {
+          es.close();
+          eventSources.delete(runId);
+          // 收尾前多半已经吃过一次 error（服务端 res.end 先到、run_end 后 flush），
+          // 横幅正挂着。close 不触发任何事件，不在这儿落它就会一直挂到下次切换。
+          setConnectionState(runId, "live");
+          announceStatus(`运行已完成：${next.task}`);
+          refreshTranscriptIfWatching(runId);
+          // 不在看的那条跑完了 → 记一颗未读星（在看的那条不必提醒，你就在看）
+          if (selectedRunId !== runId) unreadRuns.add(runId);
+          // canContinue 由服务端算，run 收尾后要拉一次列表才知道能不能追加
+          void loadRuns();
+        }
       }
     }
+}
+
+const batcher = createBatcher((batches) => {
+  for (const [runId, queue] of batches) {
+    const { ready, settleInMs } = approvalSettle.ingest(runId, queue);
+    if (ready.length) applySseBatch(runId, ready);
+    if (settleInMs != null) scheduleApprovalSettle(runId, settleInMs);
   }
 });
 
@@ -1748,26 +2530,58 @@ document.addEventListener("visibilitychange", () => {
 function ensureSubscription(runId) {
   if (eventSources.has(runId)) return;
   const state = runStates.get(runId);
-  // 空时间线的已完成父 run 仍要拉一次快照，否则谱系对话拼不出历史轮。
-  if (state && state.status === "done" && (state.timeline?.length ?? 0) > 0) return;
+  const info = runs.find((r) => r.runId === runId);
+  // 列表说还在跑：即使本地还停在上一轮 done（排队自动续跑 / 同 run 再开），
+  // 也必须重订——服务端 finalize 后已经掐过旧 SSE。
+  if (info?.status === "running") {
+    // fall through
+  } else if (state && state.status === "done" && (state.timeline?.length ?? 0) > 0) {
+    // 空时间线的已完成父 run 仍要拉一次快照，否则谱系对话拼不出历史轮。
+    return;
+  }
 
   const es = new EventSource(`/api/runs/${runId}/events`);
   eventSources.set(runId, es);
 
+  // 第一次订这条流：先攒历史重放，等 replay_done 再进 batcher。
+  // 已经 hydrate 过的重连走 Last-Event-ID，只补缺口，不必再闸。
+  const gate = (runStates.get(runId)?.lastSeq ?? 0) > 0 ? null : createReplayGate();
+  const deliver = (item) => {
+    if (!gate) {
+      enqueueEvent(runId, item);
+      return;
+    }
+    const live = gate.hold(item);
+    if (live) {
+      for (const ev of live) enqueueEvent(runId, ev);
+    }
+  };
+  const flushReplay = (force = false) => {
+    if (!gate || gate.released) return;
+    // 500ms 兜底若仍夹着未配对的审批，再等 replay_done，避免先画出幽灵卡。
+    if (!force && gate.hasUnpairedApprovalRequest()) return;
+    for (const ev of gate.release()) enqueueEvent(runId, ev);
+  };
+
   es.addEventListener("message", (msg) => {
     try {
-      enqueueEvent(runId, JSON.parse(msg.data));
+      deliver(JSON.parse(msg.data));
     } catch {
       // 解析失败静默
     }
   });
+  es.addEventListener("replay_done", () => flushReplay(true));
+  if (gate) {
+    setTimeout(() => flushReplay(false), 500);
+    setTimeout(() => flushReplay(true), 2500);
+  }
 
   // 文本流式：命名通道，不占 seq、不进事件缓冲（V-15）。
-  // 只取 main 来源——verifier/planner 的思考流不该抢占委托方的直播条。
+  // 执行者才进直播条：main / s1/main / spawn/…；规划者、核查者不抢。
   es.addEventListener("delta", (msg) => {
     try {
       const { source, kind, text } = JSON.parse(msg.data);
-      if (source !== "main") return;
+      if (!isLiveDeltaSource(source)) return;
       // reset：同轮重流（断流重试 / 换端点）前服务端宣告"清缓冲"——
       // 失败那次尝试流出的半截文字作废，否则重流全文会接在它后面反复生成
       if (kind === "reset") {
@@ -1843,6 +2657,31 @@ function syncConnectionBanner() {
  * 计划确认门应答（§5.1）。与工具审批同款口径：409 静默（幂等），不做乐观更新
  * ——服务端随后推 `plan_approval_resolved`，那条才是权威审计记录。
  */
+async function postHandoffDecision(runId, decision) {
+  try {
+    const res = await fetch(`/api/runs/${runId}/handoff`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision }),
+    });
+    if (res.status === 409) {
+      const body = await res.json().catch(() => ({}));
+      if (body && body.error) showSubmitError(String(body.error));
+      return;
+    }
+    if (!res.ok) {
+      showSubmitError(await failedActionMessage("下一步", res));
+      return;
+    }
+    const payload = await res.json().catch(() => ({}));
+    if (decision === "accept" && payload && payload.runId) {
+      selectRun(payload.runId);
+    }
+  } catch (err) {
+    showSubmitError(`下一步应答失败：${err && err.message ? err.message : err}`);
+  }
+}
+
 async function postPlanDecision(runId, decision) {
   try {
     const res = await fetch(`/api/runs/${runId}/plan-approval`, {
@@ -1852,7 +2691,7 @@ async function postPlanDecision(runId, decision) {
     });
     if (res.status === 409) return; // 已决或已收尾——重复点击不该报错
     if (!res.ok) {
-      showSubmitError(`计划门应答失败（HTTP ${res.status}）：${await res.text()}`);
+      showSubmitError(await failedActionMessage("计划门应答", res));
     }
   } catch (err) {
     showSubmitError(`计划门应答失败：${err && err.message ? err.message : err}`);
@@ -1873,7 +2712,7 @@ async function postAnswer(runId, answers) {
     });
     if (res.status === 409) return; // 已答或已收尾——重复点击不该报错
     if (!res.ok) {
-      showSubmitError(`澄清答复失败（HTTP ${res.status}）：${await res.text()}`);
+      showSubmitError(await failedActionMessage("澄清答复", res));
     }
   } catch (err) {
     showSubmitError(`澄清答复失败：${err && err.message ? err.message : err}`);
@@ -1895,12 +2734,7 @@ async function postApproval(runId, approvalId, decision, reason, scope) {
       // 409：服务端已决。404：自动放行从不进挂起表，卡却还在——同一张过期卡。
       // 两种都不该弹「审批失败」，按这次点击收口即可。
     } else if (!res.ok) {
-      let detail = "";
-      try {
-        const body = await res.json();
-        detail = body?.error ? `：${body.error}` : "";
-      } catch { /* 响应体不是 JSON */ }
-      showSubmitError(`审批失败（HTTP ${res.status}）${detail}`);
+      showSubmitError(await failedActionMessage("审批", res));
       return;
     }
     // 乐观更新，让点击立刻有反馈；服务端随后会推 approval_resolved，
@@ -1984,24 +2818,29 @@ if (autoApproveToggle) {
 function applyPermissionModeToKnobs(mode) {
   const switches = permissionModeSwitches(mode);
   if (planModeToggle) planModeToggle.checked = switches.planMode;
-  if (autoApproveToggle) {
+  // plan 档与自动放行正交：选计划编排不得顺手关掉「自动放行」。
+  if (autoApproveToggle && mode !== "plan") {
     autoApproveToggle.checked = switches.autoYes || switches.approvalDefault === "auto";
   }
 }
 
 function syncPermissionModeSelectFromKnobs() {
   if (!permissionModeSelect) return;
-  const matched = matchPermissionMode({
+  const switches = {
     approvalDefault: autoApproveToggle?.checked ? "auto" : "ask",
     planMode: planModeToggle?.checked === true,
     planGate: planModeToggle?.checked === true,
     autoYes: autoApproveToggle?.checked === true,
-  });
-  if (matched) permissionModeSelect.value = matched;
+  };
+  const matched = matchPermissionMode(switches);
+  permissionModeSelect.value = matched ?? "";
+  const stance = document.getElementById("permission-stance");
+  if (stance) stance.textContent = describePermissionStance(matched, switches);
 }
 
 if (permissionModeSelect) {
   permissionModeSelect.addEventListener("change", () => {
+    if (!permissionModeSelect.value) return;
     applyPermissionModeToKnobs(permissionModeSelect.value);
   });
   syncPermissionModeSelectFromKnobs();
@@ -2019,6 +2858,11 @@ if (verifyToggle) {
  * 提交入口。去哪儿由 `composerSubmitPlan` 说了算——它是纯函数，
  * 所以"这一下会新建还是会追加"这件事可以在测试里锁死，而不是靠人点。
  */
+document.getElementById("design-template-chip")?.addEventListener("click", () => {
+  applyDesignTemplate(null);
+  announceStatus("已取消模板");
+});
+
 submitForm.addEventListener("submit", (e) => {
   e.preventDefault();
   const plan = composerSubmitPlan(composerMode, taskInput.value);
@@ -2031,6 +2875,7 @@ submitForm.addEventListener("submit", (e) => {
     return;
   }
   if (plan.kind === "stop") void stopRun(plan.runId);
+  else if (plan.kind === "steer") void postRunningMessage("steer");
   else if (plan.kind === "append") void submitAppend(plan);
   else void submitNewRun(plan);
 });
@@ -2062,12 +2907,71 @@ taskInput.addEventListener("keydown", (e) => {
   if (typeof submitForm.requestSubmit === "function") submitForm.requestSubmit();
   else submitForm.dispatchEvent(new Event("submit", { cancelable: true, bubbles: true }));
 });
+taskInput.addEventListener("input", () => {
+  syncWelcomeComposerField();
+  syncComposer();
+});
+taskInput.addEventListener("focus", syncWelcomeComposerField);
+taskInput.addEventListener("blur", syncWelcomeComposerField);
+
+function designComposerTitle() {
+  if (selectedDesignSample) {
+    const sample = designSampleById(selectedDesignSample);
+    if (sample?.title) return sample.title;
+  }
+  if (selectedDesignId && Array.isArray(designCatalog)) {
+    const entry = designCatalog.find((e) => e.id === selectedDesignId);
+    if (entry?.title) return entry.title;
+  }
+  return "";
+}
+
+/**
+ * 设计模式稿目录：mkdir + 加入白名单。当前是宿主仓库才切过去；
+ * 用户已选别的目录不抢。自动切换不写 PREF_WORKDIR——编码包下次打开还是用户自己选的目录。
+ */
+async function ensureDesignDraftsWorkdir() {
+  if (!workdirSelect) return;
+  const current = workdirSelect.value && workdirSelect.value !== WORKDIR_ADD_VALUE
+    ? workdirSelect.value
+    : "";
+  try {
+    const res = await fetch("/api/design-drafts-workdir", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ currentWorkdir: current || undefined }),
+    });
+    if (!res.ok) return;
+    const body = await res.json().catch(() => null);
+    if (!body?.workdir) return;
+    const list = Array.isArray(body.workdirs) ? body.workdirs : [];
+    const extras = getWorkdirSelection(workdirSelect, list).extras;
+    const keep = current && list.includes(current) ? current : workdirSelect.value;
+    if (body.select) {
+      renderWorkdirOptions(workdirSelect, list, { selected: body.workdir });
+      applyWorkdirSelection(workdirSelect, list, { primary: body.workdir, extras });
+      workdirComboboxApi?.paint();
+      void workspaceGitChipApi?.refresh();
+      syncComposer();
+      announceStatus("设计稿写到独立目录");
+      return;
+    }
+    if (list.length) {
+      renderWorkdirOptions(workdirSelect, list, { selected: keep });
+      applyWorkdirSelection(workdirSelect, list, { primary: keep, extras });
+      workdirComboboxApi?.paint();
+    }
+  } catch { /* 失败不挡设计模式 */ }
+}
 
 async function submitNewRun({ text: task }) {
   submitting = true;
   newRunError = null;
   syncComposer();
   try {
+    if (designModeActive) {
+      await ensureDesignDraftsWorkdir();
+    }
     const verify = verifyToggle.checked;
     const res = await fetch("/api/runs", {
       method: "POST",
@@ -2078,6 +2982,11 @@ async function submitNewRun({ text: task }) {
         pack: packSelect?.value,
         effort: effortSelect?.value,
         rubric: rubricInput?.value,
+        mode: designModeActive ? "design" : "single",
+        designId: selectedDesignId || undefined,
+        designTab: selectedDesignTab || undefined,
+        designTemplate: selectedDesignTemplate || undefined,
+        designFilePack: selectedDesignFilePack || undefined,
         planMode: planModeToggle?.checked === true,
         multiAgent: multiAgentToggle?.checked === true,
         autoPack: autoPackToggle?.checked === true,
@@ -2089,22 +2998,50 @@ async function submitNewRun({ text: task }) {
         workdir: workdirSelect?.value && workdirSelect.value !== WORKDIR_ADD_VALUE
           ? workdirSelect.value
           : undefined,
+        extraWorkdirs: workdirSelect
+          ? getWorkdirSelection(workdirSelect).extras
+          : undefined,
         useVerifierModel: !useVerifierModel || useVerifierModel.checked,
         usePlannerModel: !usePlannerModel || usePlannerModel.checked,
       })),
     });
     if (!res.ok) {
       let detail = "";
+      let body = null;
       try {
-        const body = await res.json();
+        body = await res.json();
         detail = body?.error ? `：${body.error}` : "";
       } catch { /* 响应体不是 JSON，只报状态码 */ }
+      if (res.status === 409 && body?.designRoute) {
+        designModeActive = true;
+        if (body.designRoute.tab) selectedDesignTab = body.designRoute.tab;
+        else if (!selectedDesignTab) selectedDesignTab = "Prototype";
+        designRouteHint = body.designRoute.reason || body.error || "请选择页签或模板";
+        paintEmptyState();
+      }
       newRunError = `提交失败（HTTP ${res.status}）${detail}`;
       return;
     }
     const { runId } = await res.json();
+    const pendingTemplate = designModeActive ? null : selectedDesignTemplate;
+    selectedDesignTemplate = null;
+    selectedDesignId = null;
+    selectedDesignSample = null;
+    selectedDesignFilePack = null;
+    designRouteHint = null;
+    paintDesignTemplateChip();
+    if (pendingTemplate) {
+      try {
+        const seed = await fetch(`/api/runs/${encodeURIComponent(runId)}/seed-template`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ template: pendingTemplate }),
+        });
+        if (seed.ok) announceStatus(`已拷贝模板 ${pendingTemplate} 到工作目录`);
+      } catch { /* 模板拷贝失败不挡会话；agent 仍可自己读 templates/ */ }
+    }
 
-    const state = createInitialState(runId, task, verify);
+    const state = createInitialState(runId, task, verify, { createdAt: Date.now() });
     runStates.set(runId, state);
 
     runs.unshift({ runId, task, status: "running", verify, createdAt: Date.now(), finishedAt: null });
@@ -2132,8 +3069,8 @@ async function submitNewRun({ text: task }) {
 /**
  * 停止这次运行。
  *
- * 闸立刻拉下，按钮立刻改成「正在停止…」。当前这一步（在飞的模型请求 /
- * 工具）要等它自己结束或被 SDK 掐断，然后循环才收尾——不是点下去画面马上空白。
+ * 闸立刻拉下，按钮立刻改成「正在停止…」。loop 对在飞的模型/工具与 abort
+ * 赛跑，不应再等整轮吐完；超过约 1.5s 宿主会强制收尾。
  */
 async function stopRun(runId) {
   if (!runId || stoppingRuns.has(runId)) return;
@@ -2159,13 +3096,20 @@ async function stopRun(runId) {
   }
 }
 
+function withCanvasEditScope(text) {
+  const scope = typeof artifactCanvasApi?.getEditScope === "function"
+    ? artifactCanvasApi.getEditScope()
+    : null;
+  return attachDesignEditScope(text, scope);
+}
+
 async function submitAppend({ runId, text }) {
   submitting = true;
   // 提交前读：syncComposer 会把开关禁用，但 checked 值不动
   const verify = verifyToggle.checked;
   syncComposer();
   try {
-    await postFollowUp(runId, text, verify);
+    await postFollowUp(runId, withCanvasEditScope(text), verify);
     if (!followUpErrors.has(runId)) {
       taskInput.value = "";
       clearUploads();
@@ -2184,6 +3128,29 @@ async function submitAppend({ runId, text }) {
  * 的播报时机不受控。改成 role="alert" 的行内区域——辅助技术会自动播报，
  * 键盘焦点不动，错误内容还能带上 HTTP 状态码与服务端文案。
  */
+/**
+ * 人闸失败文案。429 不要把 `{"error":"Mutation rate limit exceeded"}` 原样甩出来——
+ * 那是额度窗，不是答复本身坏了；带上 Retry-After，并照实说这次没送出去。
+ */
+async function failedActionMessage(action, res) {
+  if (res.status === 429) {
+    const sec = Number(res.headers.get("retry-after"));
+    const wait = Number.isFinite(sec) && sec > 0 ? `${sec} 秒` : "一会儿";
+    return `${action}被限流拦住了，请 ${wait} 后再试。这次没有送出去。`;
+  }
+  let detail = "";
+  try {
+    const body = await res.json();
+    detail = body?.error ? `：${body.error}` : "";
+  } catch {
+    try {
+      const text = await res.text();
+      if (text) detail = `：${text}`;
+    } catch { /* 响应体读失败就只报状态码 */ }
+  }
+  return `${action}失败（HTTP ${res.status}）${detail}`;
+}
+
 function showSubmitError(message) {
   // 合并之后 #submit-error 由 patchComposer 统一写。这里改成设状态再同步，
   // 否则两个写入方会互相覆盖：一次列表刷新就能把刚报出来的错抹掉。
@@ -2250,11 +3217,12 @@ function subscribeLifecycle() {
         }
       } else if (payload.run) {
         const idx = runs.findIndex((r) => r.runId === payload.run.runId);
+        const prevStatus = runs[idx]?.status;
         // 生命周期流也要记未读：没订阅事件流的那些运行（你根本没点开过）
         // 只能从这里知道它们跑完了——只靠 SSE done 分支会漏掉一整类
         if (
           payload.run.status === "done" &&
-          runs[idx]?.status === "running" &&
+          prevStatus === "running" &&
           payload.run.runId !== selectedRunId
         ) {
           unreadRuns.add(payload.run.runId);
@@ -2262,6 +3230,24 @@ function subscribeLifecycle() {
         if (idx >= 0) runs[idx] = payload.run;
         else runs = [payload.run, ...runs];
         if (payload.run.status === "done") stoppingRuns.delete(payload.run.runId);
+        // 排队自动续跑：finalize 掐掉 SSE 之后又把 run 拉回 running。
+        // 本地若还停在 done，不重订事件流 →「结束后会自动回到对话」成假话。
+        if (payload.run.status === "running") {
+          const st = runStates.get(payload.run.runId);
+          if (st && st.status === "done") {
+            runStates.set(payload.run.runId, {
+              ...st,
+              status: "running",
+              runEnd: null,
+              stopReason: null,
+              error: null,
+            });
+            if (selectedRunId === payload.run.runId) {
+              renderDetailWithState(runStates.get(payload.run.runId));
+            }
+          }
+          ensureSubscription(payload.run.runId);
+        }
       }
       refreshRunListView();
       if (selectedRunId) syncAutoApprove(selectedRunId);
@@ -2283,24 +3269,37 @@ function subscribeLifecycle() {
 /** 用宿主快照填充旋钮选项——可选值由服务端给，前端不硬编码 */
 function populateKnobs(snap) {
   if (packSelect && Array.isArray(snap.availablePacks)) {
+    const keepPack = packSelect.value;
+    packSelect.innerHTML = "";
+    const none = document.createElement("option");
+    none.value = "";
+    none.textContent = "不用领域包";
+    packSelect.appendChild(none);
     for (const p of snap.availablePacks) {
       const opt = document.createElement("option");
       opt.value = p.name;
-      opt.textContent = `${p.name} — ${p.description ?? ""}`;
+      opt.textContent = p.name;
+      if (p.description) opt.title = p.description;
       packSelect.appendChild(opt);
     }
-    if (snap.pack?.name) packSelect.value = snap.pack.name;
+    const names = new Set([...packSelect.options].map((o) => o.value));
+    if (keepPack && names.has(keepPack)) packSelect.value = keepPack;
+    else if (snap.pack?.name && names.has(snap.pack.name)) packSelect.value = snap.pack.name;
     updatePackHint();
   }
   if (effortSelect && Array.isArray(snap.effortLevels)) {
+    const keepEffort = effortSelect.value;
     const labels = { low: "低", medium: "中", high: "高", xhigh: "很高", max: "最高" };
+    effortSelect.innerHTML = "";
     for (const lv of snap.effortLevels) {
       const opt = document.createElement("option");
       opt.value = lv;
       opt.textContent = labels[lv] ?? lv;
       effortSelect.appendChild(opt);
     }
-    if (snap.effort) effortSelect.value = snap.effort;
+    if (keepEffort && [...effortSelect.options].some((o) => o.value === keepEffort)) {
+      effortSelect.value = keepEffort;
+    } else if (snap.effort) effortSelect.value = snap.effort;
     // 设置中心（T7）的思考强度默认值覆盖服务端默认："" = 跟随服务端，不动 select
     applyComposerDefaults({ effortSelect }, { effort: composerDefaults(uiSettings).effort }, {
       effortLevels: snap.effortLevels,
@@ -2317,21 +3316,26 @@ function populateKnobs(snap) {
       ? workdirSelect.value
       : readPrefString(PREF_WORKDIR, snap.workdir);
     renderWorkdirOptions(workdirSelect, snap.availableWorkdirs, { selected: keep || snap.workdir });
+    const savedExtras = readPrefJson(PREF_WORKDIR_EXTRAS, []);
+    applyWorkdirSelection(workdirSelect, snap.availableWorkdirs, {
+      primary: workdirSelect.value,
+      extras: Array.isArray(savedExtras) ? savedExtras : [],
+    });
     // 有了「＋ 添加目录…」就永远有得选：不再因为只有一个目录而锁死下拉。
     // 运行中/追加模式的禁用走 patchComposer 的 optionsEnabled，语义不变。
     workdirSelect.disabled = false;
     workdirSelect.dataset.fixed = "false";
+    workdirComboboxApi?.paint();
+    void workspaceGitChipApi?.refresh();
   }
 
-  // V-30/V-31：四个角色都常驻可见。独立模型没配时明确写「跟随执行」或
-  // 「未配置」，而不是把整块藏掉后让用户猜这次到底用了什么。
+  // V-30/V-31：角色常驻可见。主执行模型在左侧独立选择器，这里只管规划/核查/识图/生图。
   const rm = snap.roleModels;
   const knob = document.getElementById("role-models-knob");
   if (rm && knob) {
     const executorText = document.getElementById("executor-role-text");
     if (executorText && rm.executor) {
       executorText.textContent = `执行 · ${rm.executor.model}`;
-      executorText.parentElement.title = `${rm.executor.model}（${rm.executor.provider}）`;
     }
 
     const wire = (role, rowId, fallbackId, textId, label) => {
@@ -2384,24 +3388,25 @@ function populateKnobs(snap) {
 }
 
 function updatePackHint() {
-  const hint = document.getElementById("pack-hint");
-  if (!hint || !harnessSnapshot?.availablePacks) return;
+  const row = document.getElementById("pack-row");
+  if (!row || !harnessSnapshot?.availablePacks) return;
   const p = harnessSnapshot.availablePacks.find((x) => x.name === packSelect.value);
   if (!p) {
-    hint.textContent = "用默认 system prompt 与全部内置工具（含有据咨询纪律）";
+    row.title = "用默认提示与全部内置工具。选包后工具面和核查纪律跟着换。";
     return;
   }
   const bits = [
+    p.description || p.name,
     `核查 ${p.verifyMode ?? "—"}`,
     p.hasRubric ? "自带评分表" : null,
     p.groundedConsult ? "有据咨询" : null,
     p.wantsWebSearch
       ? harnessSnapshot.webSearchConfigured
         ? "web_search 已配"
-        : "web_search 未配（设 AGENT_TAVILY_API_KEY）"
+        : "web_search 未配"
       : null,
   ].filter(Boolean);
-  hint.textContent = bits.join(" · ");
+  row.title = bits.join(" · ");
 }
 
 if (packSelect) packSelect.addEventListener("change", updatePackHint);
@@ -2410,6 +3415,7 @@ if (packSelect) packSelect.addEventListener("change", updatePackHint);
 const PREF_PLAN = "agent.ui.pref.planMode";
 const PREF_MULTI = "agent.ui.pref.multiAgent";
 const PREF_WORKDIR = "agent.ui.pref.workdir";
+const PREF_WORKDIR_EXTRAS = "agent.ui.pref.workdirExtras";
 const PREF_AUTO_PACK = "agent.ui.pref.autoPack";
 function readPref(key, fallback) {
   try {
@@ -2437,16 +3443,54 @@ function writePrefString(key, value) {
     if (value) localStorage.setItem(key, value);
   } catch { /* ignore */ }
 }
+function readPrefJson(key, fallback) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return fallback;
+    const parsed = JSON.parse(raw);
+    return parsed ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+function writePrefJson(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch { /* ignore */ }
+}
+function setKnobDesc(id, short, long) {
+  const hint = document.getElementById(id);
+  if (hint) hint.textContent = short;
+  const row = hint?.closest(".knob-row") ?? document.getElementById(`${id}-row`);
+  if (row && long) row.title = long;
+}
+function syncPlanHint() {
+  if (!planModeToggle) return;
+  setKnobDesc(
+    "mode-hint",
+    planModeToggle.checked ? "出图后等人批准" : "拆解后等人批准",
+    planModeToggle.checked
+      ? "planner 出图后等人批准再跑。可与多 agent 同时开。"
+      : "开 = planner 出图后等你批准再跑。可与多 agent 同时开。",
+  );
+}
+function syncAutoPackHint() {
+  if (!autoPackToggle) return;
+  if (packSelect) packSelect.disabled = autoPackToggle.checked;
+  setKnobDesc(
+    "auto-pack-hint",
+    autoPackToggle.checked ? "发送时由路由选包" : "按任务选已注册的包",
+    autoPackToggle.checked
+      ? "发送时由 router 选包；手选被忽略。编排仍由 planner 按子任务选包。"
+      : "按任务内容路由到已注册的包；选了具体包时以手选为准。",
+  );
+}
 if (planModeToggle) {
   planModeToggle.checked = readPref(PREF_PLAN, false);
+  syncPlanHint();
   planModeToggle.addEventListener("change", () => {
     writePref(PREF_PLAN, planModeToggle.checked);
-    const hint = document.getElementById("mode-hint");
-    if (hint) {
-      hint.textContent = planModeToggle.checked
-        ? "planner 出图后等人批准；可与多 agent 同时开"
-        : "每一轮都可选。开 = planner 出图后等你批准再跑";
-    }
+    syncPlanHint();
   });
 }
 if (multiAgentToggle) {
@@ -2455,17 +3499,11 @@ if (multiAgentToggle) {
 }
 if (autoPackToggle) {
   autoPackToggle.checked = readPref(PREF_AUTO_PACK, false);
+  syncAutoPackHint();
   autoPackToggle.addEventListener("change", () => {
     writePref(PREF_AUTO_PACK, autoPackToggle.checked);
-    if (packSelect) packSelect.disabled = autoPackToggle.checked;
-    const hint = document.getElementById("auto-pack-hint");
-    if (hint) {
-      hint.textContent = autoPackToggle.checked
-        ? "发送时由 router 选包；手选被忽略。编排模式（计划/多 agent）仍由 planner 按子任务选包"
-        : "按任务内容路由到已注册的包；选了具体包时以手选为准";
-    }
+    syncAutoPackHint();
   });
-  if (autoPackToggle.checked && packSelect) packSelect.disabled = true;
 }
 
 if (knobsToggle && runKnobs) {
@@ -2498,9 +3536,12 @@ if (knobsToggle && runKnobs) {
 if (newChatBtn) {
   newChatBtn.addEventListener("click", () => {
     selectedRunId = null;
+    selectedDesignTemplate = null;
+    selectedDesignSample = null;
+    designModeActive = false;
     writeHash(null, null);
     refreshRunListView();
-    renderEmptyState(runs.length > 0);
+    paintEmptyState();
     sidebar.classList.remove("narrow-hidden");
     mainPanel.classList.remove("narrow-full");
     taskInput.value = "";
@@ -2523,9 +3564,23 @@ if (newChatBtn) {
  * （bash / read_file 处理文本与数据文件），只是看不了图。
  */
 const uploaded = [];
+const composerCompose = document.getElementById("composer-compose");
+const composerMedia = document.getElementById("composer-media");
 
 function renderUploads() {
   if (!uploadList) return;
+  const images = uploaded.filter((u) => u.previewUrl && /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(u.path));
+  if (composerMedia) {
+    composerMedia.hidden = images.length === 0;
+    composerMedia.innerHTML = images
+      .map((u) => (
+        `<div class="composer-media-preview">` +
+        `<img src="${escapeHtml(u.previewUrl)}" alt="${escapeHtml(u.path)}" />` +
+        `</div>`
+      ))
+      .join("");
+  }
+  composerCompose?.classList.toggle("composer-compose--media", images.length > 0);
   uploadList.hidden = uploaded.length === 0;
   uploadList.innerHTML = uploaded
     .map((u, i) => {
@@ -2541,13 +3596,6 @@ function renderUploads() {
         `<button type="button" class="btn btn--ghost upload-remove" data-upload-remove="${i}" ` +
         `title="删除附件" aria-label="删除附件 ${name}">` +
         `<i class="ph ph-x" aria-hidden="true"></i></button>`;
-      if (u.previewUrl && /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(u.path)) {
-        return (
-          `<li class="upload-item upload-item--image">` +
-          `<img class="upload-thumb" src="${escapeHtml(u.previewUrl)}" alt="" />` +
-          `<div class="upload-meta"><code>${name}</code> ${size}</div>${previewBtn}${removeBtn}</li>`
-        );
-      }
       return `<li class="upload-item"><code>${name}</code> ${size} ${previewBtn}${removeBtn}</li>`;
     })
     .join("");
@@ -2615,15 +3663,11 @@ async function uploadFiles(files) {
   showSubmitError(null);
   /**
    * 附件落在**哪个工作目录**取决于这次提交去哪儿。
-   *
-   * 续跑复用原运行的 loop，工具的写入圈禁根是那个运行的 workdir；而
-   * `#workdir-select` 反映的是"下一次新建"的选择（追加模式下它还被禁用了）。
-   * 照旧取 select 的值，文件会落进另一个目录，agent 按路径读不到——
-   * 而且不报错，只表现为"它说找不到文件"。
+   * 已打开的对话用那场会话绑定的路径；新建才用输入栏下拉。
    */
   const at = { mode: composerMode?.mode ?? "new", runId: composerMode?.runId ?? null };
-  const targetWorkdir = at.mode === "append" || at.mode === "fork"
-    ? composerMode?.workdir
+  const targetWorkdir = composerMode?.workdirLocked
+    ? (composerMode.workdir ?? workdirSelect?.value)
     : workdirSelect?.value;
   for (const file of files) {
     try {
@@ -2680,10 +3724,8 @@ if (fileUpload) {
 }
 
 // ---- 文件预览停靠面板 + 拖拽/粘贴上传（V-35，T10 升级为停靠形态）----
-// 预览面板：附件清单与对话里的本地路径链接共用一个壳；渲染主体在
-// features/artifact-canvas.js（renderPreviewBody），外壳在 features/preview-dock.js
-// （覆盖变体），取件走 /api/file-preview（圈禁在服务端）。
-// 面板不进 hash 路由——它是瞬态的，刷新不该恢复。
+// 会话内打开文件一律走产物画布（右侧统一预览）。覆盖层只留给还没开对话时
+// 看一眼刚上传的附件；渲染主体仍是 artifact-canvas 的 renderPreviewBody。
 let filePreviewApi = /** @type {null|{ open:(o:{path:string,url:string})=>boolean, close:()=>void, isOpen:()=>boolean, isExpanded:()=>boolean, setExpanded:(b:boolean)=>void, element:HTMLElement }} */ (null);
 try {
   filePreviewApi = initFilePreview({
@@ -2693,20 +3735,22 @@ try {
 
 /** 附件清单的「预览」：上传响应里的 absolutePath 直接做取件路径（白名单内的绝对路径） */
 function previewUploadedFile(u) {
-  if (!filePreviewApi || !u) return;
+  if (!u) return;
+  // 已在会话里：跟产物同一只右侧画布。还没开对话时才用覆盖层看一眼附件。
+  if (selectedRunId && (u.path || u.absolutePath)) {
+    openArtifactByPath(selectedRunId, u.path || u.absolutePath);
+    return;
+  }
+  if (!filePreviewApi) return;
   const url = buildFilePreviewUrl({ path: u.absolutePath ?? u.path });
   filePreviewApi.open({ path: u.path, url });
 }
 
 /**
- * 对话正文里本地路径链接的「预览」：hit.path 是**相对该 run 工作目录**的路径，
- * 取件时把 run 的 workdir 一起带上（圈禁判定在服务端）。
+ * 对话正文里本地路径：一律进右侧画布（与产物卡同一只坞）。
  */
 function previewLocalPath(runId, path) {
-  if (!filePreviewApi || !path) return;
-  const run = runs.find((r) => r.runId === runId);
-  const url = buildFilePreviewUrl({ path, workdir: run?.workdir ?? null });
-  filePreviewApi.open({ path, url });
+  openArtifactByPath(runId, path);
 }
 
 // 附件清单的预览/删除按钮（清单每次重画，逐个绑会漏也会重——事件委托）
@@ -2739,9 +3783,10 @@ if (submitForm) {
 }
 
 // ---- 目录选择器浮层（V-29 运行时扩展）----
-// 下拉末项「＋ 添加目录…」选中即开浮层；加成功后重建选项并选中新目录。
+// 自定义菜单末项「＋ 添加目录…」打开浮层；加成功后重建选项并选中新目录。
 // 浮层不进 hash 路由——它是瞬态的，刷新不该恢复。
 let workdirPickerApi = /** @type {null|{ open:(p?:string|null)=>void, close:()=>void, isOpen:()=>boolean }} */ (null);
+const workdirCombobox = document.getElementById("workdir-combobox");
 if (workdirSelect) {
   try {
     workdirPickerApi = initWorkdirPicker({
@@ -2749,14 +3794,40 @@ if (workdirSelect) {
       onAdded: (path, payload) => {
         // 服务端应答带着最新合法集合；以它为准重建下拉并选中新目录
         const list = Array.isArray(payload?.workdirs) ? payload.workdirs : [path];
+        const extras = getWorkdirSelection(workdirSelect, list).extras;
         renderWorkdirOptions(workdirSelect, list, { selected: path });
-        workdirSelect.dispatchEvent(new Event("change"));
+        applyWorkdirSelection(workdirSelect, list, { primary: path, extras });
+        writePrefString(PREF_WORKDIR, path);
+        writePrefJson(PREF_WORKDIR_EXTRAS, extras);
+        workdirComboboxApi?.paint();
+        void workspaceGitChipApi?.refresh();
       },
     });
-    wireWorkdirSelect(workdirSelect, {
-      onAddRequest: () => workdirPickerApi?.open(workdirSelect.value || null),
-      onChange: (path) => writePrefString(PREF_WORKDIR, path),
-    });
+    if (workdirCombobox) {
+      workdirComboboxApi = initWorkdirCombobox(workdirCombobox, {
+        onAddRequest: () => workdirPickerApi?.open(workdirSelect.value || null),
+        onChange: (sel) => {
+          writePrefString(PREF_WORKDIR, sel.primary);
+          writePrefJson(PREF_WORKDIR_EXTRAS, sel.extras);
+          syncComposer();
+          refreshRunListView();
+          void workspaceGitChipApi?.refresh();
+        },
+      });
+    }
+    const gitChip = document.getElementById("workspace-git-chip");
+    if (gitChip) {
+      workspaceGitChipApi = initWorkspaceGitChip(gitChip, {
+        getWorkdir: () => {
+          const info = selectedRunId ? runs.find((r) => r.runId === selectedRunId) : null;
+          if (info?.workdir) return info.workdir;
+          if (!workdirSelect) return "";
+          return getWorkdirSelection(workdirSelect).primary || workdirSelect.value || "";
+        },
+        onAnnounce: (msg) => announceStatus(msg),
+      });
+      void workspaceGitChipApi?.refresh();
+    }
   } catch { /* 目录选择器是增强项，初始化失败静默降级 */ }
 }
 
@@ -2919,15 +3990,7 @@ import("./features/notifications.js").then((notifications) => {
       runs.find((r) => r.runId === runId)?.task ?? runStates.get(runId)?.task ?? null,
     onOpenConversation: (runId) => selectRun(runId),
     // 待决定类直达 action-dock：选中会话后让决定坞闪一下，视线落在该落的地方
-    onRevealDock: (runId) => {
-      selectRun(runId);
-      const dock = document.getElementById("action-dock");
-      if (!dock) return;
-      dock.classList.remove("action-dock--flash");
-      // 强制重排后再加回类名，连续两次点击也能重新播一次高亮
-      void dock.offsetWidth;
-      dock.classList.add("action-dock--flash");
-    },
+    onRevealDock: (runId) => revealDecisionDock(runId),
     onAnnounce: (msg) => announceStatus(msg),
   });
   // 初始化时 run 列表多半已经就位：立刻播种基线（不生成历史条目）
@@ -2940,6 +4003,7 @@ import("./features/notifications.js").then((notifications) => {
 import("./features/memory-panel.js").then((memory) => {
   const memoryApi = memory.initMemoryPanel({
     onAnnounce: (msg) => announceStatus(msg),
+    getWorkdir: () => workdirSelect?.value ?? "",
   });
   import("./features/command-palette.js").then((palette) => {
     palette.registerPaletteCommand({
@@ -2987,7 +4051,6 @@ try {
         patch,
         { effortLevels: harnessSnapshot?.effortLevels ?? null },
       );
-      if (typeof patch?.predictiveInput === "boolean") completeApi?.setEnabled(patch.predictiveInput);
     },
     onReplayOnboarding: () => {
       closeSettingsRoute();
@@ -2997,15 +4060,17 @@ try {
     onCloseSettings: () => closeSettingsRoute(),
     // 模型配置保存成功：重拉 /api/harness，composer 的角色 pill 立刻对齐新装配
     onModelsSaved: () => loadHarness(),
+    onPacksChanged: () => loadHarness(),
     // 设置页改了阅读模式偏好：详情顶栏的开关与对话后处理立刻对齐（同源键）
     onReadingModeChange: () => readingModeApi?.syncFromStorage(),
     onAnnounce: (msg) => announceStatus(msg),
+    fetchUsage: () => fetchUsageReport(),
   });
   import("./features/command-palette.js").then((palette) => {
     palette.registerPaletteCommand({
       id: "open-settings",
       label: "打开设置",
-      hint: "外观、运行默认值、通知、快捷键与关于",
+      hint: "外观、消耗、运行默认值、通知、快捷键与关于",
       icon: "ph-gear",
       run: () => navigateToSettings(),
     });
@@ -3022,6 +4087,37 @@ try {
     });
   }).catch(() => { /* 命令面板注册失败不影响设置本体 */ });
 } catch { /* 设置中心是增强项，初始化失败静默降级 */ }
+
+// Cursor 风格主执行模型选择器
+import("./features/executor-model-picker.js").then((mod) => {
+  const select = document.getElementById("executor-model-select");
+  const trigger = document.getElementById("executor-model-trigger");
+  const menu = document.getElementById("executor-model-menu");
+  const list = document.getElementById("executor-model-list");
+  const search = document.getElementById("executor-model-search");
+  const detail = document.getElementById("executor-model-detail");
+  const manageBtn = document.getElementById("executor-model-manage");
+  const valueEl = document.getElementById("executor-model-trigger-text");
+  if (!select || !trigger || !menu || !list || !search || !detail || !manageBtn || !valueEl) return;
+  executorModelPickerApi = mod.initExecutorModelPicker({
+    select,
+    trigger,
+    menu,
+    list,
+    search,
+    detail,
+    manageBtn,
+    valueEl,
+    onSelect: (id) => switchExecutorModel(id),
+    onManage: () => {
+      navigateToSettings();
+      settingsApi?.open("settings-models");
+    },
+    isDisabled: () => executorModelSwitchBusy || trigger.disabled,
+  });
+  if (modelsSnapshot) executorModelPickerApi.setPayload(modelsSnapshot);
+  else void loadModelsForComposer();
+}).catch(() => { /* 选择器是增强项 */ });
 
 try {
   onboardingApi = initOnboarding({
@@ -3040,47 +4136,20 @@ try {
 } catch { /* 新手引导是增强项 */ }
 
 try {
-  completeApi = initComposerComplete({
-    input: taskInput,
-    suggestEl: document.getElementById("composer-suggest"),
-    getRecent: () => {
-      const titles = runs
-        .map((r) => String(r.title || r.task || "").trim())
-        .filter(Boolean)
-        .slice(0, 20);
-      return [...EXAMPLE_TASKS.map((e) => e.text), ...titles];
-    },
-    fetchComplete: async (body) => {
-      const res = await fetch("/api/complete", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      if (!res.ok) throw new Error(`complete ${res.status}`);
-      return res.json();
-    },
-    announce: (msg) => announceStatus(msg),
-  });
-  completeApi.setEnabled(composerDefaults(uiSettings).predictiveInput);
-} catch { /* 输入补全是增强项 */ }
-
-try {
-  usageApi = initUsageView(document.body, {
-    fetchUsage: async () => {
-      const res = await fetch("/api/usage");
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return res.json();
-    },
+  usageApi = initUsageView(document.getElementById("main-panel") ?? document.body, {
+    fetchUsage: () => fetchUsageReport(),
     onClose: () => closeUsageRoute(),
   });
-  document.getElementById("usage-open-btn")?.addEventListener("click", () => navigateToUsage());
   import("./features/command-palette.js").then((palette) => {
     palette.registerPaletteCommand({
       id: "open-usage",
       label: "消耗",
-      hint: "按日、按模型查看台账成本",
+      hint: "设置里的台账轮次与成本",
       icon: "ph-chart-bar",
-      run: () => navigateToUsage(),
+      run: () => {
+        navigateToSettings();
+        settingsApi?.open("settings-usage");
+      },
     });
   }).catch(() => {});
 } catch { /* 消耗视图是增强项 */ }
@@ -3120,15 +4189,7 @@ try {
     onCloseBoard: () => closeBoardRoute(),
     onOpenConversation: (runId) => selectRun(runId),
     // 待决定卡点击直达 action-dock：与通知中心同一个 reveal 回调
-    onRevealDock: (runId) => {
-      selectRun(runId);
-      const dock = document.getElementById("action-dock");
-      if (!dock) return;
-      dock.classList.remove("action-dock--flash");
-      // 强制重排后再加回类名，连续两次点击也能重新播一次高亮
-      void dock.offsetWidth;
-      dock.classList.add("action-dock--flash");
-    },
+    onRevealDock: (runId) => revealDecisionDock(runId),
     onStopRun: (runId) => { void stopRun(runId); },
     onNewChat: () => newChatBtn?.click(),
     onAnnounce: (msg) => announceStatus(msg),
@@ -3184,23 +4245,27 @@ import("./features/reading-mode.js").then((reading) => {
 try {
   artifactCanvasApi = initArtifactCanvas({
     getRunId: () => selectedRunId,
-    getArtifacts: () => (selectedRunId ? currentRunArtifacts(selectedRunId) : []),
+    getArtifacts: () => (selectedRunId ? openedPreviewArtifacts(selectedRunId) : []),
     onClose: () => closeArtifactRoute(),
     onSwitch: (index) => {
       if (selectedRunId) {
-        location.hash = encodeArtifactHash(selectedRunId, index, {
+        replaceArtifactHash(encodeArtifactHash(selectedRunId, index, {
           full: artifactCanvasApi?.isExpanded() ?? false,
-        });
+        }));
       }
     },
+    onCloseTab: (index) => closePreviewTab(index),
     onExpandChange: (full) => {
-      // 放大/还原反映到深链（?full），刷新保持形态；hashchange 绕回来调 open 是幂等的
+      // 放大/还原反映到深链（?full），刷新保持形态。replace：不堆一层「上一次预览」。
       if (!selectedRunId || !artifactCanvasApi) return;
       const target = encodeArtifactHash(selectedRunId, artifactCanvasApi.currentIndex(), { full });
-      if (location.hash !== target) location.hash = target;
+      if (location.hash !== target) replaceArtifactHash(target);
     },
     onReveal: (path) => {
       if (selectedRunId) revealArtifact(selectedRunId, path);
+    },
+    onOpenBrowser: (url) => {
+      if (selectedRunId) openArtifactByPath(selectedRunId, url);
     },
     onAppendReview: (line) => {
       taskInput.value = appendReviewToInput(taskInput.value, line);
@@ -3214,6 +4279,21 @@ try {
   // 模块就绪时可能已有挂账的深链（loadRuns().then(applyHash) 在上方已跑过）
   openPendingArtifact();
   syncArtifactCommand();
+  import("./features/command-palette.js").then((palette) => {
+    palette.registerPaletteCommand({
+      id: "open-web-preview",
+      label: "打开网页",
+      hint: "在右侧内置浏览器打开网址",
+      icon: "ph-globe",
+      run: () => {
+        if (!selectedRunId) {
+          announceStatus("先打开一场对话");
+          return;
+        }
+        if (!artifactCanvasApi?.focusAddress()) announceStatus("预览还没就绪");
+      },
+    });
+  }).catch(() => { /* 命令面板注册失败不影响画布 */ });
 } catch { /* 产物画布是增强项，初始化失败静默降级 */ }
 
 </script>

@@ -20,6 +20,7 @@ import {
   createNotificationStore,
   classifyRunEndForNotify,
   applyRunEventToStore,
+  collapseDecisionItems,
   syncRunsToStore,
   removeRunFromStore,
   decisionUnreadCount,
@@ -89,9 +90,55 @@ describe("applyRunEventToStore 事件归约", () => {
     });
   });
 
+  it("autoResolved 的审批不进「待你决定」", () => {
+    const { added, store } = applyRunEventToStore(createNotificationStore(), {
+      ...base, seq: 7, source: "main",
+      event: { type: "approval_request", toolUseId: "tu1", name: "bash", autoResolved: true },
+    });
+    expect(added).toEqual([]);
+    expect(store.items).toEqual([]);
+  });
+
+  it("spawn / 编排子任务来源的审批不进「待你决定」", () => {
+    for (const source of ["spawn/查竞品", "s1/main"]) {
+      const { added, store } = applyRunEventToStore(createNotificationStore(), {
+        ...base, seq: 7, source,
+        event: { type: "approval_request", toolUseId: "tu1", name: "bash" },
+      });
+      expect(added).toEqual([]);
+      expect(store.items).toEqual([]);
+    }
+  });
+
+  it("同一会话多张审批待决叠成一条", () => {
+    let store = createNotificationStore();
+    ({ store } = applyRunEventToStore(store, {
+      ...base, seq: 1, source: "main",
+      event: { type: "approval_request", toolUseId: "a", name: "bash", at: NOW },
+    }));
+    ({ store } = applyRunEventToStore(store, {
+      ...base, seq: 2, source: "main",
+      event: { type: "approval_request", toolUseId: "b", name: "bash", at: NOW + 1000 },
+    }));
+    const collapsed = collapseDecisionItems(store.items);
+    expect(collapsed).toHaveLength(1);
+    expect(collapsed[0].count).toBe(2);
+    expect(decisionUnreadCount(store)).toBe(1);
+    expect(groupStoreItems(store)[0].items).toHaveLength(1);
+  });
+
   it("verifier 来源的审批不进「待你决定」（harness 内部自答）", () => {
     const { added, store } = applyRunEventToStore(createNotificationStore(), {
       ...base, seq: 7, source: "verifier",
+      event: { type: "approval_request", toolUseId: "tu1", name: "bash" },
+    });
+    expect(added).toEqual([]);
+    expect(store.items).toEqual([]);
+  });
+
+  it("planner 来源的审批不进「待你决定」（内部自答）", () => {
+    const { added, store } = applyRunEventToStore(createNotificationStore(), {
+      ...base, seq: 7, source: "planner",
       event: { type: "approval_request", toolUseId: "tu1", name: "bash" },
     });
     expect(added).toEqual([]);

@@ -29,6 +29,9 @@ import {
   deriveChatItems,
   updateLiveNode,
   renderChatItem,
+  splitUserMessageAttachments,
+  titleReflectsTask,
+  resolveDisplayedTitle,
   toolPeek,
   toolHeadline,
   foldChain,
@@ -42,7 +45,20 @@ import {
   conversationChainIds,
   deriveThreadFiles,
   renderEmptyState,
+  renderStarterGallery,
+  DESIGN_MODE_TABS,
+  DESIGN_MODE_TAB_LABELS,
+  designTabLabel,
+  designSamplesForTab,
+  resolveDesignSampleChoice,
+  nextDesignSampleState,
+  nextDesignLookState,
+  composePromptWithLook,
+  isDesignSamplePrompt,
+  DESIGN_LOOKS,
   deriveAssemblyBar,
+  deriveSpinState,
+  deriveCostWarning,
   deriveComposerMode,
   composerSubmitPlan,
   patchComposer,
@@ -64,13 +80,46 @@ import {
   fileShortPath,
   deriveThreadChatItems,
   ancestorRunIds,
+  collapseRepeatChatItems,
+  chatRepeatKey,
   formatCompletionChatText,
   pickCompletionChatText,
+  splitFoldableCompletionSections,
+  completionFoldGroups,
   splitCompletionFollowUps,
   classifyCompletionFollowUp,
   deriveRunFollowUp,
+  composerFolderName,
+  newRunPlaceholder,
   extractArtifactPaths,
   mergeCompletionArtifactFiles,
+  isNoiseArtifact,
+  selectConversationArtifacts,
+  selectPreviewArtifacts,
+  resolveArtifactOpen,
+  ensurePreviewArtifact,
+  deriveSessionFiles,
+  buildFactorCards,
+  deriveLoopFace,
+  deriveContextFace,
+  deriveToolsFace,
+  deriveVerificationFace,
+  formatChatRelTime,
+  pickTaskAt,
+  writeChatRating,
+  readChatRating,
+  chatPlainText,
+  buildChatFeedbackMessage,
+  looksLikeChatFeedback,
+  markSettledTurnActions,
+  deriveChildAgents,
+  childAgentKey,
+  isChildAgentSource,
+  isLiveDeltaSource,
+  deriveActionState,
+  rewindDialogHtml,
+  deriveRewindFilePreview,
+  ancestorRunIdsForChat,
 } from "../ui/public/app.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -248,7 +297,7 @@ describe("消息正文路径探测计划", () => {
 });
 
 // ================================================================
-// 产物路径提取（finish_task.artifacts 自由文本 → 真实路径）+ stat 降级
+// 产物路径提取（finish_task.artifacts 自由文本 → 真实路径）+ 未落盘摘除
 // ================================================================
 
 describe("extractArtifactPaths / 产物卡降级", () => {
@@ -310,7 +359,71 @@ describe("extractArtifactPaths / 产物卡降级", () => {
     expect(merged.map((f) => f.path)).toEqual(["a.md", "b.md"]);
   });
 
-  it("stat 验证不过的产物卡降级：标「未找到」、摘掉可点操作", async () => {
+  it("mergeCompletionArtifactFiles：basename 只在唯一命中时对上，重名留下真实路径", () => {
+    const unique = mergeCompletionArtifactFiles(
+      ["ringfix.css"],
+      [{ path: "nested/polish/ringfix.css", kind: "artifact", seq: 1 }],
+    );
+    expect(unique.map((f) => f.path)).toEqual(["nested/polish/ringfix.css"]);
+
+    const twins = mergeCompletionArtifactFiles(
+      ["index.html"],
+      [
+        { path: "site/index.html", kind: "artifact", seq: 1 },
+        { path: "deck-hqu/index.html", kind: "artifact", seq: 2 },
+      ],
+      { extras: "none" },
+    );
+    expect(twins.map((f) => f.path).sort()).toEqual(["deck-hqu/index.html", "site/index.html"]);
+  });
+
+  it("selectConversationArtifacts：滤掉核查脚本，保留声明交付", () => {
+    expect(isNoiseArtifact(".polish-artifacts/capture.mjs")).toBe(true);
+    expect(isNoiseArtifact("parse-gyhy.cjs")).toBe(true);
+    expect(isNoiseArtifact("style.css")).toBe(false);
+    const selected = selectConversationArtifacts(
+      [
+        { path: "index.html", kind: "artifact", seq: 1 },
+        { path: "style.css", kind: "artifact", seq: 2 },
+        { path: "parse-gyhy.cjs", kind: "artifact", seq: 3 },
+        { path: ".polish-artifacts/run-layout-check.mjs", kind: "artifact", seq: 4 },
+      ],
+      { declared: ["index.html", "style.css"], task: "帮我优化这个网站" },
+    );
+    expect(selected.map((f) => f.path)).toEqual(["index.html", "style.css"]);
+  });
+
+  it("selectPreviewArtifacts：其它路径也能进预览，只去掉核查噪音", () => {
+    const selected = selectPreviewArtifacts([
+      { path: "index.html", kind: "artifact", seq: 1 },
+      { path: "docs/11-design-mode.md", kind: "artifact", seq: 2 },
+      { path: "parse-gyhy.cjs", kind: "artifact", seq: 3 },
+      { path: "uploads/shot.png", kind: "upload", seq: 4 },
+    ]);
+    expect(selected.map((f) => f.path)).toEqual([
+      "index.html",
+      "docs/11-design-mode.md",
+      "uploads/shot.png",
+    ]);
+  });
+
+  it("resolveArtifactOpen：任何路径都走右侧画布，清单外的并到末尾", () => {
+    expect(ensurePreviewArtifact([{ path: "index.html" }], "docs/other.md")).toEqual({
+      list: [{ path: "index.html" }, { path: "docs/other.md", kind: "preview" }],
+      index: 1,
+    });
+    expect(resolveArtifactOpen([{ path: "index.html" }], "index.html")).toEqual({
+      mode: "canvas",
+      index: 0,
+    });
+    expect(resolveArtifactOpen([{ path: "index.html" }], "docs/other.md")).toEqual({
+      mode: "canvas",
+      index: 1,
+    });
+    expect(resolveArtifactOpen([], "")).toEqual({ mode: "none" });
+  });
+
+  it("stat 验证不过的产物卡从清单拿掉，不留「未找到」空位", async () => {
     let state = createInitialState("run-missing-art", "生成板子文件", false);
     state = reduceEvents(state, [
       sse(0, "main", "assistant_text", { text: "已交付。" }),
@@ -334,17 +447,13 @@ describe("extractArtifactPaths / 产物卡降级", () => {
     });
 
     await vi.waitFor(() => {
-      expect(document.querySelector(".chat-artifact--missing")).toBeTruthy();
+      expect(document.querySelector('[data-artifact-state="checking"]')).toBeNull();
+      expect(document.querySelector("[data-artifact-path]")).toBeNull();
     });
-    const card = document.querySelector(".chat-artifact--missing") as HTMLElement;
-    // 卡片标题是提取后的干净路径，不再是整条注释串
-    expect(card.textContent).toContain("missing.md");
-    expect(card.textContent).not.toContain("本轮声明但没落盘");
-    expect(card.textContent).toContain("未找到");
-    expect(card.querySelector("a[href]")).toBeNull();
-    for (const b of card.querySelectorAll("button")) {
-      expect((b as HTMLButtonElement).disabled).toBe(true);
-    }
+    expect(document.body.textContent).not.toContain("未找到");
+    expect(document.body.textContent).not.toContain("missing.md");
+    expect(document.body.textContent).not.toContain("本轮声明但没落盘");
+    expect(document.querySelector(".chat-artifacts")).toBeNull();
   });
 
   it("stat 验证通过的产物卡保持可点", async () => {
@@ -375,6 +484,83 @@ describe("extractArtifactPaths / 产物卡降级", () => {
     });
     expect(document.querySelector(".chat-artifact--missing")).toBeNull();
     expect(document.querySelector('.chat-artifact a[href*="artifact"]')).toBeTruthy();
+  });
+
+  it("stat 把裸文件名落到唯一真实路径后，卡片可点且不再标未找到", async () => {
+    let state = createInitialState("run-ringfix", "修圆环", false);
+    state = reduceEvents(state, [
+      sse(0, "main", "assistant_text", { text: "已交付。" }),
+      sse(1, "main", "done", {
+        stopReason: "completed",
+        completion: {
+          status: "completed",
+          summary: "完成",
+          artifacts: ["ringfix.css"],
+          verification: [],
+          assumptions: [],
+          blockers: [],
+        },
+      }),
+    ]);
+    renderRunDetail(state, {
+      activeTab: "loop",
+      inspectPaths: async (paths: string[]) => paths.map((input) => ({
+        input,
+        exists: input === "ringfix.css" || input.endsWith("ringfix.css"),
+        path: input === "ringfix.css" ? "nested/polish/ringfix.css" : input,
+        kind: "file" as const,
+      })),
+    });
+
+    await vi.waitFor(() => {
+      expect(document.querySelector('[data-artifact-state="ok"]')).toBeTruthy();
+    });
+    const card = document.querySelector(".chat-artifact") as HTMLElement;
+    expect(card.getAttribute("data-artifact-path")).toBe("nested/polish/ringfix.css");
+    expect(card.textContent).not.toContain("未找到");
+    expect(decodeURIComponent((card.querySelector("a[href*='artifact']") as HTMLAnchorElement).href))
+      .toContain("path=nested/polish/ringfix.css");
+  });
+
+  it("右栏混有未落盘声明时只留真文件，分组计数跟着改", async () => {
+    let state = createInitialState("run-rail-ghost", "帮我优化这个网站", false);
+    state = reduceEvents(state, [
+      sse(0, "main", "tool_call", { toolUseId: "w", name: "write_file", input: { path: "index.html" } }),
+      sse(1, "main", "tool_result", { toolUseId: "w", result: { content: "ok", isError: false } }),
+      sse(2, "main", "tool_call", { toolUseId: "g", name: "write_file", input: { path: "edp-shotel.mjs" } }),
+      sse(3, "main", "tool_result", { toolUseId: "g", result: { content: "ok", isError: false } }),
+      sse(4, "main", "done", {
+        stopReason: "completed",
+        completion: {
+          status: "completed",
+          summary: "完成",
+          artifacts: ["index.html", "edp-shotel.mjs"],
+          verification: [],
+          assumptions: [],
+          blockers: [],
+        },
+      }),
+    ]);
+    renderRunDetail(state, {
+      activeTab: "loop",
+      inspectPaths: async (paths: string[]) => paths.map((input) => ({
+        input,
+        exists: String(input).includes("index.html"),
+        path: input,
+        kind: "file" as const,
+      })),
+    });
+
+    await vi.waitFor(() => {
+      expect(document.querySelector('[data-artifact-state="checking"]')).toBeNull();
+      expect(document.querySelector('[data-artifact-path="edp-shotel.mjs"]')).toBeNull();
+    });
+    expect(document.body.textContent).not.toContain("未找到");
+    expect(document.querySelector(".artifacts")?.textContent).not.toContain("edp-shotel.mjs");
+    expect(document.querySelector(".chat-artifacts")?.textContent ?? "").not.toContain("edp-shotel.mjs");
+    const peek = [...document.querySelectorAll(".rail-section-title")].find((n) => n.textContent?.includes("网站"));
+    expect(peek?.textContent).toMatch(/网站\s*1/);
+    expect(document.querySelector('[data-artifact-path="index.html"]')).toBeTruthy();
   });
 });
 
@@ -920,6 +1106,21 @@ describe("重试退避等待在界面上可见", () => {
   });
 });
 
+describe("模型 send 起止在界面上可见", () => {
+  it("model_call_end 渲染 status 与 durationMs", () => {
+    let s = createInitialState("run-m", "模型 span", false);
+    s = reduceEvents(s, [
+      sse(0, "main", "model_call_start", { turn: 1, attempt: 0 }),
+      sse(1, "main", "model_call_end", { turn: 1, attempt: 0, status: "ok", durationMs: 1500 }),
+    ]);
+    renderRunDetail(s, { activeTab: "loop" });
+    const body = document.querySelector(".log-entries")?.textContent ?? "";
+    expect(body).toContain("模型请求开始");
+    expect(body).toContain("模型请求结束");
+    expect(body).toContain("1.5s");
+  });
+});
+
 // ================================================================
 // 文本流式（backlog §4）
 // ================================================================
@@ -983,27 +1184,66 @@ describe("流式输出直接长在对话里", () => {
     expect(conv()).toContain("const a = 1;");
   });
 
-  it("裸 JSON 流（planner 的输出契约）以代码块形态流入，不是一面正文墙", () => {
+  it("裸 JSON 计划流以『整理中』卡片流入，不是一面代码墙", () => {
     renderRunDetail(runningState(), { activeTab: "loop", liveText: '{"subtasks": [{"id": "s1"' });
-    expect(document.querySelector(".chat-msg--live pre.md-code")).toBeTruthy();
+    expect(document.querySelector(".chat-msg--live .chat-plan")).toBeTruthy();
+    expect(document.querySelector(".chat-msg--live pre.md-code")).toBeNull();
   });
 
   /**
-   * 落定条目的同族判据（同一条委托方反馈："只有 planner 的输出没做成 markdown，
-   * 很突兀"）：根因不在渲染分支——所有来源本就走同一支 renderMarkdown——
-   * 在内容：planner 的契约输出是裸 JSON，对 Markdown 渲染器是无事可做的散文。
-   * 判据按内容不按来源：整体 parse 得过才算，花括号开头的散文零误伤。
+   * 落定条目：编排计划契约改画分层卡（可并发层 + 节点），原始 JSON 收进 details。
+   * 其余裸 JSON 仍走代码块 pretty-print；花括号散文零误伤。
    */
-  it("落定的裸 JSON 正文渲染为高亮代码块并 pretty-print（展示层，事件流原文不动）", () => {
+  it("落定的计划契约渲染为分层卡，而不是裸 JSON 代码块", () => {
     let s = runningState();
     s = reduceEvents(s, [
-      sse(1, "planner", "assistant_text", { text: '{"subtasks": [{"id": "s1", "title": "改固件"}]}' }),
+      sse(1, "planner", "assistant_text", {
+        text: '{"subtasks": [{"id": "s1", "title": "改固件", "dependsOn": [], "acceptance": ["编译通过"]}]}',
+      }),
+    ]);
+    renderRunDetail(s, { activeTab: "loop" });
+    const card = document.querySelector(".chat-plan");
+    expect(card, "计划应当渲染为可视化卡片").toBeTruthy();
+    expect(card!.textContent).toContain("改固件");
+    expect(card!.textContent).toContain("第 1 层");
+    expect(document.querySelector(".chat-body--text pre.md-code"), "不应再把计划当正文代码块").toBeNull();
+    expect(document.querySelector(".chat-plan-raw")).toBeTruthy();
+  });
+
+  it("非计划形状的裸 JSON 仍渲染为高亮代码块并 pretty-print", () => {
+    let s = runningState();
+    s = reduceEvents(s, [
+      sse(1, "main", "assistant_text", { text: '{"ok": true, "count": 2}' }),
     ]);
     renderRunDetail(s, { activeTab: "loop" });
     const pre = document.querySelector(".chat-msg--assistant pre.md-code");
-    expect(pre, "裸 JSON 应当渲染为代码块").toBeTruthy();
-    expect(pre!.textContent).toContain('"subtasks"');
+    expect(pre, "普通 JSON 应当仍走代码块").toBeTruthy();
+    expect(pre!.textContent).toContain('"ok"');
     expect(pre!.textContent, "展示层应当 pretty-print（原文是单行）").toContain("\n");
+  });
+
+  it("正式 plan 事件后对话露出带状态的编排卡，并去掉 planner 的 JSON 正文", () => {
+    let s = runningState();
+    s = reduceEvents(s, [
+      sse(1, "planner", "assistant_text", {
+        text: '{"subtasks": [{"id": "s1", "title": "改固件", "dependsOn": [], "acceptance": []}]}',
+      }),
+      sse(2, "host", "plan", {
+        concurrency: 2,
+        concurrencyMode: "auto",
+        plannerMs: 1200,
+        subtasks: [
+          { id: "s1", title: "改固件", pack: "stm32-coding", description: "", acceptance: ["编译"], dependsOn: [] },
+          { id: "s2", title: "烧录", pack: "stm32-debug", description: "", acceptance: ["跑通"], dependsOn: ["s1"] },
+        ],
+      }),
+    ]);
+    renderRunDetail(s, { activeTab: "loop" });
+    expect(document.querySelectorAll(".chat-plan").length).toBe(1);
+    expect(document.querySelector(".chat-msg--plan")).toBeTruthy();
+    expect(document.body.textContent).toContain("烧录");
+    expect(document.body.textContent).toContain("第 2 层");
+    expect(document.querySelector(".chat-plan-raw")).toBeNull();
   });
 
   it("以花括号开头的散文不被误判为 JSON，仍按 Markdown 走", () => {
@@ -1038,6 +1278,32 @@ describe("流式输出直接长在对话里", () => {
   it("没有任何增量与工具时仍报「等待模型响应…」", () => {
     renderRunDetail(runningState(), { activeTab: "loop" });
     expect(strip()).toContain("等待模型响应");
+  });
+
+  it("空转时直播条说可停止，对话里也留一行", () => {
+    let s = runningState();
+    s = reduceEvents(s, [
+      sse(1, "main", "recovery_decision", {
+        reason: "stagnation",
+        action: "change_strategy",
+        detail: "连续几轮没有新进展",
+      }),
+    ]);
+    expect(deriveSpinState(s)?.label).toBe("空转 · 可停止");
+    renderRunDetail(s, { activeTab: "loop" });
+    expect(strip()).toContain("空转 · 可停止");
+    expect((document.querySelector(".live-strip") as HTMLElement).classList.contains("live-strip--stall")).toBe(true);
+    const chat = deriveChatItems(s, {});
+    expect(chat.some((it) => it.kind === "notice" && String(it.text).includes("空转"))).toBe(true);
+  });
+
+  it("接近轮次预算时直播条给出成本预警", () => {
+    let s = runningState();
+    s.runConfig = { guardrails: { maxTurns: 10 } };
+    s = reduceEvents(s, [sse(1, "main", "turn_start", { turn: 9 })]);
+    expect(deriveCostWarning(s, null)?.label).toMatch(/轮次已用/);
+    renderRunDetail(s, { activeTab: "loop", harness: { guardrails: { maxTurns: 10 } } });
+    expect(strip()).toMatch(/成本预警|轮次已用/);
   });
 
   it("运行已结束时不再有流式条目，残留增量也拉不回来", () => {
@@ -1274,6 +1540,29 @@ describe("需你决定：钉在输入框上方的固定坞", () => {
     expect(resolved.textContent).toContain("project_settings.json");
     expect(resolved.textContent).toContain(".env");
   });
+
+  it("GhostApproval：无分歧也展示 requested → real，不加警告色", () => {
+    let s = createInitialState("ghost-plain", "t", false);
+    s = reduceEvents(s, [sse(1, "main", "approval_request", {
+      toolUseId: "tu_p",
+      name: "write_file",
+      input: { path: "out.txt", content: "x" },
+      resolvedTargets: [{
+        field: "path",
+        requested: "out.txt",
+        lexical: "D:\\w\\out.txt",
+        real: "D:\\w\\out.txt",
+        diverges: false,
+      }],
+    })]);
+    s = { ...s, status: "running" };
+    renderRunDetail(s, { activeTab: "loop" });
+    const resolved = document.querySelector(".approval-resolved")!;
+    expect(resolved.hasAttribute("hidden")).toBe(false);
+    expect(resolved.classList.contains("approval-resolved--warn")).toBe(false);
+    expect(resolved.textContent).toContain("请求 → 真实");
+    expect(resolved.textContent).toContain("out.txt");
+  });
 });
 
 // ================================================================
@@ -1481,6 +1770,25 @@ describe("R-03 无需展开下钻面即可判断结果", () => {
     expect(tags[0]!.textContent).toContain("判第 1 轮对话");
     expect(document.querySelector(".conversation")!.textContent).toContain("再改一点");
     expect(document.querySelector(".conversation")!.textContent).not.toContain("本轮核查");
+  });
+
+  it("换模型追问：user_message.executorSwitched 投影进对话标签（白名单不得静默丢）", () => {
+    let s = createInitialState("run-sw", "记住暗号", false);
+    s = reduceEvents(s, [
+      sse(0, "main", "assistant_text", { text: "第一轮：alpha-7" }),
+      sse(1, "host", "user_message", {
+        turn: 2,
+        text: "换模型后续",
+        continues: "history",
+        executorSwitched: true,
+      }),
+    ]);
+    const um = s.timeline.find((e) => e.type === "user_message");
+    expect(um.executorSwitched, "reducer 白名单漏了 executorSwitched").toBe(true);
+    const item = deriveChatItems(s, null).find((it) => it.kind === "user" && it.text === "换模型后续");
+    expect(item?.executorSwitched).toBe(true);
+    document.body.innerHTML = renderChatItem(item);
+    expect(document.body.textContent).toContain("已切换模型 · 正史已接上");
   });
 
   /**
@@ -1723,17 +2031,49 @@ describe("deriveChatItems：对话从事件流派生，因此实时", () => {
     expect(collapsePriorTurns(items.filter((i) => i.kind !== "live")).some((i) => i.kind === "artifacts")).toBe(true);
   });
 
-  it("进行中已落定思考不进主对话，只靠 live 那一条", () => {
+  it("进行中有 live 时不重复铺落定思考；没有 live 时落定思考仍要看见", () => {
     const s = run(
       sse(0, "planner", "assistant_thinking", { text: "拆成三步" }),
       sse(1, "main", "assistant_thinking", { text: "先读" }),
       sse(2, "main", "tool_call", { toolUseId: "t", name: "read_file", input: { path: "a.ts" } }),
       sse(3, "main", "assistant_thinking", { text: "再写" }),
     );
-    expect(deriveChatItems(s).filter((i) => i.kind === "thinking")).toHaveLength(0);
+    const settled = deriveChatItems(s);
+    const thinks = settled.filter((i) => i.kind === "thinking");
+    expect(thinks).toHaveLength(1);
+    expect(thinks[0].text).toContain("先读");
+    expect(thinks[0].text).toContain("再写");
+    expect(thinks[0].text).not.toContain("拆成三步");
+    expect(thinks[0].live).toBe(true);
     const live = deriveChatItems(s, { thinking: "正在想", text: "" });
     expect(live.filter((i) => i.kind === "thinking")).toHaveLength(0);
     expect(live.filter((i) => i.kind === "live")).toHaveLength(1);
+  });
+
+  it("进行中没有 live 时，落定思考仍要看见（编排子任务增量不是 main）", () => {
+    const s = run(
+      sse(0, "planner", "assistant_thinking", { text: "拆成三步" }),
+      sse(1, "s1/main", "assistant_thinking", { text: "先读数据源" }),
+      sse(2, "s1/main", "tool_call", { toolUseId: "t", name: "read_file", input: { path: "a.ts" } }),
+    );
+    const items = deriveChatItems(s);
+    const thinks = items.filter((i) => i.kind === "thinking");
+    expect(thinks).toHaveLength(1);
+    expect(thinks[0].text).toContain("先读数据源");
+    expect(thinks[0].live).toBe(true);
+    expect(thinks[0].text).not.toContain("拆成三步");
+    renderRunDetail(s, { activeTab: "loop" });
+    const liveThink = document.querySelector("details.chat-thinking--live");
+    expect(liveThink?.textContent).toContain("先读数据源");
+    expect(liveThink?.querySelector(".thinking-shimmer")?.textContent).toMatch(/Thinking/);
+  });
+
+  it("运行中还没有任何思考时仍露出 Thinking 占位", () => {
+    const items = deriveChatItems(run());
+    const live = items.filter((i) => i.kind === "live");
+    expect(live).toHaveLength(1);
+    expect(live[0].waiting).toBe(true);
+    expect(renderChatItem(live[0])).toMatch(/Thinking/);
   });
 
   it("收官后一轮只留一条 Thinking，规划者/核查者不占位", () => {
@@ -1823,6 +2163,7 @@ describe("deriveChatItems：对话从事件流派生，因此实时", () => {
       onContinue: () => seen.push("go"),
     });
     expect(document.querySelector(".chat-title")!.textContent).toContain("ad7793");
+    expect(document.querySelector(".dh-kicker-text")!.textContent).toBe("FATHOM · RUN RUNTIT");
     expect(document.querySelector(".back-btn")!.textContent).not.toContain("返回列表");
     const outcome = document.querySelector(".outcome-card") as HTMLElement;
     expect(outcome.hidden).toBe(false);
@@ -1913,7 +2254,9 @@ describe("deriveChatItems：对话从事件流派生，因此实时", () => {
     const text = items.find((i) => i.kind === "text");
     expect(text?.fromCompletion).toBe(true);
     expect(text?.text).toContain("液态动效站已交付");
-    expect(text?.text).toContain("本地打开首页无报错");
+    expect(text?.text).not.toContain("本地打开首页无报错");
+    expect(text?.text).not.toContain("**验证**");
+    expect(text?.verification).toEqual(["本地打开首页无报错"]);
     expect(text?.text).not.toContain("还在打磨动效");
     const paths = items.find((i) => i.kind === "artifacts")?.files?.map((f: any) => f.path) ?? [];
     expect(paths).toContain("demo_sites/index.html");
@@ -1942,9 +2285,11 @@ describe("deriveChatItems：对话从事件流派生，因此实时", () => {
     );
     s = { ...s, status: "done" };
     const items = deriveChatItems(s);
-    const text = items.find((i) => i.kind === "text")?.text ?? "";
+    const textItem = items.find((i) => i.kind === "text");
+    const text = textItem?.text ?? "";
     expect(text).toContain("扫描已完成");
-    expect(text).toContain("**验证**");
+    expect(text).not.toContain("**验证**");
+    expect(textItem?.verification).toEqual(["glob 数过源文件"]);
     expect(items.some((i) => i.kind === "thinking")).toBe(true);
     expect(items.find((i) => i.kind === "thinking")?.text).toContain("先列目录");
     expect(items.find((i) => i.kind === "thinking")?.text).not.toContain("扫描已完成");
@@ -1956,6 +2301,52 @@ describe("deriveChatItems：对话从事件流派生，因此实时", () => {
       assumptions: [],
       blockers: [],
     }, essay)).toContain("扫描已完成");
+  });
+
+  it("验证与假设与前提默认收起，点开才看见条目", () => {
+    expect(splitFoldableCompletionSections(
+      "记分卡已交付。\n\n**验证**\n- npm test 通过\n\n**假设与前提**\n- 沿用暗色风格\n\n**未完成**\n- 动效未接",
+    )).toEqual({
+      text: "记分卡已交付。\n\n**未完成**\n- 动效未接",
+      verification: ["npm test 通过"],
+      assumptions: ["沿用暗色风格"],
+    });
+    expect(completionFoldGroups({
+      verification: ["契约字段优先"],
+      assumptions: ["环境是 Windows"],
+    }, "**验证**\n- 正文里的旧列表")).toMatchObject({
+      verification: ["契约字段优先"],
+      assumptions: ["环境是 Windows"],
+    });
+
+    let s = run(
+      sse(0, "main", "done", {
+        stopReason: "completed",
+        usage: { inputTokens: 1, outputTokens: 1, turns: 1, cacheHitRatio: 0 },
+        completion: {
+          status: "completed",
+          summary: "记分卡已交付。",
+          artifacts: [],
+          verification: ["okr-data.json 顶层键齐全"],
+          assumptions: ["未适用按已作废计"],
+          blockers: [],
+        },
+      }),
+    );
+    s = { ...s, status: "done" };
+    const item = deriveChatItems(s).find((i) => i.kind === "text");
+    expect(item?.text).toBe("记分卡已交付。");
+    expect(item?.verification).toEqual(["okr-data.json 顶层键齐全"]);
+    expect(item?.assumptions).toEqual(["未适用按已作废计"]);
+    const html = renderChatItem(item);
+    expect(html).toContain("记分卡已交付");
+    expect(html).not.toMatch(/<details[^>]*open/);
+    const folds = html.match(/<details class="chat-aside chat-completion-fold">/g);
+    expect(folds).toHaveLength(2);
+    expect(html).toContain("验证 · 1");
+    expect(html).toContain("假设与前提 · 1");
+    expect(html).toContain("okr-data.json 顶层键齐全");
+    expect(html).toContain("未适用按已作废计");
   });
 
   it("finish_task 为 partial 时正文标明状态并列出 blockers", () => {
@@ -1978,8 +2369,6 @@ describe("deriveChatItems：对话从事件流派生，因此实时", () => {
     expect(text).toContain("部分完成");
     expect(text).toContain("缺少真实素材图");
     expect(text).toContain("**阻塞**");
-    expect(text).not.toContain("未完成/阻塞");
-    expect(text).not.toContain("**未完成**");
     const follow = deriveChatItems(s).find((i) => i.kind === "run-next");
     expect(follow?.live).toBe(false);
     expect(follow?.title).toBe("本轮已结束");
@@ -2008,6 +2397,8 @@ describe("deriveChatItems：对话从事件流派生，因此实时", () => {
     expect(text).toContain("**阻塞**");
     expect(text).toContain("缺少嘉立创账号");
     expect(text).not.toContain("未完成/阻塞");
+    expect(text).not.toContain("**验证**");
+    expect(text).not.toContain("drc 0");
 
     let s = run(
       sse(0, "main", "done", {
@@ -2046,12 +2437,80 @@ describe("deriveChatItems：对话从事件流派生，因此实时", () => {
       }),
       sse(1, "verifier", "assistant_text", { text: "开始复核" }),
     );
-    s = { ...s, status: "running" };
+    s = { ...s, status: "running", verify: true };
     const follow = deriveRunFollowUp(s);
     expect(follow.live).toBe(true);
     expect(follow.autoContinue).toBe(true);
     expect(follow.title).toBe("核查还在跑");
     expect(deriveChatItems(s).find((i) => i.kind === "run-next")?.title).toBe("核查还在跑");
+  });
+
+  it("finish_task 后、核查段事件未到：标明核查即将开始，而不是空许诺「自动回到对话」", () => {
+    let s = run(
+      sse(0, "main", "done", {
+        stopReason: "partial",
+        usage: { inputTokens: 1, outputTokens: 1, turns: 1, cacheHitRatio: 0 },
+        completion: {
+          status: "partial",
+          summary: "骨架已出。",
+          artifacts: [],
+          verification: [],
+          assumptions: [],
+          blockers: ["动效未接"],
+        },
+      }),
+    );
+    s = { ...s, status: "running", verify: true };
+    const follow = deriveRunFollowUp(s);
+    expect(follow.live).toBe(true);
+    expect(follow.autoContinue).toBe(true);
+    expect(follow.title).toBe("核查即将开始");
+    expect(follow.text).toMatch(/核查结束后会自动给出裁决/);
+  });
+
+  it("已收官且未开核查时 running 只表示在收尾，不宣称会自动续聊", () => {
+    let s = run(
+      sse(0, "main", "done", {
+        stopReason: "partial",
+        usage: { inputTokens: 1, outputTokens: 1, turns: 1, cacheHitRatio: 0 },
+        completion: {
+          status: "partial",
+          summary: "骨架已出。",
+          artifacts: [],
+          verification: [],
+          assumptions: [],
+          blockers: ["动效未接"],
+        },
+      }),
+    );
+    // 单段快路径通常已是 done；这里钉住「仍 running」时的诚实文案
+    s = { ...s, status: "running", verify: false };
+    const follow = deriveRunFollowUp(s);
+    expect(follow.live).toBe(true);
+    expect(follow.autoContinue).toBe(false);
+    expect(follow.title).toBe("正在收尾");
+  });
+
+  it("活着的 spawn 支线在收官卡上可见且会自动回到对话", () => {
+    let s = run(
+      sse(0, "main", "spawn_start", { title: "查寄存器" }),
+      sse(1, "main", "done", {
+        stopReason: "partial",
+        usage: { inputTokens: 1, outputTokens: 1, turns: 1, cacheHitRatio: 0 },
+        completion: {
+          status: "partial",
+          summary: "主线先交。",
+          artifacts: [],
+          verification: [],
+          assumptions: [],
+          blockers: ["等支线"],
+        },
+      }),
+    );
+    s = { ...s, status: "running" };
+    const follow = deriveRunFollowUp(s);
+    expect(follow.autoContinue).toBe(true);
+    expect(follow.title).toBe("支线还在跑：查寄存器");
   });
 
   it("右栏文件按类型分组，空类不出现；左侧不再挂本会话文件", () => {
@@ -2082,6 +2541,94 @@ describe("deriveChatItems：对话从事件流派生，因此实时", () => {
 
     renderRunDetail({ ...s, status: "done" }, { activeTab: "loop" });
     expect(rail.hidden).toBe(false);
+  });
+
+  it("右栏预览清单不分路径：交付卡可以只留声明，预览仍列出其它目录", () => {
+    const s = run(
+      sse(0, "main", "tool_call", { toolUseId: "w", name: "write_file", input: { path: "index.html" } }),
+      sse(1, "main", "tool_result", { toolUseId: "w", result: { content: "ok", isError: false } }),
+      sse(2, "main", "tool_call", { toolUseId: "d", name: "write_file", input: { path: "docs/11.md" } }),
+      sse(3, "main", "tool_result", { toolUseId: "d", result: { content: "ok", isError: false } }),
+    );
+    const files = deriveSessionFiles(s);
+    renderRunDetail(s, {
+      activeTab: "loop",
+      threadFiles: selectConversationArtifacts(files, { declared: ["index.html"], task: s.task }),
+      previewFiles: selectPreviewArtifacts(files),
+    });
+    const railText = document.querySelector(".artifacts")?.textContent ?? "";
+    expect(railText).toContain("index.html");
+    expect(railText).toContain("11.md");
+  });
+
+  it("点文件名或缩略图走右侧画布，不新开标签", () => {
+    const s = run(
+      sse(0, "main", "tool_call", { toolUseId: "w", name: "write_file", input: { path: "hero.png" } }),
+      sse(1, "main", "tool_result", { toolUseId: "w", result: { content: "ok", isError: false } }),
+    );
+    const onOpenCanvas = vi.fn();
+    renderRunDetail(s, {
+      activeTab: "loop",
+      previewFiles: selectPreviewArtifacts(deriveSessionFiles(s)),
+      onOpenCanvas,
+    });
+    const name = document.querySelector(".artifact-name") as HTMLAnchorElement;
+    expect(name.getAttribute("data-canvas-open")).toBe("hero.png");
+    expect(name.getAttribute("target")).toBeNull();
+    name.click();
+    expect(onOpenCanvas).toHaveBeenCalledWith("hero.png");
+    const thumb = document.querySelector(".artifact-thumb-link") as HTMLAnchorElement;
+    expect(thumb.getAttribute("data-canvas-open")).toBe("hero.png");
+    thumb.click();
+    expect(onOpenCanvas).toHaveBeenCalledTimes(2);
+  });
+
+  it("对话路径链接左键进画布，不新开标签", async () => {
+    let state = createInitialState("run-path-canvas", "生成文件", false);
+    state = reduceEvents(state, [
+      sse(0, "main", "assistant_text", { text: "文件 `out/report.md`。" }),
+    ]);
+    const onOpenCanvas = vi.fn();
+    renderRunDetail(state, {
+      activeTab: "loop",
+      onOpenCanvas,
+      inspectPaths: async (paths: string[]) => paths.map((input) => ({
+        input,
+        exists: true,
+        path: input,
+        kind: "file",
+      })),
+    });
+    await vi.waitFor(() => {
+      expect(document.querySelector(".local-path-link[data-preview-path]")).toBeTruthy();
+    });
+    const fileLink = document.querySelector(".local-path-link[data-preview-path]") as HTMLAnchorElement;
+    expect(fileLink.getAttribute("target")).toBeNull();
+    fileLink.click();
+    expect(onOpenCanvas).toHaveBeenCalledWith("out/report.md");
+  });
+
+  it("对话里的外链左键进右侧内置浏览器", () => {
+    let state = createInitialState("run-web", "查一下", false);
+    state = reduceEvents(state, [
+      sse(0, "main", "assistant_text", { text: "见 [官网](https://example.com/docs)。" }),
+    ]);
+    const onOpenBrowser = vi.fn();
+    renderRunDetail(state, { activeTab: "loop", onOpenBrowser });
+    const link = [...document.querySelectorAll("#conversation a[href]")].find((a) =>
+      String((a as HTMLAnchorElement).href).includes("example.com"),
+    ) as HTMLAnchorElement;
+    expect(link).toBeTruthy();
+    link.click();
+    expect(onOpenBrowser).toHaveBeenCalledWith("https://example.com/docs");
+  });
+
+  it("edit_file 写出的路径也进预览清单", () => {
+    const s = run(
+      sse(0, "main", "tool_call", { toolUseId: "e", name: "edit_file", input: { path: "src/foo.ts" } }),
+      sse(1, "main", "tool_result", { toolUseId: "e", result: { content: "ok", isError: false } }),
+    );
+    expect(deriveSessionFiles(s).map((f) => f.path)).toContain("src/foo.ts");
   });
 
   it("做网站时入口页权重大于样式和配图", () => {
@@ -2138,7 +2685,45 @@ describe("deriveChatItems：对话从事件流派生，因此实时", () => {
     expect(html).toContain("打开");
     expect(html).toContain("chat-artifact-kind");
     expect(html).toContain("在文件夹中显示");
+    expect(html).toContain('data-canvas-open="demo_sites/index.html"');
+    expect(html).not.toContain('target="_blank"');
     expect(html).not.toContain("chat-artifact-actions");
+  });
+
+  it("带图用户气泡：左侧大预览、右侧附件标注+正文，正文不再重复附件行", () => {
+    const split = splitUserMessageAttachments(
+      "附件：uploads/pasted-1788941218235.png\n我想给我们的仓库的ui设计一个好看的标题",
+    );
+    expect(split.attachments).toEqual(["uploads/pasted-1788941218235.png"]);
+    expect(split.displayBody).toBe("我想给我们的仓库的ui设计一个好看的标题");
+    expect(split.body).toContain("附件：uploads/pasted-1788941218235.png");
+
+    const html = renderChatItem({
+      kind: "user",
+      runId: "run-attach",
+      text: "附件：uploads/pasted-1788941218235.png\n我想给我们的仓库的ui设计一个好看的标题",
+      seq: 1,
+    });
+    expect(html).toContain("chat-msg--user-media");
+    expect(html).toContain("chat-attach-preview");
+    expect(html).toContain("/api/runs/run-attach/artifact?path=");
+    expect(html).toContain("chat-attach-caption");
+    expect(html).toContain("附件：uploads/pasted-1788941218235.png");
+    expect(html).toContain("我想给我们的仓库的ui设计一个好看的标题");
+    expect(html).not.toMatch(/chat-body[\s\S]*附件：/);
+  });
+
+  it("没有图片的用户气泡保持原来的文字胶囊，不套媒体卡", () => {
+    const html = renderChatItem({
+      kind: "user",
+      runId: "run-plain",
+      text: "继续改标题",
+      seq: 2,
+    });
+    expect(html).toContain("chat-msg--user");
+    expect(html).not.toContain("chat-msg--user-media");
+    expect(html).not.toContain("chat-attach-preview");
+    expect(html).toContain("继续改标题");
   });
 
   it("待复核不占坞，只留在对话末尾的裁决卡", () => {
@@ -2313,6 +2898,31 @@ describe("未读星取代那条「■ 已完成」", () => {
   });
 });
 
+describe("侧栏运行项：CLI 来源徽章", () => {
+  it("宿主把 r.host === cli 接到 host-badge（host-lags）", () => {
+    const app = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "ui", "public", "app.js"), "utf8");
+    const server = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "ui", "server.ts"), "utf8");
+    expect(app).toMatch(/r\.host === "cli"/);
+    expect(app).toMatch(/class="host-badge"/);
+    expect(server).toMatch(/parseArchiveHost\(a\.meta\.host\) === "cli"/);
+    expect(server).toMatch(/host: r\.host === "cli" \? "cli" : r\.archived \? null : "web"/);
+  });
+
+  it("host=cli 才亮 CLI 徽章；缺字段与 web 都不标", () => {
+    const runs = [
+      { runId: "cli-1", task: "命令行那条", status: "done", verify: false, host: "cli", createdAt: 1, finishedAt: 2 },
+      { runId: "web-1", task: "网页那条", status: "done", verify: false, host: "web", createdAt: 1, finishedAt: 2 },
+      { runId: "old-1", task: "旧档案", status: "done", verify: false, createdAt: 1, finishedAt: 2 },
+    ];
+    renderRunList(runs, "cli-1", () => {}, deriveRunListItems(runs, new Map()));
+    const badge = (id: string) => document.querySelector(`[data-run-id="${id}"] .host-badge`) as HTMLElement;
+    expect(badge("cli-1").hidden).toBe(false);
+    expect(badge("cli-1").textContent).toBe("CLI");
+    expect(badge("web-1").hidden).toBe(true);
+    expect(badge("old-1").hidden).toBe(true);
+  });
+});
+
 describe("侧栏运行项：运行中不说谎", () => {
   it("运行中没有完成勾、没有绿灯，状态字用滑动高亮", () => {
     const runs = [{ runId: "r1", task: "写网站", status: "running", verify: true, createdAt: 1, finishedAt: null }];
@@ -2371,6 +2981,7 @@ describe("装配状态条", () => {
     const items = deriveAssemblyBar(configured(), { model: "claude-opus-5" });
     const by = Object.fromEntries(items.map((i) => [i.key, i.chip]));
     expect(by.model).toBe("claude-opus-5");
+    expect(by.design).toBeUndefined();
     expect(by.pack).toBe("ts-coding");
     expect(by.guardrails).toBe("40 轮 / 64k");
     expect(by.verify).toContain("15 轮");
@@ -2453,6 +3064,66 @@ describe("装配状态条", () => {
     expect(chip?.why).toContain("TypeScript 任务");
   });
 
+  it("run_config 投影 mode=design 与 designRoute，装配条写设计模式", () => {
+    const s = reduceEvents(createInitialState("r-design", "做个落地页", false), [
+      sse(0, "host", "run_config", {
+        pack: { name: "design" },
+        mode: "design",
+        designRoute: {
+          id: "saas-landing",
+          reason: "显式选用：SaaS 落地页",
+          seed: "landing-basic",
+          kind: "r1",
+        },
+      }),
+    ]);
+    expect(s.runConfig.mode).toBe("design");
+    expect(s.runConfig.designRoute).toEqual({
+      id: "saas-landing",
+      reason: "显式选用：SaaS 落地页",
+      seed: "landing-basic",
+      kind: "r1",
+      bundle: null,
+      extraSeeds: [],
+    });
+    const chip = deriveAssemblyBar(s, null).find((i) => i.key === "design");
+    expect(chip?.chip).toContain("设计模式");
+    expect(chip?.chip).toContain("saas-landing");
+    expect(chip?.chip).toContain("landing-basic");
+    expect(chip?.why).toContain("显式选用：SaaS 落地页");
+    expect(`${chip?.chip} ${chip?.why}`).not.toMatch(/Claude Design|Kimi|OpenDesign/i);
+  });
+
+  it("run_config 投影 spec-plus-deck 的 bundle/extraSeeds，装配条写规格+幻灯", () => {
+    const s = reduceEvents(createInitialState("r-bundle", "写规格再做幻灯", false), [
+      sse(0, "host", "run_config", {
+        pack: { name: "design" },
+        mode: "design",
+        designRoute: {
+          id: "pm-spec",
+          reason: "命名路径：产品规格 + 汇报幻灯（不是通用多命中检测）",
+          seed: "pm-spec",
+          kind: "r1",
+          bundle: "spec-plus-deck",
+          extraSeeds: ["deck-basic"],
+        },
+      }),
+    ]);
+    expect(s.runConfig.designRoute).toEqual({
+      id: "pm-spec",
+      reason: "命名路径：产品规格 + 汇报幻灯（不是通用多命中检测）",
+      seed: "pm-spec",
+      kind: "r1",
+      bundle: "spec-plus-deck",
+      extraSeeds: ["deck-basic"],
+    });
+    const chip = deriveAssemblyBar(s, null).find((i) => i.key === "design");
+    expect(chip?.chip).toContain("规格+幻灯");
+    expect(chip?.chip).toContain("pm-spec");
+    expect(chip?.chip).toContain("deck-basic");
+    expect(chip?.why).toContain("不是通用多命中");
+  });
+
   it("长工作目录只留尾部两级——状态条是一行", () => {
     const items = deriveAssemblyBar(configured(), null);
     const wd = items.find((i) => i.key === "workdir")!.chip;
@@ -2462,6 +3133,24 @@ describe("装配状态条", () => {
 
   it("非编排运行没有编排项", () => {
     expect(deriveAssemblyBar(configured(), null).some((i) => i.key === "plan")).toBe(false);
+  });
+
+  it("D3：自定义组合报「档 自定义」，开关仍展开", () => {
+    const s = createInitialState("rpc", "t", false);
+    s.runConfig = {
+      permission: {
+        mode: null,
+        approvalDefault: "auto",
+        planMode: true,
+        planGate: false,
+        autoYes: true,
+      },
+    };
+    const chip = deriveAssemblyBar(s, null).find((i) => i.key === "permission");
+    expect(chip?.chip).toMatch(/自定义/);
+    expect(chip?.chip).toMatch(/ask 级会自动放行/);
+    expect(chip?.why).toContain("计划编排开");
+    expect(chip?.why).toContain("autoYes 开");
   });
 
   it("D3：装配条展开 permission 真实开关，不只报模式名", () => {
@@ -2476,9 +3165,10 @@ describe("装配状态条", () => {
       },
     };
     const chip = deriveAssemblyBar(s, null).find((i) => i.key === "permission");
-    expect(chip?.chip).toContain("档 plan");
-    expect(chip?.chip).toContain("确认门开");
-    expect(chip?.chip).toContain("autoYes 关");
+    expect(chip?.chip).toMatch(/计划/);
+    expect(chip?.chip).toMatch(/不会自动放行/);
+    expect(chip?.why).toContain("确认门开");
+    expect(chip?.why).toContain("autoYes 关");
     expect(chip?.why).toMatch(/docs\/permission-modes/);
   });
 
@@ -2687,13 +3377,15 @@ describe("角色人名（backlog D4：显示层别名，与角色语义并列）
     renderRunDetail(crewState(), { activeTab: "loop" });
     expect(document.querySelectorAll(".conversation .segment-boundary")).toHaveLength(0);
     expect(document.querySelectorAll(".chat-msg--assistant .chat-role")).toHaveLength(0);
-    expect(document.body.textContent).toContain("我先拆解任务");
-    expect(document.body.textContent).toContain("开始施工");
+    expect(document.querySelector(".conversation .chat-msg--assistant")?.textContent).toContain("我先拆解任务");
+    expect([...document.querySelectorAll(".conversation .chat-msg--assistant")].some((n) => n.textContent.includes("开始施工"))).toBe(false);
+    expect(document.querySelector(".chat-agents")).toBeTruthy();
+    expect(document.body.textContent).toContain("子代理");
   });
 
   it("人名只映射显示层——派生层的 source 仍是结构名", () => {
     renderRunDetail(crewState(), { activeTab: "loop" });
-    expect(document.body.textContent).toContain("开始核查");
+    expect([...document.querySelectorAll(".conversation .chat-msg--assistant")].some((n) => n.textContent.includes("开始核查"))).toBe(false);
     expect(document.querySelector(".chat-msg--assistant .chat-role")).toBeNull();
   });
 
@@ -2776,17 +3468,26 @@ describe("停止按钮：运行中那个位置变成「停止」", () => {
       localStatus: "running",
     });
 
-  it("运行中按钮是「停止」且可点——不是一个灰着的「运行任务」", () => {
+  it("运行中空框按钮是「停止」且可点——不是一个灰着的「运行任务」", () => {
     const m = running();
     expect(m.buttonLabel).toBe("停止");
     expect(m.canSubmit).toBe(true);
     expect(m.kind).toBe("stop");
   });
 
-  /** 框里那半截草稿是给下一轮准备的，不该拦着人叫停 */
-  it("停止不需要文本", () => {
+  it("运行中有草稿则立即插入，空框才是停止", () => {
     expect(composerSubmitPlan(running(), "")).toEqual({ kind: "stop", runId: "r1", text: "" });
     expect(composerSubmitPlan(running(), "   ")).toEqual({ kind: "stop", runId: "r1", text: "" });
+    const withDraft = deriveComposerMode({
+      info: { runId: "r1", status: "running", canContinue: false },
+      localStatus: "running",
+      draft: "改一下",
+    });
+    expect(withDraft.kind).toBe("steer");
+    expect(withDraft.buttonLabel).toBe("立即插入");
+    expect(composerSubmitPlan(withDraft, "改一下")).toEqual({
+      kind: "steer", runId: "r1", text: "改一下",
+    });
   });
 
   it("运行中不再用一段说明占底栏", () => {
@@ -2847,6 +3548,31 @@ describe("B2 · 归档运行在底栏的说法", () => {
     expect(m.kind).toBe("append");
     expect(m.buttonLabel).toBe("继续对话");
     expect(m.note).toBe("");
+  });
+
+  it("restore-gate / reopen 底栏照实说，不假装有检查点", () => {
+    const gated = deriveComposerMode({
+      info: {
+        runId: "r-gate",
+        status: "done",
+        canContinue: true,
+        archived: true,
+        continuationMode: "restore-gate",
+      },
+    });
+    expect(gated.mode).toBe("restore-gate");
+    expect(gated.note).toMatch(/确认门/);
+    const reopened = deriveComposerMode({
+      info: {
+        runId: "r-reopen",
+        status: "done",
+        canContinue: true,
+        archived: true,
+        continuationMode: "reopen",
+      },
+    });
+    expect(reopened.mode).toBe("reopen");
+    expect(reopened.note).toMatch(/不重放飞行中的工具/);
   });
 });
 
@@ -2995,6 +3721,40 @@ describe("端点降级在界面上看得见", () => {
     s = reduceEvents(s, [sse(1, "model", "model_fallback", { from: "a", to: "b", reason: "503", turn: 1 })]);
     expect(deriveAssemblyBar(s, null).find((i) => i.key === "fallback")!.chip).toContain("已降级");
   });
+
+  it("prefer_cheap 路由在装配条上标「偏好廉价」", () => {
+    const s = reduceEvents(createInitialState("rc-cheap", "t", false), [
+      sse(0, "host", "run_config", {
+        fallbackChain: ["pro", "flash"],
+        fallbackRouting: "prefer_cheap",
+      }),
+    ]);
+    expect(deriveAssemblyBar(s, null).find((i) => i.key === "fallback")!.chip).toContain("偏好廉价");
+  });
+
+  it("endpointHealth 有探针/熔断证据时上装配条（只读，不改路由）", () => {
+    const s = reduceEvents(createInitialState("rc-health", "t", false), [
+      sse(0, "host", "run_config", {
+        endpointHealth: [
+          { model: "a", healthy: false, circuit: "open", reason: "upstream:503" },
+        ],
+      }),
+    ]);
+    const chip = deriveAssemblyBar(s, null).find((i) => i.key === "endpointHealth");
+    expect(chip?.chip).toContain("端点健康");
+    expect(chip?.chip).toContain("a");
+    expect(chip?.why).toMatch(/不改路由/);
+  });
+
+  it("supportsVision=false 时装配条写「识图 不可用」而不是模型名", () => {
+    const s = reduceEvents(createInitialState("rc-vis", "t", false), [
+      sse(0, "host", "run_config", {
+        roleModels: { vision: "text-only-vl" },
+        supportsVision: false,
+      }),
+    ]);
+    expect(deriveAssemblyBar(s, null).find((i) => i.key === "vision")!.chip).toBe("识图 不可用");
+  });
 });
 
 describe("会话标题：算出来的短句，不是任务原文", () => {
@@ -3102,8 +3862,17 @@ describe("空态给的是能点的例子", () => {
    * 第一次打开时最难的不是不会用，而是**不知道这个 agent 能干什么**——
    * 一句"尚无运行"把这个问题原样退回给人。
    */
+  function paintWelcome(opts = {}) {
+    const panel = document.getElementById("main-panel");
+    panel?.classList.add("is-welcome");
+    const gallery = document.getElementById("starter-gallery");
+    if (gallery) gallery.hidden = false;
+    renderEmptyState(Boolean(opts.hasRuns), opts);
+    renderStarterGallery(opts);
+  }
+
   it("无运行时列出示例，且各走一条不同的路", () => {
-    renderEmptyState(false);
+    paintWelcome();
     const items = [...document.querySelectorAll("[data-example]")];
     expect(items.length).toBeGreaterThanOrEqual(3);
     const all = items.map((e) => e.getAttribute("data-example")!).join(" ");
@@ -3112,22 +3881,317 @@ describe("空态给的是能点的例子", () => {
   });
 
   it("示例文本进 data-example，点击由宿主填进输入框（不直接开跑）", () => {
-    renderEmptyState(false);
+    paintWelcome();
     const btn = document.querySelector("[data-example]") as HTMLElement;
     expect(btn.tagName).toBe("BUTTON"); // 键盘可达
     expect(btn.getAttribute("data-example")!.length).toBeGreaterThan(5);
+    expect(btn.getAttribute("title")).toBeTruthy();
   });
 
   it("已有运行时的新建对话面仍给示例——示例属于启动器，不属于首次安装", () => {
-    renderEmptyState(true);
+    paintWelcome({ hasRuns: true });
     expect(document.querySelectorAll("[data-example]").length).toBeGreaterThanOrEqual(3);
-    expect(document.querySelector(".empty-state h2")!.textContent).toBe("开始一段新对话");
+    expect(document.querySelector(".empty-brand")!.textContent).toMatch(/FATHOM/);
+    expect(document.querySelector(".empty-tagline")!.textContent).toContain("to the bottom");
+    expect(document.querySelector(".empty-tagline-cn")!.textContent).toContain("每一层都看得见");
   });
 
-  it("空态有工作目录入口，不另起一条选择器", () => {
-    renderEmptyState(false);
-    expect(document.querySelector("[data-focus-workdir]")).toBeTruthy();
-    expect(document.querySelector("[data-replay-onboarding]")).toBeTruthy();
+  it("空态不再放工作目录/引导入口——composer 与设置里已有", () => {
+    paintWelcome();
+    expect(document.querySelector("[data-focus-workdir]")).toBeNull();
+    expect(document.querySelector("[data-replay-onboarding]")).toBeNull();
+    expect(document.getElementById("workdir-select")).toBeTruthy();
+  });
+
+  it("设计模板只出现在 starter-gallery，点选会标出", () => {
+    paintWelcome();
+    expect(document.querySelectorAll("#starter-gallery [data-design-template]").length).toBe(3);
+    expect(document.querySelector('[data-design-template="social-basic"]')?.textContent).toContain("社媒方图");
+    paintWelcome({ selectedTemplate: "deck-basic" });
+    expect(document.querySelector('[data-design-template="deck-basic"]')?.classList.contains("is-selected")).toBe(true);
+  });
+
+  it("空态有设计模式入口；进入后是 6 页签且 Prototype 含三维对象", () => {
+    paintWelcome();
+    const enter = document.querySelector("[data-design-mode-enter]");
+    expect(enter?.textContent).toContain("设计模式");
+    expect(enter?.textContent).toMatch(/幻灯|海报/);
+    expect(enter?.classList.contains("starter-tile--design-enter")).toBe(true);
+    expect(enter?.textContent).not.toMatch(/Claude Design|Kimi|OpenDesign/i);
+    expect(DESIGN_MODE_TABS).toEqual([
+      "Prototype",
+      "Live Artifact",
+      "Deck",
+      "Template",
+      "Media",
+      "Other",
+    ]);
+    expect(designTabLabel("Prototype")).toBe("原型");
+    expect(DESIGN_MODE_TAB_LABELS).toMatchObject({
+      Prototype: "原型",
+      "Live Artifact": "实时产物",
+      Deck: "幻灯",
+      Template: "模板",
+      Media: "媒体",
+      Other: "其他",
+    });
+    paintWelcome({
+      designModeActive: true,
+      selectedDesignTab: "Prototype",
+      catalog: [
+        { id: "web-prototype", tab: "Prototype", title: "网页原型", description: "默认落地页" },
+        { id: "3d-object", tab: "Prototype", title: "三维对象", description: "WebGL 场景" },
+        { id: "dashboard", tab: "Live Artifact", title: "仪表盘", description: "管理台" },
+      ],
+    });
+    const tabs = [...document.querySelectorAll("[data-design-tab]")].map((el) => el.getAttribute("data-design-tab"));
+    expect(tabs).toEqual([...DESIGN_MODE_TABS]);
+    expect([...document.querySelectorAll("[data-design-tab]")].map((el) => el.textContent?.trim())).toEqual([
+      "原型",
+      "实时产物",
+      "幻灯",
+      "模板",
+      "媒体",
+      "其他",
+    ]);
+    expect(document.querySelector(".design-tab-row")?.textContent).not.toMatch(/Prototype|Live Artifact|Deck|Template|Media|Other/);
+    expect(document.querySelector('[data-design-id="3d-object"]')?.textContent).toContain("三维对象");
+    expect(document.querySelector('[data-design-tab="Prototype"]')?.classList.contains("is-selected")).toBe(true);
+    const back = document.querySelector("[data-design-mode-exit]");
+    expect(back?.textContent).toMatch(/返回/);
+    expect(document.querySelector("[data-design-mode-enter]")).toBeNull();
+    expect(document.querySelector('[data-design-sample="proto-free"]')?.textContent).toContain("自由风格");
+    expect(document.querySelector(".design-sample-thumb")).toBeTruthy();
+    expect(document.querySelector(".design-sample-thumb--landing, .design-sample-thumb--mobile, .design-sample-thumb--cube")).toBeTruthy();
+    expect(document.body.textContent).not.toMatch(/Claude Design|Kimi|OpenDesign/i);
+  });
+
+  it("设计模式可以返回开始页；新建对话也会离开", () => {
+    paintWelcome({ designModeActive: true, selectedDesignTab: "Deck" });
+    expect(document.querySelector("[data-design-mode-exit]")).toBeTruthy();
+    expect(document.querySelector("[data-design-tab]")).toBeTruthy();
+    paintWelcome();
+    expect(document.querySelector("[data-design-mode-exit]")).toBeNull();
+    expect(document.querySelector("[data-design-tab]")).toBeNull();
+    expect(document.querySelector("[data-design-mode-enter]")).toBeTruthy();
+    const html = readFileSync(join(UI_DIR, "index.html"), "utf-8");
+    expect(html).toMatch(/data-design-mode-exit/);
+    expect(html).toMatch(/function exitDesignMode/);
+    expect(html).toMatch(/designModeActive = false/);
+  });
+
+  it("选 Deck 页签时画出带缩略图的样例卡，不是第二排文字钮", () => {
+    paintWelcome({
+      designModeActive: true,
+      selectedDesignTab: "Deck",
+      selectedDesignSample: "deck-free",
+    });
+    const cards = [...document.querySelectorAll("[data-design-sample]")];
+    expect(cards.length).toBeGreaterThanOrEqual(3);
+    expect(cards.length).toBeLessThanOrEqual(4);
+    expect(document.querySelectorAll(".design-sample-thumb").length).toBe(cards.length);
+    expect(document.querySelector(".design-sample-thumb--blank")).toBeTruthy();
+    expect(document.querySelector(".design-sample-thumb--deck, .design-sample-thumb--magazine, .design-sample-thumb--bullets")).toBeTruthy();
+    expect(document.querySelector(".design-type-row")).toBeNull();
+    expect(document.querySelector('[data-design-sample="deck-free"]')?.classList.contains("is-selected")).toBe(true);
+    expect(document.querySelector('[data-design-sample="deck-cover"]')?.getAttribute("data-design-template")).toBe("deck-basic");
+    expect(cards.every((el) => el.classList.contains("starter-tile"))).toBe(false);
+    expect(document.querySelector('[data-design-tab="Deck"]')?.textContent).toContain("幻灯");
+  });
+
+  it("设计样例卡是迷你页缩略图，不是小图标 chip", () => {
+    const css = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "ui", "public", "styles.css"), "utf-8");
+    expect(css).toMatch(/\.design-sample-card\s*\{[^}]*flex:\s*0 0 210px;/);
+    expect(css).toMatch(/\.design-sample-card\s*\{[^}]*width:\s*210px;/);
+    expect(css).toMatch(/\.design-sample-card\s*\{[^}]*min-width:\s*180px;/);
+    expect(css).toMatch(/\.design-sample-card\s*\{[^}]*max-width:\s*240px;/);
+    expect(css).toMatch(/\.design-sample-thumb\s*\{[^}]*aspect-ratio:\s*16\s*\/\s*10;/);
+    expect(css).toMatch(/\.design-sample-thumb\s*\{[^}]*min-height:\s*131px;/);
+    expect(css).toContain("#main-panel.is-welcome #starter-gallery.starter-gallery--design {\n  width: min(100%, 60rem);\n  min-height: 14.5rem;\n}");
+    expect(css).not.toMatch(/\.design-sample-row\s*\{[^}]*grid-template-columns:\s*repeat\(4/);
+    paintWelcome({ designModeActive: true, selectedDesignTab: "Prototype" });
+    const first = document.querySelector("[data-design-sample]");
+    expect(first?.getAttribute("data-design-sample")).toBe("proto-free");
+    expect(first?.querySelector(".design-sample-title")?.textContent).toBe("自由风格");
+    expect(first?.querySelector(".design-sample-thumb--blank")).toBeTruthy();
+    expect(document.querySelector("#starter-gallery .ph")).toBeNull();
+  });
+
+  it("点样例卡会带上模板或提示词", () => {
+    const deck = resolveDesignSampleChoice("deck-magazine");
+    expect(deck?.designTemplate).toBe("deck-basic");
+    expect(deck?.designId).toBe("guizang-ppt");
+    expect(deck?.prompt).toMatch(/杂志风|deck-basic/);
+
+    const landing = resolveDesignSampleChoice("proto-landing");
+    expect(landing?.designTemplate).toBe("landing-basic");
+    expect(landing?.prompt).toContain("landing-basic");
+
+    const blank = resolveDesignSampleChoice("proto-free");
+    expect(blank?.designTemplate).toBeNull();
+    expect(blank?.designId).toBe("web-prototype");
+    expect(blank?.prompt.length).toBeGreaterThan(5);
+
+    const picked = nextDesignSampleState("deck-cover", { prompt: "" });
+    expect(picked.selectedDesignSample).toBe("deck-cover");
+    expect(picked.selectedDesignTemplate).toBe("deck-basic");
+    expect(picked.prompt).toContain("封面主张");
+    expect(picked.prompt).not.toMatch(/data-slide|deck-basic/);
+
+    const kept = nextDesignSampleState("deck-cover", { prompt: "我要做融资路演" });
+    expect(kept.selectedDesignTemplate).toBe("deck-basic");
+    expect(kept.prompt).toBe("我要做融资路演");
+
+    expect(designSamplesForTab("Deck").every((s) => s.thumb && s.title)).toBe(true);
+
+    const spec = resolveDesignSampleChoice("doc-spec");
+    expect(spec?.designId).toBe("pm-spec");
+    expect(spec?.designTemplate).toBe("pm-spec");
+    const bundle = resolveDesignSampleChoice("doc-spec-deck");
+    expect(bundle?.designId).toBe("spec-plus-deck");
+    expect(bundle?.prompt).toMatch(/产品规格.*汇报幻灯/);
+    const okr = resolveDesignSampleChoice("doc-okr");
+    expect(okr?.designTemplate).toBe("team-okrs");
+    const freeDoc = resolveDesignSampleChoice("doc-free");
+    expect(freeDoc?.designId).toBeNull();
+    expect(freeDoc?.designTemplate).toBeNull();
+  });
+
+  it("幻灯/社媒页签露出五色皮，不是 540 套主题馆", () => {
+    paintWelcome({ designModeActive: true, selectedDesignTab: "Prototype" });
+    expect(document.querySelector("[data-design-look]")).toBeNull();
+
+    paintWelcome({
+      designModeActive: true,
+      selectedDesignTab: "Deck",
+      selectedDesignLook: "paper",
+    });
+    const looks = [...document.querySelectorAll("[data-design-look]")];
+    expect(looks.map((el) => el.getAttribute("data-design-look"))).toEqual(DESIGN_LOOKS.map((l) => l.id));
+    expect(looks.map((el) => el.textContent?.trim())).toEqual(["墨水", "暖纸", "夜色", "草地", "陶土"]);
+    expect(document.querySelector('[data-design-look="paper"]')?.classList.contains("is-selected")).toBe(true);
+    expect(document.querySelector(".design-look-swatch")).toBeTruthy();
+    expect(document.body.textContent).not.toMatch(/Open Design|15\s*[×x]\s*36|540/);
+
+    paintWelcome({ designModeActive: true, selectedDesignTab: "Media" });
+    expect(document.querySelectorAll("[data-design-look]").length).toBe(5);
+
+    const withLook = nextDesignSampleState("deck-cover", { prompt: "", selectedDesignLook: "paper" });
+    expect(withLook.prompt).toContain("色板用「暖纸 / paper」");
+    expect(isDesignSamplePrompt(withLook.prompt)).toBe(true);
+    expect(composePromptWithLook("做一封营销邮件：表格降级安全。", "paper")).toBe(
+      "做一封营销邮件：表格降级安全。",
+    );
+    expect(nextDesignLookState("paper", {
+      prompt: withLook.prompt,
+      selectedDesignLook: "paper",
+    }, { toggle: true }).selectedDesignLook).toBeNull();
+
+    paintWelcome({ designModeActive: true, selectedDesignTab: "Deck" });
+    const inkRow = document.querySelector(".design-sample-row");
+    expect(inkRow?.classList.contains("has-look")).toBe(true);
+    expect(inkRow?.style.getPropertyValue("--look-bg")).toBe("#0f1419");
+
+    paintWelcome({
+      designModeActive: true,
+      selectedDesignTab: "Deck",
+      selectedDesignLook: "paper",
+    });
+    expect(document.querySelector(".design-sample-row")?.style.getPropertyValue("--look-bg")).toBe("#f4f1ea");
+
+    paintWelcome({ designModeActive: true, selectedDesignTab: "Media" });
+    const social = document.querySelector('[data-design-sample="media-free"]');
+    expect(social?.textContent).toContain("社媒方图");
+    expect(social?.textContent).toContain("1080");
+    expect(social?.textContent).not.toContain("自由风格");
+    expect(resolveDesignSampleChoice("media-free")?.prompt).not.toMatch(/data-card|social-basic/);
+  });
+
+  it("新建 placeholder 带目录名，没有目录也不写「问任何问题」", () => {
+    expect(composerFolderName("D:\\\\Work\\\\Github_pros\\\\Agent_Design")).toBe("Agent_Design");
+    expect(composerFolderName("/tmp/demo/")).toBe("demo");
+    expect(composerFolderName("")).toBe("");
+    expect(newRunPlaceholder("D:\\\\Work\\\\Agent_Design")).toBe("要「Agent_Design」做什么…");
+    expect(newRunPlaceholder(null)).toBe("要这个目录做什么…");
+    expect(deriveComposerMode({ info: null }).placeholder).toBe("要这个目录做什么…");
+    expect(deriveComposerMode({ info: null, workdir: "D:\\\\repo\\\\kicad" }).placeholder)
+      .toBe("要「kicad」做什么…");
+  });
+
+  it("设计模式 placeholder 用稿名，不把仓库文件夹写进框", () => {
+    expect(newRunPlaceholder("D:\\\\Work\\\\Agent_Design", { designMode: true }))
+      .toBe("要这份稿做什么…");
+    expect(newRunPlaceholder("D:\\\\Work\\\\Agent_Design", { designMode: true, designTitle: "杂志风幻灯" }))
+      .toBe("要「杂志风幻灯」做什么…");
+    expect(deriveComposerMode({
+      info: null,
+      workdir: "D:\\\\Work\\\\Github_pros\\\\Agent_Design",
+      designMode: true,
+    }).placeholder).toBe("要这份稿做什么…");
+    expect(deriveComposerMode({
+      info: null,
+      workdir: "D:\\\\Work\\\\Github_pros\\\\Agent_Design",
+      designMode: true,
+      designTitle: "落地页",
+    }).placeholder).toBe("要「落地页」做什么…");
+
+    const html = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "ui", "public", "index.html"), "utf-8");
+    const start = html.indexOf("async function ensureDesignDraftsWorkdir");
+    const end = html.indexOf("async function submitNewRun");
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const block = html.slice(start, end);
+    expect(block).toContain("/api/design-drafts-workdir");
+    expect(block).toContain("设计稿写到独立目录");
+    expect(block).not.toContain("writePrefString");
+    expect(html).toContain("verifyToggle.checked = false");
+  });
+
+  it("composer 是紧凑胶囊：对话与欢迎共用，起步卡只在欢迎", () => {
+    const css = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "ui", "public", "styles.css"), "utf-8");
+    expect(css).toContain("#submit-form:focus-within");
+    expect(css).toMatch(/\.composer-input-row textarea \{\s*flex: 1 1 auto;\s*min-width: 0;\s*min-height: 36px;/);
+    expect(css).toContain(".composer-quickbar > .auto-approve-label");
+    expect(css).toContain(".composer-quickbar > .verify-toggle-label");
+    expect(css).not.toContain("#main-panel.is-welcome .composer-quickbar > .verify-toggle-label,\n#main-panel.is-welcome .composer-quickbar > .auto-approve-label");
+    expect(css).toContain("#main-panel.is-welcome .starter-tiles {\n  display: flex;");
+    expect(css).toContain("#main-panel.is-welcome .starter-tile-hint {\n  display: none;");
+  });
+
+  it("运行设置是一行一项的短菜单，长说明进 title", () => {
+    const root = join(dirname(fileURLToPath(import.meta.url)), "..", "ui", "public");
+    const html = readFileSync(join(root, "index.html"), "utf-8");
+    const css = readFileSync(join(root, "styles.css"), "utf-8");
+    const start = html.indexOf('id="run-knobs"');
+    const end = html.indexOf('id="starter-gallery"');
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const knobs = html.slice(start, end);
+    expect(knobs).toContain('class="knob-row"');
+    expect(knobs).not.toContain("D3 预设");
+    expect(knobs).not.toContain("不影响 passed");
+    expect(knobs).not.toContain("每一轮都可选");
+    expect(css).toMatch(/\.run-knobs\s*\{\s*display:\s*flex;/);
+    const knobGrids = [...css.matchAll(/\.run-knobs\s*\{([^}]*)\}/g)].map((m) => m[1]);
+    expect(knobGrids.some((b) => /minmax\(240px/.test(b))).toBe(false);
+    expect(css).toContain("width: min(22rem, calc(100% - 20px));");
+  });
+
+  it("welcome 时 gallery 在提交栏之后可见；对话态去掉 is-welcome 并藏 gallery", () => {
+    paintWelcome();
+    const panel = document.getElementById("main-panel")!;
+    const form = document.getElementById("submit-form")!;
+    const gallery = document.getElementById("starter-gallery")!;
+    expect(panel.classList.contains("is-welcome")).toBe(true);
+    expect(gallery.hidden).toBe(false);
+    expect(form.compareDocumentPosition(gallery) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    panel.classList.remove("is-welcome");
+    gallery.hidden = true;
+    gallery.innerHTML = "";
+    expect(panel.classList.contains("is-welcome")).toBe(false);
+    expect(gallery.hidden).toBe(true);
+    expect(gallery.querySelector("[data-example]")).toBeNull();
   });
 });
 
@@ -3136,11 +4200,20 @@ describe("侧栏标题优先用服务端存的短句", () => {
     const runs = [{ runId: "r1", task: "请帮我把这段很长的需求写成可扫视的标题", title: "需求标题" }];
     expect(deriveThreadTitle(runs, "r1")).toBe("需求标题");
   });
+
+  it("模型把「设计标题」收成方案名时，侧栏退回用户原话", () => {
+    const task = "附件：uploads/pasted-1.png\n我想给我们的仓库的ui设计一个好看的标题 你有什么好的方案吗";
+    expect(titleReflectsTask("流光·智能仓储中枢", task)).toBe(false);
+    expect(resolveDisplayedTitle("“流光·智能仓储中枢”", task)).toBe(deriveRunTitle(task));
+    expect(deriveThreadTitle([{ runId: "r1", task, title: "“流光·智能仓储中枢”" }], "r1")).toBe(deriveRunTitle(task));
+  });
 });
 
 describe("追加模式显示该对话的工作目录", () => {
-  it("切到另一条对话时下拉跟上那条的 workdir，回到新建就清记号", () => {
+  it("切对话只展示该会话路径且不可改；回到新建才解锁", () => {
     const select = document.getElementById("workdir-select") as HTMLSelectElement;
+    const trigger = document.getElementById("workdir-trigger") as HTMLButtonElement;
+    const field = document.getElementById("workdir-combobox") as HTMLElement;
     const form = document.getElementById("submit-form") as HTMLFormElement;
     select.innerHTML = "";
     for (const dir of ["D:\\first", "D:\\other"]) {
@@ -3150,14 +4223,32 @@ describe("追加模式显示该对话的工作目录", () => {
       select.appendChild(opt);
     }
     select.value = "D:\\first";
-    patchComposer(deriveComposerMode({
+    const onB = deriveComposerMode({
       info: { runId: "run-b", status: "done", canContinue: true, workdir: "D:\\other" },
       localStatus: "done",
-    }));
+    });
+    expect(onB.workdirLocked).toBe(true);
+    expect(onB.workdir).toBe("D:\\other");
+    patchComposer(onB);
     expect(select.value).toBe("D:\\other");
+    expect(trigger.disabled).toBe(true);
+    expect(field.classList.contains("scope-field--locked")).toBe(true);
     expect(form.dataset.workdirRun).toBe("run-b");
-    patchComposer(deriveComposerMode({ info: null }));
+
+    patchComposer(deriveComposerMode({
+      info: { runId: "run-a", status: "done", canContinue: true, workdir: "D:\\first" },
+      localStatus: "done",
+    }));
+    expect(select.value).toBe("D:\\first");
+    expect(form.dataset.workdirRun).toBe("run-a");
+    expect(trigger.disabled).toBe(true);
+
+    const fresh = deriveComposerMode({ info: null, workdir: "D:\\first" });
+    expect(fresh.workdirLocked).toBe(false);
+    patchComposer(fresh);
     expect(form.dataset.workdirRun).toBeUndefined();
+    expect(trigger.disabled).toBe(false);
+    expect(field.classList.contains("scope-field--locked")).toBe(false);
   });
 });
 
@@ -3285,5 +4376,506 @@ describe("revealedWindow：绝对放行计数 → 滑动窗口内的偏移", () 
     // 累计单调递增：旧实现里这个数会在 2000 处永久钉死
     expect(positions.at(-1)).toBe(5000);
     expect(positions.every((p, i) => i === 0 || p > positions[i - 1]!)).toBe(true);
+  });
+});
+
+describe("AGENT.md 上下文卡（docs/09 §4.7 host-lags）", () => {
+  it("加载了文件时 Context 卡写明指导不是执行", () => {
+    let s = createInitialState("run-md", "t", false);
+    s = reduceEvents(s, [
+      sse(0, "host", "run_config", {
+        agentMd: {
+          files: [{ path: "D:/proj/AGENT.md", layer: "project", chars: 80, truncated: false }],
+          chars: 80,
+          truncated: false,
+          maxChars: 16000,
+          guidance: true,
+        },
+      }),
+    ]);
+    const cards = buildFactorCards({
+      loop: deriveLoopFace(s, null),
+      context: deriveContextFace(s, null),
+      tools: deriveToolsFace(s, null),
+      verification: deriveVerificationFace(s, null),
+    });
+    const ctx = cards.find((c) => c.id === "context");
+    expect(ctx.lines.some((l) => /AGENT\.md/.test(l) && /指导不是执行/.test(l))).toBe(true);
+  });
+});
+
+describe("hooks 日志渲染（docs/09 §4.2 host-lags）", () => {
+  it("hook 阻断在日志里可见，不是静默丢弃", () => {
+    let s = createInitialState("run-hook", "t", false);
+    s = reduceEvents(s, [
+      sse(0, "host", "run_config", { hooks: { timeoutMs: 5000, events: ["PreToolUse", "PostToolUse", "Stop"] } }),
+      sse(1, "main", "hook", {
+        hook: "PreToolUse",
+        outcome: "block",
+        tool: "bash",
+        detail: "no network",
+      }),
+    ]);
+    renderRunDetail(s, { activeTab: "log" });
+    const row = document.querySelector(".log-entries .log-entry--warning");
+    expect(row?.textContent).toMatch(/PreToolUse/);
+    expect(row?.textContent).toMatch(/阻断|no network/);
+  });
+});
+
+describe("对话消息操作条（复制 / 分叉 / 时间）", () => {
+  it("已落定用户与助手气泡带 Copy/Fork 和时间，直播条没有", () => {
+    const now = Date.now();
+    const userHtml = renderChatItem({
+      kind: "user",
+      runId: "run-act",
+      text: "帮我改标题",
+      seq: 2,
+      at: now - 4 * 60_000,
+      showActions: true,
+    });
+    expect(userHtml).toContain("data-chat-action=\"copy\"");
+    expect(userHtml).toContain("data-chat-action=\"rewind\"");
+    expect(userHtml).toContain("data-chat-action=\"fork\"");
+    expect(userHtml).toContain("ph-clock-counter-clockwise");
+    expect(userHtml).toContain("ph-git-fork");
+    expect(userHtml).toContain("4m ago");
+    expect(userHtml).not.toContain("data-chat-action=\"up\"");
+
+    const asstHtml = renderChatItem({
+      kind: "text",
+      runId: "run-act",
+      text: "已改好",
+      seq: 5,
+      at: now - 4 * 60_000,
+      showActions: true,
+    });
+    expect(asstHtml).toContain('data-chat-action="copy"');
+    expect(asstHtml).toContain('data-chat-action="rewind"');
+    expect(asstHtml).toContain("data-chat-action=\"fork\"");
+    expect(asstHtml).toContain("data-chat-action=\"up\"");
+    expect(asstHtml).toContain("data-chat-action=\"down\"");
+    expect(asstHtml).toContain("4m ago");
+
+    const midHtml = renderChatItem({
+      kind: "text",
+      runId: "run-act",
+      text: "先 mkdir",
+      seq: 3,
+    });
+    expect(midHtml).not.toContain("chat-msg-actions");
+
+    const liveHtml = renderChatItem({ kind: "live", text: "正在写", thinking: "" });
+    expect(liveHtml).not.toContain("chat-msg-actions");
+    expect(liveHtml).not.toContain("data-chat-action");
+  });
+
+  it("操作条只挂在已收官的一轮：中间进度句和进行中没有", () => {
+    let s = createInitialState("run-mid", "抓四个站点", false);
+    s = reduceEvents(s, [
+      { seq: 0, source: "main", ts: 1, event: { type: "assistant_text", text: "先 mkdir" } },
+      { seq: 1, source: "main", ts: 2, event: { type: "tool_call", name: "bash", toolUseId: "t1", input: { command: "mkdir raw" } } },
+      { seq: 2, source: "main", ts: 3, event: { type: "tool_result", toolUseId: "t1", result: { content: "ok" }, durationMs: 1 } },
+      { seq: 3, source: "main", ts: 4, event: { type: "assistant_text", text: "再 curl 四个站点" } },
+    ]);
+    const live = deriveChatItems(s, { text: "还在写", thinking: "" }, { showProcess: true });
+    expect(live.some((it) => it.showActions)).toBe(false);
+
+    const done = deriveChatItems({ ...s, status: "done" }, null, { showProcess: true });
+    const flagged = done.filter((it) => it.showActions);
+    expect(flagged.some((it) => it.kind === "user" && it.seq === -1)).toBe(true);
+    expect(flagged.filter((it) => it.kind === "text")).toHaveLength(1);
+    expect(flagged.find((it) => it.kind === "text")?.text).toContain("再 curl");
+    expect(done.some((it) => it.kind === "text" && String(it.text).includes("mkdir") && it.showActions)).toBe(false);
+
+    const marked = markSettledTurnActions([
+      { kind: "user", text: "问", seq: -1 },
+      { kind: "text", text: "中间句", seq: 1, role: "main" },
+      { kind: "text", text: "收官句", seq: 2, role: "main" },
+    ], false);
+    expect(marked[1].showActions).toBe(false);
+    expect(marked[2].showActions).toBe(true);
+  });
+
+  it("formatChatRelTime 对齐截图口径", () => {
+    const now = 1_000_000;
+    expect(formatChatRelTime(now - 10_000, now)).toBe("刚刚");
+    expect(formatChatRelTime(now - 4 * 60_000, now)).toBe("4m ago");
+    expect(formatChatRelTime(now - 3 * 3_600_000, now)).toBe("3h ago");
+  });
+
+  it("reducer 把信封 ts 投到 user_message / assistant_text，开场任务取较早时刻", () => {
+    const created = 1_700_000_000_000;
+    let s = createInitialState("run-at", "开场任务", false, { createdAt: created });
+    s = reduceEvents(s, [
+      { seq: 0, source: "main", ts: created + 8_000, event: { type: "assistant_text", text: "好" } },
+      { seq: 1, source: "host", ts: created + 60_000, event: { type: "user_message", text: "再改", turn: 2 } },
+    ]);
+    const asst = s.timeline.find((e) => e.type === "assistant_text");
+    const user = s.timeline.find((e) => e.type === "user_message");
+    expect(asst?.at).toBe(created + 8_000);
+    expect(user?.at).toBe(created + 60_000);
+    expect(pickTaskAt(s)).toBe(created);
+
+    const items = deriveChatItems(s, null);
+    const first = items.find((it) => it.kind === "user" && it.seq === -1);
+    const follow = items.find((it) => it.kind === "user" && it.seq === 1);
+    const reply = items.find((it) => it.kind === "text");
+    expect(first?.at).toBe(created);
+    expect(follow?.at).toBe(created + 60_000);
+    expect(reply?.at).toBe(created + 8_000);
+  });
+
+  it("复制走回调；赞踩本地切换", () => {
+    const copied = [];
+    let s = createInitialState("run-copy", "记住暗号", false, { createdAt: Date.now() - 120_000 });
+    s = reduceEvents(s, [
+      { seq: 0, source: "main", ts: Date.now() - 90_000, event: { type: "assistant_text", text: "暗号是蓝鸟" } },
+    ]);
+    s = { ...s, status: "done" };
+    renderRunDetail(s, { onCopyChat: (text) => copied.push(text) });
+    const copyBtn = document.querySelector(".chat-msg--assistant + .chat-msg-actions [data-chat-action=copy]");
+    expect(copyBtn).toBeTruthy();
+    copyBtn.click();
+    expect(copied[0]).toContain("暗号是蓝鸟");
+
+    expect(chatPlainText({ kind: "text", text: "暗号是蓝鸟" })).toBe("暗号是蓝鸟");
+    const storage = window.localStorage;
+    storage.clear();
+    expect(writeChatRating("run-copy", 0, "up", storage)).toBe("up");
+    expect(readChatRating("run-copy", 0, storage)).toBe("up");
+    expect(writeChatRating("run-copy", 0, "up", storage)).toBe("up");
+    expect(writeChatRating("run-copy", 0, "down", storage)).toBe("down");
+    expect(readChatRating("run-copy", 0, storage)).toBe("down");
+
+    const keep = buildChatFeedbackMessage("up", "暗号是蓝鸟");
+    const fix = buildChatFeedbackMessage("down", "暗号是蓝鸟");
+    expect(keep).toContain("【反馈】");
+    expect(keep).toContain("继续保持");
+    expect(keep).toContain("暗号是蓝鸟");
+    expect(fix).toContain("重新调整");
+    expect(looksLikeChatFeedback(keep)).toBe(true);
+    expect(looksLikeChatFeedback("普通追问")).toBe(false);
+    expect(renderChatItem({ kind: "user", text: keep, seq: 9, showActions: true })).toContain("反馈");
+  });
+
+  it("赞踩把反馈交给回调，同一侧再点不重发", () => {
+    const rated = [];
+    let s = createInitialState("run-rate", "做一版标题", false);
+    s = reduceEvents(s, [
+      { seq: 0, source: "main", ts: Date.now() - 90_000, event: { type: "assistant_text", text: "标题用深蓝" } },
+    ]);
+    s = { ...s, status: "done" };
+    window.localStorage.clear();
+    renderRunDetail(s, {
+      onRateChat: (runId, seq, rating, excerpt) => rated.push({ runId, seq, rating, excerpt }),
+    });
+    const up = document.querySelector("[data-chat-action=up]");
+    expect(up).toBeTruthy();
+    up.click();
+    up.click();
+    expect(rated).toHaveLength(1);
+    expect(rated[0].rating).toBe("up");
+    expect(rated[0].excerpt).toContain("标题用深蓝");
+    document.querySelector("[data-chat-action=down]").click();
+    expect(rated).toHaveLength(2);
+    expect(rated[1].rating).toBe("down");
+  });
+});
+
+describe("并行子代理收进主对话卡片", () => {
+  it("childAgentKey 认 spawn 与编排子任务，不认 main/planner", () => {
+    expect(childAgentKey("spawn/查寄存器")).toBe("spawn/查寄存器");
+    expect(childAgentKey("s1/main")).toBe("s1");
+    expect(childAgentKey("s1/verifier")).toBe("s1");
+    expect(isChildAgentSource("main")).toBe(false);
+    expect(isChildAgentSource("planner")).toBe(false);
+    expect(isChildAgentSource("s1/main")).toBe(true);
+  });
+
+  it("计划节点开工后从等待翻成工作中，收工后才是已完成", () => {
+    let s = createInitialState("run-plan-agents", "做记分卡", false);
+    s = {
+      ...s,
+      plan: {
+        subtasks: [
+          { id: "s1", title: "探查数据源", dependsOn: [], acceptance: [], description: "", pack: null },
+          { id: "s2", title: "做仪表盘", dependsOn: ["s1"], acceptance: [], description: "", pack: "design" },
+        ],
+      },
+    };
+    s = reduceEvents(s, [
+      sse(0, "s1/main", "assistant_thinking", { text: "先找表格" }),
+      sse(1, "s1/main", "tool_call", { toolUseId: "t", name: "read_file", input: { path: "a.xlsx" } }),
+    ]);
+    let agents = deriveChildAgents(s);
+    expect(agents.find((a) => a.id === "s1")?.status).toBe("running");
+    expect(agents.find((a) => a.id === "s2")).toBeUndefined();
+    const card = deriveChatItems(s).find((i) => i.kind === "agents");
+    expect(renderChatItem(card)).toContain("chat-agent--running");
+    expect(renderChatItem(card)).toContain("chat-agents--busy");
+
+    s = reduceEvents(s, [
+      sse(2, "host", "plan_result", {
+        steps: [{ id: "s1", passed: true, durationMs: 12 }],
+        skipped: [],
+        completed: true,
+      }),
+    ]);
+    agents = deriveChildAgents({ ...s, status: "done" });
+    expect(agents.find((a) => a.id === "s1")?.status).toBe("done");
+  });
+
+  it("收官或追问后编排计划和子代理收成一行，续跑谱系不重贴", () => {
+    const planEvent = sse(0, "host", "plan", {
+      concurrency: 1,
+      subtasks: [
+        { id: "s1", title: "探查", dependsOn: [], acceptance: [], description: "", pack: null },
+        { id: "s2", title: "仪表盘", dependsOn: ["s1"], acceptance: [], description: "", pack: "design" },
+      ],
+    });
+    let live = createInitialState("run-chrome", "做记分卡", false);
+    live = reduceEvents(live, [
+      planEvent,
+      sse(1, "s1/main", "assistant_thinking", { text: "先读表" }),
+    ]);
+    const liveItems = deriveChatItems(live);
+    expect(liveItems.filter((i) => i.kind === "plan")).toHaveLength(1);
+    expect(liveItems.find((i) => i.kind === "plan")?.folded).toBe(false);
+    expect(liveItems.find((i) => i.kind === "agents")?.folded).toBe(false);
+
+    let done = reduceEvents(live, [
+      sse(2, "host", "plan_result", {
+        steps: [
+          { id: "s1", passed: true, durationMs: 1 },
+          { id: "s2", passed: true, durationMs: 1 },
+        ],
+        skipped: [],
+        completed: true,
+      }),
+    ]);
+    done = { ...done, status: "done", runId: "parent-chrome" };
+    const doneItems = deriveChatItems(done);
+    expect(doneItems.filter((i) => i.kind === "plan")).toHaveLength(1);
+    expect(doneItems.find((i) => i.kind === "plan")?.folded).toBe(true);
+    expect(doneItems.find((i) => i.kind === "agents")?.folded).toBe(true);
+    const foldedHtml = renderChatItem(doneItems.find((i) => i.kind === "plan"));
+    expect(foldedHtml).toContain("chat-chrome-fold");
+    expect(foldedHtml).toContain("编排计划 · 2 步");
+    expect(foldedHtml).not.toMatch(/<details[^>]*open/);
+
+    const follow = deriveChatItems(reduceEvents(done, [
+      sse(3, "host", "user_message", { turn: 2, text: "再改配色" }),
+    ]));
+    expect(follow.filter((i) => i.kind === "plan")).toHaveLength(1);
+    expect(follow.filter((i) => i.kind === "agents")).toHaveLength(1);
+    expect(follow.find((i) => i.kind === "plan")?.folded).toBe(true);
+    expect(follow.findIndex((i) => i.kind === "plan"))
+      .toBeLessThan(follow.findIndex((i) => i.kind === "user" && i.text === "再改配色"));
+
+    let child = createInitialState("child-chrome", "做记分卡", false);
+    child = reduceEvents(child, [
+      sse(0, "host", "run_forked", { parentRunId: "parent-chrome", priorRecap: "记分卡已交付", priorTurns: 1 }),
+      sse(1, "host", "plan", {
+        concurrency: 1,
+        subtasks: [{ id: "s1", title: "探查", dependsOn: [], acceptance: [], description: "", pack: null }],
+      }),
+      sse(2, "host", "user_message", { turn: 2, text: "再改配色" }),
+    ]);
+    const thread = deriveThreadChatItems(
+      [
+        { runId: "parent-chrome", continuedFrom: null },
+        { runId: "child-chrome", continuedFrom: "parent-chrome" },
+      ],
+      new Map([["parent-chrome", done], ["child-chrome", child]]),
+      "child-chrome",
+      null,
+    );
+    expect(thread.filter((i) => i.kind === "plan")).toHaveLength(1);
+    expect(thread.filter((i) => i.kind === "agents")).toHaveLength(1);
+  });
+
+  it("同一段收官正文和产物在谱系克隆里只留一份", () => {
+    const summary = "已生成单文件自包含的 OKR 记分卡仪表盘 okr-scorecard.html。";
+    const completion = {
+      status: "completed",
+      summary,
+      artifacts: ["okr-scorecard.html"],
+      verification: ["页面可打开"],
+      assumptions: ["示例数据"],
+      blockers: [],
+    };
+    const clone = (runId) => {
+      let s = createInitialState(runId, "做一张团队 OKR 记分卡", false);
+      s = reduceEvents(s, [
+        sse(0, "main", "assistant_thinking", { text: "先写页面" }),
+        sse(1, "main", "assistant_text", { text: summary }),
+        sse(2, "main", "tool_call", { toolUseId: "w", name: "write_file", input: { path: "okr-scorecard.html" } }),
+        sse(3, "main", "tool_result", { toolUseId: "w", result: { content: "ok", isError: false } }),
+        sse(4, "main", "done", {
+          stopReason: "completed",
+          usage: { inputTokens: 1, outputTokens: 1, turns: 1, cacheHitRatio: 0 },
+          completion,
+        }),
+      ]);
+      return { ...s, status: "done", runId };
+    };
+    const parent = clone("okr-root");
+    const ghost = clone("okr-ghost");
+    const doubled = reduceEvents(parent, [
+      sse(5, "main", "assistant_text", { text: summary }),
+    ]);
+    const single = deriveChatItems({ ...doubled, status: "done" }, null, { showProcess: "on" });
+    expect(single.filter((i) => i.kind === "text")).toHaveLength(1);
+    expect(single.find((i) => i.kind === "text")?.fromCompletion).toBe(true);
+    expect(single.filter((i) => i.kind === "artifacts")).toHaveLength(1);
+
+    const thread = deriveThreadChatItems(
+      [
+        { runId: "okr-root", continuedFrom: null },
+        { runId: "okr-ghost", continuedFrom: "okr-root" },
+      ],
+      new Map([["okr-root", parent], ["okr-ghost", ghost]]),
+      "okr-ghost",
+      null,
+    );
+    expect(thread.filter((i) => i.kind === "text" && String(i.text).includes("OKR 记分卡"))).toHaveLength(1);
+    expect(thread.filter((i) => i.kind === "artifacts")).toHaveLength(1);
+    expect(thread.filter((i) => i.kind === "thinking")).toHaveLength(1);
+    expect(chatRepeatKey({ kind: "text", text: "  a\n a " })).toBe(chatRepeatKey({ kind: "text", text: "a a" }));
+    expect(collapseRepeatChatItems([
+      { kind: "text", text: summary },
+      { kind: "text", text: summary, fromCompletion: true, verification: ["页面可打开"] },
+    ]).map((i) => i.fromCompletion)).toEqual([true]);
+  });
+
+  it("直播增量认执行者（含 s1/main、spawn），不认规划者/核查者", () => {
+    expect(isLiveDeltaSource("main")).toBe(true);
+    expect(isLiveDeltaSource("rework")).toBe(true);
+    expect(isLiveDeltaSource("s1/main")).toBe(true);
+    expect(isLiveDeltaSource("spawn/查竞品")).toBe(true);
+    expect(isLiveDeltaSource("planner")).toBe(false);
+    expect(isLiveDeltaSource("verifier")).toBe(false);
+    expect(isLiveDeltaSource("s1/planner")).toBe(false);
+    expect(isLiveDeltaSource("s1/verifier")).toBe(false);
+  });
+
+  it("主对话只留子代理卡，点开才看到支线正文；子审批不进主坞", () => {
+    let s = createInitialState("run-spawn", "并行调研", false);
+    s = reduceEvents(s, [
+      sse(0, "host", "spawn_start", { title: "查竞品" }),
+      sse(1, "spawn/查竞品", "assistant_text", { text: "我先打开官网" }),
+      sse(2, "spawn/查竞品", "approval_request", {
+        toolUseId: "tu_child",
+        name: "bash",
+        input: { command: "curl example.com" },
+      }),
+      sse(3, "s2/main", "assistant_text", { text: "另一条子任务在写稿" }),
+    ]);
+    const agents = deriveChildAgents(s);
+    expect(agents.map((a) => a.id).sort()).toEqual(["s2", "spawn/查竞品"]);
+    expect(agents.find((a) => a.id === "spawn/查竞品")?.pendingApprovals).toBe(1);
+
+    const items = deriveChatItems(s, null);
+    expect(items.some((it) => it.kind === "agents")).toBe(true);
+    expect(items.some((it) => it.kind === "text" && String(it.text).includes("我先打开官网"))).toBe(false);
+    expect(items.some((it) => it.kind === "text" && String(it.text).includes("另一条子任务在写稿"))).toBe(false);
+
+    const child = deriveChatItems(s, null, { agentId: "spawn/查竞品" });
+    expect(child.some((it) => it.kind === "text" && String(it.text).includes("我先打开官网"))).toBe(true);
+
+    const action = deriveActionState(s);
+    expect(action.pendingApprovals).toEqual([]);
+    expect(action.childApprovalCount).toBe(1);
+    expect(action.needsAttention).toBe(true);
+
+    let opened = "";
+    renderRunDetail(s, {
+      activeTab: "loop",
+      onOpenAgent: (id) => { opened = id; },
+    });
+    expect(document.querySelector(".approval-cards")?.hidden).toBe(true);
+    expect(document.querySelector(".chat-agents")).toBeTruthy();
+    expect(document.querySelector(".chat-agents--busy")).toBeTruthy();
+    expect(document.querySelector(".chat-agent--running")).toBeTruthy();
+    expect(document.body.textContent).toContain("子代理");
+    expect(document.body.textContent).toContain("需批准");
+    document.querySelector("[data-agent-id='spawn/查竞品']").click();
+    expect(opened).toBe("spawn/查竞品");
+
+    renderRunDetail(s, { activeTab: "loop", selectedAgentId: "spawn/查竞品" });
+    const overlay = document.getElementById("agent-overlay");
+    expect(overlay?.hidden).toBe(false);
+    expect(overlay?.textContent).toContain("我先打开官网");
+    expect(overlay?.textContent).toContain("允许本次");
+  });
+});
+
+describe("对话回退（回到这里）", () => {
+  it("回退对话框问要不要改动也一起退", () => {
+    const html = rewindDialogHtml({
+      restorable: [{ path: "okr.html", toolUseId: "w1" }],
+      unrestorable: [],
+    });
+    expect(html).toContain("回到这里？");
+    expect(html).toContain("之后的回复不会带进新对话");
+    expect(html).toContain("要不要改动也一起退");
+    expect(html).toContain("只退对话");
+    expect(html).toContain("对话和改动一起退");
+    expect(html).toContain('data-rewind-choice="chat"');
+    expect(html).toContain('data-rewind-choice="files"');
+    expect(html).toContain("记下了 1 个文件");
+  });
+
+  it("file_rewind_snapshot 进状态，预览只数裁点之后的快照", () => {
+    let s = createInitialState("run-rw", "写两版", false);
+    s = reduceEvents(s, [
+      sse(0, "main", "assistant_text", { text: "第一轮" }),
+      sse(1, "host", "file_rewind_snapshot", {
+        toolUseId: "w1", tool: "write_file", path: "a.txt", existed: false, bytes: 0,
+      }),
+      sse(2, "main", "tool_call", { toolUseId: "w1", name: "write_file", input: { path: "a.txt" } }),
+      sse(3, "main", "assistant_text", { text: "第二轮" }),
+      sse(4, "host", "file_rewind_snapshot", {
+        toolUseId: "w2", tool: "write_file", path: "a.txt", existed: true, bytes: 4,
+      }),
+      sse(5, "main", "tool_call", { toolUseId: "w2", name: "write_file", input: { path: "a.txt" } }),
+    ]);
+    expect(s.fileRewindSnapshots).toHaveLength(2);
+    const preview = deriveRewindFilePreview(s, 0);
+    expect(preview.restorable.map((r) => r.toolUseId)).toEqual(["w1", "w2"]);
+    expect(deriveRewindFilePreview(s, 3).restorable.map((r) => r.toolUseId)).toEqual(["w2"]);
+  });
+
+  it("谱系拼聊天在回退快照处截断，不把父 run 后半段贴回来", () => {
+    let parent = createInitialState("rw-parent", "做记分卡", false);
+    parent = reduceEvents(parent, [
+      sse(0, "main", "assistant_text", { text: "先出一版" }),
+      sse(1, "host", "user_message", { turn: 2, text: "再改配色" }),
+      sse(2, "main", "assistant_text", { text: "配色改完了" }),
+    ]);
+    parent = { ...parent, status: "done", runId: "rw-parent" };
+
+    let child = createInitialState("rw-child", "做记分卡", false);
+    child = reduceEvents(child, [
+      sse(0, "main", "assistant_text", { text: "先出一版" }),
+      sse(1, "host", "conversation_rewound", { parentRunId: "rw-parent", seq: 0, revertFiles: false }),
+    ]);
+    child = { ...child, status: "done", runId: "rw-child" };
+
+    const runs = [
+      { runId: "rw-parent", continuedFrom: null },
+      { runId: "rw-child", continuedFrom: "rw-parent", rewindFrom: { parentRunId: "rw-parent", seq: 0, revertFiles: false } },
+    ];
+    expect(ancestorRunIdsForChat(runs, "rw-child")).toEqual(["rw-child"]);
+    const thread = deriveThreadChatItems(
+      runs,
+      new Map([["rw-parent", parent], ["rw-child", child]]),
+      "rw-child",
+      null,
+    );
+    expect(thread.some((i) => i.kind === "text" && i.text === "先出一版")).toBe(true);
+    expect(thread.some((i) => i.kind === "text" && i.text === "配色改完了")).toBe(false);
+    expect(thread.some((i) => i.kind === "user" && i.text === "再改配色")).toBe(false);
   });
 });

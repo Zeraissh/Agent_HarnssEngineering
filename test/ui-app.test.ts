@@ -40,10 +40,25 @@ import {
   conversationTipId,
   buildFollowUpRequest,
   buildNewRunRequest,
+  nextDesignSampleState,
+  resolveDesignSampleChoice,
+  annotateResolvedApprovals,
+  createReplayGate,
+  createApprovalSettleGate,
+  deriveActionState,
+  visiblePendingApprovals,
+  readSidebarCollapsed,
+  writeSidebarCollapsed,
+  SIDEBAR_COLLAPSED_KEY,
   deriveLoopFace,
+  deriveContextFace,
   deriveAssemblyBar,
   deriveCostFace,
   foldLiveDelta,
+  isLiveDeltaSource,
+  formatRunKicker,
+  formatMcpServersLine,
+  formatWorkspaceGitChip,
 } from "../ui/public/app.js";
 import { plannedStopReason } from "../src/orchestrate.js";
 import { STOP_REASONS } from "../src/types.js";
@@ -129,6 +144,21 @@ describe("reduceEvent", () => {
     expect(
       deriveAssemblyBar(state, null).some((i) => i.key === "durable" && i.chip?.includes("同 run")),
     ).toBe(true);
+  });
+
+  it("plan_resume 投影 kept/remaining 并默认展开", () => {
+    let state = createInitialState("r1", "半截计划", false);
+    state = reduceEvent(state, {
+      seq: 0,
+      source: "host",
+      event: { type: "plan_resume", kept: ["s1"], remaining: ["s2"], reason: "接着跑" },
+    });
+    expect(state.planResume).toEqual({ kept: ["s1"], remaining: ["s2"], reason: "接着跑" });
+    const [entry] = deriveLogEntries(state);
+    expect(entry.type).toBe("plan_resume");
+    expect(entry.collapsed).toBe(false);
+    expect(entry.kept).toEqual(["s1"]);
+    expect(entry.remaining).toEqual(["s2"]);
   });
 
   it("SAFE-06：tool_prepared/committed 投影保留 idempotencyKey（host-lags 白名单锁）", () => {
@@ -252,6 +282,122 @@ describe("reduceEvent", () => {
     expect(state2.pendingApprovals[0].reason).toBe("太危险");
   });
 
+  it("自动放行的 approval_request 不进待决坞", () => {
+    let state = createInitialState("r-auto", "auto", false);
+    state = reduceEvent(state, {
+      seq: 3,
+      source: "main",
+      event: {
+        type: "approval_request",
+        toolUseId: "tu_auto",
+        name: "bash",
+        input: { command: "echo hi" },
+        autoResolved: true,
+        decision: "allow",
+        actor: "auto-run",
+      },
+    });
+    expect(state.pendingApprovals).toHaveLength(1);
+    expect(state.pendingApprovals[0].status).toBe("allowed");
+    expect(state.pendingApprovals.filter((a) => a.status === "pending")).toHaveLength(0);
+  });
+
+  it("replay_done 之前的帧攒着，放行后一次交出", () => {
+    const gate = createReplayGate();
+    expect(gate.hold({ seq: 1 })).toBeNull();
+    expect(gate.hold({ seq: 2 })).toBeNull();
+    expect(gate.released).toBe(false);
+    expect(gate.release()).toEqual([{ seq: 1 }, { seq: 2 }]);
+    expect(gate.released).toBe(true);
+    expect(gate.hold({ seq: 3 })).toEqual([{ seq: 3 }]);
+    expect(gate.release()).toEqual([]);
+  });
+
+  it("同批 request+resolved 重放不先露出 pending", () => {
+    const queued = annotateResolvedApprovals([
+      { seq: 3, source: "main", event: { type: "approval_request", toolUseId: "tu1", name: "bash" } },
+      { seq: 4, source: "host", event: { type: "approval_resolved", toolUseId: "tu1", requestSeq: 3, decision: "allow", actor: "auto-run" } },
+    ]);
+    expect(queued[0].event.autoResolved).toBe(true);
+    const state = reduceEvents(createInitialState("r-batch", "replay", false), queued);
+    expect(state.pendingApprovals.filter((a) => a.status === "pending")).toHaveLength(0);
+    expect(state.pendingApprovals[0].status).toBe("allowed");
+  });
+
+  it("跨批 request 先到、resolved 后到：settle 窗口内不露出 pending", () => {
+    const gate = createApprovalSettleGate({ settleMs: 160 });
+    const first = gate.ingest("run-x", [
+      { seq: 3, source: "main", event: { type: "approval_request", toolUseId: "tu1", name: "bash" } },
+    ], { now: 1_000 });
+    expect(first.ready).toEqual([]);
+    expect(first.hold).toHaveLength(1);
+    expect(first.settleInMs).toBe(160);
+
+    const second = gate.ingest("run-x", [
+      { seq: 4, source: "host", event: { type: "approval_resolved", toolUseId: "tu1", requestSeq: 3, decision: "allow" } },
+    ], { now: 1_080 });
+    expect(second.hold).toEqual([]);
+    expect(second.ready[0].event.autoResolved).toBe(true);
+    const state = reduceEvents(createInitialState("r-settle", "live", false), second.ready);
+    expect(visiblePendingApprovals(state)).toEqual([]);
+    expect(deriveActionState(state).pendingApprovals).toEqual([]);
+  });
+
+  it("settle 超时后未配对的 request 才作为真审批放行", () => {
+    const gate = createApprovalSettleGate({ settleMs: 160 });
+    gate.ingest("run-x", [
+      { seq: 3, source: "main", event: { type: "approval_request", toolUseId: "tu1", name: "bash" } },
+    ], { now: 1_000 });
+    const late = gate.ingest("run-x", [], { now: 1_200 });
+    expect(late.hold).toEqual([]);
+    expect(late.ready).toHaveLength(1);
+    expect(late.ready[0].event.autoResolved).toBeUndefined();
+    const state = reduceEvents(createInitialState("r-real", "ask", false), late.ready);
+    expect(visiblePendingApprovals(state)).toHaveLength(1);
+  });
+
+  it("replay 超时遇到未配对审批就继续攒，不提前放行", () => {
+    const gate = createReplayGate();
+    gate.hold({ seq: 3, source: "main", event: { type: "approval_request", toolUseId: "tu1", name: "bash" } });
+    expect(gate.hasUnpairedApprovalRequest()).toBe(true);
+    gate.hold({ seq: 4, source: "host", event: { type: "approval_resolved", toolUseId: "tu1", requestSeq: 3, decision: "allow" } });
+    expect(gate.hasUnpairedApprovalRequest()).toBe(false);
+  });
+
+  it("已结束的 run 残留 pending 不进审批坞", () => {
+    const state = {
+      ...createInitialState("r-done", "done", false),
+      status: "done",
+      runEnd: { outcome: "completed", finishedAt: 1 },
+      pendingApprovals: [
+        { toolUseId: "tu1", name: "bash", input: { command: "ls uploads" }, status: "pending" },
+      ],
+    };
+    expect(visiblePendingApprovals(state)).toEqual([]);
+    expect(deriveActionState(state).needsAttention).toBe(false);
+    expect(deriveOverview(state).actionItems.pendingApprovals).toEqual([]);
+  });
+
+  it("planner 审批只进时间线，不进待决坞", () => {
+    const state = reduceEvents(createInitialState("r-plan", "plan", false), [{
+      seq: 3,
+      source: "planner",
+      event: { type: "approval_request", toolUseId: "tu1", name: "bash", input: { command: "ls" } },
+    }]);
+    expect(state.pendingApprovals).toEqual([]);
+    expect(state.timeline.some((e) => e.type === "approval_request")).toBe(true);
+    expect(visiblePendingApprovals(state)).toEqual([]);
+  });
+
+  it("requestSeq 对不上但 toolUseId 唯一时仍标成已决", () => {
+    const queued = annotateResolvedApprovals([
+      { seq: 3, source: "main", event: { type: "approval_request", toolUseId: "tu1", name: "bash" } },
+      { seq: 9, source: "host", event: { type: "approval_expired", toolUseId: "tu1" } },
+    ]);
+    expect(queued[0].event.autoResolved).toBe(true);
+    expect(queued[0].event.expired).toBe(true);
+  });
+
   // ---- AC3-5: verdict 三值卡模型 ----
   it("5. verdict 三值卡: issues/unverified/advisory 各自到位", () => {
     let state = createInitialState("r5", "verify task", true);
@@ -349,6 +495,25 @@ describe("reduceEvent", () => {
     expect(state.timeline[1].droppedBlocks).toBe(15);
     expect(state.timeline[1].ledgerEntries).toBe(4);
     expect(state.timeline[1].summaryApplied).toBe(true);
+  });
+
+  it("9b. model_call_start/end 投影保留 turn/attempt/status/durationMs", () => {
+    let state = createInitialState("r9b", "model span", false);
+    state = reduceEvent(state, sse("main", "model_call_start", { turn: 1, attempt: 0 }));
+    state = reduceEvent(
+      state,
+      sse("main", "model_call_end", { turn: 1, attempt: 0, status: "error", durationMs: 42 }),
+    );
+    expect(state.timeline).toHaveLength(2);
+    expect(state.timeline[0]).toMatchObject({ type: "model_call_start", turn: 1, attempt: 0 });
+    expect(state.timeline[1]).toMatchObject({
+      type: "model_call_end",
+      turn: 1,
+      attempt: 0,
+      status: "error",
+      durationMs: 42,
+    });
+    expect(isEntryCollapsedByDefault(state.timeline[1])).toBe(false);
   });
 
   // ---- 10. R-01: done 事件将 pending 审批转为 expired ----
@@ -454,14 +619,48 @@ describe("reduceEvent", () => {
   });
 
   // ---- 14. 空态文案 ----
-  it("14. 空态文案: renderEmptyState 区分空列表 vs 有记录未选中", () => {
+  it("14. 空态文案: 欢迎面去说明书，模板进 starter gallery", () => {
     const appPath = join(__dirname, "..", "ui", "public", "app.js");
     const appSrc = readFileSync(appPath, "utf-8");
 
-    expect(appSrc).toContain("从一个明确目标开始");
-    // R6 的空态是新建对话工作台：必须把工作目录这条安全边界说出来。
-    expect(appSrc).toContain("工作目录决定工具可触碰的边界");
+    expect(appSrc).toContain("empty-brand");
+    expect(appSrc).toContain('class="empty-brand">FATHOM');
+    expect(appSrc).toContain("see every run to the bottom.");
+    expect(appSrc).toContain("每一层都看得见。");
     expect(appSrc).not.toContain("尚无运行。提交一个任务开始。");
+    expect(appSrc).not.toContain("工作目录决定工具可触碰的边界");
+    expect(appSrc).not.toContain("设计模板 · 开会话时选");
+    expect(appSrc).toContain("DESIGN_STARTER_TEMPLATES");
+    expect(appSrc).toContain("renderStarterGallery");
+  });
+
+  it("14b. FATHOM 眉标：去连字符后取前 6 位大写", () => {
+    expect(formatRunKicker("bb0e1f4d-c832-494d-acb7-31526036995e")).toBe("FATHOM · RUN BB0E1F");
+    expect(formatRunKicker("run-title")).toBe("FATHOM · RUN RUNTIT");
+    expect(formatRunKicker("")).toBe("FATHOM · RUN ------");
+  });
+
+  it("14c. 文档标题与侧栏字标落地 FATHOM", () => {
+    const html = readFileSync(join(__dirname, "..", "ui", "public", "index.html"), "utf-8");
+    expect(html).toContain("<title>FATHOM 控制台</title>");
+    expect(html).toContain("<h1>FATHOM 控制台</h1>");
+    expect(html).toContain("fathom-plumb");
+    expect(html).toContain("FATHOM<span class=\"fw-dot\">.</span>");
+    expect(html).toContain("项目与对话");
+  });
+
+  it("14d. 侧栏：去掉命令面板按钮，定时任务在新建对话下，消耗进设置", () => {
+    const html = readFileSync(join(__dirname, "..", "ui", "public", "index.html"), "utf-8");
+    expect(html).not.toMatch(/id="palette-open-btn"/);
+    expect(html).not.toMatch(/id="usage-open-btn"/);
+    const newChat = html.indexOf('id="new-chat-btn"');
+    const schedules = html.indexOf('id="schedules-open-btn"');
+    const footer = html.indexOf('class="sidebar-footer"');
+    expect(newChat).toBeGreaterThan(-1);
+    expect(schedules).toBeGreaterThan(newChat);
+    expect(schedules).toBeLessThan(footer);
+    expect(html).toContain('id="settings-open-btn"');
+    expect(html).toContain('settingsApi?.open("settings-usage")');
   });
 
   // ---- 阶段三: 审批拒绝 · 时间线 — 被拒工具的 tool_result 含拒绝理由 ----
@@ -1106,6 +1305,55 @@ describe("AC6 窄屏 CSS", () => {
     expect(css).toContain("max-width: 700px");
     expect(css).toContain("narrow-hidden");
     expect(css).toContain("flex-direction: column");
+    expect(css).toContain("sidebar-collapsed");
+    expect(css).toContain("sidebar-expand");
+    expect(css).toContain("preview-expand");
+  });
+
+  it("侧栏折叠偏好读写", () => {
+    const mem = new Map();
+    const storage = {
+      getItem: (k) => (mem.has(k) ? mem.get(k) : null),
+      setItem: (k, v) => { mem.set(k, String(v)); },
+      removeItem: (k) => { mem.delete(k); },
+    };
+    expect(readSidebarCollapsed(storage)).toBe(false);
+    writeSidebarCollapsed(storage, true);
+    expect(storage.getItem(SIDEBAR_COLLAPSED_KEY)).toBe("1");
+    expect(readSidebarCollapsed(storage)).toBe(true);
+    writeSidebarCollapsed(storage, false);
+    expect(readSidebarCollapsed(storage)).toBe(false);
+  });
+
+  it("会话里打开文件一律进右侧画布，产物深链选中时不得 writeHash 清画布", () => {
+    const html = readFileSync(join(__dirname, "..", "ui", "public", "index.html"), "utf-8");
+    expect(html).toContain("rememberPreviewFile");
+    expect(html).toContain("openedPreviewArtifacts");
+    expect(html).toContain("forgetPreviewFile");
+    expect(html).toContain("closePreviewTab");
+    expect(html).toMatch(/onCloseTab:\s*\(index\)\s*=>\s*closePreviewTab/);
+    expect(html).toMatch(/getArtifacts:\s*\(\)\s*=>\s*\(selectedRunId\s*\?\s*openedPreviewArtifacts/);
+    expect(html).toContain("resolveArtifactOpen(openedPreviewArtifacts");
+    expect(html).toContain("open-web-preview");
+    expect(html).toContain("onOpenBrowser");
+    expect(html).toMatch(/onPreviewPath:\s*\(path\)\s*=>\s*openArtifactByPath/);
+    expect(html).toContain("selectRun(route.runId, { keepHash: true })");
+    const select = html.match(/function selectRun\([\s\S]*?\n\}/);
+    expect(select?.[0]).toContain("keepHash");
+    expect(select?.[0]).toMatch(/if\s*\(\s*!opts\.keepHash\s*\)/);
+    const open = html.match(/function openArtifactByPath\([\s\S]*?\n\}/);
+    expect(open?.[0]).toContain("rememberPreviewFile");
+    expect(open?.[0]).not.toContain("previewLocalPath");
+  });
+
+  it("主控制器不得重复 import 同名绑定——重复会让整页脚本解析失败", () => {
+    const html = readFileSync(join(__dirname, "..", "ui", "public", "index.html"), "utf-8");
+    const start = html.indexOf("import {");
+    const end = html.indexOf('} from "/app.js"');
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const names = [...html.slice(start, end).matchAll(/^\s+([A-Za-z0-9_]+),?\s*$/gm)].map((m) => m[1]);
+    expect(names.filter((n, i) => names.indexOf(n) !== i)).toEqual([]);
   });
 });
 
@@ -1127,7 +1375,7 @@ describe("AC7 第 12 节文案", () => {
     expect(combined).toContain("核查 Agent");
     expect(combined).toContain("允许本次");
     expect(combined).toContain("拒绝并说明");
-    expect(combined).toContain("工作目录决定工具可触碰的边界");
+    expect(combined).toContain("写入仍受工作目录边界约束");
 
     const checkboxLabel = html.match(/<span>(核查|独立核查)<\/span>/);
     expect(checkboxLabel).not.toBeNull();
@@ -1215,7 +1463,7 @@ describe("AC3 概览模型 deriveOverview (R-03)", () => {
         advisory: ["建议优化"],
       },
     };
-    // 设置一个 pending 审批
+    // 已收工还挂 pending 是幽灵卡：概览不得再当「待介入」。
     state = {
       ...state,
       pendingApprovals: [
@@ -1231,8 +1479,7 @@ describe("AC3 概览模型 deriveOverview (R-03)", () => {
     expect(overview.verdict.passed).toBe(true);
     expect(overview.verdict.summary).toBe("全部通过");
     expect(overview.verdict.unverified).toEqual(["人工确认项"]);
-    expect(overview.actionItems.pendingApprovals).toHaveLength(1);
-    expect(overview.actionItems.pendingApprovals[0].toolUseId).toBe("ap1");
+    expect(overview.actionItems.pendingApprovals).toHaveLength(0);
     expect(overview.actionItems.unverifiedItems).toEqual(["人工确认项"]);
     expect(overview.usage).not.toBeNull();
     expect(overview.usage.turns).toBe(1);
@@ -1671,8 +1918,22 @@ describe("AC6 无障碍语义 (R-05)", () => {
       planMode: true,
       multiAgent: true,
     });
+    expect(buildFollowUpRequest({
+      text: "继续",
+      workdir: "D:\\a",
+      extraWorkdirs: ["D:\\b", "D:\\a"],
+      pack: "",
+    })).toEqual({
+      text: "继续",
+      workdir: "D:\\a",
+      extraWorkdirs: ["D:\\b"],
+      pack: "",
+    });
     expect(html).toContain("syncAutoApprove");
     expect(html).toMatch(/buildFollowUpRequest\(\{[\s\S]*autoApprove:/);
+    expect(html).toContain("attachDesignEditScope");
+    expect(html).toContain("withCanvasEditScope");
+    expect(html).toMatch(/postFollowUp\(runId, withCanvasEditScope\(text\)/);
   });
 
   it("单任务与计划模式都把 ask_user 开关接进真实提交载荷", () => {
@@ -1699,6 +1960,64 @@ describe("AC6 无障碍语义 (R-05)", () => {
       concurrency: "auto",
       planGate: true,
       askUser: true,
+    });
+
+    expect(buildNewRunRequest({
+      task: "t",
+      workdir: "D:\\a",
+      extraWorkdirs: ["D:\\b", "D:\\a", "D:\\b"],
+    })).toMatchObject({
+      workdir: "D:\\a",
+      extraWorkdirs: ["D:\\b"],
+    });
+    expect(buildNewRunRequest({ task: "t" })).not.toHaveProperty("extraWorkdirs");
+  });
+
+  it("设计模式载荷：mode=design 带类型字段；--plan 优先不发 design", () => {
+    expect(buildNewRunRequest({
+      task: "做个落地页",
+      mode: "design",
+      designId: "saas-landing",
+      designTab: "Prototype",
+      pack: "ts-coding",
+    })).toMatchObject({
+      task: "做个落地页",
+      mode: "design",
+      designId: "saas-landing",
+      designTab: "Prototype",
+    });
+    expect(buildNewRunRequest({
+      task: "做个落地页",
+      mode: "design",
+      designId: "saas-landing",
+      pack: "ts-coding",
+    })).not.toHaveProperty("pack");
+    expect(buildNewRunRequest({
+      task: "跨域任务",
+      mode: "design",
+      planMode: true,
+      designId: "saas-landing",
+    })).toMatchObject({ mode: "plan", planGate: true });
+    expect(buildNewRunRequest({
+      task: "跨域任务",
+      mode: "design",
+      planMode: true,
+      designId: "saas-landing",
+    })).not.toHaveProperty("designId");
+
+    const sample = nextDesignSampleState("deck-magazine", { prompt: "" });
+    expect(resolveDesignSampleChoice("deck-magazine")?.designTemplate).toBe("deck-basic");
+    expect(buildNewRunRequest({
+      task: sample.prompt,
+      mode: "design",
+      designId: sample.selectedDesignId,
+      designTab: "Deck",
+      designTemplate: sample.selectedDesignTemplate,
+    })).toMatchObject({
+      mode: "design",
+      designId: "guizang-ppt",
+      designTab: "Deck",
+      designTemplate: "deck-basic",
     });
   });
 
@@ -1742,6 +2061,14 @@ describe("AC6 无障碍语义 (R-05)", () => {
     const blocks = css.match(/\.chat-msg--user[^{]*\{[^}]+\}/g) ?? [];
     expect(blocks.join("\n")).not.toMatch(/text-align:\s*center/);
     expect(css).toMatch(/\.chat-msg--user[^{]*\{[^}]*text-align:\s*left/);
+  });
+
+  it("带图用户气泡左侧预览不随 flex 收缩，和右侧正文并排", () => {
+    const css = readFileSync(join(__dirname, "..", "ui", "public", "styles.css"), "utf-8");
+    expect(css).toMatch(/\.chat-msg--user\.chat-msg--user-media[^{]*\{[^}]*flex-direction:\s*row/);
+    expect(css).toMatch(/\.chat-attach-previews[^{]*\{[^}]*flex:\s*0\s+0\s+46%/);
+    expect(css).toMatch(/\.chat-attach-preview[^{]*\{[^}]*flex-shrink:\s*0/);
+    expect(css).toMatch(/\.composer-compose--media[^{]*\{[^}]*flex-direction:\s*row/);
   });
 
   // 以下三条由浏览器实测的 ARIA 结构缺陷催生（AC-06 键盘/屏幕阅读器专项）
@@ -2359,6 +2686,14 @@ describe("直播条：arrived 必须取自累计计数，不是缓冲长度", ()
     expect(htmlSrc).not.toMatch(/slice\(\s*-\s*LIVE/);
   });
 
+  it("delta 通道按执行者来源接入，不再只认 main（计划模式 Thinking 才看得到）", () => {
+    expect(htmlSrc).toMatch(/import\s*\{[^}]*isLiveDeltaSource[^}]*\}\s*from\s*"\/app\.js"/s);
+    expect(htmlSrc).toContain("if (!isLiveDeltaSource(source)) return");
+    expect(htmlSrc).not.toMatch(/if\s*\(\s*source\s*!==\s*["']main["']\s*\)\s*return/);
+    expect(isLiveDeltaSource("s1/main")).toBe(true);
+    expect(isLiveDeltaSource("planner")).toBe(false);
+  });
+
   it("delta 通道的 reset 帧确实进了折叠队列（断流重试的清缓冲信号）", () => {
     // 服务端在 api_retry / model_fallback 前广播 kind:"reset"（ui-server 测试锁），
     // 壳这里若把它当坏帧丢掉，直播条照样鬼畜重复——这层接线也要锁住
@@ -2484,6 +2819,8 @@ describe("附件清单可删除（壳侧接线）", () => {
     expect(htmlSrc).toContain("data-upload-remove");
     expect(htmlSrc).toContain('aria-label="删除附件');
     expect(htmlSrc).toContain("ph-x");
+    expect(htmlSrc).toContain('id="composer-media"');
+    expect(htmlSrc).toContain("composer-compose--media");
   });
 
   it("删除做三件事：清单移除、输入框「附件：」行删掉、objectURL revoke", () => {
@@ -2539,7 +2876,8 @@ describe("发送快捷键：Enter 发送（壳侧接线）", () => {
     expect(htmlSrc).toContain("Enter 发送，Shift+Enter 换行");
     expect(htmlSrc).not.toContain("Ctrl+Enter 发送");
     expect(appSrc).not.toContain("Ctrl+Enter 发送");
-    expect(appSrc.match(/Enter 发送，Shift\+Enter 换行/g)?.length).toBeGreaterThanOrEqual(5);
+    expect(appSrc).toContain('COMPOSER_SEND_HINT = "Enter 发送，Shift+Enter 换行"');
+    expect(appSrc.match(/接着说…/g)?.length).toBeGreaterThanOrEqual(4);
     expect(paletteSrc).not.toContain("Ctrl / ⌘ + Enter");
     expect(paletteSrc).toMatch(/keys: "Enter", desc: "发送任务 \/ 追加指令/);
   });
@@ -2638,5 +2976,121 @@ describe("MODEL-01a 端点降级", () => {
     expect(state.runConfig.fallbackScope).toBe("roles");
     expect(state.runConfig.fallbackRouting).toBe("prefer_healthy");
     expect(state.runConfig.compatSource).toBe("probe");
+  });
+
+  it("run_config 投影 endpointHealth / supportsVision（MODEL-01 残余）", () => {
+    let state = createInitialState("r1", "t", false);
+    state = reduceEvent(state, sse("host", "run_config", {
+      endpointHealth: [
+        { model: "deepseek-v4-pro", healthy: true, circuit: "closed", latencyMs: 42 },
+        { model: "backup", healthy: false, circuit: "open", reason: "upstream:503" },
+      ],
+      supportsVision: false,
+    }));
+    expect(state.runConfig.endpointHealth).toEqual([
+      { model: "deepseek-v4-pro", healthy: true, circuit: "closed", latencyMs: 42 },
+      { model: "backup", healthy: false, circuit: "open", reason: "upstream:503" },
+    ]);
+    expect(state.runConfig.supportsVision).toBe(false);
+  });
+
+  it("run_config 投影 hooks：未配是 null，配了才有 timeout 与事件名单", () => {
+    let state = createInitialState("rh1", "t", false);
+    state = reduceEvent(state, sse("host", "run_config", { pack: null }));
+    expect(state.runConfig.hooks).toBeNull();
+
+    state = reduceEvent(state, sse("host", "run_config", {
+      hooks: { timeoutMs: 5000, events: ["PreToolUse", "PostToolUse", "Stop"] },
+    }));
+    expect(state.runConfig.hooks).toEqual({
+      timeoutMs: 5000,
+      events: ["PreToolUse", "PostToolUse", "Stop"],
+    });
+
+    state = reduceEvent(state, sse("main", "hook", {
+      hook: "PreToolUse",
+      outcome: "block",
+      tool: "bash",
+      detail: "no network",
+    }));
+    const face = deriveLoopFace(state, null);
+    expect(face.hooks).toEqual({ timeoutMs: 5000, events: ["PreToolUse", "PostToolUse", "Stop"] });
+    expect(face.hookEvents).toHaveLength(1);
+    expect(face.hookEvents[0].outcome).toBe("block");
+  });
+
+  it("run_config 投影 agentMd：未加载是 null，加载了必须带 guidance 与文件名单", () => {
+    let state = createInitialState("rmd1", "t", false);
+    state = reduceEvent(state, sse("host", "run_config", { pack: null }));
+    expect(state.runConfig.agentMd).toBeNull();
+
+    state = reduceEvent(state, sse("host", "run_config", {
+      agentMd: {
+        files: [{ path: "D:/proj/AGENT.md", layer: "project", chars: 42, truncated: false }],
+        chars: 42,
+        truncated: false,
+        maxChars: 16000,
+        guidance: true,
+      },
+    }));
+    expect(state.runConfig.agentMd).toEqual({
+      files: [{ path: "D:/proj/AGENT.md", layer: "project", chars: 42, truncated: false }],
+      chars: 42,
+      truncated: false,
+      maxChars: 16000,
+      guidance: true,
+    });
+    const face = deriveContextFace(state, null);
+    expect(face.agentMd.guidance).toBe(true);
+    expect(face.agentMd.files).toHaveLength(1);
+  });
+
+  it("run_config 投影 workspaceGit：无仓库不占装配条，有仓库带 owner/repo 且不写 URL", () => {
+    let state = createInitialState("rgit1", "t", false);
+    state = reduceEvent(state, sse("host", "run_config", { pack: null }));
+    expect(state.runConfig.workspaceGit).toBeNull();
+    expect(deriveAssemblyBar(state, null).some((i) => i.key === "git")).toBe(false);
+
+    state = reduceEvent(state, sse("host", "run_config", {
+      workspaceGit: {
+        present: true,
+        branch: "main",
+        dirty: true,
+        github: { owner: "acme", repo: "app" },
+        remoteUrl: "https://user:ghp_secret@github.com/acme/app.git",
+        branches: ["main", "feat"],
+      },
+    }));
+    expect(state.runConfig.workspaceGit).toEqual({
+      present: true,
+      root: undefined,
+      branch: "main",
+      detached: false,
+      dirty: true,
+      github: { owner: "acme", repo: "app" },
+      branches: ["main", "feat"],
+    });
+    expect(JSON.stringify(state.runConfig.workspaceGit)).not.toContain("ghp_secret");
+    expect(formatWorkspaceGitChip(state.runConfig.workspaceGit, { withRepo: true }))
+      .toBe("main * · acme/app");
+    expect(deriveAssemblyBar(state, null).find((i) => i.key === "git")?.chip)
+      .toBe("main * · acme/app");
+  });
+});
+
+describe("formatMcpServersLine", () => {
+  it("跳过缺 token 的 server 照实写原因，不说成未连接", () => {
+    expect(formatMcpServersLine({
+      configured: true,
+      servers: [{ name: "github", status: "skipped", reason: "missing GITHUB_PERSONAL_ACCESS_TOKEN" }],
+    })).toBe("github（skipped：missing GITHUB_PERSONAL_ACCESS_TOKEN）");
+  });
+
+  it("已连接带工具数；空列表才说未连接", () => {
+    expect(formatMcpServersLine({
+      configured: true,
+      servers: [{ name: "stm32", status: "connected", toolCount: 12 }],
+    })).toBe("stm32（connected，12 工具）");
+    expect(formatMcpServersLine({ configured: true, servers: [] })).toBe("已配置但未连接");
   });
 });

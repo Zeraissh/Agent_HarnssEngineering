@@ -214,11 +214,20 @@ function createLogTail(maxLines = 40, maxLineLength = 400) {
   };
 }
 
+/**
+ * MEM-02/03：与 src/memory.ts `resolveMemoryDir` 同一合同。
+ * Electron 启动器本身不写记忆，但若要解析目录必须走同一公式，避免宿主漂移。
+ */
+function resolveMemoryDir(workdir, env = process.env) {
+  return env.AGENT_MEMORY_DIR ?? path.join(workdir, '.agent-memory');
+}
+
 module.exports = {
   parseDotEnv,
   mergeEnv,
   loadDotEnv,
   resolveHostEntry,
+  resolveMemoryDir,
   pickFreePort,
   probeHealthy,
   waitForHealthy,

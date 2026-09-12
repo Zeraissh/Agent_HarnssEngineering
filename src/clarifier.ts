@@ -7,6 +7,8 @@
  */
 import { AgentLoop, createRunBudget } from "./loop.js";
 import { withoutTaskCompletion } from "./task-completion.js";
+import { withoutAgentMd } from "./agent-md.js";
+import { withoutExternalHooks } from "./hooks.js";
 import { ASK_USER_TOOL_NAME } from "./tools/ask-user.js";
 import type {
   AgentConfig,
@@ -117,6 +119,8 @@ ${task}
 
 若存在这些未知，调用 ${ASK_USER_TOOL_NAME}，把本轮所有正交问题一次提交；拿到答复后调用 ${REQUIREMENTS_TOOL_NAME}。
 若不存在，不要为了显得谨慎而提问，直接调用 ${REQUIREMENTS_TOOL_NAME} 原样提交任务。
+同工作目录里其它会话、其它文件夹、记忆条目不是本任务的候选解释；不得把它们列进 ask_user 选项。
+相对指代（继续 / 未完成）只指向 <original_task> 已写明的对象，不要改成「选一个未完成项目」。
 不得用普通文本收尾。`;
 }
 
@@ -141,7 +145,7 @@ export async function runClarificationGate(
   }
 
   const maxTurns = opts.maxTurns ?? DEFAULT_CLARIFIER_MAX_TURNS;
-  const base = withoutTaskCompletion(cfg);
+  const base = withoutAgentMd(withoutExternalHooks(withoutTaskCompletion(cfg)));
   const gateCfg: AgentConfig = {
     ...base,
     systemPrompt:
