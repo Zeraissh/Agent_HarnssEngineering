@@ -116,10 +116,8 @@ describe("CLI durable", () => {
         preparedAt: Date.now(),
         updatedAt: Date.now(),
       });
-      // writer 链是异步的——稍等
-      await new Promise((r) => setTimeout(r, 50));
       handle.markCompleted();
-      await new Promise((r) => setTimeout(r, 50));
+      await handle.writer.flush();
       const raw = await readFile(path.join(root, "cli-test-1", "state.json"), "utf8");
       const state = JSON.parse(raw) as { phase: string; toolTx: unknown[] };
       expect(state.toolTx.length).toBe(1);
