@@ -6,7 +6,7 @@
  */
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
-import PptxGenJS from "pptxgenjs";
+import pptxgen from "pptxgenjs";
 import type { Tool } from "../types.js";
 import { resolveInWorkdir, WORKDIR_OR_ROOT_PATH } from "./fs-util.js";
 
@@ -113,7 +113,19 @@ export const writePptxTool: Tool = {
     await mkdir(path.dirname(resolved), { recursive: true });
     const revalidated = resolveInWorkdir(ctx.workdir, rel, ctx.writeRoots);
 
-    const pres = new PptxGenJS();
+    const Ctor = pptxgen as unknown as {
+      new (): {
+        layout: string;
+        author: string;
+        title: string;
+        addSlide: () => {
+          addText: (text: string, opts: Record<string, unknown>) => void;
+          addNotes: (notes: string) => void;
+        };
+        write: (opts: { outputType: "nodebuffer" }) => Promise<string | ArrayBuffer | Blob | Uint8Array>;
+      };
+    };
+    const pres = new Ctor();
     pres.layout = "LAYOUT_WIDE";
     pres.author = "agent-harness";
     pres.title = parsed[0]!.title;

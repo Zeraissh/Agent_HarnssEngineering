@@ -25,7 +25,9 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci --ignore-scripts
-      - run: npm audit
+      # high 必须 0。余下 moderate 是 vitest 3.x 的 mocker 咨询（GHSA-82fw-gwwq-j7x9），
+      # 3.x 无补丁、--force 会装 vitest 5；本仓库 CI 跑 vitest run，不暴露 mocker WebSocket。
+      - run: npm audit --audit-level=high
       - run: npm run typecheck
       - run: npm run test:coverage
       - name: TEST-01 changed-line coverage
@@ -115,7 +117,8 @@ jobs:
           cache: npm
           cache-dependency-path: cross-app/package-lock.json
       - run: npm ci --ignore-scripts
-      - run: npm audit
+      # high 必须 0。余下 moderate 是 vitest 4.1.10 mocker（GHSA-82fw）；3.x/4.1.10 无补丁。
+      - run: npm audit --audit-level=high
       - run: npm test
       - run: npm run build
       # host:stage 会编译仓库根宿主；job 彼此隔离，不能借用 core 的 node_modules。

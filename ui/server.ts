@@ -4379,7 +4379,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       if (!(EFFORT_LEVELS as readonly string[]).includes(String(parsed.effort))) {
         return { ok: false, error: `effort "${parsed.effort}" 无效。可选：${EFFORT_LEVELS.join(" | ")}` };
       }
-      target.effort = String(parsed.effort);
+      target.effort = String(parsed.effort) as Effort;
     }
     if (typeof parsed.rubric === "string") {
       const trimmed = parsed.rubric.trim();
@@ -5538,7 +5538,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         pack: run.packName ?? pack?.name ?? null,
         model: process.env.AGENT_MODEL ?? null,
         effort: run.effort ?? null,
-        mode: run.mode ?? "single",
+        mode: run.mode === "plan" ? "plan" : "single",
         verify: run.verify,
         rubric: run.rubric ?? null,
         stopReason: endInfo.mainStopReason ?? null,
@@ -5766,7 +5766,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     fromModel: string | null;
     toModel: string;
   } {
-    const roleId = modelStoreState.store.roles.executor;
+    const roleId = modelStoreState.store.roles.executor ?? "";
     const identityKey = endpointIdentityKey(executorIdentity);
     const changed = shouldTreatAsExecutorSwitch(
       { roleId: run.lastExecutorRoleId, identityKey: run.lastExecutorIdentityKey },
@@ -5776,7 +5776,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   }
 
   function rememberExecutorFingerprint(run: StoredRun): void {
-    run.lastExecutorRoleId = modelStoreState.store.roles.executor;
+    const roleId = modelStoreState.store.roles.executor;
+    if (roleId) run.lastExecutorRoleId = roleId;
     run.lastExecutorIdentityKey = endpointIdentityKey(executorIdentity);
     run.lastExecutorModel = executorModelName;
   }

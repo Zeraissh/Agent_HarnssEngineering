@@ -233,7 +233,8 @@ describe("额外只读根（readRoots，案例 #5 催生）", () => {
 
 describe("write_file + read_file", () => {
   it("路径字段允许绝对路径落在额外根里，避免模型改走 bash", () => {
-    expect(String(writeFileTool.inputSchema.properties?.path?.description ?? "")).toMatch(/absolute path/i);
+    const pathSchema = (writeFileTool.inputSchema as { properties?: { path?: { description?: string } } }).properties?.path;
+    expect(String(pathSchema?.description ?? "")).toMatch(/absolute path/i);
     expect(String(writeFileTool.description)).toMatch(/writable root/i);
   });
 

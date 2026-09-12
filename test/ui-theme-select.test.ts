@@ -23,25 +23,25 @@ describe("initThemeSelect", () => {
         <option value="">不用</option>
         <option value="kicad">kicad</option>
       </select>`;
-    const select = document.querySelector("#pack");
-    const changed = [];
+    const select = document.querySelector("#pack") as HTMLSelectElement;
+    const changed: string[] = [];
     select.addEventListener("change", () => changed.push(select.value));
     initThemeSelect(select);
     expect(select.classList.contains("sr-only")).toBe(true);
     expect(select.getAttribute("aria-hidden")).toBe("true");
-    const trigger = document.querySelector(".theme-select-trigger");
-    expect(trigger?.getAttribute("aria-labelledby")).toBe("pack-lab");
-    expect(trigger?.hasAttribute("aria-controls")).toBe(false);
-    expect(trigger?.textContent).toContain("不用");
+    const trigger = document.querySelector(".theme-select-trigger") as HTMLButtonElement;
+    expect(trigger.getAttribute("aria-labelledby")).toBe("pack-lab");
+    expect(trigger.hasAttribute("aria-controls")).toBe(false);
+    expect(trigger.textContent).toContain("不用");
     trigger.click();
     expect(trigger.getAttribute("aria-controls")).toBe("pack-menu");
     const opt = [...document.querySelectorAll(".theme-select-option")]
       .find((el) => el.textContent === "kicad");
     expect(opt, "菜单里要有 kicad").toBeTruthy();
-    opt.click();
+    (opt as HTMLElement).click();
     expect(select.value).toBe("kicad");
     expect(changed).toEqual(["kicad"]);
-    expect(document.querySelector(".theme-select-menu")?.hidden).toBe(true);
+    expect((document.querySelector(".theme-select-menu") as HTMLElement).hidden).toBe(true);
     expect(trigger.textContent).toContain("kicad");
   });
 
@@ -68,11 +68,11 @@ describe("防再犯：可见下拉必须自绘", () => {
     expect(css).toMatch(/\.theme-select-menu\s*\{[^}]*background:\s*var\(--surface-0\)/);
     expect(css).toMatch(/\.theme-select-menu\s*\{[^}]*color:\s*var\(--text-1\)/);
     expect(css).toMatch(/\.theme-select-option\s*\{[^}]*color:\s*var\(--text-1\)/);
-    const painted = [];
+    const painted: string[] = [];
     for (const m of css.matchAll(/([^{}@][^{}]*)\{([^}]*)\}/g)) {
-      const sel = m[1].replace(/\s+/g, " ").trim();
+      const sel = (m[1] ?? "").replace(/\s+/g, " ").trim();
       if (!/(^|[\s,])select([\s,:]|$)/.test(sel)) continue;
-      if (/color:\s*var\(--(?:text|fg)/.test(m[2])) painted.push(sel);
+      if (/color:\s*var\(--(?:text|fg)/.test(m[2] ?? "")) painted.push(sel);
     }
     expect(painted, `原生 select 上了主题色，Windows 弹出层会白底浅字：${painted.join(" | ")}`).toEqual([]);
   });

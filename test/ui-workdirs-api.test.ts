@@ -312,7 +312,7 @@ describe("DELETE /api/workdirs", () => {
       await new Promise((r) => setTimeout(r, 20));
     }
     expect(releaseTool).toEqual(expect.any(Function));
-    releaseTool();
+    (releaseTool as unknown as () => void)();
     await waitForStatus(base, runId, "done");
     const ok = await deleteWorkdir(base, { path: resolve(target) });
     expect(ok.status).toBe(200);

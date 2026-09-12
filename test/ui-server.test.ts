@@ -354,21 +354,21 @@ function askTool(name: string): Tool {
 
 describe("annotateApprovalReplay", () => {
   it("已决审批在重放的 request 帧上就带 autoResolved，不改原缓冲", () => {
-    const events = [
+    const events: { seq: number; source: string; ts: number; event: Record<string, unknown> }[] = [
       { seq: 1, source: "main", ts: 1, event: { type: "approval_request", toolUseId: "tu", name: "bash" } },
       { seq: 2, source: "host", ts: 2, event: { type: "approval_resolved", toolUseId: "tu", requestSeq: 1, decision: "allow", actor: "auto-run" } },
     ];
     const out = annotateApprovalReplay(events);
-    expect(out[0].event.autoResolved).toBe(true);
-    expect(out[0].event.decision).toBe("allow");
-    expect(events[0].event.autoResolved).toBeUndefined();
+    expect(out[0]!.event.autoResolved).toBe(true);
+    expect(out[0]!.event.decision).toBe("allow");
+    expect(events[0]!.event.autoResolved).toBeUndefined();
   });
 
   it("还没人决定的 request 保持原样", () => {
-    const events = [
+    const events: { seq: number; source: string; ts: number; event: Record<string, unknown> }[] = [
       { seq: 1, source: "main", ts: 1, event: { type: "approval_request", toolUseId: "tu", name: "bash" } },
     ];
-    expect(annotateApprovalReplay(events)[0].event.autoResolved).toBeUndefined();
+    expect(annotateApprovalReplay(events)[0]!.event.autoResolved).toBeUndefined();
   });
 });
 

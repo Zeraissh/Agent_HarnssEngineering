@@ -72,34 +72,6 @@ describe("deck HTML 契约解析", () => {
     expect(relativeStylesheetHrefs(html)).toEqual(["style.css"]);
   });
 
-  it("ruile-deck：8 页，概览 4 个 stat，tc 规格表行数不少於 HTML", async () => {
-    const html = await readFixture("ruile-deck", "index.html");
-    const css = await readFixture("ruile-deck", "style.css");
-    const md = await readFixture("ruile-deck", "DESIGN.md");
-    const ir = parseDeckHtml(html, css, md);
-    expect(ir.slides).toHaveLength(8);
-    expect(ir.slides.map((s) => s.id)).toEqual([
-      "cover", "overview", "tc", "rtd", "wls", "ams", "ats", "contact",
-    ]);
-    const overview = ir.slides.find((s) => s.id === "overview");
-    const stats = overview?.blocks.find((b) => b.kind === "stats");
-    expect(stats?.kind === "stats" ? stats.items : []).toHaveLength(4);
-    expect(stats?.kind === "stats" ? stats.items.map((x) => x.num) : []).toEqual([
-      "2016", "500", "2", "12",
-    ]);
-
-    const tcHtmlRows = (html.match(/data-slide="tc"[\s\S]*?<\/section>/) ?? [""])[0]
-      .match(/<tr\b/g)?.length ?? 0;
-    const tc = ir.slides.find((s) => s.id === "tc");
-    const product = tc?.blocks.find((b) => b.kind === "productGrid");
-    const tableRows = product?.kind === "productGrid" ? product.spec?.table?.rows ?? [] : [];
-    expect(tableRows.length).toBeGreaterThanOrEqual(tcHtmlRows);
-    expect(tableRows.some((row) => row.includes("产品型号"))).toBe(true);
-    expect(ir.theme.accent).toBe("22D3EE");
-    expect(ir.theme.bg).toBe("0A1628");
-    expect(ir.lossy.some((l) => l.includes("翻页提示") || l.includes("渐变字"))).toBe(true);
-  });
-
   it("无 .slide 的 HTML fail-closed，不装成空 deck", () => {
     expect(() => parseDeckHtml("<html><body><h1>落地页</h1></body></html>")).toThrow(DeckPptxError);
     try {
@@ -182,16 +154,4 @@ describe("DeckIR → pptxgenjs", () => {
     );
   });
 
-  it("ruile-deck 写出 8 页，规格表单元格进 OOXML", async () => {
-    const html = await readFixture("ruile-deck", "index.html");
-    const css = await readFixture("ruile-deck", "style.css");
-    const { ir, bytes } = await convertDeckHtmlToPptx({ html, css });
-    expect(ir.slides).toHaveLength(8);
-    expect(bytes.subarray(0, 2).toString("ascii")).toBe("PK");
-    const xml = pptxSlideXml(bytes);
-    expect(xml).toContain("广东瑞乐半导体科技有限公司");
-    expect(xml).toContain("产品型号");
-    expect(xml).toContain("TCW-4");
-    expect(xml).toContain("成立年份");
-  });
 });

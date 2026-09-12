@@ -363,13 +363,14 @@ describe("瞬时 API 错误的同轮重试", () => {
   it("中止在飞 send：先发 model_call_end(error) 再 aborted", async () => {
     const ac = new AbortController();
     const model: ModelClient = {
-      send: async (_req, _onDelta, signal) => {
+      send: async (_req, _onDelta, signal): Promise<ModelTurn> => {
         queueMicrotask(() => ac.abort());
         await new Promise<never>((_resolve, reject) => {
           signal?.addEventListener("abort", () => {
             reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
           });
         });
+        throw new Error("unreachable");
       },
     };
     const loop = new AgentLoop({ ...baseConfig, tools: [] }, model);
