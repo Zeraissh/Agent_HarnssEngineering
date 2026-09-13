@@ -513,7 +513,7 @@ describe("POST /api/design-drafts-workdir", () => {
     await expect(stat(draftsDir)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it("当前是宿主仓库 → 建目录、加入白名单、建议切过去", async () => {
+  it("当前是宿主仓库 → 建目录、加入白名单、不切走", async () => {
     const root = await mkdtemp(join(tmpdir(), "design-drafts-host-"));
     tempDirs.push(root);
     const hostWorkdir = join(root, "Agent_Design");
@@ -525,7 +525,7 @@ describe("POST /api/design-drafts-workdir", () => {
     const res = await postDesignDrafts(base, { currentWorkdir: hostWorkdir });
     expect(res.status).toBe(200);
     const body = await res.json() as any;
-    expect(body.select).toBe(true);
+    expect(body.select).toBe(false);
     expect(body.reason).toBe("host-repo");
     expect(body.added).toBe(true);
     expect(body.workdir).toBe(resolve(draftsDir));

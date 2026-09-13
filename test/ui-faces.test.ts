@@ -19,6 +19,7 @@ import {
   deriveLogEntries,
   buildFactorCards,
   derivePlanFace,
+  renderPlanReviewHtml,
   deriveAssemblyBar,
   deriveSpinState,
   deriveCostWarning,
@@ -716,6 +717,38 @@ describe("derivePlanFace", () => {
     let s = createInitialState("r", "t", true);
     s = reduceEvents(s, [planEvent(SUBS)]);
     expect(derivePlanFace(s)!.nodes.find((n: any) => n.id === "s2").resources).toEqual(["swd-probe"]);
+  });
+
+  it("签字位正文随 plan 事件透出，不在 reducer 白名单里被静默丢掉", () => {
+    seq = 0;
+    let s = createInitialState("r", "t", true);
+    s = reduceEvents(s, [planEvent([
+      {
+        id: "s1", title: "查资料", pack: null,
+        description: "先读现有实现再改",
+        acceptance: ["字节一致"],
+        dependsOn: [], resources: [],
+      },
+    ])]);
+    const n = derivePlanFace(s)!.nodes.find((x: any) => x.id === "s1");
+    expect(n.description).toBe("先读现有实现再改");
+    expect(n.acceptance).toEqual(["字节一致"]);
+    expect(n.dependsOn).toEqual([]);
+  });
+
+  it("确认门渲染摊开验收，不把正文藏进 details", () => {
+    const html = renderPlanReviewHtml({
+      layers: [[{
+        id: "s1", title: "一", description: "做 A",
+        acceptance: ["A 过"], dependsOn: [], status: "pending",
+      }]],
+      maxDuration: 1,
+    }, { revealAcceptance: true });
+    expect(html).toContain("plan-node-brief");
+    expect(html).toContain("做 A");
+    expect(html).toContain("A 过");
+    expect(html).toContain("plan-node-checks");
+    expect(html).not.toContain("<details");
   });
 
   it("planner 出不了可解析计划时标 planned=false（fail-closed，未执行任何子任务）", () => {

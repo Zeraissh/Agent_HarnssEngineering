@@ -59,6 +59,11 @@ import {
   formatRunKicker,
   formatMcpServersLine,
   formatWorkspaceGitChip,
+  formatGateChip,
+  deriveCitedChat,
+  composerCiteTrigger,
+  filterCiteCandidates,
+  sameWorkdirCiteRuns,
 } from "../ui/public/app.js";
 import { plannedStopReason } from "../src/orchestrate.js";
 import { STOP_REASONS } from "../src/types.js";
@@ -646,20 +651,30 @@ describe("reduceEvent", () => {
     expect(html).toContain("<h1>FATHOM 控制台</h1>");
     expect(html).toContain("fathom-plumb");
     expect(html).toContain("FATHOM<span class=\"fw-dot\">.</span>");
-    expect(html).toContain("项目与对话");
+    expect(html).toContain('id="workspace-face"');
+    expect(html).toContain('data-workspace-face="office"');
+    expect(html).toContain('data-workspace-face="code"');
+    expect(html).not.toContain("项目与对话");
   });
 
-  it("14d. 侧栏：去掉命令面板按钮，定时任务在新建对话下，消耗进设置", () => {
+  it("14d. 侧栏：新建在列表之上，工具按钮都在底栏，没有满宽指挥/定时标签钮", () => {
     const html = readFileSync(join(__dirname, "..", "ui", "public", "index.html"), "utf-8");
     expect(html).not.toMatch(/id="palette-open-btn"/);
     expect(html).not.toMatch(/id="usage-open-btn"/);
     const newChat = html.indexOf('id="new-chat-btn"');
+    const runList = html.indexOf('id="run-list"');
+    const footer = html.indexOf('sidebar-footer');
+    const board = html.indexOf('id="board-open-btn"');
     const schedules = html.indexOf('id="schedules-open-btn"');
-    const footer = html.indexOf('class="sidebar-footer"');
+    const settings = html.indexOf('id="settings-open-btn"');
     expect(newChat).toBeGreaterThan(-1);
-    expect(schedules).toBeGreaterThan(newChat);
-    expect(schedules).toBeLessThan(footer);
-    expect(html).toContain('id="settings-open-btn"');
+    expect(newChat).toBeLessThan(runList);
+    expect(footer).toBeGreaterThan(runList);
+    expect(board).toBeGreaterThan(footer);
+    expect(schedules).toBeGreaterThan(footer);
+    expect(settings).toBeGreaterThan(footer);
+    expect(html).not.toContain("<span>指挥中心</span>");
+    expect(html).not.toContain("<span>定时任务</span>");
     expect(html).toContain('settingsApi?.open("settings-usage")');
   });
 
@@ -1931,6 +1946,11 @@ describe("AC6 无障碍语义 (R-05)", () => {
     });
     expect(html).toContain("syncAutoApprove");
     expect(html).toMatch(/buildFollowUpRequest\(\{[\s\S]*autoApprove:/);
+    const followPayloadAt = html.indexOf("buildFollowUpRequest({", html.indexOf("async function postFollowUp"));
+    const followPayload = html.slice(followPayloadAt, html.indexOf("})", followPayloadAt));
+    expect(followPayload).toContain("autoApprove:");
+    expect(followPayload).not.toContain("planMode:");
+    expect(followPayload).not.toContain("multiAgent:");
     expect(html).toContain("attachDesignEditScope");
     expect(html).toContain("withCanvasEditScope");
     expect(html).toMatch(/postFollowUp\(runId, withCanvasEditScope\(text\)/);
@@ -1983,9 +2003,14 @@ describe("AC6 无障碍语义 (R-05)", () => {
     })).toMatchObject({
       task: "做个落地页",
       mode: "design",
+      workspace: "office",
       designId: "saas-landing",
       designTab: "Prototype",
     });
+    expect(buildNewRunRequest({ task: "修一处", workspace: "office" })).toMatchObject({
+      workspace: "office",
+    });
+    expect(buildNewRunRequest({ task: "修一处" })).toMatchObject({ workspace: "code" });
     expect(buildNewRunRequest({
       task: "做个落地页",
       mode: "design",
@@ -3092,5 +3117,61 @@ describe("formatMcpServersLine", () => {
       servers: [{ name: "stm32", status: "connected", toolCount: 12 }],
     })).toBe("stm32（connected，12 工具）");
     expect(formatMcpServersLine({ configured: true, servers: [] })).toBe("已配置但未连接");
+  });
+});
+
+describe("formatGateChip", () => {
+  it("status 为 null 时隐藏，不占文案", () => {
+    expect(formatGateChip(null)).toEqual({ hidden: true, label: "" });
+    expect(formatGateChip(undefined)).toEqual({ hidden: true, label: "" });
+    expect(formatGateChip({ summary: "在飞", nextGate: "", waiting: [] })).toEqual({ hidden: true, label: "" });
+  });
+
+  it("下一门 + 等候人数", () => {
+    expect(formatGateChip({
+      summary: "规格待签字",
+      nextGate: "评审会",
+      waiting: ["委托方：规格签字"],
+    })).toEqual({ hidden: false, label: "下一门：评审会 · 1 人在等" });
+  });
+});
+
+describe("点名引用（composer + derive）", () => {
+  it("composerCiteTrigger 只认末尾 @查询", () => {
+    expect(composerCiteTrigger("写一份规格")).toBeNull();
+    expect(composerCiteTrigger("参考 @规格")).toEqual({ query: "规格", start: 3 });
+    expect(composerCiteTrigger("@")).toEqual({ query: "", start: 0 });
+  });
+
+  it("sameWorkdirCiteRuns 只用当前目录的可见会话", () => {
+    const runs = [
+      { runId: "a", workdir: "D:/proj", task: "规格", continuedFrom: null },
+      { runId: "b", workdir: "D:/other", task: "邻居", continuedFrom: null },
+      { runId: "a2", workdir: "D:/proj", task: "续", continuedFrom: "a" },
+    ];
+    expect(sameWorkdirCiteRuns(runs, "D:/proj").map((r) => r.runId)).toEqual(["a2"]);
+  });
+
+  it("filterCiteCandidates 按标题/任务过滤", () => {
+    const list = [
+      { runId: "1", title: "规格草案", task: "写 PRD" },
+      { runId: "2", title: "幻灯", task: "做 deck" },
+    ];
+    expect(filterCiteCandidates(list, "prd").map((c) => c.runId)).toEqual(["1"]);
+  });
+
+  it("deriveCitedChat 空引用是 null", () => {
+    expect(deriveCitedChat(null)).toBeNull();
+    expect(deriveCitedChat([])).toBeNull();
+    expect(deriveCitedChat([{ runId: "r1", title: "规格", artifacts: ["DESIGN.md"] }])).toEqual({
+      kind: "cite",
+      refs: [{ runId: "r1", title: "规格", artifacts: ["DESIGN.md"] }],
+    });
+  });
+
+  it("buildNewRunRequest 带 citedRunIds", () => {
+    expect(buildNewRunRequest({ task: "接着那份规格", citedRunIds: ["r1", "r1", ""] }).citedRunIds)
+      .toEqual(["r1"]);
+    expect(buildNewRunRequest({ task: "新开" }).citedRunIds).toBeUndefined();
   });
 });

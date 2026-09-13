@@ -57,6 +57,9 @@ import {
   isDesignSamplePrompt,
   DESIGN_LOOKS,
   deriveAssemblyBar,
+  deriveCitedChat,
+  paintGateChip,
+  formatGateChip,
   deriveSpinState,
   deriveCostWarning,
   deriveComposerMode,
@@ -120,6 +123,10 @@ import {
   rewindDialogHtml,
   deriveRewindFilePreview,
   ancestorRunIdsForChat,
+  filterRunsByWorkspaceFace,
+  runBelongsToOffice,
+  CODE_STARTER_JOBS,
+  buildNewRunRequest,
 } from "../ui/public/app.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -1405,8 +1412,18 @@ describe("计划确认门的签字位", () => {
     plannerMs: 100,
     gated: true,
     subtasks: [
-      { id: "s1", title: "一", description: "", acceptance: [], dependsOn: [] },
-      { id: "s2", title: "二", description: "", acceptance: [], dependsOn: ["s1"] },
+      {
+        id: "s1", title: "一",
+        description: "读仓库里现有的 CRC 实现，不要凭空写算法",
+        acceptance: ["对照参考实现逐字节一致"],
+        dependsOn: [],
+      },
+      {
+        id: "s2", title: "二",
+        description: "按 L1 数据手册改 RCC 时钟位",
+        acceptance: ["CRC->DR 非 0"],
+        dependsOn: ["s1"],
+      },
     ],
   };
 
@@ -1431,6 +1448,21 @@ describe("计划确认门的签字位", () => {
     expect(text).toContain("没有任何副作用");
     expect(rail().querySelector("[data-action='approve']")).toBeTruthy();
     expect(rail().querySelector("[data-action='reject']")).toBeTruthy();
+  });
+
+  it("签字位摊开每一步的执行说明和验收，不再让人去 Plan 面翻", () => {
+    renderRunDetail(gatedState(), { activeTab: "loop" });
+    const review = rail().querySelector(".plan-gate-review") as HTMLElement;
+    expect(review, "步骤正文必须在确认门卡片上").toBeTruthy();
+    expect(review.getAttribute("tabindex")).toBe("0");
+    expect(review.textContent).toContain("读仓库里现有的 CRC 实现");
+    expect(review.textContent).toContain("对照参考实现逐字节一致");
+    expect(review.textContent).toContain("按 L1 数据手册改 RCC 时钟位");
+    expect(review.querySelector(".plan-node-brief")).toBeTruthy();
+    expect(review.querySelector(".plan-node-checks")).toBeTruthy();
+    expect(review.querySelector("details"), "确认门验收必须摊开，不能再藏进折叠").toBeNull();
+    expect(rail().textContent).not.toContain("详见 Plan 面");
+    expect(rail().querySelectorAll("button")).toHaveLength(2);
   });
 
   it("点击真的把决定送出去（行为断言，不是「按钮在不在」）", () => {
@@ -3124,6 +3156,42 @@ describe("装配状态条", () => {
     expect(chip?.why).toContain("不是通用多命中");
   });
 
+  it("run_config 投影 cited，对话里画出引用了谁/哪些文件", () => {
+    const s = reduceEvents(createInitialState("r-cite", "接着那份规格", false), [
+      sse(0, "host", "run_config", {
+        cited: [
+          { runId: "run-spec", title: "规格草案", artifacts: ["pm-spec/index.html", "DESIGN.md"] },
+        ],
+      }),
+    ]);
+    expect(s.runConfig.cited).toEqual([
+      { runId: "run-spec", title: "规格草案", artifacts: ["pm-spec/index.html", "DESIGN.md"] },
+    ]);
+    const cited = deriveCitedChat(s.runConfig.cited);
+    expect(cited?.refs[0].runId).toBe("run-spec");
+    const items = deriveChatItems(s, null);
+    expect(items.some((it) => it.kind === "cite")).toBe(true);
+    const html = items.filter((it) => it.kind === "cite").map((it) => renderChatItem(it)).join("");
+    expect(html).toContain("引用");
+    expect(html).toContain("规格草案");
+    expect(html).toContain("pm-spec/index.html");
+    expect(html).toContain("DESIGN.md");
+    expect(html).not.toContain("transcript");
+    expect(html).not.toContain("events");
+  });
+
+  it("门禁 chip：无看板隐藏，有下一门才占位", () => {
+    const chip = document.getElementById("gate-chip");
+    expect(chip).toBeTruthy();
+    expect(formatGateChip(null).hidden).toBe(true);
+    paintGateChip(chip, null);
+    expect(chip.hidden).toBe(true);
+    expect(chip.textContent).toBe("");
+    paintGateChip(chip, { nextGate: "评审会", waiting: ["委托方"] });
+    expect(chip.hidden).toBe(false);
+    expect(chip.textContent).toBe("下一门：评审会 · 1 人在等");
+  });
+
   it("长工作目录只留尾部两级——状态条是一行", () => {
     const items = deriveAssemblyBar(configured(), null);
     const wd = items.find((i) => i.key === "workdir")!.chip;
@@ -3871,13 +3939,22 @@ describe("空态给的是能点的例子", () => {
     renderStarterGallery(opts);
   }
 
-  it("无运行时列出示例，且各走一条不同的路", () => {
+  it("编码空态是三行作业，不是问/读/写教具", () => {
     paintWelcome();
     const items = [...document.querySelectorAll("[data-example]")];
-    expect(items.length).toBeGreaterThanOrEqual(3);
-    const all = items.map((e) => e.getAttribute("data-example")!).join(" ");
-    expect(all, "应当有一个不碰工具的纯问答").toContain("不要调用工具");
-    expect(all, "应当有一个会触发审批门的写入").toMatch(/创建|写/);
+    expect(items.map((e) => e.querySelector(".starter-tile-title")?.textContent)).toEqual([
+      "从计划开始",
+      "看看这个仓库",
+      "修一处并跑通测试",
+    ]);
+    expect(items[0].getAttribute("data-starter-plan")).toBe("1");
+    const all = items.map((e) => e.textContent).join(" ");
+    expect(all).toContain("先对齐做法");
+    expect(all).toContain("用测试当判据");
+    expect(all).not.toContain("不要调用工具");
+    expect(all).not.toMatch(/问|读|写/);
+    expect(document.querySelector("[data-design-mode-enter]")).toBeNull();
+    expect(document.querySelector("[data-office-more]")).toBeNull();
   });
 
   it("示例文本进 data-example，点击由宿主填进输入框（不直接开跑）", () => {
@@ -3890,7 +3967,7 @@ describe("空态给的是能点的例子", () => {
 
   it("已有运行时的新建对话面仍给示例——示例属于启动器，不属于首次安装", () => {
     paintWelcome({ hasRuns: true });
-    expect(document.querySelectorAll("[data-example]").length).toBeGreaterThanOrEqual(3);
+    expect(document.querySelectorAll("[data-example]").length).toBe(3);
     expect(document.querySelector(".empty-brand")!.textContent).toMatch(/FATHOM/);
     expect(document.querySelector(".empty-tagline")!.textContent).toContain("to the bottom");
     expect(document.querySelector(".empty-tagline-cn")!.textContent).toContain("每一层都看得见");
@@ -3903,21 +3980,44 @@ describe("空态给的是能点的例子", () => {
     expect(document.getElementById("workdir-select")).toBeTruthy();
   });
 
-  it("设计模板只出现在 starter-gallery，点选会标出", () => {
-    paintWelcome();
+  it("办公空态是三块稿件加更多稿件，没有问/读/写和设计模式入口瓦", () => {
+    paintWelcome({ workspaceFace: "office" });
     expect(document.querySelectorAll("#starter-gallery [data-design-template]").length).toBe(3);
     expect(document.querySelector('[data-design-template="social-basic"]')?.textContent).toContain("社媒方图");
-    paintWelcome({ selectedTemplate: "deck-basic" });
+    expect(document.querySelector("[data-office-more]")?.textContent).toContain("更多稿件");
+    expect(document.querySelector("[data-design-mode-enter]")).toBeNull();
+    expect(document.querySelector("[data-design-mode-exit]")).toBeNull();
+    expect(document.querySelector("[data-example]")).toBeNull();
+    expect(document.getElementById("starter-gallery")?.textContent).not.toMatch(/不要调用工具|设计模式|问|读|写/);
+    paintWelcome({ workspaceFace: "office", selectedTemplate: "deck-basic" });
     expect(document.querySelector('[data-design-template="deck-basic"]')?.classList.contains("is-selected")).toBe(true);
   });
 
-  it("空态有设计模式入口；进入后是 6 页签且 Prototype 含三维对象", () => {
-    paintWelcome();
-    const enter = document.querySelector("[data-design-mode-enter]");
-    expect(enter?.textContent).toContain("设计模式");
-    expect(enter?.textContent).toMatch(/幻灯|海报/);
-    expect(enter?.classList.contains("starter-tile--design-enter")).toBe(true);
-    expect(enter?.textContent).not.toMatch(/Claude Design|Kimi|OpenDesign/i);
+  it("更多稿件打开六页签；返回只回到办公四行", () => {
+    paintWelcome({ workspaceFace: "office" });
+    expect(document.querySelector("[data-office-more]")).toBeTruthy();
+    expect(document.querySelector("[data-design-tab]")).toBeNull();
+    paintWelcome({
+      workspaceFace: "office",
+      officeCatalogOpen: true,
+      selectedDesignTab: "Prototype",
+      catalog: [
+        { id: "web-prototype", tab: "Prototype", title: "网页原型", description: "默认落地页" },
+        { id: "3d-object", tab: "Prototype", title: "三维对象", description: "WebGL 场景" },
+        { id: "dashboard", tab: "Live Artifact", title: "仪表盘", description: "管理台" },
+      ],
+    });
+    expect(document.querySelector("[data-design-mode-exit]")?.textContent).toMatch(/返回/);
+    expect(document.querySelector("[data-design-tab]")).toBeTruthy();
+    paintWelcome({ workspaceFace: "office" });
+    expect(document.querySelector("[data-design-mode-exit]")).toBeNull();
+    expect(document.querySelector("[data-design-tab]")).toBeNull();
+    expect(document.querySelector("[data-office-more]")).toBeTruthy();
+    expect(document.querySelector("[data-design-mode-enter]")).toBeNull();
+  });
+
+  it("六页签廊 Prototype 含三维对象；页签只显示中文", () => {
+    expect(document.querySelector("[data-design-mode-enter]")).toBeNull();
     expect(DESIGN_MODE_TABS).toEqual([
       "Prototype",
       "Live Artifact",
@@ -3970,14 +4070,16 @@ describe("空态给的是能点的例子", () => {
     paintWelcome({ designModeActive: true, selectedDesignTab: "Deck" });
     expect(document.querySelector("[data-design-mode-exit]")).toBeTruthy();
     expect(document.querySelector("[data-design-tab]")).toBeTruthy();
-    paintWelcome();
+    paintWelcome({ workspaceFace: "office" });
     expect(document.querySelector("[data-design-mode-exit]")).toBeNull();
     expect(document.querySelector("[data-design-tab]")).toBeNull();
-    expect(document.querySelector("[data-design-mode-enter]")).toBeTruthy();
+    expect(document.querySelector("[data-office-more]")).toBeTruthy();
+    expect(document.querySelector("[data-design-mode-enter]")).toBeNull();
     const html = readFileSync(join(UI_DIR, "index.html"), "utf-8");
     expect(html).toMatch(/data-design-mode-exit/);
     expect(html).toMatch(/function exitDesignMode/);
-    expect(html).toMatch(/designModeActive = false/);
+    expect(html).toMatch(/officeCatalogOpen = false/);
+    expect(html).toMatch(/designModeActive = workspaceFace === "office"/);
   });
 
   it("选 Deck 页签时画出带缩略图的样例卡，不是第二排文字钮", () => {
@@ -4136,15 +4238,23 @@ describe("空态给的是能点的例子", () => {
     }).placeholder).toBe("要「落地页」做什么…");
 
     const html = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "ui", "public", "index.html"), "utf-8");
-    const start = html.indexOf("async function ensureDesignDraftsWorkdir");
+    const start = html.indexOf("function applyDraftsWorkdirSelection");
     const end = html.indexOf("async function submitNewRun");
     expect(start).toBeGreaterThan(-1);
     expect(end).toBeGreaterThan(start);
     const block = html.slice(start, end);
+    expect(block).toContain("async function ensureDesignDraftsWorkdir");
     expect(block).toContain("/api/design-drafts-workdir");
     expect(block).toContain("设计稿写到独立目录");
+    expect(block).toContain("host-repo");
+    expect(block).toContain("showDesignDraftsHint");
     expect(block).not.toContain("writePrefString");
+    expect(html).toContain("稿目录已加入白名单，当前仍在本仓库");
+    expect(html).toContain("改写到稿目录");
     expect(html).toContain("verifyToggle.checked = false");
+    expect(html).toContain('id="gate-chip"');
+    expect(html).toContain('id="design-drafts-hint"');
+    expect(html).toContain('id="cite-picker"');
   });
 
   it("composer 是紧凑胶囊：对话与欢迎共用，起步卡只在欢迎", () => {
@@ -4192,6 +4302,46 @@ describe("空态给的是能点的例子", () => {
     expect(panel.classList.contains("is-welcome")).toBe(false);
     expect(gallery.hidden).toBe(true);
     expect(gallery.querySelector("[data-example]")).toBeNull();
+  });
+});
+
+describe("办公/编码脸与侧栏密度", () => {
+  it("列表按 workspace 分脸，旧档 packName=design 回退办公", () => {
+    const runs = [
+      { runId: "o1", task: "幻灯", workspace: "office", packName: "design" },
+      { runId: "c1", task: "修 bug", workspace: "code", packName: "ts-coding" },
+      { runId: "legacy", task: "旧稿", packName: "design" },
+      { runId: "old-code", task: "板上 CRC", packName: "stm32-debug" },
+    ];
+    expect(filterRunsByWorkspaceFace(runs, "office").map((r) => r.runId)).toEqual(["o1", "legacy"]);
+    expect(filterRunsByWorkspaceFace(runs, "code").map((r) => r.runId)).toEqual(["c1", "old-code"]);
+    expect(runBelongsToOffice({ packName: "design" })).toBe(true);
+    expect(runBelongsToOffice({ workspace: "code", packName: "design" })).toBe(false);
+  });
+
+  it("办公新建载荷带 workspace=office", () => {
+    expect(buildNewRunRequest({ task: "做幻灯", mode: "design", workspace: "office" })).toMatchObject({
+      mode: "design",
+      workspace: "office",
+    });
+    expect(CODE_STARTER_JOBS.map((j) => j.label)).toEqual([
+      "从计划开始",
+      "看看这个仓库",
+      "修一处并跑通测试",
+    ]);
+  });
+
+  it("侧栏骨架：列表前没有第三颗满宽标签钮；会话 meta 默认不占行", () => {
+    const html = readFileSync(join(UI_DIR, "index.html"), "utf-8");
+    const css = readFileSync(join(UI_DIR, "styles.css"), "utf-8");
+    const searchEnd = html.indexOf('id="run-list"');
+    const chrome = html.slice(html.indexOf('id="sidebar"'), searchEnd);
+    expect(chrome).toContain('id="workspace-face"');
+    expect(chrome).toContain('id="new-chat-btn"');
+    expect(chrome).not.toContain("<span>指挥中心</span>");
+    expect(chrome).not.toContain("<span>定时任务</span>");
+    expect(css).toContain(".starter-tiles--jobs .starter-tile-hint {\n  display: block;");
+    expect(css).toMatch(/\.run-item-status,\s*\.run-item-meta,\s*\.run-item-recap \{\s*display: none;/);
   });
 });
 

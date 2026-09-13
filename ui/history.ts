@@ -131,6 +131,8 @@ export interface ArchivedMeta {
   finishedAt: number | null;
   packName: string | null;
   mode: "single" | "plan";
+  /** 侧栏办公/编码脸；旧档案缺省，前端按 packName=design 回退 */
+  workspace?: "office" | "code";
   effort: string | null;
   rubric: string | null;
   workdir: string | null;

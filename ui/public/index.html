@@ -29,8 +29,8 @@
   <h1>FATHOM 控制台</h1>
 </header>
 
-<!-- 侧栏：项目 → 对话 -->
-<aside class="sidebar" id="sidebar">
+<!-- 侧栏：分脸 → 新建 → 会话列表；工具进底栏图标 -->
+<aside class="sidebar" id="sidebar" data-workspace-face="code">
   <div class="sidebar-header">
     <div class="sidebar-brand">
       <span class="sidebar-brand-mark" aria-hidden="true">
@@ -44,18 +44,67 @@
       </span>
       <span class="sidebar-brand-copy">
         <strong>FATHOM<span class="fw-dot">.</span></strong>
-        <span>项目与对话</span>
       </span>
     </div>
-    <!-- 通知中心入口（T4）：铃铛 + 待决定未读角标。按钮在静态骨架里，
-         面板与行为由 features/notifications.js 初始化时挂载。 -->
+    <button type="button" class="icon-btn sidebar-collapse-btn" id="sidebar-collapse"
+      aria-label="隐藏侧栏" title="隐藏侧栏（Ctrl+B）" aria-keyshortcuts="Control+B Meta+B"
+      aria-expanded="true">
+      <i class="ph ph-caret-left" aria-hidden="true"></i>
+    </button>
+  </div>
+  <div class="workspace-face" id="workspace-face" role="radiogroup" aria-label="工作区">
+    <button type="button" class="workspace-face-tab" role="radio" id="workspace-face-office"
+      data-workspace-face="office" aria-checked="false">办公</button>
+    <button type="button" class="workspace-face-tab is-selected" role="radio" id="workspace-face-code"
+      data-workspace-face="code" aria-checked="true">编码</button>
+  </div>
+  <div class="sidebar-search">
+    <button type="button" class="btn btn--primary new-chat-btn" id="new-chat-btn">
+      <i class="ph ph-plus" aria-hidden="true"></i>
+      <span>新建对话</span>
+    </button>
+    <div class="run-search-row">
+      <div class="run-search-field">
+        <i class="ph ph-magnifying-glass" aria-hidden="true"></i>
+        <label for="run-search" class="sr-only">搜索对话</label>
+        <input type="search" id="run-search" class="run-search" placeholder="搜索对话…" autocomplete="off" />
+      </div>
+      <button type="button" class="icon-btn sidebar-filter-btn" id="sidebar-filter-btn"
+        aria-label="筛选对话" aria-haspopup="true" aria-expanded="false">
+        <i class="ph ph-sliders-horizontal" aria-hidden="true"></i>
+      </button>
+      <div class="sidebar-filter-menu" id="sidebar-filter-menu" hidden>
+        <label class="sidebar-project-filter">
+          <input type="checkbox" id="sidebar-all-projects" />
+          全部项目
+        </label>
+        <select class="run-filter" id="run-filter" aria-label="按状态筛选对话">
+          <option value="all">全部</option>
+          <option value="running">运行中</option>
+          <option value="done">已完成</option>
+          <option value="failed">未通过</option>
+        </select>
+      </div>
+    </div>
+  </div>
+  <!-- role=listbox / aria-label 由 renderRunList 动态挂载：listbox 必须含 option
+       子项（aria-required-children），空态/加载态若静态带着 role 反而是 critical
+       违规——这条是 axe 扫描器上线首跑抓到的（s3d 手工修复引入的新问题） -->
+  <div id="run-list" class="run-list">
+    <div class="run-list-empty">加载中…</div>
+  </div>
+  <div class="sidebar-footer sidebar-footer--icons">
+    <button type="button" class="icon-btn" id="board-open-btn" aria-label="打开指挥中心">
+      <i class="ph ph-squares-four" aria-hidden="true"></i>
+    </button>
+    <button type="button" class="icon-btn" id="schedules-open-btn" aria-label="打开定时任务">
+      <i class="ph ph-clock" aria-hidden="true"></i>
+    </button>
     <button type="button" class="icon-btn notifications-btn" id="notifications-btn"
       aria-label="通知中心" aria-haspopup="dialog" aria-expanded="false">
       <i class="ph ph-bell" aria-hidden="true"></i>
       <span class="notifications-badge" id="notifications-badge" hidden>0</span>
     </button>
-    <!-- 记忆面板入口（T5）：按钮在静态骨架里，
-         面板与行为由 features/memory-panel.js 初始化时挂载。 -->
     <button type="button" class="icon-btn memory-btn" id="memory-btn"
       aria-label="记忆" aria-haspopup="dialog" aria-expanded="false">
       <i class="ph ph-brain" aria-hidden="true"></i>
@@ -93,59 +142,8 @@
         </button>
       </div>
     </div>
-    <button type="button" class="icon-btn sidebar-collapse-btn" id="sidebar-collapse"
-      aria-label="隐藏侧栏" title="隐藏侧栏（Ctrl+B）" aria-keyshortcuts="Control+B Meta+B"
-      aria-expanded="true">
-      <i class="ph ph-caret-left" aria-hidden="true"></i>
-    </button>
-  </div>
-  <div class="sidebar-search">
-    <!-- 指挥中心入口（T11）：点击走 hash 路由 #/board，由 features/command-center.js 绑定 -->
-    <button type="button" class="palette-open-btn" id="board-open-btn" aria-label="打开指挥中心">
-      <i class="ph ph-squares-four" aria-hidden="true"></i>
-      <span>指挥中心</span>
-    </button>
-    <button type="button" class="btn btn--primary new-chat-btn" id="new-chat-btn">
-      <i class="ph ph-plus" aria-hidden="true"></i>
-      <span>新建对话</span>
-    </button>
-    <!-- 定时任务（T9）：放在新建对话下方。命令面板仍走 Ctrl+K，侧栏不再单列入口。 -->
-    <button type="button" class="settings-open-btn" id="schedules-open-btn" aria-label="打开定时任务">
-      <i class="ph ph-clock" aria-hidden="true"></i>
-      <span>定时任务</span>
-    </button>
-    <div class="run-search-field">
-      <i class="ph ph-magnifying-glass" aria-hidden="true"></i>
-      <label for="run-search" class="sr-only">搜索对话</label>
-      <input type="search" id="run-search" class="run-search" placeholder="搜索对话…" autocomplete="off" />
-    </div>
-    <div class="sidebar-filter-row">
-      <span class="sidebar-section-label">对话</span>
-      <label class="sidebar-project-filter">
-        <input type="checkbox" id="sidebar-all-projects" />
-        全部项目
-      </label>
-      <!-- R-08 状态筛选 -->
-      <select class="run-filter" id="run-filter" aria-label="按状态筛选对话">
-        <option value="all">全部</option>
-        <option value="running">运行中</option>
-        <option value="done">已完成</option>
-        <option value="failed">未通过</option>
-      </select>
-    </div>
-  </div>
-  <!-- role=listbox / aria-label 由 renderRunList 动态挂载：listbox 必须含 option
-       子项（aria-required-children），空态/加载态若静态带着 role 反而是 critical
-       违规——这条是 axe 扫描器上线首跑抓到的（s3d 手工修复引入的新问题） -->
-  <div id="run-list" class="run-list">
-    <div class="run-list-empty">加载中…</div>
-  </div>
-  <!-- 设置中心入口（T7）：按钮在静态骨架里，视图与行为由 features/settings.js
-       初始化时挂载；点击走 hash 路由 #/settings。消耗在设置分组里，不占侧栏。 -->
-  <div class="sidebar-footer">
-    <button type="button" class="settings-open-btn" id="settings-open-btn" aria-label="打开设置">
+    <button type="button" class="icon-btn" id="settings-open-btn" aria-label="打开设置">
       <i class="ph ph-gear" aria-hidden="true"></i>
-      <span>设置</span>
     </button>
   </div>
 </aside>
@@ -294,6 +292,8 @@
          内容全部由 message_queued / message_queue_updated 事件重放长出（renderQueueChips）。
          不能放进 .composer-input-row——它是 flex 行，chips 会被挤成内联一员 -->
     <div id="queue-chips" class="queue-chips" hidden></div>
+    <div id="cite-chips" class="cite-chips" hidden></div>
+    <div id="cite-picker" class="cite-picker" hidden role="listbox" aria-label="引用同目录会话"></div>
     <div class="composer-compose" id="composer-compose">
     <div id="composer-media" class="composer-media" hidden></div>
     <div class="composer-compose-main">
@@ -324,6 +324,7 @@
         <input type="checkbox" id="verify-toggle" />
         <span>独立核查</span>
       </label>
+      <button type="button" id="gate-chip" class="gate-chip" hidden></button>
       <button type="button" id="design-template-chip" class="design-template-chip" hidden></button>
       <span class="composer-quick-hint sr-only">写入仍受工作目录边界约束</span>
       <!-- 上下文圆环：钉在提交栏右下角；面板向上展开，避免被视口裁切 -->
@@ -342,6 +343,13 @@
     </div>
     <!-- 模式说明。独立于 #submit-error：后者是 role="alert"，
          "这次提交会去哪儿"不是错误，不该被当成警报播报 -->
+    <p id="design-drafts-hint" class="design-drafts-hint" hidden>
+      <span>稿目录已加入白名单，当前仍在本仓库</span>
+      <button type="button" id="design-drafts-switch" class="btn btn--ghost">改写到稿目录</button>
+      <button type="button" id="design-drafts-hint-dismiss" class="btn btn--ghost inline-error-close" aria-label="关闭提示">
+        <i class="ph ph-x" aria-hidden="true"></i>
+      </button>
+    </p>
     <p id="composer-note" class="composer-note knob-hint" hidden></p>
     <div id="budget-extend-row" class="budget-extend-row" hidden>
       <button type="button" id="budget-extend-btn" class="btn btn--ghost">
@@ -460,6 +468,7 @@ import {
   filterRunsByStatus,
   filterRunsByQuery,
   filterRunsByComposerWorkdir,
+  filterRunsByWorkspaceFace,
   conversationTipId,
   renderRunList,
   readCollapsedWorkdirGroups,
@@ -502,6 +511,10 @@ import {
   createReplayGate,
   createApprovalSettleGate,
   deriveChildAgents,
+  paintGateChip,
+  sameWorkdirCiteRuns,
+  filterCiteCandidates,
+  composerCiteTrigger,
 } from "/app.js";
 import {
   loadSettings,
@@ -567,6 +580,13 @@ let eventSources = /** @type {Map<string, EventSource>} */ (new Map());
 
 /** 通知中心（T4）实例，由文件末尾的动态 import 赋值；未加载时为 null，所有调用点可选链 */
 let notificationsApi = /** @type {null|{ ingest:(runId:string, sseEvent:any)=>void, syncRuns:()=>void, removeRun:(runId:string)=>void }} */ (null);
+let memoryPanelApi = /** @type {null|{ open:()=>void, close:()=>void, isOpen:()=>boolean }} */ (null);
+/** @type {string|null} */
+let pendingDraftsWorkdir = null;
+/** @type {string[]} */
+let selectedCiteIds = [];
+/** @type {Array<{ runId:string, title:string, task?:string, conversationRecap?:string|null, artifacts?:string[] }>} */
+let citeCandidates = [];
 
 /**
  * 设置中心（T7）。settingsApi 由文件末尾初始化；uiSettings 是「运行默认值」
@@ -885,18 +905,15 @@ function syncScrollNav() {
       exitDesignMode();
       return;
     }
+    const moreDrafts = e.target.closest?.("[data-office-more]");
+    if (moreDrafts) {
+      openOfficeCatalog();
+      return;
+    }
     const enterDesign = e.target.closest?.("[data-design-mode-enter]");
     if (enterDesign) {
-      designModeActive = true;
-      if (verifyToggle) verifyToggle.checked = false;
-      selectedDesignTab = selectedDesignTab && DESIGN_MODE_TABS.includes(selectedDesignTab)
-        ? selectedDesignTab
-        : "Prototype";
-      designRouteHint = null;
-      applyDesignTabDefaults(selectedDesignTab, { fillPrompt: false });
-      paintEmptyState();
-      syncComposer();
-      void ensureDesignDraftsWorkdir();
+      applyWorkspaceFace("office");
+      openOfficeCatalog();
       return;
     }
     const tabChip = e.target.closest?.("[data-design-tab]");
@@ -955,7 +972,13 @@ function syncScrollNav() {
     taskInput.focus();
     // 光标放到末尾，人可以直接接着改
     taskInput.setSelectionRange(taskInput.value.length, taskInput.value.length);
+    if (btn.hasAttribute("data-starter-plan") && planModeToggle) {
+      planModeToggle.checked = true;
+      writePref(PREF_PLAN, true);
+      syncPlanHint();
+    }
     syncWelcomeComposerField();
+    syncComposer();
   });
 })();
 
@@ -1005,6 +1028,9 @@ let submitting = false;
 let selectedDesignTemplate = /** @type {string|null} */ (null);
 /** 空态设计模式门面：输入框 + 6 页签 chip + 样例卡 */
 let designModeActive = false;
+let workspaceFace = "code";
+let officeCatalogOpen = false;
+let codeVerifyPref = true;
 let selectedDesignTab = /** @type {string|null} */ (null);
 let selectedDesignId = /** @type {string|null} */ (null);
 let selectedDesignSample = /** @type {string|null} */ (null);
@@ -1156,11 +1182,61 @@ function announceStatus(msg) {
 }
 
 function exitDesignMode() {
-  if (!designModeActive) return;
-  designModeActive = false;
+  if (!officeCatalogOpen && !designModeActive) return;
+  officeCatalogOpen = false;
+  designModeActive = workspaceFace === "office";
   paintEmptyState();
   syncComposer();
   announceStatus("已返回开始页");
+}
+
+function openOfficeCatalog() {
+  applyWorkspaceFace("office");
+  officeCatalogOpen = true;
+  designModeActive = true;
+  selectedDesignTab = selectedDesignTab && DESIGN_MODE_TABS.includes(selectedDesignTab)
+    ? selectedDesignTab
+    : "Prototype";
+  designRouteHint = null;
+  applyDesignTabDefaults(selectedDesignTab, { fillPrompt: false });
+  paintEmptyState();
+  syncComposer();
+  void ensureDesignDraftsWorkdir();
+}
+
+function syncWorkspaceFaceChrome() {
+  sidebar?.setAttribute("data-workspace-face", workspaceFace);
+  document.documentElement.dataset.workspaceFace = workspaceFace;
+  for (const btn of document.querySelectorAll("#workspace-face [data-workspace-face]")) {
+    const on = btn.getAttribute("data-workspace-face") === workspaceFace;
+    btn.setAttribute("aria-checked", String(on));
+    btn.classList.toggle("is-selected", on);
+  }
+}
+
+function applyWorkspaceFace(next, { persist = true, refresh = true } = {}) {
+  const face = next === "office" ? "office" : "code";
+  const prev = workspaceFace;
+  workspaceFace = face;
+  if (persist) writePrefString(PREF_WORKSPACE_FACE, face);
+  if (face === "office") {
+    if (prev !== "office" && verifyToggle) {
+      codeVerifyPref = verifyToggle.checked;
+      verifyToggle.checked = false;
+    }
+    designModeActive = true;
+    officeCatalogOpen = false;
+    if (prev !== "office") void ensureDesignDraftsWorkdir();
+  } else {
+    officeCatalogOpen = false;
+    designModeActive = false;
+    if (prev === "office" && verifyToggle) verifyToggle.checked = codeVerifyPref;
+  }
+  syncWorkspaceFaceChrome();
+  if (refresh) {
+    refreshRunListView();
+    syncComposer();
+  }
 }
 
 function paintEmptyState() {
@@ -1169,11 +1245,13 @@ function paintEmptyState() {
   if (gallery) gallery.hidden = false;
   renderEmptyState(runs.length > 0, {
     selectedTemplate: selectedDesignTemplate,
-    designModeActive,
+    designModeActive: workspaceFace === "office",
   });
   renderStarterGallery({
     selectedTemplate: selectedDesignTemplate,
-    designModeActive,
+    workspaceFace,
+    officeCatalogOpen,
+    designModeActive: officeCatalogOpen,
     selectedDesignTab: selectedDesignTab || "Prototype",
     selectedDesignId,
     selectedDesignSample,
@@ -1321,7 +1399,10 @@ function getFilteredRuns() {
   const composerWorkdir = workdirSelect?.value ?? "";
   return filterRunsByQuery(
     filterRunsByStatus(
-      filterRunsByComposerWorkdir(runs, composerWorkdir, allProjects),
+      filterRunsByWorkspaceFace(
+        filterRunsByComposerWorkdir(runs, composerWorkdir, allProjects),
+        workspaceFace,
+      ),
       runStates,
       currentFilter,
     ),
@@ -1384,6 +1465,7 @@ async function loadRuns() {
     notificationsApi?.syncRuns();
     // 指挥中心随列表对账一起刷新（运行中/最近完成两栏的数据源就是这份列表）
     boardApi?.refresh();
+    void refreshCiteCandidates();
   } catch {
     // 服务器未就绪时静默
   }
@@ -1397,6 +1479,26 @@ runFilter.addEventListener("change", () => {
 document.getElementById("sidebar-all-projects")?.addEventListener("change", () => {
   refreshRunListView();
 });
+{
+  const filterBtn = document.getElementById("sidebar-filter-btn");
+  const filterMenu = document.getElementById("sidebar-filter-menu");
+  if (filterBtn && filterMenu) {
+    const setFilterOpen = (open) => {
+      filterMenu.hidden = !open;
+      filterBtn.setAttribute("aria-expanded", String(open));
+    };
+    filterBtn.addEventListener("click", (event) => {
+      event.stopPropagation();
+      setFilterOpen(filterMenu.hidden);
+    });
+    document.addEventListener("pointerdown", (event) => {
+      if (filterMenu.hidden) return;
+      const target = /** @type {Node|null} */ (event.target);
+      if (target && (filterMenu.contains(target) || filterBtn.contains(target))) return;
+      setFilterOpen(false);
+    });
+  }
+}
 
 // 搜索：列表用键控补丁更新，不重建节点，所以边打字边过滤不会打断输入焦点
 if (runSearch) {
@@ -1867,7 +1969,7 @@ function syncComposer() {
     error: newRunError ?? (selectedRunId ? followUpErrors.get(selectedRunId) ?? null : null),
     workdir: welcomeWorkdir,
     draft: taskInput?.value ?? "",
-    designMode: designModeActive,
+    designMode: workspaceFace === "office",
     designTitle: designComposerTitle(),
   });
   patchComposer(composerMode);
@@ -2074,8 +2176,8 @@ async function postFollowUp(runId, text, verify) {
         text,
         verify,
         autoApprove: autoApproveToggle?.checked !== false,
-        planMode: planModeToggle?.checked === true,
-        multiAgent: multiAgentToggle?.checked === true,
+        // 追问续的是对话。计划/并行旋钮只约束「新开一轮」；完成态 plan
+        // 再带 planMode 会另起 planner，其 run_end 会拆掉还在跑的执行者。
         effort: effortSelect?.value,
         pack: packSelect?.value ?? "",
         autoPack: autoPackToggle?.checked === true,
@@ -2277,6 +2379,8 @@ async function loadHarness() {
       if (state) renderDetailWithState(state);
     }
     await loadModelsForComposer();
+    void refreshGateChip();
+    void refreshCiteCandidates();
   } catch {
     // 拿不到就照实降级：Tools 面会显示"未获取到工具清单"
   }
@@ -2504,6 +2608,7 @@ function applySseBatch(runId, queue) {
           if (selectedRunId !== runId) unreadRuns.add(runId);
           // canContinue 由服务端算，run 收尾后要拉一次列表才知道能不能追加
           void loadRuns();
+          void refreshGateChip();
         }
       }
     }
@@ -2900,9 +3005,23 @@ submitBtn.addEventListener("click", (e) => {
  * 选词上屏，绝不许触发发送。
  */
 taskInput.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    const picker = document.getElementById("cite-picker");
+    if (picker && !picker.hidden) {
+      e.preventDefault();
+      hideCitePicker();
+      return;
+    }
+  }
   if (e.key !== "Enter") return;
   if (e.isComposing || e.keyCode === 229) return;
   if (e.shiftKey) return; // Shift+Enter 留给换行
+  const firstCite = document.querySelector("#cite-picker:not([hidden]) .cite-picker-item");
+  if (firstCite) {
+    e.preventDefault();
+    addCite(firstCite.getAttribute("data-run-id"));
+    return;
+  }
   e.preventDefault();
   if (typeof submitForm.requestSubmit === "function") submitForm.requestSubmit();
   else submitForm.dispatchEvent(new Event("submit", { cancelable: true, bubbles: true }));
@@ -2910,9 +3029,27 @@ taskInput.addEventListener("keydown", (e) => {
 taskInput.addEventListener("input", () => {
   syncWelcomeComposerField();
   syncComposer();
+  onComposerCiteInput();
 });
 taskInput.addEventListener("focus", syncWelcomeComposerField);
-taskInput.addEventListener("blur", syncWelcomeComposerField);
+taskInput.addEventListener("blur", () => {
+  syncWelcomeComposerField();
+  window.setTimeout(() => hideCitePicker(), 150);
+});
+document.getElementById("gate-chip")?.addEventListener("click", () => {
+  memoryPanelApi?.open();
+});
+document.getElementById("design-drafts-switch")?.addEventListener("click", () => {
+  if (!pendingDraftsWorkdir || !workdirSelect) return;
+  const list = [...workdirSelect.options]
+    .map((o) => o.value)
+    .filter((v) => v && v !== WORKDIR_ADD_VALUE);
+  if (!list.includes(pendingDraftsWorkdir)) list.push(pendingDraftsWorkdir);
+  applyDraftsWorkdirSelection(pendingDraftsWorkdir, list);
+});
+document.getElementById("design-drafts-hint-dismiss")?.addEventListener("click", () => {
+  hideDesignDraftsHint();
+});
 
 function designComposerTitle() {
   if (selectedDesignSample) {
@@ -2926,9 +3063,35 @@ function designComposerTitle() {
   return "";
 }
 
+function hideDesignDraftsHint() {
+  pendingDraftsWorkdir = null;
+  const hint = document.getElementById("design-drafts-hint");
+  if (hint) hint.hidden = true;
+}
+
+function showDesignDraftsHint(workdir) {
+  pendingDraftsWorkdir = workdir || null;
+  const hint = document.getElementById("design-drafts-hint");
+  if (hint) hint.hidden = !pendingDraftsWorkdir;
+}
+
+function applyDraftsWorkdirSelection(draftsPath, list) {
+  if (!workdirSelect || !draftsPath) return;
+  const extras = getWorkdirSelection(workdirSelect, list).extras;
+  renderWorkdirOptions(workdirSelect, list, { selected: draftsPath });
+  applyWorkdirSelection(workdirSelect, list, { primary: draftsPath, extras });
+  workdirComboboxApi?.paint();
+  void workspaceGitChipApi?.refresh();
+  void refreshGateChip();
+  void refreshCiteCandidates();
+  syncComposer();
+  announceStatus("设计稿写到独立目录");
+  hideDesignDraftsHint();
+}
+
 /**
- * 设计模式稿目录：mkdir + 加入白名单。当前是宿主仓库才切过去；
- * 用户已选别的目录不抢。自动切换不写 PREF_WORKDIR——编码包下次打开还是用户自己选的目录。
+ * 设计模式稿目录：mkdir + 加入白名单。宿主仓库不自动切走；
+ * 空目录才默认用稿目录。自动切换不写 PREF_WORKDIR。
  */
 async function ensureDesignDraftsWorkdir() {
   if (!workdirSelect) return;
@@ -2948,12 +3111,7 @@ async function ensureDesignDraftsWorkdir() {
     const extras = getWorkdirSelection(workdirSelect, list).extras;
     const keep = current && list.includes(current) ? current : workdirSelect.value;
     if (body.select) {
-      renderWorkdirOptions(workdirSelect, list, { selected: body.workdir });
-      applyWorkdirSelection(workdirSelect, list, { primary: body.workdir, extras });
-      workdirComboboxApi?.paint();
-      void workspaceGitChipApi?.refresh();
-      syncComposer();
-      announceStatus("设计稿写到独立目录");
+      applyDraftsWorkdirSelection(body.workdir, list);
       return;
     }
     if (list.length) {
@@ -2961,7 +3119,154 @@ async function ensureDesignDraftsWorkdir() {
       applyWorkdirSelection(workdirSelect, list, { primary: keep, extras });
       workdirComboboxApi?.paint();
     }
+    if (body.reason === "host-repo") {
+      showDesignDraftsHint(body.workdir);
+    }
   } catch { /* 失败不挡设计模式 */ }
+}
+
+function composerWorkdir() {
+  if (!workdirSelect || workdirSelect.value === WORKDIR_ADD_VALUE) return "";
+  return workdirSelect.value || "";
+}
+
+async function refreshGateChip() {
+  const chip = document.getElementById("gate-chip");
+  if (!chip) return;
+  const wd = composerWorkdir();
+  if (!wd) {
+    paintGateChip(chip, null);
+    return;
+  }
+  try {
+    const res = await fetch(`/api/memory?scope=current&workdir=${encodeURIComponent(wd)}`);
+    if (!res.ok) {
+      paintGateChip(chip, null);
+      return;
+    }
+    const body = await res.json().catch(() => null);
+    paintGateChip(chip, body?.status ?? null);
+  } catch {
+    paintGateChip(chip, null);
+  }
+}
+
+function paintCiteChips() {
+  const host = document.getElementById("cite-chips");
+  if (!host) return;
+  host.replaceChildren();
+  const selected = selectedCiteIds
+    .map((id) => citeCandidates.find((c) => c.runId === id) || sameWorkdirCiteRuns(runs, composerWorkdir()).find((r) => r.runId === id))
+    .filter(Boolean);
+  host.hidden = selected.length === 0;
+  for (const ref of selected) {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "cite-chip";
+    chip.dataset.runId = ref.runId;
+    chip.textContent = ref.title || ref.task || ref.runId;
+    const x = document.createElement("span");
+    x.className = "cite-chip-x";
+    x.setAttribute("aria-hidden", "true");
+    x.textContent = "×";
+    chip.appendChild(x);
+    chip.setAttribute("aria-label", `移除引用 ${chip.textContent}`);
+    chip.addEventListener("click", () => {
+      selectedCiteIds = selectedCiteIds.filter((id) => id !== ref.runId);
+      paintCiteChips();
+    });
+    host.appendChild(chip);
+  }
+}
+
+function hideCitePicker() {
+  const picker = document.getElementById("cite-picker");
+  if (picker) {
+    picker.hidden = true;
+    picker.replaceChildren();
+  }
+}
+
+function paintCitePicker(query) {
+  const picker = document.getElementById("cite-picker");
+  if (!picker) return;
+  const local = sameWorkdirCiteRuns(runs, composerWorkdir()).map((r) => ({
+    runId: r.runId,
+    title: r.title || r.task,
+    task: r.task,
+    conversationRecap: r.recap ?? null,
+    artifacts: [],
+  }));
+  const merged = new Map();
+  for (const c of [...local, ...citeCandidates]) {
+    if (c?.runId) merged.set(c.runId, { ...merged.get(c.runId), ...c });
+  }
+  const available = [...merged.values()].filter((c) => !selectedCiteIds.includes(c.runId));
+  const filtered = filterCiteCandidates(available, query);
+  picker.replaceChildren();
+  if (!filtered.length) {
+    picker.hidden = true;
+    return;
+  }
+  picker.hidden = false;
+  for (const c of filtered.slice(0, 8)) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "cite-picker-item";
+    btn.setAttribute("role", "option");
+    btn.dataset.runId = c.runId;
+    const title = document.createElement("span");
+    title.className = "cite-picker-title";
+    title.textContent = c.title || c.task || c.runId;
+    const task = document.createElement("span");
+    task.className = "cite-picker-task";
+    task.textContent = c.task && c.task !== c.title ? c.task : "";
+    btn.appendChild(title);
+    if (task.textContent) btn.appendChild(task);
+    btn.addEventListener("mousedown", (ev) => {
+      ev.preventDefault();
+      addCite(c.runId);
+    });
+    picker.appendChild(btn);
+  }
+}
+
+function addCite(runId) {
+  if (!runId || selectedCiteIds.includes(runId)) return;
+  selectedCiteIds = [...selectedCiteIds, runId];
+  const trigger = composerCiteTrigger(taskInput.value);
+  if (trigger) {
+    taskInput.value = `${taskInput.value.slice(0, trigger.start)}${taskInput.value.slice(trigger.start + 1 + trigger.query.length)}`.trimStart();
+    syncWelcomeComposerField();
+    syncComposer();
+  }
+  paintCiteChips();
+  hideCitePicker();
+}
+
+async function refreshCiteCandidates() {
+  const wd = composerWorkdir();
+  if (!wd) {
+    citeCandidates = [];
+    return;
+  }
+  try {
+    const res = await fetch(`/api/cite-candidates?workdir=${encodeURIComponent(wd)}`);
+    if (!res.ok) return;
+    const body = await res.json().catch(() => null);
+    citeCandidates = Array.isArray(body?.candidates) ? body.candidates : [];
+  } catch {
+    /* 点名列表失败时仍可用本地 runs */
+  }
+}
+
+function onComposerCiteInput() {
+  const trigger = composerCiteTrigger(taskInput.value);
+  if (!trigger) {
+    hideCitePicker();
+    return;
+  }
+  paintCitePicker(trigger.query);
 }
 
 async function submitNewRun({ text: task }) {
@@ -2969,7 +3274,7 @@ async function submitNewRun({ text: task }) {
   newRunError = null;
   syncComposer();
   try {
-    if (designModeActive) {
+    if (workspaceFace === "office") {
       await ensureDesignDraftsWorkdir();
     }
     const verify = verifyToggle.checked;
@@ -2982,7 +3287,8 @@ async function submitNewRun({ text: task }) {
         pack: packSelect?.value,
         effort: effortSelect?.value,
         rubric: rubricInput?.value,
-        mode: designModeActive ? "design" : "single",
+        workspace: workspaceFace,
+        mode: workspaceFace === "office" ? "design" : "single",
         designId: selectedDesignId || undefined,
         designTab: selectedDesignTab || undefined,
         designTemplate: selectedDesignTemplate || undefined,
@@ -3003,6 +3309,7 @@ async function submitNewRun({ text: task }) {
           : undefined,
         useVerifierModel: !useVerifierModel || useVerifierModel.checked,
         usePlannerModel: !usePlannerModel || usePlannerModel.checked,
+        citedRunIds: selectedCiteIds,
       })),
     });
     if (!res.ok) {
@@ -3013,6 +3320,8 @@ async function submitNewRun({ text: task }) {
         detail = body?.error ? `：${body.error}` : "";
       } catch { /* 响应体不是 JSON，只报状态码 */ }
       if (res.status === 409 && body?.designRoute) {
+        applyWorkspaceFace("office", { refresh: false });
+        officeCatalogOpen = true;
         designModeActive = true;
         if (body.designRoute.tab) selectedDesignTab = body.designRoute.tab;
         else if (!selectedDesignTab) selectedDesignTab = "Prototype";
@@ -3023,7 +3332,10 @@ async function submitNewRun({ text: task }) {
       return;
     }
     const { runId } = await res.json();
-    const pendingTemplate = designModeActive ? null : selectedDesignTemplate;
+    selectedCiteIds = [];
+    paintCiteChips();
+    hideCitePicker();
+    const pendingTemplate = workspaceFace === "office" ? null : selectedDesignTemplate;
     selectedDesignTemplate = null;
     selectedDesignId = null;
     selectedDesignSample = null;
@@ -3044,7 +3356,16 @@ async function submitNewRun({ text: task }) {
     const state = createInitialState(runId, task, verify, { createdAt: Date.now() });
     runStates.set(runId, state);
 
-    runs.unshift({ runId, task, status: "running", verify, createdAt: Date.now(), finishedAt: null });
+    runs.unshift({
+      runId,
+      task,
+      status: "running",
+      verify,
+      createdAt: Date.now(),
+      finishedAt: null,
+      workspace: workspaceFace,
+      ...(workspaceFace === "office" ? { packName: "design", mode: "design" } : {}),
+    });
     selectedRunId = runId;
     activeTabs.set(runId, "loop");
     renderDetailWithState(state);
@@ -3417,6 +3738,7 @@ const PREF_MULTI = "agent.ui.pref.multiAgent";
 const PREF_WORKDIR = "agent.ui.pref.workdir";
 const PREF_WORKDIR_EXTRAS = "agent.ui.pref.workdirExtras";
 const PREF_AUTO_PACK = "agent.ui.pref.autoPack";
+const PREF_WORKSPACE_FACE = "agent.ui.pref.workspaceFace";
 function readPref(key, fallback) {
   try {
     const v = localStorage.getItem(key);
@@ -3506,6 +3828,16 @@ if (autoPackToggle) {
   });
 }
 
+{
+  const savedFace = readPrefString(PREF_WORKSPACE_FACE, "code");
+  applyWorkspaceFace(savedFace === "office" ? "office" : "code", { persist: false, refresh: false });
+  document.getElementById("workspace-face")?.addEventListener("click", (event) => {
+    const tab = event.target.closest?.("[data-workspace-face]");
+    if (!tab) return;
+    applyWorkspaceFace(tab.getAttribute("data-workspace-face"));
+  });
+}
+
 if (knobsToggle && runKnobs) {
   const setKnobsOpen = (open) => {
     runKnobs.hidden = !open;
@@ -3538,7 +3870,8 @@ if (newChatBtn) {
     selectedRunId = null;
     selectedDesignTemplate = null;
     selectedDesignSample = null;
-    designModeActive = false;
+    officeCatalogOpen = false;
+    designModeActive = workspaceFace === "office";
     writeHash(null, null);
     refreshRunListView();
     paintEmptyState();
@@ -3812,6 +4145,11 @@ if (workdirSelect) {
           syncComposer();
           refreshRunListView();
           void workspaceGitChipApi?.refresh();
+          void refreshGateChip();
+          void refreshCiteCandidates();
+          selectedCiteIds = [];
+          paintCiteChips();
+          hideCitePicker();
         },
       });
     }
@@ -4001,9 +4339,10 @@ import("./features/notifications.js").then((notifications) => {
 // 动态加载，失败不影响主流程。同时把「查看记忆」注册进命令面板——
 // 两个 import 命中同一个模块缓存，registerPaletteCommand 是模块级注册表。
 import("./features/memory-panel.js").then((memory) => {
-  const memoryApi = memory.initMemoryPanel({
+  memoryPanelApi = memory.initMemoryPanel({
     onAnnounce: (msg) => announceStatus(msg),
     getWorkdir: () => workdirSelect?.value ?? "",
+    onClose: () => { void refreshGateChip(); },
   });
   import("./features/command-palette.js").then((palette) => {
     palette.registerPaletteCommand({
@@ -4011,7 +4350,7 @@ import("./features/memory-panel.js").then((memory) => {
       label: "查看记忆",
       hint: "打开记忆面板，审查 Agent 跨会话积累的内容",
       icon: "ph-brain",
-      run: () => memoryApi.open(),
+      run: () => memoryPanelApi?.open(),
     });
   }).catch(() => { /* 命令面板注册失败不影响面板本体 */ });
 }).catch(() => { /* 记忆面板是增强项，加载失败静默降级 */ });

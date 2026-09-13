@@ -2260,6 +2260,150 @@ describe("ui-server", () => {
     expect(row2.stopReason).toBe("completed");
   });
 
+  it("v2-17c. 完成态 plan 追问即使带 planMode 仍按单执行者跑", async () => {
+    const planJson = JSON.stringify({
+      subtasks: [
+        { id: "s1", title: "第一步", description: "做 A", acceptance: ["A 完成"], dependsOn: [] },
+      ],
+    });
+    const pass = (summary: string) =>
+      fakeMessage([textBlock(JSON.stringify({ passed: true, issues: [], summary }))], "end_turn");
+    const model = new FakeModelClient([
+      fakeMessage([textBlock(["```json", planJson, "```"].join("\n"))], "end_turn"),
+      fakeMessage([textBlock("s1 完成")], "end_turn"), pass("A 一致"),
+      fakeMessage([textBlock("按计划摘要继续改")], "end_turn"),
+    ]);
+    handle = createUiServer({ modelClient: model, tools: [autoTool("noop")], workdir: process.cwd() });
+    port = await startServer(handle);
+    base = baseUrl(port);
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "一步任务", mode: "plan", concurrency: 1 }),
+    })).json() as { runId: string };
+    await waitForDone(base, runId);
+
+    const res = await fetch(`${base}/api/runs/${runId}/messages`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "继续改", planMode: true, verify: false }),
+    });
+    expect(res.status).toBe(200);
+    await waitForDone(base, runId);
+    const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`)) as any[];
+    const um = [...events].reverse().find((e) => e.event.type === "user_message")!;
+    expect(um.event.continues).toBe("plan-summary");
+    const afterUm = events.filter((e) => e.seq > um.seq);
+    expect(afterUm.some((e) => e.source === "planner")).toBe(false);
+    expect(afterUm.some((e) => e.event.type === "plan_result")).toBe(false);
+    expect(afterUm.some((e) => e.source === "main" && e.event.type === "done")).toBe(true);
+  });
+
+  it("在飞追问时另一条 planMode 不得拆掉执行者 broker", async () => {
+    let releaseFollowUpModel!: () => void;
+    const followUpHeld = new Promise<void>((resolveHold) => {
+      releaseFollowUpModel = resolveHold;
+    });
+    let sendCount = 0;
+    const script = [
+      fakeMessage([textBlock("首轮完成")], "end_turn"),
+      fakeMessage([toolUseBlock("tu_live_bash", "bash", { command: "echo follow-up" })], "tool_use"),
+      fakeMessage([textBlock("追问跑完")], "end_turn"),
+    ];
+    const model: ModelClient = {
+      async send(req) {
+        sendCount += 1;
+        if (sendCount === 2) await followUpHeld;
+        const message = script[sendCount - 1];
+        if (!message) throw new Error(`script exhausted at call ${sendCount}`);
+        return { message, stopReason: message.stop_reason, usage: message.usage };
+      },
+    };
+    const boundaryFor = (boundaryId: string): ExecutionBoundaryStatus => ({
+      schemaVersion: 1,
+      boundaryId,
+      requestedMode: "required",
+      requestedBackend: "oci",
+      effectiveState: "partial",
+      resolvedBackend: "oci",
+      policyDigest: "a".repeat(64),
+      probe: { state: "ready", candidate: "oci" },
+      coverage: ["bash"],
+      filesystem: "ro root + rw workdir",
+      network: "none",
+      identity: "uid 65532",
+      resources: "limited",
+    });
+    const processBoundary = boundaryFor("process-probe");
+    const processBroker: ExecutionBroker = {
+      boundaryId: processBoundary.boundaryId,
+      status: () => processBoundary,
+      probe: async () => processBoundary,
+      executeShell: async (request) => ({
+        stdout: "", stderr: "", exitCode: 0, signal: null,
+        timedOut: false, aborted: request.signal.aborted, outputLimitExceeded: false,
+        cleanup: "runtime-rm", status: processBoundary,
+      }),
+    };
+    const created: Array<{ runId: string; disposed: boolean; commands: string[] }> = [];
+    handle = createUiServer({
+      modelClient: model,
+      tools: [{ ...bashTool, permission: "auto" }],
+      workdir: process.cwd(),
+      executionProbeBroker: processBroker,
+      executionBrokerFactory: (runId) => {
+        const state = { runId, disposed: false, commands: [] as string[] };
+        created.push(state);
+        const boundary = boundaryFor(runId);
+        return {
+          boundaryId: runId,
+          status: () => boundary,
+          probe: async () => boundary,
+          executeShell: async (request) => {
+            if (state.disposed) throw new Error("Execution broker is disposed.");
+            state.commands.push(request.command);
+            return {
+              stdout: "follow-up-ok\n", stderr: "", exitCode: 0, signal: null,
+              timedOut: false, aborted: request.signal.aborted, outputLimitExceeded: false,
+              cleanup: "runtime-rm", status: boundary,
+            };
+          },
+          dispose: async () => { state.disposed = true; },
+        };
+      },
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "先做完再追问" }),
+    })).json() as { runId: string };
+    await waitForDone(base, runId);
+
+    const followA = fetch(`${base}/api/runs/${runId}/messages`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "跑一下 echo", verify: false }),
+    });
+    const aRes = await followA;
+    expect(aRes.status).toBe(200);
+
+    const followB = await fetch(`${base}/api/runs/${runId}/messages`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "继续", planMode: true, verify: false }),
+    });
+    expect(followB.status).toBe(409);
+
+    releaseFollowUpModel();
+    await waitForDone(base, runId);
+    const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`)) as any[];
+    const dumped = JSON.stringify(events);
+    expect(dumped).not.toContain("Execution broker is disposed");
+    expect(dumped).toContain("follow-up-ok");
+    const um = [...events].reverse().find((e) => e.event.type === "user_message")!;
+    expect(um.event.text).toBe("跑一下 echo");
+    expect(events.filter((e) => e.event.type === "plan_result")).toHaveLength(0);
+    const followBroker = created.find((row) => row.commands.includes("echo follow-up"));
+    expect(followBroker).toBeDefined();
+  });
+
   it("v2-18. planner 产不出可解析计划时 fail-closed：planned=false 且零子任务执行", async () => {
     handle = createUiServer({
       modelClient: new FakeModelClient([
@@ -7063,11 +7207,34 @@ describe("B2 · 运行历史落盘", () => {
     expect(state.budget.usedTurns).toBe(2);
     // 两轮各一段 main：段号 0 / 1，检查点指向最后一段
     const meta = JSON.parse(await readFile(join(dir, runId, "meta.json"), "utf8"));
+    expect(meta.workspace).toBe("code");
     expect(meta.conversationTurn).toBe(2);
     expect(meta.checkpoint.segmentIndex).toBe(1);
     expect(meta.checkpoint.conversationTurn).toBe(2);
     // 预算沿谱系累计：两轮各一次模型调用
     expect(meta.checkpoint.runBudget.usedTurns).toBe(2);
+  });
+
+  it("新建 run 把 workspace 写入 meta 和列表；非法值 400", async () => {
+    dir = await mkdtemp(join(tmpdir(), "history-workspace-"));
+    await boot({
+      modelClient: new FakeModelClient([fakeMessage([textBlock("ok")], "end_turn")]),
+      tools: [autoTool("noop")],
+      workdir: process.cwd(),
+      history: dir,
+    });
+    const bad = await post("/api/runs", { task: "x", workspace: "cowork" });
+    expect(bad.status).toBe(400);
+    const { runId } = (await (await post("/api/runs", { task: "办公稿", workspace: "office", verify: false })).json()) as {
+      runId: string;
+    };
+    await waitForDone(base, runId);
+    const list = (await (await fetch(`${base}/api/runs`)).json()) as any[];
+    expect(list.find((r) => r.runId === runId)?.workspace).toBe("office");
+    await handle!.close();
+    handle = undefined;
+    const meta = JSON.parse(await readFile(join(dir, runId, "meta.json"), "utf8"));
+    expect(meta.workspace).toBe("office");
   });
 
   it("RUN-01：崩溃档案(meta=running)恢复后 phase=interrupted，不冒充可同 run 续跑", async () => {

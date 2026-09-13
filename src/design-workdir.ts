@@ -1,5 +1,6 @@
 /**
- * 设计模式稿目录：离开宿主源码仓库，落到独立草稿根。
+ * 设计模式稿目录：mkdir + 加入白名单。当前是宿主仓库时不自动切走——
+ * 否则记忆与运行档案会跟着 workdir 消失。空目录才默认用稿目录。
  *
  * 编码 / 硬件包仍用各自选的 workdir；这里只回答「设计稿该不该切走」。
  */
@@ -51,6 +52,6 @@ export function decideDesignDraftsSelection(opts: {
   if (sameWorkdirPath(cur, opts.draftsDir)) {
     return { select: false, reason: "already-drafts" };
   }
-  if (opts.currentIsHarness) return { select: true, reason: "host-repo" };
+  if (opts.currentIsHarness) return { select: false, reason: "host-repo" };
   return { select: false, reason: "custom" };
 }

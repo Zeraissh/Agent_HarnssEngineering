@@ -297,8 +297,8 @@ describe("axe 自动扫描：空态 / 列表 / 详情三种画面零 violations"
       plannerMs: 120,
       gated: true,
       subtasks: [
-        { id: "s1", title: "写固件", description: "", acceptance: [], dependsOn: [] },
-        { id: "s2", title: "烧录验证", description: "", acceptance: [], dependsOn: ["s1"] },
+        { id: "s1", title: "写固件", description: "改 main.c 并构建 ELF", acceptance: ["产物存在"], dependsOn: [] },
+        { id: "s2", title: "烧录验证", description: "烧到板子上读心跳", acceptance: ["heartbeat 递增"], dependsOn: ["s1"] },
       ],
     });
     push("host", { type: "plan_approval_request", at: 1000 });

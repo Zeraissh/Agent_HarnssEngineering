@@ -454,6 +454,7 @@ export function initMemoryPanel(host = {}, env = {}) {
     trigger?.setAttribute("aria-expanded", "false");
     if (restoreFocusTo && typeof restoreFocusTo.focus === "function") restoreFocusTo.focus();
     restoreFocusTo = null;
+    host.onClose?.();
   }
 
   // ---- 事件 ----

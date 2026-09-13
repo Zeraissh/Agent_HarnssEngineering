@@ -35,12 +35,12 @@ describe("harness 仓库识别", () => {
 describe("decideDesignDraftsSelection", () => {
   const drafts = resolve("/tmp/Fathom");
 
-  it("当前是宿主仓库 → 切到稿目录", () => {
+  it("当前是宿主仓库 → 不切走（只建议加入白名单）", () => {
     expect(decideDesignDraftsSelection({
       currentWorkdir: resolve("/repo/Agent_Design"),
       draftsDir: drafts,
       currentIsHarness: true,
-    })).toEqual({ select: true, reason: "host-repo" });
+    })).toEqual({ select: false, reason: "host-repo" });
   });
 
   it("已经在稿目录 → 不反复切", () => {

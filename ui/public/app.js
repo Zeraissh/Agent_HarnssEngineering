@@ -596,7 +596,19 @@ export function reduceEvent(state, sseEvent) {
         concurrency: Number(event.concurrency ?? 1),
         concurrencyMode: String(event.concurrencyMode ?? "fixed"),
         plannerMs: Number(event.plannerMs ?? 0),
-        subtasks: Array.isArray(event.subtasks) ? event.subtasks : [],
+        // 白名单投影：description / acceptance 是签字位正文，漏字段界面只剩标题。
+        subtasks: (Array.isArray(event.subtasks) ? event.subtasks : []).map((raw) => {
+          const t = raw && typeof raw === "object" ? raw : {};
+          return {
+            id: String(t.id ?? ""),
+            title: String(t.title ?? ""),
+            pack: t.pack == null || t.pack === "" ? null : String(t.pack),
+            description: typeof t.description === "string" ? t.description : "",
+            acceptance: Array.isArray(t.acceptance) ? t.acceptance.map(String) : [],
+            dependsOn: Array.isArray(t.dependsOn) ? t.dependsOn.map(String) : [],
+            resources: Array.isArray(t.resources) ? t.resources.map(String) : [],
+          };
+        }),
         // 门开着时这份计划还在等签字，界面不能显得像已经在跑
         gated: Boolean(event.gated),
       },
@@ -947,6 +959,14 @@ export function reduceEvent(state, sseEvent) {
           : null,
         // 工作区 git 身份：跟 workdir 走。不列出就会被白名单投影静默丢弃。
         workspaceGit: normalizeWorkspaceGit(event.workspaceGit),
+        // 点名引用：不列进白名单就会静默丢弃，对话里看不见引用了谁/哪些文件
+        cited: Array.isArray(event.cited)
+          ? event.cited.map((c) => ({
+              runId: String(c?.runId ?? ""),
+              title: String(c?.title ?? ""),
+              artifacts: Array.isArray(c?.artifacts) ? c.artifacts.map(String) : [],
+            })).filter((c) => c.runId)
+          : null,
       },
     };
   }
@@ -2077,9 +2097,10 @@ export function derivePlanFace(state) {
     if (computing.has(id)) return 0;
     computing.add(id);
     const t = byId.get(id);
-    const d = !t || t.dependsOn.length === 0
+    const deps = Array.isArray(t?.dependsOn) ? t.dependsOn : [];
+    const d = !t || deps.length === 0
       ? 0
-      : Math.max(...t.dependsOn.map((p) => depthOf(p) + 1));
+      : Math.max(...deps.map((p) => depthOf(p) + 1));
     computing.delete(id);
     depth.set(id, d);
     return d;
@@ -2087,6 +2108,9 @@ export function derivePlanFace(state) {
 
   const nodes = subs.map((t) => ({
     ...t,
+    description: typeof t.description === "string" ? t.description : "",
+    acceptance: Array.isArray(t.acceptance) ? t.acceptance.map(String) : [],
+    dependsOn: Array.isArray(t.dependsOn) ? t.dependsOn.map(String) : [],
     depth: depthOf(t.id),
     status: statusOf(t.id),
     durationMs: stepById.get(t.id)?.durationMs ?? null,
@@ -2787,6 +2811,8 @@ function blockedReason(info) {
  * verify 是**本轮**的核查开关；未给时不发字段，服务端沿用该 run 上一轮的设置。
  * autoApprove 也必须显式带上——归档派生 / 续跑是新的执行，不继承父 run 的活权限。
  * 勾着「自动放行」却不发这个字段，界面看起来开着、服务端仍会逐条问。
+ * planMode / multiAgent 只用于把**单轮对话**升级成编排；完成态计划追问
+ * 不要从常驻「计划」旋钮带上这两项——那会误开 planner。
  */
 export function buildFollowUpRequest({
   text, verify, autoApprove, planMode, multiAgent, effort,
@@ -2926,6 +2952,8 @@ export function buildNewRunRequest({
   designTab,
   designTemplate,
   designFilePack,
+  citedRunIds,
+  workspace,
 } = {}) {
   const trimmedRubric = String(rubric ?? "").trim();
   // 逐 run 上下文预算：空 / 非数字不传（沿用 env > 包 > 默认）；填了就原样交给宿主校验区间——
@@ -2955,6 +2983,9 @@ export function buildNewRunRequest({
   const wantMulti = multiAgent === true;
   const orchestrate = mode === "plan" || wantPlanGate || wantMulti;
   const wantDesign = mode === "design" && !orchestrate;
+  const workspaceFace = workspace === "office" || workspace === "code"
+    ? workspace
+    : wantDesign ? "office" : "code";
   const effectiveConcurrency =
     concurrency !== undefined && concurrency !== null && concurrency !== ""
       ? concurrency
@@ -2999,6 +3030,10 @@ export function buildNewRunRequest({
     // 与宿主既有契约一致：角色模型默认启用，只有显式关闭才传 false。
     ...(!useVerifierModel ? { useVerifierModel: false } : {}),
     ...(!usePlannerModel ? { usePlannerModel: false } : {}),
+    ...(Array.isArray(citedRunIds) && citedRunIds.filter(Boolean).length
+      ? { citedRunIds: [...new Set(citedRunIds.map(String).filter(Boolean))] }
+      : {}),
+    workspace: workspaceFace,
   };
 }
 
@@ -4033,6 +4068,19 @@ export function filterRunsByComposerWorkdir(runs, workdir, allProjects = false) 
   return runs.filter((r) => sameWorkdirPath(r.workdir, cur));
 }
 
+/** 办公脸：显式 workspace，或旧档案 packName=design。其余归编码。 */
+export function runBelongsToOffice(run) {
+  if (run?.workspace === "office") return true;
+  if (run?.workspace === "code") return false;
+  return run?.packName === "design" || run?.mode === "design";
+}
+
+export function filterRunsByWorkspaceFace(runs, face) {
+  const list = Array.isArray(runs) ? runs : [];
+  if (face === "office") return list.filter(runBelongsToOffice);
+  return list.filter((r) => !runBelongsToOffice(r));
+}
+
 // ---------------------------------------------------------------
 // 阶段二 新增：日志条目默认展开/折叠状态查询
 // ---------------------------------------------------------------
@@ -4206,6 +4254,76 @@ function patchRunGroupHeader(box, group, collapsed) {
  * 一条对话谱系在侧栏只露当前这一头。父归档被续跑接走之后再占一行，
  * 看起来像「又新开了对话」。
  */
+/**
+ * 进行中看板 → composer 门禁 chip。status 为 null 时藏起来，不占位。
+ * @param {{ nextGate?: string, waiting?: string[], summary?: string }|null|undefined} status
+ * @returns {{ hidden: boolean, label: string }}
+ */
+export function formatGateChip(status) {
+  if (!status || typeof status !== "object") return { hidden: true, label: "" };
+  const gate = String(status.nextGate ?? "").trim();
+  const waiting = Array.isArray(status.waiting)
+    ? status.waiting.map((w) => String(w ?? "").trim()).filter(Boolean)
+    : [];
+  if (!gate && waiting.length === 0) return { hidden: true, label: "" };
+  const parts = [];
+  if (gate) parts.push(`下一门：${gate}`);
+  if (waiting.length) parts.push(`${waiting.length} 人在等`);
+  return { hidden: false, label: parts.join(" · ") };
+}
+
+/** 把门禁 chip 画到已有按钮上。hidden 时清空文案，避免占位。 */
+export function paintGateChip(el, status) {
+  if (!el) return formatGateChip(status);
+  const face = formatGateChip(status);
+  el.hidden = face.hidden;
+  el.textContent = face.hidden ? "" : face.label;
+  return face;
+}
+
+/**
+ * run_config.cited → 对话里的引用卡。没有引用返回 null。
+ * @param {unknown} cited
+ * @returns {{ kind: "cite", refs: { runId: string, title: string, artifacts: string[] }[] }|null}
+ */
+export function deriveCitedChat(cited) {
+  if (!Array.isArray(cited) || cited.length === 0) return null;
+  const refs = cited.map((c) => ({
+    runId: String(c?.runId ?? ""),
+    title: String(c?.title ?? ""),
+    artifacts: Array.isArray(c?.artifacts) ? c.artifacts.map(String).filter(Boolean) : [],
+  })).filter((c) => c.runId);
+  if (!refs.length) return null;
+  return { kind: "cite", refs };
+}
+
+/** 输入框末尾的 @查询：没有 @ 触发则 null。 */
+export function composerCiteTrigger(text) {
+  const s = String(text ?? "");
+  const m = s.match(/(^|[\s])@([^\s@]*)$/);
+  if (!m) return null;
+  return { query: m[2] ?? "", start: (m.index ?? 0) + m[1].length };
+}
+
+/**
+ * 同 workdir 可见会话，给 composer @ 点名用。
+ * 不猜邻居：workdir 对不上的一律不进。
+ */
+export function sameWorkdirCiteRuns(runs, workdir) {
+  return visibleConversationRuns(filterRunsByComposerWorkdir(runs, workdir, false));
+}
+
+export function filterCiteCandidates(candidates, query) {
+  const q = String(query ?? "").trim().toLowerCase();
+  const list = Array.isArray(candidates) ? candidates : [];
+  if (!q) return list;
+  return list.filter((c) => {
+    const title = String(c?.title ?? "").toLowerCase();
+    const task = String(c?.task ?? "").toLowerCase();
+    return title.includes(q) || task.includes(q);
+  });
+}
+
 export function visibleConversationRuns(runs) {
   const superseded = new Set();
   for (const r of runs) {
@@ -5477,17 +5595,25 @@ function patchPlanGate(parts, state, faces, callbacks) {
     return;
   }
 
-  const count = state.plan?.subtasks?.length ?? 0;
-  const sig = signature(["pending", count]);
+  const plan = derivePlanFace(state);
+  const count = plan?.nodes?.length ?? state.plan?.subtasks?.length ?? 0;
+  const reviewSig = (plan?.nodes ?? []).map((n) =>
+    `${n.id}:${n.title}:${n.description}:${(n.acceptance ?? []).join("|")}:${(n.dependsOn ?? []).join(",")}`,
+  ).join(";");
+  const sig = signature(["pending", count, reviewSig]);
   if (parts.sig.planGate === sig) return;
   parts.sig.planGate = sig;
   setAttr(parts.planGate, "hidden", null);
 
+  const review = plan ? renderPlanReviewHtml(plan, { revealAcceptance: true }) : "";
   parts.planGate.innerHTML =
     '<div class="plan-gate-card">' +
     '<h3 class="rail-title">◈ 计划待你签字</h3>' +
-    `<p class="plan-gate-body">${ROLE_PERSONA.planner}（planner）已拆出 <strong>${count}</strong> 个子任务（详见 Plan 面）。` +
-    "批准后才会发射第一个子任务；此刻否决没有任何副作用。</p>" +
+    `<p class="plan-gate-body">${ROLE_PERSONA.planner}（planner）已拆出 <strong>${count}</strong> 个子任务。` +
+    "下面是每一步要做什么——批准后才会发射第一个子任务；此刻否决没有任何副作用。</p>" +
+    (review
+      ? `<div class="plan-gate-review" tabindex="0">${review}</div>`
+      : "") +
     '<div class="plan-gate-actions">' +
     '<button class="btn btn--allow" data-action="approve">批准并开跑</button>' +
     '<button class="btn btn--deny" data-action="reject">否决（中止本次运行）</button>' +
@@ -7468,14 +7594,7 @@ function patchPlanBoard(parts, host, plan) {
   }
 
   // 依赖分层：同层 = 互不依赖 = 可并发。这正是调度器在做的决策
-  html += '<ol class="plan-layers">';
-  plan.layers.forEach((layer, i) => {
-    html += `<li class="plan-layer"><span class="plan-layer-label">第 ${i + 1} 层${layer.length > 1 ? `（${layer.length} 个可并发）` : ""}</span>`;
-    html += '<div class="plan-nodes">';
-    for (const n of layer) html += renderPlanNode(n, plan.maxDuration);
-    html += "</div></li>";
-  });
-  html += "</ol>";
+  html += renderPlanReviewHtml(plan);
 
   if (plan.timing) {
     const t = plan.timing;
@@ -7530,29 +7649,56 @@ function renderAgentsCard(agents) {
   return html;
 }
 
-function renderPlanNode(n, maxDuration) {
+function renderPlanNode(n, maxDuration, opts = {}) {
   const mark = { passed: "✔", failed: "✘", skipped: "－", running: "●", pending: "○" }[n.status];
   const pct = n.durationMs ? Math.max(2, Math.round((n.durationMs / maxDuration) * 100)) : 0;
   const openable = n.status !== "pending";
+  const revealAcceptance = opts.revealAcceptance === true;
+  const deps = Array.isArray(n.dependsOn) ? n.dependsOn : [];
+  const brief = String(n.description ?? "").trim();
+  const acceptance = Array.isArray(n.acceptance) ? n.acceptance : [];
   let html = `<div class="plan-node plan-node--${n.status}${openable ? " plan-node--openable" : ""}">`;
   // 可点的是标题行，不是整张卡：卡里还有 <details>，套 role=button 会 nested-interactive。
   html += `<div class="plan-node-head"${openable ? ` data-agent-id="${esc(n.id)}" role="button" tabindex="0"` : ""}><span class="plan-node-mark">${mark}</span>`;
   html += `<code class="plan-node-id">${esc(n.id)}</code> <span class="plan-node-title">${esc(n.title)}</span></div>`;
   html += '<div class="plan-node-meta">';
   if (n.pack) html += `<span class="chip-perm">包 ${esc(n.pack)}</span>`;
-  if (n.dependsOn.length) html += `<span>⇐ ${esc(n.dependsOn.join(", "))}</span>`;
+  if (deps.length) html += `<span>⇐ ${esc(deps.join(", "))}</span>`;
   // 独占资源要显眼：同标签强制串行，是"为什么这两个没并发"的唯一解释
   if (n.resources?.length) html += `<span class="plan-node-res">⊘ 独占 ${esc(n.resources.join("、"))}</span>`;
   if (n.reworks) html += `<span>↺ 返工 ${n.reworks} 轮</span>`;
   if (n.durationMs != null) html += `<span>${formatDuration(n.durationMs)}</span>`;
   html += "</div>";
   if (pct > 0) html += `<div class="plan-bar"><div class="plan-bar-fill" style="width:${pct}%"></div></div>`;
-  if (n.acceptance?.length) {
-    html += `<details class="chat-aside"><summary>验收 ${n.acceptance.length} 条</summary><ul class="plan-acceptance">`;
-    html += n.acceptance.map((a) => `<li>${esc(a)}</li>`).join("");
-    html += "</ul></details>";
+  if (brief) html += `<p class="plan-node-brief">${esc(brief)}</p>`;
+  if (acceptance.length) {
+    const list = `<ul class="plan-acceptance">${acceptance.map((a) => `<li>${esc(a)}</li>`).join("")}</ul>`;
+    html += revealAcceptance
+      ? `<div class="plan-node-checks"><span class="plan-node-checks-label">验收 ${acceptance.length} 条</span>${list}</div>`
+      : `<details class="chat-aside"><summary>验收 ${acceptance.length} 条</summary>${list}</details>`;
   }
   html += "</div>";
+  return html;
+}
+
+/**
+ * 计划分层图（签字位 / 对话卡 / 右栏共用）。
+ * revealAcceptance：确认门上验收必须摊开，不能再藏进「详见 Plan 面」。
+ */
+export function renderPlanReviewHtml(plan, opts = {}) {
+  if (!plan || !Array.isArray(plan.layers) || plan.layers.length === 0) return "";
+  const revealAcceptance = opts.revealAcceptance === true;
+  let html = `<ol class="plan-layers${opts.className ? ` ${opts.className}` : ""}">`;
+  plan.layers.forEach((layer, i) => {
+    const nodes = Array.isArray(layer) ? layer : [];
+    html += `<li class="plan-layer"><span class="plan-layer-label">第 ${i + 1} 层${
+      nodes.length > 1 ? `（${nodes.length} 个可并发）` : ""
+    }</span>`;
+    html += '<div class="plan-nodes">';
+    for (const n of nodes) html += renderPlanNode(n, plan.maxDuration, { revealAcceptance });
+    html += "</div></li>";
+  });
+  html += "</ol>";
   return html;
 }
 
@@ -7801,6 +7947,10 @@ export function deriveChatItems(state, live, opts = {}) {
       runId: state.runId ?? null,
       ...(taskAt != null ? { at: taskAt } : {}),
     });
+  }
+  if (!agentId) {
+    const cited = deriveCitedChat(state.runConfig?.cited);
+    if (cited) items.push({ ...cited, seq: -0.8 });
   }
   const priorRecap = agentId ? "" : String(state.lineage?.priorRecap ?? "").trim();
   if (priorRecap) {
@@ -8983,16 +9133,7 @@ export function renderPlanChatCard(plan, { live = false, rawJson = null } = {}) 
     `${plan.nodes.length} 步 · 层宽 ${plan.parallelWidth}` +
     `${plan.concurrency ? ` · 并行度 ${plan.concurrency}` : ""}` +
     `</span></div>`;
-  html += '<ol class="plan-layers chat-plan-layers">';
-  plan.layers.forEach((layer, i) => {
-    html += `<li class="plan-layer"><span class="plan-layer-label">第 ${i + 1} 层${
-      layer.length > 1 ? `（${layer.length} 个可并发）` : ""
-    }</span>`;
-    html += '<div class="plan-nodes">';
-    for (const n of layer) html += renderPlanNode(n, plan.maxDuration);
-    html += "</div></li>";
-  });
-  html += "</ol>";
+  html += renderPlanReviewHtml(plan, { className: "chat-plan-layers" });
   if (rawJson) {
     html +=
       `<details class="chat-aside chat-plan-raw"><summary>查看原始 JSON</summary>` +
@@ -9301,6 +9442,21 @@ export function renderChatItem(it, thinkingOpen = false) {
       case "artifacts":
         html += renderChatArtifacts(it);
         break;
+      case "cite": {
+        const refs = Array.isArray(it.refs) ? it.refs : [];
+        const body = refs.map((ref) => {
+          const files = Array.isArray(ref.artifacts) && ref.artifacts.length
+            ? ref.artifacts.join("、")
+            : "无主产物";
+          return `${ref.title || formatRunKicker(ref.runId)} · ${files}`;
+        }).join("\n");
+        html +=
+          `<div class="chat-recap chat-cite" role="note">` +
+          `<div class="chat-recap-head">引用</div>` +
+          `<p class="chat-recap-body">${esc(body)}</p>` +
+          `</div>`;
+        break;
+      }
       case "recap": {
         const turns = Number(it.turns ?? 0);
         const head = turns > 0 ? `此前 ${turns} 轮` : "此前对话";
@@ -10414,34 +10570,42 @@ function renderVerdictCard(v) {
 }
 
 /**
- * 渲染空态提示。
- * @param {boolean} [hasRuns] - 列表是否已有运行记录
+ * 编码脸空态是作业清单，不是教具三字。点一下填进输入框，不直接开跑。
  */
-/**
- * 空态给的是**能点的例子**，不是一句"尚无运行"。
- *
- * 第一次打开时最难的不是不会用，而是不知道**这个 agent 到底能干什么**——
- * 一句"尚无运行"把这个问题原样退回给人。四个例子刻意各走一条不同的路：
- * 纯问答（不碰工具）、读代码（只读工具）、写文件（会触发审批门）、
- * 带核查的交付（三值裁决）。点一下填进输入框，**不直接开跑**——
- * 让人看清自己要提交什么，是这个 harness 一贯的做法。
- */
-export const EXAMPLE_TASKS = [
-  { label: "问", hint: "纯问答，不调用工具", text: "用三句话解释什么是 PID 控制器。不要调用工具。" },
-  { label: "读", hint: "总结当前工作目录", text: "看看当前工作目录里有哪些源文件，用一段话总结这个项目在做什么。" },
-  { label: "写", hint: "创建文件（会问审批）", text: "在工作目录下创建 hello.md，写一段这个项目的简介。" },
-  { label: "带独立核查的交付", text: "写一个 TypeScript 函数 clamp(n, min, max) 并配 vitest 测试，跑通后告诉我结果。" },
+export const CODE_STARTER_JOBS = [
+  {
+    id: "plan",
+    label: "从计划开始",
+    hint: "先对齐做法，再动代码",
+    text: "先对齐做法再动代码：看清这个仓库后，列出你打算改什么、怎么验收，等我同意再动手。",
+    plan: true,
+  },
+  {
+    id: "survey",
+    label: "看看这个仓库",
+    hint: "用一段话说明项目在做什么",
+    text: "看看当前工作目录里有哪些源文件，用一段话说明这个项目在做什么。",
+  },
+  {
+    id: "fix-test",
+    label: "修一处并跑通测试",
+    hint: "改代码，用测试当判据",
+    text: "找一处值得修的地方改掉，用相关测试当判据，跑通后告诉我结果。",
+  },
 ];
 
+/** @deprecated 教具三字已退役；兼容旧 import，内容就是编码作业。 */
+export const EXAMPLE_TASKS = CODE_STARTER_JOBS;
+
 /** 空态画廊只露出前三条。 */
-export const STARTER_EXAMPLE_TASKS = EXAMPLE_TASKS.slice(0, 3);
+export const STARTER_EXAMPLE_TASKS = CODE_STARTER_JOBS;
 
 /** 开会话时选的 design 模板（画布顶条不再放模板） */
 export const DESIGN_STARTER_TEMPLATES = [
   {
     id: "deck-basic",
     title: "多页幻灯",
-    hint: "一页一个主张，适合介绍与汇报",
+    hint: "封面主张，可导出 PPTX",
     prompt: "用多页幻灯做一套介绍：主题自拟，一页一个主张。",
   },
   {
@@ -10453,10 +10617,16 @@ export const DESIGN_STARTER_TEMPLATES = [
   {
     id: "landing-basic",
     title: "单页落地",
-    hint: "单页网站，适合产品或活动介绍",
+    hint: "一页介绍，浏览器里预览",
     prompt: "用落地页做一页介绍：主题自拟，不要外链。",
   },
 ];
+
+export const OFFICE_MORE_DRAFTS = Object.freeze({
+  id: "more",
+  title: "更多稿件",
+  hint: "原型、看板、邮件和其他样子",
+});
 
 export function designTemplateById(id) {
   return DESIGN_STARTER_TEMPLATES.find((t) => t.id === id) ?? null;
@@ -10984,42 +11154,61 @@ function renderDesignModeGallery(opts = {}) {
   );
 }
 
-/** 模板 + 示例统一成一套 starter-tile，画在 #starter-gallery。 */
+function renderJobTile({ title, hint, attrs }) {
+  return (
+    `<li><button type="button" class="starter-tile" ${attrs}` +
+    (hint ? ` title="${esc(hint)}"` : "") + `>` +
+    `<span class="starter-tile-title">${esc(title)}</span>` +
+    (hint ? `<span class="starter-tile-hint">${esc(hint)}</span>` : "") +
+    "</button></li>"
+  );
+}
+
+/** 模板 + 作业清单，画在 #starter-gallery。 */
 export function renderStarterGallery(opts = {}) {
   const root = document.getElementById("starter-gallery");
   if (!root) return;
-  root.classList.toggle("starter-gallery--design", Boolean(opts.designModeActive));
-  if (opts.designModeActive) {
+  const catalogOpen = Boolean(opts.designModeActive || opts.officeCatalogOpen);
+  const face = opts.workspaceFace === "office" ? "office" : "code";
+  root.classList.toggle("starter-gallery--design", catalogOpen);
+  root.classList.toggle("starter-gallery--jobs", !catalogOpen);
+  if (catalogOpen) {
     root.innerHTML = renderDesignModeGallery(opts);
     return;
   }
-  const selected = opts.selectedTemplate ? String(opts.selectedTemplate) : "";
-  const tiles = [
-    `<li><button type="button" class="starter-tile starter-tile--design-enter" data-design-mode-enter="1">` +
-    `<span class="starter-tile-title">设计模式</span>` +
-    `<span class="starter-tile-hint">做幻灯、海报、落地页</span>` +
-    "</button></li>",
-    ...DESIGN_STARTER_TEMPLATES.map((t) => {
-      const on = t.id === selected;
-      return (
-        `<li><button type="button" class="starter-tile${on ? " is-selected" : ""}" ` +
-        `data-design-template="${esc(t.id)}" aria-pressed="${on ? "true" : "false"}"` +
-        (t.hint ? ` title="${esc(t.hint)}"` : "") + `>` +
-        `<span class="starter-tile-title">${esc(t.title)}</span>` +
-        `<span class="starter-tile-hint">${esc(t.hint)}</span>` +
-        "</button></li>"
-      );
+  if (face === "office") {
+    const selected = opts.selectedTemplate ? String(opts.selectedTemplate) : "";
+    const tiles = [
+      ...DESIGN_STARTER_TEMPLATES.map((t) => {
+        const on = t.id === selected;
+        return (
+          `<li><button type="button" class="starter-tile${on ? " is-selected" : ""}" ` +
+          `data-design-template="${esc(t.id)}" aria-pressed="${on ? "true" : "false"}"` +
+          (t.hint ? ` title="${esc(t.hint)}"` : "") + `>` +
+          `<span class="starter-tile-title">${esc(t.title)}</span>` +
+          `<span class="starter-tile-hint">${esc(t.hint)}</span>` +
+          "</button></li>"
+        );
+      }),
+      renderJobTile({
+        title: OFFICE_MORE_DRAFTS.title,
+        hint: OFFICE_MORE_DRAFTS.hint,
+        attrs: `data-office-more="1"`,
+      }),
+    ];
+    root.innerHTML = `<ul class="starter-tiles starter-tiles--jobs">${tiles.join("")}</ul>`;
+    return;
+  }
+  const tiles = CODE_STARTER_JOBS.map((e) =>
+    renderJobTile({
+      title: e.label,
+      hint: e.hint,
+      attrs:
+        `data-example="${esc(e.text)}"` +
+        (e.plan ? ` data-starter-plan="1"` : ""),
     }),
-    ...STARTER_EXAMPLE_TASKS.map(
-      (e) =>
-        `<li><button type="button" class="starter-tile" data-example="${esc(e.text)}"` +
-        (e.hint ? ` title="${esc(e.hint)}"` : "") + `>` +
-        `<span class="starter-tile-title">${esc(e.label)}</span>` +
-        (e.hint ? `<span class="starter-tile-hint">${esc(e.hint)}</span>` : "") +
-        "</button></li>",
-    ),
-  ];
-  root.innerHTML = `<ul class="starter-tiles">${tiles.join("")}</ul>`;
+  );
+  root.innerHTML = `<ul class="starter-tiles starter-tiles--jobs">${tiles.join("")}</ul>`;
 }
 
 // ---------------------------------------------------------------

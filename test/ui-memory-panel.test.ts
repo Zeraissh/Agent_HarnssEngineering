@@ -318,6 +318,16 @@ describe("initMemoryPanel DOM 层", () => {
     expect(api.getState().listScope).toBe("all");
   });
 
+  it("关闭面板时通知宿主刷新门禁 chip", async () => {
+    const onClose = vi.fn();
+    const fetchFn = vi.fn(async () => mockResponse(200, LIST_PAYLOAD));
+    const api = initMemoryPanel({ onClose }, { fetchFn, now: () => NOW });
+    api.open();
+    await waitFor(() => document.querySelectorAll(".mem-item").length === 2);
+    api.close();
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
   it("幂等：重复初始化返回既有节点薄壳，不重复挂 DOM", async () => {
     const fetchFn = vi.fn(async () => mockResponse(200, LIST_PAYLOAD));
     const first = initMemoryPanel({}, { fetchFn, now: () => NOW });

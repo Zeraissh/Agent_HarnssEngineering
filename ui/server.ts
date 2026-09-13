@@ -200,6 +200,14 @@ import {
   withBootContext,
   type ThreadEventLike,
 } from "./conversation-context.js";
+import {
+  formatCiteBlock,
+  oneLineTask,
+  parseCitedRunIds,
+  resolveCiteArtifacts,
+  visibleCiteRuns,
+  type CiteRef,
+} from "./cite.js";
 import { aggregateUsage, parseLedgerLines } from "./usage.js";
 import { envUpdatesFromStore, upsertEnvKeys } from "./env-sync.js";
 import {
@@ -628,6 +636,8 @@ interface StoredRun {
   host?: "cli" | "web";
   /** V-27：编排模式。plan = 走 runPlanned；design = 设计模式门面（单执行者） */
   mode?: "single" | "plan" | "design";
+  /** 侧栏办公/编码脸；旧档案缺省，列表按 packName=design 回退 */
+  workspace?: "office" | "code";
   /** 设计模式路由结果，给界面照实说 */
   designRoute?: {
     id: string | null;
@@ -675,6 +685,14 @@ interface StoredRun {
   steeringQueue?: string[];
   /** 已进行的对话轮数（第 1 轮 = 建 run 时那次提交） */
   conversationTurn: number;
+  /**
+   * 对话轮驱动世代。follow-up / flush / 首轮各占一段；finalize 必须带同一世代，
+   * 否则不得发 run_end、不得拆 execution broker。真机事故：planner 抢先收尾
+   * 把还在跑的执行者 bash 拆成 "Execution broker is disposed."
+   */
+  turnDriverEpoch?: number;
+  /** 当前是否有一段对话轮驱动在飞（比 status=running 更早立上，挡住 TOCTOU） */
+  turnDriverActive?: boolean;
   /** V-29：本次运行的工作目录（工具写入圈禁根），必来自白名单 */
   workdir?: string;
   /** 工作区 git 身份（不带 remote URL）。跟 workdir 走，换包不消失。 */
@@ -770,6 +788,10 @@ interface StoredRun {
    * 只进执行者首轮任务书 / fresh 续跑反馈，不改写委托方原话、不冒充正史。
    */
   bootContext?: string;
+  /** 委托方点名引用的【引用】块；与 sibling boot 分开，不改 formatSiblingBootContext。 */
+  citeContext?: string;
+  /** 本 run 点名引用的会话（进 run_config，供界面画出引用了谁/哪些文件） */
+  cited?: Array<{ runId: string; title: string; artifacts: string[] }>;
   /** 仅供刚派生的新 run 装配首轮；完成后 checkpoint 会从真实 done 事件重建。 */
   resumeBudget?: SharedRunBudget;
   initialContextInputTokens?: number;
@@ -3328,6 +3350,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       packName: run.packName ?? pack?.name ?? null,
       // 档案 mode 仍是 plan | single：设计模式是单执行者门面，不另开归档形状
       mode: run.mode === "plan" ? "plan" : "single",
+      workspace: run.workspace === "office" || run.workspace === "code"
+        ? run.workspace
+        : (run.mode === "design" || run.packName === "design" ? "office" : "code"),
       effort: run.effort ?? null,
       rubric: run.rubric ?? null,
       workdir: run.workdir ?? workdir,
@@ -3496,6 +3521,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           ...(typeof a.meta.packName === "string" && a.meta.packName
             ? { packName: a.meta.packName }
             : {}),
+          ...(a.meta.workspace === "office" || a.meta.workspace === "code"
+            ? { workspace: a.meta.workspace }
+            : a.meta.packName === "design"
+              ? { workspace: "office" as const }
+              : {}),
           ...(a.meta.mode === "plan" ? { mode: "plan" as const } : {}),
           ...(typeof a.meta.effort === "string" &&
           (EFFORT_LEVELS as readonly string[]).includes(a.meta.effort)
@@ -3814,6 +3844,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       createdAt: r.createdAt,
       finishedAt: r.finishedAt ?? null,
       packName: r.packName ?? pack?.name ?? null,
+      workspace: r.workspace === "office" || r.workspace === "code"
+        ? r.workspace
+        : (r.mode === "design" || r.packName === "design" ? "office" : "code"),
       ...(r.packRoute ? { packRoute: r.packRoute } : {}),
       stopReason: r.mainStopReason ?? null,
       // 活 run 走 outcome，归档 run 走 meta 里的摘要——列表列不因重启而变
@@ -5274,13 +5307,18 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     run: StoredRun,
     text: string,
   ): Promise<{ ok: true } | { ok: false; error: string }> {
-    if (run.archived || run.status !== "done") {
+    if (run.archived || run.status !== "done" || run.turnDriverActive) {
+      return { ok: false, error: "run 不在可续跑状态（已归档或仍在运行）" };
+    }
+    const epoch = tryClaimTurnDriver(run);
+    if (epoch == null) {
       return { ok: false, error: "run 不在可续跑状态（已归档或仍在运行）" };
     }
     prepareLineageBudgetForContinuation(run);
     // 与路由同序：执行健康先于日预算，日预算先于并发准入（拒因更具体的先说）
     await refreshExecutionHealth(true);
     if (!executionHealthy) {
+      releaseTurnDriver(run, epoch);
       return {
         ok: false,
         error: `Required command isolation is unavailable: ${processExecutionStatus.probe.reason ?? "backend probe failed"}`,
@@ -5289,16 +5327,21 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     if (run.dailyBudget !== false) {
       const budgetRefusal = dailyBudgetRefusal();
       if (budgetRefusal) {
+        releaseTurnDriver(run, epoch);
         return { ok: false, error: `日 token 预算已用尽（${budgetRefusal.used}/${budgetRefusal.budget}）` };
       }
     }
     const releaseAdmission = acquireRunAdmission();
-    if (!releaseAdmission) return { ok: false, error: "并发容量已满" };
+    if (!releaseAdmission) {
+      releaseTurnDriver(run, epoch);
+      return { ok: false, error: "并发容量已满" };
+    }
     try {
       const resumePack = run.packName ? getPack(run.packName) : pack;
       const resumeResources = resumePack?.resources ?? [];
       const resourceOutcome = tryAcquireRunResources(run.id, resumeResources);
       if (resourceOutcome !== "acquired") {
+        releaseTurnDriver(run, epoch);
         return {
           ok: false,
           error: `Exclusive resource "${resourceOutcome.conflict}" is held by run ${resourceOutcome.heldBy}`,
@@ -5307,6 +5350,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       const workdirRejection = sharedWorkdirRejection(run.id, run.workdir ?? workdir);
       if (workdirRejection) {
         hostResources.release(resumeResources, run.id);
+        releaseTurnDriver(run, epoch);
         return { ok: false, error: `Workdir is in use by running run ${workdirRejection.conflictRunId}` };
       }
       if (resumeResources.length) run.heldResources = resumeResources;
@@ -5319,7 +5363,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         });
       }
       void withFallbackAttribution(run, () =>
-        startConversationTurn(run, text, { verify: run.verify }),
+        startConversationTurn(run, text, { verify: run.verify, driverEpoch: epoch }),
       );
       return { ok: true };
     } finally {
@@ -5352,15 +5396,41 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     });
   }
 
+  function tryClaimTurnDriver(run: StoredRun): number | null {
+    if (run.turnDriverActive) return null;
+    run.turnDriverActive = true;
+    run.turnDriverEpoch = (run.turnDriverEpoch ?? 0) + 1;
+    return run.turnDriverEpoch;
+  }
+
+  function releaseTurnDriver(run: StoredRun, epoch: number): void {
+    if (run.turnDriverEpoch !== epoch) return;
+    run.turnDriverActive = false;
+  }
+
+  function turnDriverInFlight(run: StoredRun): boolean {
+    return run.status === "running" || Boolean(run.turnDriverActive);
+  }
+
+  function conversationHasCompletedPlan(run: StoredRun): boolean {
+    return Boolean(run.planSummary) || Boolean(run.planNodes?.length);
+  }
+
   /**
    * 标记 run 完成并关闭所有 SSE 连接。
    *
    * 顺序是契约的一部分：先把仍挂起的审批逐条宣告过期，再发 run_end，最后才断流。
    * run_end 恒为最后一条 durable 事件——它同时是"整个 run 结束了"的唯一权威信号
    * （段级 done 不是）与客户端"可以主动 close，不要再自动重连"的信号。
+   *
+   * `driverEpoch`：这段驱动收尾时必须仍是当前世代。过期的 finally（另一段
+   * planner/执行者已经接着跑，或宿主已权威 stop）不得拆还在用的 broker。
+   * 不传 epoch = 权威收尾（停止 / 关停），仍受 status===done 幂等保护。
    */
-  function finalizeRun(run: StoredRun, endInfo: RunEndInfo): void {
+  function finalizeRun(run: StoredRun, endInfo: RunEndInfo, driverEpoch?: number): void {
+    if (driverEpoch !== undefined && driverEpoch !== run.turnDriverEpoch) return;
     if (run.status === "done") return; // 幂等：异常路径可能重复调用
+    run.turnDriverActive = false;
 
     for (const pending of run.pendingApprovals.values()) {
       pushSyntheticEvent(run, "host", {
@@ -5663,13 +5733,15 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
   /** 启动一次不带核查的运行 */
   async function startPlainRun(run: StoredRun): Promise<void> {
+    const epoch = tryClaimTurnDriver(run);
+    if (epoch == null) return;
     await ensureMcp(run.packName ? getPack(run.packName) : pack); // 必须在 buildConfig 之前：工具面要么齐要么别开跑
     if (!(await pushRunConfig(run))) {
       finalizeRun(run, {
         outcome: "error",
         mainStopReason: "execution_unavailable",
         error: ledgerErrorClass("execution_unavailable"),
-      });
+      }, epoch);
       return;
     }
     applyDurableTransition(run, { type: "start" });
@@ -5683,7 +5755,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     let mainStopReason: string | undefined;
     let mainError: string | null = null;
     try {
-      for await (const event of loop.run(withBootContext(run.task, run.bootContext), run.abort?.signal)) {
+      for await (const event of loop.run(firstTurnPrompt(run), run.abort?.signal)) {
         if (event.type === "done") {
           mainStopReason = event.result.stopReason;
           if (event.result.stopReason === "error" && event.result.error) {
@@ -5711,7 +5783,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         outcome: runOutcomeForStopReason(mainStopReason),
         ...(mainStopReason ? { mainStopReason } : {}),
         ...(mainError || mainStopReason === "error" ? { error: mainError ?? ledgerErrorClass("error") } : {}),
-      });
+      }, epoch);
     }
   }
 
@@ -5759,6 +5831,38 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       recap: best.conversationRecap || recapFromRunEvents(best) || null,
       conversationTurn: best.conversationTurn,
     });
+  }
+
+  /** 首轮任务书 = 原话 + 点名引用 + sibling boot。两段分开装配，不改 sibling 默认文案。 */
+  function firstTurnPrompt(run: StoredRun): string {
+    const extras = [run.citeContext, run.bootContext].filter((s): s is string => Boolean(s?.trim()));
+    return withBootContext(run.task, extras.length ? extras.join("\n\n") : undefined);
+  }
+
+  async function assembleCitedRefs(
+    citedRunIds: string[],
+    targetWorkdir: string,
+  ): Promise<{ block: string; refs: NonNullable<StoredRun["cited"]> }> {
+    if (!citedRunIds.length) return { block: "", refs: [] };
+    const root = resolve(targetWorkdir);
+    const artifacts = await resolveCiteArtifacts(root);
+    const refs: CiteRef[] = [];
+    for (const id of citedRunIds) {
+      const r = runs.get(id);
+      if (!r) continue;
+      if (resolve(r.workdir ?? workdir) !== root) continue;
+      refs.push({
+        runId: r.id,
+        title: resolveRunTitle(r.title, r.task),
+        task: oneLineTask(r.task),
+        recap: r.conversationRecap || recapFromRunEvents(r) || null,
+        artifacts,
+      });
+    }
+    return {
+      block: formatCiteBlock(refs),
+      refs: refs.map((c) => ({ runId: c.runId, title: c.title, artifacts: c.artifacts })),
+    };
   }
 
   function executorSwitchOf(run: StoredRun): {
@@ -5888,8 +5992,14 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       concurrency?: number | "auto";
       /** AGENT-01：带着上一份节点状态重跑 planner，而不是单执行者追问 */
       replan?: boolean;
+      /** 路由已占住的驱动世代；缺省则本函数自己占 */
+      driverEpoch?: number;
     },
   ): Promise<void> {
+    const epoch = turn.driverEpoch !== undefined
+      ? (run.turnDriverActive && run.turnDriverEpoch === turn.driverEpoch ? turn.driverEpoch : null)
+      : tryClaimTurnDriver(run);
+    if (epoch == null) return;
     const previousTurn = run.conversationTurn;
     const switchInfo = executorSwitchOf(run);
     const history = historyForContinuation(run, switchInfo);
@@ -5971,11 +6081,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           handoffs: run.planHandoffs ?? {},
         },
         skipClarifier: true,
+        driverEpoch: epoch,
       });
       return;
     }
     if (turn.orchestrate) {
-      await startPlannedRun(run, executorFeedback, { skipClarifier: true });
+      await startPlannedRun(run, executorFeedback, { skipClarifier: true, driverEpoch: epoch });
       return;
     }
     await executeTurn(run, {
@@ -5984,6 +6095,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       executorFeedback,
       verify: turn.verify,
       signal: abort.signal,
+      driverEpoch: epoch,
     });
   }
 
@@ -6005,6 +6117,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       executorFeedback: string;
       verify: boolean;
       signal: AbortSignal;
+      driverEpoch: number;
     },
   ): Promise<void> {
     await ensureMcp(run.packName ? getPack(run.packName) : pack);
@@ -6013,7 +6126,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         outcome: "error",
         mainStopReason: "execution_unavailable",
         error: ledgerErrorClass("execution_unavailable"),
-      });
+      }, turn.driverEpoch);
       return;
     }
     const cfg = await buildRunConfig(run);
@@ -6026,7 +6139,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       await runVerifiedTurn(run, cfg, continuationVerifyTask(run.task, turn.feedback), {
         ...(turn.history ? { history: turn.history } : {}),
         feedback: turn.executorFeedback,
-      });
+      }, turn.driverEpoch);
       return;
     }
 
@@ -6063,7 +6176,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         outcome: runOutcomeForStopReason(mainStopReason),
         ...(mainStopReason ? { mainStopReason } : {}),
         ...(mainError || mainStopReason === "error" ? { error: mainError ?? ledgerErrorClass("error") } : {}),
-      });
+      }, turn.driverEpoch);
     }
   }
 
@@ -6131,6 +6244,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       return;
     }
 
+    const epoch = tryClaimTurnDriver(run);
+    if (epoch == null) return;
+
     const resumeAt = Date.now();
     applyDurableTransition(run, { type: "resume", at: resumeAt });
 
@@ -6185,8 +6301,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         .map((n) => n.id);
       pushSyntheticEvent(run, "host", hostPlanResumeEvent({ kept, remaining, reason: feedback }));
       persistMeta(run);
-      await startPlannedRun(run, withBootContext(run.task, run.bootContext), {
+      await startPlannedRun(run, firstTurnPrompt(run), {
         resume: { nodes: run.planNodes, handoffs: run.planHandoffs ?? {} },
+        driverEpoch: epoch,
       });
       return;
     }
@@ -6196,7 +6313,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       run.concurrency = turn.concurrency ?? (turn.planGate ? 1 : "auto");
       run.planGate = Boolean(turn.planGate);
       persistMeta(run);
-      await startPlannedRun(run, feedback, { skipClarifier: true });
+      await startPlannedRun(run, feedback, { skipClarifier: true, driverEpoch: epoch });
       return;
     }
 
@@ -6215,6 +6332,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         : feedback,
       verify: turn.verify,
       signal: run.abort?.signal ?? new AbortController().signal,
+      driverEpoch: epoch,
     });
   }
 
@@ -6279,7 +6397,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       ...(parent.askUser ? { askUser: true } : {}),
       ...(parent.autoApprove ? { autoApprove: true } : {}),
       ...(parent.permissionMode ? { permissionMode: parent.permissionMode } : {}),
-      ...(parent.mode === "plan" ? { mode: "plan" as const } : {}),
+      ...(parent.mode === "plan" ? { mode: "plan" as const } : parent.mode === "design" ? { mode: "design" as const } : {}),
+      ...(parent.workspace === "office" || parent.workspace === "code"
+        ? { workspace: parent.workspace }
+        : parent.mode === "design" || parent.packName === "design"
+          ? { workspace: "office" as const }
+          : { workspace: "code" as const }),
       ...(parent.contextTokenLimit !== undefined ? { contextTokenLimit: parent.contextTokenLimit } : {}),
       ...(parent.lastExecutorRoleId ? { lastExecutorRoleId: parent.lastExecutorRoleId } : {}),
       ...(parent.lastExecutorIdentityKey ? { lastExecutorIdentityKey: parent.lastExecutorIdentityKey } : {}),
@@ -6401,7 +6524,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       ...(parent.askUser ? { askUser: true } : {}),
       ...(parent.autoApprove ? { autoApprove: true } : {}),
       ...(parent.permissionMode ? { permissionMode: parent.permissionMode } : {}),
-      ...(parent.mode === "plan" ? { mode: "plan" as const } : {}),
+      ...(parent.mode === "plan" ? { mode: "plan" as const } : parent.mode === "design" ? { mode: "design" as const } : {}),
+      ...(parent.workspace === "office" || parent.workspace === "code"
+        ? { workspace: parent.workspace }
+        : parent.mode === "design" || parent.packName === "design"
+          ? { workspace: "office" as const }
+          : { workspace: "code" as const }),
       ...(parent.contextTokenLimit !== undefined ? { contextTokenLimit: parent.contextTokenLimit } : {}),
       ...(parent.lastExecutorRoleId ? { lastExecutorRoleId: parent.lastExecutorRoleId } : {}),
       ...(parent.lastExecutorIdentityKey ? { lastExecutorIdentityKey: parent.lastExecutorIdentityKey } : {}),
@@ -6519,6 +6647,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       return;
     }
 
+    const epoch = tryClaimTurnDriver(run);
+    if (epoch == null) return;
+
     applyDurableTransition(run, { type: "start" });
 
     // 第一条 durable 事件就是环境边界；即使 MCP 连接很慢，人也能立刻看懂
@@ -6581,7 +6712,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       run.concurrency = turn.concurrency ?? (turn.planGate ? 1 : "auto");
       run.planGate = Boolean(turn.planGate);
       persistMeta(run);
-      await startPlannedRun(run, feedback, { skipClarifier: true });
+      await startPlannedRun(run, feedback, { skipClarifier: true, driverEpoch: epoch });
       return;
     }
     await executeTurn(run, {
@@ -6597,6 +6728,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       ),
       verify: turn.verify,
       signal: run.abort?.signal ?? new AbortController().signal,
+      driverEpoch: epoch,
     });
   }
 
@@ -6615,7 +6747,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    */
   async function startPlannedRun(
     run: StoredRun,
-    taskText = withBootContext(run.task, run.bootContext),
+    taskText = firstTurnPrompt(run),
     extras?: {
       replan?: {
         originalTask: string;
@@ -6628,15 +6760,20 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         handoffs: Record<string, string>;
       };
       skipClarifier?: boolean;
+      driverEpoch?: number;
     },
   ): Promise<void> {
+    const epoch = extras?.driverEpoch !== undefined
+      ? (run.turnDriverActive && run.turnDriverEpoch === extras.driverEpoch ? extras.driverEpoch : null)
+      : tryClaimTurnDriver(run);
+    if (epoch == null) return;
     await ensureMcp(run.packName ? getPack(run.packName) : pack);
     if (!(await pushRunConfig(run))) {
       finalizeRun(run, {
         outcome: "error",
         mainStopReason: "execution_unavailable",
         error: ledgerErrorClass("execution_unavailable"),
-      });
+      }, epoch);
       return;
     }
     if (!extras?.resume) applyDurableTransition(run, { type: "plan_begin" });
@@ -6920,26 +7057,28 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         outcome: runOutcomeForStopReason(mainStopReason),
         ...(mainStopReason ? { mainStopReason } : {}),
         ...(mainError || mainStopReason === "error" ? { error: mainError ?? ledgerErrorClass("error") } : {}),
-      });
+      }, epoch);
     }
   }
 
   /** 启动一次带核查的运行 */
   async function startVerifiedRun(run: StoredRun): Promise<void> {
+    const epoch = tryClaimTurnDriver(run);
+    if (epoch == null) return;
     await ensureMcp(run.packName ? getPack(run.packName) : pack);
     if (!(await pushRunConfig(run))) {
       finalizeRun(run, {
         outcome: "error",
         mainStopReason: "execution_unavailable",
         error: ledgerErrorClass("execution_unavailable"),
-      });
+      }, epoch);
       return;
     }
     applyDurableTransition(run, { type: "start" });
     const cfg = await buildRunConfig(run);
     // 信息队列·插队（核查轮同口径；核查者的配置在 orchestrate 里被剥掉这个钩子）
     cfg.steering = { drain: () => (run.steeringQueue ?? []).splice(0) };
-    await runVerifiedTurn(run, cfg, withBootContext(run.task, run.bootContext));
+    await runVerifiedTurn(run, cfg, firstTurnPrompt(run), undefined, epoch);
   }
 
   /**
@@ -6954,6 +7093,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     cfg: AgentConfig,
     task: string,
     continuation?: VerifiedRunOptions["continuation"],
+    driverEpoch?: number,
   ): Promise<void> {
     const judgedTurn = run.conversationTurn;
     let mainStopReason: string | undefined;
@@ -7018,7 +7158,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         outcome: runOutcomeForStopReason(mainStopReason),
         ...(mainStopReason ? { mainStopReason } : {}),
         ...(mainError || mainStopReason === "error" ? { error: mainError ?? ledgerErrorClass("error") } : {}),
-      });
+      }, driverEpoch);
     }
   }
 
@@ -7244,6 +7384,13 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         : null,
       agentMd: agentMdView(agentMdForRun(run)),
       workspaceGit: run.workspaceGit ?? { present: false },
+      cited: Array.isArray(run.cited) && run.cited.length
+        ? run.cited.map((c) => ({
+            runId: c.runId,
+            title: c.title,
+            artifacts: Array.isArray(c.artifacts) ? c.artifacts.map(String) : [],
+          }))
+        : null,
     });
   }
 
@@ -7880,6 +8027,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     | { type: "workdirsList" }
     | { type: "workdirAdd" }
     | { type: "designDraftsWorkdir" }
+    | { type: "citeCandidates"; workdir: string | null }
     | { type: "workdirRemove" }
     | { type: "workspaceGitGet"; workdir: string | null }
     | { type: "workspaceGitCheckout" }
@@ -8001,6 +8149,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     }
     if (method === "POST" && url === "/api/design-drafts-workdir") {
       return { type: "designDraftsWorkdir" };
+    }
+    const citeCandidatesMatch = method === "GET" && url.match(/^\/api\/cite-candidates(?:\?(.*))?$/);
+    if (citeCandidatesMatch) {
+      const params = new URLSearchParams(citeCandidatesMatch[1] ?? "");
+      return { type: "citeCandidates", workdir: params.get("workdir") };
     }
     if (method === "DELETE" && url === "/api/workdirs") {
       return { type: "workdirRemove" };
@@ -8343,6 +8496,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     designTab?: string;
     designTemplate?: string;
     designFilePack?: string;
+    citedRunIds?: unknown;
+    workspace?: string;
   }
 
   /** 准入结果：HTTP 处理器把它写成响应；调度器把非 200 记成 lastTrigger=error */
@@ -8416,6 +8571,14 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     ) {
       return { status: 400, payload: { error: `mode "${parsed.mode}" 无效。可选：single | plan | design` } };
     }
+    if (
+      parsed.workspace !== undefined &&
+      parsed.workspace !== "" &&
+      parsed.workspace !== "office" &&
+      parsed.workspace !== "code"
+    ) {
+      return { status: 400, payload: { error: `workspace "${parsed.workspace}" 无效。可选：office | code` } };
+    }
     let permissionMode: PermissionMode | undefined;
     if (parsed.permissionMode !== undefined && parsed.permissionMode !== "") {
       if (!(PERMISSION_MODES as readonly string[]).includes(String(parsed.permissionMode))) {
@@ -8486,6 +8649,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       return { status: 400, payload: { error: extraParsed.error } };
     }
     const extraWorkdirs = extraParsed.extraWorkdirs;
+    const admittedWorkspace: "office" | "code" | undefined =
+      parsed.workspace === "office" || parsed.workspace === "code"
+        ? parsed.workspace
+        : undefined;
 
     let packRoute: { pack: string | null; reason: string } | undefined;
     let admittedDesignRoute: DesignRoute | undefined;
@@ -8617,6 +8784,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       ...(packRoute ? { packRoute } : {}),
       ...(parsed.effort ? { effort: parsed.effort as Effort } : {}),
       ...(parsed.rubric ? { rubric: parsed.rubric } : {}),
+      workspace: admittedWorkspace ?? (wantsDesign ? "office" : "code"),
       ...(wantsOrchestrate
         ? { mode: "plan" as const }
         : wantsDesign
@@ -8645,6 +8813,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     if (extras?.parentRunId) run.continuedFrom = extras.parentRunId;
     const boot = resolveSiblingBootContext(parsed.task, run.workdir ?? workdir, id);
     if (boot) run.bootContext = boot;
+    const citedIds = parseCitedRunIds(parsed.citedRunIds);
+    if (citedIds.length) {
+      const assembled = await assembleCitedRefs(citedIds, run.workdir ?? workdir);
+      if (assembled.block) run.citeContext = assembled.block;
+      if (assembled.refs.length) run.cited = assembled.refs;
+    }
     // B2：建档要在第一条事件之前——writer 的写入链从 mkdir 开始保序
     if (historyRoot) {
       run.archiveWriter = createArchiveWriter(id);
@@ -9751,6 +9925,28 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         return json(res, 200, { path: target, parent, name: mkdirParsed.name.trim() });
       }
 
+      case "citeCandidates": {
+        const listed = listedWorkdir(route.workdir);
+        if (!listed.ok) return json(res, listed.status, { error: listed.error });
+        const root = listed.path;
+        const artifacts = await resolveCiteArtifacts(root);
+        const rows = [...runs.values()]
+          .filter((r) => resolve(r.workdir ?? workdir) === root)
+          .map((r) => ({
+            runId: r.id,
+            title: resolveRunTitle(r.title, r.task),
+            task: oneLineTask(r.task),
+            conversationRecap: r.conversationRecap || recapFromRunEvents(r) || null,
+            continuedFrom: r.continuedFrom ?? null,
+            createdAt: r.createdAt,
+            artifacts,
+          }));
+        const candidates = visibleCiteRuns(rows)
+          .sort((a, b) => b.createdAt - a.createdAt)
+          .map(({ continuedFrom: _c, createdAt: _t, ...rest }) => rest);
+        return json(res, 200, { workdir: root, candidates });
+      }
+
       case "memoryList": {
         /**
          * T5 记忆面板：默认 current = 当前项目 + 全局教训 + 进行中看板。
@@ -10322,14 +10518,14 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
          * 编排类选项（planMode / multiAgent / mode:"plan"）只能开启新的一轮，
          * 运行中塞不进去，当场 400 说清楚，不静默降级成普通排队。
          */
-        if (!run.archived && run.status === "running") {
+        if (!run.archived && turnDriverInFlight(run)) {
           let earlyBody: string;
           try {
             earlyBody = await readBody(req, requestBodyMaxBytes);
           } catch (error) {
             return requestBodyFailure(res, error);
           }
-          let earlyParsed: { text?: unknown; mode?: unknown };
+          let earlyParsed: { text?: unknown; mode?: unknown; planMode?: unknown; multiAgent?: unknown };
           try {
             earlyParsed = JSON.parse(earlyBody);
           } catch {
@@ -10341,6 +10537,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           const earlyMode = earlyParsed.mode ?? "queue";
           if (earlyMode !== "steer" && earlyMode !== "queue") {
             return badRequest(res, '运行中 mode 只接受 "steer"（插队重想）或 "queue"（排队等待，缺省）；编排模式的追加请等本轮结束');
+          }
+          const earlyWantsPlan =
+            earlyParsed.planMode === true || earlyParsed.multiAgent === true || earlyParsed.mode === "plan";
+          // 完成态计划对话勾着计划旋钮不算重开 DAG——按普通排队收，不 409。
+          if (earlyWantsPlan && !conversationHasCompletedPlan(run)) {
+            return json(res, 409, { error: "运行进行中，编排模式的追加请等本轮结束（或改用排队/插队）" });
           }
           return enqueueRunningMessage(res, run, earlyParsed.text.trim(), earlyMode);
         }
@@ -10406,8 +10608,13 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         if (parsed.replan === true && !run.planNodes?.length) {
           return badRequest(res, "replan 需要上一份计划的节点状态；本对话还没有可重规划的计划");
         }
-        const turnOrchestrate = parsed.multiAgent === true || parsed.planMode === true || parsed.mode === "plan";
-        const turnPlanGate = parsed.planMode === true || parsed.planGate === true;
+        const wantsNewPlan = parsed.multiAgent === true || parsed.planMode === true || parsed.mode === "plan";
+        // 完成态 plan 追问续的是对话不是 DAG。权限档「计划」会让界面一直带 planMode，
+        // 再开 planner 的 run_end 会拆掉还在跑的执行者 broker。要重开编排请传 replan。
+        const turnOrchestrate = wantsNewPlan && !conversationHasCompletedPlan(run);
+        const turnPlanGate =
+          (parsed.planMode === true || parsed.planGate === true) &&
+          (turnOrchestrate || parsed.replan === true);
         if (turnPlanGate && !turnOrchestrate && parsed.replan !== true) {
           return badRequest(res, "planGate 仅在编排（planMode 或 multiAgent）下有意义");
         }
@@ -10429,16 +10636,32 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         // 信息队列之后这里也不再 409：与主门同口径按 mode 入队（编排类选项
         // 塞不进在跑的一轮，那条路径在 readBody 前的 400 已经说清了——能走到
         // 这儿的编排请求同样拒绝，不静默降级）。
-        if (!run.archived && run.status === "running") {
+        if (!run.archived && turnDriverInFlight(run)) {
           if (turnOrchestrate) {
             return json(res, 409, { error: "运行进行中，编排模式的追加请等本轮结束（或改用排队/插队）" });
           }
           const raceMode = parsed.mode === "steer" ? "steer" : "queue";
           return enqueueRunningMessage(res, run, feedback, raceMode);
         }
+        let claimedEpoch: number | undefined;
+        if (!run.archived) {
+          const epoch = tryClaimTurnDriver(run);
+          if (epoch == null) {
+            if (turnOrchestrate) {
+              return json(res, 409, { error: "运行进行中，编排模式的追加请等本轮结束（或改用排队/插队）" });
+            }
+            const raceMode = parsed.mode === "steer" ? "steer" : "queue";
+            return enqueueRunningMessage(res, run, feedback, raceMode);
+          }
+          claimedEpoch = epoch;
+        }
+        const releaseClaimedDriver = (): void => {
+          if (claimedEpoch !== undefined) releaseTurnDriver(run, claimedEpoch);
+        };
         // 续跑也是新的执行 segment：绕过 createRun 路由不等于绕过隔离准入。
         await refreshExecutionHealth(true);
         if (!executionHealthy) {
+          releaseClaimedDriver();
           return json(res, 503, {
             error:
               `Required command isolation is unavailable: ${processExecutionStatus.probe.reason ?? "backend probe failed"}`,
@@ -10448,10 +10671,16 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         // 追问/归档派生同属新的执行准入：日预算门先于并发门（拒因更具体）
         if (run.dailyBudget !== false) {
           const budgetRefusal = dailyBudgetRefusal();
-          if (budgetRefusal) return rejectAtDailyBudget(res, budgetRefusal);
+          if (budgetRefusal) {
+            releaseClaimedDriver();
+            return rejectAtDailyBudget(res, budgetRefusal);
+          }
         }
         const releaseAdmission = acquireRunAdmission();
-        if (!releaseAdmission) return rejectAtCapacity(res);
+        if (!releaseAdmission) {
+          releaseClaimedDriver();
+          return rejectAtCapacity(res);
+        }
 
         if (run.archived) {
           try {
@@ -10814,17 +11043,20 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         // 按子任务粒度管，这里不整占（与 createRun 同口径）。
         const liveAssembled = await applyFollowUpAssembly(run, parsed, feedback);
         if (!liveAssembled.ok) {
+          releaseClaimedDriver();
           releaseAdmission();
           return badRequest(res, liveAssembled.error);
         }
         const resumePack = run.packName ? getPack(run.packName) : pack;
         const resumeResources = (turnOrchestrate || parsed.replan === true) ? [] : (resumePack?.resources ?? []);
         if (acquireRunResources(res, run.id, resumeResources) === "refused") {
+          releaseClaimedDriver();
           releaseAdmission();
           return;
         }
         if (refuseOrWarnSharedWorkdir(res, run.id, run.workdir ?? workdir, run.id)) {
           hostResources.release(resumeResources, run.id);
+          releaseClaimedDriver();
           releaseAdmission();
           return;
         }
@@ -10841,6 +11073,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         // startConversationTurn 在第一个 await 之前就把轮数加过了，这里不能再 +1
         void withFallbackAttribution(run, () => startConversationTurn(run, feedback, {
           verify: turnVerify,
+          ...(claimedEpoch !== undefined ? { driverEpoch: claimedEpoch } : {}),
           ...(parsed.replan === true ? { replan: true, planGate: turnPlanGate } : {}),
           ...(turnOrchestrate
             ? {
