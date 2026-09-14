@@ -15,6 +15,7 @@ export interface McpServerPublic {
 
 export interface McpServerWrite extends McpServerPublic {
   env?: Record<string, string>;
+  requiredEnv?: string[];
 }
 
 const SECRET_KEY = /(?:key|token|secret|password|passwd|authorization)/i;
@@ -80,6 +81,19 @@ export function applyMcpServerPatch(
   if (patch.url !== undefined) prev.url = String(patch.url ?? "").trim();
   if (patch.enabled !== undefined) prev.enabled = Boolean(patch.enabled);
   if (patch.permission !== undefined) prev.permission = patch.permission === "auto" ? "auto" : "ask";
+  if (patch.env !== undefined) {
+    const prevEnv =
+      prev.env && typeof prev.env === "object" && !Array.isArray(prev.env)
+        ? { ...(prev.env as Record<string, unknown>) }
+        : {};
+    for (const [key, value] of Object.entries(patch.env)) {
+      prevEnv[key] = String(value ?? "");
+    }
+    prev.env = prevEnv;
+  }
+  if (patch.requiredEnv !== undefined) {
+    prev.requiredEnv = patch.requiredEnv.map(String);
+  }
   if (!prev.command && !prev.url) {
     throw new Error("MCP 服务需要 command（stdio）或 url（HTTP）");
   }

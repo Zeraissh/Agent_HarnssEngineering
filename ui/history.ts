@@ -130,7 +130,22 @@ export interface ArchivedMeta {
   createdAt: number;
   finishedAt: number | null;
   packName: string | null;
+  /**
+   * 档案执行形状仍只有 single | plan。设计是单执行者门面，不另开 DurableRun mode。
+   * 设计脸靠 facade + designRoute，避免 meta 看起来像换了一种产品。
+   */
   mode: "single" | "plan";
+  /** 设计门面。旧档案缺省；有则列表不得只剩 single 当普通对话。 */
+  facade?: "design";
+  /** 设计路由快照；旧档案缺省。追问改成 single 执行后仍应保留。 */
+  designRoute?: {
+    id: string | null;
+    reason: string;
+    seed: string;
+    kind: string;
+    bundle?: string | null;
+    extraSeeds?: string[];
+  };
   /** 侧栏办公/编码脸；旧档案缺省，前端按 packName=design 回退 */
   workspace?: "office" | "code";
   effort: string | null;
@@ -138,6 +153,12 @@ export interface ArchivedMeta {
   workdir: string | null;
   /** 勾选的额外白名单目录（本次只读根）；旧档案缺省 */
   extraWorkdirs?: string[];
+  /** 所属项目。slug / 侧栏分组跟这个 id；旧档案缺省。 */
+  projectId?: string;
+  /** 战役 id；旧档案缺省。 */
+  campaignId?: string;
+  /** 导演 / 子对话；旧档案缺省。 */
+  campaignRole?: "director" | "child";
   conversationTurn: number;
   planGate: boolean;
   planDecision: { decision: "approve" | "reject"; at: number } | null;

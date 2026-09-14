@@ -1,16 +1,27 @@
 import { describe, expect, it } from "vitest";
-import { buildStoreZip, zipEntryName } from "../ui/zip.js";
+import { isSameDirSiteAsset, shouldSkipSiteZipName, siteRefsFromText } from "../ui/zip.js";
 
-describe("buildStoreZip", () => {
-  it("打出可读的 store ZIP，拒绝 ..", () => {
-    expect(() => zipEntryName("../x")).toThrow();
-    const zip = buildStoreZip([
-      { name: "index.html", data: Buffer.from("<h1>hi</h1>", "utf8") },
-      { name: "a/style.css", data: Buffer.from("body{}", "utf8") },
+describe("site-zip 过滤", () => {
+  it("跳过 _qa / webb_* / 下划线目录 / node_modules", () => {
+    expect(shouldSkipSiteZipName("_qa")).toBe(true);
+    expect(shouldSkipSiteZipName("webb_research")).toBe(true);
+    expect(shouldSkipSiteZipName("_hidden")).toBe(true);
+    expect(shouldSkipSiteZipName("node_modules")).toBe(true);
+    expect(shouldSkipSiteZipName(".git")).toBe(true);
+    expect(shouldSkipSiteZipName("css")).toBe(false);
+    expect(shouldSkipSiteZipName("index.html")).toBe(false);
+  });
+
+  it("同目录站点资产含 css/js，不含 png 调研图", () => {
+    expect(isSameDirSiteAsset("style.css")).toBe(true);
+    expect(isSameDirSiteAsset("app.js")).toBe(true);
+    expect(isSameDirSiteAsset("noise.png")).toBe(false);
+  });
+
+  it("抽出相对 href/src/url，忽略协议与锚点", () => {
+    expect(siteRefsFromText('<link href="style.css"><img src="https://x/a.png"><a href="#top">')).toEqual([
+      "style.css",
     ]);
-    expect(zip.subarray(0, 4).equals(Buffer.from([0x50, 0x4b, 0x03, 0x04]))).toBe(true);
-    expect(zip.includes(Buffer.from("index.html", "utf8"))).toBe(true);
-    expect(zip.includes(Buffer.from("<h1>hi</h1>", "utf8"))).toBe(true);
-    expect(zip.includes(Buffer.from("a/style.css", "utf8"))).toBe(true);
+    expect(siteRefsFromText("body{background:url(./hero.svg)}")).toEqual(["./hero.svg"]);
   });
 });

@@ -193,7 +193,7 @@ export function renderWorkdirMenu(menu, workdirs, selection = {}) {
 
   const hint = doc.createElement("p");
   hint.className = "wd-menu-hint";
-  hint.textContent = "勾选的目录本次都可以读写。主目录是默认写入位置。";
+  hint.textContent = "勾选的目录本次都可以读写。设为主只换默认写入点，不会把旧主目录自动勾回。";
   menu.appendChild(hint);
 
   const list = doc.createElement("div");
@@ -335,7 +335,7 @@ export function initWorkdirCombobox(root, hooks = {}, env = {}) {
       const cur = getWorkdirSelection(select);
       applyWorkdirSelection(select, listedWorkdirs(), {
         primary: path,
-        extras: [...cur.extras, cur.primary].filter((p) => p && p !== path),
+        extras: cur.extras.filter((p) => p && p !== path),
       });
       emitChange();
       return;

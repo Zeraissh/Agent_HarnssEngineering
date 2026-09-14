@@ -6,7 +6,9 @@
 <title>FATHOM 控制台</title>
 <link rel="icon" href="/fathom-mark.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/vendor/phosphor/style.css">
+<link rel="stylesheet" href="/vendor/katex/katex.min.css">
 <link rel="stylesheet" href="/styles.css">
+<script defer src="/vendor/katex/katex.min.js"></script>
 <script>
 // 主题在样式表生效前就定下来，否则从 localStorage 恢复暗色时会先闪一帧亮色。
 // auto 不写 data-theme，交给 prefers-color-scheme；其余主题在首帧前显式恢复。
@@ -29,7 +31,7 @@
   <h1>FATHOM 控制台</h1>
 </header>
 
-<!-- 侧栏：分脸 → 新建 → 会话列表；工具进底栏图标 -->
+<!-- 侧栏：品牌 → 顶栏图标 → 分脸 → 新建 → 搜索 → 会话列表；其余工具留底栏 -->
 <aside class="sidebar" id="sidebar" data-workspace-face="code">
   <div class="sidebar-header">
     <div class="sidebar-brand">
@@ -52,62 +54,11 @@
       <i class="ph ph-caret-left" aria-hidden="true"></i>
     </button>
   </div>
-  <div class="workspace-face" id="workspace-face" role="radiogroup" aria-label="工作区">
-    <button type="button" class="workspace-face-tab" role="radio" id="workspace-face-office"
-      data-workspace-face="office" aria-checked="false">办公</button>
-    <button type="button" class="workspace-face-tab is-selected" role="radio" id="workspace-face-code"
-      data-workspace-face="code" aria-checked="true">编码</button>
-  </div>
-  <div class="sidebar-search">
-    <button type="button" class="btn btn--primary new-chat-btn" id="new-chat-btn">
-      <i class="ph ph-plus" aria-hidden="true"></i>
-      <span>新建对话</span>
-    </button>
-    <div class="run-search-row">
-      <div class="run-search-field">
-        <i class="ph ph-magnifying-glass" aria-hidden="true"></i>
-        <label for="run-search" class="sr-only">搜索对话</label>
-        <input type="search" id="run-search" class="run-search" placeholder="搜索对话…" autocomplete="off" />
-      </div>
-      <button type="button" class="icon-btn sidebar-filter-btn" id="sidebar-filter-btn"
-        aria-label="筛选对话" aria-haspopup="true" aria-expanded="false">
-        <i class="ph ph-sliders-horizontal" aria-hidden="true"></i>
-      </button>
-      <div class="sidebar-filter-menu" id="sidebar-filter-menu" hidden>
-        <label class="sidebar-project-filter">
-          <input type="checkbox" id="sidebar-all-projects" />
-          全部项目
-        </label>
-        <select class="run-filter" id="run-filter" aria-label="按状态筛选对话">
-          <option value="all">全部</option>
-          <option value="running">运行中</option>
-          <option value="done">已完成</option>
-          <option value="failed">未通过</option>
-        </select>
-      </div>
-    </div>
-  </div>
-  <!-- role=listbox / aria-label 由 renderRunList 动态挂载：listbox 必须含 option
-       子项（aria-required-children），空态/加载态若静态带着 role 反而是 critical
-       违规——这条是 axe 扫描器上线首跑抓到的（s3d 手工修复引入的新问题） -->
-  <div id="run-list" class="run-list">
-    <div class="run-list-empty">加载中…</div>
-  </div>
-  <div class="sidebar-footer sidebar-footer--icons">
-    <button type="button" class="icon-btn" id="board-open-btn" aria-label="打开指挥中心">
-      <i class="ph ph-squares-four" aria-hidden="true"></i>
-    </button>
-    <button type="button" class="icon-btn" id="schedules-open-btn" aria-label="打开定时任务">
-      <i class="ph ph-clock" aria-hidden="true"></i>
-    </button>
+  <div class="sidebar-top-tools">
     <button type="button" class="icon-btn notifications-btn" id="notifications-btn"
       aria-label="通知中心" aria-haspopup="dialog" aria-expanded="false">
       <i class="ph ph-bell" aria-hidden="true"></i>
       <span class="notifications-badge" id="notifications-badge" hidden>0</span>
-    </button>
-    <button type="button" class="icon-btn memory-btn" id="memory-btn"
-      aria-label="记忆" aria-haspopup="dialog" aria-expanded="false">
-      <i class="ph ph-brain" aria-hidden="true"></i>
     </button>
     <div class="theme-picker" id="theme-picker">
       <button type="button" class="theme-toggle icon-btn" id="theme-toggle"
@@ -142,6 +93,62 @@
         </button>
       </div>
     </div>
+  </div>
+  <div class="workspace-face" id="workspace-face" role="radiogroup" aria-label="工作区">
+    <button type="button" class="workspace-face-tab" role="radio" id="workspace-face-office"
+      data-workspace-face="office" aria-checked="false">Work</button>
+    <button type="button" class="workspace-face-tab is-selected" role="radio" id="workspace-face-code"
+      data-workspace-face="code" aria-checked="true">Code</button>
+  </div>
+  <div class="sidebar-search">
+    <button type="button" class="btn btn--primary new-chat-btn" id="new-chat-btn">
+      <i class="ph ph-plus" aria-hidden="true"></i>
+      <span>新建对话</span>
+    </button>
+    <div class="run-search-row">
+      <div class="run-search-field">
+        <i class="ph ph-magnifying-glass" aria-hidden="true"></i>
+        <label for="run-search" class="sr-only">筛选对话列表，回车按正文全局搜索</label>
+        <input type="search" id="run-search" class="run-search" placeholder="搜索对话…" autocomplete="off" />
+      </div>
+      <button type="button" class="icon-btn sidebar-filter-btn" id="sidebar-filter-btn"
+        aria-label="筛选对话" aria-haspopup="true" aria-expanded="false">
+        <i class="ph ph-sliders-horizontal" aria-hidden="true"></i>
+      </button>
+      <div class="sidebar-filter-menu" id="sidebar-filter-menu" hidden>
+        <label class="sidebar-project-filter">
+          <input type="checkbox" id="sidebar-all-projects" />
+          全部项目
+        </label>
+        <select class="run-filter" id="run-filter" aria-label="按状态筛选对话">
+          <option value="all">全部</option>
+          <option value="running">运行中</option>
+          <option value="done">已完成</option>
+          <option value="failed">未通过</option>
+        </select>
+      </div>
+    </div>
+  </div>
+  <!-- role=listbox / aria-label 由 renderRunList 动态挂载：listbox 必须含 option
+       子项（aria-required-children），空态/加载态若静态带着 role 反而是 critical
+       违规——这条是 axe 扫描器上线首跑抓到的（s3d 手工修复引入的新问题） -->
+  <div id="run-list" class="run-list">
+    <div class="run-list-empty">加载中…</div>
+  </div>
+  <div class="sidebar-footer sidebar-footer--icons">
+    <button type="button" class="icon-btn" id="board-open-btn" aria-label="打开指挥中心">
+      <i class="ph ph-squares-four" aria-hidden="true"></i>
+    </button>
+    <button type="button" class="icon-btn" id="artifacts-open-btn" aria-label="打开产物">
+      <i class="ph ph-folder-open" aria-hidden="true"></i>
+    </button>
+    <button type="button" class="icon-btn" id="schedules-open-btn" aria-label="打开定时任务">
+      <i class="ph ph-clock" aria-hidden="true"></i>
+    </button>
+    <button type="button" class="icon-btn memory-btn" id="memory-btn"
+      aria-label="记忆" aria-haspopup="dialog" aria-expanded="false">
+      <i class="ph ph-brain" aria-hidden="true"></i>
+    </button>
     <button type="button" class="icon-btn" id="settings-open-btn" aria-label="打开设置">
       <i class="ph ph-gear" aria-hidden="true"></i>
     </button>
@@ -209,6 +216,13 @@
        胶囊铬（chip / 图标发送 / 紧凑输入）对话态与欢迎态共用；欢迎只多居中和起步卡。 -->
   <form id="submit-form" class="submit-bar" autocomplete="off">
     <div class="composer-scopebar" id="composer-scopebar">
+      <div class="scope-field scope-field--project" id="project-field">
+        <i class="ph ph-briefcase" aria-hidden="true"></i>
+        <label class="sr-only" for="project-select">项目</label>
+        <select id="project-select" class="wd-trigger" aria-label="项目">
+          <option value="">未入项（按目录）</option>
+        </select>
+      </div>
       <div class="scope-field scope-field--workdir" id="workdir-combobox">
         <i class="ph ph-folder-simple" aria-hidden="true"></i>
         <label id="workdir-label" class="sr-only" for="workdir-trigger">工作目录</label>
@@ -351,6 +365,13 @@
       </button>
     </p>
     <p id="composer-note" class="composer-note knob-hint" hidden></p>
+    <p id="plan-mode-hint" class="design-drafts-hint plan-mode-hint" hidden role="status">
+      <span id="plan-mode-hint-text"></span>
+      <button type="button" id="plan-mode-hint-switch" class="btn btn--ghost">改用普通模式</button>
+      <button type="button" id="plan-mode-hint-dismiss" class="btn btn--ghost inline-error-close" aria-label="关闭提示">
+        <i class="ph ph-x" aria-hidden="true"></i>
+      </button>
+    </p>
     <div id="budget-extend-row" class="budget-extend-row" hidden>
       <button type="button" id="budget-extend-btn" class="btn btn--ghost">
         <i class="ph ph-plus-circle" aria-hidden="true"></i>
@@ -469,6 +490,12 @@ import {
   filterRunsByQuery,
   filterRunsByComposerWorkdir,
   filterRunsByWorkspaceFace,
+  composerListMembership,
+  inferWorkdirFace,
+  workdirVisibleOnFace,
+  composerCwdForProject,
+  sameWorkdirPath,
+  pickWelcomeWorkdir,
   conversationTipId,
   renderRunList,
   readCollapsedWorkdirGroups,
@@ -488,8 +515,10 @@ import {
   composePromptWithLook,
   nextDesignSampleState,
   nextDesignLookState,
+  harnessVisionConfigured,
   deriveComposerMode,
   composerSubmitPlan,
+  suggestPlainModeInsteadOfPlan,
   buildNewRunRequest,
   buildFollowUpRequest,
   mergeForkedFollowUp,
@@ -515,6 +544,7 @@ import {
   sameWorkdirCiteRuns,
   filterCiteCandidates,
   composerCiteTrigger,
+  formatCiteChip,
 } from "/app.js";
 import {
   loadSettings,
@@ -528,7 +558,7 @@ import {
   initSettingsView,
 } from "/features/settings.js";
 import { initOnboarding } from "/features/onboarding.js";
-import { appendReviewToInput, attachDesignEditScope } from "/features/review-mode.js";
+import { appendReviewToInput } from "/features/review-mode.js";
 import {
   isSchedulesRoute,
   SCHEDULES_HASH,
@@ -562,6 +592,11 @@ import {
   COMMAND_CENTER_HASH,
   initCommandCenterView,
 } from "/features/command-center.js";
+import {
+  isArtifactsRoute,
+  ARTIFACTS_HASH,
+  initArtifactsView,
+} from "/features/artifacts.js";
 import {
   isUsageRoute,
   USAGE_HASH,
@@ -814,6 +849,10 @@ let enteredSchedulesFromApp = false;
  */
 let boardApi = /** @type {null|{ open:()=>void, close:()=>void, isOpen:()=>boolean, refresh:()=>void }} */ (null);
 let enteredBoardFromApp = false;
+let artifactsApi = /** @type {null|{ open:(filter?:{projectId?:string,workdir?:string})=>void, close:()=>void, isOpen:()=>boolean, refresh:()=>void }} */ (null);
+let enteredArtifactsFromApp = false;
+/** @type {{ projectId?:string, workdir?:string }|null} */
+let artifactsFilter = null;
 let uiSettings = (() => {
   try {
     const loaded = loadSettings(localStorage);
@@ -932,6 +971,7 @@ function syncScrollNav() {
     }
     const sampleCard = e.target.closest?.("[data-design-sample]");
     if (sampleCard) {
+      if (sampleCard.disabled || sampleCard.getAttribute("aria-disabled") === "true") return;
       applyDesignSample(sampleCard.getAttribute("data-design-sample"), { toggle: true });
       return;
     }
@@ -1064,6 +1104,10 @@ const multiAgentToggle = /** @type {HTMLInputElement|null} */ (document.getEleme
 const autoApproveToggle = /** @type {HTMLInputElement} */ (document.getElementById("auto-approve-toggle"));
 const permissionModeSelect = /** @type {HTMLSelectElement|null} */ (document.getElementById("permission-mode-select"));
 const workdirSelect = /** @type {HTMLSelectElement} */ (document.getElementById("workdir-select"));
+const projectSelect = /** @type {HTMLSelectElement|null} */ (document.getElementById("project-select"));
+const PROJECT_ADD_VALUE = "__new_project__";
+/** @type {Array<{id:string,name:string,workdirs:string[],primaryWorkdir:string,createdAt:string}>} */
+let availableProjects = [];
 /** @type {null|{ paint:()=>void, open:()=>void, close:()=>void, isOpen:()=>boolean }} */
 let workdirComboboxApi = null;
 /** @type {null|{ paint:()=>void, refresh:()=>Promise<unknown>, checkout:(b:string)=>Promise<void>, close:()=>void }} */
@@ -1219,6 +1263,11 @@ function applyWorkspaceFace(next, { persist = true, refresh = true } = {}) {
   const prev = workspaceFace;
   workspaceFace = face;
   if (persist) writePrefString(PREF_WORKSPACE_FACE, face);
+  if (prev !== face && workdirSelect) {
+    rememberWorkdirForFace(prev);
+    paintWorkdirsForFace();
+    restoreWorkdirForFace(face);
+  }
   if (face === "office") {
     if (prev !== "office" && verifyToggle) {
       codeVerifyPref = verifyToggle.checked;
@@ -1260,6 +1309,7 @@ function paintEmptyState() {
     catalog: designCatalog,
     installedFilePacks: designFilePacks,
     designRouteHint,
+    visionConfigured: harnessVisionConfigured(harnessSnapshot),
   });
   syncWelcomeComposerField();
 }
@@ -1396,13 +1446,13 @@ function applyDesignTemplate(id, { toggle = false } = {}) {
 // ---- 运行列表刷新 ----
 function getFilteredRuns() {
   const allProjects = document.getElementById("sidebar-all-projects")?.checked === true;
-  const composerWorkdir = workdirSelect?.value ?? "";
+  const faced = filterRunsByWorkspaceFace(runs, workspaceFace);
+  const project = allProjects ? null : selectedComposerProject();
   return filterRunsByQuery(
     filterRunsByStatus(
-      filterRunsByWorkspaceFace(
-        filterRunsByComposerWorkdir(runs, composerWorkdir, allProjects),
-        workspaceFace,
-      ),
+      project
+        ? filterRunsByComposerWorkdir(faced, "", false, composerListMembership(project))
+        : faced,
       runStates,
       currentFilter,
     ),
@@ -1422,10 +1472,12 @@ function refreshRunListView() {
   const metaMap = deriveRunListItems(filtered, runStates, unreadRuns);
   renderRunList(filtered, selectedRunId, selectRun, metaMap, deleteConversation, {
     collapsed: readCollapsedWorkdirGroups(),
+    projects: availableProjects,
     onToggle: (key) => {
       toggleCollapsedWorkdirGroup(key);
       refreshRunListView();
     },
+    onOpenArtifacts: (projectId) => navigateToArtifacts({ projectId }),
   });
   if (!selectedRunId) {
     paintEmptyState();
@@ -1459,6 +1511,7 @@ async function loadRuns() {
     const res = await fetch("/api/runs");
     if (!res.ok) return;
     runs = await res.json();
+    maybeRepaintWorkdirsForFace();
     refreshRunListView();
     if (selectedRunId) syncAutoApprove(selectedRunId);
     // 列表是通知中心对历史 run 的对账来源（首次调用只播种，不刷屏）
@@ -1599,6 +1652,7 @@ function writeHash(runId, tab) {
   settingsApi?.close();
   schedulesApi?.close();
   boardApi?.close();
+  artifactsApi?.close();
   usageApi?.close();
   artifactCanvasApi?.close();
   pendingArtifact = null;
@@ -1607,17 +1661,16 @@ function writeHash(runId, tab) {
 }
 
 /**
- * 六路路由：设置视图 / 定时任务视图 / 指挥中心 / 产物画布 / 会话详情 / 主视图。
- * 设置路由的判定与 features/settings.js 的 isSettingsRoute 共用一条，不各写一份。
- * 定时任务路由同理（features/schedules.js 的 isSchedulesRoute）。
- * 指挥中心同理（features/command-center.js 的 isCommandCenterRoute）。
- * 产物画布（features/artifact-canvas.js 的 parseArtifactRoute）必须先于通用
- * `#/run/<id>/<tab>` 判定——否则 "artifact/3" 会被 normalizeTab 吞成 loop。
+ * 七路路由：设置 / 定时任务 / 指挥中心 / 产物画廊 / 产物画布 / 会话详情 / 主视图。
+ * 各独立视图的判定与对应 features/*.js 共用一条，不各写一份。
+ * 产物画布（parseArtifactRoute）必须先于通用 `#/run/<id>/<tab>`——
+ * 否则 "artifact/3" 会被 normalizeTab 吞成 loop。
  */
 function parseRoute() {
   if (isSettingsRoute(location.hash || "")) return { kind: "settings" };
   if (isSchedulesRoute(location.hash || "")) return { kind: "schedules" };
   if (isCommandCenterRoute(location.hash || "")) return { kind: "board" };
+  if (isArtifactsRoute(location.hash || "")) return { kind: "artifacts" };
   if (isUsageRoute(location.hash || "")) return { kind: "usage" };
   const artifact = parseArtifactRoute(location.hash || "");
   if (artifact) return { kind: "artifact", runId: artifact.runId, index: artifact.index, full: artifact.full };
@@ -1701,11 +1754,63 @@ function closeUsageRoute() {
   location.hash = "#/";
 }
 
+function currentArtifactsFilter() {
+  const project = selectedComposerProject();
+  if (project?.id) return { projectId: project.id };
+  const wd = workdirSelect?.value;
+  if (wd && wd !== WORKDIR_ADD_VALUE) return { workdir: wd };
+  const snapWd = harnessSnapshot?.workdir;
+  if (snapWd) return { workdir: snapWd };
+  return {};
+}
+
+/** 进入产物画廊：与设置视图同一条 hash 路由纪律 */
+function navigateToArtifacts(filter) {
+  enteredArtifactsFromApp = true;
+  artifactsFilter = filter ?? currentArtifactsFilter();
+  if (isArtifactsRoute(location.hash || "")) {
+    artifactsApi?.open(artifactsFilter);
+    return;
+  }
+  location.hash = ARTIFACTS_HASH;
+}
+
+function closeArtifactsRoute() {
+  if (enteredArtifactsFromApp && history.length > 1) {
+    history.back();
+    return;
+  }
+  location.hash = "#/";
+}
+
+function openGalleryArtifact(card) {
+  if (card?.runId && card?.rel) {
+    openArtifactByPath(card.runId, card.rel);
+    return;
+  }
+  enteredArtifactsFromApp = false;
+  artifactsApi?.close();
+  if (location.hash === ARTIFACTS_HASH) {
+    suppressHashHandling = true;
+    location.hash = "#/";
+    setTimeout(() => { suppressHashHandling = false; }, 0);
+  }
+  if (!filePreviewApi || !card?.rel) {
+    announceStatus("没有会话可以预览这份产物");
+    return;
+  }
+  filePreviewApi.open({
+    path: card.rel,
+    url: buildFilePreviewUrl({ path: card.rel, workdir: card.workdir }),
+  });
+}
+
 function applyHash() {
   const route = parseRoute();
   if (route.kind === "settings") {
     schedulesApi?.close();
     boardApi?.close();
+    artifactsApi?.close();
     usageApi?.close();
     settingsApi?.open();
     return;
@@ -1713,6 +1818,7 @@ function applyHash() {
   if (route.kind === "schedules") {
     settingsApi?.close();
     boardApi?.close();
+    artifactsApi?.close();
     usageApi?.close();
     schedulesApi?.open();
     return;
@@ -1720,16 +1826,28 @@ function applyHash() {
   if (route.kind === "board") {
     settingsApi?.close();
     schedulesApi?.close();
+    artifactsApi?.close();
     usageApi?.close();
     artifactCanvasApi?.close();
     pendingArtifact = null;
     boardApi?.open();
     return;
   }
+  if (route.kind === "artifacts") {
+    settingsApi?.close();
+    schedulesApi?.close();
+    boardApi?.close();
+    usageApi?.close();
+    artifactCanvasApi?.close();
+    pendingArtifact = null;
+    artifactsApi?.open(artifactsFilter ?? currentArtifactsFilter());
+    return;
+  }
   if (route.kind === "usage") {
     settingsApi?.close();
     schedulesApi?.close();
     boardApi?.close();
+    artifactsApi?.close();
     artifactCanvasApi?.close();
     pendingArtifact = null;
     usageApi?.open();
@@ -1738,6 +1856,7 @@ function applyHash() {
   settingsApi?.close();
   schedulesApi?.close();
   boardApi?.close();
+  artifactsApi?.close();
   usageApi?.close();
   if (route.kind === "artifact") {
     // 产物画布深链：先确保会话选中（selectRun 的 writeHash 会盖掉深链，随后恢复），
@@ -1762,6 +1881,7 @@ function applyHash() {
   enteredSettingsFromApp = false;
   enteredSchedulesFromApp = false;
   enteredBoardFromApp = false;
+  enteredArtifactsFromApp = false;
   if (route.kind === "home") {
     if (selectedRunId) backToList();
     return;
@@ -1857,8 +1977,16 @@ function renderDetailWithState(state) {
       const next = runStates.get(runId);
       if (next) renderDetailWithState(next);
     },
+    onOpenRun: (id) => { if (id) selectRun(id); },
+    onCancelCampaignChild: (childId) => {
+      const cid = state.runConfig?.campaignId;
+      if (!cid || !childId) return;
+      void fetch(`/api/campaigns/${encodeURIComponent(cid)}/children/${encodeURIComponent(childId)}/cancel`, {
+        method: "POST",
+      });
+    },
     onContinue: () => {
-      const text = withCanvasEditScope(taskInput.value.trim() || "继续");
+      const text = taskInput.value.trim() || "继续";
       void submitAppend({ runId, text });
     },
     threadFiles: conversationArtifactFiles(runId),
@@ -1971,8 +2099,10 @@ function syncComposer() {
     draft: taskInput?.value ?? "",
     designMode: workspaceFace === "office",
     designTitle: designComposerTitle(),
+    planMode: planModeToggle?.checked === true,
   });
   patchComposer(composerMode);
+  paintPlanModeHint();
   workdirComboboxApi?.paint();
   void workspaceGitChipApi?.refresh();
   paintDesignTemplateChip();
@@ -2001,7 +2131,7 @@ function syncQueueChips() {
  */
 async function postRunningMessage(qMode, textOverride) {
   const runId = composerMode?.runId;
-  const text = withCanvasEditScope(String(textOverride ?? taskInput.value).trim());
+  const text = String(textOverride ?? taskInput.value).trim();
   if (!runId) return false;
   if (!text) {
     announceStatus("先输入指令内容再发送");
@@ -2183,6 +2313,8 @@ async function postFollowUp(runId, text, verify) {
         autoPack: autoPackToggle?.checked === true,
         permissionMode: permissionModeSelect?.value || undefined,
         rubric: rubricInput?.value,
+        projectId: selectedComposerProject()?.id,
+        citedRunIds: selectedCiteIds,
       })),
     });
     if (!res.ok) {
@@ -2372,6 +2504,7 @@ async function loadHarness() {
         : [];
     }
     populateKnobs(harnessSnapshot);
+    maybeRepaintWorkdirsForFace();
     if (mainPanel.classList.contains("is-welcome")) paintEmptyState();
     // 快照到达前渲染过的详情要补一次——四决定因素的护栏/工具面全靠它
     if (selectedRunId) {
@@ -3050,6 +3183,14 @@ document.getElementById("design-drafts-switch")?.addEventListener("click", () =>
 document.getElementById("design-drafts-hint-dismiss")?.addEventListener("click", () => {
   hideDesignDraftsHint();
 });
+document.getElementById("plan-mode-hint-switch")?.addEventListener("click", () => {
+  applyPlainModeFromHint();
+});
+document.getElementById("plan-mode-hint-dismiss")?.addEventListener("click", () => {
+  const host = document.getElementById("plan-mode-hint");
+  planHintDismissedReason = host?.dataset.reason || "standing";
+  paintPlanModeHint();
+});
 
 function designComposerTitle() {
   if (selectedDesignSample) {
@@ -3061,6 +3202,42 @@ function designComposerTitle() {
     if (entry?.title) return entry.title;
   }
   return "";
+}
+
+let planHintDismissedReason = null;
+
+function paintPlanModeHint() {
+  const host = document.getElementById("plan-mode-hint");
+  const textEl = document.getElementById("plan-mode-hint-text");
+  if (!host || !textEl) return;
+  const suggestion = suggestPlainModeInsteadOfPlan(taskInput?.value ?? "", {
+    planMode: planModeToggle?.checked === true,
+    kind: composerMode?.kind ?? "new",
+  });
+  if (!suggestion || suggestion.reason === planHintDismissedReason) {
+    host.hidden = true;
+    textEl.textContent = "";
+    return;
+  }
+  textEl.textContent = suggestion.message;
+  host.hidden = false;
+  host.dataset.reason = suggestion.reason;
+}
+
+function applyPlainModeFromHint() {
+  if (planModeToggle) {
+    planModeToggle.checked = false;
+    writePref(PREF_PLAN, false);
+  }
+  if (permissionModeSelect?.value === "plan") {
+    permissionModeSelect.value = "manual";
+    applyPermissionModeToKnobs("manual");
+  }
+  syncPermissionModeSelectFromKnobs();
+  syncPlanHint();
+  planHintDismissedReason = "applied";
+  paintPlanModeHint();
+  announceStatus("已改用普通模式：不再先拆计划");
 }
 
 function hideDesignDraftsHint() {
@@ -3164,7 +3341,7 @@ function paintCiteChips() {
     chip.type = "button";
     chip.className = "cite-chip";
     chip.dataset.runId = ref.runId;
-    chip.textContent = ref.title || ref.task || ref.runId;
+    chip.textContent = formatCiteChip(ref);
     const x = document.createElement("span");
     x.className = "cite-chip-x";
     x.setAttribute("aria-hidden", "true");
@@ -3217,7 +3394,7 @@ function paintCitePicker(query) {
     btn.dataset.runId = c.runId;
     const title = document.createElement("span");
     title.className = "cite-picker-title";
-    title.textContent = c.title || c.task || c.runId;
+    title.textContent = formatCiteChip(c);
     const task = document.createElement("span");
     task.className = "cite-picker-task";
     task.textContent = c.task && c.task !== c.title ? c.task : "";
@@ -3307,6 +3484,7 @@ async function submitNewRun({ text: task }) {
         extraWorkdirs: workdirSelect
           ? getWorkdirSelection(workdirSelect).extras
           : undefined,
+        projectId: selectedComposerProject()?.id,
         useVerifierModel: !useVerifierModel || useVerifierModel.checked,
         usePlannerModel: !usePlannerModel || usePlannerModel.checked,
         citedRunIds: selectedCiteIds,
@@ -3417,20 +3595,13 @@ async function stopRun(runId) {
   }
 }
 
-function withCanvasEditScope(text) {
-  const scope = typeof artifactCanvasApi?.getEditScope === "function"
-    ? artifactCanvasApi.getEditScope()
-    : null;
-  return attachDesignEditScope(text, scope);
-}
-
 async function submitAppend({ runId, text }) {
   submitting = true;
   // 提交前读：syncComposer 会把开关禁用，但 checked 值不动
   const verify = verifyToggle.checked;
   syncComposer();
   try {
-    await postFollowUp(runId, withCanvasEditScope(text), verify);
+    await postFollowUp(runId, text, verify);
     if (!followUpErrors.has(runId)) {
       taskInput.value = "";
       clearUploads();
@@ -3570,6 +3741,7 @@ function subscribeLifecycle() {
           ensureSubscription(payload.run.runId);
         }
       }
+      maybeRepaintWorkdirsForFace();
       refreshRunListView();
       if (selectedRunId) syncAutoApprove(selectedRunId);
       // 通知中心对账：running→done 跃迁补「运行完成」，已删除/已完成 run 清账
@@ -3633,14 +3805,24 @@ function populateKnobs(snap) {
   // V-29 工作目录：列宿主声明过的集合，末项恒为「＋ 添加目录…」（哨兵值，
   // 选中即打开目录选择器浮层——见 features/workdir-picker.js）
   if (workdirSelect && Array.isArray(snap.availableWorkdirs)) {
+    const pref = readPrefString(PREF_WORKDIR, "");
     const keep = workdirSelect.value && workdirSelect.value !== WORKDIR_ADD_VALUE
       ? workdirSelect.value
-      : readPrefString(PREF_WORKDIR, snap.workdir);
-    renderWorkdirOptions(workdirSelect, snap.availableWorkdirs, { selected: keep || snap.workdir });
-    const savedExtras = readPrefJson(PREF_WORKDIR_EXTRAS, []);
-    applyWorkdirSelection(workdirSelect, snap.availableWorkdirs, {
+      : pref;
+    const visible = workdirListForFace(snap.availableWorkdirs);
+    const selected = pickWelcomeWorkdir({
+      visible,
+      keep,
+      snapWorkdir: snap.workdir,
+      hostWorkdirIsHarness: Boolean(snap.designMode?.hostWorkdirIsHarness),
+      hasPref: Boolean(pref),
+    });
+    renderWorkdirOptions(workdirSelect, visible, { selected: selected || snap.workdir });
+    const savedExtras = (readPrefJson(PREF_WORKDIR_EXTRAS, []) || [])
+      .filter((d) => visible.some((v) => sameWorkdirPath(v, d)));
+    applyWorkdirSelection(workdirSelect, visible, {
       primary: workdirSelect.value,
-      extras: Array.isArray(savedExtras) ? savedExtras : [],
+      extras: savedExtras,
     });
     // 有了「＋ 添加目录…」就永远有得选：不再因为只有一个目录而锁死下拉。
     // 运行中/追加模式的禁用走 patchComposer 的 optionsEnabled，语义不变。
@@ -3648,6 +3830,18 @@ function populateKnobs(snap) {
     workdirSelect.dataset.fixed = "false";
     workdirComboboxApi?.paint();
     void workspaceGitChipApi?.refresh();
+  }
+
+  if (Array.isArray(snap.availableProjects)) {
+    availableProjects = snap.availableProjects;
+  }
+  if (projectSelect) {
+    const keep = projectSelect.value && projectSelect.value !== PROJECT_ADD_VALUE
+      ? projectSelect.value
+      : readPrefString(PREF_PROJECT, "");
+    renderProjectOptions(keep);
+    const chosen = selectedComposerProject();
+    if (chosen) applyProjectMembership(chosen, { keepCurrent: true });
   }
 
   // V-30/V-31：角色常驻可见。主执行模型在左侧独立选择器，这里只管规划/核查/识图/生图。
@@ -3737,6 +3931,8 @@ const PREF_PLAN = "agent.ui.pref.planMode";
 const PREF_MULTI = "agent.ui.pref.multiAgent";
 const PREF_WORKDIR = "agent.ui.pref.workdir";
 const PREF_WORKDIR_EXTRAS = "agent.ui.pref.workdirExtras";
+const PREF_WORKDIR_BY_FACE = "agent.ui.pref.workdirByFace";
+const PREF_PROJECT = "agent.ui.pref.projectId";
 const PREF_AUTO_PACK = "agent.ui.pref.autoPack";
 const PREF_WORKSPACE_FACE = "agent.ui.pref.workspaceFace";
 function readPref(key, fallback) {
@@ -3765,6 +3961,204 @@ function writePrefString(key, value) {
     if (value) localStorage.setItem(key, value);
   } catch { /* ignore */ }
 }
+function clearPrefString(key) {
+  try { localStorage.removeItem(key); } catch { /* ignore */ }
+}
+
+let lastWorkdirFaceSig = "";
+
+function workdirListForFace(all) {
+  return (Array.isArray(all) ? all : []).filter((dir) => workdirVisibleOnFace(dir, workspaceFace, runs));
+}
+
+function maybeRepaintWorkdirsForFace() {
+  const source = harnessSnapshot?.availableWorkdirs;
+  if (!Array.isArray(source) || !source.length) return;
+  const sig = `${workspaceFace}\0${source.map((d) => `${d}\0${inferWorkdirFace(d, runs) ?? "*"}`).join("|")}`;
+  if (sig === lastWorkdirFaceSig) return;
+  lastWorkdirFaceSig = sig;
+  paintWorkdirsForFace(source);
+  const chosen = selectedComposerProject();
+  if (chosen) applyProjectMembership(chosen, { keepCurrent: true });
+}
+
+function rememberWorkdirForFace(face) {
+  if (!workdirSelect) return;
+  const current = workdirSelect.value && workdirSelect.value !== WORKDIR_ADD_VALUE
+    ? workdirSelect.value
+    : "";
+  if (!current) return;
+  const map = { ...(readPrefJson(PREF_WORKDIR_BY_FACE, {}) || {}) };
+  map[face === "office" ? "office" : "code"] = current;
+  writePrefJson(PREF_WORKDIR_BY_FACE, map);
+}
+
+function paintWorkdirsForFace(all) {
+  if (!workdirSelect) return;
+  const source = Array.isArray(all) && all.length
+    ? all
+    : (harnessSnapshot?.availableWorkdirs ?? []);
+  if (!source.length) return;
+  const visible = workdirListForFace(source);
+  const pref = readPrefString(PREF_WORKDIR, "");
+  const keep = workdirSelect.value && workdirSelect.value !== WORKDIR_ADD_VALUE
+    ? workdirSelect.value
+    : pref;
+  const selected = pickWelcomeWorkdir({
+    visible,
+    keep,
+    snapWorkdir: harnessSnapshot?.workdir,
+    hostWorkdirIsHarness: Boolean(harnessSnapshot?.designMode?.hostWorkdirIsHarness),
+    hasPref: Boolean(pref),
+  });
+  const extras = getWorkdirSelection(workdirSelect, source).extras
+    .filter((d) => visible.some((v) => sameWorkdirPath(v, d)));
+  renderWorkdirOptions(workdirSelect, visible, { selected: selected || "" });
+  applyWorkdirSelection(workdirSelect, visible, {
+    primary: workdirSelect.value,
+    extras,
+  });
+  workdirComboboxApi?.paint();
+}
+
+function restoreWorkdirForFace(face) {
+  if (!workdirSelect) return;
+  const visible = [...workdirSelect.options]
+    .map((o) => o.value)
+    .filter((v) => v && v !== WORKDIR_ADD_VALUE);
+  if (!visible.length) return;
+  const map = readPrefJson(PREF_WORKDIR_BY_FACE, {}) || {};
+  const wanted = map[face === "office" ? "office" : "code"];
+  const next = visible.find((d) => sameWorkdirPath(d, wanted)) ?? visible[0];
+  const extras = getWorkdirSelection(workdirSelect, visible).extras
+    .filter((d) => visible.some((v) => sameWorkdirPath(v, d)));
+  applyWorkdirSelection(workdirSelect, visible, { primary: next, extras });
+  writePrefString(PREF_WORKDIR, next);
+  workdirComboboxApi?.paint();
+}
+
+function selectedComposerProject() {
+  const id = projectSelect?.value ?? "";
+  if (!id || id === PROJECT_ADD_VALUE) return null;
+  return availableProjects.find((p) => p.id === id) ?? null;
+}
+
+function extrasFromProject(project, primary) {
+  const root = String(primary ?? project.primaryWorkdir ?? "");
+  return (project.workdirs ?? []).filter((dir) => !sameWorkdirPath(dir, root));
+}
+
+function applyProjectMembership(project, opts = {}) {
+  if (!project || !workdirSelect) return;
+  const all = harnessSnapshot?.availableWorkdirs ?? [];
+  const list = workdirListForFace(all);
+  if (!list.length) return;
+  const current = workdirSelect.value && workdirSelect.value !== WORKDIR_ADD_VALUE
+    ? workdirSelect.value
+    : "";
+  let primary = opts.keepCurrent
+    ? composerCwdForProject(project, current)
+    : (project.primaryWorkdir || composerCwdForProject(project, current));
+  if (!list.some((d) => sameWorkdirPath(d, primary))) {
+    primary = (project.workdirs ?? []).find((d) => list.some((v) => sameWorkdirPath(v, d)))
+      ?? list[0];
+  }
+  const extras = extrasFromProject(project, primary)
+    .filter((dir) => list.some((v) => sameWorkdirPath(v, dir)));
+  applyWorkdirSelection(workdirSelect, list, {
+    primary,
+    extras,
+  });
+  writePrefString(PREF_WORKDIR, primary);
+  writePrefJson(PREF_WORKDIR_EXTRAS, extras);
+  workdirComboboxApi?.paint();
+  void workspaceGitChipApi?.refresh();
+}
+
+function renderProjectOptions(selected) {
+  if (!projectSelect) return;
+  const keep = selected ?? projectSelect.value;
+  projectSelect.replaceChildren();
+  const leftover = document.createElement("option");
+  leftover.value = "";
+  leftover.textContent = "未入项（按目录）";
+  projectSelect.appendChild(leftover);
+  for (const project of availableProjects) {
+    const opt = document.createElement("option");
+    opt.value = project.id;
+    opt.textContent = project.name;
+    projectSelect.appendChild(opt);
+  }
+  const add = document.createElement("option");
+  add.value = PROJECT_ADD_VALUE;
+  add.textContent = "＋ 新建项目…";
+  projectSelect.appendChild(add);
+  projectSelect.value = availableProjects.some((p) => p.id === keep) ? keep : "";
+}
+
+function syncProjectSelectToWorkdir() {
+  if (!projectSelect) return;
+  const project = selectedComposerProject();
+  if (!project) return;
+  const primary = workdirSelect?.value && workdirSelect.value !== WORKDIR_ADD_VALUE
+    ? workdirSelect.value
+    : "";
+  if (!primary) return;
+  const inProject = (project.workdirs ?? []).some((dir) => sameWorkdirPath(dir, primary));
+  if (!inProject) {
+    projectSelect.value = "";
+    clearPrefString(PREF_PROJECT);
+  }
+}
+
+async function createProjectFromComposer() {
+  const previous = readPrefString(PREF_PROJECT, "");
+  const name = window.prompt("项目名称");
+  if (!name || !name.trim()) {
+    renderProjectOptions(previous);
+    return;
+  }
+  const primary = workdirSelect?.value && workdirSelect.value !== WORKDIR_ADD_VALUE
+    ? workdirSelect.value
+    : "";
+  if (!primary) {
+    announceStatus("请先选一个工作目录再新建项目");
+    renderProjectOptions(previous);
+    return;
+  }
+  // 只快照当前主目录 + 此刻勾选的 extras。设为主不再把旧主目录勾回，
+  // 所以这里不会把欢迎页默认的产品仓默默拍进成员。
+  const extras = workdirSelect ? getWorkdirSelection(workdirSelect).extras : [];
+  try {
+    const res = await fetch("/api/projects", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: name.trim(),
+        workdirs: [primary, ...extras],
+        primaryWorkdir: primary,
+      }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      announceStatus(body?.error ? String(body.error) : `新建项目失败（HTTP ${res.status}）`);
+      renderProjectOptions(previous);
+      return;
+    }
+    const created = body?.project;
+    if (created?.id) {
+      availableProjects = [...availableProjects.filter((p) => p.id !== created.id), created];
+      if (harnessSnapshot) harnessSnapshot.availableProjects = availableProjects;
+      writePrefString(PREF_PROJECT, created.id);
+      renderProjectOptions(created.id);
+      applyProjectMembership(created);
+      refreshRunListView();
+    }
+  } catch (err) {
+    announceStatus(`新建项目失败：${err instanceof Error ? err.message : String(err)}`);
+    renderProjectOptions(previous);
+  }
+}
 function readPrefJson(key, fallback) {
   try {
     const raw = localStorage.getItem(key);
@@ -3790,9 +4184,9 @@ function syncPlanHint() {
   if (!planModeToggle) return;
   setKnobDesc(
     "mode-hint",
-    planModeToggle.checked ? "出图后等人批准" : "拆解后等人批准",
+    planModeToggle.checked ? "出图后等人批准。日常对话、小修请关掉" : "拆解后等人批准",
     planModeToggle.checked
-      ? "planner 出图后等人批准再跑。可与多 agent 同时开。"
+      ? "planner 出图后等人批准再跑。日常对话或单点小修是纯开销，建议改用普通模式。可与多 agent 同时开。"
       : "开 = planner 出图后等你批准再跑。可与多 agent 同时开。",
   );
 }
@@ -3813,6 +4207,9 @@ if (planModeToggle) {
   planModeToggle.addEventListener("change", () => {
     writePref(PREF_PLAN, planModeToggle.checked);
     syncPlanHint();
+    if (planModeToggle.checked) planHintDismissedReason = null;
+    paintPlanModeHint();
+    syncComposer();
   });
 }
 if (multiAgentToggle) {
@@ -4127,11 +4524,20 @@ if (workdirSelect) {
       onAdded: (path, payload) => {
         // 服务端应答带着最新合法集合；以它为准重建下拉并选中新目录
         const list = Array.isArray(payload?.workdirs) ? payload.workdirs : [path];
-        const extras = getWorkdirSelection(workdirSelect, list).extras;
-        renderWorkdirOptions(workdirSelect, list, { selected: path });
-        applyWorkdirSelection(workdirSelect, list, { primary: path, extras });
+        if (harnessSnapshot) harnessSnapshot.availableWorkdirs = list;
+        lastWorkdirFaceSig = "";
+        paintWorkdirsForFace(list);
+        const extras = getWorkdirSelection(workdirSelect).extras;
+        const visible = workdirListForFace(list);
+        if (path && visible.some((d) => sameWorkdirPath(d, path))) {
+          applyWorkdirSelection(workdirSelect, visible, {
+            primary: path,
+            extras,
+          });
+        }
         writePrefString(PREF_WORKDIR, path);
         writePrefJson(PREF_WORKDIR_EXTRAS, extras);
+        syncProjectSelectToWorkdir();
         workdirComboboxApi?.paint();
         void workspaceGitChipApi?.refresh();
       },
@@ -4142,6 +4548,7 @@ if (workdirSelect) {
         onChange: (sel) => {
           writePrefString(PREF_WORKDIR, sel.primary);
           writePrefJson(PREF_WORKDIR_EXTRAS, sel.extras);
+          syncProjectSelectToWorkdir();
           syncComposer();
           refreshRunListView();
           void workspaceGitChipApi?.refresh();
@@ -4167,6 +4574,25 @@ if (workdirSelect) {
       void workspaceGitChipApi?.refresh();
     }
   } catch { /* 目录选择器是增强项，初始化失败静默降级 */ }
+}
+
+if (projectSelect) {
+  projectSelect.addEventListener("change", () => {
+    if (projectSelect.value === PROJECT_ADD_VALUE) {
+      void createProjectFromComposer();
+      return;
+    }
+    const chosen = selectedComposerProject();
+    if (chosen) {
+      writePrefString(PREF_PROJECT, chosen.id);
+      applyProjectMembership(chosen);
+    } else {
+      clearPrefString(PREF_PROJECT);
+    }
+    syncComposer();
+    refreshRunListView();
+    if (schedulesApi?.isOpen?.()) void schedulesApi.refresh();
+  });
 }
 
 const budgetExtendBtn = /** @type {HTMLButtonElement|null} */ (document.getElementById("budget-extend-btn"));
@@ -4498,6 +4924,7 @@ try {
 try {
   schedulesApi = initSchedulesView({
     getHarnessSnapshot: () => harnessSnapshot,
+    getCurrentProject: () => selectedComposerProject(),
     onOpenSchedules: () => navigateToSchedules(),
     onCloseSchedules: () => closeSchedulesRoute(),
     onOpenRun: (runId) => selectRun(runId),
@@ -4543,6 +4970,27 @@ try {
     });
   }).catch(() => { /* 命令面板注册失败不影响指挥中心本体 */ });
 } catch { /* 指挥中心是增强项，初始化失败静默降级 */ }
+
+try {
+  artifactsApi = initArtifactsView({
+    getFilter: () => artifactsFilter ?? currentArtifactsFilter(),
+    getHarnessSnapshot: () => harnessSnapshot,
+    onOpenArtifacts: () => navigateToArtifacts(),
+    onCloseArtifacts: () => closeArtifactsRoute(),
+    onOpenArtifact: (card) => openGalleryArtifact(card),
+    onNewArtifact: () => newChatBtn?.click(),
+    onAnnounce: (msg) => announceStatus(msg),
+  });
+  import("./features/command-palette.js").then((palette) => {
+    palette.registerPaletteCommand({
+      id: "open-artifacts",
+      label: "产物",
+      hint: "查看当前项目的落地页、规格与画册",
+      icon: "ph-folder-open",
+      run: () => navigateToArtifacts(),
+    });
+  }).catch(() => { /* 命令面板注册失败不影响产物画廊 */ });
+} catch { /* 产物画廊是增强项，初始化失败静默降级 */ }
 
 // ---- 变更审查（T8）----
 // 动态加载，失败不影响主流程。分区本体挂在对话详情右栏 rail（Progress / 产物

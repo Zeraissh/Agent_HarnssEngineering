@@ -201,11 +201,12 @@ describe("renderWorkdirMenu + initWorkdirCombobox", () => {
     expect(rows[0].textContent).toContain("D:\\Work");
     expect(rows[1].classList.contains("is-primary")).toBe(true);
     expect(menu.querySelector(".wd-menu-hint")?.textContent).toContain("读写");
+    expect(menu.querySelector(".wd-menu-hint")?.textContent).toContain("设为主只换默认写入点");
     expect(menu.querySelector(".wd-add")?.textContent).toContain("添加目录");
     expect(menu.querySelector("option")).toBeNull();
   });
 
-  it("勾选额外目录 → onChange；设为主会把旧主目录留在 extras", () => {
+  it("勾选额外目录 → onChange；设为主不把旧主目录留在 extras", () => {
     const { root, select, trigger, menu } = mountCombobox();
     const onChange = vi.fn();
     const onAddRequest = vi.fn();
@@ -224,8 +225,9 @@ describe("renderWorkdirMenu + initWorkdirCombobox", () => {
 
     const setPrimary = menu.querySelector('[data-path="C"] .wd-primary-btn');
     setPrimary.click();
-    expect(onChange).toHaveBeenLastCalledWith({ primary: "C", extras: ["B", "A"] });
+    expect(onChange).toHaveBeenLastCalledWith({ primary: "C", extras: ["B"] });
     expect(select.value).toBe("C");
+    expect(getWorkdirSelection(select)).toEqual({ primary: "C", extras: ["B"] });
   });
 
   it("添加目录按钮关掉菜单并请求浮层；Esc / 点外面关闭", () => {

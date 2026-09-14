@@ -89,7 +89,8 @@ export interface ToolContext {
   readRoots?: string[];
   /**
    * 额外可写根（可选）：write_file / edit_file / bash 圈禁把这些目录与主 workdir
-   * 同等对待。Web 宿主注入整份白名单（除主目录）；AGENT_READ_ROOTS 仍只进 readRoots。
+   * 同等对待。Web 宿主只注入本 run 勾选的 extraWorkdirs / 显式项目成员，
+   * 不把 AGENT_UI_WORKDIRS 整表拷进来；AGENT_READ_ROOTS 仍只进 readRoots。
    */
   writeRoots?: string[];
   /** 本次调用的 tool_use_id，用于日志关联 */
@@ -287,7 +288,7 @@ export interface AgentConfig {
   executionBroker?: ExecutionBroker;
   /** 额外只读根（见 ToolContext.readRoots）。CLI 经 AGENT_READ_ROOTS 注入 */
   readRoots?: string[];
-  /** 额外可写根（见 ToolContext.writeRoots）。Web 宿主注入整份白名单（除主目录） */
+  /** 额外可写根（见 ToolContext.writeRoots）。Web 宿主只注入本 run 勾选的目录 */
   writeRoots?: string[];
   /**
    * 第三方 Anthropic 兼容端点模式（DeepSeek/GLM/Kimi 等）：

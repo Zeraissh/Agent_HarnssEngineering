@@ -10,6 +10,9 @@
  *             默认值持久化与 composer 同步、通知授权、角标开关、关于分组
  */
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   SETTINGS_STORAGE_KEY,
   SETTINGS_SCHEMA_VERSION,
@@ -33,6 +36,15 @@ import {
   permissionStateLabel,
   shortcutRows,
   initSettingsView,
+  MCP_MARKET_HEADER,
+  MCP_MARKET_COPY,
+  MCP_MARKET_ESSAY_PHRASES,
+  mcpMarketFaceText,
+  mcpMarketFaceHasEssay,
+  mcpMarketKindLabel,
+  mcpOneLine,
+  filterMcpMarketItems,
+  renderMcpMarketCardHtml,
 } from "../ui/public/features/settings.js";
 import { SHORTCUTS } from "../ui/public/features/command-palette.js";
 import { PROMPT_STORAGE_KEY } from "../ui/public/features/notifications.js";
@@ -57,6 +69,15 @@ describe("设置读写与容错", () => {
     expect(s.version).toBe(SETTINGS_SCHEMA_VERSION);
     expect(s.defaults).toEqual({ effort: "", verify: false, autoApprove: true });
     expect(s.badge).toBe(true);
+  });
+
+  it("独立核查设置文案写明计划编排默认仍核查", () => {
+    const src = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "../ui/public/features/settings.js"),
+      "utf8",
+    );
+    expect(src).toContain("计划编排的子任务默认仍会核查");
+    expect(src).not.toContain("提交栏里可逐次关掉。");
   });
 
   it("parseSettings 合法 JSON 往返", () => {
@@ -581,5 +602,172 @@ describe("initSettingsView 视图行为", () => {
     await new Promise((r) => setTimeout(r, 0));
     expect(host.onPacksChanged).toHaveBeenCalled();
     expect(calls.some((c) => c.method === "POST" && String(c.url).includes("/drafts/thermo/install"))).toBe(true);
+  });
+
+  it("MCP 市场：卡片不是论文，详情收起，安装仍走 confirm", async () => {
+    const record = {};
+    const confirm = vi.fn(() => true);
+    const prevConfirm = window.confirm;
+    window.confirm = confirm;
+    try {
+      const api = initSettingsView(makeHost(), makeEnv({ fetchImpl: marketFetcher(record) }));
+      api.open();
+      await new Promise((r) => setTimeout(r, 0));
+      await new Promise((r) => setTimeout(r, 0));
+
+      const section = document.getElementById("settings-mcp");
+      expect(section.querySelector("#settings-mcp-lede")?.textContent).toBe(MCP_MARKET_HEADER);
+      expect(section.textContent).not.toContain("不是 Cursor Marketplace");
+
+      const catalog = document.getElementById("settings-mcp-catalog");
+      const feishu = catalog.querySelector('[data-catalog-id="feishu-lark"]');
+      const slack = catalog.querySelector('[data-catalog-id="slack"]');
+      const missing = catalog.querySelector('[data-catalog-id="google-workspace"]');
+      expect(cardFaceText(feishu)).toContain("飞书");
+      expect(cardFaceText(feishu)).toContain("安装");
+      expect(cardFaceText(feishu)).not.toContain("AGENT_FEISHU_WEBHOOK");
+      expect(cardFaceText(feishu)).not.toContain("Lark OpenAPI");
+      for (const phrase of MCP_MARKET_ESSAY_PHRASES) {
+        expect(cardFaceText(feishu)).not.toContain(phrase);
+      }
+      expect(feishu.querySelector("details")?.open).toBeFalsy();
+      expect(feishu.querySelector("details")?.textContent).toContain("AGENT_FEISHU_WEBHOOK");
+
+      expect(cardFaceText(slack)).toContain("已安装");
+      expect(slack.querySelector("[data-mcp-install]")).toBeNull();
+      expect(missing.querySelector("button[disabled]")?.textContent).toBe("不可装");
+      expect(cardFaceText(missing)).toMatch(/没有可装/);
+
+      const installed = document.getElementById("settings-mcp-list");
+      expect(installed.querySelector("[data-mcp-toggle='slack']")?.textContent).toBe("停用");
+      expect(installed.querySelector("[data-mcp-uninstall='slack']")?.textContent).toBe("移除");
+      expect(document.getElementById("settings-mcp-github")?.textContent).toBe("安装");
+      expect(document.querySelector(".settings-mcp-manual")?.open).toBeFalsy();
+
+      feishu.querySelector("[data-mcp-install]").click();
+      expect(confirm).toHaveBeenCalled();
+      await new Promise((r) => setTimeout(r, 0));
+      expect(record.installBody).toMatchObject({ catalogId: "feishu-lark", confirm: true, kind: "mcp" });
+
+      document.getElementById("settings-mcp-filter").value = "飞书";
+      document.getElementById("settings-mcp-filter").dispatchEvent(new Event("input"));
+      expect(catalog.querySelector('[data-catalog-id="feishu-lark"]')).toBeTruthy();
+      expect(catalog.querySelector('[data-catalog-id="slack"]')).toBeNull();
+    } finally {
+      window.confirm = prevConfirm;
+    }
+  });
+});
+
+const MARKET_FIXTURE = {
+  path: "mcp.json",
+  enabled: false,
+  catalog: [
+    {
+      id: "feishu-lark",
+      title: "飞书 / Lark OpenAPI",
+      description: "飞书官方 OpenAPI MCP（文档、日历、会话等）。不是出站 IM 卡片。",
+      kind: "mcp",
+      availability: "ready",
+      repo: "larksuite/lark-openapi-mcp",
+      notes: "官方仓库。需要 APP_ID / APP_SECRET。出站 webhook（AGENT_FEISHU_WEBHOOK）是另一条切片。",
+    },
+    {
+      id: "slack",
+      title: "Slack",
+      description: "MCP 组织参考 stdio 实现。不是 Slack Inc 托管的 HTTP MCP。",
+      kind: "mcp",
+      availability: "ready",
+      notes: "stdio 配方来自参考实现。Slack 官方是托管 HTTP（mcp.slack.com）。",
+      mcpSnippet: { name: "slack" },
+    },
+    {
+      id: "superpowers",
+      title: "Superpowers",
+      description: "obra/superpowers 是 skill/plugin，不是 DomainPack。",
+      kind: "skill",
+      availability: "ready",
+      notes: "安装写入 using-superpowers，不会新增 pack。",
+    },
+    {
+      id: "google-workspace",
+      title: "Google Workspace",
+      description: "Gmail / Calendar / Drive 不在本目录。",
+      kind: "mcp",
+      availability: "missing",
+      notes: "不收录未经核实的插件，也不会从 Cursor Marketplace 搬运。",
+    },
+  ],
+  servers: [{ name: "slack", command: "npx", enabled: true }],
+  skills: [],
+  custom: [],
+  installedCatalogIds: ["slack"],
+  skillInstall: { available: true, reason: "" },
+};
+
+function marketFetcher(extra = {}) {
+  return vi.fn(async (url, opts = {}) => {
+    extra.calls ||= [];
+    extra.calls.push({ url, method: opts.method, body: opts.body });
+    if (url === "/api/mcp") {
+      return { ok: true, status: 200, json: async () => MARKET_FIXTURE };
+    }
+    if (url === "/api/mcp/install") {
+      extra.installBody = JSON.parse(opts.body);
+      return { ok: true, status: 200, json: async () => ({ message: "已写入 mcp.json" }) };
+    }
+    return { ok: true, status: 200, json: async () => ({ models: [], roles: {}, source: "env" }) };
+  });
+}
+
+function cardFaceText(card) {
+  const clone = card.cloneNode(true);
+  clone.querySelectorAll("details").forEach((node) => node.remove());
+  return clone.textContent ?? "";
+}
+
+describe("MCP / Skills 小型市场", () => {
+  const styles = readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), "../ui/public/styles.css"),
+    "utf8",
+  );
+
+  it("卡面短标题 + 一句，长说明只进详情", () => {
+    expect(MCP_MARKET_HEADER).toMatch(/AGENT_UI_MCP=1/);
+    expect(MCP_MARKET_HEADER).not.toMatch(/Marketplace|预装二进制|Gmail/);
+    expect(mcpMarketFaceHasEssay(MCP_MARKET_HEADER)).toBe(false);
+    for (const [id, copy] of Object.entries(MCP_MARKET_COPY)) {
+      const face = mcpMarketFaceText({ id, title: "飞书 / Lark OpenAPI 长标题", description: "很长的论文。" });
+      expect(face).toContain(copy.title);
+      expect(face).toContain(copy.blurb);
+      expect(mcpMarketFaceHasEssay(face)).toBe(false);
+      expect(face).not.toContain("不是 Cursor Marketplace");
+    }
+    expect(mcpMarketKindLabel({ kind: "mcp" })).toBe("MCP");
+    expect(mcpMarketKindLabel({ kind: "skill" })).toBe("Skill");
+    expect(mcpMarketKindLabel({ availability: "missing" })).toBe("缺");
+    expect(mcpOneLine("第一句。第二句还很长。", 40)).toBe("第一句");
+  });
+
+  it("筛选按短名命中，渲染锁：详情默认收起、安装按钮在", () => {
+    const html = renderMcpMarketCardHtml({
+      id: "feishu-lark",
+      title: "飞书 / Lark OpenAPI",
+      description: MARKET_FIXTURE.catalog[0].description,
+      notes: MARKET_FIXTURE.catalog[0].notes,
+      kind: "mcp",
+    });
+    expect(html).toContain("安装");
+    expect(html).toContain("<summary>详情</summary>");
+    expect(html).not.toMatch(/<details[^>]*\sopen/);
+    expect(html).toContain("AGENT_FEISHU_WEBHOOK");
+    expect(filterMcpMarketItems(MARKET_FIXTURE.catalog, "飞书").map((i) => i.id)).toEqual(["feishu-lark"]);
+    expect(filterMcpMarketItems(MARKET_FIXTURE.catalog, "xyzzy")).toEqual([]);
+  });
+
+  it("卡面 CSS 禁止字距拉开（避免 MCP 看起来像 MCPP）", () => {
+    expect(styles).toMatch(/\.settings-mcp-card,\s*\n\s*\.settings-mcp-card \* \{\s*\n\s*letter-spacing: 0;/);
+    expect(styles).toMatch(/\.settings-mcp-grid \{[\s\S]*grid-template-columns: repeat\(2/);
+    expect(styles).toMatch(/@media \(max-width: 700px\) \{[\s\S]*\.settings-mcp-grid \{ grid-template-columns: 1fr; \}/);
   });
 });

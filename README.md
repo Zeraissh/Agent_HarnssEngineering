@@ -32,6 +32,7 @@
 | [docs/09-借鉴清单.md](docs/09-借鉴清单.md) | 他山机制的借鉴决策台账：机制对照表 + 借/变形借/不借的理由 + 待借条目的判据（阈值先写） |
 | [docs/10-design-mode-evolution.md](docs/10-design-mode-evolution.md) | 设计模式（已拍板）：统一入口 + 模式内选制品类型 |
 | [docs/11-design-mode-benchmarks-ext.md](docs/11-design-mode-benchmarks-ext.md) | 设计模式外部对标扩展 |
+| [docs/12-live-multiuser-harness-test.md](docs/12-live-multiuser-harness-test.md) | 共享宿主真机评测纪律（BASE-04 软件切片：并发、可数事实、证据三件套） |
 | [CHANGELOG.md](CHANGELOG.md) | 版本变更日志（Keep a Changelog；每条对应真实提交；Release 正文自动附对应小节） |
 | [docs/reference/README.md](docs/reference/README.md) | `src/` 全部 21 个模块的参考文档（签名与源码逐一核对；由 v1.1 并行编排自举生成，见案例 #2） |
 | [docs/cases/](docs/cases) | 真实任务案例：#1 遥测固件真机闭环、#2 并行编排交付参考文档（墙钟 −43%） |
@@ -280,12 +281,17 @@ powershell ... -EnvironmentId "<Agent 面板 Environment 卡片里的 ID>"
 
 ```powershell
 npm run ui                              # 浏览器控制台 http://127.0.0.1:4173
+npm run desktop                         # Electron：无宿主则用 ui/serve.ts + tsx 拉起当前 Web UI
 cd cross-app
-$env:AGENT_UI_URL = "http://127.0.0.1:4173"
-npm run desktop                         # Electron 直接加载当前宿主，无复制 UI 漂移
+npm run desktop                         # 同上（从外壳目录启动）
 npm run desktop:dist                    # 生产打包；Windows/macOS 缺签名凭据会拒绝
 npm run desktop:dist:unsigned           # 只供本机安装测试，不得发布
 ```
+
+桌面壳入口顺序：`AGENT_UI_HOST_ENTRY`（文件必须存在，否则 fail-closed）>
+仓库 `ui/serve.ts` + `tsx`（源码是当前事实）> `dist/ui/serve.js`。
+陈旧 dist 不会静默顶包。若 4173 已有旧宿主，会 attach 到它——要最新界面就先停掉旧进程，或不要设 `AGENT_UI_URL`。
+Office 文件（`.pptx` / `.docx`）在宿主里预览 + 点评 + 对话改稿，不是另一套产品。
 
 Desktop 自管本地宿主时，可从应用菜单打开 **设置 → 模型与运行设置…**（`Ctrl/Cmd+,`），
 配置 API 协议、模型、Base URL、API key 以及 token/超时/重试/并发护栏。API key 由

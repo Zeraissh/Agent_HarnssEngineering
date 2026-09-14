@@ -43,6 +43,48 @@ export function zipEntryName(relativePath: string): string {
 
 export type ZipFileEntry = { name: string; data: Buffer };
 
+const SITE_SKIP_DIR_EXACT = new Set(["node_modules", ".git", "_qa"]);
+const SAME_DIR_SITE_EXT = new Set([
+  ".html",
+  ".htm",
+  ".css",
+  ".js",
+  ".mjs",
+  ".svg",
+  ".ico",
+]);
+
+/** 调研残渣 / 宿主元数据目录：不得打进落地页 ZIP。 */
+export function shouldSkipSiteZipName(name: string): boolean {
+  const n = String(name ?? "");
+  if (!n || SITE_SKIP_DIR_EXACT.has(n)) return true;
+  if (n.startsWith("_")) return true;
+  return /^webb_/i.test(n);
+}
+
+/** 入口同目录的站点资产（未写进 HTML 的 style.css 仍算站点树）。 */
+export function isSameDirSiteAsset(name: string): boolean {
+  const dot = String(name ?? "").lastIndexOf(".");
+  if (dot < 0) return false;
+  return SAME_DIR_SITE_EXT.has(name.slice(dot).toLowerCase());
+}
+
+/** 从 HTML/CSS 抽出相对引用（href / src / url()）。忽略协议与锚点。 */
+export function siteRefsFromText(source: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const re = /(?:href|src)\s*=\s*["']([^"']+)["']|url\(\s*["']?([^"')]+)["']?\s*\)/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(String(source ?? ""))) !== null) {
+    const raw = String(m[1] ?? m[2] ?? "").trim();
+    if (!raw || seen.has(raw)) continue;
+    if (/^(?:[a-z][a-z0-9+.-]*:|\/\/|#|data:)/i.test(raw)) continue;
+    seen.add(raw);
+    out.push(raw.split(/[?#]/)[0] ?? raw);
+  }
+  return out;
+}
+
 /**
  * 组装 store-method ZIP。entries 的 name 已是 zip 内路径。
  */

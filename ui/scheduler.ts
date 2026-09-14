@@ -9,9 +9,9 @@
  * ② **触发语义**：宿主内 setInterval 周期 tick（默认 30s，测试注入时钟手动 tick）。
  *    到期 = enabled 且 nextRunAt <= now。发起 run 走与 POST /api/runs **完全相同**
  *    的内部入口（createRunFromBody），调度器只负责构造请求体 { task, workdir, verify }。
- * ③ **错过（missed）**：once/daily 任务到期时刻已过超过 MISSED_WINDOW_MS（24h）
+ * ③ **错过（missed）**：once/daily/weekly 任务到期时刻已过超过 MISSED_WINDOW_MS（24h）
  *    才被发现（宿主停机/休眠），不补跑——半夜补跑"每天早上 8 点的报表"是惊吓不是
- *    功能。once 错过即禁用；daily 错过则顺推到下一个未来时刻。interval 不按错过
+ *    功能。once 错过即禁用；daily/weekly 错过则顺推到下一个未来时刻。interval 不按错过
  *    处理：过期间隔只补跑一次，随后从触发时刻重新排期（不追打欠账）。
  * ④ **并发护栏（skipped）**：到期时该任务上一次 run 仍在跑（isRunActive(lastRunId)）
  *    → 本次跳过，只记 lastTrigger=skipped 不落盘（长 run 挡着短间隔任务时每 30s
@@ -30,7 +30,11 @@ import { dirname, join, resolve } from "node:path";
 export type ScheduleSpec =
   | { kind: "once"; at: number }
   | { kind: "daily"; hhmm: string }
+  | { kind: "weekly"; days: number[]; hhmm: string }
   | { kind: "interval"; everyMs: number };
+
+/** 周一到周五（0=周日 … 6=周六）。预设「工作日」用这一组。 */
+export const WEEKDAYS = [1, 2, 3, 4, 5] as const;
 
 export type ScheduleTriggerOutcome = "launched" | "skipped" | "missed" | "error";
 
@@ -55,6 +59,8 @@ export interface ScheduleEntry {
   /** 计算值随每次变更落盘；列表端点直接回读，不必每次重算 */
   nextRunAt: number | null;
   lastTrigger: ScheduleTriggerRecord | null;
+  /** 可选：所属项目。缺省不入项；列表按当前项目过滤时只留对上的。 */
+  projectId?: string;
 }
 
 /** 落盘文件形状。version 是将来格式演进的逃生口（与 meta.json 同纪律） */
@@ -87,8 +93,31 @@ export function parseHhmm(raw: unknown): { hh: number; mm: number } | null {
 }
 
 /**
+ * 每周几天：整数 0=周日 … 6=周六，至少一天，去重后按日历序。
+ * 越界 / 非整数 / 空数组一律 null——不静默丢掉坏项。
+ */
+export function parseWeeklyDays(raw: unknown): number[] | null {
+  if (!Array.isArray(raw) || raw.length < 1) return null;
+  const seen = new Set<number>();
+  for (const item of raw) {
+    if (typeof item !== "number" || !Number.isInteger(item) || item < 0 || item > 6) return null;
+    seen.add(item);
+  }
+  if (seen.size < 1) return null;
+  return [...seen].sort((a, b) => a - b);
+}
+
+/** 工作日 = 周一到周五（1–5），顺序无关。 */
+export function isWeekdays(days: readonly number[]): boolean {
+  if (days.length !== WEEKDAYS.length) return false;
+  const have = new Set(days);
+  return WEEKDAYS.every((d) => have.has(d));
+}
+
+/**
  * 调度规则校验（API 入参与落盘加载共用一条，不各写一份）。
  * once.at 必须是有限整数；daily.hhmm 必须过 parseHhmm；
+ * weekly.days 必须是 0–6 的非空整数集 + 合法 hhmm；
  * interval.everyMs 必须是 >= MIN_INTERVAL_MS 的整数。
  */
 export function parseScheduleSpec(raw: unknown): ScheduleSpec | null {
@@ -101,6 +130,11 @@ export function parseScheduleSpec(raw: unknown): ScheduleSpec | null {
   if (o.kind === "daily") {
     if (!parseHhmm(o.hhmm)) return null;
     return { kind: "daily", hhmm: o.hhmm as string };
+  }
+  if (o.kind === "weekly") {
+    const days = parseWeeklyDays(o.days);
+    if (!days || !parseHhmm(o.hhmm)) return null;
+    return { kind: "weekly", days, hhmm: o.hhmm as string };
   }
   if (o.kind === "interval") {
     if (typeof o.everyMs !== "number" || !Number.isInteger(o.everyMs) || o.everyMs < MIN_INTERVAL_MS) {
@@ -123,10 +157,45 @@ function nextDailyAt(hhmm: string, now: number): number {
 }
 
 /**
+ * weekly：从 now 起找下一个落在 days 里的本地 hh:mm（严格大于 now）。
+ * 最多往前看 7 天；days 已由 parse 保证非空。
+ */
+function nextWeeklyAt(days: readonly number[], hhmm: string, now: number): number {
+  const { hh, mm } = parseHhmm(hhmm)!;
+  const wanted = new Set(days);
+  const cursor = new Date(now);
+  for (let offset = 0; offset <= 7; offset++) {
+    const candidate = new Date(
+      cursor.getFullYear(),
+      cursor.getMonth(),
+      cursor.getDate() + offset,
+      hh,
+      mm,
+      0,
+      0,
+    );
+    if (candidate.getTime() > now && wanted.has(candidate.getDay())) {
+      return candidate.getTime();
+    }
+  }
+  // 理论上 days 非空时走不到；退回一周后同一时刻以免 null 卡住启用态
+  return new Date(
+    cursor.getFullYear(),
+    cursor.getMonth(),
+    cursor.getDate() + 7,
+    hh,
+    mm,
+    0,
+    0,
+  ).getTime();
+}
+
+/**
  * 计算下一次触发时刻。
  *
  * - once：at 在未来 → at；已过 → null（等 missed/禁用处理）
  * - daily：下一个 hh:mm（严格大于 now）
+ * - weekly：下一个落在 days 里的 hh:mm（严格大于 now）
  * - interval：base + everyMs。base 取 lastRunAt ?? createdAt；
  *   算出来已在过去（宿主停机欠账）就**不逐拍追补**，直接排 now + everyMs
  */
@@ -141,6 +210,9 @@ export function computeNextRunAt(
   if (schedule.kind === "daily") {
     return nextDailyAt(schedule.hhmm, now);
   }
+  if (schedule.kind === "weekly") {
+    return nextWeeklyAt(schedule.days, schedule.hhmm, now);
+  }
   const anchor = typeof base === "number" && Number.isFinite(base) ? base : now;
   const next = anchor + schedule.everyMs;
   return next > now ? next : now + schedule.everyMs;
@@ -152,7 +224,20 @@ export function isDue(entry: Pick<ScheduleEntry, "enabled" | "nextRunAt">, now: 
 }
 
 /**
- * 判据③错过判定：once/daily 的到期时刻已过去超过 MISSED_WINDOW_MS。
+ * 当前选了项目时：只留带同一 projectId 的条目。
+ * 未选项目（空 / 缺省）→ 原样返回，不把未入项的任务藏起来。
+ */
+export function filterSchedulesByProject<T extends Pick<ScheduleEntry, "projectId">>(
+  entries: readonly T[],
+  projectId?: string | null,
+): T[] {
+  const want = String(projectId ?? "").trim();
+  if (!want) return [...entries];
+  return entries.filter((entry) => entry.projectId === want);
+}
+
+/**
+ * 判据③错过判定：once/daily/weekly 的到期时刻已过去超过 MISSED_WINDOW_MS。
  * interval 永不 missed（判据③：只补跑一次后重新排期）。
  */
 export function isMissed(
@@ -166,7 +251,7 @@ export function isMissed(
 
 /**
  * 触发（含手动）成功后顺推排期：
- * once → 禁用并清空 nextRunAt；daily → 下一个 hh:mm；interval → 从触发时刻起 +everyMs。
+ * once → 禁用并清空 nextRunAt；daily/weekly → 下一个时刻；interval → 从触发时刻起 +everyMs。
  */
 export function advanceAfterTrigger(entry: ScheduleEntry, now: number): void {
   if (entry.schedule.kind === "once") {
@@ -177,7 +262,7 @@ export function advanceAfterTrigger(entry: ScheduleEntry, now: number): void {
   entry.nextRunAt = computeNextRunAt(entry.schedule, now, now);
 }
 
-/** 判据③错过处置：once 禁用；daily 顺推到下一个未来时刻。 */
+/** 判据③错过处置：once 禁用；daily/weekly 顺推到下一个未来时刻。 */
 export function advanceAfterMiss(entry: ScheduleEntry, now: number): void {
   if (entry.schedule.kind === "once") {
     entry.enabled = false;
@@ -265,6 +350,9 @@ export function parseScheduleEntry(raw: unknown): ScheduleEntry | null {
     lastRunId: typeof o.lastRunId === "string" ? o.lastRunId : null,
     nextRunAt: numOrNull(o.nextRunAt),
     lastTrigger,
+    ...(typeof o.projectId === "string" && o.projectId.trim()
+      ? { projectId: o.projectId.trim() }
+      : {}),
   };
 }
 

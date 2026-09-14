@@ -357,6 +357,18 @@ export function formatWorkspaceGitChip(git, opts = {}) {
 }
 
 /**
+ * `/api/harness` 的 notify 投影。只认 kind + armed，剥掉 webhook/url/token。
+ * 缺席或非对象 → null（旧宿主）。
+ * @param {object|null|undefined} raw
+ * @returns {{kind:"feishu"|"webhook", armed:boolean}|null}
+ */
+export function normalizeNotifySnapshot(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const kind = raw.kind === "webhook" ? "webhook" : "feishu";
+  return { kind, armed: Boolean(raw.armed) };
+}
+
+/**
  * 上下文窗口 / 预算投影（run_config.context / harness.context 同形，MEM-01 窗口 / 预算分离）。
  *
  * 窗口是**事实**（端点在多大处拒收；null = 未知，界面必须写"窗口未知"而不是画 0），
@@ -823,6 +835,7 @@ export function reduceEvent(state, sseEvent) {
           source,
           type,
           title: String(event.title ?? ""),
+          ...(event.runId ? { runId: String(event.runId) } : {}),
           ...(type === "spawn_done"
             ? {
                 passed: event.passed === true,
@@ -831,6 +844,22 @@ export function reduceEvent(state, sseEvent) {
                 ...(typeof event.turns === "number" ? { turns: event.turns } : {}),
               }
             : {}),
+        },
+      ],
+    };
+  }
+  if (type === "campaign_child") {
+    return {
+      ...state,
+      timeline: [
+        ...state.timeline,
+        {
+          seq,
+          source,
+          type: "campaign_child",
+          runId: String(event.runId ?? ""),
+          title: String(event.title ?? ""),
+          status: String(event.status ?? "running"),
         },
       ],
     };
@@ -898,6 +927,12 @@ export function reduceEvent(state, sseEvent) {
           event.supportsVision === true || event.supportsVision === false
             ? event.supportsVision
             : null,
+        describeImageBacking:
+          event.describeImageBacking === "executor"
+          || event.describeImageBacking === "vision-role"
+          || event.describeImageBacking === "none"
+            ? event.describeImageBacking
+            : null,
         guardrails: event.guardrails ?? null,
         // 上下文窗口（事实）/ 预算（策略）各带来源（MEM-01 窗口 / 预算分离）——三段水位条的唯一数据源
         context: normalizeContextConfig(event.context),
@@ -935,6 +970,11 @@ export function reduceEvent(state, sseEvent) {
         readRoots: Array.isArray(event.readRoots) ? event.readRoots.map(String) : null,
         writeRoots: Array.isArray(event.writeRoots) ? event.writeRoots.map(String) : [],
         extraWorkdirs: Array.isArray(event.extraWorkdirs) ? event.extraWorkdirs.map(String) : [],
+        projectId: event.projectId == null || event.projectId === "" ? null : String(event.projectId),
+        campaignId: event.campaignId == null || event.campaignId === "" ? null : String(event.campaignId),
+        campaignRole: event.campaignRole === "director" || event.campaignRole === "child"
+          ? event.campaignRole
+          : null,
         // docs/09 §4.2：null = 未武装，与空对象不是一回事
         hooks: event.hooks && typeof event.hooks === "object"
           ? {
@@ -965,6 +1005,7 @@ export function reduceEvent(state, sseEvent) {
               runId: String(c?.runId ?? ""),
               title: String(c?.title ?? ""),
               artifacts: Array.isArray(c?.artifacts) ? c.artifacts.map(String) : [],
+              ...(c?.workdirLabel ? { workdirLabel: String(c.workdirLabel) } : {}),
             })).filter((c) => c.runId)
           : null,
       },
@@ -1403,6 +1444,31 @@ export function spawnAgentId(title) {
   return `spawn/${String(title ?? "").slice(0, 40)}`;
 }
 
+/** 导演条：campaign_child + 带 runId 的 spawn 事件。 */
+export function deriveCampaignChildren(state) {
+  const byId = new Map();
+  for (const e of state?.timeline ?? []) {
+    if (e.type === "campaign_child" && e.runId) {
+      byId.set(String(e.runId), {
+        runId: String(e.runId),
+        title: String(e.title ?? ""),
+        status: String(e.status ?? "running"),
+      });
+    }
+    if ((e.type === "spawn_start" || e.type === "spawn_done") && e.runId) {
+      const prev = byId.get(String(e.runId)) ?? {
+        runId: String(e.runId),
+        title: String(e.title ?? ""),
+        status: "running",
+      };
+      if (e.type === "spawn_done") prev.status = e.passed === true ? "done" : "error";
+      if (e.title) prev.title = String(e.title);
+      byId.set(String(e.runId), prev);
+    }
+  }
+  return [...byId.values()];
+}
+
 /**
  * 从时间线收出当前 run 的子代理列表（编排子任务 + spawn 支线）。
  * 没开跑的计划节点不进这里——计划卡已经有它们。
@@ -1439,6 +1505,7 @@ export function deriveChildAgents(state) {
       const id = spawnAgentId(e.title);
       const a = ensure(id, { title: String(e.title ?? ""), kind: "spawn", seq: e.seq, started: true });
       a.status = "running";
+      if (e.runId) a.runId = String(e.runId);
       continue;
     }
     if (e.type === "spawn_done") {
@@ -1446,6 +1513,7 @@ export function deriveChildAgents(state) {
       const a = ensure(id, { title: String(e.title ?? ""), kind: "spawn", seq: e.seq, started: true });
       a.status = e.passed === true ? "done" : "error";
       a.lastText = String(e.summary || e.error || "");
+      if (e.runId) a.runId = String(e.runId);
       continue;
     }
     const key = childAgentKey(e.source);
@@ -1815,6 +1883,20 @@ function applyVerdict(state, event) {
  *
  * @returns {RunState}
  */
+/** done.completion 逐字段投影：blockers 不列出就会在对话面蒸发。 */
+function projectCompletion(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const list = (v) => (Array.isArray(v) ? v.map((x) => String(x)) : []);
+  return {
+    status: String(raw.status ?? ""),
+    summary: String(raw.summary ?? ""),
+    artifacts: list(raw.artifacts),
+    verification: list(raw.verification),
+    assumptions: list(raw.assumptions),
+    blockers: list(raw.blockers),
+  };
+}
+
 function applySegmentDone(state, event, source = "main") {
   const usage = event.usage && typeof event.usage === "object" ? /** @type {any} */ (event.usage) : null;
   const stopReason = /** @type {string} */ (event.stopReason);
@@ -1822,13 +1904,12 @@ function applySegmentDone(state, event, source = "main") {
     event.error && typeof event.error === "object"
       ? String(/** @type {any} */ (event.error).message ?? "")
       : "";
+  const completion = projectCompletion(event.completion);
 
   const next = {
     ...state,
     stopReason,
-    ...(event.completion && typeof event.completion === "object"
-      ? { completion: { ...event.completion } }
-      : {}),
+    ...(completion ? { completion } : {}),
     ...(event.runBudget && typeof event.runBudget === "object"
       ? { runBudget: { ...event.runBudget } }
       : {}),
@@ -2432,6 +2513,9 @@ export function deriveToolsFace(state, harness) {
     executionIsolation: rc?.executionIsolation ?? harness?.executionIsolation ?? null,
     // 逐 run 可换工作目录，Tools 面必须报本 run 真正用的那个
     workdir: rc?.workdir ?? harness?.workdir ?? null,
+    projectId: rc?.projectId ?? null,
+    campaignId: rc?.campaignId ?? null,
+    campaignRole: rc?.campaignRole ?? null,
     roleModels: rc?.roleModels ?? null,
     readRoots: Array.isArray(rc?.readRoots) ? rc.readRoots : (harness?.readRoots ?? []),
     writeRoots: Array.isArray(rc?.writeRoots)
@@ -2440,6 +2524,7 @@ export function deriveToolsFace(state, harness) {
     // 运行历史的真实落点是进程级装配（不逐 run 变），只来自宿主快照
     history: harness?.history ?? null,
     mcp: harness?.mcp ?? null,
+    notify: normalizeNotifySnapshot(harness?.notify),
     guardrails: rc?.guardrails ?? harness?.guardrails ?? null,
     // 窗口 / 预算（MEM-01）：逐 run 优先，进程级快照兜底；旧宿主两处都没有 = null（不显示这一行）
     context: normalizeContextConfig(rc?.context) ?? normalizeContextConfig(harness?.context) ?? null,
@@ -2590,9 +2675,18 @@ export function newRunPlaceholder(workdir, opts) {
  *   draft?: string|null,         // 输入框当前草稿：运行中有字 → 立即插入，空 → 停止
  *   designMode?: boolean,        // 设计模式新建：placeholder 用稿名，不用文件夹名
  *   designTitle?: string|null,   // 当前样例 / 注册表标题
+ *   planMode?: boolean,          // 新建勾了计划编排：核查勾改不了子任务核查
  * }} input
  */
-export function deriveComposerMode({ info, localStatus, submitting, error, stopping, workdir, draft, designMode, designTitle } = {}) {
+export function deriveComposerMode({ info, localStatus, submitting, error, stopping, workdir, draft, designMode, designTitle, planMode } = {}) {
+  // runPlanned 成文仍走 runVerified。勾选只约束单轮对话，计划子任务默认仍核查。
+  const planVerifiesSubtasks = Boolean(planMode) || (info?.mode === "plan" && info?.status === "running");
+  const verifyLabelNew = planVerifiesSubtasks
+    ? "独立核查（计划编排默认仍核查子任务）"
+    : "独立核查";
+  const verifyLabelTurn = planVerifiesSubtasks
+    ? "本轮独立核查（计划编排默认仍核查子任务）"
+    : "本轮独立核查";
   const base = {
     runId: info?.runId ?? null,
     workdir: info?.workdir ?? workdir ?? null,
@@ -2609,7 +2703,7 @@ export function deriveComposerMode({ info, localStatus, submitting, error, stopp
      * 新建：用户自己的选择，不动；追加：缺省沿用该 run 上一轮的设置（defaultChecked），
      * 由 patchComposer 在**切到这个 run 时**套一次；运行中/提交中：禁用。
      */
-    verifyToggle: { enabled: true, defaultChecked: null, label: "独立核查" },
+    verifyToggle: { enabled: true, defaultChecked: null, label: verifyLabelNew },
   };
 
   // 提交在飞：服务端在 json(res) **之前**就广播了 run_created，于是列表先一步
@@ -2696,7 +2790,7 @@ export function deriveComposerMode({ info, localStatus, submitting, error, stopp
 
   if (info.canContinue) {
     // 追加轮的核查开关：缺省沿用该 run 上一轮的设置，可逐轮改（会话中心化）
-    const verifyToggle = { enabled: true, defaultChecked: Boolean(info.verify), label: "本轮独立核查" };
+    const verifyToggle = { enabled: true, defaultChecked: Boolean(info.verify), label: verifyLabelTurn };
     if (info.continuationMode === "same-run") {
       return {
         ...base,
@@ -2781,7 +2875,7 @@ export function deriveComposerMode({ info, localStatus, submitting, error, stopp
     note: "",
     canSubmit: true,
     optionsEnabled: true,
-    verifyToggle: { enabled: true, defaultChecked: Boolean(info.verify), label: "本轮独立核查" },
+    verifyToggle: { enabled: true, defaultChecked: Boolean(info.verify), label: verifyLabelTurn },
     budgetExhausted: Boolean(info.budgetExhausted || info.canExtendBudget),
     canExtendBudget: Boolean(info.canExtendBudget),
   };
@@ -2816,7 +2910,8 @@ function blockedReason(info) {
  */
 export function buildFollowUpRequest({
   text, verify, autoApprove, planMode, multiAgent, effort,
-  workdir, extraWorkdirs, pack, autoPack, permissionMode, rubric,
+  workdir, extraWorkdirs, projectId, pack, autoPack, permissionMode, rubric,
+  citedRunIds,
 } = {}) {
   const extras = Array.isArray(extraWorkdirs)
     ? [...new Set(extraWorkdirs.map(String).filter((p) => p && p !== workdir))]
@@ -2831,10 +2926,14 @@ export function buildFollowUpRequest({
     ...(effort ? { effort } : {}),
     ...(workdir ? { workdir } : {}),
     ...(extras.length ? { extraWorkdirs: extras } : {}),
+    ...(projectId ? { projectId: String(projectId) } : {}),
     ...(typeof pack === "string" ? { pack } : {}),
     ...(autoPack === true ? { autoPack: true } : {}),
     ...(permissionMode ? { permissionMode } : {}),
     ...(trimmedRubric ? { rubric: trimmedRubric } : {}),
+    ...(Array.isArray(citedRunIds) && citedRunIds.filter(Boolean).length
+      ? { citedRunIds: [...new Set(citedRunIds.map(String).filter(Boolean))] }
+      : {}),
   };
 }
 
@@ -2849,6 +2948,71 @@ export function composerSubmitPlan(mode, rawText) {
   const text = String(rawText ?? "").trim();
   if (!text) return mode.kind === "steer" ? { kind: "stop", runId: mode.runId, text: "" } : null;
   return { kind: mode.kind, runId: mode.runId, text };
+}
+
+/**
+ * 计划编排的主场是跨领域交接 / 长管线（findings 发现 10：单领域上 planned 是纯开销）。
+ * 日常对话、单点小修不该先跑 planner。只在信号够时建议切回普通模式，拿不准不说话。
+ * 不自动改旋钮——建议不是拦截。
+ *
+ * @returns {{reason:"standing"|"casual"|"small-fix", message:string}|null}
+ */
+export function suggestPlainModeInsteadOfPlan(task, opts = {}) {
+  if (opts.planMode !== true) return null;
+  if (opts.kind != null && opts.kind !== "new") return null;
+  const text = String(task ?? "").replace(/\s+/g, " ").trim();
+  if (looksLikePlanWorthyTask(text)) return null;
+  if (!text) {
+    return {
+      reason: "standing",
+      message: "计划编排适合跨领域或长管线。日常对话、小修建议改用普通模式。",
+    };
+  }
+  if (looksLikeCasualChatTask(text)) {
+    return {
+      reason: "casual",
+      message: "这更像日常对话。计划编排会先拆一轮再动手，建议改用普通模式。",
+    };
+  }
+  if (looksLikeSmallFixTask(text)) {
+    return {
+      reason: "small-fix",
+      message: "这更像单点小修。单领域任务上编排是纯开销，建议改用普通模式。",
+    };
+  }
+  return null;
+}
+
+const PLAN_WORTHY_TASK_RE = /子任务|并行编排|跨(?:领域|包|目录)|拆成|拆解|计划确认|烧录|原理图|\bpcb\b|网表|验收标准|多领域|并且还要|然后再做|同时交付/i;
+const CASUAL_CHAT_EXACT_RE = /^(你好|您好|嗨|哈喽|在吗|在么|在不在|hello|hi|hey|thanks|thank you|谢谢|早安|晚安|早|嗯+|好的|ok|okay)[!！?？。.~～]*$/i;
+const SMALL_FIX_TASK_RE = /修(?:一)?下|修个|改(?:一)?下|改个|小\s*bug|typo|拼写|错字|漏了个|少了个|对齐一下|改个颜色|改个文案/i;
+
+function looksLikePlanWorthyTask(text) {
+  if (!text) return false;
+  if (text.length > 280) return true;
+  if (PLAN_WORTHY_TASK_RE.test(text)) return true;
+  const steps = text.match(/\d+[.)、]\s+\S+/g);
+  return Boolean(steps && steps.length >= 2);
+}
+
+function looksLikeCasualChatTask(text) {
+  if (SMALL_FIX_TASK_RE.test(text)) return false;
+  if (/\d+[.)、]/.test(text)) return false;
+  if (CASUAL_CHAT_EXACT_RE.test(text)) return true;
+  if (text.length <= 24 && /[?？]$/.test(text) && !taskLooksLikeWorkPath(text)) return true;
+  if (text.length <= 16 && !taskLooksLikeWorkPath(text) && !/(实现|重构|设计|交付|验收|编写|撰写|修复)/.test(text)) {
+    return true;
+  }
+  return false;
+}
+
+function looksLikeSmallFixTask(text) {
+  if (text.length > 140) return false;
+  return SMALL_FIX_TASK_RE.test(text);
+}
+
+function taskLooksLikeWorkPath(text) {
+  return /[\\/]|\.\w{1,5}\b/.test(text);
 }
 
 /**
@@ -2948,6 +3112,7 @@ export function buildNewRunRequest({
   autoPack = false,
   permissionMode,
   extraWorkdirs,
+  projectId,
   designId,
   designTab,
   designTemplate,
@@ -3027,6 +3192,7 @@ export function buildNewRunRequest({
     ...(Array.isArray(extraWorkdirs) && extraWorkdirs.filter((p) => p && p !== workdir).length
       ? { extraWorkdirs: [...new Set(extraWorkdirs.map(String).filter((p) => p && p !== workdir))] }
       : {}),
+    ...(projectId ? { projectId: String(projectId) } : {}),
     // 与宿主既有契约一致：角色模型默认启用，只有显式关闭才传 false。
     ...(!useVerifierModel ? { useVerifierModel: false } : {}),
     ...(!usePlannerModel ? { usePlannerModel: false } : {}),
@@ -3325,15 +3491,18 @@ export function renderQueueChips(queuedMessages, opts = {}) {
   const chips = items.length
     ? `<span class="queue-chips-label">排队中</span>` +
       items
-        .map(
-          (text, i) =>
-            `<span class="queue-chip" title="${esc(text)}">` +
-            `<span class="queue-chip-text">${esc(truncate(text, 40))}</span>` +
+        .map((text, i) => {
+          const face = paintConversationUserText(text);
+          const painted = face.display || face.stub || stripHostEditScopeChrome(text) || text;
+          return (
+            `<span class="queue-chip" title="${esc(painted)}">` +
+            `<span class="queue-chip-text">${esc(truncate(painted, 40))}</span>` +
             `<button type="button" class="queue-chip-insert" data-steer-index="${i}" aria-label="立即插入这条">` +
             `<i class="ph ph-lightning" aria-hidden="true"></i></button>` +
             `<button type="button" class="queue-chip-cancel" data-index="${i}" aria-label="取消这条排队消息">✕</button>` +
-            `</span>`,
-        )
+            `</span>`
+          );
+        })
         .join("")
     : "";
   return insertBtn + chips;
@@ -3585,7 +3754,9 @@ function clip(text, max) {
  * 因为 `附件：uploads/<32 位哈希>.jpg` 里唯一有信息量的就是那个扩展名与前几位。
  */
 export function titleSourceText(task) {
-  const lines = String(task ?? "").split(NEWLINE_RE).map((l) => l.trim()).filter(Boolean);
+  const painted = paintConversationUserText(task);
+  const source = painted.display || painted.stub || stripHostEditScopeChrome(task);
+  const lines = source.split(NEWLINE_RE).map((l) => l.trim()).filter(Boolean);
   return lines.find((l) => !ATTACH_RE.test(l)) ?? "";
 }
 
@@ -3903,6 +4074,171 @@ function artifactKindIcon(label) {
 }
 
 /**
+ * 宿主曾把画布当前页写成 [改稿范围]/[改范围] 贴进续跑正文（只改那一页）。
+ * 默认 UI 不再注入；历史正史里还可能带着这行，画气泡/排队 chip/侧栏标题时剥掉，用户原话留下。
+ */
+export function stripHostEditScopeChrome(text) {
+  return String(text ?? "")
+    .replace(/\[改稿范围\][^\n]*/g, "")
+    .replace(/\[改范围\][^\n]*/g, "")
+    .replace(/^\n+/, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+/** finish_task 回执；续跑时可能焊在下一句人话前面。只在画气泡时剥，正史不动。 */
+export const TERMINAL_TOOL_ACK_DISPLAY = "已收到，交付完成。";
+const TERMINAL_TOOL_ACK_SPLIT_RE = /已收到，交付完成。?/g;
+const HUGE_DOCUMENT_CHARS = 20_000;
+const HTML_DOCUMENT_FOLD_CHARS = 512;
+
+export function looksLikeHtmlDocument(text) {
+  const t = String(text ?? "").trim();
+  return /^<!DOCTYPE\s+html\b/i.test(t) || /^<html[\s>]/i.test(t);
+}
+
+/** 整份 HTML / 超大 write_file 体——对话里只能留一行摘要。 */
+export function looksLikeHugeDocumentBody(text) {
+  const t = String(text ?? "").trim();
+  if (!t) return false;
+  if (t.length >= HUGE_DOCUMENT_CHARS) return true;
+  return looksLikeHtmlDocument(t) && t.length >= HTML_DOCUMENT_FOLD_CHARS;
+}
+
+/**
+ * 工具回执（不是人说的话）。只认行首/整段形态，避免误伤「Progress updated 了吗」。
+ */
+export function isToolReceiptText(text) {
+  const t = String(text ?? "").trim();
+  if (!t) return false;
+  if (/^已收到，交付完成。?$/.test(t)) return true;
+  if (/^未执行：本轮已通过终结工具交付/.test(t)) return true;
+  if (/^终结工具入参不符合交付契约/.test(t)) return true;
+  if (/^Progress updated\s*\(\d+\)/.test(t)) return true;
+  if (/^\[execution boundary=/.test(t)) return true;
+  if (/^Wrote \d+ bytes\b/.test(t)) return true;
+  if (/^Refused:/.test(t)) return true;
+  if (/^Command exited with\s+\d+/.test(t)) return true;
+  if (/^Legacy execution boundary/.test(t)) return true;
+  return false;
+}
+
+function isToolReceiptLeadLine(line) {
+  const t = String(line ?? "").trim();
+  return !t || isToolReceiptText(t);
+}
+
+function conversationLooksHuman(text) {
+  const t = String(text ?? "").trim();
+  if (!t) return false;
+  if (looksLikeHugeDocumentBody(t) || looksLikeHtmlDocument(t)) return false;
+  if (isToolReceiptText(t)) return false;
+  return true;
+}
+
+/**
+ * 续跑把 tool_result / 「已收到，交付完成」焊进人话时，对话面只留人话。
+ * 模型仍看得到原串（事件 / messages 不改）。
+ */
+export function peelHostToolReceipts(text) {
+  let t = String(text ?? "").replace(/\r\n/g, "\n").trim();
+  if (!t) return "";
+  if (TERMINAL_TOOL_ACK_SPLIT_RE.test(t)) {
+    TERMINAL_TOOL_ACK_SPLIT_RE.lastIndex = 0;
+    const chunks = t.split(TERMINAL_TOOL_ACK_SPLIT_RE).map((s) => s.trim()).filter(Boolean);
+    const human = [...chunks].reverse().find((c) => conversationLooksHuman(c));
+    t = human ?? chunks.filter((c) => conversationLooksHuman(c)).join("\n\n").trim();
+  }
+  const lines = t.split("\n");
+  let start = 0;
+  while (start < lines.length && isToolReceiptLeadLine(lines[start])) start++;
+  t = lines.slice(start).join("\n").trim();
+  return conversationLooksHuman(t) ? t : "";
+}
+
+export function foldedDocumentStub(text, opts = {}) {
+  const raw = String(text ?? "");
+  const path = typeof opts.path === "string" ? opts.path : "";
+  const name = path ? String(path).split(/[/\\]/).pop() : "";
+  const kb = Math.max(1, Math.round(raw.length / 1024));
+  const html = looksLikeHtmlDocument(raw);
+  const written = opts.written === true || String(opts.tool ?? "") === "write_file";
+  if (name && written) return `已写入 ${name}（约 ${kb}KB）`;
+  if (html) return name ? `已折叠 ${name}（约 ${kb}KB）` : "工具读回了一份 HTML，已折叠";
+  if (name) return `已折叠 ${name}（约 ${kb}KB）`;
+  return `长内容已折叠（约 ${kb}KB）`;
+}
+
+function toolBodyCandidate(input, result) {
+  const fromInput = input && typeof input === "object"
+    ? String(input.content ?? input.contents ?? input.body ?? "")
+    : "";
+  const fromResult = String(result ?? "");
+  if (looksLikeHugeDocumentBody(fromInput) || looksLikeHtmlDocument(fromInput)) return fromInput;
+  if (looksLikeHugeDocumentBody(fromResult) || looksLikeHtmlDocument(fromResult)) return fromResult;
+  return fromResult || fromInput;
+}
+
+function toolPathHint(input) {
+  if (!input || typeof input !== "object") return "";
+  return String(input.path ?? input.file_path ?? "").trim();
+}
+
+/**
+ * 用户气泡的展示层：剥页锁 / 工具回执 / 焊上的终结回执，巨文档改成一行摘要。
+ * `it.text` 仍是原文，不改事件、不改正史。
+ *
+ * @returns {{kind:"text"|"document"|"receipt", display:string, stub:string}}
+ */
+export function paintConversationUserText(text) {
+  const { displayBody } = splitUserMessageAttachments(text);
+  const stripped = stripHostEditScopeChrome(displayBody);
+  const peeled = peelHostToolReceipts(stripped);
+  if (peeled) {
+    if (looksLikeHugeDocumentBody(peeled) || looksLikeHtmlDocument(peeled)) {
+      return { kind: "document", display: "", stub: foldedDocumentStub(peeled) };
+    }
+    return { kind: "text", display: peeled, stub: "" };
+  }
+  const raw = stripped || String(text ?? "").trim();
+  if (looksLikeHugeDocumentBody(raw) || looksLikeHtmlDocument(raw)) {
+    const path = toolPathHint({ path: raw.match(/index\.html/i) ? "index.html" : "" });
+    return { kind: "document", display: "", stub: foldedDocumentStub(raw, { path }) };
+  }
+  if (isToolReceiptText(raw) || !raw) {
+    return { kind: "receipt", display: "", stub: "工具回执，已折叠" };
+  }
+  return { kind: "text", display: "", stub: "" };
+}
+
+export function foldConversationBody(text, opts = {}) {
+  const t = String(text ?? "");
+  if (!looksLikeHugeDocumentBody(t) && !looksLikeHtmlDocument(t)) return null;
+  return {
+    stub: foldedDocumentStub(t, opts),
+    detailsHtml: renderFoldedDocument(t, "展开全文"),
+  };
+}
+
+function renderFoldedDocument(text, summary) {
+  return (
+    `<details class="chat-aside chat-doc-fold">` +
+    `<summary>${esc(summary)}</summary>` +
+    `<pre class="chat-doc-fold-body">${esc(truncate(String(text ?? ""), 12000))}</pre>` +
+    `</details>`
+  );
+}
+
+function renderFoldedToolReceiptChip(stub, raw) {
+  return (
+    `<details class="chat-aside chat-tool-receipt">` +
+    `<summary>工具 · ${esc(stub)}</summary>` +
+    `<pre class="chat-doc-fold-body">${esc(truncate(String(raw ?? ""), 4000))}</pre>` +
+    `</details>`
+  );
+}
+
+/**
  * 从用户消息里拆出正文与附件行。`body` 仍含附件行（模型看到的原文）；
  * `displayBody` 去掉附件行，给气泡右侧正文用——左侧已经有预览和「附件：」标注。
  */
@@ -4058,27 +4394,133 @@ export function sameWorkdirPath(a, b) {
 }
 
 /**
- * 侧栏默认只看当前作曲栏工作目录。allProjects 才摊开全部项目。
- * 空 workdir 不过滤（还没选目录时不要把列表藏空）。
+ * 欢迎页默认工作目录。有上次选择就用它；宿主 cwd 是产品仓且白名单里另有
+ * scratch 时，不要默默落在源码树。不改 /api/harness.workdir（测试仍认启动 cwd）。
  */
-export function filterRunsByComposerWorkdir(runs, workdir, allProjects = false) {
+export function pickWelcomeWorkdir({
+  visible,
+  keep,
+  snapWorkdir,
+  hostWorkdirIsHarness,
+  hasPref,
+} = {}) {
+  const list = Array.isArray(visible) ? visible.filter(Boolean) : [];
+  if (!list.length) return "";
+  const keepHit = keep && list.find((d) => sameWorkdirPath(d, keep));
+  if (keepHit) return keepHit;
+  if (hostWorkdirIsHarness && !hasPref) {
+    const scratch = list.find((d) => !sameWorkdirPath(d, snapWorkdir));
+    if (scratch) return scratch;
+  }
+  return list.find((d) => sameWorkdirPath(d, snapWorkdir)) ?? list[0];
+}
+
+/**
+ * 侧栏会话可见性。
+ *
+ * 旧谓词（会把多目录项目看空）：`sameWorkdirPath(run.workdir, composerWorkdir)`。
+ * 选项目会把作曲栏 cwd 设成 primaryWorkdir，于是兄弟目录的对话全部消失。
+ *
+ * 新谓词：
+ *   - 「全部项目」：不过滤
+ *   - 选了项目：`run.projectId === project.id`，或（无/同 projectId 且
+ *     workdir 落在该项目 workdirs，正反斜杠/尾斜杠无关）
+ *   - 未入项剩目录：仍只按作曲栏路径（旧行为）
+ * 空 workdir 不过滤（还没选目录时不要把列表藏空）。
+ * 第 4 参可选——旧调用（2–3 个参数）保持按路径过滤。
+ */
+export function filterRunsByComposerWorkdir(runs, workdir, allProjects = false, project = null) {
   if (allProjects) return runs;
+  if (project && (project.id || (Array.isArray(project.workdirs) && project.workdirs.length))) {
+    return runs.filter((r) => runBelongsToProject(r, project));
+  }
   const cur = String(workdir ?? "").trim();
   if (!cur) return runs;
   return runs.filter((r) => sameWorkdirPath(r.workdir, cur));
 }
 
-/** 办公脸：显式 workspace，或旧档案 packName=design。其余归编码。 */
+export function runBelongsToProject(run, project) {
+  if (!project) return false;
+  const runProject = String(run?.projectId ?? "").trim();
+  const want = String(project.id ?? "").trim();
+  if (runProject && want) {
+    if (runProject === want) return true;
+    return false;
+  }
+  const members = Array.isArray(project.workdirs) ? project.workdirs : [];
+  return members.some((dir) => sameWorkdirPath(run?.workdir, dir));
+}
+
+/** 作曲栏 cwd：当前已是成员则保留，否则退回 primary。不拿 primary 当可见性过滤。 */
+export function composerCwdForProject(project, currentWorkdir) {
+  const current = String(currentWorkdir ?? "").trim();
+  if (!project) return current;
+  const members = Array.isArray(project.workdirs) ? project.workdirs : [];
+  if (current && members.some((dir) => sameWorkdirPath(dir, current))) return current;
+  return String(project.primaryWorkdir ?? current);
+}
+
+/** 侧栏分组：入项的 run 跟项目走；剩目录仍按路径末段。 */
+export function findProjectForRun(run, projects) {
+  const list = Array.isArray(projects) ? projects : [];
+  if (!list.length) return null;
+  if (run?.projectId) {
+    const hit = list.find((p) => p.id === run.projectId);
+    if (hit) return hit;
+  }
+  if (run?.workdir) {
+    return list.find((p) => (p.workdirs ?? []).some((dir) => sameWorkdirPath(dir, run.workdir))) ?? null;
+  }
+  return null;
+}
+
+/** 办公脸：显式 workspace，或旧档案 packName=design。其余归编码。只给新建默认 pack，不藏列表。 */
 export function runBelongsToOffice(run) {
   if (run?.workspace === "office") return true;
   if (run?.workspace === "code") return false;
-  return run?.packName === "design" || run?.mode === "design";
+  return run?.packName === "design"
+    || run?.mode === "design"
+    || run?.facade === "design"
+    || Boolean(run?.designRoute);
 }
 
+/**
+ * 侧栏 membership：只认选中的项目实体。勾选的 extra 目录是下次 run 的
+ * 读写范围，不合成「看得见谁」的过滤器。
+ */
+export function composerListMembership(project, _workdir, _extras = []) {
+  if (project && (project.id || (Array.isArray(project.workdirs) && project.workdirs.length))) {
+    return project;
+  }
+  return null;
+}
+
+/** 目录落在哪张脸：该路径上的 run 全是办公→office，全是编码→code；空或混用→两边都可见。 */
+export function inferWorkdirFace(workdir, runs) {
+  let office = 0;
+  let code = 0;
+  for (const run of Array.isArray(runs) ? runs : []) {
+    if (!sameWorkdirPath(run?.workdir, workdir)) continue;
+    if (runBelongsToOffice(run)) office += 1;
+    else code += 1;
+  }
+  if (office && !code) return "office";
+  if (code && !office) return "code";
+  return null;
+}
+
+export function workdirVisibleOnFace(workdir, face, runs) {
+  const inferred = inferWorkdirFace(workdir, runs);
+  if (!inferred) return true;
+  const wantOffice = face === "office" || face === "work";
+  return wantOffice ? inferred === "office" : inferred === "code";
+}
+
+/** Work 只留办公对话，Code 只留编码对话。 */
 export function filterRunsByWorkspaceFace(runs, face) {
   const list = Array.isArray(runs) ? runs : [];
-  if (face === "office") return list.filter(runBelongsToOffice);
-  return list.filter((r) => !runBelongsToOffice(r));
+  const wantOffice = face === "office" || face === "work";
+  return list.filter((r) => (wantOffice ? runBelongsToOffice(r) : !runBelongsToOffice(r)));
 }
 
 // ---------------------------------------------------------------
@@ -4201,7 +4643,7 @@ export function renderRunList(runs, selectedRunId, onSelect, metaMap, onDelete, 
   // V-32/R6：始终按工作目录分组。此前只有一个目录时自动摊平，但这会让
   // 同一套侧栏在「一个项目」与「两个项目」之间突然变结构，也把最重要的
   // 工具圈禁边界藏掉。项目 → 对话现在是稳定的信息架构，不随数量漂移。
-  const groups = groupRunsByWorkdir(runs);
+  const groups = groupRunsByWorkdir(runs, groupState?.projects);
 
   // 分组时用 listbox > group > option（ARIA 1.2 允许的结构）。
   patchList(listEl, groups, {
@@ -4214,26 +4656,38 @@ export function renderRunList(runs, selectedRunId, onSelect, metaMap, onDelete, 
       box.innerHTML =
         '<div class="run-group-label">' +
         '<span class="run-group-identity"><i class="ph ph-caret-down run-group-caret" aria-hidden="true"></i><i class="ph ph-folder-simple" aria-hidden="true"></i><span class="run-group-name"></span></span>' +
+        '<span class="run-group-actions">' +
+        '<button type="button" class="run-group-artifacts" hidden aria-label="查看产物">' +
+        '<i class="ph ph-folder-open" aria-hidden="true"></i></button>' +
         '<span class="run-group-count"></span>' +
-        '</div><div class="run-group-items"></div>';
+        "</span></div><div class=\"run-group-items\"></div>";
       const toggle = box.querySelector(".run-group-label");
       toggle?.addEventListener("click", (event) => {
+        if (event.target instanceof Element && event.target.closest(".run-group-artifacts")) return;
         event.preventDefault();
         event.stopPropagation();
         groupState?.onToggle?.(g.key);
       });
-      patchRunGroupHeader(box, g, groupState?.collapsed);
+      const artifactsBtn = box.querySelector(".run-group-artifacts");
+      artifactsBtn?.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const id = box.getAttribute("data-project-id");
+        if (id) groupState?.onOpenArtifacts?.(id);
+      });
+      patchRunGroupHeader(box, g, groupState);
       patchRunItems(box.querySelector(".run-group-items"), g.runs, metaMap, selectedRunId, onSelect, onDelete);
       return box;
     },
     update: (box, g) => {
-      patchRunGroupHeader(box, g, groupState?.collapsed);
+      patchRunGroupHeader(box, g, groupState);
       patchRunItems(box.querySelector(".run-group-items"), g.runs, metaMap, selectedRunId, onSelect, onDelete);
     },
   });
 }
 
-function patchRunGroupHeader(box, group, collapsed) {
+function patchRunGroupHeader(box, group, groupState) {
+  const collapsed = groupState?.collapsed;
   const label = box.querySelector(".run-group-label");
   const isCollapsed = Boolean(collapsed?.has(group.key));
   setText(box.querySelector(".run-group-name"), group.label);
@@ -4242,6 +4696,12 @@ function patchRunGroupHeader(box, group, collapsed) {
   setClass(box, "run-group--collapsed", isCollapsed);
   const caret = box.querySelector(".run-group-caret");
   if (caret) caret.className = `ph ${isCollapsed ? "ph-caret-right" : "ph-caret-down"} run-group-caret`;
+  const projectId = String(group.key ?? "").startsWith("project:") ? String(group.key).slice("project:".length) : "";
+  setAttr(box, "data-project-id", projectId || null);
+  const artifactsBtn = box.querySelector(".run-group-artifacts");
+  if (artifactsBtn) {
+    artifactsBtn.hidden = !projectId || typeof groupState?.onOpenArtifacts !== "function";
+  }
 }
 
 /**
@@ -4282,9 +4742,19 @@ export function paintGateChip(el, status) {
 }
 
 /**
+ * 引用芯片文案：有目录标签就带上，避免同名产物混在一起。
+ * @param {{ title?: string, task?: string, runId?: string, workdirLabel?: string }} ref
+ */
+export function formatCiteChip(ref) {
+  const name = String(ref?.title || ref?.task || ref?.runId || "").trim() || String(ref?.runId ?? "");
+  const label = String(ref?.workdirLabel ?? "").trim();
+  return label ? `${name} · ${label}` : name;
+}
+
+/**
  * run_config.cited → 对话里的引用卡。没有引用返回 null。
  * @param {unknown} cited
- * @returns {{ kind: "cite", refs: { runId: string, title: string, artifacts: string[] }[] }|null}
+ * @returns {{ kind: "cite", refs: { runId: string, title: string, artifacts: string[], workdirLabel?: string }[] }|null}
  */
 export function deriveCitedChat(cited) {
   if (!Array.isArray(cited) || cited.length === 0) return null;
@@ -4292,6 +4762,7 @@ export function deriveCitedChat(cited) {
     runId: String(c?.runId ?? ""),
     title: String(c?.title ?? ""),
     artifacts: Array.isArray(c?.artifacts) ? c.artifacts.map(String).filter(Boolean) : [],
+    ...(c?.workdirLabel ? { workdirLabel: String(c.workdirLabel) } : {}),
   })).filter((c) => c.runId);
   if (!refs.length) return null;
   return { kind: "cite", refs };
@@ -4344,19 +4815,30 @@ export function conversationTipId(runs, runId) {
   return tip;
 }
 
-export function groupRunsByWorkdir(runs) {
-  const byDir = new Map();
+export function groupRunsByWorkdir(runs, projects = []) {
+  const byKey = new Map();
+  const labels = new Map();
   for (const r of visibleConversationRuns(runs)) {
+    const project = findProjectForRun(r, projects);
     const dir = r.workdir ?? "";
-    if (!byDir.has(dir)) byDir.set(dir, []);
-    byDir.get(dir).push(r);
+    const key = project ? `project:${project.id}` : (dir || "(default)");
+    const label = project
+      ? project.name
+      : dir
+        ? dir.split(/[\\/]/).filter(Boolean).pop() ?? dir
+        : "（默认工作目录）";
+    if (!byKey.has(key)) {
+      byKey.set(key, []);
+      labels.set(key, label);
+    }
+    byKey.get(key).push(r);
   }
-  return [...byDir.entries()].map(([dir, list]) => ({
-    key: dir || "(default)",
+  return [...byKey.entries()].map(([key, list]) => ({
+    key,
     // 标签只取末段：完整绝对路径在窄侧栏里会挤掉一切，完整值在 Tools 面有
     // 两种分隔符都要切：这个宿主主要跑在 Windows 上（反斜杠），但路径也可能
     // 是 posix 风格。只切 `/` 的话 Windows 路径切不开，组名会变成整条绝对路径
-    label: dir ? dir.split(/[\\/]/).filter(Boolean).pop() ?? dir : "（默认工作目录）",
+    label: labels.get(key),
     runs: list,
   }));
 }
@@ -4518,6 +5000,7 @@ export function renderRunDetail(state, callbacks) {
   patchApprovalRail(parts, state, isRunning, callbacks);
   patchUnverifiedRail(parts, faces, callbacks);
   patchLiveStrip(parts, state, isRunning, callbacks.liveText ?? "", callbacks.liveThinking ?? "", harness);
+  patchCampaignStrip(parts, state, callbacks);
   patchConversation(
     parts,
     state,
@@ -4623,6 +5106,17 @@ function ensureDetailSkeleton(mainEl, state, callbacks) {
     mainEl.__parts.ctxRing = ring;
     mainEl.__parts.ctxRingArc = ring?.querySelector(".ctx-ring-arc") ?? null;
     mainEl.__parts.ctxUsagePanel = document.getElementById("ctx-usage-panel");
+    if (!mainEl.querySelector(".campaign-strip")) {
+      const stack = mainEl.querySelector(".conversation-stack");
+      const conv = mainEl.querySelector(".conversation");
+      if (stack && conv) {
+        const strip = document.createElement("div");
+        strip.className = "campaign-strip";
+        strip.hidden = true;
+        stack.insertBefore(strip, conv);
+      }
+    }
+    mainEl.__parts.campaignStrip = mainEl.querySelector(".campaign-strip");
     return mainEl.__parts;
   }
 
@@ -4666,6 +5160,7 @@ function ensureDetailSkeleton(mainEl, state, callbacks) {
      */
     '<div class="detail-layout">' +
     '<div class="conversation-stack">' +
+    '<div class="campaign-strip" hidden></div>' +
     '<div class="conversation" id="conversation"></div>' +
     '<div class="agent-overlay" id="agent-overlay" hidden></div>' +
     "</div>" +
@@ -4721,6 +5216,7 @@ function ensureDetailSkeleton(mainEl, state, callbacks) {
     // 它不随内容滚走，新审批出现在哪都看得见（委托方建议的结构解法）
     ...ensureActionDock(),
     liveStrip: mainEl.querySelector(".live-strip"),
+    campaignStrip: mainEl.querySelector(".campaign-strip"),
     conversation: mainEl.querySelector(".conversation"),
     agentOverlay: mainEl.querySelector("#agent-overlay"),
     rail: mainEl.querySelector(".detail-rail"),
@@ -4980,6 +5476,15 @@ export function deriveAssemblyBar(state, harness) {
 
   // 设计模式：门面芯片必须看得见匹配结果，不能只改后端
   const designRoute = cfg.designRoute && typeof cfg.designRoute === "object" ? cfg.designRoute : null;
+  if (cfg.campaignId || cfg.campaignRole === "director") {
+    const role = cfg.campaignRole === "director" ? "导演" : cfg.campaignRole === "child" ? "子对话" : "战役";
+    push(
+      "campaign",
+      `战役 · ${role}`,
+      "导演是薄看板：不产制品，用 spawn_task 开子对话。子对话是可进入的独立 StoredRun。规格+幻灯不拆战役。",
+    );
+  }
+
   if (cfg.mode === "design" || designRoute) {
     const bundle = designRoute?.bundle === "spec-plus-deck";
     const extra = Array.isArray(designRoute?.extraSeeds) ? designRoute.extraSeeds.filter(Boolean) : [];
@@ -5147,25 +5652,38 @@ export function deriveAssemblyBar(state, harness) {
     cfg.supportsVision !== undefined && cfg.supportsVision !== null
       ? cfg.supportsVision
       : harness?.supportsVision;
-  const visionChip =
-    visionName && supportsVision === false
-      ? "识图 不可用"
-      : visionName
-        ? `识图 ${visionName}`
-        : "识图 未配";
-  push(
-    "vision",
-    visionChip,
-    visionName && supportsVision === false
-      ? "配了视觉模型，但能力探针（AGENT_MODEL_PROBE=1）判定端点不接受图像——" +
-        "`describe_image` 已不进工具面（与没配同纪律）。"
-      : visionName
-      ? "配了视觉模型，`describe_image` 才在工具面上。图片走独立角色模型，与执行者解耦——" +
-        "执行模型不必自己支持视觉。"
-      : "没配视觉模型（`AGENT_VISION_MODEL`），所以 `describe_image` **根本不进工具面**——" +
-        "而不是摆一个一调用就报错的工具。给模型一个用不了的工具，它会反复尝试并把失败归咎于自己；" +
-        "工具面必须与真实能力一致，这是工具运行时地板那条纪律。",
-  );
+  const imageBacking = cfg.describeImageBacking ?? harness?.describeImageBacking ?? null;
+  const visionUnconfiguredWhy =
+    "没配视觉模型（`AGENT_VISION_MODEL`），所以 `describe_image` **根本不进工具面**——" +
+    "而不是摆一个一调用就报错的工具。给模型一个用不了的工具，它会反复尝试并把失败归咎于自己；" +
+    "工具面必须与真实能力一致，这是工具运行时地板那条纪律。";
+  let visionChip;
+  let visionWhy;
+  if (imageBacking === "executor") {
+    visionChip = "识图 执行者";
+    visionWhy =
+      "执行者自己能看图，`describe_image` 走执行模型，不另引识图角色。" +
+      "磁盘上的图不会自动进对话，所以工具仍在；只是不再 wrap / 计量 / 写进本 run 的独立识图模型。";
+  } else if (imageBacking === "none") {
+    visionChip = "识图 未配";
+    visionWhy = visionUnconfiguredWhy;
+  } else {
+    visionChip =
+      visionName && supportsVision === false
+        ? "识图 不可用"
+        : visionName
+          ? `识图 ${visionName}`
+          : "识图 未配";
+    visionWhy =
+      visionName && supportsVision === false
+        ? "配了视觉模型，但能力探针（AGENT_MODEL_PROBE=1）判定端点不接受图像——" +
+          "`describe_image` 已不进工具面（与没配同纪律）。"
+        : visionName
+        ? "执行者看不见图，才引用独立识图角色。`describe_image` 在工具面上；" +
+          "执行者自己能看图时不会走到这一格。"
+        : visionUnconfiguredWhy;
+  }
+  push("vision", visionChip, visionWhy);
 
   const imageRun = cfg.roleModels?.image ?? null;
   const imageCfg = harness?.roleModels?.image ?? null;
@@ -5180,6 +5698,18 @@ export function deriveAssemblyBar(state, harness) {
         "执行模型不必自己会画图。"
       : "没配生图模型（`AGENT_IMAGE_MODEL`），所以 `generate_image` **根本不进工具面**——" +
         "而不是摆一个一调用就报错的工具。",
+  );
+
+  /**
+   * 办公出站门禁。只在 armed 时上条——未开是常态，摆「未开」是噪声。
+   * 快照若误带 webhook 字段，normalize 会剥掉，芯片与 why 都不许出现地址。
+   */
+  const notifySnap = normalizeNotifySnapshot(harness?.notify);
+  push(
+    "notify",
+    notifySnap?.armed ? (notifySnap.kind === "webhook" ? "门禁通知已开" : "飞书门禁通知已开") : null,
+    "看板（project_status）写入或清除时向办公软件出站推一门卡片。" +
+      "Webhook 只活在服务端，`/api/harness` 只报 kind 与 armed，不下发地址。",
   );
 
   /**
@@ -6225,6 +6755,60 @@ function dismissMissingArtifactCard(node) {
  * 签名只看 `lastSeq` 与条目数：事件流单调追加，这两个数不变就没有新内容。
  * 与日志面同款——重画整段对话会打断正在展开的 details 与用户的滚动位置。
  */
+function campaignChildStatusLabel(status) {
+  if (status === "running") return "工作中";
+  if (status === "done") return "已完成";
+  if (status === "cancelled") return "已取消";
+  if (status === "error") return "未完成";
+  if (status === "pending") return "等待";
+  return String(status ?? "");
+}
+
+function patchCampaignStrip(parts, state, callbacks) {
+  const host = parts.campaignStrip;
+  if (!host) return;
+  const children = deriveCampaignChildren(state);
+  const show = children.length > 0;
+  setAttr(host, "hidden", show ? null : "");
+  if (!show) {
+    host.innerHTML = "";
+    host.__bound = false;
+    return;
+  }
+  let html =
+    '<div class="campaign-strip-head">子对话</div><ul class="campaign-chip-list">';
+  for (const c of children) {
+    const cancel = c.status === "running"
+      ? `<button type="button" class="campaign-chip-cancel" data-cancel-child="${esc(c.runId)}">取消</button>`
+      : "";
+    html +=
+      `<li class="campaign-chip campaign-chip--${esc(c.status)}">` +
+      `<span class="campaign-chip-title">${esc(c.title || "子对话")}</span>` +
+      `<span class="campaign-chip-status">${esc(campaignChildStatusLabel(c.status))}</span>` +
+      `<button type="button" class="campaign-chip-enter" data-open-run="${esc(c.runId)}">进入</button>` +
+      cancel +
+      `</li>`;
+  }
+  html += "</ul>";
+  host.innerHTML = html;
+  host.__campaignCallbacks = callbacks;
+  if (!host.__bound) {
+    host.__bound = true;
+    host.addEventListener("click", (e) => {
+      const cb = host.__campaignCallbacks ?? {};
+      const open = e.target instanceof Element ? e.target.closest("[data-open-run]") : null;
+      if (open) {
+        cb.onOpenRun?.(open.getAttribute("data-open-run"));
+        return;
+      }
+      const cancelBtn = e.target instanceof Element ? e.target.closest("[data-cancel-child]") : null;
+      if (cancelBtn) {
+        cb.onCancelCampaignChild?.(cancelBtn.getAttribute("data-cancel-child"));
+      }
+    });
+  }
+}
+
 function patchConversation(parts, state, live, callbacks) {
   const host = parts.conversation;
   if (!host) return;
@@ -6321,6 +6905,11 @@ function patchConversation(parts, state, live, callbacks) {
             }
           } catch { /* 非法网址按普通链接 */ }
         }
+      }
+      const openRun = e.target instanceof Element ? e.target.closest("[data-open-run]") : null;
+      if (openRun) {
+        cb.onOpenRun?.(openRun.getAttribute("data-open-run"));
+        return;
       }
       const agentBtn = e.target instanceof Element ? e.target.closest("[data-agent-id]") : null;
       if (agentBtn) {
@@ -6508,6 +7097,8 @@ function chatItemSig(it) {
       return `verdict:${JSON.stringify(it.verdict)}`;
     case "artifacts":
       return `artifacts:${(it.files ?? []).map((f) => f.path).join("|")}`;
+    case "blocked":
+      return `blocked:${(it.conditions ?? []).join("|")}:${it.summary ?? ""}`;
     case "plan":
       return `plan:${it.folded ? 1 : 0}:${(it.plan?.nodes ?? []).map((n) => `${n.id}:${n.status}`).join("|")}`;
     case "agents":
@@ -7154,6 +7745,7 @@ function patchTabContent(parts, state, activeTab, overview, logEntries, callback
             faces.tools.totalCalls, faces.tools.totalErrors,
             faces.tools.tools.length, faces.tools.denials.length,
             faces.tools.reroutes.length, faces.tools.pack?.name ?? "",
+            faces.tools.projectId ?? "", faces.tools.campaignId ?? "", faces.tools.workdir ?? "",
           ])
         : signature([
             state.verifierTimeline.length,
@@ -7390,6 +7982,11 @@ function renderToolsTab(tools) {
       `${label} · backend ${e.resolvedBackend ?? "none"} · probe ${e.probe?.state ?? "unknown"}`,
     );
     html += row("隔离策略摘要", `fs: ${e.filesystem} · net: ${e.network} · identity: ${e.identity} · resources: ${e.resources}`);
+  }
+  if (tools.projectId) html += row("项目", tools.projectId);
+  if (tools.campaignId) {
+    const role = tools.campaignRole === "director" ? "导演" : tools.campaignRole === "child" ? "子对话" : "";
+    html += row("战役", role ? `${tools.campaignId} · ${role}` : tools.campaignId);
   }
   if (tools.workdir) html += row("工作目录", tools.workdir);
   if (tools.roleModels) {
@@ -7637,13 +8234,18 @@ function renderAgentsCard(agents) {
     const status = a.status === "running" ? "工作中" : a.status === "error" ? "未完成" : a.status === "pending" ? "等待" : "已完成";
     const peek = String(a.lastText || a.peek || "").replace(/\s+/g, " ").trim();
     html +=
-      `<li><button type="button" class="chat-agent chat-agent--${esc(a.status)}" data-agent-id="${esc(a.id)}">` +
+      `<li class="chat-agent-row">` +
+      `<button type="button" class="chat-agent chat-agent--${esc(a.status)}" data-agent-id="${esc(a.id)}">` +
       `<span class="chat-agent-mark" aria-hidden="true"></span>` +
       `<span class="chat-agent-copy">` +
       `<span class="chat-agent-title">${esc(a.title)}</span>` +
       `<span class="chat-agent-meta">${esc(status)}${a.pendingApprovals > 0 ? " · 需批准" : ""}</span>` +
       (peek ? `<span class="chat-agent-peek">${esc(truncate(peek, 80))}</span>` : "") +
-      `</span></button></li>`;
+      `</span></button>` +
+      (a.runId
+        ? `<button type="button" class="chat-agent-enter" data-open-run="${esc(a.runId)}">进入子对话</button>`
+        : "") +
+      `</li>`;
   }
   html += "</ul></div>";
   return html;
@@ -7986,7 +8588,9 @@ export function deriveChatItems(state, live, opts = {}) {
       lastSource = e.source;
     }
     switch (e.type) {
-      case "user_message":
+      case "user_message": {
+        // 纯工具回执不占用户气泡；焊在人话前面的回执仍留条目，画的时候再剥。
+        if (paintConversationUserText(e.text).kind === "receipt") break;
         items.push({
           kind: "user", text: e.text, seq: e.seq, runId: state.runId ?? null,
           ...(e.turn ? { turn: e.turn } : {}),
@@ -7996,9 +8600,10 @@ export function deriveChatItems(state, live, opts = {}) {
           ...(Number.isFinite(e.at) ? { at: e.at } : {}),
         });
         break;
+      }
       case "steering":
         // 插队指令：用户气泡 + 「插队指令」标注（renderChatItem 认 steering 位）
-        if (String(e.text ?? "").trim()) {
+        if (String(e.text ?? "").trim() && paintConversationUserText(e.text).kind !== "receipt") {
           items.push({
             kind: "user",
             text: e.text,
@@ -8228,6 +8833,7 @@ export function deriveChatItems(state, live, opts = {}) {
     : deriveSessionFiles(state);
   if (!agentId) {
     keyed = applyDeliveryKeepingCurrentTurn(keyed, state, files, state.status === "running");
+    keyed = applyBlockedCard(keyed, state);
   }
   for (const it of keyed) {
     it.key =
@@ -8238,6 +8844,7 @@ export function deriveChatItems(state, live, opts = {}) {
       : it.kind === "tools" ? ("tools:" + (it.tools?.[0]?.toolUseId ?? it.seq ?? "x"))
       : it.kind === "verdict" ? ("verdict:" + (it.judgedTurn ?? "x") + ":" + it.round)
       : it.kind === "artifacts" ? "artifacts"
+      : it.kind === "blocked" ? "blocked"
       : it.kind === "plan" ? "plan"
       : it.kind === "agents" ? "agents"
       : it.kind === "tool" ? ("tool:" + (it.toolUseId ?? it.seq ?? "x"))
@@ -8638,6 +9245,8 @@ export function pickCompletionChatText(completion, lastExecutorText) {
   const structured = formatCompletionChatText(completion);
   const summary = String(completion?.summary ?? "").trim();
   if (!last) return structured;
+  // 巨文档/HTML 仍折在气泡里；阻塞清单走独立卡，不要焊进折叠正文。
+  if (looksLikeHugeDocumentBody(last) || looksLikeHtmlDocument(last)) return last;
   const lastIsReport = last.length >= 200 || (summary.length > 0 && last.length > summary.length * 2);
   if (!lastIsReport) return structured || last;
   const extras = formatCompletionExtras(completion);
@@ -8861,9 +9470,13 @@ export function applyStructuredDelivery(items, state, sessionFiles) {
   let out = [...(items ?? [])];
 
   if (completion) {
+    // 只改**当前这一轮**（最后一条用户话之后）。跨轮去找「最后一段正文」
+    // 会把 finish_task(blocked) 焊到上一轮杂志总结上——本轮只剩 Thought Process。
+    const lastUserAt = lastUserItemIndex(out);
+    const turnStart = lastUserAt >= 0 ? lastUserAt + 1 : 0;
     let lastExecutorText = "";
     let textAt = -1;
-    for (let i = out.length - 1; i >= 0; i--) {
+    for (let i = out.length - 1; i >= turnStart; i--) {
       if (out[i].kind === "text" && out[i].role !== "verifier" && out[i].role !== "planner") {
         textAt = i;
         lastExecutorText = String(out[i].text ?? "");
@@ -8918,6 +9531,109 @@ export function applyStructuredDelivery(items, state, sessionFiles) {
     : (sessionFiles ?? []).filter((f) => f && f.path && f.kind !== "upload" && !isNoiseArtifact(f.path));
   const ranked = rankDeliveryArtifacts(files, { task: state?.task ?? "", declared: declaredClean });
   return weaveDeliveryArtifacts(out, ranked, state?.runId ?? null);
+}
+
+const BLOCK_REASON_MAX = 280;
+
+function shortBlockLine(text) {
+  const line = String(text ?? "").split(/\r?\n/).map((s) => s.trim()).find(Boolean) ?? "";
+  if (!line) return "";
+  if (looksLikeHugeDocumentBody(line) || looksLikeHtmlDocument(line)) return "";
+  return truncate(line, BLOCK_REASON_MAX);
+}
+
+/**
+ * 从 finish_task 入参 / 短错误回执抽出阻塞句。巨文档只当折叠物，不当理由。
+ * @param {RunState} state
+ * @returns {string[]}
+ */
+function extractBlockedConditionsFromTimeline(state) {
+  const all = [...(state?.timeline ?? []), ...(state?.verifierTimeline ?? [])];
+  for (let i = all.length - 1; i >= 0; i--) {
+    const e = all[i];
+    if (e.type === "tool_call" && e.name === "finish_task") {
+      const input = e.input && typeof e.input === "object" ? /** @type {any} */ (e.input) : null;
+      const blockers = Array.isArray(input?.blockers)
+        ? input.blockers.map((x) => String(x).trim()).filter(Boolean)
+        : [];
+      if (blockers.length) return blockers;
+      const summary = shortBlockLine(input?.summary);
+      if (summary) return [summary];
+    }
+  }
+  for (let i = all.length - 1; i >= 0; i--) {
+    const e = all[i];
+    if (e.type === "tool_result" && e.resultIsError) {
+      const line = shortBlockLine(e.resultContent);
+      if (line) return [line];
+    }
+  }
+  return [];
+}
+
+/**
+ * 对话面要画的阻塞清单。status/stopReason 不是 blocked 则不画卡
+ * （partial 的未完成项仍走收官正文）。
+ * @param {RunState} state
+ * @returns {{title:string, conditions:string[], summary:string}|null}
+ */
+export function deriveBlockedFace(state) {
+  const stop = String(state?.stopReason ?? "");
+  const completion = state?.completion && typeof state.completion === "object"
+    ? state.completion
+    : null;
+  const status = String(completion?.status ?? "");
+  if (stop !== "blocked" && status !== "blocked") return null;
+  const leftover = splitCompletionFollowUps(completion);
+  let conditions = leftover.blocked.map((x) => String(x).trim()).filter(Boolean);
+  if (conditions.length === 0 && Array.isArray(completion?.blockers)) {
+    conditions = completion.blockers.map((x) => String(x).trim()).filter(Boolean);
+  }
+  if (conditions.length === 0) conditions = extractBlockedConditionsFromTimeline(state);
+  if (conditions.length === 0) return null;
+  return {
+    title: "阻塞",
+    conditions,
+    summary: String(completion?.summary ?? "").trim(),
+  };
+}
+
+/**
+ * 阻塞卡挂在**最后一轮**产物后面（没有产物则在 run-next / 裁决前）。
+ * 幂等：先摘掉旧卡再插一张。
+ * @param {any[]} items
+ * @param {RunState} state
+ * @returns {any[]}
+ */
+export function applyBlockedCard(items, state) {
+  const without = (items ?? []).filter((it) => it.kind !== "blocked");
+  const face = deriveBlockedFace(state);
+  if (!face) return without;
+  const card = {
+    kind: "blocked",
+    title: face.title,
+    conditions: face.conditions,
+    summary: face.summary,
+    seq: null,
+    key: "blocked",
+  };
+  const artAt = without.findIndex((it) => it.kind === "artifacts");
+  if (artAt >= 0) {
+    without.splice(artAt + 1, 0, card);
+    return without;
+  }
+  const runNextAt = without.findIndex((it) => it.kind === "run-next");
+  if (runNextAt >= 0) {
+    without.splice(runNextAt, 0, card);
+    return without;
+  }
+  const verdictAt = without.findIndex((it) => it.kind === "verdict");
+  if (verdictAt >= 0) {
+    without.splice(verdictAt, 0, card);
+    return without;
+  }
+  without.push(card);
+  return without;
 }
 
 /** 连续工具收成一组：摘要滑动显示正在做的那一步，点开才铺逐条。 */
@@ -9316,7 +10032,12 @@ export function renderChatItem(it, thinkingOpen = false) {
         html += renderSegmentBoundary({ role: it.role, round: it.round ?? 0, source: it.source });
         break;
       case "user": {
-        const { displayBody, attachments } = splitUserMessageAttachments(it.text);
+        const { attachments } = splitUserMessageAttachments(it.text);
+        const painted = paintConversationUserText(it.text);
+        if (painted.kind === "receipt") {
+          html += renderFoldedToolReceiptChip(painted.stub, it.text);
+          break;
+        }
         const runId = it.runId ?? null;
         const imageAtts = attachments.filter((p) => isImagePath(p) && runId);
         const previews = imageAtts
@@ -9331,28 +10052,38 @@ export function renderChatItem(it, thinkingOpen = false) {
         const captions = attachments
           .map((p) => `<div class="chat-attach-caption">附件：${esc(p)}</div>`)
           .join("");
-        const bodyHtml = displayBody
-          ? `<div class="chat-body chat-body--text md">${renderMarkdown(displayBody)}</div>`
-          : "";
+        const folded = painted.kind === "document"
+          ? foldConversationBody(splitUserMessageAttachments(it.text).displayBody || it.text)
+          : null;
+        const bodyHtml = folded
+          ? `<div class="chat-body chat-body--text">${esc(folded.stub)}</div>`
+          : painted.display
+            ? `<div class="chat-body chat-body--text md">${renderMarkdown(painted.display)}</div>`
+            : "";
+        const foldHtml = folded ? folded.detailsHtml : "";
         const media = previews.length > 0;
         html +=
           `<div class="chat-msg chat-msg--user${media ? " chat-msg--user-media" : ""}">` +
           // 信息队列：运行中插队进来的指令，与正常追加区分开——它是"打断当前的思考"
           (it.steering ? `<div class="chat-msg-tag">插队指令</div>` : "") +
-          (looksLikeChatFeedback(it.text) ? `<div class="chat-msg-tag">反馈</div>` : "") +
+          (looksLikeChatFeedback(painted.display || it.text) ? `<div class="chat-msg-tag">反馈</div>` : "") +
           (it.executorSwitched ? `<div class="chat-msg-tag">已切换模型 · 正史已接上</div>` : "") +
           (previews ? `<div class="chat-attach-previews">${previews}</div>` : "") +
           (media || captions
             ? `<div class="chat-msg-user-copy">${captions}${bodyHtml}</div>`
             : bodyHtml) +
+          foldHtml +
           `</div>`;
         break;
       }
       case "text": {
         const planShaped = isPlanShapedAssistantText(it.text);
+        const folded = !planShaped ? foldConversationBody(it.text) : null;
         html +=
           `<div class="chat-msg chat-msg--assistant${planShaped ? " chat-msg--plan" : ""}">` +
-          `<div class="chat-body${planShaped ? "" : " chat-body--text md"}">${renderAssistantText(it.text)}</div>` +
+          (folded
+            ? `<div class="chat-body chat-body--text">${esc(folded.stub)}</div>${folded.detailsHtml}`
+            : `<div class="chat-body${planShaped ? "" : " chat-body--text md"}">${renderAssistantText(it.text)}</div>`) +
           renderCompletionFolds(it) +
           `</div>`;
         break;
@@ -9399,9 +10130,12 @@ export function renderChatItem(it, thinkingOpen = false) {
         }
         if (String(it.text ?? "").trim()) {
           const planLive = looksLikePlanJsonStream(it.text);
+          const folded = !planLive ? foldConversationBody(it.text) : null;
           html +=
             `<div class="chat-msg chat-msg--assistant chat-msg--live${planLive ? " chat-msg--plan" : ""}">` +
-            `<div class="chat-body${planLive ? "" : " chat-body--text md chat-live-text"}">${renderLiveText(it.text)}</div></div>`;
+            (folded
+              ? `<div class="chat-body chat-body--text chat-live-text">${esc(folded.stub)}</div>${folded.detailsHtml}</div>`
+              : `<div class="chat-body${planLive ? "" : " chat-body--text md chat-live-text"}">${renderLiveText(it.text)}</div></div>`);
         }
         break;
       case "activity":
@@ -9442,13 +10176,26 @@ export function renderChatItem(it, thinkingOpen = false) {
       case "artifacts":
         html += renderChatArtifacts(it);
         break;
+      case "blocked": {
+        const conditions = Array.isArray(it.conditions) ? it.conditions : [];
+        const summary = String(it.summary ?? "").trim();
+        html +=
+          `<aside class="chat-blocked" role="status">` +
+          `<div class="chat-blocked-head">${esc(it.title || "阻塞")}</div>` +
+          (summary ? `<p class="chat-blocked-summary">${esc(summary)}</p>` : "") +
+          (conditions.length
+            ? `<ul class="chat-blocked-list">${conditions.map((c) => `<li>${esc(c)}</li>`).join("")}</ul>`
+            : "") +
+          `</aside>`;
+        break;
+      }
       case "cite": {
         const refs = Array.isArray(it.refs) ? it.refs : [];
         const body = refs.map((ref) => {
           const files = Array.isArray(ref.artifacts) && ref.artifacts.length
             ? ref.artifacts.join("、")
             : "无主产物";
-          return `${ref.title || formatRunKicker(ref.runId)} · ${files}`;
+          return `${formatCiteChip({ title: ref.title, runId: ref.runId, workdirLabel: ref.workdirLabel })} · ${files}`;
         }).join("\n");
         html +=
           `<div class="chat-recap chat-cite" role="note">` +
@@ -9493,15 +10240,21 @@ function renderToolGroup(it) {
     : { verb: "", target: "", stages: [], command: "" };
   const mark = live ? "" : `<span class="aside-mark">${err ? "✗" : "✓"}</span>`;
   const command = featured ? toolCommandText(featured) : "";
-  const result = !live && featured?.result
-    ? `<pre class="chat-body">${esc(truncate(String(featured.result), 4000))}</pre>`
-    : "";
+  const commandFold = command && (looksLikeHugeDocumentBody(command) || looksLikeHtmlDocument(command))
+    ? foldConversationBody(command, {
+        path: toolPathHint(featured?.input),
+        tool: featured?.name,
+      })
+    : null;
+  const resultBody = !live && featured ? renderToolResultBody(featured) : "";
   return (
     `<details class="chat-tool-group${cls}">` +
     `<summary>${mark}${renderToolHeadline(headline, Boolean(live))}</summary>` +
     `<div class="chat-tool-group-body">` +
-    (command ? `<pre class="chat-tool-now">${esc(command)}</pre>` : "") +
-    result +
+    (commandFold
+      ? `<div class="chat-body chat-body--text">${esc(commandFold.stub)}</div>${commandFold.detailsHtml}`
+      : (command ? `<pre class="chat-tool-now">${esc(truncate(command, 1200))}</pre>` : "")) +
+    resultBody +
     `</div>` +
     `</details>`
   );
@@ -9514,9 +10267,7 @@ function renderToolRow(it) {
   const gate = it.gated ? '<span class="chat-tool-gate" title="这一步曾等待人工放行">⚠ 经放行</span>' : "";
   const peek = esc(truncate(toolPeek(it.name, it.input), 88));
   const paths = renderToolPathStrip(it.input);
-  const body = paths + (it.result
-    ? `<pre class="chat-body">${esc(truncate(String(it.result), 4000))}</pre>`
-    : `<pre class="chat-body">${esc(truncate(formatInput(it.input), 1200))}</pre>`);
+  const body = paths + renderToolResultBody(it);
   return (
     `<details class="chat-tool${cls}">` +
     `<summary><span class="aside-mark">${mark}</span> <code>${esc(it.name ?? "")}</code> ` +
@@ -9524,8 +10275,32 @@ function renderToolRow(it) {
   );
 }
 
+function renderToolResultBody(it) {
+  const candidate = toolBodyCandidate(it?.input, it?.result);
+  const folded = foldConversationBody(candidate, {
+    path: toolPathHint(it?.input),
+    tool: it?.name,
+    written: String(it?.name ?? "") === "write_file",
+  });
+  if (folded) {
+    return `<div class="chat-body chat-body--text">${esc(folded.stub)}</div>${folded.detailsHtml}`;
+  }
+  if (it?.result) {
+    return `<pre class="chat-body">${esc(truncate(String(it.result), 4000))}</pre>`;
+  }
+  const inputDump = formatInput(it?.input);
+  if (looksLikeHugeDocumentBody(inputDump) || looksLikeHtmlDocument(inputDump)) {
+    const via = foldConversationBody(inputDump, {
+      path: toolPathHint(it?.input),
+      tool: it?.name,
+    });
+    if (via) return `<div class="chat-body chat-body--text">${esc(via.stub)}</div>${via.detailsHtml}`;
+  }
+  return `<pre class="chat-body">${esc(truncate(inputDump, 1200))}</pre>`;
+}
+
 /** 各工具的"主参数"——摘要行只说这一个，别的展开再看 */
-const TOOL_PEEK_KEYS = ["command", "path", "file_path", "url", "query", "name", "expression", "pattern"];
+const TOOL_PEEK_KEYS = ["catalogId", "githubUrl", "writeTarget", "kind", "command", "path", "file_path", "url", "query", "name", "expression", "pattern"];
 
 /**
  * 工具入参里哪些字段具有明确的“路径所有权”。
@@ -10142,12 +10917,22 @@ function renderLogEntryBody(e) {
       return `<div class="log-entry-body">按落盘节点续发射半截计划${bits.length ? `（${esc(bits.join(" · "))}）` : ""}。<br>已通过：${esc((e.kept ?? []).join("、") || "无")}；待跑：${esc((e.remaining ?? []).join("、") || "无")}</div>`;
     }
     case "spawn_start":
-      return `<div class="log-entry-body">开调查支线：${esc(e.title ?? "")}（扣本 run 谱系预算，深度 1）</div>`;
+      return `<div class="log-entry-body">开调查支线：${esc(e.title ?? "")}（扣本 run 谱系预算，深度 1）${
+        e.runId
+          ? `<br><button type="button" class="linkish" data-open-run="${esc(e.runId)}">进入子对话</button>`
+          : ""
+      }</div>`;
     case "spawn_done":
       return `<div class="log-entry-body">${e.passed ? "支线完成" : "支线未完成"}：${esc(e.title ?? "")}${
         e.summary ? `<br>${esc(String(e.summary).slice(0, 240))}` : ""
       }${e.error ? `<br>错误：${esc(e.error)}` : ""}${
         typeof e.turns === "number" ? `<br>轮次：${esc(String(e.turns))}` : ""
+      }${e.runId ? `<br><button type="button" class="linkish" data-open-run="${esc(e.runId)}">进入子对话</button>` : ""}</div>`;
+    case "campaign_child":
+      return `<div class="log-entry-body">子对话 ${esc(e.title ?? "")} · ${esc(e.status ?? "")}${
+        e.runId
+          ? ` · <button type="button" class="linkish" data-open-run="${esc(e.runId)}">进入子对话</button>`
+          : ""
       }</div>`;
     case "api_retry":
       // 等待时长要看得见：抖动之后同一 attempt 的等待不再是定值，
@@ -10825,6 +11610,7 @@ export const DESIGN_SAMPLE_CARDS = Object.freeze([
     thumb: "magazine",
     designId: "guizang-ppt",
     template: "deck-basic",
+    needsImages: true,
     prompt: "做一套杂志风幻灯：封面有刊头和大图，内页分栏。",
   }),
   Object.freeze({
@@ -10964,7 +11750,21 @@ export function resolveDesignSampleChoice(sampleId) {
     designId: sample.designId || null,
     designTemplate: sample.template || null,
     prompt: sample.prompt,
+    needsImages: Boolean(sample.needsImages),
   };
+}
+
+/** 识图没配时，「要配图」样例不能空跑。未传入快照时不禁用（测试/首屏）。 */
+export function harnessVisionConfigured(harness) {
+  const backing = harness?.describeImageBacking;
+  if (backing === "executor" || backing === "vision-role") return true;
+  if (backing === "none") return false;
+  return Boolean(harness?.roleModels?.vision?.configured);
+}
+
+export function designSampleBlockedReason(sample, visionConfigured) {
+  if (!sample?.needsImages || visionConfigured !== false) return "";
+  return "未配置识图，这类要配图的样例不能空跑";
 }
 
 export function isDesignSamplePrompt(text) {
@@ -11085,18 +11885,25 @@ function renderDesignModeGallery(opts = {}) {
     : null;
   const sampleCards = samples.map((s) => {
     const on = selectedSample ? s.id === selectedSample : false;
-    const caption = s.hint ? `${s.title}：${s.hint}` : s.title;
+    const blocked = designSampleBlockedReason(s, opts.visionConfigured);
+    const caption = blocked || (s.hint ? `${s.title}：${s.hint}` : s.title);
     return (
       `<li><button type="button" class="design-sample-card${on ? " is-selected" : ""}" ` +
       `data-design-sample="${esc(s.id)}" ` +
       (s.designId ? `data-design-id="${esc(s.designId)}" ` : "") +
       (s.template ? `data-design-template="${esc(s.template)}" ` : "") +
+      (s.needsImages ? `data-needs-images="1" ` : "") +
+      (blocked ? `disabled aria-disabled="true" ` : "") +
       `aria-pressed="${on ? "true" : "false"}" title="${esc(caption)}">` +
       `<span class="design-sample-thumb design-sample-thumb--${esc(s.thumb)}" aria-hidden="true">` +
       renderSampleThumb(s.thumb) +
       "</span>" +
       `<span class="design-sample-title">${esc(s.title)}</span>` +
-      (s.hint ? `<span class="design-sample-hint">${esc(s.hint)}</span>` : "") +
+      (blocked
+        ? `<span class="design-sample-hint">${esc(blocked)}</span>`
+        : s.hint
+          ? `<span class="design-sample-hint">${esc(s.hint)}</span>`
+          : "") +
       "</button></li>"
     );
   });
@@ -11311,8 +12118,11 @@ export function looksLikeChatFeedback(text) {
 export function chatPlainText(it) {
   if (!it) return "";
   if (it.kind === "user") {
-    return splitUserMessageAttachments(it.text).displayBody || String(it.text ?? "");
+    const painted = paintConversationUserText(it.text);
+    return painted.display || painted.stub || "";
   }
+  const folded = foldConversationBody(it.text);
+  if (folded) return folded.stub;
   const extra = [];
   for (const [title, items] of [["验证", it.verification], ["假设与前提", it.assumptions]]) {
     if (!Array.isArray(items) || items.length === 0) continue;

@@ -20,7 +20,7 @@ import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { createUiServer, type UiServerHandle } from "../ui/server.js";
-import { mergeRunReadRoots, parseExtraWorkdirs } from "../ui/workdirs.js";
+import { mergeRunReadRoots, mergeRunWriteRoots, parseExtraWorkdirs } from "../ui/workdirs.js";
 import { resetObservabilityMetrics } from "../src/metrics.js";
 import { clearCapabilityCache } from "../src/model-capability.js";
 import { FakeModelClient, fakeMessage, makeTool, textBlock, toolUseBlock } from "./helpers.js";
@@ -124,6 +124,16 @@ describe("parseExtraWorkdirs / mergeRunReadRoots", () => {
     expect(mergeRunReadRoots(["D:\\refs", "D:\\a"], ["D:\\b", "D:\\refs"], "D:\\a")).toEqual([
       resolve("D:\\refs"),
       resolve("D:\\b"),
+    ]);
+  });
+
+  it("可写根只含勾选 extras，不含白名单整表", () => {
+    expect(mergeRunWriteRoots([], "D:\\a")).toEqual([]);
+    expect(mergeRunWriteRoots(undefined, "D:\\a")).toEqual([]);
+    expect(mergeRunWriteRoots(["D:\\b", "D:\\a"], "D:\\a")).toEqual([resolve("D:\\b")]);
+    expect(mergeRunWriteRoots(["D:\\b", "D:\\c"], "D:\\a")).toEqual([
+      resolve("D:\\b"),
+      resolve("D:\\c"),
     ]);
   });
 });

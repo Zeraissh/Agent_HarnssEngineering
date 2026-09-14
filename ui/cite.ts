@@ -1,7 +1,9 @@
 /**
- * 点名引用：同 workdir 会话的产物清单与【引用】装配块。
+ * 点名引用：同项目（任一成员 workdir）会话的产物清单与【引用】装配块。
+ * 无项目时仍只放行同一 resolve(workdir)。
  * 不读 transcript / events；不猜邻居任务。
  */
+import { basename, resolve } from "node:path";
 import { stat } from "node:fs/promises";
 import { resolveInWorkdir } from "../src/tools/fs-util.js";
 
@@ -18,7 +20,77 @@ export type CiteRef = {
   task: string;
   recap: string | null;
   artifacts: string[];
+  /** 成员目录末段，避免同名产物路径混在一起 */
+  workdirLabel?: string;
 };
+
+export type CiteRunHint = {
+  workdir?: string | null;
+  projectId?: string | null;
+};
+
+export type CiteScope = {
+  workdir: string;
+  projectId?: string | null;
+  projectWorkdirs?: string[];
+  allowedWorkdirs: Iterable<string>;
+};
+
+/** 芯片 / 【引用】块上的目录标签：只取末段，不拼绝对路径。 */
+export function citeWorkdirLabel(workdir: string): string {
+  const trimmed = String(workdir ?? "").trim().replace(/[\\/]+$/, "");
+  return basename(trimmed) || trimmed;
+}
+
+/**
+ * 放行：目标有 projectId 时，同项目任一（已入项且在白名单内的）workdir；
+ * 无项目时仍要求同一 resolve(workdir)。
+ * 白名单外 / 其它项目一律跳过。
+ */
+export function isCiteableRun(
+  run: CiteRunHint,
+  scope: CiteScope,
+  resolvePath: (p: string) => string = resolve,
+): boolean {
+  const rawDir = String(run.workdir ?? "").trim();
+  if (!rawDir) return false;
+  let runDir: string;
+  try {
+    runDir = resolvePath(rawDir);
+  } catch {
+    return false;
+  }
+  const allowed = new Set<string>();
+  for (const item of scope.allowedWorkdirs) {
+    try {
+      allowed.add(resolvePath(item));
+    } catch {
+      /* 非法白名单项：忽略 */
+    }
+  }
+  if (!allowed.has(runDir)) return false;
+
+  const scopeProject = String(scope.projectId ?? "").trim();
+  const runProject = String(run.projectId ?? "").trim();
+  if (scopeProject) {
+    if (runProject && runProject !== scopeProject) return false;
+    const members = new Set<string>();
+    for (const item of scope.projectWorkdirs ?? []) {
+      try {
+        members.add(resolvePath(item));
+      } catch {
+        /* 非法成员路径：忽略 */
+      }
+    }
+    if (members.size) return members.has(runDir);
+    return runProject === scopeProject;
+  }
+  try {
+    return runDir === resolvePath(scope.workdir);
+  } catch {
+    return false;
+  }
+}
 
 export function visibleCiteRuns<T extends { runId: string; continuedFrom?: string | null }>(
   runs: T[],
@@ -65,11 +137,18 @@ export async function resolveCiteArtifacts(workdir: string): Promise<string[]> {
   return found;
 }
 
+export function formatCiteChip(ref: { title?: string; task?: string; runId: string; workdirLabel?: string }): string {
+  const name = String(ref.title || ref.task || ref.runId).trim() || ref.runId;
+  const label = String(ref.workdirLabel ?? "").trim();
+  return label ? `${name} · ${label}` : name;
+}
+
 export function formatCiteBlock(refs: CiteRef[]): string {
   if (!refs.length) return "";
   const lines = ["【引用】"];
   for (const ref of refs) {
-    lines.push(`- ${ref.title}（${ref.runId}）`);
+    const loc = String(ref.workdirLabel ?? "").trim();
+    lines.push(loc ? `- ${ref.title}（${ref.runId} · ${loc}）` : `- ${ref.title}（${ref.runId}）`);
     if (ref.task) lines.push(`  原任务：${ref.task}`);
     if (ref.recap) lines.push(`  收口：${ref.recap}`);
     if (ref.artifacts.length) lines.push(`  产物：${ref.artifacts.join("、")}`);

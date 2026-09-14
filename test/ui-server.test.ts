@@ -407,6 +407,37 @@ describe("ui-server", () => {
     expect(hiddenDependency.status).toBe(404);
   });
 
+  it("KaTeX 只暴露 css/js/字体，不挂整包", async () => {
+    handle = createUiServer({
+      modelClient: new FakeModelClient([]),
+      tools: [],
+      workdir: process.cwd(),
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+
+    const css = await fetch(`${base}/vendor/katex/katex.min.css`);
+    expect(css.status).toBe(200);
+    expect(css.headers.get("content-type")).toContain("text/css");
+    expect(await css.text()).toContain("font-family:KaTeX_Main");
+
+    const js = await fetch(`${base}/vendor/katex/katex.min.js`);
+    expect(js.status).toBe(200);
+    expect(js.headers.get("content-type")).toMatch(/javascript|ecmascript/);
+    expect(await js.text()).toContain("renderToString");
+
+    const auto = await fetch(`${base}/vendor/katex/contrib/auto-render.min.js`);
+    expect(auto.status).toBe(200);
+
+    const font = await fetch(`${base}/vendor/katex/fonts/KaTeX_Main-Regular.woff2`);
+    expect(font.status).toBe(200);
+    expect(font.headers.get("content-type")).toContain("font/woff2");
+    expect((await font.arrayBuffer()).byteLength).toBeGreaterThan(1000);
+
+    const hidden = await fetch(`${base}/vendor/katex/README.md`);
+    expect(hidden.status).toBe(404);
+  });
+
   // ---- a. verify=false run → 完整事件序列，seq 单调递增 ----
   it("a. verify=false: 收到 turn_start → done 事件序列，seq 单调递增", async () => {
     const model = new FakeModelClient([
@@ -2188,6 +2219,14 @@ describe("ui-server", () => {
 
     const result = events.find((e: any) => e.event.type === "plan_result") as any;
     expect(result, "未发出 plan_result 事件").toBeDefined();
+    // live-mu 2026-09-14：锁的是服务端事件日志。planner 自己的 done 之后
+    // plan_result / run_end 仍必须在 GET /events 里（不声称浏览器 SSE 没关）。
+    const plannerDone = events.find((e: any) => e.source === "planner" && e.event.type === "done") as any;
+    const runEnd = events.find((e: any) => e.event.type === "run_end") as any;
+    expect(plannerDone, "planner done 必须在服务端事件流").toBeDefined();
+    expect(runEnd, "run_end 必须仍在服务端事件流").toBeDefined();
+    expect(plannerDone.seq).toBeLessThan(result.seq);
+    expect(result.seq).toBeLessThan(runEnd.seq);
     expect(result.event.plannerRecovery).toBe("direct"); // B0：计划获得路径随事件透出
     expect(result.event.steps.map((st: any) => st.id)).toEqual(["s1", "s2"]);
     // 每个数字都要有口径：子任务阶段墙钟排除 planner，节省是相对串行全序和
@@ -2195,6 +2234,14 @@ describe("ui-server", () => {
       expect(typeof result.event.timing[k], `timing.${k} 缺失`).toBe("number");
     }
     expect(result.event.timing.totalMs).toBeGreaterThanOrEqual(result.event.timing.subtaskWallMs);
+
+    const listed = await (await fetch(`${base}/api/runs`)).json() as {
+      runId: string; verify: boolean; plannedSubtaskVerify?: boolean; mode?: string;
+    }[];
+    const row = listed.find((r) => r.runId === runId);
+    expect(row?.verify).toBe(false);
+    expect(row?.mode).toBe("plan");
+    expect(row?.plannedSubtaskVerify).toBe(true);
   });
 
   /**
@@ -3069,6 +3116,7 @@ describe("ui-server", () => {
     expect(list1.canContinue).toBe(true);
     expect(list1.continuationMode).toBe("same");
     expect(list1.verdictTurn).toBe(1);
+    expect(list1.verdictTurn).toBe(list1.conversationTurn);
 
     // 第 2 轮：显式关掉核查
     const res2 = await fetch(`${base}/api/runs/${runId}/messages`, {
@@ -3126,6 +3174,7 @@ describe("ui-server", () => {
     expect(list3.verdictTurn).toBe(3);
     expect(list3.finalPassed).toBe(false);
     expect(list3.conversationTurn).toBe(3);
+    expect(list3.verdictTurn).toBe(list3.conversationTurn);
     expect(list3.verify).toBe(true);
     expect(list3.canContinue).toBe(true);
   });
@@ -3236,7 +3285,9 @@ describe("ui-server", () => {
     await gate;
     expect((await fetch(`${base}/api/runs/${runId}/stop`, { method: "POST" })).status).toBe(200);
     await waitForDone(base, runId);
-    expect(((await (await fetch(`${base}/api/runs`)).json() as any[]).find((r) => r.runId === runId)).stopReason).toBe("aborted");
+    const afterStop = ((await (await fetch(`${base}/api/runs`)).json() as any[]).find((r) => r.runId === runId));
+    expect(afterStop.stopReason).toBe("aborted");
+    expect(afterStop.conversationTurn).toBe(1);
 
     const res = await fetch(`${base}/api/runs/${runId}/messages`, {
       method: "POST", headers: { "Content-Type": "application/json" },
@@ -3247,6 +3298,7 @@ describe("ui-server", () => {
     const row = ((await (await fetch(`${base}/api/runs`)).json() as any[]).find((r) => r.runId === runId));
     // 修前：新一轮复用已 abort 的 AbortController，立刻又是 aborted
     expect(row.stopReason).toBe("completed");
+    expect(row.conversationTurn).toBe(2);
     expect(model.calls).toBe(2);
   });
 
@@ -3543,8 +3595,8 @@ describe("ui-server", () => {
     await rm(extra, { recursive: true, force: true });
   });
 
-  it("白名单目录默认可写，不必勾 extraWorkdirs", async () => {
-    const extra = await mkdtemp(join(tmpdir(), "ui-write-allow-"));
+  it("extraWorkdirs 为空时 writeRoots 不含白名单其余目录，写入失败", async () => {
+    const extra = await mkdtemp(join(tmpdir(), "ui-write-deny-"));
     handle = createUiServer({
       modelClient: new FakeModelClient([
         fakeMessage([toolUseBlock("w1", "write_file", {
@@ -3563,6 +3615,42 @@ describe("ui-server", () => {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ task: "写到白名单另一目录", autoApprove: true }),
+    });
+    expect(created.status).toBe(200);
+    const { runId } = await created.json() as { runId: string };
+    await waitForDone(base, runId);
+    expect(existsSync(join(extra, "note.txt"))).toBe(false);
+    const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+    const rc = events.find((e: any) => e.event.type === "run_config") as any;
+    expect(rc.event.writeRoots ?? []).not.toContain(resolve(extra));
+    expect(rc.event.readRoots).toContain(resolve(extra));
+    await rm(extra, { recursive: true, force: true });
+  });
+
+  it("勾选 extraWorkdirs 后该目录进 writeRoots 且可写", async () => {
+    const extra = await mkdtemp(join(tmpdir(), "ui-write-extra-"));
+    handle = createUiServer({
+      modelClient: new FakeModelClient([
+        fakeMessage([toolUseBlock("w1", "write_file", {
+          path: join(extra, "note.txt"),
+          content: "across-root",
+        })], "tool_use"),
+        fakeMessage([textBlock("ok")], "end_turn"),
+      ]),
+      tools: [{ ...writeFileTool, permission: "auto" }],
+      workdir: process.cwd(),
+      workdirs: [extra],
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+    const created = await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        task: "写到勾选的额外目录",
+        autoApprove: true,
+        extraWorkdirs: [extra],
+      }),
     });
     expect(created.status).toBe(200);
     const { runId } = await created.json() as { runId: string };
@@ -4348,6 +4436,7 @@ describe("ui-server", () => {
     let snap = await (await fetch(`${baseUrl(port)}/api/harness`)).json() as any;
     expect(snap.tools.map((t: any) => t.name)).not.toContain("describe_image");
     expect(snap.roleModels.vision.configured).toBe(false);
+    expect(snap.describeImageBacking).toBe("none");
     await handle.close();
 
     // 配上（Kimi 形态：OpenAI 兼容端点）
@@ -4374,9 +4463,41 @@ describe("ui-server", () => {
     expect(snap.roleModels.vision).toEqual({
       model: "moonshot-v1-8k-vision-preview", provider: "openai", configured: true,
     });
+    expect(snap.describeImageBacking).toBe("vision-role");
     // 密钥与端点一律不下发
     expect(raw).not.toContain("sk-vision-must-not-leak");
     expect(raw).not.toContain("api.moonshot.cn");
+    await handle.close();
+
+    // 执行者自己能看图：工具仍在，但不引用独立识图角色（run_config.vision = null）
+    handle = createUiServer({
+      modelClient: new FakeModelClient([fakeMessage([textBlock("ok")], "end_turn")]),
+      workdir: process.cwd(),
+      executorSupportsVision: true,
+      roleEnv: {
+        AGENT_VISION_MODEL: "moonshot-v1-8k-vision-preview",
+        AGENT_VISION_PROVIDER: "openai",
+        AGENT_VISION_BASE_URL: "https://api.moonshot.cn/v1",
+        AGENT_VISION_API_KEY: "sk-vision-must-not-leak",
+      },
+    });
+    port = await startServer(handle);
+    base = baseUrl(port);
+    snap = await (await fetch(`${base}/api/harness`)).json() as any;
+    expect(snap.describeImageBacking).toBe("executor");
+    expect(snap.supportsVision).toBe(true);
+    expect(snap.tools.map((t: any) => t.name)).toContain("describe_image");
+    expect(snap.roleModels.vision.configured).toBe(true);
+    const { runId } = await (await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task: "执行者能看图" }),
+    })).json() as { runId: string };
+    await waitForDone(base, runId);
+    const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+    const runCfg = (events.find((e: any) => e.event.type === "run_config") as any).event;
+    expect(runCfg.describeImageBacking).toBe("executor");
+    expect(runCfg.roleModels.vision).toBeNull();
   });
 
   it("配了 AGENT_IMAGE_MODEL 才注册 generate_image；没配就不该摆在工具面上", async () => {
@@ -5041,6 +5162,37 @@ describe("整站预览：相对资源可解析，但仍无同源身份", () => {
     const buf = Buffer.from(await zipRes.arrayBuffer());
     expect(buf.subarray(0, 2).toString("utf8")).toBe("PK");
     expect(buf.includes(Buffer.from("style.css", "utf8"))).toBe(true);
+  });
+
+  it("site-zip 不含 _qa 与 webb_* 残渣", async () => {
+    await mkdir(join(dir, "landing", "_qa"), { recursive: true });
+    await writeFile(join(dir, "landing", "index.html"), "<html><body>ok</body></html>", "utf8");
+    await writeFile(join(dir, "landing", "style.css"), "body{}", "utf8");
+    await writeFile(join(dir, "landing", "_qa", "noise.png"), Buffer.alloc(64));
+    await writeFile(join(dir, "landing", "webb_notes.html"), "<html>junk</html>", "utf8");
+    const zipRes = await fetch(
+      `${base}/api/runs/${runId}/site-zip?path=${encodeURIComponent("landing/index.html")}`,
+    );
+    expect(zipRes.status).toBe(200);
+    const buf = Buffer.from(await zipRes.arrayBuffer());
+    expect(buf.includes(Buffer.from("style.css", "utf8"))).toBe(true);
+    expect(buf.includes(Buffer.from("index.html", "utf8"))).toBe(true);
+    expect(buf.includes(Buffer.from("noise.png", "utf8"))).toBe(false);
+    expect(buf.includes(Buffer.from("webb_notes.html", "utf8"))).toBe(false);
+  });
+
+  it("含 TeX 的 HTML 预览注入本机 KaTeX，C:\\\\Users 仍在原文里", async () => {
+    await writeFile(
+      join(dir, "demos", "liquid", "math.html"),
+      `<!doctype html><html><body><p>\\\\(E=mc^2\\\\) path C:\\\\Users\\\\rk302</p></body></html>`,
+      "utf8",
+    );
+    const res = await getSite("demos/liquid/math.html");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("/vendor/katex/katex.min.js");
+    expect(html).toContain("/core/katex-preview-runtime.js");
+    expect(html).toContain("C:\\\\Users\\\\rk302");
   });
 
   it("?print=1 注入 window.print 钩子", async () => {

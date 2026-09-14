@@ -34,6 +34,16 @@ export function projectSlugFromWorkdir(workdir: string): string {
   return SLUG_RE.test(slug) ? slug : "project";
 }
 
+/**
+ * 选了项目实体时 slug 跟 project.id，避免两目录同名撞车。
+ * 未入项 / 非法 id 仍回落到 workdir 末段。
+ */
+export function resolveProjectSlug(workdir: string, projectId?: string | null): string {
+  const id = String(projectId ?? "").trim();
+  if (id && SLUG_RE.test(id)) return id;
+  return projectSlugFromWorkdir(workdir);
+}
+
 export function isSharedMemoryDir(
   workdir: string,
   memoryDir: string,
@@ -173,9 +183,39 @@ function asStringList(value: unknown): string[] {
 
 type StoreResolver = (workdir: string) => MemoryStore;
 
+export type ProjectStatusToolOpts = {
+  sharedFor?: (workdir: string) => boolean;
+  /**
+   * 看板写成功 / 清除成功后回调。status=null 表示 clear。
+   * 第二参是本工作目录的 slug——清除时宿主仍要知道是哪个项目。
+   * 回调抛错或 reject 不得让本工具失败（出站通知是附加动作）。
+   */
+  onBoardChange?: (status: ProjectStatus | null, project: string) => void | Promise<void>;
+  /** 选中项目时返回 project.id；未入项则不要返回，工具回落到 basename。 */
+  resolveProject?: (workdir: string) => string | undefined;
+};
+
+function emitBoardChange(
+  onBoardChange: ProjectStatusToolOpts["onBoardChange"],
+  status: ProjectStatus | null,
+  project: string,
+): void {
+  if (!onBoardChange) return;
+  try {
+    const ret = onBoardChange(status, project);
+    if (ret && typeof (ret as Promise<unknown>).then === "function") {
+      void Promise.resolve(ret).catch(() => {
+        /* 出站通知不得让看板工具失败 */
+      });
+    }
+  } catch {
+    /* 同步抛错同样不得让看板工具失败 */
+  }
+}
+
 export function createProjectStatusTool(
   resolveStore: StoreResolver,
-  opts?: { sharedFor?: (workdir: string) => boolean },
+  opts?: ProjectStatusToolOpts,
 ): Tool {
   return {
     name: PROJECT_STATUS_TOOL,
@@ -205,7 +245,7 @@ export function createProjectStatusTool(
     parallelSafe: false,
     async execute(input, ctx: ToolContext) {
       const store = resolveStore(ctx.workdir);
-      const project = projectSlugFromWorkdir(ctx.workdir);
+      const project = resolveProjectSlug(ctx.workdir, opts?.resolveProject?.(ctx.workdir));
       const shared = opts?.sharedFor?.(ctx.workdir) ?? false;
       const name = inProgressMemoryName(project, shared);
       const body = (input ?? {}) as {
@@ -221,6 +261,7 @@ export function createProjectStatusTool(
         } catch {
           /* 没有看板也算清掉 */
         }
+        emitBoardChange(opts?.onBoardChange, null, project);
         return { content: `In-progress board cleared: ${name}` };
       }
       const summary = String(body.summary ?? "").trim();
@@ -236,6 +277,7 @@ export function createProjectStatusTool(
         project,
       };
       await store.write(name, formatProjectStatusMarkdown(status));
+      emitBoardChange(opts?.onBoardChange, status, project);
       return { content: `In-progress board saved: ${name}` };
     },
   };
@@ -245,8 +287,9 @@ export async function readProjectStatus(
   store: MemoryStore,
   workdir: string,
   shared: boolean,
+  projectId?: string | null,
 ): Promise<ProjectStatus | null> {
-  const project = projectSlugFromWorkdir(workdir);
+  const project = resolveProjectSlug(workdir, projectId);
   const name = inProgressMemoryName(project, shared);
   try {
     const text = await store.read(name);
@@ -259,9 +302,10 @@ export async function readProjectStatus(
 export async function annotateMemoryEntries(
   store: MemoryStore,
   workdir: string,
+  projectId?: string | null,
 ): Promise<Array<MemoryEntry & { scope: MemoryScope }>> {
   const shared = isSharedMemoryDir(workdir, store.dir);
-  const project = projectSlugFromWorkdir(workdir);
+  const project = resolveProjectSlug(workdir, projectId);
   const entries = await store.list();
   const out: Array<MemoryEntry & { scope: MemoryScope }> = [];
   for (const entry of entries) {
@@ -284,8 +328,12 @@ export async function annotateMemoryEntries(
   return out;
 }
 
-export async function scopedMemoryIndex(store: MemoryStore, workdir: string): Promise<string> {
-  const kept = (await annotateMemoryEntries(store, workdir)).filter((entry) => entry.scope !== "other");
+export async function scopedMemoryIndex(
+  store: MemoryStore,
+  workdir: string,
+  projectId?: string | null,
+): Promise<string> {
+  const kept = (await annotateMemoryEntries(store, workdir, projectId)).filter((entry) => entry.scope !== "other");
   if (kept.length === 0) return "(no memories yet)";
   return kept.map((entry) => `- ${entry.name}: ${entry.summary}`).join("\n");
 }

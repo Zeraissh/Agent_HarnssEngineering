@@ -60,10 +60,15 @@ import {
   formatMcpServersLine,
   formatWorkspaceGitChip,
   formatGateChip,
+  stripHostEditScopeChrome,
+  paintConversationUserText,
+  peelHostToolReceipts,
   deriveCitedChat,
   composerCiteTrigger,
   filterCiteCandidates,
   sameWorkdirCiteRuns,
+  suggestPlainModeInsteadOfPlan,
+  pickWelcomeWorkdir,
 } from "../ui/public/app.js";
 import { plannedStopReason } from "../src/orchestrate.js";
 import { STOP_REASONS } from "../src/types.js";
@@ -654,25 +659,47 @@ describe("reduceEvent", () => {
     expect(html).toContain('id="workspace-face"');
     expect(html).toContain('data-workspace-face="office"');
     expect(html).toContain('data-workspace-face="code"');
+    expect(html).toMatch(/id="workspace-face-office"[^>]*>Work</);
+    expect(html).toMatch(/id="workspace-face-code"[^>]*>Code</);
+    expect(html).not.toMatch(/id="workspace-face-office"[^>]*>办公</);
+    expect(html).not.toMatch(/id="workspace-face-code"[^>]*>编码</);
     expect(html).not.toContain("项目与对话");
   });
 
-  it("14d. 侧栏：新建在列表之上，工具按钮都在底栏，没有满宽指挥/定时标签钮", () => {
+  it("14d. 侧栏：通知与主题在顶栏，底栏留其余工具，新建在列表之上", () => {
     const html = readFileSync(join(__dirname, "..", "ui", "public", "index.html"), "utf-8");
     expect(html).not.toMatch(/id="palette-open-btn"/);
     expect(html).not.toMatch(/id="usage-open-btn"/);
+    const header = html.indexOf("sidebar-header");
+    const topTools = html.indexOf("sidebar-top-tools");
+    const notif = html.indexOf('id="notifications-btn"');
+    const theme = html.indexOf('id="theme-toggle"');
+    const face = html.indexOf('id="workspace-face"');
     const newChat = html.indexOf('id="new-chat-btn"');
+    const runSearch = html.indexOf('id="run-search"');
     const runList = html.indexOf('id="run-list"');
-    const footer = html.indexOf('sidebar-footer');
+    const footer = html.indexOf("sidebar-footer");
     const board = html.indexOf('id="board-open-btn"');
     const schedules = html.indexOf('id="schedules-open-btn"');
+    const memory = html.indexOf('id="memory-btn"');
     const settings = html.indexOf('id="settings-open-btn"');
-    expect(newChat).toBeGreaterThan(-1);
-    expect(newChat).toBeLessThan(runList);
+    expect(header).toBeGreaterThan(-1);
+    expect(header).toBeLessThan(topTools);
+    expect(topTools).toBeLessThan(face);
+    expect(notif).toBeGreaterThan(topTools);
+    expect(notif).toBeLessThan(face);
+    expect(theme).toBeGreaterThan(topTools);
+    expect(theme).toBeLessThan(face);
+    expect(face).toBeLessThan(newChat);
+    expect(newChat).toBeLessThan(runSearch);
+    expect(runSearch).toBeLessThan(runList);
     expect(footer).toBeGreaterThan(runList);
     expect(board).toBeGreaterThan(footer);
     expect(schedules).toBeGreaterThan(footer);
+    expect(memory).toBeGreaterThan(footer);
     expect(settings).toBeGreaterThan(footer);
+    expect(notif).toBeLessThan(footer);
+    expect(theme).toBeLessThan(footer);
     expect(html).not.toContain("<span>指挥中心</span>");
     expect(html).not.toContain("<span>定时任务</span>");
     expect(html).toContain('settingsApi?.open("settings-usage")');
@@ -1900,6 +1927,26 @@ describe("AC6 无障碍语义 (R-05)", () => {
     expect(html).toContain('["light", "dark", "graphite", "contrast"]');
   });
 
+  it("日常对话和小修在计划开着时建议改用普通模式，跨领域长管线不打扰", () => {
+    const html = readFileSync(join(__dirname, "..", "ui", "public", "index.html"), "utf-8");
+    expect(html).toContain("id=\"plan-mode-hint\"");
+    expect(html).toContain("改用普通模式");
+    expect(html).toContain("suggestPlainModeInsteadOfPlan(");
+    expect(html).toContain("applyPlainModeFromHint()");
+    expect(html).toContain("paintPlanModeHint()");
+    expect(suggestPlainModeInsteadOfPlan("你好", { planMode: true, kind: "new" })?.reason).toBe("casual");
+    expect(suggestPlainModeInsteadOfPlan("修一下按钮颜色", { planMode: true, kind: "new" })?.reason).toBe("small-fix");
+    expect(suggestPlainModeInsteadOfPlan("改个 typo", { planMode: true, kind: "new" })?.reason).toBe("small-fix");
+    expect(suggestPlainModeInsteadOfPlan("", { planMode: true, kind: "new" })?.reason).toBe("standing");
+    expect(suggestPlainModeInsteadOfPlan("修一下按钮颜色", { planMode: false, kind: "new" })).toBeNull();
+    expect(suggestPlainModeInsteadOfPlan("修一下按钮颜色", { planMode: true, kind: "append" })).toBeNull();
+    expect(suggestPlainModeInsteadOfPlan("写 STM32 固件并烧录，再出原理图", { planMode: true, kind: "new" })).toBeNull();
+    expect(suggestPlainModeInsteadOfPlan(
+      "1. 写规格\n2. 做幻灯",
+      { planMode: true, kind: "new" },
+    )).toBeNull();
+  });
+
   it("设置面板不再单独解释计划门与需求澄清；提交仍默认带上", () => {
     const html = readFileSync(join(__dirname, "..", "ui", "public", "index.html"), "utf-8");
     expect(html).not.toContain("id=\"ask-user-fact\"");
@@ -1951,9 +1998,14 @@ describe("AC6 无障碍语义 (R-05)", () => {
     expect(followPayload).toContain("autoApprove:");
     expect(followPayload).not.toContain("planMode:");
     expect(followPayload).not.toContain("multiAgent:");
-    expect(html).toContain("attachDesignEditScope");
-    expect(html).toContain("withCanvasEditScope");
-    expect(html).toMatch(/postFollowUp\(runId, withCanvasEditScope\(text\)/);
+    expect(followPayload).toContain("citedRunIds");
+    expect(buildFollowUpRequest({ text: "对照" })).not.toHaveProperty("citedRunIds");
+    expect(html).not.toContain("attachDesignEditScope");
+    expect(html).not.toContain("withCanvasEditScope");
+    expect(html).not.toContain("formatDesignEditScope");
+    expect(html).toMatch(/postFollowUp\(runId, text,/);
+    expect(html).toMatch(/const text = taskInput\.value\.trim\(\) \|\| "继续"/);
+    expect(html).toMatch(/const text = String\(textOverride \?\? taskInput\.value\)\.trim\(\)/);
   });
 
   it("单任务与计划模式都把 ask_user 开关接进真实提交载荷", () => {
@@ -1991,6 +2043,8 @@ describe("AC6 无障碍语义 (R-05)", () => {
       extraWorkdirs: ["D:\\b"],
     });
     expect(buildNewRunRequest({ task: "t" })).not.toHaveProperty("extraWorkdirs");
+    expect(buildNewRunRequest({ task: "t", projectId: "board-1" })).toMatchObject({ projectId: "board-1" });
+    expect(buildNewRunRequest({ task: "t" })).not.toHaveProperty("projectId");
   });
 
   it("设计模式载荷：mode=design 带类型字段；--plan 优先不发 design", () => {
@@ -3017,6 +3071,12 @@ describe("MODEL-01a 端点降级", () => {
       { model: "backup", healthy: false, circuit: "open", reason: "upstream:503" },
     ]);
     expect(state.runConfig.supportsVision).toBe(false);
+
+    state = reduceEvent(state, sse("host", "run_config", {
+      describeImageBacking: "executor",
+      supportsVision: true,
+    }));
+    expect(state.runConfig.describeImageBacking).toBe("executor");
   });
 
   it("run_config 投影 hooks：未配是 null，配了才有 timeout 与事件名单", () => {
@@ -3120,6 +3180,40 @@ describe("formatMcpServersLine", () => {
   });
 });
 
+describe("改范围 chrome 不进默认 composer", () => {
+  it("submit-form / quickbar 不画 [改范围]；门禁 chip 仍在", () => {
+    const html = readFileSync(join(__dirname, "..", "ui", "public", "index.html"), "utf-8");
+    const formStart = html.indexOf('id="submit-form"');
+    const formEnd = html.indexOf("</form>", formStart);
+    expect(formStart).toBeGreaterThan(-1);
+    expect(formEnd).toBeGreaterThan(formStart);
+    const form = html.slice(formStart, formEnd);
+    expect(form).not.toContain("[改范围]");
+    expect(form).not.toContain("[改稿范围]");
+    expect(form).toContain('id="gate-chip"');
+    expect(html).not.toContain("attachDesignEditScope");
+    expect(html).not.toContain("withCanvasEditScope");
+    expect(html).not.toContain("formatDesignEditScope");
+  });
+
+  it("剥掉宿主页锁，用户原话留下", () => {
+    const scoped =
+      `[改稿范围] 只改 data-slide="back"（文件 index.html）。不要改其它页，不要整份重写。\n` +
+      "图片你自己有核对过吗？完全与介绍的科技不相关";
+    expect(stripHostEditScopeChrome(scoped)).toBe("图片你自己有核对过吗？完全与介绍的科技不相关");
+    expect(stripHostEditScopeChrome(
+      `[改范围]只改 data-slide="back"（文件 index.html）。不要改其他页，不要整页重写。\n图片不对`,
+    )).toBe("图片不对");
+    expect(stripHostEditScopeChrome("缩短标题")).toBe("缩短标题");
+  });
+
+  it("对话面剥工具回执，正史原句不动", () => {
+    expect(peelHostToolReceipts("已收到，交付完成。\n下一句才是人话")).toBe("下一句才是人话");
+    expect(paintConversationUserText("Progress updated (1): [x] 写完").kind).toBe("receipt");
+    expect(paintConversationUserText("缩短标题").display).toBe("缩短标题");
+  });
+});
+
 describe("formatGateChip", () => {
   it("status 为 null 时隐藏，不占文案", () => {
     expect(formatGateChip(null)).toEqual({ hidden: true, label: "" });
@@ -3173,5 +3267,67 @@ describe("点名引用（composer + derive）", () => {
     expect(buildNewRunRequest({ task: "接着那份规格", citedRunIds: ["r1", "r1", ""] }).citedRunIds)
       .toEqual(["r1"]);
     expect(buildNewRunRequest({ task: "新开" }).citedRunIds).toBeUndefined();
+    expect(buildFollowUpRequest({ text: "对照", citedRunIds: ["r1"] })).toEqual({
+      text: "对照",
+      citedRunIds: ["r1"],
+    });
+  });
+});
+
+describe("项目多目录：侧栏可见性接线", () => {
+  it("选中项目时按项目过滤，快照不把已选成员目录打回 primary", () => {
+    const html = readFileSync(join(__dirname, "..", "ui", "public", "index.html"), "utf-8");
+    expect(html).toContain("filterRunsByWorkspaceFace(runs, workspaceFace)");
+    expect(html).toContain("composerListMembership(project)");
+    expect(html).toContain("filterRunsByComposerWorkdir(");
+    expect(html).toContain("maybeRepaintWorkdirsForFace()");
+    const filteredFn = html.match(/function getFilteredRuns\(\) \{[\s\S]*?\n\}/);
+    expect(filteredFn?.[0]).not.toMatch(/getWorkdirSelection/);
+    expect(filteredFn?.[0]).not.toMatch(/extras/);
+    expect(html).not.toMatch(/composerListMembership\([^)]*extras/);
+    expect(html).toMatch(/applyProjectMembership\(\s*chosen,\s*\{\s*keepCurrent:\s*true\s*\}\s*\)/);
+    expect(html).toMatch(/workdir:\s*workdirSelect\?\.value/);
+    expect(html).toMatch(/projectId:\s*selectedComposerProject\(\)\?\.id/);
+    expect(html).toMatch(/workdirs:\s*\[primary,\s*\.\.\.extras\]/);
+    expect(html).toContain("只快照当前主目录 + 此刻勾选的 extras");
+    expect(html).toMatch(/planMode:\s*planModeToggle\?\.checked === true/);
+    expect(html).toMatch(/planModeToggle\.addEventListener\("change",[\s\S]*syncComposer\(\)/);
+    expect(html).toContain("pickWelcomeWorkdir");
+    expect(html).toMatch(/currentArtifactsFilter[\s\S]*harnessSnapshot\?\.workdir/);
+  });
+});
+
+describe("pickWelcomeWorkdir", () => {
+  it("有上次选择就用它；产品仓且无 pref 时改选 scratch", () => {
+    const repo = "D:\\Work\\Github_pros\\Agent_Design";
+    const scratch = "D:\\Work\\scratch\\chat";
+    expect(pickWelcomeWorkdir({
+      visible: [repo, scratch],
+      keep: scratch,
+      snapWorkdir: repo,
+      hostWorkdirIsHarness: true,
+      hasPref: true,
+    })).toBe(scratch);
+    expect(pickWelcomeWorkdir({
+      visible: [repo, scratch],
+      keep: "",
+      snapWorkdir: repo,
+      hostWorkdirIsHarness: true,
+      hasPref: false,
+    })).toBe(scratch);
+    expect(pickWelcomeWorkdir({
+      visible: [repo],
+      keep: "",
+      snapWorkdir: repo,
+      hostWorkdirIsHarness: true,
+      hasPref: false,
+    })).toBe(repo);
+    expect(pickWelcomeWorkdir({
+      visible: [repo, scratch],
+      keep: "",
+      snapWorkdir: repo,
+      hostWorkdirIsHarness: false,
+      hasPref: false,
+    })).toBe(repo);
   });
 });

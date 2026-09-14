@@ -153,3 +153,14 @@ export function mergeRunReadRoots(
   }
   return out;
 }
+
+/**
+ * 本次 run 的额外可写根 = 操作员勾选 / 显式项目成员，去掉主 workdir。
+ * 宿主白名单是准入集合（picker 只能从里面勾），不整表拷进 writeRoots。
+ */
+export function mergeRunWriteRoots(
+  extraWorkdirs: string[] | undefined,
+  primaryWorkdir: string,
+): string[] {
+  return mergeRunReadRoots([], extraWorkdirs, primaryWorkdir);
+}

@@ -52,10 +52,26 @@ import {
   WORKDIRS_SCHEMA_VERSION,
   loadWorkdirStore,
   mergeRunReadRoots,
+  mergeRunWriteRoots,
   parseExtraWorkdirs,
   saveWorkdirStore,
   isSafeFolderName,
 } from "./workdirs.js";
+import {
+  PROJECTS_FILENAME,
+  PROJECTS_SCHEMA_VERSION,
+  createProjectRecord,
+  extraWorkdirsFromProject,
+  findProjectById,
+  findProjectByWorkdir,
+  loadProjectStore,
+  overlappingProjectWorkdirs,
+  parseProjectPatch,
+  parseProjectWrite,
+  saveProjectStore,
+  type Project,
+} from "./projects.js";
+import { collectWorkdirArtifactCards, compareArtifactCards } from "./artifacts.js";
 import {
   instrumentModelClient,
   modelCallSeconds,
@@ -121,6 +137,27 @@ import {
   writeDraftPack,
 } from "../src/pack-files.js";
 import { draftDomainPackTool } from "../src/tools/draft-domain-pack.js";
+import { installMcpTool } from "../src/tools/install-mcp.js";
+import {
+  MCP_CATALOG_IDS,
+  MCP_NOT_STARTED_HINT,
+  MCP_WRITTEN_HINT,
+  combinedInstalledCatalogIds,
+  customCatalogPath,
+  performCatalogInstall,
+  performCatalogUninstall,
+  publicCatalogEntries,
+  readCustomCatalog,
+} from "../src/mcp-catalog.js";
+import {
+  publicSkillsView,
+  readSkillsIndex,
+  readSkillsIndexSync,
+  resolveSkillsDir,
+  setSkillEnabled,
+  withEnabledSkills,
+  type SkillFetch,
+} from "../src/skills.js";
 import { routeToPack } from "../src/router.js";
 import {
   DESIGN_TABS,
@@ -152,6 +189,11 @@ import {
   relativeStylesheetHrefs,
 } from "../src/deck-pptx.js";
 import {
+  isOoxmlPreviewError,
+  officeKindFromPath,
+  parseOfficePreview,
+} from "../src/ooxml-preview.js";
+import {
   CARD_PNG_CAPTURE_UNAVAILABLE,
   CARD_PNG_NO_FRAMES,
   capturePngFramesWithPlaywright,
@@ -180,7 +222,13 @@ import {
 } from "../src/workspace-git.js";
 import { resolveRunTitle, sanitizeGeneratedTitle, summarizeTitle, titleSourceText, TITLE_SYSTEM } from "./title.js";
 import { appendSiteHooks } from "./public/features/review-mode.js";
-import { buildStoreZip, zipEntryName } from "./zip.js";
+import {
+  buildStoreZip,
+  isSameDirSiteAsset,
+  shouldSkipSiteZipName,
+  siteRefsFromText,
+  zipEntryName,
+} from "./zip.js";
 import {
   copyDesignTemplate,
   designTemplatesRootFromRepo,
@@ -201,12 +249,15 @@ import {
   type ThreadEventLike,
 } from "./conversation-context.js";
 import {
+  citeWorkdirLabel,
   formatCiteBlock,
+  isCiteableRun,
   oneLineTask,
   parseCitedRunIds,
   resolveCiteArtifacts,
   visibleCiteRuns,
   type CiteRef,
+  type CiteScope,
 } from "./cite.js";
 import { aggregateUsage, parseLedgerLines } from "./usage.js";
 import { envUpdatesFromStore, upsertEnvKeys } from "./env-sync.js";
@@ -222,10 +273,17 @@ import {
   createProjectStatusTool,
   formatProjectStatusBlock,
   isSharedMemoryDir,
-  projectSlugFromWorkdir,
   readProjectStatus,
+  resolveProjectSlug,
   scopedMemoryIndex,
 } from "../src/project-status.js";
+import {
+  createOfficeNotifier,
+  gateNotifyPayloadFromBoard,
+  officeNotifySnapshot,
+  resolveOfficeNotifyFromEnv,
+  type OfficeNotifyConfig,
+} from "../src/notify.js";
 import { DEFAULT_VERIFIER_MAX_TURNS, resolveVerifierReadOnlyCommands } from "../src/verifier.js";
 import type { Plan, PlanNodeState, SubTask } from "../src/planner.js";
 import {
@@ -249,7 +307,26 @@ import { bashTool, SHELL_DESC } from "../src/tools/bash.js";
 import { ASK_USER_TOOL_NAME, createAskUserTool, type UserQuestion } from "../src/tools/ask-user.js";
 import { createProposeHandoffTool } from "../src/tools/propose-handoff.js";
 import { createSpawnTaskTool } from "../src/tools/spawn-task.js";
-import { runSpawnedTask } from "../src/spawn.js";
+import { runSpawnedTask, withSpawnSlot } from "../src/spawn.js";
+import { createCampaignMailTool } from "../src/tools/campaign-mail.js";
+import {
+  detectCampaignSplit,
+  directorSplitForTask,
+  planFromCampaignSplit,
+  DIRECTOR_SYSTEM_PROMPT,
+  type CampaignChildRecord,
+  type CampaignChildStatus,
+  type CampaignMeta,
+  type MailboxAction,
+} from "../src/campaign.js";
+import {
+  appendCampaignMailbox,
+  campaignsRootPath,
+  createCampaignMeta,
+  listCampaignMetas,
+  readCampaignMailbox,
+  saveCampaignMeta,
+} from "./campaign.js";
 import {
   buildHandoffPlan,
   buildHandoffTask,
@@ -259,7 +336,12 @@ import {
   FINISH_TASK_TOOL_NAME,
   withTaskCompletion,
 } from "../src/task-completion.js";
-import { createDescribeImageTool } from "../src/tools/describe-image.js";
+import {
+  assembleDescribeImageTool,
+  resolveDescribeImageBacking,
+  resolveExecutorVisionSupport,
+  type DescribeImageBacking,
+} from "../src/design-image-review.js";
 import { createGenerateImageTool } from "../src/tools/generate-image.js";
 import { createOpenAIImageClient, DEFAULT_OPENAI_IMAGE_BASE } from "../src/image-client.js";
 import { createWebSearchTool, isWebSearchConfigured } from "../src/tools/web-search.js";
@@ -338,6 +420,7 @@ import {
   SCHEDULE_TICK_MS,
   advanceAfterMiss,
   computeNextRunAt,
+  filterSchedulesByProject,
   isMissed,
   loadSchedules,
   parseScheduleSpec,
@@ -638,6 +721,11 @@ interface StoredRun {
   mode?: "single" | "plan" | "design";
   /** 侧栏办公/编码脸；旧档案缺省，列表按 packName=design 回退 */
   workspace?: "office" | "code";
+  /**
+   * 设计门面。档案 mode 仍是 single|plan；直播可暂为 design。
+   * 追问按合同改成 single 执行时必须留下这个字段，列表才不会像换了一种产品。
+   */
+  facade?: "design";
   /** 设计模式路由结果，给界面照实说 */
   designRoute?: {
     id: string | null;
@@ -697,8 +785,18 @@ interface StoredRun {
   workdir?: string;
   /** 工作区 git 身份（不带 remote URL）。跟 workdir 走，换包不消失。 */
   workspaceGit?: PublicWorkspaceGit;
-  /** 勾选的额外白名单目录（提示焦点）。写入圈是整份白名单，不靠这一项放行。 */
+  /** 勾选的额外白名单目录。写入圈 = 主 workdir ∪ 这一项，不再拷整张白名单。 */
   extraWorkdirs?: string[];
+  /** 可选：本次运行所属项目。slug / 侧栏分组跟这个 id，不是 workdir 末段。 */
+  projectId?: string;
+  /** 战役 id。导演与子对话共用；注入宿主缺省不落盘。 */
+  campaignId?: string;
+  campaignRole?: "director" | "child";
+  /** 子对话共享父执行谱系预算（同一引用）。 */
+  sharedBudget?: SharedRunBudget;
+  /** 子对话继承父资源标签：不重占、finalize 不释放。 */
+  inheritResources?: boolean;
+  campaignMailTool?: Tool;
   /** V-30：本次运行是否启用已配置的独立角色模型 */
   useVerifierModel?: boolean;
   usePlannerModel?: boolean;
@@ -791,7 +889,7 @@ interface StoredRun {
   /** 委托方点名引用的【引用】块；与 sibling boot 分开，不改 formatSiblingBootContext。 */
   citeContext?: string;
   /** 本 run 点名引用的会话（进 run_config，供界面画出引用了谁/哪些文件） */
-  cited?: Array<{ runId: string; title: string; artifacts: string[] }>;
+  cited?: Array<{ runId: string; title: string; artifacts: string[]; workdirLabel?: string }>;
   /** 仅供刚派生的新 run 装配首轮；完成后 checkpoint 会从真实 done 事件重建。 */
   resumeBudget?: SharedRunBudget;
   initialContextInputTokens?: number;
@@ -1473,6 +1571,11 @@ export interface UiServerOptions {
    */
   roleEnv?: NodeJS.ProcessEnv;
   /**
+   * 测试覆盖：执行者会不会看图。注入假模型时默认当看不见（名称常是 claude-*，
+   * 不能据此当真）。真机由探针 / 名称猜测决定。传 true 可锁「能看就不引识图角色」。
+   */
+  executorSupportsVision?: boolean;
+  /**
    * 模型库文件（MODEL-02，.agent-models.json）落点。缺省：真实宿主
    * `<workdir>/.agent-models.json`；**注入了 modelClient 的宿主缺省 null**
    * （纯内存库，仪器纪律同 roleEnv——假模型宿主不该被开发机残留的库文件武装）。
@@ -1483,6 +1586,14 @@ export interface UiServerOptions {
   envFile?: string | null;
   /** mcp.json 落点。缺省 `AGENT_MCP_CONFIG` 或 `<workdir>/mcp.json`。测试应显式传入，避免改仓库文件。 */
   mcpConfigFile?: string;
+  /**
+   * Skill 文件根目录。缺省：真实宿主 `AGENT_SKILLS_DIR` 或 `<workdir>/.agent-skills`；
+   * **注入了 modelClient 的宿主缺省不装**——必须显式传入，避免写操作员目录。
+   * 显式 `null` = 关闭 skill 安装面。
+   */
+  skillsDir?: string | null;
+  /** 测试注入：skill 下载（raw.githubusercontent.com；公开 contents API 无令牌）。 */
+  skillFetch?: SkillFetch;
   /**
    * 文件领域包根目录（drafts/ + installed/）。
    * 缺省：真实宿主读 `AGENT_PACKS_DIR` 或 `<cwd>/.agent-packs`；
@@ -1497,6 +1608,19 @@ export interface UiServerOptions {
    * 运行时添加目录的持久化与 round-trip。
    */
   workdirStoreFile?: string | null;
+  /**
+   * 项目清单文件（.agent-projects.json）落点。缺省：真实宿主
+   * `AGENT_PROJECTS_FILE` 或 `<workdir>/.agent-projects.json`；
+   * **注入了 modelClient 的宿主缺省 null**（不落盘、不读残留，
+   * 仪器纪律同 workdirStoreFile）。
+   */
+  projectsStoreFile?: string | null;
+  /**
+   * 战役目录（.agent-campaigns）。缺省：真实宿主 AGENT_CAMPAIGNS_DIR 或
+   * `<workdir>/.agent-campaigns`；**注入了 modelClient 的宿主缺省 null**
+   * （仪器纪律同 projectsStoreFile——假模型不写操作员那份战役目录）。
+   */
+  campaignsRoot?: string | null;
   /** 只在宿主确实位于可信反向代理之后时读取 X-Forwarded-Proto/Host。 */
   trustProxy?: boolean;
   /**
@@ -1519,6 +1643,14 @@ export interface UiServerOptions {
    * 避免测试套启动 Chromium。
    */
   capturePngFrames?: PngCaptureFn;
+  /**
+   * 办公出站门禁通知（飞书自定义机器人 / 通用 JSON webhook）。
+   * 缺省：真实宿主读 AGENT_FEISHU_WEBHOOK / AGENT_NOTIFY_WEBHOOK；
+   * **注入了 modelClient 的宿主不读 env**——开发机残留 webhook 不得武装
+   * 测试宿主（仪器纪律同日预算 / AGENT_UI_MCP）。要验证投递，显式传本字段。
+   * 快照只报 `{ kind, armed }`，永不带 URL。
+   */
+  notify?: OfficeNotifyConfig;
 }
 
 /**
@@ -1659,6 +1791,14 @@ const PHOSPHOR_DIR = [
 ].find((candidate) => existsSync(candidate))
   ?? join(__dirname, "..", "node_modules", PHOSPHOR_RELATIVE);
 
+const KATEX_RELATIVE = join("katex", "dist");
+const KATEX_DIR = [
+  join(__dirname, "..", "node_modules", KATEX_RELATIVE),
+  join(__dirname, "..", "..", "node_modules", KATEX_RELATIVE),
+  join(process.cwd(), "node_modules", KATEX_RELATIVE),
+].find((candidate) => existsSync(candidate))
+  ?? join(__dirname, "..", "node_modules", KATEX_RELATIVE);
+
 /**
  * UI 图标走本地、固定版本的 Phosphor 字体，不依赖运行时 CDN。
  *
@@ -1670,7 +1810,24 @@ const VENDOR_STATIC = new Map<string, string>([
   ["vendor/phosphor/Phosphor.woff2", join(PHOSPHOR_DIR, "Phosphor.woff2")],
   ["vendor/phosphor/Phosphor.woff", join(PHOSPHOR_DIR, "Phosphor.woff")],
   ["vendor/phosphor/Phosphor.ttf", join(PHOSPHOR_DIR, "Phosphor.ttf")],
+  ["vendor/katex/katex.min.js", join(KATEX_DIR, "katex.min.js")],
+  ["vendor/katex/katex.min.css", join(KATEX_DIR, "katex.min.css")],
+  ["vendor/katex/contrib/auto-render.min.js", join(KATEX_DIR, "contrib", "auto-render.min.js")],
 ]);
+
+const KATEX_FONT_RE = /^vendor\/katex\/fonts\/([A-Za-z0-9._-]+\.(?:woff2|woff|ttf))$/;
+
+/** 白名单内的 vendor 文件；KaTeX 字体按名放行，不挂整棵 node_modules。 */
+export function resolveVendorFile(urlPath: string): string | undefined {
+  const exact = VENDOR_STATIC.get(urlPath);
+  if (exact) return exact;
+  const font = urlPath.match(KATEX_FONT_RE);
+  if (font) {
+    const abs = join(KATEX_DIR, "fonts", font[1]);
+    if (existsSync(abs)) return abs;
+  }
+  return undefined;
+}
 
 function firstForwarded(value: string | string[] | undefined): string | undefined {
   const raw = Array.isArray(value) ? value[0] : value;
@@ -2544,6 +2701,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   let executorCapabilities: EndpointCapabilities | null = null;
   /** 识图探针结果；未探 / fail-open 时 null（工具仍按"配了就注册"） */
   let visionProbe: { supportsVision: boolean; reason?: string } | null = null;
+  /** 执行者识图探针：只信 source=probe，其它当没探过 */
+  let executorVisionKnown: boolean | null = null;
   /**
    * 端点降级链（MODEL-01a/b）。执行者 AGENT_FALLBACK_*；角色可 own / inherit。
    * 熔断按端点身份经 sharedBreakerRegistry 共享；装饰器实例按角色隔离。
@@ -2574,7 +2733,13 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   let envCompat = true;
 
   function assembleExecutor(entry: ModelEntry | null, probedCompat?: boolean): void {
-    executorModelName = entry?.model ?? process.env.AGENT_MODEL ?? "claude-opus-4-8";
+    const nextName = entry?.model ?? process.env.AGENT_MODEL ?? "claude-opus-4-8";
+    if (options.executorSupportsVision !== undefined) {
+      executorVisionKnown = options.executorSupportsVision;
+    } else if (executorModelName && executorModelName !== nextName) {
+      executorVisionKnown = null;
+    }
+    executorModelName = nextName;
     const compatOverride =
       probedCompat !== undefined ? { compat: probedCompat } : {};
     resolved = entry
@@ -2641,6 +2806,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           assembleExecutor(entry, caps.compat);
           // 执行者备用端点对象换了，inherit 角色要跟着重建
           assembleRoles();
+          probeExecutorVision();
         }
       })
       .catch(() => {
@@ -2763,6 +2929,101 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     });
   }
 
+  /**
+   * 项目清单。真实宿主默认 AGENT_PROJECTS_FILE 或 <workdir>/.agent-projects.json；
+   * 注入了 modelClient 的宿主缺省 null——不读不写操作员那份文件。
+   */
+  const projectsStoreFile = options.projectsStoreFile !== undefined
+    ? options.projectsStoreFile
+    : realHost
+      ? (process.env.AGENT_PROJECTS_FILE?.trim()
+        ? resolve(process.env.AGENT_PROJECTS_FILE.trim())
+        : join(workdir, PROJECTS_FILENAME))
+      : null;
+  let projects: Project[] = [];
+  if (projectsStoreFile) {
+    const loaded = loadProjectStore(projectsStoreFile);
+    if (loaded.recoveredFromCorrupt) {
+      operationalLog("warn", "projects_store_recovered", { file: projectsStoreFile });
+    }
+    projects = loaded.store?.projects ?? [];
+  }
+
+  function persistProjects(): void {
+    if (!projectsStoreFile) return;
+    saveProjectStore(projectsStoreFile, {
+      schemaVersion: PROJECTS_SCHEMA_VERSION,
+      projects,
+    });
+  }
+
+  /**
+   * 战役落盘。真实宿主默认 AGENT_CAMPAIGNS_DIR 或 <workdir>/.agent-campaigns；
+   * 注入了 modelClient 的宿主缺省 null——不读不写操作员那份目录。
+   */
+  const campaignsRoot = options.campaignsRoot !== undefined
+    ? options.campaignsRoot
+    : realHost
+      ? campaignsRootPath(process.env, workdir)
+      : null;
+  const campaignStore = new Map<string, CampaignMeta>();
+  const mailboxStore = new Map<string, MailboxAction[]>();
+  if (campaignsRoot) {
+    for (const meta of listCampaignMetas(campaignsRoot)) {
+      campaignStore.set(meta.id, meta);
+    }
+  }
+
+  function persistCampaign(meta: CampaignMeta): void {
+    campaignStore.set(meta.id, meta);
+    if (campaignsRoot) saveCampaignMeta(campaignsRoot, meta);
+  }
+
+  function persistMailbox(campaignId: string, childRunId: string, action: MailboxAction): void {
+    const key = `${campaignId}/${childRunId}`;
+    const list = mailboxStore.get(key) ?? [];
+    list.push(action);
+    mailboxStore.set(key, list);
+    if (campaignsRoot) appendCampaignMailbox(campaignsRoot, campaignId, childRunId, action);
+  }
+
+  function mailboxFor(campaignId: string, childRunId: string): MailboxAction[] {
+    const key = `${campaignId}/${childRunId}`;
+    const mem = mailboxStore.get(key);
+    if (mem?.length) return mem;
+    if (!campaignsRoot) return [];
+    const disk = readCampaignMailbox(campaignsRoot, campaignId, childRunId);
+    if (disk.length) mailboxStore.set(key, disk);
+    return disk;
+  }
+
+  function upsertCampaignChild(campaignId: string, child: CampaignChildRecord): void {
+    const meta = campaignStore.get(campaignId);
+    if (!meta) return;
+    const idx = meta.children.findIndex((c) => c.runId === child.runId);
+    if (idx >= 0) meta.children[idx] = { ...meta.children[idx], ...child };
+    else meta.children.push(child);
+    persistCampaign(meta);
+  }
+
+  function admitProjectSelection(
+    raw: unknown,
+  ): { ok: true; project?: Project } | { ok: false; error: string } {
+    if (raw === undefined || raw === null || raw === "") return { ok: true };
+    if (typeof raw !== "string") return { ok: false, error: "projectId 必须是字符串" };
+    const id = raw.trim();
+    const project = findProjectById(projects, id);
+    if (!project) return { ok: false, error: `未知项目 "${id}"` };
+    return { ok: true, project };
+  }
+
+  /** run 上的 projectId 优先（档案在项目删掉后仍应对上旧 slug）；否则按目录入项。 */
+  function projectIdForWorkdir(runWorkdir: string, explicit?: string | null): string | undefined {
+    const id = String(explicit ?? "").trim();
+    if (id) return id;
+    return findProjectByWorkdir(projects, runWorkdir)?.id;
+  }
+
   /** 在飞 run（status === "running"）有没有正用着这个目录——删除保护用。 */
   function workdirInFlight(target: string): boolean {
     for (const r of runs.values()) {
@@ -2773,11 +3034,36 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   const memoryHost = createWorkdirScopedMemoryTools(
     (runWorkdir) => resolveMemoryDir(runWorkdir),
   );
+  /**
+   * 出站门禁卡片。env 只武装 realHost；测试宿主要投递必须显式 options.notify。
+   * 触发只认 project_status 写/清——run_end 再推一遍是噪声（v1 单触发）。
+   */
+  const notifyConfig = options.notify
+    ?? (realHost ? resolveOfficeNotifyFromEnv(process.env) ?? undefined : undefined);
+  const officeNotifier = createOfficeNotifier(notifyConfig ?? { enabled: false });
+  const fireGateNotify = (
+    status: Parameters<typeof gateNotifyPayloadFromBoard>[0],
+    project: string,
+  ): void => {
+    void officeNotifier.notify(gateNotifyPayloadFromBoard(status, project)).catch((err) => {
+      if (realHost) {
+        operationalLog("warn", "office_notify_failed", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    });
+  };
   const memoryTools = [
     ...memoryHost.tools,
     createProjectStatusTool(
       (runWorkdir) => new MemoryStore(resolveMemoryDir(runWorkdir)),
-      { sharedFor: (runWorkdir) => isSharedMemoryDir(runWorkdir, resolveMemoryDir(runWorkdir)) },
+      {
+        sharedFor: (runWorkdir) => isSharedMemoryDir(runWorkdir, resolveMemoryDir(runWorkdir)),
+        onBoardChange: (status, project) => {
+          fireGateNotify(status, project);
+        },
+        resolveProject: (runWorkdir) => findProjectByWorkdir(projects, runWorkdir)?.id,
+      },
     ),
   ];
   const defaultMemoryDir = resolveMemoryDir(workdir);
@@ -2791,6 +3077,15 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   const executionEnv: NodeJS.ProcessEnv = options.executionEnv ?? process.env;
   const executionPolicy = parseExecutionPolicy(executionEnv);
   const mcpEnabled = process.env.AGENT_UI_MCP === "1";
+  const mcpConfigPath = options.mcpConfigFile ?? process.env.AGENT_MCP_CONFIG ?? join(workdir, "mcp.json");
+  /** 注入宿主必须显式传 mcpConfigFile，避免写到操作员仓库的 mcp.json。 */
+  const mcpWritesArmed = realHost || options.mcpConfigFile !== undefined;
+  const catalogSkillRoot = resolveSkillsDir({
+    workdir,
+    explicit: options.skillsDir,
+    realHost,
+  });
+  const skillFetch = options.skillFetch;
   // 先过跨能力边界，再创建/启动任何 OCI probe。否则构造函数随后 throw 时调用方
   // 拿不到 handle，也就没有机会 dispose 已启动的 canary。
   if (executionPolicy.mode === "required" && mcpEnabled) {
@@ -2969,12 +3264,46 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
   const webSearchTool = isWebSearchConfigured() ? createWebSearchTool() : null;
   const draftPackTool = packsRoot ? draftDomainPackTool(packsRoot) : null;
+  const catalogInstallTool = installMcpTool({
+    configPath: mcpConfigPath,
+    workdir,
+    writesArmed: mcpWritesArmed,
+    mcpEnabled,
+    ...(catalogSkillRoot ? { skillRoot: catalogSkillRoot } : {}),
+    ...(skillFetch ? { fetchImpl: skillFetch } : {}),
+  });
   const enabledBuiltinPool = [
     ...(bashEnabled ? BUILTIN_POOL : BUILTIN_POOL.filter((tool) => tool.name !== bashTool.name)),
     ...(draftPackTool ? [draftPackTool] : []),
+    catalogInstallTool,
   ];
-  /** 工具面随角色装配重建：vision 配了才有 describe_image；image 配了才有 generate_image */
+  /** 工具面随角色装配重建：执行者能看图或配了识图角色才有 describe_image */
   let toolPool: Tool[] = [];
+
+  function describeImageBackingNow(): DescribeImageBacking {
+    return resolveDescribeImageBacking({
+      executorSupportsVision: resolveExecutorVisionSupport({
+        modelName: executorModelName,
+        probed: options.executorSupportsVision ?? executorVisionKnown,
+        injectedClient: Boolean(options.modelClient) && options.executorSupportsVision === undefined,
+      }),
+      visionRoleConfigured: Boolean(visionRole),
+      visionRoleSupportsVision: visionProbe?.supportsVision,
+    });
+  }
+
+  /** 工具面有没有识图。none=false；执行者 backing=true；识图角色未探完=null。 */
+  function describeImageSupportsVisionNow(): boolean | null {
+    const backing = describeImageBackingNow();
+    if (backing === "none") return false;
+    if (backing === "executor") return true;
+    return visionProbe ? visionProbe.supportsVision : null;
+  }
+
+  /** 本 run 实际引用的独立识图角色；执行者自己能看时为 null。 */
+  function activeVisionRoleName(): string | null {
+    return describeImageBackingNow() === "vision-role" ? (visionRole?.name ?? null) : null;
+  }
 
   function resolveImageRoleFromLibrary(): {
     name: string;
@@ -3002,7 +3331,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     visionRole = resolveRoleFromLibrary("vision");
     verifierClient = verifierRole ? wrapRoleClient("verifier", verifierRole, verifierRole.baseURL) : null;
     plannerClient = plannerRole ? wrapRoleClient("planner", plannerRole, plannerRole.baseURL) : null;
-    visionClient = visionRole ? wrapRoleClient("vision", visionRole, visionRole.baseURL) : null;
+
+    const imageBacking = describeImageBackingNow();
+    // 执行者自己能看图就不 wrap 独立识图 client——否则库里配了 vision 也会被引用、计量、写进 run_config。
+    visionClient = imageBacking === "vision-role" && visionRole
+      ? wrapRoleClient("vision", visionRole, visionRole.baseURL)
+      : null;
 
     /**
      * OBS-02 首抓盲区：被告警引用的直方图必须在开机时就有 0 值序列，否则
@@ -3014,20 +3348,24 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       { role: "execution" as const, model: executorModelName },
       ...(verifierRole ? [{ role: "verification" as const, model: verifierRole.name }] : []),
       ...(plannerRole ? [{ role: "planner" as const, model: plannerRole.name }] : []),
-      ...(visionRole ? [{ role: "vision" as const, model: visionRole.name }] : []),
+      ...(imageBacking === "vision-role" && visionRole
+        ? [{ role: "vision" as const, model: visionRole.name }]
+        : []),
     ]);
 
-    visionTool = visionRole && visionClient && visionProbe?.supportsVision !== false
-      ? createDescribeImageTool({
-          // 计量包裹：视觉调用不经 done/verification 记账路径，只能在客户端边界抓。
-          // 视觉是独立 client（不在主 modelClient 的日账包裹之内），日账本也在这里喂
-          client: meterModelClient(visionClient, (u) => {
-            growTokens("vision", u);
-            bumpDaily(u);
-          }),
-          modelName: visionRole.name,
-        })
-      : null;
+    visionTool = assembleDescribeImageTool({
+      backing: imageBacking,
+      executor: { client: modelClient, modelName: executorModelName },
+      vision: visionClient && visionRole
+        ? {
+            client: meterModelClient(visionClient, (u) => {
+              growTokens("vision", u);
+              bumpDaily(u);
+            }),
+            modelName: visionRole.name,
+          }
+        : undefined,
+    }) ?? null;
     // 生图不走 ModelClient / 降级链 / token 计量——Images API 不是 chat usage。
     const imageResolved = resolveImageRoleFromLibrary();
     imageRole = imageResolved
@@ -3058,7 +3396,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    * 未开探针 / 判不清 → fail-open 保留工具。
    */
   function probeVisionEndpoint(): void {
-    if (options.modelClient || !visionRole) return;
+    if (options.modelClient || describeImageBackingNow() !== "vision-role" || !visionRole) return;
     if (!shouldRunModelProbe(fallbackEnv)) return;
     const entry = roleEntryOf(modelStoreState.store, "vision");
     const envApiKey =
@@ -3076,21 +3414,45 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       .then((result) => {
         visionProbe = { supportsVision: result.supportsVision, ...(result.reason ? { reason: result.reason } : {}) };
         if (result.supportsVision === false) {
-          // 卸工具即可；roleModels 仍报 configured（配了但端点不会看图）——
-          // 装配条读 tools 列表比读 configured 更诚实，见 deriveAssemblyBar。
-          visionTool = null;
-          toolPool = [
-            ...enabledBuiltinPool,
-            ...(webSearchTool ? [webSearchTool] : []),
-            ...(imageTool ? [imageTool] : []),
-          ];
+          assembleRoles();
         }
       })
       .catch(() => {
         /* fail-open：探针失败不卸工具 */
       });
   }
+
+  /**
+   * 执行者识图探针：只信 source=probe。fail-open 的「没探过当能看」不能拿来
+   * 给 DeepSeek 发图像块。探完若 backing 变了，重装配；翻到 vision-role 再探角色端点。
+   */
+  function probeExecutorVision(): void {
+    if (options.modelClient || options.executorSupportsVision !== undefined) return;
+    if (!shouldRunModelProbe(fallbackEnv)) return;
+    const entry = roleEntryOf(modelStoreState.store, "executor");
+    const envApiKey = resolved.provider === "openai" ? process.env.OPENAI_API_KEY : process.env.ANTHROPIC_API_KEY;
+    const apiKey = entry?.apiKey || envApiKey;
+    void probeVisionSupport({
+      identity: executorIdentity,
+      ...(apiKey ? { apiKey } : {}),
+      env: fallbackEnv,
+    })
+      .then((result) => {
+        if (result.source !== "probe") return;
+        const before = describeImageBackingNow();
+        executorVisionKnown = result.supportsVision;
+        const after = describeImageBackingNow();
+        if (before !== after) {
+          assembleRoles();
+          if (after === "vision-role") probeVisionEndpoint();
+        }
+      })
+      .catch(() => {
+        /* 没探成就维持名称猜测，不卸工具 */
+      });
+  }
   probeVisionEndpoint();
+  probeExecutorVision();
 
   /**
    * 降级链快照全部现算（MODEL-02：PUT /api/models 后旧常量会撒谎）。
@@ -3335,9 +3697,46 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
   // ---- B2 运行历史落盘 ----
 
+  /** 设计是门面，不是第三种 DurableRun mode。档案 / 列表靠 facade + designRoute 认脸。 */
+  function designFacadeOf(run: {
+    mode?: string;
+    facade?: string;
+    designRoute?: unknown;
+  }): boolean {
+    return run.facade === "design" || run.mode === "design" || Boolean(run.designRoute);
+  }
+
+  function persistDesignRoute(route: StoredRun["designRoute"]): ArchivedMeta["designRoute"] | undefined {
+    if (!route || typeof route !== "object") return undefined;
+    return {
+      id: typeof route.id === "string" || route.id === null ? route.id : null,
+      reason: String(route.reason ?? ""),
+      seed: String(route.seed ?? ""),
+      kind: String(route.kind ?? ""),
+      ...(route.bundle ? { bundle: route.bundle } : {}),
+      ...(route.extraSeeds?.length ? { extraSeeds: [...route.extraSeeds] } : {}),
+    };
+  }
+
+  function restoreDesignRoute(raw: unknown): StoredRun["designRoute"] | undefined {
+    if (!raw || typeof raw !== "object") return undefined;
+    const r = raw as Record<string, unknown>;
+    return {
+      id: typeof r.id === "string" ? r.id : null,
+      reason: typeof r.reason === "string" ? r.reason : "",
+      seed: typeof r.seed === "string" ? r.seed : "",
+      kind: typeof r.kind === "string" ? r.kind : "",
+      ...(typeof r.bundle === "string" ? { bundle: r.bundle } : {}),
+      ...(Array.isArray(r.extraSeeds)
+        ? { extraSeeds: r.extraSeeds.filter((s): s is string => typeof s === "string") }
+        : {}),
+    };
+  }
+
   /** run → meta.json 的形状。创建 / 追加轮开始 / 收尾各整写一次 */
   function persistMeta(run: StoredRun): void {
     if (!run.archiveWriter) return;
+    const designRoute = persistDesignRoute(run.designRoute);
     const meta: ArchivedMeta = {
       version: 1,
       runId: run.id,
@@ -3350,13 +3749,18 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       packName: run.packName ?? pack?.name ?? null,
       // 档案 mode 仍是 plan | single：设计模式是单执行者门面，不另开归档形状
       mode: run.mode === "plan" ? "plan" : "single",
+      ...(designFacadeOf(run) ? { facade: "design" as const } : {}),
+      ...(designRoute ? { designRoute } : {}),
       workspace: run.workspace === "office" || run.workspace === "code"
         ? run.workspace
-        : (run.mode === "design" || run.packName === "design" ? "office" : "code"),
+        : (run.mode === "design" || run.packName === "design" || designFacadeOf(run) ? "office" : "code"),
       effort: run.effort ?? null,
       rubric: run.rubric ?? null,
       workdir: run.workdir ?? workdir,
       ...(run.extraWorkdirs?.length ? { extraWorkdirs: run.extraWorkdirs } : {}),
+      ...(run.projectId ? { projectId: run.projectId } : {}),
+      ...(run.campaignId ? { campaignId: run.campaignId } : {}),
+      ...(run.campaignRole ? { campaignRole: run.campaignRole } : {}),
       conversationTurn: run.conversationTurn,
       planGate: Boolean(run.planGate),
       planDecision: run.planDecision ?? null,
@@ -3523,10 +3927,20 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             : {}),
           ...(a.meta.workspace === "office" || a.meta.workspace === "code"
             ? { workspace: a.meta.workspace }
-            : a.meta.packName === "design"
+            : a.meta.packName === "design" || a.meta.facade === "design"
               ? { workspace: "office" as const }
               : {}),
-          ...(a.meta.mode === "plan" ? { mode: "plan" as const } : {}),
+          ...(a.meta.mode === "plan"
+            ? { mode: "plan" as const }
+            : a.meta.facade === "design" && a.meta.conversationTurn === 1
+              ? { mode: "design" as const }
+              : {}),
+          ...(a.meta.facade === "design" || a.meta.designRoute
+            ? { facade: "design" as const }
+            : {}),
+          ...(restoreDesignRoute(a.meta.designRoute)
+            ? { designRoute: restoreDesignRoute(a.meta.designRoute) }
+            : {}),
           ...(typeof a.meta.effort === "string" &&
           (EFFORT_LEVELS as readonly string[]).includes(a.meta.effort)
             ? { effort: a.meta.effort as Effort }
@@ -3541,6 +3955,15 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             ? {
                 extraWorkdirs: a.meta.extraWorkdirs.filter((p): p is string => typeof p === "string" && p.trim() !== ""),
               }
+            : {}),
+          ...(typeof a.meta.projectId === "string" && a.meta.projectId.trim()
+            ? { projectId: a.meta.projectId.trim() }
+            : {}),
+          ...(typeof a.meta.campaignId === "string" && a.meta.campaignId.trim()
+            ? { campaignId: a.meta.campaignId.trim() }
+            : {}),
+          ...(a.meta.campaignRole === "director" || a.meta.campaignRole === "child"
+            ? { campaignRole: a.meta.campaignRole }
             : {}),
           ...(a.meta.planGate ? { planGate: true } : {}),
           ...(a.meta.planDecision ? { planDecision: a.meta.planDecision } : {}),
@@ -3841,20 +4264,36 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       title: resolveRunTitle(r.title, r.task),
       status: r.status,
       verify: r.verify,
+      // 计划编排子任务成文走 runVerified；verify 只报请求勾选，避免列表 verify=false 却上百条核查却不声明
+      plannedSubtaskVerify: r.mode === "plan",
       createdAt: r.createdAt,
       finishedAt: r.finishedAt ?? null,
       packName: r.packName ?? pack?.name ?? null,
       workspace: r.workspace === "office" || r.workspace === "code"
         ? r.workspace
-        : (r.mode === "design" || r.packName === "design" ? "office" : "code"),
+        : (r.mode === "design" || r.packName === "design" || designFacadeOf(r) ? "office" : "code"),
       ...(r.packRoute ? { packRoute: r.packRoute } : {}),
-      stopReason: r.mainStopReason ?? null,
+      // 在飞一轮时上一轮 completed/finalPassed 不再描述当前 turn
+      stopReason: r.status === "running" ? null : (r.mainStopReason ?? null),
+      ...(r.status === "running" && r.mainStopReason
+        ? { lastStopReason: r.mainStopReason }
+        : {}),
       // 活 run 走 outcome，归档 run 走 meta 里的摘要——列表列不因重启而变
-      finalPassed: r.outcome?.finalPassed ?? r.archivedOutcome?.finalPassed ?? null,
+      finalPassed: r.status === "running"
+        ? null
+        : (r.outcome?.finalPassed ?? r.archivedOutcome?.finalPassed ?? null),
+      ...(r.status === "running" && (r.outcome?.finalPassed ?? r.archivedOutcome?.finalPassed) != null
+        ? { lastFinalPassed: r.outcome?.finalPassed ?? r.archivedOutcome?.finalPassed }
+        : {}),
       reworks: r.outcome?.reworks ?? r.archivedOutcome?.reworks ?? null,
       // 裁决只对它核查的那一轮负责：列表报最近一次裁决时必须带轮号，
       // 否则"第 1 轮通过、第 3 轮没核查"会被读成"这场对话通过了"
-      verdictTurn: r.outcome ? (r.outcomeTurn ?? null) : (r.archivedOutcome?.judgedTurn ?? null),
+      verdictTurn: r.status === "running"
+        ? null
+        : (r.outcome ? (r.outcomeTurn ?? null) : (r.archivedOutcome?.judgedTurn ?? null)),
+      ...(r.status === "running" && (r.outcomeTurn ?? r.archivedOutcome?.judgedTurn) != null
+        ? { lastVerdictTurn: r.outcomeTurn ?? r.archivedOutcome?.judgedTurn }
+        : {}),
       pendingApprovals: r.pendingApprovals.size,
       approvalGrants: {
         active: activeApprovalGrants,
@@ -3878,6 +4317,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       planDecision: r.planDecision?.decision ?? null,
       verdict: r.outcome?.verifications.at(-1)?.verdict ?? r.archivedOutcome?.verdict ?? null,
       mode: r.mode ?? "single",
+      ...(designFacadeOf(r) ? { facade: "design" as const } : {}),
       ...(r.designRoute ? { designRoute: r.designRoute } : {}),
       // 只在明确是 CLI 时标 cli；旧档案缺字段保持 null，不猜成 Web。
       host: r.host === "cli" ? "cli" : r.archived ? null : "web",
@@ -3900,6 +4340,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       // 也就是"这段工作触碰的范围"——它是这个 harness 自己长出来的分组键，
       // 不是从别家侧栏照搬来的层级
       workdir: r.workdir ?? workdir,
+      projectId: r.projectId ?? null,
+      campaignId: r.campaignId ?? null,
+      campaignRole: r.campaignRole ?? null,
       effort: r.effort ?? null,
       // 能否追加：让界面据此决定要不要显示输入框，而不是点了才报错。
       canContinue: liveCanContinue || archiveCanSameRun || archiveCanFork || archiveRestoreGate || archiveCanReopen,
@@ -4082,8 +4525,6 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    * 常驻进程——默认连接就等于一个长期攥着调试探针的会话，正是案例 #3 里
    * 害得整块板子连不上的那种形态。要用就显式开，用完关掉宿主。
    */
-  const mcpConfigPath = options.mcpConfigFile ?? process.env.AGENT_MCP_CONFIG ?? join(workdir, "mcp.json");
-
   /**
    * MCP 运行时（**懒连接**）。
    *
@@ -4141,6 +4582,47 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     await mcpConnecting;
   }
 
+  function readMcpServersFromDisk(): Record<string, unknown> {
+    try {
+      return parseMcpConfigFile(readFileSync(mcpConfigPath, "utf8")).servers;
+    } catch {
+      return {};
+    }
+  }
+
+  function skillsPublic(): Array<{ id: string; kind: "skill"; enabled: boolean }> {
+    return publicSkillsView(readSkillsIndexSync(catalogSkillRoot));
+  }
+
+  async function mcpSettingsPayload(servers?: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const current = servers ?? readMcpServersFromDisk();
+    const custom = mcpWritesArmed ? await readCustomCatalog(customCatalogPath(mcpConfigPath)) : [];
+    const skills = skillsPublic();
+    return {
+      path: mcpConfigPath,
+      enabled: mcpEnabled,
+      writesArmed: mcpWritesArmed,
+      servers: publicMcpServers(current),
+      catalog: publicCatalogEntries(),
+      installedCatalogIds: combinedInstalledCatalogIds(current, skills.map((row) => row.id)),
+      custom: custom.map((row) => ({
+        id: row.id,
+        title: row.title,
+        repo: row.repo,
+        url: row.url,
+        kind: row.kind,
+        notes: row.notes,
+      })),
+      skills,
+      skillInstall: {
+        available: Boolean(catalogSkillRoot),
+        ...(catalogSkillRoot
+          ? { root: catalogSkillRoot }
+          : { reason: "注入宿主须显式传 skillsDir；真实宿主默认 <workdir>/.agent-skills。MCP 关闭不挡 skill。" }),
+      },
+    };
+  }
+
   function mcpSnapshot(): Record<string, unknown> {
     const servers = [
       ...Object.entries(mcpRuntime?.summary ?? {}).map(([name, n]) => ({
@@ -4160,6 +4642,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         reason,
       })),
     ];
+    const configuredServers = readMcpServersFromDisk();
+    const installedNames = Object.keys(configuredServers).sort();
     return {
       configured: existsSync(mcpConfigPath),
       configPath: mcpConfigPath,
@@ -4167,6 +4651,14 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       connected: Object.keys(mcpRuntime?.summary ?? {}).length > 0,
       servers,
       toolCount: mcpTools.length,
+      installedNames,
+      catalogIds: [...MCP_CATALOG_IDS],
+      installedCatalogIds: combinedInstalledCatalogIds(
+        configuredServers,
+        skillsPublic().map((row) => row.id),
+      ),
+      skills: skillsPublic(),
+      skillSurface: { available: Boolean(catalogSkillRoot) },
       ...(mcpError ? { error: mcpError } : {}),
       ...(mcpConnectWarnings.length ? { warnings: mcpConnectWarnings } : {}),
       // reason 三态互斥，不能含糊：没开 / 开了还没轮到 / 试过了但失败。
@@ -4195,8 +4687,13 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     const runWorkdir = run?.workdir ?? workdir;
     const allowlistRoots = mergeRunReadRoots([...allowedWorkdirs], run?.extraWorkdirs, runWorkdir);
     const runReadRoots = mergeRunReadRoots(readRoots, allowlistRoots, runWorkdir);
-    const runWriteRoots = allowlistRoots;
-    const systemPrompt = runPack?.systemPrompt ?? DEFAULT_SYSTEM_PROMPT;
+    const runWriteRoots = mergeRunWriteRoots(run?.extraWorkdirs, runWorkdir);
+    const systemPrompt = withEnabledSkills(
+      run?.campaignRole === "director"
+        ? DIRECTOR_SYSTEM_PROMPT
+        : (runPack?.systemPrompt ?? DEFAULT_SYSTEM_PROMPT),
+      catalogSkillRoot,
+    );
     // MCP 工具按包的 includeTools 收窄（selectPackTools 负责）。mcpTools 在
     // ensureMcp 之后才非空——所有 start*Run 都先 await 它，不会拿到半截工具面
     const baseTools = injectedTools ?? selectPackTools(runPack, toolPool, mcpTools);
@@ -4206,19 +4703,29 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
      * verifier/planner 拿不到它：`withoutAskUser` 在 harness 层剔除（决定 3），
      * 宿主这边不必也不该重复实现那道闸。
      */
-    let tools = run?.askUser
-      ? [...appendMemoryTools(baseTools), (run.askUserTool ??= makeAskUserTool(run))]
-      : appendMemoryTools(baseTools);
-    /**
-     * 下一步提议：包声明了 handoffs 才装。不挡对话（工具立刻返回），
-     * 也不走 --ask 开关——那是另一件事。verifier/planner 由 withoutAskUser 剔除。
-     */
-    if (run && runPack?.handoffs?.length) {
-      tools = [...tools, (run.proposeHandoffTool ??= makeProposeHandoffTool(run))];
-    }
-    // AGENT-02：默认关；AGENT_SPAWN_TASK=1 才装。verifier/planner 由 withoutAskUser 剥掉。
-    if (run && process.env.AGENT_SPAWN_TASK === "1") {
-      tools = [...tools, (run.spawnTaskTool ??= makeSpawnTaskTool(run))];
+    let tools: Tool[];
+    if (run?.campaignRole === "director") {
+      const status = memoryTools.find((t) => t.name === "project_status");
+      const mail = run.campaignMailTool ??= makeCampaignMailTool(run);
+      const spawn = run.spawnTaskTool ??= makeSpawnTaskTool(run);
+      tools = [status, mail, spawn].filter((t): t is Tool => Boolean(t));
+    } else {
+      tools = run?.askUser
+        ? [...appendMemoryTools(baseTools), (run.askUserTool ??= makeAskUserTool(run))]
+        : appendMemoryTools(baseTools);
+      /**
+       * 下一步提议：包声明了 handoffs 才装。不挡对话（工具立刻返回），
+       * 也不走 --ask 开关——那是另一件事。verifier/planner 由 withoutAskUser 剔除。
+       */
+      if (run && runPack?.handoffs?.length) {
+        tools = [...tools, (run.proposeHandoffTool ??= makeProposeHandoffTool(run))];
+      }
+      // AGENT-02：默认关；战役或 AGENT_CAMPAIGN=1 也武装。子对话永不 spawn。
+      const campaignSpawn = Boolean(run?.campaignId) || process.env.AGENT_CAMPAIGN === "1";
+      const spawnArmed = process.env.AGENT_SPAWN_TASK === "1" || campaignSpawn;
+      if (run && spawnArmed && run.campaignRole !== "child") {
+        tools = [...tools, (run.spawnTaskTool ??= makeSpawnTaskTool(run))];
+      }
     }
     if (run) {
       tools = wrapToolsWithRewindSnapshots(tools, async (name, input, ctx) => {
@@ -4279,6 +4786,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           }
         : {}),
       ...(run?.resumeBudget ? { runBudget: run.resumeBudget } : {}),
+      ...(run?.sharedBudget ? { runBudget: run.sharedBudget } : {}),
       ...(run?.initialContextInputTokens !== undefined
         ? { initialContextInputTokens: run.initialContextInputTokens }
         : {}),
@@ -4336,6 +4844,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     const runWorkdir = run?.workdir ?? workdir;
     const allowlistRoots = mergeRunReadRoots([...allowedWorkdirs], run?.extraWorkdirs, runWorkdir);
     const runReadRoots = mergeRunReadRoots(readRoots, allowlistRoots, runWorkdir);
+    const runWriteRoots = mergeRunWriteRoots(run?.extraWorkdirs, runWorkdir);
     return {
       ...cfg,
       dynamicContext: mergeAgentMdContext({
@@ -4350,13 +4859,18 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             }
           : {}),
         ...(runReadRoots.length ? { read_only_roots: runReadRoots.join("; ") } : {}),
-        ...(allowlistRoots.length ? { writable_roots: allowlistRoots.join("; ") } : {}),
-        memory_index: await scopedMemoryIndex(new MemoryStore(resolveMemoryDir(runWorkdir)), runWorkdir),
+        ...(runWriteRoots.length ? { writable_roots: runWriteRoots.join("; ") } : {}),
+        memory_index: await scopedMemoryIndex(
+          new MemoryStore(resolveMemoryDir(runWorkdir)),
+          runWorkdir,
+          projectIdForWorkdir(runWorkdir, run?.projectId),
+        ),
         project_status: formatProjectStatusBlock(
           await readProjectStatus(
             new MemoryStore(resolveMemoryDir(runWorkdir)),
             runWorkdir,
             isSharedMemoryDir(runWorkdir, resolveMemoryDir(runWorkdir)),
+            projectIdForWorkdir(runWorkdir, run?.projectId),
           ),
         ),
         workspace_git: formatWorkspaceGitLine(
@@ -4403,6 +4917,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       autoPack?: unknown;
       workdir?: unknown;
       extraWorkdirs?: unknown;
+      projectId?: unknown;
       effort?: unknown;
       rubric?: unknown;
     },
@@ -4419,6 +4934,28 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       if (trimmed) target.rubric = trimmed;
       else delete target.rubric;
     }
+    if (parsed.projectId !== undefined) {
+      if (parsed.projectId === "" || parsed.projectId === null) {
+        delete target.projectId;
+      } else {
+        const admitted = admitProjectSelection(parsed.projectId);
+        if (!admitted.ok) return { ok: false, error: admitted.error };
+        if (admitted.project) {
+          target.projectId = admitted.project.id;
+          if (parsed.workdir === undefined || parsed.workdir === "") {
+            target.workdir = admitted.project.primaryWorkdir;
+          }
+          if (parsed.extraWorkdirs === undefined) {
+            const extras = extraWorkdirsFromProject(
+              admitted.project,
+              target.workdir ?? admitted.project.primaryWorkdir,
+            );
+            if (extras.length) target.extraWorkdirs = extras;
+            else delete target.extraWorkdirs;
+          }
+        }
+      }
+    }
     if (parsed.workdir !== undefined && parsed.workdir !== "") {
       const asked = resolve(String(parsed.workdir));
       if (!allowedWorkdirs.has(asked)) {
@@ -4426,6 +4963,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           ok: false,
           error: `工作目录不在白名单内。可选：${[...allowedWorkdirs].join(" | ")}（可点工作目录下拉的「＋ 添加目录…」即时加入）`,
         };
+      }
+      if (target.projectId) {
+        const owner = findProjectById(projects, target.projectId);
+        if (owner && !owner.workdirs.includes(asked)) {
+          return { ok: false, error: `工作目录不属于项目「${owner.name}」` };
+        }
       }
       target.workdir = asked;
     }
@@ -4788,19 +5331,151 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     });
   }
 
+  const runFinishWaiters = new Map<string, Array<(finished: StoredRun) => void>>();
+
+  function waitForRunFinished(runId: string): Promise<StoredRun> {
+    return new Promise((resolve) => {
+      const existing = runs.get(runId);
+      if (existing && existing.status === "done") {
+        resolve(existing);
+        return;
+      }
+      const list = runFinishWaiters.get(runId) ?? [];
+      list.push(resolve);
+      runFinishWaiters.set(runId, list);
+    });
+  }
+
+  function notifyRunFinished(finished: StoredRun): void {
+    const list = runFinishWaiters.get(finished.id);
+    if (!list) return;
+    runFinishWaiters.delete(finished.id);
+    for (const fn of list) fn(finished);
+  }
+
+  function abortStoredRun(run: StoredRun): void {
+    run.abort?.abort();
+    for (const pending of run.pendingApprovals.values()) {
+      try { pending.respond("deny", "委托方已停止这次运行"); } catch { /* 已应答过 */ }
+    }
+    run.pendingApprovals.clear();
+    if (run.pendingPlan) {
+      try { run.pendingPlan.settle("reject"); } catch { /* 已决 */ }
+    }
+    try { expireQuestion(run, "stopped"); } catch { /* 已应答 */ }
+    const stoppingId = run.id;
+    setTimeout(() => {
+      const still = runs.get(stoppingId);
+      if (!still || still.status !== "running" || !still.abort?.signal.aborted) return;
+      finalizeRun(still, { outcome: "closed", mainStopReason: "aborted" });
+    }, 1500);
+    broadcastLifecycle("run_updated", run);
+  }
+
+  function abortCampaignChildren(parent: StoredRun): void {
+    if (!parent.campaignId || parent.campaignRole !== "director") return;
+    for (const other of runs.values()) {
+      if (
+        other.campaignId === parent.campaignId
+        && other.campaignRole === "child"
+        && other.status === "running"
+      ) {
+        abortStoredRun(other);
+      }
+    }
+  }
+
+  function isCampaignSpawn(run: StoredRun): boolean {
+    return Boolean(run.campaignId) || run.campaignRole === "director" || process.env.AGENT_CAMPAIGN === "1";
+  }
+
+  function ensureCampaignForRun(run: StoredRun): string {
+    if (run.campaignId) return run.campaignId;
+    const meta = createCampaignMeta({
+      directorRunId: run.id,
+      task: run.task,
+      projectId: run.projectId,
+    });
+    run.campaignId = meta.id;
+    persistCampaign(meta);
+    persistMeta(run);
+    return meta.id;
+  }
+
+  function childSpawnTask(request: { title: string; description: string; acceptance: string[] }): string {
+    const acceptanceBlock = request.acceptance.length
+      ? `\n\n验收：\n${request.acceptance.map((a) => `- ${a}`).join("\n")}`
+      : "";
+    return (
+      `【支线 · ${request.title}】\n${request.description}${acceptanceBlock}\n\n` +
+      "完成后用终结工具交付；你看不到父会话正史与战役总 transcript，请把结论写自洽。"
+    );
+  }
+
+  function artifactsFromRun(child: StoredRun): string[] {
+    for (let i = child.events.length - 1; i >= 0; i--) {
+      const ev = child.events[i]?.event as {
+        type?: string;
+        result?: { completion?: { artifacts?: string[] } };
+      };
+      if (ev?.type === "done" && ev.result?.completion?.artifacts?.length) {
+        return ev.result.completion.artifacts;
+      }
+    }
+    return [];
+  }
+
+  function spawnResultFromChild(child: StoredRun): {
+    summary: string;
+    artifacts?: string[];
+    passed: boolean;
+    error?: string;
+    turns?: number;
+    runId: string;
+  } {
+    const summary = child.conversationRecap || recapFromRunEvents(child) || "";
+    const artifacts = artifactsFromRun(child);
+    const aborted = child.mainStopReason === "aborted";
+    const errored = child.mainStopReason === "error";
+    const passed = !aborted && !errored && (
+      child.mainStopReason === "completed"
+      || child.mainStopReason === "partial"
+      || child.status === "done"
+    );
+    return {
+      summary: summary || (passed ? "支线结束" : ""),
+      ...(artifacts.length ? { artifacts } : {}),
+      passed,
+      ...(passed ? {} : { error: child.mainStopReason ?? "未完成" }),
+      ...(child.turnExecutorTurns !== undefined ? { turns: child.turnExecutorTurns } : {}),
+      runId: child.id,
+    };
+  }
+
+  function makeCampaignMailTool(run: StoredRun): Tool {
+    return createCampaignMailTool({
+      append: (childRunId, action) => {
+        const campaignId = run.campaignId;
+        if (!campaignId) throw new Error("本 run 不是战役导演");
+        persistMailbox(campaignId, childRunId, action);
+      },
+    });
+  }
+
   /**
-   * AGENT-02：同谱系支线。子事件 source=`spawn/<title>`，不回灌父正史；
-   * 子正史若有 archiveWriter 则随父 run 旁路记入（events 流可见）。
+   * AGENT-02：战役 / AGENT_CAMPAIGN=1 时真开 StoredRun；否则同 run 旁路（今日行为）。
    */
   function makeSpawnTaskTool(run: StoredRun): Tool {
     return createSpawnTaskTool({
       depth: 0,
       onStart: (request) => {
-        pushSyntheticEvent(run, "host", {
-          type: "spawn_start",
-          title: request.title,
-          at: Date.now(),
-        });
+        if (!isCampaignSpawn(run)) {
+          pushSyntheticEvent(run, "host", {
+            type: "spawn_start",
+            title: request.title,
+            at: Date.now(),
+          });
+        }
       },
       onDone: (request, result) => {
         pushSyntheticEvent(run, "host", {
@@ -4808,30 +5483,101 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           title: request.title,
           passed: result.passed,
           summary: result.summary,
+          ...(result.runId ? { runId: result.runId } : {}),
           ...(result.error ? { error: result.error } : {}),
           ...(result.turns !== undefined ? { turns: result.turns } : {}),
           at: Date.now(),
         });
       },
       spawn: async (request) => {
-        const budget = run.loop?.getRunBudget();
-        if (!budget) {
-          return { summary: "", passed: false, error: "父 loop 尚未就绪，无法共享预算" };
+        if (!isCampaignSpawn(run)) {
+          const budget = run.loop?.getRunBudget();
+          if (!budget) {
+            return { summary: "", passed: false, error: "父 loop 尚未就绪，无法共享预算" };
+          }
+          const parentCfg = await buildRunConfig(run);
+          const childId = `${run.id}-spawn-${randomUUID().slice(0, 8)}`;
+          const spawnSource = `spawn/${request.title.slice(0, 40)}`;
+          return runSpawnedTask({
+            parentConfig: parentCfg,
+            modelClient,
+            runBudget: budget,
+            request,
+            childRunId: childId,
+            signal: run.abort?.signal,
+            onEvent: async (event) => {
+              pushEvent(run, spawnSource, event);
+            },
+          });
         }
-        const parentCfg = await buildRunConfig(run);
-        const childId = `${run.id}-spawn-${randomUUID().slice(0, 8)}`;
-        const spawnSource = `spawn/${request.title.slice(0, 40)}`;
-        return runSpawnedTask({
-          parentConfig: parentCfg,
-          modelClient,
-          runBudget: budget,
-          request,
-          childRunId: childId,
-          signal: run.abort?.signal,
-          onEvent: async (event) => {
-            // 旁路进事件流（可观测）；不进父会话正史（ContextManager 是子 loop 自己的）
-            pushEvent(run, spawnSource, event);
-          },
+        return withSpawnSlot(async () => {
+          const budget = run.loop?.getRunBudget();
+          if (!budget) {
+            return { summary: "", passed: false, error: "父 loop 尚未就绪，无法共享预算" };
+          }
+          const campaignId = ensureCampaignForRun(run);
+          const outcome = await createRunFromBody(
+            {
+              task: childSpawnTask(request),
+              ...(run.workdir ? { workdir: run.workdir } : {}),
+              extraWorkdirs: run.extraWorkdirs,
+              projectId: run.projectId,
+              ...(run.packName ? { pack: run.packName } : {}),
+              autoApprove: run.autoApprove,
+              askUser: run.askUser,
+              effort: run.effort,
+              contextTokenLimit: run.contextTokenLimit,
+              verify: false,
+              dailyBudget: false,
+              ...(run.lineageBudget === false ? { lineageBudget: false } : {}),
+            },
+            {
+              campaignId,
+              campaignRole: "child",
+              parentRunId: run.id,
+              sharedBudget: budget,
+              inheritResources: true,
+              skipCapacity: true,
+              skipWorkdirExclusive: true,
+              skipDailyBudget: true,
+              skipSiblingBoot: true,
+              skipCite: true,
+              title: request.title,
+            },
+          );
+          if (outcome.status !== 200) {
+            const err = (outcome.payload as { error?: string } | null)?.error;
+            return { summary: "", passed: false, error: err ?? `创建子对话失败（${outcome.status}）` };
+          }
+          const childId = (outcome.payload as { runId: string }).runId;
+          pushSyntheticEvent(run, "host", {
+            type: "spawn_start",
+            title: request.title,
+            runId: childId,
+            at: Date.now(),
+          });
+          persistMailbox(campaignId, childId, {
+            at: Date.now(),
+            action: "assign",
+            task: request.description,
+            artifacts: [],
+          });
+          upsertCampaignChild(campaignId, {
+            runId: childId,
+            title: request.title,
+            status: "running",
+            pack: run.packName ?? null,
+          });
+          pushSyntheticEvent(run, "host", {
+            type: "campaign_child",
+            runId: childId,
+            title: request.title,
+            status: "running",
+            at: Date.now(),
+          });
+          broadcastLifecycle("run_updated", run);
+          const child = await waitForRunFinished(childId);
+          return spawnResultFromChild(child);
         });
       },
     });
@@ -5465,7 +6211,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     // 独占资源随收尾释放（release 按 holder 幂等；追问续跑会重新占用）。
     // 释放后清掉字段：留着旧数组会让它的语义从"当前持有"漂成"最后一次持有"，
     // 后续把它当持有状态读的代码会拿到假数据（评审 de6ddef）
-    if (run.heldResources?.length) {
+    if (!run.inheritResources && run.heldResources?.length) {
       hostResources.release(run.heldResources, run.id);
       delete run.heldResources;
     }
@@ -5585,6 +6331,32 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     }
     run.sseClients.clear();
 
+    if (run.campaignRole === "child" && run.campaignId) {
+      const status: CampaignChildStatus = run.mainStopReason === "aborted"
+        ? "cancelled"
+        : run.mainStopReason === "error"
+          ? "error"
+          : "done";
+      const meta = campaignStore.get(run.campaignId);
+      const title = meta?.children.find((c) => c.runId === run.id)?.title ?? run.title ?? "子对话";
+      upsertCampaignChild(run.campaignId, {
+        runId: run.id,
+        title,
+        status,
+        pack: run.packName ?? null,
+      });
+      const director = meta ? runs.get(meta.directorRunId) : undefined;
+      if (director && director.id !== run.id) {
+        pushSyntheticEvent(director, "host", {
+          type: "campaign_child",
+          runId: run.id,
+          title,
+          status,
+          at: Date.now(),
+        });
+      }
+    }
+    notifyRunFinished(run);
     broadcastLifecycle("run_finished", run);
 
     /**
@@ -5732,11 +6504,16 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   }
 
   /** 启动一次不带核查的运行 */
-  async function startPlainRun(run: StoredRun): Promise<void> {
-    const epoch = tryClaimTurnDriver(run);
+  async function startPlainRun(
+    run: StoredRun,
+    extras?: { driverEpoch?: number; skipRunConfig?: boolean },
+  ): Promise<void> {
+    const epoch = extras?.driverEpoch !== undefined
+      ? (run.turnDriverActive && run.turnDriverEpoch === extras.driverEpoch ? extras.driverEpoch : null)
+      : tryClaimTurnDriver(run);
     if (epoch == null) return;
     await ensureMcp(run.packName ? getPack(run.packName) : pack); // 必须在 buildConfig 之前：工具面要么齐要么别开跑
-    if (!(await pushRunConfig(run))) {
+    if (!extras?.skipRunConfig && !(await pushRunConfig(run))) {
       finalizeRun(run, {
         outcome: "error",
         mainStopReason: "execution_unavailable",
@@ -5744,7 +6521,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       }, epoch);
       return;
     }
-    applyDurableTransition(run, { type: "start" });
+    if (!extras?.skipRunConfig) applyDurableTransition(run, { type: "start" });
     const cfg = await buildRunConfig(run);
     // 信息队列·插队：drain 直接读 run 上的队列（取空语义），loop 在每次模型调用前取
     cfg.steering = { drain: () => (run.steeringQueue ?? []).splice(0) };
@@ -5835,34 +6612,78 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
   /** 首轮任务书 = 原话 + 点名引用 + sibling boot。两段分开装配，不改 sibling 默认文案。 */
   function firstTurnPrompt(run: StoredRun): string {
+    if (run.campaignRole === "child") {
+      // 子对话 first-turn 只有 spawn 任务书。不注入战役总 transcript，也不补 sibling。
+      return run.task;
+    }
     const extras = [run.citeContext, run.bootContext].filter((s): s is string => Boolean(s?.trim()));
     return withBootContext(run.task, extras.length ? extras.join("\n\n") : undefined);
   }
 
+  function citeScopeFor(targetWorkdir: string, targetProjectId?: string | null): CiteScope {
+    const root = resolve(targetWorkdir);
+    const project = (targetProjectId && findProjectById(projects, targetProjectId))
+      || findProjectByWorkdir(projects, root);
+    return {
+      workdir: root,
+      projectId: project?.id ?? (typeof targetProjectId === "string" && targetProjectId.trim()
+        ? targetProjectId.trim()
+        : null),
+      projectWorkdirs: project?.workdirs,
+      allowedWorkdirs,
+    };
+  }
+
+  async function artifactsForCite(runWorkdir: string): Promise<string[]> {
+    return resolveCiteArtifacts(resolve(runWorkdir));
+  }
+
+  /** 首轮任务书点名引用：同项目任一白名单 workdir；无项目仍只放行同一目录。不读 transcript。 */
   async function assembleCitedRefs(
     citedRunIds: string[],
     targetWorkdir: string,
+    targetProjectId?: string | null,
   ): Promise<{ block: string; refs: NonNullable<StoredRun["cited"]> }> {
     if (!citedRunIds.length) return { block: "", refs: [] };
-    const root = resolve(targetWorkdir);
-    const artifacts = await resolveCiteArtifacts(root);
+    const scope = citeScopeFor(targetWorkdir, targetProjectId);
     const refs: CiteRef[] = [];
     for (const id of citedRunIds) {
       const r = runs.get(id);
       if (!r) continue;
-      if (resolve(r.workdir ?? workdir) !== root) continue;
+      const runDir = resolve(r.workdir ?? workdir);
+      if (!isCiteableRun({ workdir: runDir, projectId: r.projectId }, scope)) continue;
+      const artifacts = await artifactsForCite(runDir);
       refs.push({
         runId: r.id,
         title: resolveRunTitle(r.title, r.task),
         task: oneLineTask(r.task),
         recap: r.conversationRecap || recapFromRunEvents(r) || null,
         artifacts,
+        workdirLabel: citeWorkdirLabel(runDir),
       });
     }
     return {
       block: formatCiteBlock(refs),
-      refs: refs.map((c) => ({ runId: c.runId, title: c.title, artifacts: c.artifacts })),
+      refs: refs.map((c) => ({
+        runId: c.runId,
+        title: c.title,
+        artifacts: c.artifacts,
+        ...(c.workdirLabel ? { workdirLabel: c.workdirLabel } : {}),
+      })),
     };
+  }
+
+  /** 追问轮装配【引用】：与新建同一口径（同 workdir / 同项目）。空数组清掉本轮 citeContext。 */
+  async function applyFollowUpCite(target: StoredRun, rawIds: unknown): Promise<void> {
+    const citedIds = parseCitedRunIds(rawIds);
+    if (!citedIds.length) {
+      delete target.citeContext;
+      return;
+    }
+    const assembled = await assembleCitedRefs(citedIds, target.workdir ?? workdir, target.projectId);
+    if (assembled.block) target.citeContext = assembled.block;
+    else delete target.citeContext;
+    if (assembled.refs.length) target.cited = assembled.refs;
   }
 
   function executorSwitchOf(run: StoredRun): {
@@ -5906,6 +6727,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     opts: { executorChanged?: boolean } = {},
   ): string {
     const parts = [feedback];
+    if (run.citeContext?.trim()) parts.push(run.citeContext.trim());
     if (lastVerdict) parts.push(verdictFeedbackSummary(lastVerdict, previousTurn));
     const planSummary = run.planSummary ?? archivedPlanSummary(run);
     const sketch = buildThreadSketch(
@@ -6016,6 +6838,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       run.concurrency = turn.concurrency ?? (turn.planGate ? 1 : "auto");
       run.planGate = Boolean(turn.planGate);
     } else {
+      // 追问合同：非编排轮是 single 执行。设计门面留下 facade + designRoute，
+      // 列表不得看起来像换了一种产品。
+      if (designFacadeOf(run) || previousMode === "design") run.facade = "design";
       delete run.mode;
       delete run.concurrency;
       delete run.planGate;
@@ -6320,16 +7145,14 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     await executeTurn(run, {
       history,
       feedback,
-      executorFeedback: switchInfo.changed
-        ? composeTurnFeedback(
-            run,
-            feedback,
-            run.conversationTurn - 1,
-            history,
-            undefined,
-            { executorChanged: true },
-          )
-        : feedback,
+      executorFeedback: composeTurnFeedback(
+        run,
+        feedback,
+        run.conversationTurn - 1,
+        history,
+        undefined,
+        { executorChanged: switchInfo.changed },
+      ),
       verify: turn.verify,
       signal: run.abort?.signal ?? new AbortController().signal,
       driverEpoch: epoch,
@@ -6394,13 +7217,16 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       ...(parent.rubric ? { rubric: parent.rubric } : {}),
       ...(parent.workdir ? { workdir: parent.workdir } : {}),
       ...(parent.extraWorkdirs?.length ? { extraWorkdirs: [...parent.extraWorkdirs] } : {}),
+      ...(parent.projectId ? { projectId: parent.projectId } : {}),
       ...(parent.askUser ? { askUser: true } : {}),
       ...(parent.autoApprove ? { autoApprove: true } : {}),
       ...(parent.permissionMode ? { permissionMode: parent.permissionMode } : {}),
       ...(parent.mode === "plan" ? { mode: "plan" as const } : parent.mode === "design" ? { mode: "design" as const } : {}),
+      ...(designFacadeOf(parent) ? { facade: "design" as const } : {}),
+      ...(parent.designRoute ? { designRoute: parent.designRoute } : {}),
       ...(parent.workspace === "office" || parent.workspace === "code"
         ? { workspace: parent.workspace }
-        : parent.mode === "design" || parent.packName === "design"
+        : parent.mode === "design" || parent.packName === "design" || designFacadeOf(parent)
           ? { workspace: "office" as const }
           : { workspace: "code" as const }),
       ...(parent.contextTokenLimit !== undefined ? { contextTokenLimit: parent.contextTokenLimit } : {}),
@@ -6477,7 +7303,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       const gitOk = await detectGitRepo(root);
       files = await applyFileRevert({
         workdir: root,
-        writeRoots: mergeRunReadRoots([...allowedWorkdirs], parent.extraWorkdirs, root),
+        writeRoots: mergeRunWriteRoots(parent.extraWorkdirs, root),
         gitRoot: gitOk ? root : null,
         writes,
         snapshots,
@@ -6521,13 +7347,16 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       ...(parent.rubric ? { rubric: parent.rubric } : {}),
       ...(parent.workdir ? { workdir: parent.workdir } : {}),
       ...(parent.extraWorkdirs?.length ? { extraWorkdirs: [...parent.extraWorkdirs] } : {}),
+      ...(parent.projectId ? { projectId: parent.projectId } : {}),
       ...(parent.askUser ? { askUser: true } : {}),
       ...(parent.autoApprove ? { autoApprove: true } : {}),
       ...(parent.permissionMode ? { permissionMode: parent.permissionMode } : {}),
       ...(parent.mode === "plan" ? { mode: "plan" as const } : parent.mode === "design" ? { mode: "design" as const } : {}),
+      ...(designFacadeOf(parent) ? { facade: "design" as const } : {}),
+      ...(parent.designRoute ? { designRoute: parent.designRoute } : {}),
       ...(parent.workspace === "office" || parent.workspace === "code"
         ? { workspace: parent.workspace }
-        : parent.mode === "design" || parent.packName === "design"
+        : parent.mode === "design" || parent.packName === "design" || designFacadeOf(parent)
           ? { workspace: "office" as const }
           : { workspace: "code" as const }),
       ...(parent.contextTokenLimit !== undefined ? { contextTokenLimit: parent.contextTokenLimit } : {}),
@@ -6914,7 +7743,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           return {
             cfg: {
               ...baseCfg,
-              systemPrompt: sp?.systemPrompt ?? baseCfg.systemPrompt,
+              systemPrompt: sp?.systemPrompt
+                ? withEnabledSkills(sp.systemPrompt, catalogSkillRoot)
+                : baseCfg.systemPrompt,
               // 逐子任务按各自的包收窄 MCP 工具面：stm32-coding 的 mcp:false
               // 拿不到任何 MCP 工具，stm32-debug 才拿到它 includeTools 里那些
               tools: [...domainTools, ...controlTools, ...proposeForSub].filter(
@@ -7279,6 +8110,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     executionBoundary: ExecutionBoundaryStatus | null,
   ): void {
     const allowlistRoots = mergeRunReadRoots([...allowedWorkdirs], run.extraWorkdirs, cfg.workdir);
+    const runWriteRoots = mergeRunWriteRoots(run.extraWorkdirs, cfg.workdir);
     pushSyntheticEvent(run, "host", {
       type: "run_config",
       pack: packView(runPack),
@@ -7304,7 +8136,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       verifierReadOnlySource: readOnlyFor(runPack).source,
       workdir: cfg.workdir,
       extraWorkdirs: run.extraWorkdirs ?? [],
-      writeRoots: allowlistRoots,
+      projectId: run.projectId ?? null,
+      campaignId: run.campaignId ?? null,
+      campaignRole: run.campaignRole ?? null,
+      writeRoots: runWriteRoots,
       readRoots: mergeRunReadRoots(readRoots, allowlistRoots, cfg.workdir),
       executionIsolation: executionBoundary,
       roleModels: {
@@ -7312,7 +8147,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         // 报的是本 run 实际用了什么，而不是配了什么——两者可以不同
         verifier: verifierRole && (run.useVerifierModel ?? true) ? verifierRole.name : null,
         planner: plannerRole && (run.usePlannerModel ?? true) ? plannerRole.name : null,
-        vision: visionRole?.name ?? null,
+        vision: activeVisionRoleName(),
         image: imageRole?.name ?? null,
       },
       /**
@@ -7327,11 +8162,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       fallbackRouting: fallbackChain || anyRoleFallbackNow() ? routingPolicy : null,
       compatSource: executorCapabilities?.source ?? "name",
       endpointHealth: endpointHealthView(),
-      supportsVision: visionRole
-        ? visionProbe
-          ? visionProbe.supportsVision
-          : null
-        : false,
+      describeImageBacking: describeImageBackingNow(),
+      supportsVision: describeImageSupportsVisionNow(),
       guardrails: {
         maxTurns: cfg.maxTurns ?? null,
         maxTokens: cfg.maxTokens ?? null,
@@ -7378,6 +8210,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       })(),
       ...(run.packRoute ? { packRoute: run.packRoute } : {}),
       mode: run.mode ?? "single",
+      ...(designFacadeOf(run) ? { facade: "design" as const } : {}),
       ...(run.designRoute ? { designRoute: run.designRoute } : {}),
       hooks: hookSpec
         ? { timeoutMs: hookSpec.timeoutMs, events: ["PreToolUse", "PostToolUse", "Stop"] }
@@ -7389,6 +8222,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             runId: c.runId,
             title: c.title,
             artifacts: Array.isArray(c.artifacts) ? c.artifacts.map(String) : [],
+            ...(c.workdirLabel ? { workdirLabel: c.workdirLabel } : {}),
           }))
         : null,
     });
@@ -7586,6 +8420,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       // V-29：合法工作目录集合由宿主声明，浏览器只在其中选（运行时经
       // 本机 UI 添加的也在这个集合里——集合是活的，快照时铺平）
       availableWorkdirs: [...allowedWorkdirs],
+      availableProjects: projects,
+      campaignArmed: process.env.AGENT_CAMPAIGN === "1",
+      spawnTaskArmed: process.env.AGENT_SPAWN_TASK === "1" || process.env.AGENT_CAMPAIGN === "1",
       roleModels: roleModelsView(),
       // MODEL-01a：进程级降级链快照（逐 run 的同名字段走 run_config）。
       // null = 未配置这条防线，与"链上只有主端点"不是一回事
@@ -7596,12 +8433,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       compatSource: executorCapabilities?.source ?? "name",
       // MODEL-01 残余：链健康只读面（粘性探针 + 熔断）；不改路由
       endpointHealth: endpointHealthView(),
-      // null = 配了但尚未探完；false = 明确不会看图（工具已卸）
-      supportsVision: visionRole
-        ? visionProbe
-          ? visionProbe.supportsVision
-          : null
-        : false,
+      describeImageBacking: describeImageBackingNow(),
+      // none=false；执行者 backing=true；识图角色未探完=null
+      supportsVision: describeImageSupportsVisionNow(),
       // 核查预算与执行者解耦，但**不是常数**（9.1）：领域包可用 verify.maxTurns
       // 覆盖。这里报进程级默认包的值；逐 run 的真实值走 run_config
       verifierBudgetTurns: verifyMaxTurnsOf(pack) ?? DEFAULT_VERIFIER_MAX_TURNS,
@@ -7626,6 +8460,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         origin: toolOrigin(t.name),
       })),
       mcp: mcpSnapshot(),
+      /**
+       * 办公出站门禁。只报 kind + armed。Webhook / token 不下发、不进 JSON。
+       */
+      notify: officeNotifySnapshot(officeNotifier),
       hooks: hookSpec
         ? { timeoutMs: hookSpec.timeoutMs, events: ["PreToolUse", "PostToolUse", "Stop"] }
         : null,
@@ -7821,12 +8659,20 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     "modelsTest",
     "modelsSyncEnv",
     "mcpPut",
+    "mcpInstall",
+    "mcpUninstall",
+    "mcpSkills",
     "packsDraft",
     "packsInstall",
     "packsDiscard",
     "workdirAdd",
     "designDraftsWorkdir",
     "workdirRemove",
+    "projectCreate",
+    "projectPatch",
+    "projectRemove",
+    "campaignCreate",
+    "campaignChildCancel",
     "fsMkdir",
     "workspaceGitCheckout",
     "seedTemplate",
@@ -8020,6 +8866,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     | { type: "usageGet" }
     | { type: "mcpGet" }
     | { type: "mcpPut" }
+    | { type: "mcpInstall" }
+    | { type: "mcpUninstall" }
+    | { type: "mcpSkills" }
     | { type: "packsGet" }
     | { type: "packsDraft" }
     | { type: "packsInstall"; name: string }
@@ -8027,6 +8876,21 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     | { type: "workdirsList" }
     | { type: "workdirAdd" }
     | { type: "designDraftsWorkdir" }
+    | { type: "projectsList" }
+    | { type: "projectCreate" }
+    | { type: "projectPatch"; id: string }
+    | { type: "projectRemove"; id: string }
+    | { type: "campaignsList" }
+    | { type: "campaignCreate" }
+    | { type: "campaignGet"; id: string }
+    | { type: "campaignTranscript"; id: string }
+    | { type: "campaignMailbox"; id: string; childRunId: string }
+    | { type: "campaignChildCancel"; id: string; childRunId: string }
+    /**
+     * 产物画廊（#/artifacts）：扫项目 workdirs / 当前 workdir 的 CITE_ARTIFACT_RELS。
+     * 不改 cite 同 workdir 政策；不自动重做过期画册。
+     */
+    | { type: "artifactsList"; projectId: string | null; workdir: string | null }
     | { type: "citeCandidates"; workdir: string | null }
     | { type: "workdirRemove" }
     | { type: "workspaceGitGet"; workdir: string | null }
@@ -8051,6 +8915,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     | { type: "exportPptx"; runId: string }
     | { type: "exportPng"; runId: string }
     | { type: "filePreview"; path: string; workdir: string | null; download: boolean }
+    | { type: "officePreview"; runId: string | null; path: string; workdir: string | null }
     | { type: "reveal"; runId: string }
     | { type: "stop"; runId: string }
     | { type: "deleteRun"; runId: string }
@@ -8062,7 +8927,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     | { type: "upload" }
     | { type: "uploadDelete" }
     | { type: "createRun" }
-    | { type: "schedulesList" }
+    | { type: "schedulesList"; projectId?: string }
     | { type: "scheduleCreate" }
     | { type: "scheduleUpdate"; scheduleId: string }
     | { type: "scheduleDelete"; scheduleId: string }
@@ -8120,6 +8985,15 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     if (method === "PUT" && url === "/api/mcp") {
       return { type: "mcpPut" };
     }
+    if (method === "POST" && url === "/api/mcp/install") {
+      return { type: "mcpInstall" };
+    }
+    if (method === "POST" && url === "/api/mcp/uninstall") {
+      return { type: "mcpUninstall" };
+    }
+    if (method === "POST" && url === "/api/mcp/skills") {
+      return { type: "mcpSkills" };
+    }
     if (method === "GET" && url === "/api/packs") {
       return { type: "packsGet" };
     }
@@ -8158,6 +9032,65 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     if (method === "DELETE" && url === "/api/workdirs") {
       return { type: "workdirRemove" };
     }
+    if (method === "GET" && url === "/api/projects") {
+      return { type: "projectsList" };
+    }
+    if (method === "POST" && url === "/api/projects") {
+      return { type: "projectCreate" };
+    }
+    const projectPatchMatch = method === "PATCH" && url.match(/^\/api\/projects\/([^/]+)$/);
+    if (projectPatchMatch) {
+      return { type: "projectPatch", id: decodeURIComponent(projectPatchMatch[1]!) };
+    }
+    const projectRemoveMatch = method === "DELETE" && url.match(/^\/api\/projects\/([^/]+)$/);
+    if (projectRemoveMatch) {
+      return { type: "projectRemove", id: decodeURIComponent(projectRemoveMatch[1]!) };
+    }
+    if (method === "GET" && url === "/api/campaigns") {
+      return { type: "campaignsList" };
+    }
+    if (method === "POST" && url === "/api/campaigns") {
+      return { type: "campaignCreate" };
+    }
+    const campaignTranscriptMatch = method === "GET" && url.match(/^\/api\/campaigns\/([^/]+)\/transcript$/);
+    if (campaignTranscriptMatch) {
+      return { type: "campaignTranscript", id: decodeURIComponent(campaignTranscriptMatch[1]!) };
+    }
+    const campaignMailboxMatch = method === "GET" && url.match(/^\/api\/campaigns\/([^/]+)\/mailbox\/([^/]+)$/);
+    if (campaignMailboxMatch) {
+      return {
+        type: "campaignMailbox",
+        id: decodeURIComponent(campaignMailboxMatch[1]!),
+        childRunId: decodeURIComponent(campaignMailboxMatch[2]!),
+      };
+    }
+    const campaignCancelMatch = method === "POST" && url.match(/^\/api\/campaigns\/([^/]+)\/children\/([^/]+)\/cancel$/);
+    if (campaignCancelMatch) {
+      return {
+        type: "campaignChildCancel",
+        id: decodeURIComponent(campaignCancelMatch[1]!),
+        childRunId: decodeURIComponent(campaignCancelMatch[2]!),
+      };
+    }
+    const campaignGetMatch = method === "GET" && url.match(/^\/api\/campaigns\/([^/]+)$/);
+    if (campaignGetMatch) {
+      return { type: "campaignGet", id: decodeURIComponent(campaignGetMatch[1]!) };
+    }
+
+    /**
+     * ----- 产物画廊 #/artifacts（section 3 + deck-stale）-----
+     * 只加这一条 GET。不改上面的 projects 处理器，也不动 cite-candidates。
+     */
+    const artifactsMatch = method === "GET" && url.match(/^\/api\/artifacts(?:\?(.*))?$/);
+    if (artifactsMatch) {
+      const params = new URLSearchParams(artifactsMatch[1] ?? "");
+      return {
+        type: "artifactsList",
+        projectId: params.get("projectId"),
+        workdir: params.get("workdir"),
+      };
+    }
+
     const workspaceGitMatch = method === "GET" && url.match(/^\/api\/workspace\/git(?:\?(.*))?$/);
     if (workspaceGitMatch) {
       const params = new URLSearchParams(workspaceGitMatch[1] ?? "");
@@ -8335,6 +9268,30 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       };
     }
 
+    /**
+     * Office 预览 JSON：.pptx / .docx 拆页（文本 + 嵌入图）。
+     * 圈禁与 file-preview / artifact 同一把尺；只出结构化页，不执行宏、不解密。
+     */
+    const officePreviewMatch = method === "GET" && url.match(/^\/api\/office-preview\?(.*)$/);
+    if (officePreviewMatch) {
+      const q = new URLSearchParams(officePreviewMatch[1]!);
+      const wanted = q.get("path");
+      if (!wanted) return { type: "malformed" };
+      return { type: "officePreview", runId: null, path: wanted, workdir: q.get("workdir") };
+    }
+    const runOfficePreviewMatch =
+      method === "GET" && sitePathOnly.match(/^\/api\/runs\/([^/]+)\/office-preview$/);
+    if (runOfficePreviewMatch) {
+      const wanted = new URLSearchParams(siteQ).get("path");
+      if (!wanted) return { type: "malformed" };
+      return {
+        type: "officePreview",
+        runId: runOfficePreviewMatch[1]!,
+        path: wanted,
+        workdir: null,
+      };
+    }
+
     const revealMatch = method === "POST" && url.match(/^\/api\/runs\/([^/]+)\/reveal$/);
     if (revealMatch) {
       return { type: "reveal", runId: revealMatch[1]! };
@@ -8394,8 +9351,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
      * 校验（task 非空 / workdir 白名单 / schedule 合法）都在处理器里，
      * 与 /api/runs 的"路由管形状、处理器管语义"同模式。
      */
-    if (method === "GET" && url === "/api/schedules") {
-      return { type: "schedulesList" };
+    if (method === "GET") {
+      const [schedulesPath, schedulesQuery = ""] = url.split("?", 2);
+      if (schedulesPath === "/api/schedules") {
+        const asked = new URLSearchParams(schedulesQuery).get("projectId")?.trim();
+        return { type: "schedulesList", ...(asked ? { projectId: asked } : {}) };
+      }
     }
     if (method === "POST" && url === "/api/schedules") {
       return { type: "scheduleCreate" };
@@ -8481,11 +9442,56 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     }
   }
 
+  /** 战役导演：先推计划门，人批后再跑薄看板循环（不走 runPlanned）。 */
+  async function startDirectorRun(run: StoredRun): Promise<void> {
+    const epoch = tryClaimTurnDriver(run);
+    if (epoch == null) return;
+    await ensureMcp(run.packName ? getPack(run.packName) : pack);
+    if (!(await pushRunConfig(run))) {
+      finalizeRun(run, {
+        outcome: "error",
+        mainStopReason: "execution_unavailable",
+        error: ledgerErrorClass("execution_unavailable"),
+      }, epoch);
+      return;
+    }
+    applyDurableTransition(run, { type: "start" });
+    if (run.planGate && run.injectedPlan) {
+      const plan = run.injectedPlan;
+      const pending = planNodesFromSubtasks(plan.subtasks, "pending");
+      run.planNodes = pending;
+      pushSyntheticEvent(
+        run,
+        "host",
+        hostPlanEvent({
+          concurrency: 1,
+          concurrencyMode: "fixed",
+          plannerMs: 0,
+          subtasks: hostPlanSubtaskViews(plan.subtasks, (name) => getPack(name)?.resources),
+          gated: true,
+        }),
+      );
+      try {
+        await waitForPlanDecision(run);
+      } catch (err) {
+        if (err instanceof PlanRejectedError) {
+          finalizeRun(run, {
+            outcome: "closed",
+            mainStopReason: planGateStopReason(err.cause_),
+          }, epoch);
+          return;
+        }
+        throw err;
+      }
+    }
+    await startPlainRun(run, { driverEpoch: epoch, skipRunConfig: true });
+  }
+
   /** POST /api/runs 的请求体形状（HTTP 层只负责 JSON 解析，语义校验全在 createRunFromBody） */
   interface RunCreateBody {
     task?: string; verify?: boolean; pack?: string; effort?: string; rubric?: string;
     mode?: string; concurrency?: number | string;
-    workdir?: string; extraWorkdirs?: unknown; useVerifierModel?: boolean; usePlannerModel?: boolean;
+    workdir?: string; extraWorkdirs?: unknown; projectId?: string; useVerifierModel?: boolean; usePlannerModel?: boolean;
     planGate?: boolean; askUser?: boolean; autoApprove?: boolean; contextTokenLimit?: number | string;
     multiAgent?: boolean;
     autoPack?: boolean;
@@ -8498,6 +9504,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     designFilePack?: string;
     citedRunIds?: unknown;
     workspace?: string;
+    /** 显式开战：导演 + 计划门。spec-plus-deck 会 409。 */
+    campaign?: boolean;
   }
 
   /** 准入结果：HTTP 处理器把它写成响应；调度器把非 200 记成 lastTrigger=error */
@@ -8518,7 +9526,20 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    */
   async function createRunFromBody(
     parsed: RunCreateBody,
-    extras?: { injectedPlan?: Plan; parentRunId?: string },
+    extras?: {
+      injectedPlan?: Plan;
+      parentRunId?: string;
+      campaignId?: string;
+      campaignRole?: "director" | "child";
+      sharedBudget?: SharedRunBudget;
+      inheritResources?: boolean;
+      skipCapacity?: boolean;
+      skipWorkdirExclusive?: boolean;
+      skipDailyBudget?: boolean;
+      skipSiblingBoot?: boolean;
+      skipCite?: boolean;
+      title?: string;
+    },
   ): Promise<RunAdmissionOutcome> {
     if (parsed.mode === "design") {
       if (parsed.task !== undefined && parsed.task !== null && typeof parsed.task !== "string") {
@@ -8528,6 +9549,24 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     } else if (!parsed.task || typeof parsed.task !== "string") {
       return { status: 400, payload: { error: 'Missing or invalid "task" field' } };
     }
+    const isChildCreate = extras?.campaignRole === "child";
+    const campaignTask = typeof parsed.task === "string" ? parsed.task : "";
+    const campaignSplit = isChildCreate ? null : detectCampaignSplit(campaignTask);
+    const explicitCampaign = parsed.campaign === true && !isChildCreate;
+    if (explicitCampaign && campaignSplit?.reason === "spec-plus-deck") {
+      return {
+        status: 409,
+        payload: {
+          error: "规格+幻灯是一场设计任务，不拆战役。请用设计模式开跑。",
+          reason: "spec-plus-deck",
+        },
+      };
+    }
+    const willPromoteDirector = !isChildCreate && (
+      extras?.campaignRole === "director"
+      || explicitCampaign
+      || (process.env.AGENT_CAMPAIGN === "1" && Boolean(campaignSplit?.split))
+    );
     // V-24：外部输入一律当场校验拒绝，不静默降级——静默降级会让"我明明选了
     // python-coding"与实际行为长期不一致，查起来很贵（口径同 src/cli.ts 对
     // AGENT_EFFORT 的处理）
@@ -8605,7 +9644,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     const planGateRequested = parsed.planGate === true;
     const wantsOrchestrate = multiAgent || parsed.mode === "plan";
     const wantsDesign = parsed.mode === "design" && !wantsOrchestrate;
-    if (planGateRequested && !wantsOrchestrate) {
+    if (planGateRequested && !wantsOrchestrate && !willPromoteDirector) {
       return { status: 400, payload: { error: "planGate 仅在编排（mode=plan 或 multiAgent）下有意义：单跑模式没有计划这一步" } };
     }
     let concurrency: number | "auto" | undefined;
@@ -8626,6 +9665,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     const lineageBudget = parsed.lineageBudget !== false;
     const dailyBudget = parsed.dailyBudget !== false;
 
+    const projectAdmit = admitProjectSelection(parsed.projectId);
+    if (!projectAdmit.ok) {
+      return { status: 400, payload: { error: projectAdmit.error } };
+    }
+    let admittedProject = projectAdmit.project;
+
     // V-29：工作目录必须命中白名单。规范化后逐条比对绝对路径——
     // 只做字符串前缀判断会被 `..` 穿出去，而这是工具的写入边界
     let runWorkdir: string | undefined;
@@ -8637,18 +9682,36 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           payload: { error: `工作目录不在白名单内。可选：${[...allowedWorkdirs].join(" | ")}（可点工作目录下拉的「＋ 添加目录…」即时加入）` },
         };
       }
+      if (admittedProject && !admittedProject.workdirs.includes(asked)) {
+        return {
+          status: 400,
+          payload: { error: `工作目录不属于项目「${admittedProject.name}」` },
+        };
+      }
       runWorkdir = asked;
+    } else if (admittedProject) {
+      runWorkdir = admittedProject.primaryWorkdir;
     }
 
-    const extraParsed = parseExtraWorkdirs(
-      parsed.extraWorkdirs,
-      allowedWorkdirs,
-      runWorkdir ?? workdir,
-    );
-    if (!extraParsed.ok) {
-      return { status: 400, payload: { error: extraParsed.error } };
+    let extraWorkdirs: string[];
+    if (admittedProject && parsed.extraWorkdirs === undefined) {
+      extraWorkdirs = extraWorkdirsFromProject(admittedProject, runWorkdir ?? admittedProject.primaryWorkdir);
+    } else {
+      const extraParsed = parseExtraWorkdirs(
+        parsed.extraWorkdirs,
+        allowedWorkdirs,
+        runWorkdir ?? workdir,
+      );
+      if (!extraParsed.ok) {
+        return { status: 400, payload: { error: extraParsed.error } };
+      }
+      extraWorkdirs = extraParsed.extraWorkdirs;
     }
-    const extraWorkdirs = extraParsed.extraWorkdirs;
+    // 按 workdir 入项只标 projectId（侧栏 / 记忆），不把项目 extras 写进 extraWorkdirs。
+    // 可写圈只认请求体 extraWorkdirs 或上面显式 projectId 展开的成员。
+    if (!admittedProject) {
+      admittedProject = findProjectByWorkdir(projects, runWorkdir ?? workdir);
+    }
     const admittedWorkspace: "office" | "code" | undefined =
       parsed.workspace === "office" || parsed.workspace === "code"
         ? parsed.workspace
@@ -8656,7 +9719,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
     let packRoute: { pack: string | null; reason: string } | undefined;
     let admittedDesignRoute: DesignRoute | undefined;
-    if (wantsDesign) {
+    if (willPromoteDirector) {
+      /* 导演不走设计门面 / autoPack：拆役已由 detectCampaignSplit 裁定 */
+    } else if (wantsDesign) {
       const installed = installedFilePacksFrom(allPacks());
       const installedNames = installed.map((p) => p.name);
       // 设计模式锁定后端包为 design，除非点了已安装文件包。内置工程包忽略。
@@ -8715,7 +9780,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     const verify = parsed.verify === true;
     // §5.2 决定 1：默认关，逐 run 显式开
     const askUser = parsed.askUser === true;
-    if (dailyBudget) {
+    if (dailyBudget && !extras?.skipDailyBudget) {
       const budgetRefusal = dailyBudgetRefusal();
       if (budgetRefusal) {
         metrics.budgetRejected += 1;
@@ -8727,37 +9792,42 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     // 跨 run 独占资源：single/verified 按包声明在准入时整体占用；
     // plan 模式由调度器经同一张宿主表按子任务粒度管理，此处不占
     const admissionPack = parsed.pack ? getPack(parsed.pack) : pack;
-    const packResources = wantsOrchestrate ? [] : (admissionPack?.resources ?? []);
-    const resourceOutcome = tryAcquireRunResources(id, packResources);
-    if (resourceOutcome !== "acquired") {
-      metrics.resourceRejected += 1;
-      return {
-        status: 429,
-        payload: {
-          error:
-            `Exclusive resource "${resourceOutcome.conflict}" is held by run ${resourceOutcome.heldBy}. ` +
-            "Wait for that run to finish (or stop it), then retry.",
-          resource: resourceOutcome.conflict,
-          heldBy: resourceOutcome.heldBy,
-        },
-      };
+    const inheritResources = extras?.inheritResources === true;
+    const packResources = wantsOrchestrate || inheritResources ? [] : (admissionPack?.resources ?? []);
+    if (!inheritResources) {
+      const resourceOutcome = tryAcquireRunResources(id, packResources);
+      if (resourceOutcome !== "acquired") {
+        metrics.resourceRejected += 1;
+        return {
+          status: 429,
+          payload: {
+            error:
+              `Exclusive resource "${resourceOutcome.conflict}" is held by run ${resourceOutcome.heldBy}. ` +
+              "Wait for that run to finish (or stop it), then retry.",
+            resource: resourceOutcome.conflict,
+            heldBy: resourceOutcome.heldBy,
+          },
+        };
+      }
     }
-    const workdirRejection = sharedWorkdirRejection(id, runWorkdir ?? workdir);
-    if (workdirRejection) {
-      hostResources.release(packResources, id);
-      metrics.workdirRejected += 1;
-      return {
-        status: 409,
-        payload: {
-          error:
-            `Workdir is in use by running run ${workdirRejection.conflictRunId}. Concurrent runs sharing a workdir ` +
-            "can silently overwrite each other's artifacts; give each run its own workdir " +
-            "(AGENT_UI_WORKDIRS) or wait for the other run.",
-          conflictRunId: workdirRejection.conflictRunId,
-        },
-      };
+    if (!extras?.skipWorkdirExclusive) {
+      const workdirRejection = sharedWorkdirRejection(id, runWorkdir ?? workdir);
+      if (workdirRejection) {
+        hostResources.release(packResources, id);
+        metrics.workdirRejected += 1;
+        return {
+          status: 409,
+          payload: {
+            error:
+              `Workdir is in use by running run ${workdirRejection.conflictRunId}. Concurrent runs sharing a workdir ` +
+              "can silently overwrite each other's artifacts; give each run its own workdir " +
+              "(AGENT_UI_WORKDIRS) or wait for the other run.",
+            conflictRunId: workdirRejection.conflictRunId,
+          },
+        };
+      }
     }
-    const releaseAdmission = acquireRunAdmission();
+    const releaseAdmission = extras?.skipCapacity ? () => {} : acquireRunAdmission();
     if (!releaseAdmission) {
       hostResources.release(packResources, id);
       metrics.capacityRejected += 1;
@@ -8790,6 +9860,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         : wantsDesign
           ? {
               mode: "design" as const,
+              facade: "design" as const,
               ...(admittedDesignRoute
                 ? { designRoute: designRouteForRunConfig(admittedDesignRoute) }
                 : {}),
@@ -8798,6 +9869,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       ...(concurrency !== undefined ? { concurrency } : {}),
       ...(runWorkdir ? { workdir: runWorkdir } : {}),
       ...(extraWorkdirs.length ? { extraWorkdirs } : {}),
+      ...(admittedProject ? { projectId: admittedProject.id } : {}),
       ...(parsed.useVerifierModel === false ? { useVerifierModel: false } : {}),
       ...(parsed.usePlannerModel === false ? { usePlannerModel: false } : {}),
       ...(planGateRequested ? { planGate: true } : {}),
@@ -8811,13 +9883,36 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     };
     if (extras?.injectedPlan) run.injectedPlan = extras.injectedPlan;
     if (extras?.parentRunId) run.continuedFrom = extras.parentRunId;
-    const boot = resolveSiblingBootContext(parsed.task, run.workdir ?? workdir, id);
-    if (boot) run.bootContext = boot;
-    const citedIds = parseCitedRunIds(parsed.citedRunIds);
-    if (citedIds.length) {
-      const assembled = await assembleCitedRefs(citedIds, run.workdir ?? workdir);
-      if (assembled.block) run.citeContext = assembled.block;
-      if (assembled.refs.length) run.cited = assembled.refs;
+    if (extras?.title) run.title = extras.title;
+    if (extras?.sharedBudget) run.sharedBudget = extras.sharedBudget;
+    if (inheritResources) run.inheritResources = true;
+    if (willPromoteDirector) {
+      const split = directorSplitForTask(parsed.task);
+      run.campaignRole = "director";
+      run.planGate = true;
+      run.injectedPlan = extras?.injectedPlan ?? planFromCampaignSplit(split);
+      const meta = createCampaignMeta({
+        directorRunId: id,
+        task: parsed.task,
+        projectId: run.projectId,
+      });
+      run.campaignId = meta.id;
+      persistCampaign(meta);
+    } else if (extras?.campaignRole === "child" && extras.campaignId) {
+      run.campaignRole = "child";
+      run.campaignId = extras.campaignId;
+    }
+    if (!extras?.skipSiblingBoot) {
+      const boot = resolveSiblingBootContext(parsed.task, run.workdir ?? workdir, id);
+      if (boot) run.bootContext = boot;
+    }
+    if (!extras?.skipCite) {
+      const citedIds = parseCitedRunIds(parsed.citedRunIds);
+      if (citedIds.length) {
+        const assembled = await assembleCitedRefs(citedIds, run.workdir ?? workdir, run.projectId);
+        if (assembled.block) run.citeContext = assembled.block;
+        if (assembled.refs.length) run.cited = assembled.refs;
+      }
     }
     // B2：建档要在第一条事件之前——writer 的写入链从 mkdir 开始保序
     if (historyRoot) {
@@ -8879,7 +9974,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       await applyUiDesignSeed(admittedDesignRoute, run.workdir ?? workdir);
     }
 
-    if (run.mode === "plan") {
+    if (run.campaignRole === "director") {
+      void withFallbackAttribution(run, () => startDirectorRun(run));
+    } else if (run.mode === "plan") {
       void withFallbackAttribution(run, () => startPlannedRun(run));
     } else if (verify) {
       void withFallbackAttribution(run, () => startVerifiedRun(run));
@@ -8887,7 +9984,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       void withFallbackAttribution(run, () => startPlainRun(run));
     }
 
-    return { status: 200, payload: { runId: id } };
+    return {
+      status: 200,
+      payload: { runId: id, ...(run.campaignId ? { campaignId: run.campaignId } : {}) },
+    };
   }
 
   /**
@@ -8927,6 +10027,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         task: entry.task,
         workdir: entry.workdir,
         verify: entry.verify,
+        ...(entry.projectId ? { projectId: entry.projectId } : {}),
       });
       if (outcome.status === 200) {
         return { ok: true, runId: (outcome.payload as { runId: string }).runId };
@@ -8971,8 +10072,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   void schedulesReady.then(() => scheduleRunner.tick());
 
   /** 列表端点的 DTO：原样透出 + 服务端当前时刻（前端倒计时以它为锚，不赌客户端时钟） */
-  function scheduleListPayload(): { schedules: ScheduleEntry[]; serverTime: number } {
-    return { schedules: scheduleEntries, serverTime: Date.now() };
+  function scheduleListPayload(projectId?: string): { schedules: ScheduleEntry[]; serverTime: number } {
+    return {
+      schedules: filterSchedulesByProject(scheduleEntries, projectId),
+      serverTime: Date.now(),
+    };
   }
 
   // ------------------------------------------------------
@@ -9086,6 +10190,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         "workdirAdd",
         "designDraftsWorkdir",
         "workdirRemove",
+        "projectCreate",
+        "projectPatch",
+        "campaignCreate",
         "fsMkdir",
         "workspaceGitCheckout",
         "seedTemplate",
@@ -9178,6 +10285,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           visionProbe = null;
           assembleRoles();
           probeVisionEndpoint();
+          probeExecutorVision();
         } catch (error) {
           return json(res, 500, {
             error: `模型装配失败：${error instanceof Error ? error.message : String(error)}`,
@@ -9254,6 +10362,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           visionProbe = null;
           assembleRoles();
           probeVisionEndpoint();
+          probeExecutorVision();
         } catch (error) {
           return json(res, 500, {
             error: `模型装配失败：${error instanceof Error ? error.message : String(error)}`,
@@ -9357,17 +10466,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       }
 
       case "mcpGet": {
-        let servers: Record<string, unknown> = {};
-        try {
-          servers = parseMcpConfigFile(await readFile(mcpConfigPath, "utf8")).servers;
-        } catch {
-          servers = {};
-        }
-        return json(res, 200, {
-          path: mcpConfigPath,
-          enabled: mcpEnabled,
-          servers: publicMcpServers(servers),
-        });
+        return json(res, 200, await mcpSettingsPayload());
       }
 
       case "packsGet": {
@@ -9460,6 +10559,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         if (!hostname || !isLoopbackHostname(hostname)) {
           return json(res, 403, { error: "MCP 配置仅本机（loopback）可用" });
         }
+        if (!mcpWritesArmed) {
+          return json(res, 409, { error: "注入宿主未指定 mcpConfigFile，拒绝写操作员 mcp.json" });
+        }
         let body: string;
         try {
           body = await readBody(req, requestBodyMaxBytes);
@@ -9492,10 +10594,144 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         }
         await writeFile(mcpConfigPath, serializeMcpConfig(current), "utf8");
         if (realHost) operationalLog("info", "mcp_updated", { name: parsed.name, removed: parsed.remove === true });
+        return json(res, 200, await mcpSettingsPayload(current));
+      }
+
+      case "mcpInstall": {
+        if (!hostname || !isLoopbackHostname(hostname)) {
+          return json(res, 403, { error: "安装 MCP 仅本机（loopback）可用" });
+        }
+        let installBody: string;
+        try {
+          installBody = await readBody(req, requestBodyMaxBytes);
+        } catch (error) {
+          return requestBodyFailure(res, error);
+        }
+        let installParsed: { catalogId?: unknown; githubUrl?: unknown; kind?: unknown; confirm?: unknown };
+        try {
+          installParsed = JSON.parse(installBody);
+        } catch {
+          return badRequest(res, "Invalid JSON body");
+        }
+        const installKind = installParsed.kind === "skill" || installParsed.kind === "mcp"
+          ? installParsed.kind
+          : undefined;
+        const installed = await performCatalogInstall({
+          configPath: mcpConfigPath,
+          workdir,
+          writesArmed: mcpWritesArmed,
+          confirm: installParsed.confirm === true,
+          ...(typeof installParsed.catalogId === "string" ? { catalogId: installParsed.catalogId } : {}),
+          ...(typeof installParsed.githubUrl === "string" ? { githubUrl: installParsed.githubUrl } : {}),
+          ...(installKind ? { kind: installKind } : {}),
+          ...(catalogSkillRoot ? { skillRoot: catalogSkillRoot } : {}),
+          ...(skillFetch ? { fetchImpl: skillFetch } : {}),
+        });
+        if (!installed.ok) {
+          return json(res, installed.error?.includes("注入宿主") ? 409 : 400, {
+            error: installed.error ?? installed.message,
+          });
+        }
+        const message = installed.kind === "skill"
+          ? installed.message
+          : installed.installed
+            ? (mcpEnabled ? MCP_WRITTEN_HINT : MCP_NOT_STARTED_HINT)
+            : installed.message;
+        if (realHost) operationalLog("info", "mcp_catalog_install", {
+          catalogId: installed.catalogId,
+          kind: installed.kind,
+          installed: installed.installed,
+          recorded: installed.recorded,
+        });
         return json(res, 200, {
-          path: mcpConfigPath,
-          enabled: mcpEnabled,
-          servers: publicMcpServers(current),
+          ok: true,
+          installed: installed.installed,
+          recorded: installed.recorded,
+          kind: installed.kind,
+          catalogId: installed.catalogId,
+          serverName: installed.serverName,
+          writeTarget: installed.writeTarget,
+          message,
+          ...(await mcpSettingsPayload(installed.servers)),
+        });
+      }
+
+      case "mcpUninstall": {
+        if (!hostname || !isLoopbackHostname(hostname)) {
+          return json(res, 403, { error: "卸载 MCP 仅本机（loopback）可用" });
+        }
+        let uninstallBody: string;
+        try {
+          uninstallBody = await readBody(req, requestBodyMaxBytes);
+        } catch (error) {
+          return requestBodyFailure(res, error);
+        }
+        let uninstallParsed: { catalogId?: unknown; name?: unknown; confirm?: unknown };
+        try {
+          uninstallParsed = JSON.parse(uninstallBody);
+        } catch {
+          return badRequest(res, "Invalid JSON body");
+        }
+        const removed = await performCatalogUninstall({
+          configPath: mcpConfigPath,
+          writesArmed: mcpWritesArmed,
+          confirm: uninstallParsed.confirm === true,
+          ...(typeof uninstallParsed.catalogId === "string" ? { catalogId: uninstallParsed.catalogId } : {}),
+          ...(typeof uninstallParsed.name === "string" ? { name: uninstallParsed.name } : {}),
+          ...(catalogSkillRoot ? { skillRoot: catalogSkillRoot } : {}),
+        });
+        if (!removed.ok) {
+          return json(res, removed.error?.includes("注入宿主") ? 409 : 400, {
+            error: removed.error ?? removed.message,
+          });
+        }
+        if (realHost) operationalLog("info", "mcp_catalog_uninstall", {
+          catalogId: removed.catalogId,
+          name: removed.serverName,
+        });
+        return json(res, 200, {
+          ok: true,
+          message: removed.message,
+          ...(await mcpSettingsPayload(removed.servers)),
+        });
+      }
+
+      case "mcpSkills": {
+        if (!hostname || !isLoopbackHostname(hostname)) {
+          return json(res, 403, { error: "skill 开关仅本机（loopback）可用" });
+        }
+        if (!catalogSkillRoot) {
+          return json(res, 409, { error: "注入宿主未指定 skillsDir，拒绝写操作员 skill 目录" });
+        }
+        let skillBody: string;
+        try {
+          skillBody = await readBody(req, requestBodyMaxBytes);
+        } catch (error) {
+          return requestBodyFailure(res, error);
+        }
+        let skillParsed: { id?: unknown; enabled?: unknown };
+        try {
+          skillParsed = JSON.parse(skillBody);
+        } catch {
+          return badRequest(res, "Invalid JSON body");
+        }
+        if (typeof skillParsed.id !== "string" || !skillParsed.id.trim()) {
+          return badRequest(res, '"id" 必须是非空字符串');
+        }
+        if (typeof skillParsed.enabled !== "boolean") {
+          return badRequest(res, '"enabled" 必须是布尔值');
+        }
+        const index = await readSkillsIndex(catalogSkillRoot);
+        if (!index.skills[skillParsed.id]) {
+          return json(res, 404, { error: `未安装 skill ${skillParsed.id}` });
+        }
+        await setSkillEnabled(catalogSkillRoot, skillParsed.id, skillParsed.enabled);
+        if (realHost) operationalLog("info", "skill_toggled", { id: skillParsed.id, enabled: skillParsed.enabled });
+        return json(res, 200, {
+          ok: true,
+          id: skillParsed.id,
+          enabled: skillParsed.enabled,
+          ...(await mcpSettingsPayload()),
         });
       }
 
@@ -9714,6 +10950,269 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         });
       }
 
+      case "projectsList": {
+        if (!hostname || !isLoopbackHostname(hostname)) {
+          return json(res, 403, { error: "项目管理仅本机（loopback）可用" });
+        }
+        return json(res, 200, { projects });
+      }
+
+      case "projectCreate": {
+        if (!hostname || !isLoopbackHostname(hostname)) {
+          return json(res, 403, { error: "项目管理仅本机（loopback）可用" });
+        }
+        let body: string;
+        try {
+          body = await readBody(req, requestBodyMaxBytes);
+        } catch (error) {
+          return requestBodyFailure(res, error);
+        }
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          return badRequest(res, "Invalid JSON body");
+        }
+        const write = parseProjectWrite(parsed, allowedWorkdirs);
+        if (!write.ok) return json(res, write.status ?? 400, { error: write.error });
+        const overlap = overlappingProjectWorkdirs(projects, write.workdirs);
+        if (overlap.length) {
+          return json(res, 400, { error: `这些目录已属于另一个项目：${overlap.join(" | ")}` });
+        }
+        const record = createProjectRecord(write);
+        projects = [...projects, record];
+        try {
+          persistProjects();
+        } catch (error) {
+          projects = projects.filter((p) => p.id !== record.id);
+          return json(res, 500, {
+            error: `项目清单写盘失败：${error instanceof Error ? error.message : String(error)}`,
+          });
+        }
+        if (realHost) operationalLog("info", "project_created", { id: record.id, name: record.name });
+        return json(res, 200, { project: record });
+      }
+
+      case "projectPatch": {
+        if (!hostname || !isLoopbackHostname(hostname)) {
+          return json(res, 403, { error: "项目管理仅本机（loopback）可用" });
+        }
+        const existing = findProjectById(projects, route.id);
+        if (!existing) return notFound(res, `未知项目：${route.id}`);
+        let body: string;
+        try {
+          body = await readBody(req, requestBodyMaxBytes);
+        } catch (error) {
+          return requestBodyFailure(res, error);
+        }
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          return badRequest(res, "Invalid JSON body");
+        }
+        const patch = parseProjectPatch(parsed, allowedWorkdirs);
+        if (!patch.ok) return json(res, patch.status ?? 400, { error: patch.error });
+        const nextWorkdirs = patch.workdirs ?? existing.workdirs;
+        const nextPrimary = patch.primaryWorkdir ?? existing.primaryWorkdir;
+        if (!nextWorkdirs.includes(nextPrimary)) {
+          return json(res, 400, { error: "primaryWorkdir 必须是 workdirs 中的一项" });
+        }
+        const overlap = overlappingProjectWorkdirs(projects, nextWorkdirs, existing.id);
+        if (overlap.length) {
+          return json(res, 400, { error: `这些目录已属于另一个项目：${overlap.join(" | ")}` });
+        }
+        const updated: Project = {
+          ...existing,
+          ...(patch.name !== undefined ? { name: patch.name } : {}),
+          workdirs: nextWorkdirs,
+          primaryWorkdir: nextPrimary,
+        };
+        const previous = projects;
+        projects = projects.map((p) => (p.id === existing.id ? updated : p));
+        try {
+          persistProjects();
+        } catch (error) {
+          projects = previous;
+          return json(res, 500, {
+            error: `项目清单写盘失败：${error instanceof Error ? error.message : String(error)}`,
+          });
+        }
+        if (realHost) operationalLog("info", "project_updated", { id: updated.id });
+        return json(res, 200, { project: updated });
+      }
+
+      case "projectRemove": {
+        if (!hostname || !isLoopbackHostname(hostname)) {
+          return json(res, 403, { error: "项目管理仅本机（loopback）可用" });
+        }
+        const existing = findProjectById(projects, route.id);
+        if (!existing) return notFound(res, `未知项目：${route.id}`);
+        const previous = projects;
+        projects = projects.filter((p) => p.id !== existing.id);
+        try {
+          persistProjects();
+        } catch (error) {
+          projects = previous;
+          return json(res, 500, {
+            error: `项目清单写盘失败：${error instanceof Error ? error.message : String(error)}`,
+          });
+        }
+        if (realHost) operationalLog("info", "project_removed", { id: existing.id });
+        return json(res, 200, { removed: true, id: existing.id });
+      }
+
+      case "campaignsList": {
+        return json(res, 200, { campaigns: [...campaignStore.values()] });
+      }
+
+      case "campaignGet": {
+        const meta = campaignStore.get(route.id);
+        if (!meta) return notFound(res, `未知战役：${route.id}`);
+        return json(res, 200, { campaign: meta });
+      }
+
+      case "campaignCreate": {
+        await refreshExecutionHealth(true);
+        if (!executionHealthy) {
+          return json(res, 503, {
+            error:
+              `Required command isolation is unavailable: ${processExecutionStatus.probe.reason ?? "backend probe failed"}`,
+            executionIsolation: processExecutionStatus,
+          });
+        }
+        let body: string;
+        try {
+          body = await readBody(req, requestBodyMaxBytes);
+        } catch (error) {
+          return requestBodyFailure(res, error);
+        }
+        let parsed: RunCreateBody;
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          return badRequest(res, "Invalid JSON body");
+        }
+        const outcome = await createRunFromBody({ ...parsed, campaign: true });
+        if (outcome.headers) {
+          for (const [name, value] of Object.entries(outcome.headers)) {
+            res.setHeader(name, value);
+          }
+        }
+        return json(res, outcome.status, outcome.payload);
+      }
+
+      case "campaignTranscript": {
+        const meta = campaignStore.get(route.id);
+        if (!meta) return notFound(res, `未知战役：${route.id}`);
+        const parts = meta.children
+          .map((child) => {
+            const childRun = runs.get(child.runId);
+            if (!childRun) return null;
+            return {
+              runId: childRun.id,
+              title: child.title,
+              createdAt: childRun.createdAt,
+              transcript: childRun.transcript,
+            };
+          })
+          .filter((p): p is NonNullable<typeof p> => p !== null)
+          .sort((a, b) => a.createdAt - b.createdAt);
+        return json(res, 200, {
+          campaignId: meta.id,
+          directorRunId: meta.directorRunId,
+          parts,
+        });
+      }
+
+      case "campaignMailbox": {
+        const meta = campaignStore.get(route.id);
+        if (!meta) return notFound(res, `未知战役：${route.id}`);
+        return json(res, 200, { actions: mailboxFor(route.id, route.childRunId) });
+      }
+
+      case "campaignChildCancel": {
+        const meta = campaignStore.get(route.id);
+        if (!meta) return notFound(res, `未知战役：${route.id}`);
+        const child = runs.get(route.childRunId);
+        if (!child || child.campaignId !== route.id) {
+          return notFound(res, `未知子对话：${route.childRunId}`);
+        }
+        if (child.status === "done") {
+          return json(res, 409, { error: "子对话已经结束" });
+        }
+        persistMailbox(route.id, child.id, {
+          at: Date.now(),
+          action: "cancel",
+          task: "委托方取消子对话",
+          artifacts: [],
+        });
+        upsertCampaignChild(route.id, {
+          runId: child.id,
+          title: meta.children.find((c) => c.runId === child.id)?.title ?? child.title ?? "子对话",
+          status: "cancelled",
+          pack: child.packName ?? null,
+        });
+        abortStoredRun(child);
+        const director = runs.get(meta.directorRunId);
+        if (director) {
+          pushSyntheticEvent(director, "host", {
+            type: "campaign_child",
+            runId: child.id,
+            title: meta.children.find((c) => c.runId === child.id)?.title ?? child.title ?? "子对话",
+            status: "cancelled",
+            at: Date.now(),
+          });
+        }
+        return json(res, 200, { stopping: true, runId: child.id });
+      }
+
+      /**
+       * ----- 产物画廊 #/artifacts（section 3 + deck-stale）-----
+       * projectId → 项目内各白名单 workdir；workdir 查询只扫该目录。
+       * 缺参 400（与 cite-candidates 同口径）——不得静默落到宿主 cwd/产品仓空画廊。
+       */
+      case "artifactsList": {
+        let roots: string[] = [];
+        let projectId: string | null = null;
+        const askedProject = String(route.projectId ?? "").trim();
+        if (askedProject) {
+          const project = findProjectById(projects, askedProject);
+          if (!project) return notFound(res, `未知项目：${askedProject}`);
+          projectId = project.id;
+          roots = project.workdirs.filter((path) => allowedWorkdirs.has(path));
+        } else if (route.workdir) {
+          const listed = listedWorkdir(route.workdir);
+          if (!listed.ok) return json(res, listed.status, { error: listed.error });
+          roots = [listed.path];
+          projectId = findProjectByWorkdir(projects, listed.path)?.id ?? null;
+        } else {
+          return badRequest(res, "缺少工作目录（workdir）或项目（projectId）");
+        }
+
+        const latestByWorkdir = new Map<string, { id: string; at: number }>();
+        for (const run of runs.values()) {
+          const root = resolve(run.workdir ?? workdir);
+          const prev = latestByWorkdir.get(root);
+          if (!prev || run.createdAt > prev.at) {
+            latestByWorkdir.set(root, { id: run.id, at: run.createdAt });
+          }
+        }
+
+        const artifacts = [];
+        for (const root of roots) {
+          const runId = latestByWorkdir.get(root)?.id ?? null;
+          artifacts.push(...await collectWorkdirArtifactCards(root, runId));
+        }
+        artifacts.sort(compareArtifactCards);
+        return json(res, 200, {
+          projectId,
+          workdirs: roots,
+          artifacts,
+          deckStale: artifacts.some((card) => card.deckStale),
+        });
+      }
+
       case "workspaceGitGet": {
         const listed = listedWorkdir(route.workdir);
         if (!listed.ok) return json(res, listed.status, { error: listed.error });
@@ -9929,10 +11428,19 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         const listed = listedWorkdir(route.workdir);
         if (!listed.ok) return json(res, listed.status, { error: listed.error });
         const root = listed.path;
-        const artifacts = await resolveCiteArtifacts(root);
-        const rows = [...runs.values()]
-          .filter((r) => resolve(r.workdir ?? workdir) === root)
-          .map((r) => ({
+        const scope = citeScopeFor(root);
+        const artifactByDir = new Map<string, Promise<string[]>>();
+        const rows = [];
+        for (const r of [...runs.values()]) {
+          const runDir = resolve(r.workdir ?? workdir);
+          if (!isCiteableRun({ workdir: runDir, projectId: r.projectId }, scope)) continue;
+          let pending = artifactByDir.get(runDir);
+          if (!pending) {
+            pending = artifactsForCite(runDir);
+            artifactByDir.set(runDir, pending);
+          }
+          const artifacts = await pending;
+          rows.push({
             runId: r.id,
             title: resolveRunTitle(r.title, r.task),
             task: oneLineTask(r.task),
@@ -9940,11 +11448,17 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             continuedFrom: r.continuedFrom ?? null,
             createdAt: r.createdAt,
             artifacts,
-          }));
+            workdirLabel: citeWorkdirLabel(runDir),
+          });
+        }
         const candidates = visibleCiteRuns(rows)
           .sort((a, b) => b.createdAt - a.createdAt)
           .map(({ continuedFrom: _c, createdAt: _t, ...rest }) => rest);
-        return json(res, 200, { workdir: root, candidates });
+        return json(res, 200, {
+          workdir: root,
+          ...(scope.projectId ? { projectId: scope.projectId } : {}),
+          candidates,
+        });
       }
 
       case "memoryList": {
@@ -9961,8 +11475,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         const memDir = resolveMemoryDir(targetWorkdir);
         const store = memDir === defaultMemoryDir ? defaultMemoryStore : new MemoryStore(memDir);
         const shared = isSharedMemoryDir(targetWorkdir, memDir);
-        const project = projectSlugFromWorkdir(targetWorkdir);
-        const annotated = await annotateMemoryEntries(store, targetWorkdir);
+        const projectId = projectIdForWorkdir(targetWorkdir);
+        const project = resolveProjectSlug(targetWorkdir, projectId);
+        const annotated = await annotateMemoryEntries(store, targetWorkdir, projectId);
         const visible = route.scope === "all"
           ? annotated
           : annotated.filter((entry) => entry.scope !== "other");
@@ -9975,7 +11490,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             return { name: entry.name, summary: entry.summary, sizeBytes: entry.sizeBytes, scope: entry.scope, mtimeMs };
           }),
         );
-        const status = await readProjectStatus(store, targetWorkdir, shared);
+        const status = await readProjectStatus(store, targetWorkdir, shared, projectId);
         return json(res, 200, {
           dir: memDir,
           project,
@@ -10109,7 +11624,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
        */
       case "schedulesList": {
         await schedulesReady;
-        return json(res, 200, scheduleListPayload());
+        return json(res, 200, scheduleListPayload(route.projectId));
       }
 
       case "scheduleCreate": {
@@ -10122,7 +11637,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         }
         let parsed: {
           name?: string; task?: string; workdir?: string; verify?: boolean;
-          enabled?: boolean; schedule?: unknown;
+          enabled?: boolean; schedule?: unknown; projectId?: unknown;
         };
         try {
           parsed = JSON.parse(body);
@@ -10135,8 +11650,13 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         if (parsed.name !== undefined && typeof parsed.name !== "string") {
           return badRequest(res, '名称（name）必须是字符串');
         }
+        const projectAdmit = admitProjectSelection(parsed.projectId);
+        if (!projectAdmit.ok) {
+          return badRequest(res, projectAdmit.error);
+        }
+        const admittedProject = projectAdmit.project;
         // 工作目录与 /api/runs 同一条白名单（V-29）：resolve 后精确比对
-        let scheduleWorkdir = workdir;
+        let scheduleWorkdir = admittedProject?.primaryWorkdir ?? workdir;
         if (parsed.workdir !== undefined && parsed.workdir !== "") {
           const asked = resolve(parsed.workdir);
           if (!allowedWorkdirs.has(asked)) {
@@ -10145,13 +11665,16 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
               `工作目录不在白名单内。可选：${[...allowedWorkdirs].join(" | ")}（可点工作目录下拉的「＋ 添加目录…」即时加入）`,
             );
           }
+          if (admittedProject && !admittedProject.workdirs.includes(asked)) {
+            return badRequest(res, `工作目录不属于项目「${admittedProject.name}」`);
+          }
           scheduleWorkdir = asked;
         }
         const schedule = parseScheduleSpec(parsed.schedule);
         if (!schedule) {
           return badRequest(
             res,
-            '调度规则（schedule）不合法。支持：{kind:"once",at} / {kind:"daily",hhmm:"HH:MM"} / {kind:"interval",everyMs≥60000}',
+            '调度规则（schedule）不合法。支持：{kind:"once",at} / {kind:"daily",hhmm:"HH:MM"} / {kind:"weekly",days,hhmm} / {kind:"interval",everyMs≥60000}',
           );
         }
         const now = Date.now();
@@ -10171,6 +11694,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           lastRunId: null,
           nextRunAt: null,
           lastTrigger: null,
+          ...(admittedProject ? { projectId: admittedProject.id } : {}),
         };
         if (entry.enabled) {
           entry.nextRunAt = computeNextRunAt(entry.schedule, now, null);
@@ -10578,8 +12102,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           autoPack?: unknown;
           workdir?: unknown;
           extraWorkdirs?: unknown;
+          projectId?: unknown;
           effort?: unknown;
           rubric?: unknown;
+          citedRunIds?: unknown;
         };
         try {
           parsed = JSON.parse(body);
@@ -10729,6 +12255,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
               if (!assembled.ok) {
                 return badRequest(res, assembled.error);
               }
+              await applyFollowUpCite(run, parsed.citedRunIds);
               const gatePack = run.packName ? getPack(run.packName) : pack;
               const gateResources = gatePack?.resources ?? [];
               if (acquireRunResources(res, run.id, gateResources) === "refused") return;
@@ -10796,6 +12323,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
               if (!assembled.ok) {
                 return badRequest(res, assembled.error);
               }
+              await applyFollowUpCite(run, parsed.citedRunIds);
               const resumePack = run.packName ? getPack(run.packName) : pack;
               const resumeResources = resumePack?.resources ?? [];
               if (acquireRunResources(res, run.id, resumeResources) === "refused") return;
@@ -10872,6 +12400,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
               if (!assembled.ok) {
                 return badRequest(res, assembled.error);
               }
+              await applyFollowUpCite(run, parsed.citedRunIds);
               const reopenPack = run.packName ? getPack(run.packName) : pack;
               const reopenResources =
                 turnOrchestrate || parsed.replan === true ? [] : (reopenPack?.resources ?? []);
@@ -10977,6 +12506,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
               ...(run.rubric ? { rubric: run.rubric } : {}),
               ...(run.workdir ? { workdir: resolve(run.workdir) } : { workdir }),
               ...(run.extraWorkdirs?.length ? { extraWorkdirs: run.extraWorkdirs } : {}),
+              ...(run.projectId ? { projectId: run.projectId } : {}),
               ...(run.askUser ? { askUser: true } : {}),
               ...(parsed.autoApprove === true ? { autoApprove: true } : {}),
               ...(turnOrchestrate ? { mode: "plan" as const } : {}),
@@ -10991,6 +12521,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
               hostResources.release(childResources, id);
               return badRequest(res, childAssembled.error);
             }
+            await applyFollowUpCite(child, parsed.citedRunIds);
+            if (designFacadeOf(run)) child.facade = "design";
+            if (run.designRoute) child.designRoute = run.designRoute;
             if (historyRoot) {
               child.archiveWriter = createArchiveWriter(id);
               persistMeta(child);
@@ -11047,6 +12580,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           releaseAdmission();
           return badRequest(res, liveAssembled.error);
         }
+        await applyFollowUpCite(run, parsed.citedRunIds);
         const resumePack = run.packName ? getPack(run.packName) : pack;
         const resumeResources = (turnOrchestrate || parsed.replan === true) ? [] : (resumePack?.resources ?? []);
         if (acquireRunResources(res, run.id, resumeResources) === "refused") {
@@ -11214,9 +12748,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         await hydrateArchive(run); // 归档 run 的正文在磁盘上，首次访问才读
         // 按需拉：会话正文可达数 MB，不能进 SSE 缓冲（那会让每个晚订阅的
         // 客户端都重放一遍）。这里只在用户真的切到对话视图时才付这笔代价。
+        // 按需拉：会话正文可达数 MB，不能进 SSE 缓冲。只给已封口段
+        // （loop done 才 push）；直播中 segments 为空是契约，不是丢了。
         return json(res, 200, {
           runId: run.id,
           task: run.task,
+          sealedOnly: true,
           segments: run.transcript,
         });
       }
@@ -11401,7 +12938,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       }
 
       /**
-       * 整站 ZIP：以入口 HTML 所在目录为根打包（圈禁 run workdir）。
+       * 整站 ZIP：入口 HTML + 引用闭包 + 同目录站点资产。
+       * 排除 _qa / webb_* / 下划线目录与 node_modules/.git，不把调研残渣打进去。
        */
       case "siteZip": {
         const run = runs.get(route.runId);
@@ -11422,30 +12960,61 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           if (!st.isFile()) return notFound(res, "Not a file");
           const dir = dirname(abs);
           const entries: { name: string; data: Buffer }[] = [];
+          const seen = new Set<string>();
           let total = 0;
           const maxFiles = 200;
           const maxBytes = 20_000_000;
 
-          async function walk(current: string, prefix: string): Promise<void> {
-            const kids = await readdir(current, { withFileTypes: true });
-            for (const kid of kids) {
-              if (entries.length >= maxFiles) throw new Error("too many files");
-              const childAbs = join(current, kid.name);
-              const childName = prefix ? `${prefix}/${kid.name}` : kid.name;
-              if (kid.isDirectory()) {
-                if (kid.name === "node_modules" || kid.name === ".git") continue;
-                await walk(childAbs, childName);
+          const addFile = async (childAbs: string, childName: string): Promise<void> => {
+            if (seen.has(childAbs)) return;
+            if (entries.length >= maxFiles) throw new Error("too many files");
+            const data = await readFile(childAbs);
+            total += data.length;
+            if (total > maxBytes) throw new Error("archive too large");
+            seen.add(childAbs);
+            entries.push({ name: zipEntryName(childName), data });
+          };
+
+          const kids = await readdir(dir, { withFileTypes: true });
+          for (const kid of kids) {
+            if (shouldSkipSiteZipName(kid.name)) continue;
+            if (kid.isDirectory()) continue;
+            if (!kid.isFile()) continue;
+            if (!isSameDirSiteAsset(kid.name) && kid.name !== basename(abs)) continue;
+            await addFile(join(dir, kid.name), kid.name);
+          }
+          await addFile(abs, basename(abs));
+
+          const queue = [...entries];
+          for (let i = 0; i < queue.length; i++) {
+            const item = queue[i]!;
+            const ext = extname(item.name).toLowerCase();
+            if (ext !== ".html" && ext !== ".htm" && ext !== ".css") continue;
+            const text = item.data.toString("utf8");
+            const fromDir = dirname(join(dir, item.name));
+            for (const ref of siteRefsFromText(text)) {
+              let refAbs: string;
+              try {
+                const relFromRoot = relative(root, join(fromDir, ref));
+                refAbs = resolveInWorkdir(root, relFromRoot);
+              } catch {
                 continue;
               }
-              if (!kid.isFile()) continue;
-              const data = await readFile(childAbs);
-              total += data.length;
-              if (total > maxBytes) throw new Error("archive too large");
-              entries.push({ name: zipEntryName(childName), data });
+              const relFromSite = relative(dir, refAbs).replace(/\\/g, "/");
+              if (!relFromSite || relFromSite.startsWith("..")) continue;
+              if (relFromSite.split("/").some((seg) => shouldSkipSiteZipName(seg))) continue;
+              try {
+                const refSt = await stat(refAbs);
+                if (!refSt.isFile()) continue;
+              } catch {
+                continue;
+              }
+              const before = entries.length;
+              await addFile(refAbs, relFromSite);
+              if (entries.length > before) queue.push(entries[entries.length - 1]!);
             }
           }
 
-          await walk(dir, "");
           if (entries.length === 0) return notFound(res, "Empty site directory");
           const zip = buildStoreZip(entries);
           const zipName = `${basename(dir) || "site"}.zip`;
@@ -11778,6 +13347,71 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       }
 
       /**
+       * Office 预览：圈禁后读盘，拆成可翻页的结构化 JSON。
+       * 加密 / 坏文件 422；不是 .pptx/.docx 400。文案是预览失败原因，不是「我们不做 Office」。
+       */
+      case "officePreview": {
+        const kind = officeKindFromPath(route.path);
+        if (!kind) {
+          return json(res, 400, { error: "只预览 .pptx / .docx", code: "UNSUPPORTED" });
+        }
+        let abs = "";
+        if (route.runId) {
+          const run = runs.get(route.runId);
+          if (!run) return notFound(res, `Run not found: ${route.runId}`);
+          const root = run.workdir ?? workdir;
+          try {
+            abs = resolveInWorkdir(root, localPathTarget(route.path));
+          } catch (err) {
+            return json(res, 400, { error: (err as Error).message });
+          }
+        } else {
+          const wanted = localPathTarget(route.path);
+          if (isAbsolute(wanted)) {
+            for (const root of allowedWorkdirs) {
+              try {
+                abs = resolveInWorkdir(root, wanted);
+                break;
+              } catch { /* 试下一个白名单根 */ }
+            }
+            if (!abs) {
+              return json(res, 403, { error: `路径不在任何白名单工作目录内：${wanted}` });
+            }
+          } else {
+            const root = resolve(route.workdir || workdir);
+            if (!allowedWorkdirs.has(root)) {
+              return json(res, 403, { error: `工作目录不在白名单内：${root}` });
+            }
+            try {
+              abs = resolveInWorkdir(root, wanted);
+            } catch (err) {
+              return json(res, 403, { error: (err as Error).message });
+            }
+          }
+        }
+        try {
+          const st = await stat(abs);
+          if (!st.isFile()) return notFound(res, "Not a file");
+          if (st.size > FILE_PREVIEW_MAX_BYTES) {
+            return json(res, 413, {
+              error: `文件过大：${(st.size / 1_000_000).toFixed(1)}MB 超过 ${(FILE_PREVIEW_MAX_BYTES / 1_000_000).toFixed(0)}MB 预览上限`,
+            });
+          }
+          const parsed = parseOfficePreview(await readFile(abs), kind);
+          return json(res, 200, {
+            kind: parsed.kind,
+            pages: parsed.pages,
+            mode: "preview",
+          });
+        } catch (err) {
+          if (isOoxmlPreviewError(err)) {
+            return json(res, 422, { error: err.message, code: err.code });
+          }
+          return notFound(res, `File not found: ${route.path}`);
+        }
+      }
+
+      /**
        * 在系统文件管理器里选中这个文件。
        *
        * 这条是**从网页请求启动本机进程**，所以圈禁必须比取件更严：同一套
@@ -11841,27 +13475,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         if (!run.abort) {
           return json(res, 409, { error: "This run does not support stopping" });
         }
-        run.abort.abort();
-        // 挂起的审批/计划门要立刻解除，否则协程仍吊在 await 上，abort 传不进去
-        for (const pending of run.pendingApprovals.values()) {
-          try { pending.respond("deny", "委托方已停止这次运行"); } catch { /* 已应答过 */ }
-        }
-        run.pendingApprovals.clear();
-        if (run.pendingPlan) {
-          try { run.pendingPlan.settle("reject"); } catch { /* 已决 */ }
-        }
-        // §5.2 提问同理。settle(null) 而不是抛——停止是委托方的决定，
-        // 工具那边会回"按你的最佳判断继续"，不是把它当故障（决定 4）
-        try { expireQuestion(run, "stopped"); } catch { /* 已应答 */ }
-        // 兼容端点 / 无视 signal 的工具：abort 后仍可能卡在 await。
-        // 点了停止超过 1.5s 还 running，就强制收尾——按钮不能停比没有更糟。
-        const stoppingId = run.id;
-        setTimeout(() => {
-          const still = runs.get(stoppingId);
-          if (!still || still.status !== "running" || !still.abort?.signal.aborted) return;
-          finalizeRun(still, { outcome: "closed", mainStopReason: "aborted" });
-        }, 1500);
-        broadcastLifecycle("run_updated", run);
+        abortCampaignChildren(run);
+        abortStoredRun(run);
         return json(res, 200, { stopping: true });
       }
 
@@ -12078,6 +13693,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             verify: true,
             ...(run.workdir ? { workdir: run.workdir } : {}),
             ...(run.extraWorkdirs ? { extraWorkdirs: run.extraWorkdirs } : {}),
+            ...(run.projectId ? { projectId: run.projectId } : {}),
             ...(run.effort ? { effort: run.effort } : {}),
             ...(run.contextTokenLimit !== undefined ? { contextTokenLimit: run.contextTokenLimit } : {}),
             ...(run.autoApprove ? { autoApprove: true } : {}),
@@ -12390,7 +14006,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       }
 
       case "static": {
-        const filePath = VENDOR_STATIC.get(route.filePath) ?? join(PUBLIC_DIR, route.filePath);
+        const filePath = resolveVendorFile(route.filePath) ?? join(PUBLIC_DIR, route.filePath);
         if (!existsSync(filePath)) {
           return notFound(res, `File not found: ${route.filePath}`);
         }

@@ -58,7 +58,7 @@ export const THEME_CHOICES = [
 export const SETTINGS_SECTIONS = [
   { id: "settings-appearance", label: "外观", icon: "ph-palette" },
   { id: "settings-models", label: "模型", icon: "ph-cpu" },
-  { id: "settings-mcp", label: "MCP", icon: "ph-plugs-connected" },
+  { id: "settings-mcp", label: "MCP / Skills", icon: "ph-plugs-connected" },
   { id: "settings-packs", label: "领域包", icon: "ph-package" },
   { id: "settings-defaults", label: "运行默认值", icon: "ph-sliders-horizontal" },
   { id: "settings-notifications", label: "通知", icon: "ph-bell" },
@@ -74,6 +74,235 @@ export const SETTINGS_SECTIONS = [
 export const MODELS_API_URL = "/api/models";
 export const MODELS_TEST_API_URL = "/api/models/test";
 export const PACKS_API_URL = "/api/packs";
+export const MCP_API_URL = "/api/mcp";
+export const MCP_INSTALL_API_URL = "/api/mcp/install";
+export const MCP_UNINSTALL_API_URL = "/api/mcp/uninstall";
+export const MCP_SKILLS_API_URL = "/api/mcp/skills";
+
+/** 设置页 MCP 目录：只收展示字段，不要把密钥画进 DOM。 */
+export function parseMcpSettingsPayload(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const servers = Array.isArray(raw.servers) ? raw.servers : [];
+  const catalog = Array.isArray(raw.catalog)
+    ? raw.catalog.filter((item) => item && typeof item.id === "string").map((item) => ({
+      id: item.id,
+      title: typeof item.title === "string" ? item.title : item.id,
+      description: typeof item.description === "string" ? item.description : "",
+      kind: item.kind === "skill" ? "skill" : "mcp",
+      availability: item.availability === "missing" ? "missing" : "ready",
+      repo: typeof item.repo === "string" ? item.repo : "",
+      notes: typeof item.notes === "string" ? item.notes : "",
+      serverName: item.mcpSnippet && typeof item.mcpSnippet.name === "string" ? item.mcpSnippet.name : "",
+    }))
+    : [];
+  const custom = Array.isArray(raw.custom)
+    ? raw.custom.filter((item) => item && typeof item.id === "string").map((item) => ({
+      id: item.id,
+      title: typeof item.title === "string" ? item.title : item.id,
+      repo: typeof item.repo === "string" ? item.repo : "",
+      url: typeof item.url === "string" ? item.url : "",
+      kind: item.kind === "skill" ? "skill" : "mcp",
+      notes: typeof item.notes === "string" ? item.notes : "",
+    }))
+    : [];
+  const skills = Array.isArray(raw.skills)
+    ? raw.skills.filter((item) => item && typeof item.id === "string").map((item) => ({
+      id: item.id,
+      kind: "skill",
+      enabled: item.enabled !== false,
+    }))
+    : [];
+  return {
+    path: typeof raw.path === "string" ? raw.path : "mcp.json",
+    enabled: raw.enabled === true,
+    writesArmed: raw.writesArmed !== false,
+    servers,
+    catalog,
+    custom,
+    skills,
+    installedCatalogIds: Array.isArray(raw.installedCatalogIds) ? raw.installedCatalogIds.map(String) : [],
+    skillInstall: raw.skillInstall && typeof raw.skillInstall === "object"
+      ? {
+        available: raw.skillInstall.available === true,
+        reason: typeof raw.skillInstall.reason === "string" ? raw.skillInstall.reason : "",
+      }
+      : { available: false, reason: "" },
+  };
+}
+
+/** 页头一句。长说明进「详情」，不进每张卡。 */
+export const MCP_MARKET_HEADER = "本宿主目录，安装才写入。MCP 需 AGENT_UI_MCP=1。";
+
+/**
+ * 目录卡面短文案。id 与 /api/mcp catalog 对齐；标题按委托方市场口径缩短。
+ * 长笔记（webhook / stdio vs HTTP / 不是 pack）只进 details。
+ */
+export const MCP_MARKET_COPY = {
+  "feishu-lark": { title: "飞书", blurb: "文档、日历、会话。" },
+  slack: { title: "Slack", blurb: "读频道、发消息。" },
+  github: { title: "GitHub", blurb: "仓库、议题与拉取请求。" },
+  filesystem: { title: "文件系统", blurb: "额外的目录访问，不是内置读写的替代。" },
+  notion: { title: "Notion", blurb: "连接 Notion 工作区。" },
+  superpowers: { title: "Superpowers", blurb: "技能包，安装后注入后续对话。" },
+  "ppt-master": { title: "ppt-master", blurb: "可编辑 PPTX 幻灯 skill。" },
+  "google-workspace": { title: "Google Workspace", blurb: "本目录没有可装的官方配方。" },
+};
+
+/** 这些句子属于详情/页头，不得出现在默认卡面。 */
+export const MCP_MARKET_ESSAY_PHRASES = [
+  "不是 Cursor Marketplace",
+  "不会预装二进制",
+  "出站 webhook",
+  "Slack Inc",
+  "mcp.slack.com",
+  "slack-skills-plugin",
+  "DomainPack",
+  "using-superpowers",
+  "skill（不是 MCP）",
+];
+
+export function escapeSettingsHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
+
+export function mcpOneLine(text, max = 40) {
+  const raw = String(text ?? "").replace(/\s+/g, " ").trim();
+  if (!raw) return "";
+  const sentence = raw.split(/[。！？\n]/)[0] || raw;
+  if (sentence.length <= max) return sentence;
+  return `${sentence.slice(0, Math.max(1, max - 1))}…`;
+}
+
+export function mcpMarketTitle(item) {
+  const mapped = item?.id ? MCP_MARKET_COPY[item.id] : null;
+  const fallback = String(item?.title || item?.name || item?.id || "").trim();
+  return mapped?.title || fallback || "未命名";
+}
+
+export function mcpMarketBlurb(item) {
+  const mapped = item?.id ? MCP_MARKET_COPY[item.id] : null;
+  if (mapped?.blurb) return mapped.blurb;
+  return mcpOneLine(item?.description || item?.notes || item?.command || item?.url || "");
+}
+
+export function mcpMarketKindLabel(item) {
+  if (item?.availability === "missing") return "缺";
+  return item?.kind === "skill" ? "Skill" : "MCP";
+}
+
+export function mcpMarketInitial(title) {
+  const chars = Array.from(String(title ?? "").trim());
+  return chars[0] || "?";
+}
+
+export function mcpMarketFaceText(item) {
+  return [mcpMarketTitle(item), mcpMarketKindLabel(item), mcpMarketBlurb(item)].join(" ");
+}
+
+export function mcpMarketFaceHasEssay(text) {
+  const blob = String(text ?? "");
+  return MCP_MARKET_ESSAY_PHRASES.some((phrase) => blob.includes(phrase));
+}
+
+export function mcpDetailsParts(item) {
+  const blurb = mcpMarketBlurb(item);
+  const parts = [];
+  const desc = String(item?.description || "").trim();
+  if (desc && desc !== blurb) parts.push(desc);
+  const notes = String(item?.notes || "").trim();
+  if (notes && notes !== blurb && notes !== desc) parts.push(notes);
+  if (item?.repo) parts.push(`仓库 ${item.repo}`);
+  if (item?.url && !parts.includes(item.url)) parts.push(item.url);
+  return parts;
+}
+
+export function filterMcpMarketItems(items, query) {
+  const list = Array.isArray(items) ? items : [];
+  const q = String(query ?? "").trim().toLowerCase();
+  if (!q) return list;
+  return list.filter((item) => {
+    const hay = [item.id, item.title, item.name, mcpMarketTitle(item), mcpMarketBlurb(item)]
+      .filter(Boolean)
+      .join("\n")
+      .toLowerCase();
+    return hay.includes(q);
+  });
+}
+
+/**
+ * 市场卡 HTML。mode=catalog 时按钮是 安装 / 已安装 / 不可装；
+ * 已装区才有启用/停用/移除。详情默认收起。
+ */
+export function renderMcpMarketCardHtml(item, opts = {}) {
+  const title = mcpMarketTitle(item);
+  const blurb = mcpMarketBlurb(item);
+  const kind = mcpMarketKindLabel(item);
+  const initial = mcpMarketInitial(title);
+  const details = mcpDetailsParts(item);
+  const mode = opts.mode || "catalog";
+  const installed = opts.installed === true;
+  const missing = item?.availability === "missing";
+  const enabled = opts.enabled !== false;
+  const id = item?.id ? String(item.id) : "";
+  const serverName = String(item?.serverName || item?.name || "");
+
+  let actions = "";
+  if (mode === "catalog") {
+    if (missing) {
+      actions = '<button type="button" class="btn" disabled>不可装</button>';
+    } else if (installed) {
+      actions = '<button type="button" class="btn" disabled>已安装</button>';
+    } else {
+      actions =
+        `<button type="button" class="btn btn--primary" data-mcp-install="${escapeSettingsHtml(id)}" data-mcp-kind="${escapeSettingsHtml(item.kind === "skill" ? "skill" : "mcp")}">安装</button>`;
+    }
+  } else if (mode === "installed-skill") {
+    actions =
+      `<button type="button" class="btn btn--ghost" data-skill-enable="${escapeSettingsHtml(id)}" data-skill-on="${enabled ? "1" : "0"}">${enabled ? "停用" : "启用"}</button>` +
+      `<button type="button" class="btn btn--ghost" data-mcp-uninstall="${escapeSettingsHtml(id)}">移除</button>`;
+  } else if (mode === "installed-mcp") {
+    if (serverName) {
+      actions += `<button type="button" class="btn btn--ghost" data-mcp-toggle="${escapeSettingsHtml(serverName)}">${enabled ? "停用" : "启用"}</button>`;
+    }
+    actions += `<button type="button" class="btn btn--ghost" data-mcp-uninstall="${escapeSettingsHtml(id)}">移除</button>`;
+  } else if (mode === "installed-custom") {
+    actions = `<button type="button" class="btn btn--ghost" data-mcp-uninstall="${escapeSettingsHtml(id)}">移除</button>`;
+  } else if (mode === "installed-server") {
+    actions =
+      `<button type="button" class="btn btn--ghost" data-mcp-toggle="${escapeSettingsHtml(serverName)}">${enabled ? "停用" : "启用"}</button>` +
+      `<button type="button" class="btn btn--ghost" data-mcp-remove="${escapeSettingsHtml(serverName)}">移除</button>`;
+  }
+
+  const attrs = [];
+  if (id && mode !== "installed-server") attrs.push(`data-catalog-id="${escapeSettingsHtml(id)}"`);
+  if (mode === "installed-skill" && id) attrs.push(`data-skill-id="${escapeSettingsHtml(id)}"`);
+  if (serverName && (mode === "installed-server" || mode === "installed-mcp")) {
+    attrs.push(`data-mcp-name="${escapeSettingsHtml(serverName)}"`);
+  }
+
+  const state = mode.startsWith("installed") && mode !== "installed-custom"
+    ? `<span class="settings-mcp-state">${enabled ? "已启用" : "已停用"}</span>`
+    : "";
+
+  return (
+    `<article class="settings-mcp-card" ${attrs.join(" ")}>` +
+    `<div class="settings-mcp-card-top">` +
+    `<span class="settings-mcp-icon" aria-hidden="true">${escapeSettingsHtml(initial)}</span>` +
+    `<div class="settings-mcp-card-head">` +
+    `<strong class="settings-mcp-card-title">${escapeSettingsHtml(title)}</strong>` +
+    `<span class="settings-mcp-chip${missing ? " settings-mcp-chip--miss" : ""}">${escapeSettingsHtml(kind)}</span>` +
+    state +
+    `</div></div>` +
+    `<p class="settings-mcp-card-desc">${escapeSettingsHtml(blurb)}</p>` +
+    `<div class="settings-mcp-card-actions">${actions}` +
+    (details.length
+      ? `<details class="settings-mcp-details"><summary>详情</summary><div class="settings-mcp-details-body">${details.map((part) => `<p>${escapeSettingsHtml(part)}</p>`).join("")}</div></details>`
+      : "") +
+    `</div></article>`
+  );
+}
 
 /** 设置页领域包列表：只收名字与描述，不要把 systemPrompt 画进 DOM。 */
 export function parsePacksPayload(raw) {
@@ -116,7 +345,7 @@ export const MODEL_ROLE_META = [
   { key: "executor", label: "执行", allowEmpty: false, emptyLabel: "", hint: "实际干活的模型——拆任务、调工具、写代码" },
   { key: "planner", label: "规划", allowEmpty: true, emptyLabel: "跟随执行", hint: "复杂任务的框架设计与拆分；跟随执行 = 与执行者同一个模型" },
   { key: "verifier", label: "核查", allowEmpty: true, emptyLabel: "跟随执行", hint: "审查与复查检查——可以把这一步交给更强的模型" },
-  { key: "vision", label: "识图", allowEmpty: true, emptyLabel: "不配置", hint: "图片理解（describe_image 工具）；不配置 = 不提供该工具" },
+  { key: "vision", label: "识图", allowEmpty: true, emptyLabel: "不配置", hint: "仅当执行者自己不能看图时才启用；执行者能看则 describe_image 走执行模型。两边都没有就不提供该工具" },
   { key: "image", label: "生图", allowEmpty: true, emptyLabel: "不配置", hint: "文生图（generate_image 工具，OpenAI 兼容 Images API）；不配置 = 不提供该工具" },
 ];
 
@@ -1253,65 +1482,199 @@ export function initSettingsView(host = {}, env = {}) {
     });
   }
 
-  // ---- MCP 插件 ----
-  const mcpSection = addSection("settings-mcp", "MCP 插件");
+  // ---- MCP / Skills（小型市场：卡面一句，长说明进详情）----
+  const mcpSection = addSection("settings-mcp", "MCP / Skills");
+  mcpSection.classList.add("settings-mcp-market");
   const mcpNote = doc.createElement("p");
-  mcpNote.className = "settings-card-note";
-  mcpNote.textContent = "宿主已能把 mcp.json 里的服务适配成工具。这里改配置；启用需 AGENT_UI_MCP=1。";
+  mcpNote.className = "settings-mcp-lede";
+  mcpNote.id = "settings-mcp-lede";
+  mcpNote.textContent = MCP_MARKET_HEADER;
   mcpSection.appendChild(mcpNote);
+  const mcpFilterRow = doc.createElement("div");
+  mcpFilterRow.className = "settings-mcp-filter";
+  mcpFilterRow.innerHTML =
+    '<label class="sr-only" for="settings-mcp-filter">筛选目录</label>' +
+    '<input id="settings-mcp-filter" type="search" placeholder="筛选名称…" autocomplete="off" />';
+  mcpSection.appendChild(mcpFilterRow);
+  const mcpFilter = /** @type {HTMLInputElement} */ (mcpFilterRow.querySelector("#settings-mcp-filter"));
+  const mcpCatalog = doc.createElement("div");
+  mcpCatalog.id = "settings-mcp-catalog";
+  mcpCatalog.className = "settings-mcp-grid";
+  mcpSection.appendChild(mcpCatalog);
+  const mcpInstalledTitle = doc.createElement("h4");
+  mcpInstalledTitle.className = "settings-subhead";
+  mcpInstalledTitle.textContent = "已安装";
+  mcpSection.appendChild(mcpInstalledTitle);
   const mcpList = doc.createElement("div");
   mcpList.id = "settings-mcp-list";
-  mcpList.className = "settings-models-list";
+  mcpList.className = "settings-mcp-grid";
   mcpSection.appendChild(mcpList);
-  const mcpForm = doc.createElement("div");
-  mcpForm.className = "settings-field";
-  mcpForm.innerHTML =
-    '<label for="settings-mcp-name">添加服务</label>' +
-    '<input id="settings-mcp-name" placeholder="名称，如 stm32" autocomplete="off" />' +
-    '<input id="settings-mcp-command" placeholder="command，如 python" autocomplete="off" />' +
-    '<input id="settings-mcp-args" placeholder="args，空格分隔" autocomplete="off" />' +
-    '<input id="settings-mcp-url" placeholder="或 HTTP url" autocomplete="off" />';
-  mcpSection.appendChild(mcpForm);
+  const mcpCustom = doc.createElement("div");
+  mcpCustom.className = "settings-mcp-custom";
+  mcpCustom.innerHTML =
+    '<label class="sr-only" for="settings-mcp-url">GitHub URL</label>' +
+    '<input id="settings-mcp-url" type="url" placeholder="https://github.com/owner/repo" autocomplete="off" />' +
+    '<label class="sr-only" for="settings-mcp-kind">种类</label>' +
+    '<select id="settings-mcp-kind">' +
+    '<option value="">种类</option>' +
+    '<option value="mcp">MCP</option>' +
+    '<option value="skill">Skill</option>' +
+    "</select>" +
+    '<button type="button" class="btn btn--primary" id="settings-mcp-github">安装</button>';
+  mcpSection.appendChild(mcpCustom);
+  const mcpGithubBtn = /** @type {HTMLButtonElement} */ (mcpCustom.querySelector("#settings-mcp-github"));
+  const mcpManual = doc.createElement("details");
+  mcpManual.className = "settings-mcp-manual";
+  mcpManual.innerHTML =
+    "<summary>手动添加服务</summary>" +
+    '<div class="settings-mcp-manual-body">' +
+    '<label for="settings-mcp-name">名称</label>' +
+    '<input id="settings-mcp-name" placeholder="如 stm32" autocomplete="off" />' +
+    '<label for="settings-mcp-command">命令</label>' +
+    '<input id="settings-mcp-command" placeholder="如 python" autocomplete="off" />' +
+    '<label for="settings-mcp-args">参数</label>' +
+    '<input id="settings-mcp-args" placeholder="空格分隔" autocomplete="off" />' +
+    "</div>";
+  mcpSection.appendChild(mcpManual);
   const mcpAddBtn = doc.createElement("button");
   mcpAddBtn.type = "button";
-  mcpAddBtn.className = "btn btn--primary";
+  mcpAddBtn.className = "btn btn--ghost";
   mcpAddBtn.textContent = "添加 / 更新";
-  mcpSection.appendChild(mcpAddBtn);
+  mcpManual.querySelector(".settings-mcp-manual-body")?.appendChild(mcpAddBtn);
   const mcpStatus = doc.createElement("p");
   mcpStatus.className = "settings-field-hint";
+  mcpStatus.id = "settings-mcp-status";
   mcpSection.appendChild(mcpStatus);
+
+  /** @type {ReturnType<typeof parseMcpSettingsPayload>} */
+  let lastMcpParsed = null;
+
+  function renderMcpLists() {
+    const parsed = lastMcpParsed ?? {
+      path: "mcp.json", enabled: false, writesArmed: true, servers: [], catalog: [], custom: [],
+      skills: [], installedCatalogIds: [], skillInstall: { available: false, reason: "" },
+    };
+    const query = mcpFilter?.value ?? "";
+    const installed = new Set([...parsed.installedCatalogIds, ...parsed.skills.map((row) => row.id)]);
+    const catalogItems = filterMcpMarketItems(parsed.catalog, query);
+    mcpCatalog.innerHTML = catalogItems.length
+      ? catalogItems.map((item) => renderMcpMarketCardHtml(item, {
+        mode: "catalog",
+        installed: installed.has(item.id),
+      })).join("")
+      : `<p class="settings-field-hint">${parsed.catalog.length ? "没有匹配的条目。" : "目录为空。"}</p>`;
+
+    const seenServers = new Set();
+    const installedCards = [];
+    for (const skill of parsed.skills) {
+      const catalog = parsed.catalog.find((row) => row.id === skill.id) ?? { id: skill.id, title: skill.id, kind: "skill" };
+      installedCards.push(renderMcpMarketCardHtml(catalog, {
+        mode: "installed-skill",
+        enabled: skill.enabled !== false,
+      }));
+    }
+    for (const item of parsed.catalog) {
+      if (item.kind !== "mcp" || !installed.has(item.id)) continue;
+      const server = parsed.servers.find((row) => row.name && (row.name === item.serverName || row.name === item.id));
+      if (server?.name) seenServers.add(server.name);
+      installedCards.push(renderMcpMarketCardHtml(item, {
+        mode: "installed-mcp",
+        enabled: server ? server.enabled !== false : true,
+      }));
+    }
+    for (const item of parsed.custom) {
+      installedCards.push(renderMcpMarketCardHtml(item, { mode: "installed-custom" }));
+    }
+    for (const server of parsed.servers) {
+      if (!server?.name || seenServers.has(server.name)) continue;
+      installedCards.push(renderMcpMarketCardHtml({
+        id: server.name,
+        title: server.name,
+        name: server.name,
+        command: server.command || server.url || "",
+        kind: "mcp",
+      }, {
+        mode: "installed-server",
+        enabled: server.enabled !== false,
+      }));
+    }
+    const visibleInstalled = query
+      ? installedCards.filter((html) => html.replace(/<[^>]+>/g, " ").toLowerCase().includes(query.trim().toLowerCase()))
+      : installedCards;
+    mcpList.innerHTML = visibleInstalled.length
+      ? visibleInstalled.join("")
+      : '<p class="settings-field-hint">还没有配置 MCP 或 skill。</p>';
+
+    const enableLine = parsed.enabled
+      ? `MCP 已启用（${parsed.path}）`
+      : `MCP 未连接（需 AGENT_UI_MCP=1）。${parsed.path}`;
+    mcpStatus.textContent = parsed.skillInstall.reason
+      ? `${enableLine} ${parsed.skillInstall.reason}`
+      : enableLine;
+  }
 
   async function refreshMcp() {
     if (!fetcher) return;
     try {
-      const res = await fetcher("/api/mcp");
+      const res = await fetcher(MCP_API_URL);
       const data = await res.json().catch(() => null);
-      const servers = Array.isArray(data?.servers) ? data.servers : [];
-      const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({
-        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
-      }[c]));
-      mcpList.innerHTML = servers.length
-        ? servers.map((s) =>
-            `<div class="settings-model-card" data-mcp-name="${esc(s.name)}">` +
-            `<strong>${esc(s.name)}</strong> · ${s.enabled === false ? "已停用" : "启用"} · ${esc(s.command || s.url || "（无命令）")}` +
-            `<div class="settings-model-form-actions">` +
-            `<button type="button" class="btn btn--ghost" data-mcp-toggle="${esc(s.name)}">${s.enabled === false ? "启用" : "停用"}</button>` +
-            `<button type="button" class="btn btn--ghost" data-mcp-remove="${esc(s.name)}">删除</button>` +
-            `</div></div>`,
-          ).join("")
-        : '<p class="settings-field-hint">还没有配置 MCP 服务。</p>';
-      mcpStatus.textContent = data?.enabled ? `已启用（${data.path}）` : `配置在 ${data?.path ?? "mcp.json"}；当前宿主未开 AGENT_UI_MCP=1`;
+      lastMcpParsed = parseMcpSettingsPayload(data) ?? {
+        path: "mcp.json", enabled: false, writesArmed: true, servers: [], catalog: [], custom: [],
+        skills: [], installedCatalogIds: [], skillInstall: { available: false, reason: "" },
+      };
+      renderMcpLists();
     } catch {
       mcpStatus.textContent = "无法读取 MCP 配置";
     }
   }
+  mcpFilter?.addEventListener("input", () => renderMcpLists());
 
-  mcpList.addEventListener("click", (event) => {
+  async function postCatalog(url, body) {
+    const res = await fetcher(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok) {
+      mcpStatus.textContent = data?.error ?? `请求失败（HTTP ${res.status}）`;
+      return;
+    }
+    mcpStatus.textContent = data?.message ?? "已更新";
+    void refreshMcp();
+  }
+
+  mcpSection.addEventListener("click", (event) => {
     const t = event.target instanceof Element ? event.target : null;
+    const install = t?.closest?.("[data-mcp-install]");
+    const uninstall = t?.closest?.("[data-mcp-uninstall]");
     const remove = t?.closest?.("[data-mcp-remove]");
     const toggle = t?.closest?.("[data-mcp-toggle]");
+    const skillToggle = t?.closest?.("[data-skill-enable]");
+    if (install) {
+      const id = install.getAttribute("data-mcp-install");
+      const kind = install.getAttribute("data-mcp-kind");
+      const ok = kind === "skill"
+        ? win.confirm(`确认安装 skill「${id}」？将写入 .agent-skills/${id}/SKILL.md 并注入后续对话。与 AGENT_UI_MCP 无关。`)
+        : win.confirm(`确认安装「${id}」？只写入 mcp.json 配方，不会跑安装脚本。AGENT_UI_MCP=1 才会连接。`);
+      if (!ok) return;
+      void postCatalog(MCP_INSTALL_API_URL, { catalogId: id, confirm: true, ...(kind ? { kind } : {}) });
+      return;
+    }
+    if (skillToggle) {
+      const id = skillToggle.getAttribute("data-skill-enable");
+      const on = skillToggle.getAttribute("data-skill-on") === "1";
+      void postCatalog(MCP_SKILLS_API_URL, { id, enabled: !on });
+      return;
+    }
+    if (uninstall) {
+      const id = uninstall.getAttribute("data-mcp-uninstall");
+      if (!win.confirm(`确认移除「${id}」？MCP 只改 mcp.json；skill 删除已写入的 SKILL.md。不跑卸载脚本。`)) return;
+      void postCatalog(MCP_UNINSTALL_API_URL, { catalogId: id, confirm: true });
+      return;
+    }
     if (remove) {
-      void fetcher("/api/mcp", {
+      void fetcher(MCP_API_URL, {
         method: "PUT",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ name: remove.getAttribute("data-mcp-remove"), remove: true }),
@@ -1322,7 +1685,7 @@ export function initSettingsView(host = {}, env = {}) {
       const name = toggle.getAttribute("data-mcp-toggle");
       const card = mcpList.querySelector(`[data-mcp-name="${name}"]`);
       const enabled = !card?.textContent?.includes("已停用");
-      void fetcher("/api/mcp", {
+      void fetcher(MCP_API_URL, {
         method: "PUT",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ name, server: { enabled: !enabled } }),
@@ -1338,7 +1701,7 @@ export function initSettingsView(host = {}, env = {}) {
       mcpStatus.textContent = "先填服务名";
       return;
     }
-    void fetcher("/api/mcp", {
+    void fetcher(MCP_API_URL, {
       method: "PUT",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -1352,6 +1715,20 @@ export function initSettingsView(host = {}, env = {}) {
         return;
       }
       void refreshMcp();
+    });
+  });
+  mcpGithubBtn.addEventListener("click", () => {
+    const url = /** @type {HTMLInputElement} */ (doc.getElementById("settings-mcp-url"))?.value.trim();
+    if (!url) {
+      mcpStatus.textContent = "先在 url 栏粘贴 https://github.com/owner/repo";
+      return;
+    }
+    const kind = /** @type {HTMLSelectElement} */ (doc.getElementById("settings-mcp-kind"))?.value;
+    if (!win.confirm(`确认从 ${url} 安装或记下？不会跑 curl|sh。目录未命中时必须指定 mcp 或 skill。`)) return;
+    void postCatalog(MCP_INSTALL_API_URL, {
+      githubUrl: url,
+      confirm: true,
+      ...(kind === "mcp" || kind === "skill" ? { kind } : {}),
     });
   });
   void refreshMcp();
@@ -1504,7 +1881,7 @@ export function initSettingsView(host = {}, env = {}) {
     defaultsSection.appendChild(row);
     return input;
   };
-  const verifyInput = buildToggle("settings-verify", "独立核查", "新对话默认开启独立核查；提交栏里可逐次关掉。");
+  const verifyInput = buildToggle("settings-verify", "独立核查", "新对话默认开启独立核查。单轮对话可在提交栏关掉；计划编排的子任务默认仍会核查，此勾改不了编排。");
   const autoApproveInput = buildToggle("settings-auto-approve", "自动放行工具", "新对话默认自动放行低风险工具；写入仍受工作目录边界约束。");
 
   effortSelect.addEventListener("change", () => {

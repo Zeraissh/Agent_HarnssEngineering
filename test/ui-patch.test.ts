@@ -30,6 +30,11 @@ import {
   updateLiveNode,
   renderChatItem,
   splitUserMessageAttachments,
+  stripHostEditScopeChrome,
+  paintConversationUserText,
+  peelHostToolReceipts,
+  looksLikeHugeDocumentBody,
+  foldedDocumentStub,
   titleReflectsTask,
   resolveDisplayedTitle,
   toolPeek,
@@ -51,6 +56,8 @@ import {
   designTabLabel,
   designSamplesForTab,
   resolveDesignSampleChoice,
+  designSampleBlockedReason,
+  harnessVisionConfigured,
   nextDesignSampleState,
   nextDesignLookState,
   composePromptWithLook,
@@ -92,6 +99,8 @@ import {
   splitCompletionFollowUps,
   classifyCompletionFollowUp,
   deriveRunFollowUp,
+  deriveBlockedFace,
+  applyBlockedCard,
   composerFolderName,
   newRunPlaceholder,
   extractArtifactPaths,
@@ -124,6 +133,7 @@ import {
   deriveRewindFilePreview,
   ancestorRunIdsForChat,
   filterRunsByWorkspaceFace,
+  filterRunsByComposerWorkdir,
   runBelongsToOffice,
   CODE_STARTER_JOBS,
   buildNewRunRequest,
@@ -1641,6 +1651,37 @@ describe("换标签重建时对话视图的签名要一起作废", () => {
       "对话不该落在下钻面里",
     ).toBe(false);
   });
+
+  it("Tools 面画出 run_config.projectId（白名单 + 渲染锁）", () => {
+    const s = reduceEvents(createInitialState("run-p", "任务", false), [
+      sse(0, "host", "run_config", { projectId: "board-1", workdir: "D:\\work\\alpha" }),
+    ]);
+    renderRunDetail(s, { activeTab: "tools", harness: null });
+    const text = document.getElementById("tab-content")!.textContent ?? "";
+    expect(text).toContain("项目");
+    expect(text).toContain("board-1");
+  });
+
+  it("Tools 面画出 run_config.campaignId（白名单 + 渲染锁）", () => {
+    const s = reduceEvents(createInitialState("run-c", "任务", false), [
+      sse(0, "host", "run_config", {
+        campaignId: "camp-1",
+        campaignRole: "director",
+        workdir: "D:\\work\\alpha",
+      }),
+      sse(1, "host", "campaign_child", { runId: "child-9", title: "固件", status: "running" }),
+    ]);
+    renderRunDetail(s, { activeTab: "tools", harness: null });
+    const text = document.getElementById("tab-content")!.textContent ?? "";
+    expect(text).toContain("战役");
+    expect(text).toContain("camp-1");
+    expect(text).toContain("导演");
+    const strip = document.querySelector(".campaign-strip");
+    expect(strip, "导演条应在主干对话上方").toBeTruthy();
+    expect((strip as HTMLElement).hidden).toBe(false);
+    expect(strip!.textContent).toContain("固件");
+    expect(strip!.querySelector("[data-open-run='child-9']")).toBeTruthy();
+  });
 });
 
 // ================================================================
@@ -2379,6 +2420,134 @@ describe("deriveChatItems：对话从事件流派生，因此实时", () => {
     expect(html).toContain("假设与前提 · 1");
     expect(html).toContain("okr-data.json 顶层键齐全");
     expect(html).toContain("未适用按已作废计");
+  });
+
+  it("blocked 收官：对话面必须看见具体阻塞条件，20KB HTML 工具回执不进主气泡", () => {
+    const html20k = `<!DOCTYPE html>\n<html lang="zh-CN"><head><title>三体</title></head><body>${"x".repeat(20_000)}</body></html>`;
+    const reason = "UNIQUE_BLOCK_REASON_PPT_404_REPO_MISSING";
+    let s = run(
+      sse(0, "main", "assistant_text", { text: "上一轮杂志已经写好，入口 index.html。" }),
+      sse(1, "main", "tool_call", {
+        toolUseId: "w",
+        name: "write_file",
+        input: { path: "index.html", content: html20k },
+      }),
+      sse(2, "main", "tool_result", {
+        toolUseId: "w",
+        result: { content: html20k, isError: false },
+      }),
+      sse(3, "main", "done", {
+        stopReason: "completed",
+        usage: { inputTokens: 1, outputTokens: 1, turns: 1, cacheHitRatio: 0 },
+        completion: {
+          status: "completed",
+          summary: "已用纯 CSS 重做杂志页，入口 index.html。",
+          artifacts: ["index.html"],
+          verification: [],
+          assumptions: [],
+          blockers: [],
+        },
+      }),
+      sse(4, "host", "user_message", { text: "帮我安装ppt-master的skill然后再用这个skill再重做一版", turn: 2 }),
+      sse(5, "main", "assistant_thinking", {
+        text: `install_mcp 失败 HTTP 404，仓库不存在。准备 finish_task(blocked)：${reason}`,
+      }),
+      sse(6, "main", "tool_call", {
+        toolUseId: "inst",
+        name: "install_mcp",
+        input: { repo: "https://github.com/hugohe3/ppt-master" },
+      }),
+      sse(7, "main", "tool_result", {
+        toolUseId: "inst",
+        result: { content: "下载 skill 失败（HTTP 404）", isError: true },
+        durationMs: 80,
+      }),
+      sse(8, "main", "tool_call", {
+        toolUseId: "fin",
+        name: "finish_task",
+        input: {
+          status: "blocked",
+          summary: "尝试安装 ppt-master skill 失败。",
+          artifacts: [],
+          verification: ["install_mcp 返回 404"],
+          assumptions: [],
+          blockers: [reason],
+        },
+      }),
+      sse(9, "main", "done", {
+        stopReason: "blocked",
+        usage: { inputTokens: 2, outputTokens: 2, turns: 2, cacheHitRatio: 0 },
+        completion: {
+          status: "blocked",
+          summary: "尝试安装 ppt-master skill 失败。",
+          artifacts: [],
+          verification: ["install_mcp 返回 404"],
+          assumptions: [],
+          blockers: [reason],
+        },
+      }),
+    );
+    const items = deriveChatItems(s);
+    const lastUserAt = items.reduce((acc, it, i) => (it.kind === "user" ? i : acc), -1);
+    const afterUser = items.slice(lastUserAt);
+    expect(afterUser.some((i) => i.kind === "blocked")).toBe(true);
+    expect(afterUser.find((i) => i.kind === "blocked")?.conditions).toContain(reason);
+    expect(items.filter((i) => i.kind === "text").some((i) => String(i.text).includes("上一轮杂志已经写好"))).toBe(true);
+    expect(deriveBlockedFace(s)?.conditions).toContain(reason);
+
+    document.body.innerHTML = items.map((it) => `<div class="chat-item">${renderChatItem(it)}</div>`).join("");
+    expect(document.body.textContent).toContain(reason);
+    const card = document.querySelector(".chat-blocked");
+    expect(card).toBeTruthy();
+    expect(card?.textContent).toContain(reason);
+    expect(card?.textContent).toContain("阻塞");
+    const mainBubbles = [...document.querySelectorAll(".chat-msg--assistant .chat-body")];
+    expect(mainBubbles.length).toBeGreaterThan(0);
+    for (const b of mainBubbles) {
+      expect(b.textContent ?? "").not.toContain("<!DOCTYPE html>");
+    }
+    expect(card?.textContent ?? "").not.toContain("<!DOCTYPE html>");
+  });
+
+  it("blocked 且 done 未带 completion 时，从 finish_task 入参抽出条件", () => {
+    const reason = "NEED_ACCESSIBLE_PPT_MASTER_REPO";
+    let s = run(
+      sse(0, "main", "tool_call", {
+        toolUseId: "fin",
+        name: "finish_task",
+        input: {
+          status: "blocked",
+          summary: "装不上 skill",
+          artifacts: [],
+          verification: [],
+          assumptions: [],
+          blockers: [reason],
+        },
+      }),
+      sse(1, "main", "done", {
+        stopReason: "blocked",
+        usage: { inputTokens: 1, outputTokens: 1, turns: 1, cacheHitRatio: 0 },
+      }),
+    );
+    const items = deriveChatItems(s);
+    expect(items.find((i) => i.kind === "blocked")?.conditions).toContain(reason);
+    document.body.innerHTML = items.map((it) => `<div class="chat-item">${renderChatItem(it)}</div>`).join("");
+    expect(document.body.textContent).toContain(reason);
+    expect(document.querySelector(".chat-blocked")?.textContent).toContain(reason);
+  });
+
+  it("applyBlockedCard 幂等，且 partial 不画阻塞卡", () => {
+    const face = { kind: "blocked", title: "阻塞", conditions: ["x"], summary: "", seq: null, key: "blocked" };
+    const once = applyBlockedCard(
+      [{ kind: "text", text: "ok", seq: 1 }, face],
+      { stopReason: "blocked", completion: { status: "blocked", summary: "卡死", blockers: ["仓库 404"] } },
+    );
+    expect(once.filter((i) => i.kind === "blocked")).toHaveLength(1);
+    expect(once.find((i) => i.kind === "blocked")?.conditions).toEqual(["仓库 404"]);
+    expect(applyBlockedCard([], {
+      stopReason: "partial",
+      completion: { status: "partial", summary: "半成品", blockers: ["下一回合再做"] },
+    }).some((i) => i.kind === "blocked")).toBe(false);
   });
 
   it("finish_task 为 partial 时正文标明状态并列出 blockers", () => {
@@ -3712,6 +3881,24 @@ describe("装配条的生图那一格", () => {
   });
 });
 
+describe("装配条的办公出站通知那一格", () => {
+  const bare = () => createInitialState("rn", "t", false);
+  const leak = "https://open.feishu.cn/open-apis/bot/v2/hook/LEAKED_NOTIFY_TOKEN";
+
+  it("armed 时上条；未开不上条；误带的 webhook 不进芯片", () => {
+    const on = deriveAssemblyBar(bare(), {
+      notify: { kind: "feishu", armed: true, webhookUrl: leak },
+    });
+    const chip = on.find((i) => i.key === "notify");
+    expect(chip?.chip).toBe("飞书门禁通知已开");
+    expect(JSON.stringify(chip)).not.toContain(leak);
+    expect(JSON.stringify(chip)).not.toContain("webhookUrl");
+
+    const off = deriveAssemblyBar(bare(), { notify: { kind: "feishu", armed: false } });
+    expect(off.some((i) => i.key === "notify")).toBe(false);
+  });
+});
+
 // ================================================================
 // MODEL-01a 端点降级：换端点这件事必须在界面上留痕
 // ================================================================
@@ -3823,6 +4010,22 @@ describe("端点降级在界面上看得见", () => {
     ]);
     expect(deriveAssemblyBar(s, null).find((i) => i.key === "vision")!.chip).toBe("识图 不可用");
   });
+
+  it("执行者能看图 → 条上写「识图 执行者」，不引用库里的识图角色名", () => {
+    const s = reduceEvents(createInitialState("rc-eye", "t", false), [
+      sse(0, "host", "run_config", {
+        describeImageBacking: "executor",
+        roleModels: { vision: null },
+        supportsVision: true,
+      }),
+    ]);
+    const item = deriveAssemblyBar(s, {
+      roleModels: { vision: { configured: true, model: "moonshot-v1-8k-vision-preview" } },
+    }).find((i) => i.key === "vision")!;
+    expect(item.chip).toBe("识图 执行者");
+    expect(item.why).toMatch(/不另引识图角色/);
+    expect(item.chip).not.toContain("moonshot");
+  });
 });
 
 describe("会话标题：算出来的短句，不是任务原文", () => {
@@ -3859,6 +4062,109 @@ describe("会话标题：算出来的短句，不是任务原文", () => {
     expect(deriveRunTitle("   \n  ")).toBe("未命名任务");
     expect(deriveRunTitle(undefined)).toBe("未命名任务");
   });
+
+  it("用户气泡与标题不重印宿主 [改范围] chrome，用户原话留下", () => {
+    const text =
+      `[改稿范围] 只改 data-slide="back"（文件 index.html）。不要改其它页，不要整份重写。\n` +
+      "图片你自己有核对过吗？完全与介绍的科技不相关";
+    expect(stripHostEditScopeChrome(text)).toBe("图片你自己有核对过吗？完全与介绍的科技不相关");
+    const html = renderChatItem({ kind: "user", text, seq: 9 });
+    expect(html).not.toContain("[改稿范围]");
+    expect(html).not.toContain("[改范围]");
+    expect(html).not.toContain("data-slide");
+    expect(html).toContain("图片你自己有核对过吗");
+    expect(deriveRunTitle(text)).toContain("图片你自己有核对过吗");
+    expect(deriveRunTitle(text)).not.toContain("改稿范围");
+  });
+});
+
+describe("对话展示层：工具回执与整份 HTML 不进主气泡", () => {
+  const html20k = `<!DOCTYPE html>\n<html lang="zh-CN"><head><title>三体</title></head><body>${"x".repeat(20_000)}</body></html>`;
+
+  it("剥掉焊在人话前面的「已收到，交付完成」", () => {
+    const welded = "已收到，交付完成。\n帮我安装 ppt-master 的 skill 然后你再用这个 skill 再重做一版";
+    expect(peelHostToolReceipts(welded)).toBe("帮我安装 ppt-master 的 skill 然后你再用这个 skill 再重做一版");
+    expect(paintConversationUserText(welded).display).toContain("帮我安装 ppt-master");
+    expect(paintConversationUserText(welded).display).not.toContain("已收到");
+    const html = renderChatItem({ kind: "user", text: welded, seq: 7 });
+    document.body.innerHTML = html;
+    const bubble = document.querySelector(".chat-msg--user .chat-body") as HTMLElement;
+    const shown = bubble.textContent ?? "";
+    expect(shown).toContain("帮我安装 ppt-master");
+    expect(shown).not.toContain("已收到，交付完成");
+  });
+
+  it("纯工具回执不画成用户气泡", () => {
+    expect(paintConversationUserText("已收到，交付完成。").kind).toBe("receipt");
+    expect(paintConversationUserText("Progress updated (3): [x] 写 index.html").kind).toBe("receipt");
+    expect(paintConversationUserText("[execution boundary=abc state=report-only] total 40").kind).toBe("receipt");
+    let s = createInitialState("run-receipt", "做杂志", false);
+    s = reduceEvents(s, [
+      sse(1, "host", "user_message", { text: "已收到，交付完成。", turn: 2 }),
+      sse(2, "host", "user_message", { text: "帮我重做一版", turn: 3 }),
+    ]);
+    const users = deriveChatItems({ ...s, status: "done" }).filter((it) => it.kind === "user");
+    expect(users.some((it) => it.text === "已收到，交付完成。")).toBe(false);
+    expect(users.some((it) => it.text === "帮我重做一版")).toBe(true);
+    document.body.innerHTML = renderChatItem({ kind: "user", text: "已收到，交付完成。", seq: 1 });
+    expect(document.querySelector(".chat-msg--user")).toBeNull();
+    expect(document.querySelector(".chat-tool-receipt")).not.toBeNull();
+  });
+
+  it("20KB HTML 用户消息不进主气泡 innerText", () => {
+    expect(looksLikeHugeDocumentBody(html20k)).toBe(true);
+    expect(foldedDocumentStub(html20k)).toMatch(/HTML|折叠/);
+    let s = createInitialState("run-html", "做杂志", false);
+    s = reduceEvents(s, [
+      sse(1, "host", "user_message", { text: html20k, turn: 2 }),
+    ]);
+    const item = deriveChatItems({ ...s, status: "done" }).find((it) => it.kind === "user" && it.seq === 1);
+    expect(item, "事件原文仍在条目上，不改正史").toMatchObject({ text: html20k });
+    document.body.innerHTML = renderChatItem(item);
+    const bubble = document.querySelector(".chat-msg--user .chat-body") as HTMLElement;
+    expect(bubble).toBeTruthy();
+    const shown = bubble.textContent ?? "";
+    expect(shown).not.toContain("<!DOCTYPE html>");
+    expect(shown).toMatch(/HTML|折叠|写入/);
+    expect(shown.length).toBeLessThan(80);
+    expect(document.querySelector(".chat-doc-fold")).not.toBeNull();
+  });
+
+  it("20KB HTML 工具回执不进用户/助手主气泡", () => {
+    let s = createInitialState("run-tool-html", "做杂志", false);
+    s = reduceEvents(s, [
+      sse(0, "main", "tool_call", {
+        toolUseId: "w",
+        name: "write_file",
+        input: { path: "index.html", content: html20k },
+      }),
+      sse(1, "main", "tool_result", {
+        toolUseId: "w",
+        result: { content: html20k, isError: false },
+      }),
+    ]);
+    const running = deriveChatItems(s);
+    const group = running.find((it) => it.kind === "tools");
+    expect(group).toBeTruthy();
+    document.body.innerHTML = renderChatItem(group);
+    expect(document.querySelector(".chat-msg--user")).toBeNull();
+    const main = document.querySelector(".chat-tool-group-body .chat-body") as HTMLElement;
+    expect(main).toBeTruthy();
+    const shown = main.textContent ?? "";
+    expect(shown).not.toContain("<!DOCTYPE html>");
+    expect(shown).toMatch(/index\.html|HTML|折叠|写入/);
+  });
+
+  it("20KB HTML 助手正文也不进主气泡 innerText", () => {
+    document.body.innerHTML = renderChatItem({ kind: "text", text: html20k, seq: 3, role: "main" });
+    const bubble = document.querySelector(".chat-msg--assistant .chat-body") as HTMLElement;
+    const shown = bubble.textContent ?? "";
+    expect(shown).not.toContain("<!DOCTYPE html>");
+    expect(shown).toMatch(/HTML|折叠|写入/);
+  });
+});
+
+describe("deriveRunTitle 续", () => {
 
   it("每轮收尾后从执行者最后一段正文抽出摘要", () => {
     let s = createInitialState("r", "做网站", false);
@@ -4123,7 +4429,20 @@ describe("空态给的是能点的例子", () => {
     const deck = resolveDesignSampleChoice("deck-magazine");
     expect(deck?.designTemplate).toBe("deck-basic");
     expect(deck?.designId).toBe("guizang-ppt");
+    expect(deck?.needsImages).toBe(true);
     expect(deck?.prompt).toMatch(/杂志风|deck-basic/);
+    expect(designSampleBlockedReason(deck, false)).toMatch(/未配置识图/);
+    expect(designSampleBlockedReason(deck, true)).toBe("");
+    expect(harnessVisionConfigured({ roleModels: { vision: { configured: true } } })).toBe(true);
+    expect(harnessVisionConfigured({ roleModels: { vision: { configured: false } } })).toBe(false);
+    expect(harnessVisionConfigured({
+      describeImageBacking: "executor",
+      roleModels: { vision: { configured: false } },
+    })).toBe(true);
+    expect(harnessVisionConfigured({
+      describeImageBacking: "none",
+      roleModels: { vision: { configured: true } },
+    })).toBe(false);
 
     const landing = resolveDesignSampleChoice("proto-landing");
     expect(landing?.designTemplate).toBe("landing-basic");
@@ -4139,6 +4458,17 @@ describe("空态给的是能点的例子", () => {
     expect(picked.selectedDesignTemplate).toBe("deck-basic");
     expect(picked.prompt).toContain("封面主张");
     expect(picked.prompt).not.toMatch(/data-slide|deck-basic/);
+
+    paintWelcome({
+      designModeActive: true,
+      selectedDesignTab: "Deck",
+      visionConfigured: false,
+    });
+    const magazine = document.querySelector('[data-design-sample="deck-magazine"]');
+    expect(magazine?.hasAttribute("disabled")).toBe(true);
+    expect(magazine?.getAttribute("data-needs-images")).toBe("1");
+    expect(magazine?.textContent).toMatch(/未配置识图/);
+    expect(document.querySelector('[data-design-sample="deck-cover"]')?.hasAttribute("disabled")).toBe(false);
 
     const kept = nextDesignSampleState("deck-cover", { prompt: "我要做融资路演" });
     expect(kept.selectedDesignTemplate).toBe("deck-basic");
@@ -4306,7 +4636,7 @@ describe("空态给的是能点的例子", () => {
 });
 
 describe("办公/编码脸与侧栏密度", () => {
-  it("列表按 workspace 分脸，旧档 packName=design 回退办公", () => {
+  it("Work 只留办公对话，Code 只留编码；旧档 packName=design 算办公", () => {
     const runs = [
       { runId: "o1", task: "幻灯", workspace: "office", packName: "design" },
       { runId: "c1", task: "修 bug", workspace: "code", packName: "ts-coding" },
@@ -4316,7 +4646,35 @@ describe("办公/编码脸与侧栏密度", () => {
     expect(filterRunsByWorkspaceFace(runs, "office").map((r) => r.runId)).toEqual(["o1", "legacy"]);
     expect(filterRunsByWorkspaceFace(runs, "code").map((r) => r.runId)).toEqual(["c1", "old-code"]);
     expect(runBelongsToOffice({ packName: "design" })).toBe(true);
+    expect(runBelongsToOffice({ facade: "design", mode: "single" })).toBe(true);
+    expect(runBelongsToOffice({ designRoute: { id: "pm-spec" }, mode: "single" })).toBe(true);
     expect(runBelongsToOffice({ workspace: "code", packName: "design" })).toBe(false);
+  });
+
+  it("Work 脸只列 Fathom 对话，不列 AGS；勾选与 primary 无关", () => {
+    const ags = "D:\\Work\\Wafer\\AGS";
+    const fathom = "C:\\Users\\rk302\\Fathom";
+    const project = {
+      id: "wafer-board",
+      name: "看板",
+      workdirs: [ags, fathom],
+      primaryWorkdir: fathom,
+    };
+    const pair = [
+      { runId: "ags-1", task: "看看 AGS 源文件", workdir: ags, workspace: "code", packName: "ts-coding" },
+      { runId: "fathom-1", task: "杂志风幻灯", workdir: fathom, workspace: "office", packName: "design" },
+    ];
+    const visible = filterRunsByWorkspaceFace(
+      filterRunsByComposerWorkdir(pair, fathom, false, project),
+      "office",
+    );
+    expect(visible.map((r) => r.runId)).toEqual(["fathom-1"]);
+    document.body.innerHTML = '<div id="run-list" class="run-list"></div>';
+    renderRunList(visible, null, () => {}, new Map(), undefined, { projects: [project] });
+    expect(document.querySelector(".run-group-name")?.textContent).toBe("看板");
+    const tasks = [...document.querySelectorAll(".run-item-task")].map((el) => el.textContent);
+    expect(tasks.some((t) => t?.includes("AGS"))).toBe(false);
+    expect(tasks.some((t) => t?.includes("幻灯"))).toBe(true);
   });
 
   it("办公新建载荷带 workspace=office", () => {
@@ -4337,6 +4695,11 @@ describe("办公/编码脸与侧栏密度", () => {
     const searchEnd = html.indexOf('id="run-list"');
     const chrome = html.slice(html.indexOf('id="sidebar"'), searchEnd);
     expect(chrome).toContain('id="workspace-face"');
+    expect(chrome).toContain("sidebar-top-tools");
+    expect(chrome).toContain('id="notifications-btn"');
+    expect(chrome).toContain('id="theme-toggle"');
+    expect(chrome).toMatch(/id="workspace-face-office"[^>]*>Work</);
+    expect(chrome).toMatch(/id="workspace-face-code"[^>]*>Code</);
     expect(chrome).toContain('id="new-chat-btn"');
     expect(chrome).not.toContain("<span>指挥中心</span>");
     expect(chrome).not.toContain("<span>定时任务</span>");

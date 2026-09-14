@@ -21,7 +21,8 @@ export { AUTO_CONCURRENCY_CAP as SPAWN_CONCURRENCY_CAP };
 let activeSpawns = 0;
 const spawnWaiters: Array<() => void> = [];
 
-async function withSpawnSlot<T>(fn: () => Promise<T>): Promise<T> {
+/** 并发 cap=3；战役真开子 run 与同 run 支线共用这一闸。 */
+export async function withSpawnSlot<T>(fn: () => Promise<T>): Promise<T> {
   while (activeSpawns >= AUTO_CONCURRENCY_CAP) {
     await new Promise<void>((resolve) => spawnWaiters.push(resolve));
   }
