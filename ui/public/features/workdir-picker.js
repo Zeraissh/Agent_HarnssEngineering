@@ -23,6 +23,8 @@
  * hash 路由历史。
  */
 
+import { humanizeHttpFailure } from "./humanize-error.js";
+
 // ---------------------------------------------------------------
 // 纯函数层
 // ---------------------------------------------------------------
@@ -637,7 +639,7 @@ export function initWorkdirPicker(host = {}, env = {}) {
     if (token !== renderToken) return;
     const body = await res.json().catch(() => ({}));
     if (!res.ok) {
-      setStatus(body?.error ?? `读取失败（HTTP ${res.status}）`, "error");
+      setStatus(humanizeHttpFailure(res.status, body?.error ?? "没读到目录"), "error");
       return;
     }
     currentPath = body.path ?? null;
@@ -687,7 +689,7 @@ export function initWorkdirPicker(host = {}, env = {}) {
       });
       const body = await res.json().catch(() => ({}));
       if (!res.ok) {
-        setStatus(body?.error ?? `加入失败（HTTP ${res.status}）`, "error");
+        setStatus(humanizeHttpFailure(res.status, body?.error ?? "没加成"), "error");
         return;
       }
       const added = String(body.workdir ?? currentPath);
@@ -725,7 +727,7 @@ export function initWorkdirPicker(host = {}, env = {}) {
       });
       const body = await res.json().catch(() => ({}));
       if (!res.ok) {
-        setStatus(body?.error ?? `新建失败（HTTP ${res.status}）`, "error");
+        setStatus(humanizeHttpFailure(res.status, body?.error ?? "没建成"), "error");
         return;
       }
       host.onAnnounce?.(`已新建：${body.path ?? name}`);

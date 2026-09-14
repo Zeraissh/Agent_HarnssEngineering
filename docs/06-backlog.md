@@ -2,11 +2,12 @@
 
 # 交接：从这里接着做（2026-09-14）
 
-**现在在干什么**：人格走查本波 + UX 第二批（用量 / `@` / 预览坞 / 计划门 edits / 桌面标题）**已落地**。评测档案结论不改。不要 revert 已合上的产品代码。
+**现在在干什么**：人格走查本波 + UX 第一/二/三批**已落地**（未 commit）。评测档案结论不改。不要 revert 已合上的产品代码。
 
 - 前端第一批：发送 / 「说要做什么…」；自动放行默认不勾、「默认先问」；新手卡「打一句话，回车」；批准卡「要新建或改 …」+「允许」「拒绝」；默认 Work 脸；独立核查在运行设置；停→「已停止」、完成→「运行已完成」、否决→「计划未获批准」；计划 / 助手
-- 前端第二批：`@` `#` `/` `$` 不再弹旧对话，「引用会话」是按钮；「全部项目」默认勾上；勾选 vs 设为主说人话；空态「现在只能在这个窗口下指令」；GitHub 没连不给假开 PR；来源表 +「导出链接列表」；`consult · 查资料`；侧栏/指挥中心「今日 $」/「这次 $」；预览页内坞/浮层，不跳 `file://`；计划确认门可改标题/短说明
-- 服务端：Work 没点稿件芯片不再 409；出厂先问；`POST …/plan-approval` 的 `edits` 写入活计划再执行（只 title/description）。CLI `--plan` 仍无这扇门
+- 前端第二批：`@` 当时还不弹旧对话（第三批起真列文件）；「引用会话」是按钮；「全部项目」默认勾上；勾选 vs 设为主说人话；空态「现在只能在这个窗口下指令」；GitHub 没连不给假开 PR；来源表 +「导出链接列表」；`consult · 查资料`；侧栏/指挥中心「今日 $」/「这次 $」；预览页内坞/浮层，不跳 `file://`；计划确认门可改标题/短说明
+- 前端第三批：计划门上点停止 = 「已停止」（不是否决）；否决按钮才是否决；停/否决后不再钉「批准并开跑」。`@` 列出圈禁内文件/目录，插入 `@path`；「引用会话」仍是旧对话。失败条（含 composer 以外）429/HTTP/领域包改成一句人话
+- 服务端：Work 没点稿件芯片不再 409；出厂先问；`POST …/plan-approval` 的 `edits` 写入活计划再执行（只 title/description）。门上停止 → `aborted`，否决 → `plan_rejected`。CLI `--plan` 仍无这扇门。429 正文「前面还有人在交，请等几秒。」
 - CLI：非 TTY 确认、`--yes` 横幅、`--resume-run` 停而不重开、`run --help`
 - 桌面：`npm run desktop`；窗框 `FATHOM` / `FATHOM · 对话`；没有开始菜单项
 
@@ -14,7 +15,7 @@
 
 ## 开放（只列现在还该动手的）
 
-1. **persona-ux 评测档案**（[`BACKLOG.md`](../eval/persona-ux/BACKLOG.md) 28 条结论不改）。第一批 + 第二批可见行为见「已关闭」；**不要**再把用量首页、`@` 弹旧对话、预览跳 `file://`、换项目空账号、桌面「控制台」标题当活缺口。回走用原剧本，不要把 VERIFY 改成已修复。
+1. **persona-ux 评测档案**（[`BACKLOG.md`](../eval/persona-ux/BACKLOG.md) 28 条结论不改）。三批可见行为见「已关闭」；**不要**再把用量首页、`@` 弹旧对话（现已列工作区文件）、预览跳 `file://`、计划门停止当否决、失败条甩 HTTP/领域包、换项目空账号、桌面「控制台」标题当活缺口。回走用原剧本，不要把 VERIFY 改成已修复。
 2. **`docs/08` 里仍标 `[~]` 的工程项**（SAFE-04/05/06、RUN-01 残余、OBS-02、E2E 签名包等）。与 UX 评测分开。**不要**从 2026-09-03 那段「下一刀：MEM-01 Phase B」开工——Phase B 已落地。
 3. **`docs/13-live-mu-backlog.md`**：共享宿主评测债 D1–D10 本波已标完成；对抗 U1 / U3–U6 已锁。不是「下一轮开案例 #9」。
 
@@ -32,6 +33,7 @@
 - 前端第一批（`ui/public`）：发送 / 「说要做什么…」；自动放行默认不勾；新手卡「打一句话，回车」；批准卡「要新建或改 …」「允许」「拒绝」；默认 Work；核查进运行设置；收尾三分；计划 / 助手。详见 [`_fix-notes-web.md`](../eval/persona-ux/_fix-notes-web.md)。
 - 前端第二批：`@` `#` `/` `$` 不弹旧对话；「引用会话」按钮；「全部项目」默认勾；目录菜单人话；空态只在这个窗口下指令；没连 GitHub 不开假 PR；来源表；`consult · 查资料`；「今日 $」/「这次 $」；预览坞不跳 `file://`。详见 [`_fix-notes-web2-app.md`](../eval/persona-ux/_fix-notes-web2-app.md) / [`_fix-notes-web2-usage.md`](../eval/persona-ux/_fix-notes-web2-usage.md) / [`_fix-notes-web2-preview.md`](../eval/persona-ux/_fix-notes-web2-preview.md)。
 - 计划门 edits：批准体 `edits` 只写 title/description，写入活计划再执行。CLI `--plan` 拆完就跑。详见 [`_fix-notes-plan-edits.md`](../eval/persona-ux/_fix-notes-plan-edits.md)。
+- 前端第三批：计划门停止 ≠ 否决（读屏「已停止」）；停/否决后不钉「批准并开跑」；`@` 圈内浅列文件插入 `@path`；失败条人话（429：「前面还有人在交，请等几秒。」）。详见 [`_fix-notes-web3.md`](../eval/persona-ux/_fix-notes-web3.md)。
 - 桌面：窗框 `FATHOM` / `FATHOM · 对话`；`npm run desktop`；没有开始菜单项。详见 [`_fix-notes-desktop.md`](../eval/persona-ux/_fix-notes-desktop.md)。
 
 ## 不要做

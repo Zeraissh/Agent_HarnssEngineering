@@ -16,6 +16,7 @@
 
 import { renderMarkdown } from "../core/markdown.js";
 import { formatRelTime } from "./notifications.js";
+import { humanizeHttpFailure } from "./humanize-error.js";
 
 // ---------------------------------------------------------------
 // 纯函数层
@@ -93,8 +94,8 @@ export function formatSize(bytes) {
 /** 空态与错误态文案（测试与 UI 共用同一份，避免两处漂移）。 */
 export const MEMORY_COPY = {
   empty: "还没有记忆——Agent 在跨会话工作中积累的内容会出现在这里",
-  listError: (status) => `记忆列表加载失败（HTTP ${status}）`,
-  previewError: (status) => (status === 404 ? "这条记忆已被删除" : `记忆内容加载失败（HTTP ${status}）`),
+  listError: (status) => humanizeHttpFailure(status, "记忆列表没加载出来"),
+  previewError: (status) => (status === 404 ? "这条记忆已被删除" : humanizeHttpFailure(status, "记忆内容没加载出来")),
   previewPlaceholder: "选择左侧一条记忆查看全文",
   truncatedNote: "内容超过 256 KB，已截断显示",
 };

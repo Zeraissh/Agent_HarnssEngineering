@@ -7,6 +7,9 @@ import {
   DECK_READY_MESSAGE_TYPE,
   DECK_GOTO_MESSAGE_TYPE,
   DECK_STATE_MESSAGE_TYPE,
+  WEBGL_STATUS_MESSAGE_TYPE,
+  WEBGL_PROBE_SOURCE,
+  HIDDEN_ATTR_FIX_CSS,
   DECK_RUNTIME_SOURCE,
   DECK_VISIBILITY_CSS,
   PRINT_HOOK_SOURCE,
@@ -20,6 +23,7 @@ import {
   appendInspectHook,
   appendSiteHooks,
   isInspectPick,
+  isWebglStatus,
   pathLength,
   pct,
   strokeBounds,
@@ -111,6 +115,24 @@ describe("inspect hook 注入", () => {
     expect(PRINT_HOOK_SOURCE).toContain("window.print");
     const hooked = appendSiteHooks("<html><body>x</body></html>", { print: true });
     expect(hooked).toContain("window.print");
+  });
+
+  it("整站预览补回 [hidden] 的 display:none，避免 fallback 遮罩假报没有 WebGL", () => {
+    const hooked = appendSiteHooks("<html><head></head><body><div class=\"fallback\" hidden>这台设备没有可用的 WebGL</div></body></html>");
+    expect(hooked).toContain('id="agent-hidden-fix"');
+    expect(hooked).toContain(HIDDEN_ATTR_FIX_CSS);
+    expect(appendSiteHooks(hooked)).toMatch(/id="agent-hidden-fix"/g);
+    expect(appendSiteHooks(hooked).match(/id="agent-hidden-fix"/g)?.length).toBe(1);
+  });
+
+  it("整站默认注入 WebGL 探针；探完立刻释放上下文", () => {
+    const hooked = appendSiteHooks("<html><body>x</body></html>");
+    expect(hooked).toContain(WEBGL_STATUS_MESSAGE_TYPE);
+    expect(WEBGL_PROBE_SOURCE).toContain("WEBGL_lose_context");
+    expect(WEBGL_PROBE_SOURCE).toContain("loseContext");
+    expect(isWebglStatus({ type: WEBGL_STATUS_MESSAGE_TYPE, ok: false })).toBe(true);
+    expect(isWebglStatus({ type: WEBGL_STATUS_MESSAGE_TYPE, ok: true })).toBe(true);
+    expect(isWebglStatus({ type: WEBGL_STATUS_MESSAGE_TYPE, ok: "no" })).toBe(false);
   });
 
   it("只认本协议的 postMessage", () => {

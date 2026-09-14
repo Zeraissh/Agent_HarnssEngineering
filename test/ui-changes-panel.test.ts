@@ -281,7 +281,7 @@ describe("initChangesPanel DOM 层", () => {
     rows[0].querySelector("button.chg-row-head").click();
     const preview = await waitFor(() => {
       const el = document.querySelector(".chg-preview");
-      return el && el.textContent.includes("HTTP 404") ? el : null;
+      return el && el.textContent.includes(CHANGES_COPY.previewError(404)) ? el : null;
     });
     expect(preview.textContent).toBe(CHANGES_COPY.previewError(404));
   });
@@ -316,7 +316,7 @@ describe("initChangesPanel DOM 层", () => {
     expect(document.querySelector(".chg-hint")).toBeNull();
   });
 
-  it("错误态：404 说档案不存在，500 给 HTTP 状态", async () => {
+  it("错误态：404 说档案不存在，其它失败用人话", async () => {
     const fetchFn = vi.fn(async () => mockJsonResponse(404, { error: "nope" }));
     const { api } = mountApi(fetchFn);
     api.setRun("gone");

@@ -30,7 +30,8 @@
  *   展开开关仍在 why 里。`mode` 只跟实际开关反推，不跟点过的标签（追问改编排后对不上 → 自定义）
  * - Web 计划确认门（`plan` 档）：卡上可改子任务 title/description；
  *   `POST /api/runs/:id/plan-approval` 的 `edits` 写入活计划再执行。其它结构字段不写。
- *   CLI `--plan` 拆完就执行，没有这扇门。
+ *   门上点停止 = `aborted` / 「已停止」，不是否决；否决按钮才是 `plan_rejected`。
+ *   停 / 否决 / 过期后不再钉「批准并开跑」。CLI `--plan` 拆完就执行，没有这扇门。
  * - 台账：`permissionMode` 记实际开关反推的档（自定义 → null），不是点过的标签；
  *   `approvals{asked,auto,denied}` 记工具审批结局（计划门不计）
  */

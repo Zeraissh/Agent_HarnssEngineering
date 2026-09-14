@@ -12,6 +12,7 @@ const { existsSync, readFileSync } = require('node:fs');
 const http = require('node:http');
 const net = require('node:net');
 const path = require('node:path');
+const chromeUserData = require('./chrome-user-data.cjs');
 
 /**
  * 复刻 `node --env-file-if-exists` 的核心语义子集：KEY=VALUE 行、# 注释、
@@ -235,4 +236,8 @@ module.exports = {
   stopHostTree,
   taskkillArgs,
   createLogTail,
+  resolveChromeUserDataDir: chromeUserData.resolveChromeUserDataDir,
+  chromeUserDataDirFlag: chromeUserData.chromeUserDataDirFlag,
+  rewriteUserDataDirArgs: chromeUserData.rewriteUserDataDirArgs,
+  isUnsafeChromeUserDataDir: chromeUserData.isUnsafeChromeUserDataDir,
 };

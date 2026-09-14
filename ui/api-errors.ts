@@ -6,6 +6,9 @@ const HTTP_STATUS_IN_TEXT = /HTTP\s*[0-9]{3}/gi;
 
 export function toBrowserApiError(raw: string): string {
   let text = String(raw ?? "");
+  if (/mutation rate limit|rate limit exceeded/i.test(text)) {
+    return "前面还有人在交，请等几秒。";
+  }
   text = text.replace(HTTP_STATUS_IN_TEXT, "");
   text = text.replace(/\bHTTP\b/gi, "");
   text = text.replace(/领域包/g, "专用工具");

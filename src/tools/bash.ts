@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import path from "node:path";
+import { rewriteUserDataDirInCommand } from "../chrome-user-data.js";
 import {
   configuredExecutionStatus,
   createExecutionBroker,
@@ -162,6 +163,9 @@ export function createBashTool(options: {
     if (!confine.ok) {
       return { content: confine.reason, isError: true };
     }
+    // Chrome 把相对 --user-data-dir 当 cwd 解析；cwd 不可写或被锁就弹系统框。
+    // 审批看到的仍是原命令，执行前改成绝对可写目录，避免 ./chrome-profile。
+    const launched = rewriteUserDataDirInCommand(command, { cwd: path.resolve(ctx.workdir) });
     // Web/CLI 正常路径逐 run 注入；公开 Tool.execute 的旧调用仍走一个明确标为
     // legacy-unbound 的 broker，而不是绕过 SAFE-05 重新直调 child_process。
     const ownsBroker = !ctx.executionBroker;
@@ -174,7 +178,7 @@ export function createBashTool(options: {
     let executionFailure: unknown;
     try {
       result = await broker.executeShell({
-        command,
+        command: launched,
         ...(WINDOWS_BASH ? { shell: WINDOWS_BASH } : {}),
         cwd: path.resolve(ctx.workdir),
         // 必须显式给 env：不传时 direct exec 会隐式继承完整 process.env，剥密钥即失效。

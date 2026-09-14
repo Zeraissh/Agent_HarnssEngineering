@@ -19,6 +19,18 @@ describe('production desktop shell', () => {
     expect(main).toMatch(/nodeIntegration:\s*false/);
     expect(main).toMatch(/sandbox:\s*true/);
     expect(main).not.toMatch(/preload:/);
+    expect(main).not.toMatch(/disableHardwareAcceleration\s*\(/);
+    expect(main).not.toMatch(/commandLine\.appendSwitch\(\s*['"]disable-gpu/);
+    expect(main).not.toMatch(/commandLine\.appendSwitch\(\s*['"]disable-webgl/);
+  });
+
+  it('整站预览在新窗顶层打开，不关硬件加速，也不把 /site/ 当下载', () => {
+    const main = readFileSync(join(root, 'electron', 'main.cjs'), 'utf8');
+    const readme = readFileSync(join(root, 'README.md'), 'utf8');
+    expect(main).toContain('/site(?:');
+    expect(main).toMatch(/action:\s*'allow'/);
+    expect(main).not.toMatch(/disableHardwareAcceleration\s*\(/);
+    expect(readme).toMatch(/硬件加速/);
   });
 
   it('模型设置只在独立本地窗口开放窄 IPC，远程 Harness 窗口拿不到凭据能力', () => {

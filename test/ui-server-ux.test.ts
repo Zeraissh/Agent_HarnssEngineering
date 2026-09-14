@@ -171,6 +171,7 @@ describe("toBrowserApiError", () => {
     expect(toBrowserApiError("提交失败（HTTP 409）：不涉及任何领域包，已指定页签 Prototype"))
       .not.toMatch(/HTTP|领域包|Prototype/);
     expect(toBrowserApiError("HTTP 429 Mutation rate limit exceeded")).not.toMatch(/HTTP/);
+    expect(toBrowserApiError("Mutation rate limit exceeded")).toBe("前面还有人在交，请等几秒。");
     expect(toBrowserApiError("")).toMatch(/没发出去/);
   });
 });

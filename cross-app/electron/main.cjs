@@ -365,6 +365,7 @@ function createWindow() {
       nodeIntegration: false,
       sandbox: true,
       webSecurity: true,
+      // 预览坞 three.js/WebGL 依赖 GPU。保持硬件加速；不要加 disable-gpu / disable-webgl。
     },
   });
   harnessWindows.add(win);
@@ -374,10 +375,30 @@ function createWindow() {
 
   win.webContents.setWindowOpenHandler(({ url }) => {
     try {
-      if (harnessOrigin && new URL(url).origin === harnessOrigin) {
+      const parsed = new URL(url);
+      if (harnessOrigin && parsed.origin === harnessOrigin) {
+        // 整站预览顶层打开：同一 session（令牌 cookie 不外泄），没有 iframe 沙箱挡 WebGL。
+        if (/\/api\/runs\/[^/]+\/site(?:\/|$)/.test(parsed.pathname)) {
+          return {
+            action: 'allow',
+            overrideBrowserWindowOptions: {
+              width: 1280,
+              height: 800,
+              backgroundColor: '#171717',
+              webPreferences: {
+                contextIsolation: true,
+                nodeIntegration: false,
+                sandbox: true,
+                webSecurity: true,
+              },
+            },
+          };
+        }
         // 保留同一 Electron session，访问令牌 cookie 不会泄漏给系统浏览器。
         win.webContents.downloadURL(url);
       } else if (canOpenExternally(url)) {
+        // 系统默认浏览器，不带 --user-data-dir。禁止再 spawn chrome.exe
+        // --user-data-dir=./chrome-profile（相对 cwd 会弹「无法创建数据目录」）。
         void shell.openExternal(url);
       }
     } catch {
@@ -394,6 +415,7 @@ function createWindow() {
     }
     event.preventDefault();
     if (canOpenExternally(url)) {
+      // 同 setWindowOpenHandler：openExternal，不给 Chrome 相对 user-data-dir。
       void shell.openExternal(url);
     }
   });

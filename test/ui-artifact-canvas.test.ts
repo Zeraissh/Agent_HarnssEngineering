@@ -31,14 +31,19 @@ import {
   officeExportPaths,
   pptxPathForHtml,
   pngPathsForHtml,
+  officePreviewUrl,
+  OFFICE_PREVIEW_NOTE,
+  showOfficePage,
   initArtifactCanvas,
   parseBrowserUrl,
   isBrowserPreviewPath,
   browserTabLabel,
   previewTabLabel,
   previewAddressValue,
+  PREVIEW_HTML_SANDBOX,
+  PREVIEW_IFRAME_ALLOW,
 } from "../ui/public/features/artifact-canvas.js";
-import { DECK_READY_MESSAGE_TYPE, DECK_GOTO_MESSAGE_TYPE } from "../ui/public/features/review-mode.js";
+import { DECK_READY_MESSAGE_TYPE, DECK_GOTO_MESSAGE_TYPE, DECK_STATE_MESSAGE_TYPE, WEBGL_STATUS_MESSAGE_TYPE } from "../ui/public/features/review-mode.js";
 import { deriveWrittenPaths } from "../ui/public/app.js";
 
 const flush = () => new Promise((r) => setTimeout(r, 0));
@@ -70,7 +75,8 @@ describe("类型分派 artifactRendererKind", () => {
     ["out/model.bin", "binary"],
     ["out/archive.zip", "binary"],
     ["out/report.xlsx", "binary"],
-    ["out/deck.pptx", "binary"],
+    ["out/deck.pptx", "pptx"],
+    ["out/notes.docx", "docx"],
     ["out/deck.pdf", "binary"],
     ["out/noext", "binary"],
   ])("%s → %s", (path, kind) => {
@@ -82,11 +88,13 @@ describe("类型分派 artifactRendererKind", () => {
   });
 
   it("每种渲染器都有中文徽章", () => {
-    for (const kind of ["html", "browser", "image", "markdown", "csv", "code", "text", "binary"]) {
+    for (const kind of ["html", "browser", "image", "markdown", "csv", "code", "text", "pptx", "docx", "binary"]) {
       expect(rendererKindLabel(kind)).toBeTruthy();
     }
     expect(rendererKindLabel("csv")).toBe("表格");
     expect(rendererKindLabel("browser")).toBe("网页");
+    expect(rendererKindLabel("pptx")).toBe("幻灯");
+    expect(rendererKindLabel("docx")).toBe("文档");
   });
 
   it("http(s) 网址走内置浏览器，不按扩展名当分文件", () => {
@@ -298,9 +306,16 @@ describe("initArtifactCanvas — 打开与 chrome", () => {
     await flush();
     const frame = document.querySelector("iframe.ac-frame");
     expect(frame).toBeTruthy();
+    expect(frame.getAttribute("sandbox")).toBe(PREVIEW_HTML_SANDBOX);
     expect(frame.getAttribute("sandbox")).toBe("allow-scripts");
     expect(frame.getAttribute("sandbox")).not.toContain("allow-same-origin");
+    expect(frame.getAttribute("allow")).toBe(PREVIEW_IFRAME_ALLOW);
+    expect(frame.getAttribute("allow")).toMatch(/webgl \*/);
+    expect(frame.getAttribute("allow")).toMatch(/xr-spatial-tracking \*/);
     expect(frame.getAttribute("src")).toBe("/api/runs/run-1/site/out/index.html?deck=1");
+    const openExt = document.querySelector("#ac-browser-ext");
+    expect(openExt?.hidden).toBe(false);
+    expect(openExt?.getAttribute("href")).toContain("/api/runs/run-1/site/out/index.html");
     expect(document.querySelector(".ac-note")?.textContent).toContain("整站预览");
     expect(document.querySelector("#ac-site")).toBeNull();
     expect(document.querySelector("#ac-export")?.hidden).toBe(false);
@@ -340,6 +355,7 @@ describe("initArtifactCanvas — 打开与 chrome", () => {
     expect(frame).toBeTruthy();
     expect(frame.getAttribute("src")).toBe("https://example.com/");
     expect(frame.getAttribute("sandbox")).toContain("allow-same-origin");
+    expect(frame.getAttribute("allow")).toMatch(/webgl \*/);
     expect(document.querySelector(".ac-badge")?.textContent).toBe("网页");
     expect(document.querySelector(".ac-tab")?.textContent).toBe("example.com");
     expect(document.querySelector(".ac-reveal")?.hidden).toBe(true);
@@ -371,9 +387,41 @@ describe("initArtifactCanvas — 打开与 chrome", () => {
     const frame = document.querySelector("iframe.ac-frame");
     expect(frame.getAttribute("sandbox")).toBe("allow-scripts");
     expect(frame.getAttribute("sandbox")).not.toContain("allow-same-origin");
+    expect(frame.getAttribute("allow")).toMatch(/webgl \*/);
     expect(frame.getAttribute("src")).toBe("/api/runs/run-1/site/out/index.html?deck=1&inspect=1");
     expect(frame.getAttribute("srcdoc")).toBeNull();
     expect(document.querySelector(".ac-note")?.textContent).toContain("点评模式");
+  });
+
+  it("iframe 报到没有 WebGL 时显示人话条，并接到「在系统浏览器打开」", async () => {
+    const api = initArtifactCanvas(setupHost(), { fetch: vi.fn() });
+    expect(api.open(0)).toBe(true);
+    await flush();
+    const banner = document.querySelector("#ac-webgl-banner");
+    expect(banner?.hidden).toBe(true);
+    const frame = document.querySelector("iframe.ac-frame");
+    const cw = {};
+    Object.defineProperty(frame, "contentWindow", { value: cw, configurable: true });
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        data: { type: WEBGL_STATUS_MESSAGE_TYPE, ok: false },
+        source: cw,
+      }),
+    );
+    expect(banner?.hidden).toBe(false);
+    expect(banner?.textContent).toMatch(/硬件加速|远程桌面|系统浏览器/);
+    const openExt = document.querySelector("#ac-browser-ext");
+    const click = vi.fn();
+    openExt.click = click;
+    document.querySelector("#ac-webgl-open").click();
+    expect(click).toHaveBeenCalled();
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        data: { type: WEBGL_STATUS_MESSAGE_TYPE, ok: true },
+        source: cw,
+      }),
+    );
+    expect(banner?.hidden).toBe(true);
   });
 
   it("幻灯报到后显示翻页条；裸方向键只翻页，不再切文件", async () => {
@@ -411,6 +459,15 @@ describe("initArtifactCanvas — 打开与 chrome", () => {
     posts.length = 0;
     document.querySelectorAll(".ac-deck-page")[2].click();
     expect(posts.some((p) => p?.type === DECK_GOTO_MESSAGE_TYPE && p.index === 2)).toBe(true);
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        data: { type: DECK_STATE_MESSAGE_TYPE, index: 2, total: 3, slide: "3" },
+        source: cw,
+      }),
+    );
+    await flush();
+    expect(document.querySelector(".ac-deck-pos")?.textContent).toContain("3 / 3");
+    expect(document.querySelectorAll(".ac-deck-page")[2].getAttribute("aria-pressed")).toBe("true");
   });
 
   it("点评列表可全部写入输入框，也可清空", async () => {
@@ -442,6 +499,58 @@ describe("initArtifactCanvas — 打开与 chrome", () => {
     expect(onAppendReview).toHaveBeenCalledWith(expect.stringContaining("[点评][slide:2]"));
     document.querySelector("#ac-review-clear").click();
     expect(document.querySelector("#ac-review-list")?.hidden).toBe(true);
+  });
+
+  it("pptx 在画布里翻页 + 点评写 [点评][slide:N]，文案是预览+点评+对话改稿", async () => {
+    const onAppendReview = vi.fn();
+    const fakeFetch = vi.fn(async (url) => {
+      if (String(url).includes("/office-preview")) {
+        return {
+          ok: true,
+          json: async () => ({
+            kind: "pptx",
+            pages: [
+              { index: 1, title: "封面", texts: ["封面", "主张"] },
+              { index: 2, title: "收束", texts: ["收束", "下一步"] },
+            ],
+          }),
+        };
+      }
+      return { ok: false };
+    });
+    const api = initArtifactCanvas(
+      setupHost({
+        getArtifacts: () => [{ path: "out/deck.pptx" }],
+        onAppendReview,
+      }),
+      { fetch: fakeFetch },
+    );
+    expect(api.open(0)).toBe(true);
+    await flush();
+    expect(fakeFetch).toHaveBeenCalledWith("/api/runs/run-1/office-preview?path=out%2Fdeck.pptx");
+    expect(document.querySelector(".ac-badge")?.textContent).toBe("幻灯");
+    expect(document.querySelector(".ac-note")?.textContent).toContain("预览 + 点评 + 对话改稿");
+    expect(document.querySelector(".ac-note")?.textContent).not.toContain("不做 Office");
+    expect(document.querySelector(".ac-office-pos")?.textContent).toContain("1 / 2");
+    expect(document.querySelector(".ac-office-page:not([hidden]) .ac-office-title")?.textContent).toBe("封面");
+    document.querySelector(".ac-office-next").click();
+    expect(document.querySelector(".ac-office-pos")?.textContent).toContain("2 / 2");
+    expect(document.querySelector(".ac-office-page:not([hidden]) .ac-office-title")?.textContent).toBe("收束");
+    expect(document.querySelector("#ac-inspect")?.hidden).toBe(false);
+    document.querySelector("#ac-inspect").click();
+    await flush();
+    const comment = document.querySelector(".ac-office-comment");
+    expect(comment).toBeTruthy();
+    comment.value = "标题字号加大";
+    document.querySelector(".ac-office-review button[type='submit']").click();
+    await flush();
+    expect(onAppendReview).toHaveBeenCalledWith(expect.stringContaining("[点评][slide:2]"));
+    expect(onAppendReview.mock.calls[0][0]).toContain("标题字号加大");
+    expect(OFFICE_PREVIEW_NOTE).toContain("对话改稿");
+    expect(officePreviewUrl("run-1", "out/deck.pptx")).toContain("office-preview");
+    const root = document.querySelector(".ac-office");
+    expect(showOfficePage(root, 0)).toBe(true);
+    expect(document.querySelector(".ac-office-pos")?.textContent).toContain("1 / 2");
   });
 
   it("parseDesignPalette 抽出色块；画布不再展示 DESIGN.md 色板；导出菜单收 ZIP，幻灯才出打印", async () => {
@@ -573,7 +682,7 @@ describe("initArtifactCanvas — 打开与 chrome", () => {
     expect(host.onAnnounce).toHaveBeenCalledWith(expect.stringContaining("没有 section.slide"));
   });
 
-  it("点选某一页才进入改稿范围；仅报到不误伤", async () => {
+  it("点选某一页才钉住；仅报到不误伤", async () => {
     const api = initArtifactCanvas(setupHost(), { fetch: vi.fn() });
     api.open(0);
     await flush();

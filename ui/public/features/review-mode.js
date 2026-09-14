@@ -25,6 +25,15 @@ export const INSPECT_MESSAGE_TYPE = "agent-inspect-pick";
 export const DECK_READY_MESSAGE_TYPE = "agent-deck-ready";
 export const DECK_GOTO_MESSAGE_TYPE = "agent-deck-goto";
 export const DECK_STATE_MESSAGE_TYPE = "agent-deck-state";
+export const WEBGL_STATUS_MESSAGE_TYPE = "agent-webgl-status";
+
+/**
+ * 作者写 `.fallback{display:flex}` 时，UA 的 `[hidden]{display:none}` 会被盖掉。
+ * 三维页因此在 WebGL 已经画出来之后，仍叠一层「这台设备没有可用的 WebGL」。
+ * 整站预览统一补回 hidden 的语义；打印媒体不改。
+ */
+export const HIDDEN_ATTR_FIX_CSS = "[hidden]{display:none!important}";
+export const HIDDEN_ATTR_FIX_TAG = `<style id="agent-hidden-fix">${HIDDEN_ATTR_FIX_CSS}</style>`;
 
 export function sanitizeClassToken(token) {
   return /^[A-Za-z][\w-]*$/.test(String(token ?? "")) ? String(token) : "";
@@ -92,6 +101,15 @@ export function isInspectPick(data) {
     && data.type === INSPECT_MESSAGE_TYPE
     && typeof data.selector === "string"
     && data.selector.trim(),
+  );
+}
+
+export function isWebglStatus(data) {
+  return Boolean(
+    data
+    && typeof data === "object"
+    && data.type === WEBGL_STATUS_MESSAGE_TYPE
+    && typeof data.ok === "boolean",
   );
 }
 
@@ -309,6 +327,28 @@ export const DECK_RUNTIME_SOURCE = `(function(){
   });
 })();`;
 
+/**
+ * 父页读不到无源 iframe 的 contentDocument，只能让页内自己探 WebGL。
+ * 探完立刻 loseContext，避免占掉 GPU 上下文槽位害 three.js 自己建不出来。
+ */
+export const WEBGL_PROBE_SOURCE = `(function(){
+  if (window.__agentWebglProbed) return;
+  window.__agentWebglProbed = true;
+  var ok = false;
+  try {
+    var c = document.createElement("canvas");
+    c.width = 1;
+    c.height = 1;
+    var gl = c.getContext("webgl2") || c.getContext("webgl") || c.getContext("experimental-webgl");
+    ok = Boolean(gl);
+    if (gl) {
+      var lose = gl.getExtension("WEBGL_lose_context");
+      if (lose) lose.loseContext();
+    }
+  } catch (e) {}
+  parent.postMessage({ type: "${WEBGL_STATUS_MESSAGE_TYPE}", ok: ok }, "*");
+})();`;
+
 /** 新窗口打印：加载后调起系统打印对话框（另存为 PDF 由系统对话框完成）。 */
 export const PRINT_HOOK_SOURCE = `(function(){
   if (window.__agentPrintHooked) return;
@@ -345,6 +385,10 @@ export function appendPrintHook(html) {
   return appendScriptHook(html, PRINT_HOOK_SOURCE);
 }
 
+export function appendWebglProbe(html) {
+  return appendScriptHook(html, WEBGL_PROBE_SOURCE);
+}
+
 function appendHeadTag(html, tag) {
   const raw = String(html ?? "");
   if (/<\/head>/i.test(raw)) return raw.replace(/<\/head>/i, `${tag}</head>`);
@@ -377,13 +421,20 @@ export function appendKatexRuntime(html) {
 /**
  * 整站 HTML 响应钩子：按需叠加 deck / inspect / print；TeX 缺渲染器时再叠 KaTeX。
  * @param {string} html
- * @param {{ deck?: boolean, inspect?: boolean, print?: boolean, katex?: boolean }} opts
+ * @param {{ deck?: boolean, inspect?: boolean, print?: boolean, katex?: boolean, webgl?: boolean }} opts
  */
+export function appendHiddenAttrFix(html) {
+  const raw = String(html ?? "");
+  if (raw.includes('id="agent-hidden-fix"')) return raw;
+  return appendHeadTag(raw, HIDDEN_ATTR_FIX_TAG);
+}
+
 export function appendSiteHooks(html, opts = {}) {
-  let out = String(html ?? "");
+  let out = appendHiddenAttrFix(String(html ?? ""));
   if (opts.deck) out = appendDeckRuntime(out);
   if (opts.inspect) out = appendInspectHook(out);
   if (opts.print) out = appendPrintHook(out);
+  if (opts.webgl !== false) out = appendWebglProbe(out);
   if (opts.katex !== false) out = appendKatexRuntime(out);
   return out;
 }

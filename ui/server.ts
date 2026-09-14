@@ -57,6 +57,7 @@ import {
   saveWorkdirStore,
   isSafeFolderName,
 } from "./workdirs.js";
+import { listWorkspaceFiles } from "./workspace-files.js";
 import {
   PROJECTS_FILENAME,
   PROJECTS_SCHEMA_VERSION,
@@ -934,7 +935,7 @@ interface PendingPlan {
   concurrencyMode: "auto" | "fixed";
   plannerMs: number;
   /** 由 waitForPlanDecision 装填：应答或过期时结束等待 */
-  settle: (decision: "approve" | "reject" | "expired") => void;
+  settle: (decision: "approve" | "reject" | "expired" | "stopped") => void;
 }
 
 interface HandoffProposalState {
@@ -972,8 +973,14 @@ interface QueuedQuestion {
 
 /** 计划被否决的哨兵——不是错误，是决定，所以要与 error 路径区分开 */
 class PlanRejectedError extends Error {
-  constructor(readonly cause_: "rejected" | "expired") {
-    super(cause_ === "rejected" ? "计划被委托方否决" : "计划确认门未应答即结束");
+  constructor(readonly cause_: "rejected" | "expired" | "stopped") {
+    super(
+      cause_ === "rejected"
+        ? "计划被委托方否决"
+        : cause_ === "stopped"
+          ? "委托方已停止这次运行"
+          : "计划确认门未应答即结束",
+    );
     this.name = "PlanRejectedError";
   }
 }
@@ -985,9 +992,11 @@ class PlanRejectedError extends Error {
  * 集成测试观测不到那条缓冲事件，只能在这一层钉住映射（B2 落盘后它会浮出水面）。
  */
 export function planGateStopReason(
-  cause: "rejected" | "expired",
-): "plan_rejected" | "plan_gate_expired" {
-  return cause === "expired" ? "plan_gate_expired" : "plan_rejected";
+  cause: "rejected" | "expired" | "stopped",
+): "plan_rejected" | "plan_gate_expired" | "aborted" {
+  if (cause === "expired") return "plan_gate_expired";
+  if (cause === "stopped") return "aborted";
+  return "plan_rejected";
 }
 
 /** 审批唯一键：同一 toolUseId 在返工轮再次出现时，靠 requestSeq 区分 */
@@ -2419,6 +2428,12 @@ export const SITE_PREVIEW_CSP = [
   "form-action 'none'",
   "object-src 'none'",
 ].join("; ");
+
+/**
+ * 整站预览 Permissions-Policy：无源 iframe 对不上 `'src'`，必须 `*`。
+ * 与预览 iframe 的 `allow="webgl *; xr-spatial-tracking *"` 对齐。
+ */
+export const SITE_PREVIEW_PERMISSIONS_POLICY = "webgl=*, xr-spatial-tracking=*";
 
 /**
  * 把 workdir 相对路径编成整站预览 URL（路径段编码，相对引用才能解析）。
@@ -5251,6 +5266,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         settle: (decision) => {
           delete run.pendingPlan;
           if (decision === "approve") resolve();
+          else if (decision === "stopped") reject(new PlanRejectedError("stopped"));
           else reject(new PlanRejectedError(decision === "reject" ? "rejected" : "expired"));
         },
       };
@@ -5440,7 +5456,13 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     }
     run.pendingApprovals.clear();
     if (run.pendingPlan) {
-      try { run.pendingPlan.settle("reject"); } catch { /* 已决 */ }
+      const pendingPlan = run.pendingPlan;
+      pushSyntheticEvent(run, "host", {
+        type: "plan_approval_expired",
+        requestSeq: pendingPlan.requestSeq,
+        cause: "stopped",
+      });
+      try { pendingPlan.settle("stopped"); } catch { /* 已决 */ }
     }
     try { expireQuestion(run, "stopped"); } catch { /* 已应答 */ }
     const stoppingId = run.id;
@@ -8987,6 +9009,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
      */
     | { type: "artifactsList"; projectId: string | null; workdir: string | null }
     | { type: "citeCandidates"; workdir: string | null }
+    | { type: "workspaceFiles"; workdir: string | null; q: string | null }
     | { type: "workdirRemove" }
     | { type: "workspaceGitGet"; workdir: string | null }
     | { type: "workspaceGitCheckout" }
@@ -9123,6 +9146,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     if (citeCandidatesMatch) {
       const params = new URLSearchParams(citeCandidatesMatch[1] ?? "");
       return { type: "citeCandidates", workdir: params.get("workdir") };
+    }
+    const workspaceFilesMatch = method === "GET" && url.match(/^\/api\/workspace\/files(?:\?(.*))?$/);
+    if (workspaceFilesMatch) {
+      const params = new URLSearchParams(workspaceFilesMatch[1] ?? "");
+      return { type: "workspaceFiles", workdir: params.get("workdir"), q: params.get("q") };
     }
     if (method === "DELETE" && url === "/api/workdirs") {
       return { type: "workdirRemove" };
@@ -10141,7 +10169,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       const message = (outcome.payload as { error?: unknown } | null)?.error;
       return {
         ok: false,
-        error: typeof message === "string" ? message : `准入失败（HTTP ${outcome.status}）`,
+        error: typeof message === "string" ? toBrowserApiError(message) : "这次没排上，请稍后再试。",
       };
     },
     isRunActive: (runId) => runs.get(runId)?.status === "running",
@@ -10269,7 +10297,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       if (retryAfter !== null) {
         metrics.rateRejected += 1;
         res.setHeader("Retry-After", String(retryAfter));
-        return json(res, 429, { error: "Mutation rate limit exceeded" });
+        return json(res, 429, { error: toBrowserApiError("Mutation rate limit exceeded") });
       }
     }
 
@@ -11560,6 +11588,13 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           ...(scope.projectId ? { projectId: scope.projectId } : {}),
           candidates,
         });
+      }
+
+      case "workspaceFiles": {
+        const listed = listedWorkdir(route.workdir);
+        if (!listed.ok) return json(res, listed.status, { error: toBrowserApiError(listed.error) });
+        const listedFiles = await listWorkspaceFiles(listed.path, route.q ?? "");
+        return json(res, 200, { workdir: listed.path, files: listedFiles.files });
       }
 
       case "memoryList": {
@@ -13029,6 +13064,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             "Content-Disposition": `inline; filename*=UTF-8''${encodeURIComponent(name)}`,
             "Cache-Control": "no-store",
             "Content-Security-Policy": SITE_PREVIEW_CSP,
+            "Permissions-Policy": SITE_PREVIEW_PERMISSIONS_POLICY,
             "X-Content-Type-Options": "nosniff",
           });
           res.end(body);

@@ -141,6 +141,7 @@ import {
   describeApprovalAction,
   runEndAnnouncement,
   humanizeSubmitError,
+  humanizeActionFailure,
   ROLE_PERSONA,
 } from "../ui/public/app.js";
 
@@ -1545,6 +1546,34 @@ describe("计划确认门的签字位", () => {
     const head = document.querySelector(".detail-head")?.textContent ?? document.body.textContent ?? "";
     expect(head).toContain("计划未获批准");
     expect(head).not.toContain("异常终止");
+  });
+
+  it("计划门停止或否决收尾后不再钉着批准并开跑", () => {
+    const rejected = gatedState([
+      sse(3, "host", "plan_approval_resolved", { requestSeq: 2, decision: "reject", actor: "user", at: 5 }),
+      sse(4, "main", "done", { stopReason: "plan_rejected", messageCount: 0, usage: {} }),
+      sse(5, "host", "run_end", { outcome: "rejected", mainStopReason: "plan_rejected" }),
+    ]);
+    renderRunDetail(rejected, { activeTab: "loop" });
+    expect(rail().textContent).not.toContain("批准并开跑");
+    expect(rail().hasAttribute("hidden")).toBe(true);
+
+    const stopped = gatedState([
+      sse(3, "host", "plan_approval_expired", { requestSeq: 2, cause: "stopped" }),
+      sse(4, "main", "done", { stopReason: "aborted", messageCount: 0, usage: {} }),
+      sse(5, "host", "run_end", { outcome: "closed", mainStopReason: "aborted" }),
+    ]);
+    renderRunDetail(stopped, { activeTab: "loop" });
+    expect(rail().textContent).not.toContain("批准并开跑");
+    expect(document.body.textContent).toContain("已停止");
+    expect(document.body.textContent).not.toContain("计划未获批准");
+
+    const stale = gatedState([
+      sse(4, "main", "done", { stopReason: "plan_rejected", messageCount: 0, usage: {} }),
+      sse(5, "host", "run_end", { outcome: "rejected", mainStopReason: "plan_rejected" }),
+    ]);
+    renderRunDetail(stale, { activeTab: "loop" });
+    expect(rail().textContent).not.toContain("批准并开跑");
   });
 });
 
@@ -5526,7 +5555,12 @@ describe("persona-ux 文案锁（#4/#5/#6/#9/#10/#25）", () => {
       .not.toMatch(/HTTP|领域包/);
     expect(humanizeSubmitError({}, 409)).toBe("这次发不出去，请换种说法再试。");
     expect(humanizeSubmitError({}, 429)).toBe("前面还有人在交，请等几秒。");
+    expect(humanizeSubmitError({ error: "Mutation rate limit exceeded" }, 429))
+      .toBe("前面还有人在交，请等几秒。");
     expect(humanizeSubmitError("工作目录不属于项目", 400)).toBe("工作目录不属于项目");
+    expect(humanizeActionFailure("上传", 429, "Mutation rate limit exceeded"))
+      .toBe("前面还有人在交，请等几秒。");
+    expect(humanizeActionFailure("停止", 500, null)).not.toMatch(/HTTP/);
   });
 
   it("提问卡 / 计划卡不署剧名，只叫助手 / 计划", () => {

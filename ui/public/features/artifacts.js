@@ -11,6 +11,8 @@
  * 「新建」回 composer。画册过期只标徽章，不自动重做。
  */
 
+import { humanizeHttpFailure } from "./humanize-error.js";
+
 export const ARTIFACTS_HASH = "#/artifacts";
 
 const KIND_ICON = {
@@ -179,7 +181,7 @@ export function initArtifactsView(host = {}, env = {}) {
       data = await res.json();
       const status = typeof res.status === "number" ? res.status : 200;
       if (status !== 200) {
-        host.onAnnounce?.(data?.error ? String(data.error) : `加载产物失败（HTTP ${status}）`);
+        host.onAnnounce?.(humanizeHttpFailure(status, data?.error ?? "产物列表没加载出来"));
         cards = [];
         render();
         return;

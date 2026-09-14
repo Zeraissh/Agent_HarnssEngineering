@@ -4973,6 +4973,12 @@ body.sidebar-collapsed .sidebar {
 .cite-picker-item:focus { background: var(--surface-2); }
 .cite-picker-title { font-size: var(--font-sm); }
 .cite-picker-task { font-size: var(--font-xs); color: var(--text-3); }
+.cite-picker-empty {
+  margin: 0;
+  padding: 8px;
+  font-size: var(--font-sm);
+  color: var(--text-3);
+}
 .chat-cite .chat-recap-head { color: var(--accent); }
 .composer-quickbar > .ctx-ring-wrap {
   margin-left: auto;
@@ -8851,6 +8857,20 @@ button.chg-row-head:focus-visible { outline: 2px solid var(--focus); outline-off
   flex-wrap: wrap;
 }
 .ac-deck-bar[hidden] { display: none !important; }
+.ac-webgl-banner {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-sm);
+  padding: var(--space-sm) var(--space-lg);
+  font-size: var(--font-sm);
+  color: var(--text-2);
+  background: var(--surface-1);
+  border-bottom: 1px solid var(--border-1);
+  flex-shrink: 0;
+}
+.ac-webgl-banner[hidden] { display: none !important; }
+.ac-webgl-banner p { margin: 0; }
 .ac-deck-pages {
   display: flex;
   flex-wrap: wrap;

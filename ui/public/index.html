@@ -553,6 +553,8 @@ import {
   matchPermissionMode,
   describePermissionStance,
   humanizeSubmitError,
+  humanizeActionFailure,
+  buildWorkspaceFilesUrl,
   runEndAnnouncement,
   annotateResolvedApprovals,
   createReplayGate,
@@ -1522,7 +1524,7 @@ async function deleteConversation(runId) {
       const res = await fetch(`/api/runs/${encodeURIComponent(id)}`, { method: "DELETE" });
       if (!res.ok && res.status !== 404) {
         const body = await res.json().catch(() => ({}));
-        showSubmitError(body.error ?? `删除失败（HTTP ${res.status}）`);
+        showSubmitError(humanizeActionFailure("删除", res.status, body.error));
         return;
       }
     } catch (err) {
@@ -1719,7 +1721,7 @@ function parseRoute() {
 
 async function fetchUsageReport() {
   const res = await fetch("/api/usage");
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok) throw new Error(humanizeActionFailure("用量", res.status));
   return res.json();
 }
 
@@ -2262,7 +2264,7 @@ async function cancelQueuedMessage(runId, index) {
     });
     if (!res.ok) {
       const b = await res.json().catch(() => ({}));
-      showSubmitError(b.error ?? `取消失败（HTTP ${res.status}）`);
+      showSubmitError(humanizeActionFailure("取消", res.status, b.error));
     }
     // 成功路径不本地改 chips：等服务端 message_queue_updated 推回来（唯一事实源）
   } catch (err) {
@@ -2302,7 +2304,7 @@ async function rewindConversation(runId, seq) {
     });
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
-      announceStatus(body.error ?? `回退失败（HTTP ${res.status}）`);
+      announceStatus(humanizeActionFailure("回退", res.status, body.error));
       return;
     }
     const payload = await res.json();
@@ -2338,7 +2340,7 @@ async function forkConversation(runId) {
     });
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
-      announceStatus(body.error ?? `分叉失败（HTTP ${res.status}）`);
+      announceStatus(humanizeActionFailure("分叉", res.status, body.error));
       return;
     }
     const payload = await res.json();
@@ -2469,7 +2471,7 @@ async function revealArtifact(runId, path) {
     });
     if (!res.ok) {
       const b = await res.json().catch(() => ({}));
-      showSubmitError(b.error ?? `打开失败（HTTP ${res.status}）`);
+      showSubmitError(humanizeActionFailure("打开", res.status, b.error));
     }
   } catch (err) {
     showSubmitError(`打开失败：${err.message ?? "网络错误"}`);
@@ -2524,7 +2526,7 @@ async function switchExecutorModel(nextId) {
     if (!res.ok) {
       if (select) select.value = prevId;
       executorModelPickerApi?.setPayload(modelsSnapshot);
-      showSubmitError(data?.error ?? `切换模型失败（HTTP ${res.status}）`);
+      showSubmitError(humanizeActionFailure("切换模型", res.status, data?.error));
       return;
     }
     modelsSnapshot = data;
@@ -3083,7 +3085,7 @@ async function postAutoApprove(runId, enabled) {
     }
     if (res.status !== 409) {
       const body = await res.json().catch(() => ({}));
-      showSubmitError(body.error ?? `自动放行设置失败（HTTP ${res.status}）`);
+      showSubmitError(humanizeActionFailure("自动放行设置", res.status, body.error));
     }
   } catch (err) {
     showSubmitError(`自动放行设置失败：${err && err.message ? err.message : err}`);
@@ -3226,7 +3228,9 @@ taskInput.addEventListener("keydown", (e) => {
   const firstCite = document.querySelector("#cite-picker:not([hidden]) .cite-picker-item");
   if (firstCite) {
     e.preventDefault();
-    addCite(firstCite.getAttribute("data-run-id"));
+    const file = firstCite.getAttribute("data-file-path");
+    if (file) insertWorkspaceFileMention(file, firstCite.getAttribute("data-file-kind"));
+    else addCite(firstCite.getAttribute("data-run-id"));
     return;
   }
   e.preventDefault();
@@ -3443,16 +3447,96 @@ function paintCiteChips() {
 }
 
 function hideCitePicker() {
+  filePickerToken += 1;
   const picker = document.getElementById("cite-picker");
   if (picker) {
     picker.hidden = true;
     picker.replaceChildren();
+    picker.setAttribute("aria-label", "引用会话");
+  }
+}
+
+let filePickerToken = 0;
+
+function insertWorkspaceFileMention(relative, kind) {
+  const mention = `@${String(relative ?? "").replace(/\\/g, "/")}`;
+  const suffix = kind === "directory" ? "/" : " ";
+  const trigger = composerCiteTrigger(taskInput.value);
+  if (trigger) {
+    const after = taskInput.value.slice(trigger.start + 1 + trigger.query.length);
+    taskInput.value = `${taskInput.value.slice(0, trigger.start)}${mention}${suffix}${after}`;
+  } else {
+    const pad = taskInput.value && !/\s$/.test(taskInput.value) ? " " : "";
+    taskInput.value = `${taskInput.value}${pad}${mention}${suffix}`;
+  }
+  syncWelcomeComposerField();
+  syncComposer();
+  hideCitePicker();
+  if (kind === "directory") onComposerCiteInput();
+  else taskInput.focus();
+}
+
+async function paintWorkspaceFilePicker(query) {
+  const picker = document.getElementById("cite-picker");
+  const wd = composerWorkdir();
+  if (!picker) return;
+  if (!wd) {
+    hideCitePicker();
+    return;
+  }
+  const token = ++filePickerToken;
+  picker.setAttribute("aria-label", "工作区文件");
+  try {
+    const res = await fetch(buildWorkspaceFilesUrl(wd, query));
+    if (token !== filePickerToken) return;
+    if (!res.ok) {
+      picker.replaceChildren();
+      const empty = document.createElement("p");
+      empty.className = "cite-picker-empty";
+      empty.textContent = humanizeActionFailure("列文件", res.status);
+      picker.appendChild(empty);
+      picker.hidden = false;
+      return;
+    }
+    const body = await res.json().catch(() => null);
+    const files = Array.isArray(body?.files) ? body.files : [];
+    picker.replaceChildren();
+    if (!files.length) {
+      const empty = document.createElement("p");
+      empty.className = "cite-picker-empty";
+      empty.textContent = query ? "这个文件夹里没有匹配的文件。" : "这个文件夹里还没有可点名的文件。";
+      picker.appendChild(empty);
+      picker.hidden = false;
+      return;
+    }
+    picker.hidden = false;
+    for (const f of files.slice(0, 12)) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "cite-picker-item";
+      btn.setAttribute("role", "option");
+      btn.dataset.filePath = f.relative;
+      btn.dataset.fileKind = f.kind;
+      const title = document.createElement("span");
+      title.className = "cite-picker-title";
+      title.textContent = f.kind === "directory" ? `${f.relative}/` : f.relative;
+      btn.appendChild(title);
+      btn.addEventListener("mousedown", (ev) => {
+        ev.preventDefault();
+        insertWorkspaceFileMention(f.relative, f.kind);
+      });
+      picker.appendChild(btn);
+    }
+  } catch {
+    if (token !== filePickerToken) return;
+    hideCitePicker();
   }
 }
 
 function paintCitePicker(query) {
   const picker = document.getElementById("cite-picker");
   if (!picker) return;
+  picker.setAttribute("aria-label", "引用会话");
   const local = sameWorkdirCiteRuns(runs, composerWorkdir()).map((r) => ({
     runId: r.runId,
     title: r.title || r.task,
@@ -3529,7 +3613,7 @@ function onComposerCiteInput() {
     hideCitePicker();
     return;
   }
-  paintCitePicker(trigger.query);
+  void paintWorkspaceFilePicker(trigger.query);
 }
 
 async function submitNewRun({ text: task }) {
@@ -3678,7 +3762,7 @@ async function stopRun(runId) {
       void loadRuns();
       return;
     }
-    showSubmitError(b.error ?? `停止失败（HTTP ${res.status}）`);
+    showSubmitError(humanizeActionFailure("停止", res.status, b.error));
   } catch (err) {
     stoppingRuns.delete(runId);
     showSubmitError(`停止失败：${err.message ?? "网络错误"}`);
@@ -4237,7 +4321,7 @@ async function createProjectFromComposer() {
     });
     const body = await res.json().catch(() => ({}));
     if (!res.ok) {
-      announceStatus(body?.error ? String(body.error) : `新建项目失败（HTTP ${res.status}）`);
+      announceStatus(humanizeActionFailure("新建项目", res.status, body?.error));
       renderProjectOptions(previous);
       return;
     }
@@ -4471,7 +4555,7 @@ async function removeUploadedFile(index) {
     });
     if (!res.ok) {
       const b = await res.json().catch(() => ({}));
-      announceStatus(`已从清单移除，但盘上文件保留：${b.error ?? `HTTP ${res.status}`}`);
+      announceStatus(`已从清单移除，但盘上文件保留：${humanizeActionFailure("移除", res.status, b.error)}`);
     } else {
       announceStatus(`已删除附件 ${u.path}`);
     }
@@ -4515,7 +4599,7 @@ async function uploadFiles(files) {
       });
       if (!res.ok) {
         const b = await res.json().catch(() => ({}));
-        showSubmitError(b.error ?? `上传失败（HTTP ${res.status}）`);
+        showSubmitError(humanizeActionFailure("上传", res.status, b.error));
         continue;
       }
       const info = await res.json();
@@ -4707,7 +4791,7 @@ if (budgetExtendBtn) {
       });
       const body = await res.json().catch(() => ({}));
       if (!res.ok) {
-        showSubmitError(body.error ?? `追加预算失败（HTTP ${res.status}）`);
+        showSubmitError(humanizeActionFailure("追加预算", res.status, body.error));
         return;
       }
       followUpErrors.delete(runId);

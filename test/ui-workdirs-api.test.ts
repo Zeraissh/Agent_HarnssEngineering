@@ -406,6 +406,29 @@ describe("GET /api/fs/list", () => {
   });
 });
 
+describe("GET /api/workspace/files", () => {
+  it("圈禁内浅列文件，不列凭据；圈外 403", async () => {
+    const { base, hostWorkdir } = await makeHost();
+    await writeFile(join(hostWorkdir, "hello.txt"), "x");
+    await writeFile(join(hostWorkdir, ".env"), "SECRET=1");
+    await mkdir(join(hostWorkdir, "src"));
+
+    const res = await fetch(`${base}/api/workspace/files?workdir=${encodeURIComponent(hostWorkdir)}`);
+    expect(res.status).toBe(200);
+    const body = await res.json() as { files: Array<{ name: string; relative: string; kind: string }> };
+    const names = body.files.map((f) => f.name);
+    expect(names).toContain("hello.txt");
+    expect(names).toContain("src");
+    expect(names).not.toContain(".env");
+
+    const q = await fetch(`${base}/api/workspace/files?workdir=${encodeURIComponent(hostWorkdir)}&q=hel`);
+    expect(((await q.json()) as any).files.map((f: any) => f.relative)).toEqual(["hello.txt"]);
+
+    const outside = await fetch(`${base}/api/workspace/files?workdir=${encodeURIComponent(join(hostWorkdir, ".."))}`);
+    expect(outside.status).toBe(403);
+  });
+});
+
 // ------------------------------------------------------
 // loopback 门：非 loopback Host 一律 403
 // ------------------------------------------------------

@@ -2,17 +2,21 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  chromeUserDataDirFlag,
   createLogTail,
+  isUnsafeChromeUserDataDir,
   loadDotEnv,
   mergeEnv,
   parseDotEnv,
   pickFreePort,
   probeHealthy,
+  resolveChromeUserDataDir,
   resolveHostEntry,
   resolveMemoryDir,
+  rewriteUserDataDirArgs,
   spawnHost,
   stopHostTree,
   taskkillArgs,
@@ -352,6 +356,31 @@ describe('spawnHost / stopHostTree：真拉起、真收树（僵尸进程纪律�
     await new Promise((resolve) => child.once('exit', resolve));
     expect(await stopHostTree(child)).toBe(true);
     expect(await stopHostTree(child)).toBe(true);
+  });
+});
+
+describe('Chrome user-data-dir 防护（禁止 ./chrome-profile）', () => {
+  it('resolveChromeUserDataDir 永远绝对，且不是 ./chrome-profile', () => {
+    const local = makeTmpDir();
+    const dir = resolveChromeUserDataDir({
+      preferred: './chrome-profile',
+      env: { LOCALAPPDATA: local },
+    });
+    expect(isAbsolute(dir)).toBe(true);
+    expect(isUnsafeChromeUserDataDir(dir)).toBe(false);
+    expect(dir).not.toContain('./chrome-profile');
+  });
+
+  it('rewriteUserDataDirArgs 改写相对 user-data-dir', () => {
+    const local = makeTmpDir();
+    const args = rewriteUserDataDirArgs(['--user-data-dir=./chrome-profile'], {
+      env: { LOCALAPPDATA: local },
+    });
+    const flag = args[0];
+    expect(flag.startsWith('--user-data-dir=')).toBe(true);
+    const dir = flag.slice('--user-data-dir='.length);
+    expect(isAbsolute(dir)).toBe(true);
+    expect(() => chromeUserDataDirFlag('./chrome-profile')).toThrow(/absolute/);
   });
 });
 

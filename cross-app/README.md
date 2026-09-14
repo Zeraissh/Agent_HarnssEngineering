@@ -62,6 +62,10 @@ npm run desktop
 要最新 Web UI，先确认 4173 上不是一台旧宿主。远程 Harness 渲染器启用
 context isolation 与 sandbox，不暴露 preload/Node 桥；只有本地打包的设置窗口拥有
 经过 sender 校验的窄 IPC。
+桌面壳**默认开硬件加速**（预览坞里的 three.js / WebGL 需要 GPU）。不要调用
+`app.disableHardwareAcceleration()`，也不要给 Electron/Chrome 加 `--disable-gpu`
+或 `--disable-webgl`。远程桌面或核显上若页内仍提示没有 WebGL，用预览顶栏
+「在系统浏览器打开」。
 
 #### 模型与运行设置
 

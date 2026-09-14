@@ -332,11 +332,27 @@ export function humanizeSubmitError(body, status) {
     .replace(/[（(]\s*[）)]/g, "")
     .replace(/\s{2,}/g, " ")
     .trim();
+  if (status === 429 || /rate limit|Mutation rate/i.test(cleaned) || /rate limit|Mutation rate/i.test(raw)) {
+    return "前面还有人在交，请等几秒。";
+  }
   if (cleaned) return cleaned;
   if (status === 409) return "这次发不出去，请换种说法再试。";
   if (status === 400) return "这次请求对不上，请改一下再发。";
-  if (status === 429) return "前面还有人在交，请等几秒。";
   return "发送失败，请稍后再试。";
+}
+
+/** composer 以外的条：删除 / 上传 / 停止 等失败，不报 HTTP 状态码。 */
+export function humanizeActionFailure(action, status, bodyError) {
+  if (status === 429) return "前面还有人在交，请等几秒。";
+  const fromBody = bodyError
+    ? humanizeSubmitError({ error: String(bodyError) }, status)
+    : "";
+  if (fromBody && fromBody !== "发送失败，请稍后再试。") return fromBody;
+  const verb = String(action ?? "这次").replace(/失败$/, "");
+  if (status === 400) return `${verb}没做成，请改一下再试。`;
+  if (status === 404) return `${verb}找不到这项。`;
+  if (status === 409) return `${verb}现在还不能这样做。`;
+  return `${verb}没做成，请稍后再试。`;
 }
 
 /**
@@ -2034,6 +2050,9 @@ function applyRunEnd(state, event) {
     error:
       mainStopReason === "error" ? state.error || "运行异常终止" : state.error,
     pendingApprovals: expireAll(state.pendingApprovals),
+    planApproval: state.planApproval?.status === "pending"
+      ? { ...state.planApproval, status: "expired" }
+      : state.planApproval,
     // 末轮之前若未收到 verification 事件（如旧事件流重放），用 run_end 里的补齐
     verifications:
       state.verifications.length > 0 || !Array.isArray(event.verifications)
@@ -3618,7 +3637,7 @@ export function deriveActionState(state) {
   const unverified = state.verdict ? state.verdict.unverified : [];
   // 计划确认门（§5.1）：签字位也是"需你决定"，而且是最靠前的那一件——
   // 它挂起时一个子任务都还没发射，此刻的决定成本最低
-  const planPending = state.planApproval?.status === "pending";
+  const planPending = !runHasClosed(state) && state.planApproval?.status === "pending";
   /**
    * §5.2 提问同属"需你现在决定"，而且是**阻塞式**的——执行协程正吊在
    * ask_user 的 execute 里等这一下。不进 needsAttention 就等于整个运行卡死
@@ -4842,11 +4861,22 @@ export function deriveCitedChat(cited) {
 }
 
 /**
- * 输入框末尾的触发符。`@` `#` `/` `$` 都不当补全——没有文件补全就不要
- * 弹出旧对话。引用会话走明确按钮，不占 `@`。
+ * 输入框末尾的 `@` 才开文件补全。`#` `/` `$` 不吃。引用会话走按钮，不占 `@`。
+ * @returns {{ start: number, query: string, kind: "file" } | null}
  */
-export function composerCiteTrigger(_text) {
-  return null;
+export function composerCiteTrigger(text) {
+  const raw = String(text ?? "");
+  const m = raw.match(/(^|[\s])@([^\s@]*)$/);
+  if (!m) return null;
+  const query = m[2] ?? "";
+  return { start: raw.length - query.length - 1, query, kind: "file" };
+}
+
+export function buildWorkspaceFilesUrl(workdir, query) {
+  const q = new URLSearchParams();
+  if (workdir) q.set("workdir", workdir);
+  if (query) q.set("q", query);
+  return `/api/workspace/files?${q}`;
 }
 
 /**
@@ -6268,8 +6298,8 @@ function patchPlanGate(parts, state, faces, callbacks) {
     parts.planGate.innerHTML = "";
     return;
   }
-  // 已决/过期不留在 rail 上——那是"需你现在决定"的位置。审计记录归 Plan 面。
-  if (gate.status !== "pending") {
+  // 已决/过期/整场已停不留在 rail 上——停≠否决，但都不能再钉着「批准并开跑」。
+  if (gate.status !== "pending" || runHasClosed(state)) {
     setAttr(parts.planGate, "hidden", "");
     parts.sig.planGate = null;
     parts.planGate.innerHTML = "";
@@ -11744,7 +11774,7 @@ export function renderEmptyState(_hasRuns, _opts = {}) {
     '<p class="empty-tagline">说要做什么，回车就发。</p>' +
     '<p class="empty-tagline-cn">稿件、纪要、问答都可以从这里开始。</p>' +
     '<p class="empty-window-note">现在只能在这个窗口下指令。</p>' +
-    '<p class="empty-cite-hint">用附件或工作目录，这里没有 @ 文件补全。</p>' +
+    '<p class="empty-cite-hint">输入 @ 可点名这个文件夹里的文件。旧对话用「引用会话」。</p>' +
     '<span class="empty-depthline" aria-hidden="true"></span>' +
     "</div>";
 }

@@ -5,6 +5,7 @@
  * 创作源仍是 HTML；位图由宿主截契约卡。
  */
 import { pathToFileURL } from "node:url";
+import { chromePlaywrightLaunchArgs } from "./chrome-user-data.js";
 
 export const CARD_PNG_NO_FRAMES = "NO_FRAMES";
 export const CARD_PNG_CAPTURE_UNAVAILABLE = "CAPTURE_UNAVAILABLE";
@@ -108,6 +109,11 @@ export const fixturePngCapture: PngCaptureFn = async ({ frames }) =>
     height: frame.height,
   }));
 
+/** Playwright Chromium 启动参数：user-data-dir 必须绝对，禁止 ./chrome-profile。 */
+export function playwrightChromiumLaunchOptions(): { headless: true; args: string[] } {
+  return { headless: true, args: chromePlaywrightLaunchArgs() };
+}
+
 /**
  * 真实宿主用 Playwright 截契约卡。调用方必须在 finally 关浏览器——
  * Windows 上漏关会留 chromium 僵尸。
@@ -125,7 +131,7 @@ export const capturePngFramesWithPlaywright: PngCaptureFn = async ({ htmlAbs, fr
   let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
   try {
     try {
-      browser = await chromium.launch({ headless: true });
+      browser = await chromium.launch(playwrightChromiumLaunchOptions());
     } catch (err) {
       throw new CardPngError(
         CARD_PNG_CAPTURE_UNAVAILABLE,

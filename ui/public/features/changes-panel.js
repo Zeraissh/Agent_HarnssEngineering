@@ -25,6 +25,7 @@
 
 import { formatRelTime } from "./notifications.js";
 import { formatSize } from "./memory-panel.js";
+import { humanizeHttpFailure } from "./humanize-error.js";
 
 // ---------------------------------------------------------------
 // 纯函数层
@@ -54,14 +55,14 @@ export const GIT_STATUS_BADGES = {
 /** 空态与提示文案（测试与 UI 共用同一份，避免两处漂移）。 */
 export const CHANGES_COPY = {
   empty: "本次运行没有写盘操作",
-  listError: (status) => `变更列表加载失败（HTTP ${status}）`,
+  listError: (status) => status === 404 ? "这次运行的档案已不存在" : humanizeHttpFailure(status, "变更列表没加载出来"),
   listNetworkError: "变更列表加载失败（网络错误）",
   runGone: "这次运行的档案已不存在",
   loading: "加载中…",
   outOfScope: "路径越出本次工作目录，不提供预览",
   deleted: "文件已被删除，不提供预览",
   binary: "非文本文件，请用产物面板的预览 / 下载",
-  previewError: (status) => `文件内容加载失败（HTTP ${status}）`,
+  previewError: (status) => humanizeHttpFailure(status, "文件内容没加载出来"),
   previewNetworkError: "文件内容加载失败（网络错误）",
   previewTruncated: (n) => `仅显示前 ${n} 行`,
 };

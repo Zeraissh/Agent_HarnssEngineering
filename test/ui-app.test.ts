@@ -65,6 +65,7 @@ import {
   peelHostToolReceipts,
   deriveCitedChat,
   composerCiteTrigger,
+  buildWorkspaceFilesUrl,
   filterCiteCandidates,
   sameWorkdirCiteRuns,
   packOptionLabel,
@@ -641,7 +642,7 @@ describe("reduceEvent", () => {
     expect(appSrc).toContain("说要做什么，回车就发。");
     expect(appSrc).toContain("稿件、纪要、问答都可以从这里开始。");
     expect(appSrc).toContain("现在只能在这个窗口下指令。");
-    expect(appSrc).toContain("这里没有 @ 文件补全。");
+    expect(appSrc).toContain("输入 @ 可点名这个文件夹里的文件。");
     expect(appSrc).not.toContain("see every run to the bottom.");
     expect(appSrc).not.toContain("每一层都看得见。");
     expect(appSrc).not.toContain("尚无运行。提交一个任务开始。");
@@ -3247,13 +3248,16 @@ describe("formatGateChip", () => {
 });
 
 describe("点名引用（composer + derive）", () => {
-  it("composerCiteTrigger 不吃 @ # / $，没有文件补全就不弹 picker", () => {
+  it("composerCiteTrigger：@ 列文件，# / $ 仍不弹", () => {
     expect(composerCiteTrigger("写一份规格")).toBeNull();
-    expect(composerCiteTrigger("参考 @规格")).toBeNull();
-    expect(composerCiteTrigger("@")).toBeNull();
     expect(composerCiteTrigger("#tag")).toBeNull();
     expect(composerCiteTrigger("/help")).toBeNull();
     expect(composerCiteTrigger("$var")).toBeNull();
+    expect(composerCiteTrigger("user@host")).toBeNull();
+    expect(composerCiteTrigger("@")).toEqual({ start: 0, query: "", kind: "file" });
+    expect(composerCiteTrigger("参考 @规格")).toEqual({ start: 3, query: "规格", kind: "file" });
+    expect(buildWorkspaceFilesUrl("D:\\work", "src/a")).toContain("/api/workspace/files?");
+    expect(buildWorkspaceFilesUrl("D:\\work", "src/a")).toContain("q=src");
   });
 
   it("consult 包在运行设置里写清查资料", () => {

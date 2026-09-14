@@ -49,6 +49,11 @@ __pycache__/
 .claude/settings.local.json
 design-qa.md
 
+# Chrome 用户数据：相对路径 ./chrome-profile 会弹系统框，禁止进仓
+/chrome-profile/
+eval/persona-ux/walks/*-chrome-profile/
+eval/persona-ux/walks/*-chrome-profile-*/
+
 # 演示站 / 硬件工程 / PPT 曾堆在仓库根目录，正式位置是 D:\Work\scratch
 ad7793_thermocouple/
 demo_sites/

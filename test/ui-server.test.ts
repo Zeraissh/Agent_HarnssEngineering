@@ -31,6 +31,7 @@ import {
   sitePreviewUrl,
   decodeSitePreviewPath,
   SITE_PREVIEW_CSP,
+  SITE_PREVIEW_PERMISSIONS_POLICY,
   localPathTarget,
   planGateStopReason,
   meterModelClient,
@@ -2779,9 +2780,43 @@ describe("ui-server", () => {
    * 路径是宿主关停——关停后 SSE 已断、HTTP 已关，集成层观测不到那条缓冲
    * 事件（B2 运行历史落盘后才会浮出水面），所以映射在纯函数层钉住。
    */
-  it("计划门两种收场必须分开：否决 → plan_rejected，未应答 → plan_gate_expired", () => {
+  it("计划门三种收场必须分开：否决 / 未应答 / 停止", () => {
     expect(planGateStopReason("rejected")).toBe("plan_rejected");
     expect(planGateStopReason("expired")).toBe("plan_gate_expired");
+    expect(planGateStopReason("stopped")).toBe("aborted");
+  });
+
+  it("计划门上点停止 = aborted，不是 plan_rejected", async () => {
+    const runId = await startGatedRun();
+    await waitForPlanGate(runId);
+
+    const res = await fetch(`${base}/api/runs/${runId}/stop`, { method: "POST" });
+    expect(res.status).toBe(200);
+    await waitForDone(base, runId);
+
+    const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+    expect(
+      events.some((e: any) => String(e.source).includes("/")),
+      "停止后不得有任何子任务执行",
+    ).toBe(false);
+    expect(events.some((e: any) => e.event.type === "plan_approval_expired")).toBe(true);
+
+    const done = events.find(
+      (e: any) => e.event.type === "done" && e.source === "main",
+    ) as any;
+    expect(done, "未发出 main 段的 done").toBeDefined();
+    expect(done.event.stopReason).toBe("aborted");
+    expect(done.event.error, "停止不该带 error 负载").toBeUndefined();
+
+    const end = events.find((e: any) => e.event.type === "run_end") as any;
+    expect(end.event.outcome).toBe("closed");
+    expect(end.event.mainStopReason).toBe("aborted");
+
+    const list = await (await fetch(`${base}/api/runs`)).json() as any[];
+    const summary = list.find((x) => x.runId === runId);
+    expect(summary.stopReason).toBe("aborted");
+    expect(summary.planDecision).toBeNull();
+    expect(summary.awaitingPlanApproval).toBe(false);
   });
 
   it("v2-33. 计划门幂等：二次应答 409，且不改已记录的决策", async () => {
@@ -5208,7 +5243,11 @@ describe("整站预览：相对资源可解析，但仍无同源身份", () => {
     expect(csp).toContain("script-src 'self'");
     expect(csp).toContain("default-src 'self'");
     expect(res.headers.get("x-content-type-options")).toBe("nosniff");
-    expect(await res.text()).toContain("style.css");
+    expect(res.headers.get("permissions-policy")).toContain("webgl=");
+    expect(SITE_PREVIEW_PERMISSIONS_POLICY).toContain("webgl=*");
+    const html = await res.text();
+    expect(html).toContain("style.css");
+    expect(html).toContain("agent-webgl-status");
   });
 
   it(".js 以 javascript MIME 提供，相对同目录可取", async () => {
@@ -5743,6 +5782,7 @@ describe("在文件夹中显示：从网页请求启动本机进程，圈禁只�
     expect(siteContentTypeOf("app.js")).toContain("javascript");
     expect(siteContentTypeOf("style.css")).toContain("text/css");
     expect(SITE_PREVIEW_CSP).toContain("script-src 'self'");
+    expect(SITE_PREVIEW_PERMISSIONS_POLICY).toMatch(/webgl=\*/);
   });
 
   it("sitePreviewUrl / decodeSitePreviewPath 往返，拒绝 ..", () => {
@@ -8396,6 +8436,9 @@ describe("P0 production host boundary", () => {
     });
     expect(second.status).toBe(429);
     expect(Number(second.headers.get("retry-after"))).toBeGreaterThan(0);
+    const limited = await second.json() as { error?: string };
+    expect(limited.error).toMatch(/等|交/);
+    expect(JSON.stringify(limited)).not.toMatch(/HTTP|Mutation rate limit|领域包/);
   });
 
   it("路径探活和未知 POST 不占突变额度", async () => {

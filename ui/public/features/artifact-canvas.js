@@ -23,6 +23,12 @@
  *   - iframe `sandbox="allow-scripts"`：**故意不给 allow-same-origin**。给了它，
  *     产物脚本就能读宿主 localStorage、调同源 /api/*；不给则是无源文档，脚本
  *     即使绕过 CSP 也碰不到宿主。两层独立，各自失效时另一层仍在。
+ *     翻页不读 contentDocument：chrome 只 postMessage，可见性由 /site 注入的
+ *     deck runtime 在 iframe 里改 class/hidden。不为此放开 same-origin。
+ *   - 无源文档对 Permissions-Policy 不是 `'src'`。缺 `allow="webgl *"` 时，
+ *     three.js 的 `getContext` 会在页内预览里变 null，产物就弹出
+ *     「这台设备没有可用的 WebGL」——同一份 HTML 在系统 Chrome 顶层打开却正常。
+ *     `allow` 只授权 GPU，不放开 same-origin。
  * 文本类产物（Markdown / 代码 / CSV）一律经 core/markdown.js 与
  * core/highlight.js 渲染——它们遵守「先整体转义，再做变换」纪律，本模块
  * 绝不把产物原文直接塞进 innerHTML。
@@ -36,6 +42,7 @@ import {
   formatImageReview,
   formatReviewComment,
   isInspectPick,
+  isWebglStatus,
   DECK_READY_MESSAGE_TYPE,
   DECK_GOTO_MESSAGE_TYPE,
   DECK_STATE_MESSAGE_TYPE,
@@ -50,6 +57,19 @@ export const CSV_MAX_ROWS = 200;
 /** 文本类产物最多读入的字符数（超出截断并标注，防一份超大日志卡死渲染） */
 export const TEXT_MAX_CHARS = 400_000;
 
+/**
+ * HTML 预览沙箱：有脚本、无 same-origin（无源文档，碰不到宿主 /api）。
+ * 浏览器页才额外给 same-origin，见 PREVIEW_BROWSER_SANDBOX。
+ */
+export const PREVIEW_HTML_SANDBOX = "allow-scripts";
+export const PREVIEW_BROWSER_SANDBOX =
+  "allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-same-origin allow-downloads";
+/**
+ * 无源 iframe 的文档 origin 是 opaque。`allow="webgl"` 默认 allowlist 是 `'src'`，
+ * 对不上 opaque origin，WebGL 仍被 Permissions-Policy 挡住。必须 `*`。
+ */
+export const PREVIEW_IFRAME_ALLOW = "webgl *; xr-spatial-tracking *";
+
 const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp|bmp|svg|avif)$/i;
 const HTML_EXT_RE = /\.html?$/i;
 const MARKDOWN_EXT_RE = /\.(md|mdx|markdown)$/i;
@@ -57,6 +77,16 @@ const CSV_EXT_RE = /\.(csv|tsv)$/i;
 const CODE_EXT_RE =
   /\.(css|scss|less|jsx?|mjs|cjs|tsx?|json|py|c|h|cc|cpp|cxx|hpp|cs|java|go|rs|sh|ps1|bat|cmd|ya?ml|toml|ini|xml|sql|vue|svelte)$/i;
 const TEXT_EXT_RE = /\.(txt|log|env|rst|adoc)$/i;
+const PPTX_EXT_RE = /\.pptx$/i;
+const DOCX_EXT_RE = /\.docx$/i;
+
+/** 预览 + 点评 + 对话改稿。不是「我们不做 Office」，也不是 Microsoft 就地编辑。 */
+export const OFFICE_PREVIEW_NOTE =
+  "预览 + 点评 + 对话改稿：翻页看内容，点评写进输入框，模型用 write_pptx / 源文件改稿。不是 Microsoft Office 就地编辑。";
+
+export function isOfficeKind(kind) {
+  return kind === "pptx" || kind === "docx";
+}
 
 /** 代码扩展名 → 高亮语言（highlight.js 的 normalizeLang 认得别名，这里给到粗粒度即可） */
 const CODE_LANG = {
@@ -78,7 +108,7 @@ const CODE_LANG = {
  * 判据是**扩展名**而不是 Content-Type：服务端对源码统一回 text/plain，
  * 对未知类型回 octet-stream，都不足以区分「代码高亮」与「纯文本」。
  * @param {string} path
- * @returns {"html"|"image"|"markdown"|"csv"|"code"|"text"|"binary"}
+ * @returns {"html"|"image"|"markdown"|"csv"|"code"|"text"|"pptx"|"docx"|"binary"}
  */
 /** 预览清单里的 http(s) 项：内置浏览器标签，不是本地文件。 */
 export function isBrowserPreviewPath(path) {
@@ -134,6 +164,8 @@ export function artifactRendererKind(path) {
   if (CSV_EXT_RE.test(clean)) return "csv";
   if (CODE_EXT_RE.test(clean)) return "code";
   if (TEXT_EXT_RE.test(clean)) return "text";
+  if (PPTX_EXT_RE.test(clean)) return "pptx";
+  if (DOCX_EXT_RE.test(clean)) return "docx";
   return "binary";
 }
 
@@ -148,8 +180,64 @@ export function rendererKindLabel(kind, { deck = false } = {}) {
     case "csv": return "表格";
     case "code": return "代码";
     case "text": return "文本";
+    case "pptx": return "幻灯";
+    case "docx": return "文档";
     default: return "文件";
   }
+}
+
+/**
+ * 产物画布：会话内 Office 预览 JSON。
+ * @param {string} runId
+ * @param {string} path
+ */
+export function officePreviewUrl(runId, path) {
+  return `/api/runs/${encodeURIComponent(runId)}/office-preview?path=${encodeURIComponent(path)}`;
+}
+
+/**
+ * 文件预览覆盖层：从取件 URL 抄 workdir，改走 /api/office-preview。
+ * @param {string} path
+ * @param {string} fileUrl
+ */
+export function officePreviewUrlFromFileUrl(path, fileUrl) {
+  try {
+    const u = new URL(String(fileUrl ?? ""), "http://local.invalid");
+    const q = new URLSearchParams();
+    q.set("path", String(path ?? ""));
+    const wd = u.searchParams.get("workdir");
+    if (wd) q.set("workdir", wd);
+    return `/api/office-preview?${q.toString()}`;
+  } catch {
+    return `/api/office-preview?path=${encodeURIComponent(String(path ?? ""))}`;
+  }
+}
+
+/**
+ * 翻到 Office 预览的第 index 页（0-based）。返回是否切成功。
+ * @param {HTMLElement} root
+ * @param {number} index
+ */
+export function showOfficePage(root, index) {
+  if (!root) return false;
+  const pages = [...root.querySelectorAll(".ac-office-page")];
+  if (pages.length === 0) return false;
+  const next = Math.max(0, Math.min(pages.length - 1, Number(index) || 0));
+  root.dataset.index = String(next);
+  pages.forEach((el, i) => {
+    el.hidden = i !== next;
+  });
+  const pos = root.querySelector(".ac-office-pos");
+  if (pos) pos.textContent = `${next + 1} / ${pages.length}`;
+  root.querySelectorAll(".ac-office-num").forEach((btn, i) => {
+    btn.setAttribute("aria-pressed", i === next ? "true" : "false");
+    btn.classList.toggle("is-active", i === next);
+  });
+  const prev = root.querySelector(".ac-office-prev");
+  const nxt = root.querySelector(".ac-office-next");
+  if (prev) prev.disabled = pages.length < 2;
+  if (nxt) nxt.disabled = pages.length < 2;
+  return true;
 }
 
 /**
@@ -444,15 +532,86 @@ function renderPreviewErrorCard(body, message) {
 }
 
 /**
+ * 把 Office 预览 JSON 画进容器：每页一篇，自带翻页 chrome。
+ * @param {HTMLElement} body
+ * @param {{ kind?:string, pages?:{ index?:number, title?:string, texts?:string[], images?:{ name?:string, mime?:string, dataUrl?:string }[] }[] }} preview
+ * @param {{ inspect?:boolean }} [opts]
+ */
+export function paintOfficePreview(body, preview, opts = {}) {
+  const pages = Array.isArray(preview?.pages) ? preview.pages : [];
+  const kind = preview?.kind === "docx" ? "docx" : "pptx";
+  const pageBits = pages.map((page, i) => {
+    const texts = Array.isArray(page?.texts) ? page.texts : [];
+    const images = Array.isArray(page?.images) ? page.images : [];
+    const title = String(page?.title ?? texts[0] ?? `第 ${i + 1} 页`);
+    const rest = texts.filter((t) => t && t !== title);
+    const imgBits = images
+      .filter((img) => img?.dataUrl && String(img.dataUrl).startsWith("data:image/"))
+      .map((img) => `<img class="ac-office-img" src="${esc(img.dataUrl)}" alt="${esc(img.name || title)}" />`)
+      .join("");
+    const list = rest.length
+      ? `<ul class="ac-office-texts">${rest.map((t) => `<li>${esc(t)}</li>`).join("")}</ul>`
+      : "";
+    return (
+      `<article class="ac-office-page" data-slide="${i + 1}"${i === 0 ? "" : " hidden"}>` +
+      `<h2 class="ac-office-title">${esc(title)}</h2>` +
+      list +
+      (imgBits ? `<div class="ac-office-images">${imgBits}</div>` : "") +
+      `</article>`
+    );
+  });
+  const nums = pages.map((_, i) =>
+    `<button type="button" class="btn btn--ghost ac-office-num${i === 0 ? " is-active" : ""}" data-index="${i}" aria-pressed="${i === 0 ? "true" : "false"}">${i + 1}</button>`,
+  ).join("");
+  body.innerHTML =
+    `<div class="ac-office" data-kind="${kind}" data-index="0" data-total="${pages.length}">` +
+    `<p class="ac-note">${esc(OFFICE_PREVIEW_NOTE)}</p>` +
+    `<div class="ac-office-chrome" role="navigation" aria-label="翻页">` +
+    `<button type="button" class="btn btn--ghost ac-office-prev">上一页</button>` +
+    `<div class="ac-office-pages">${nums}</div>` +
+    `<span class="ac-office-pos">${pages.length ? "1" : "0"} / ${pages.length}</span>` +
+    `<button type="button" class="btn btn--ghost ac-office-next">下一页</button>` +
+    `</div>` +
+    pageBits.join("") +
+    `<form class="ac-office-review"${opts.inspect ? "" : " hidden"}>` +
+    `<p class="ac-review-kicker">本页点评</p>` +
+    `<textarea class="ac-review-comment ac-office-comment" rows="2" placeholder="说说这一页要改什么"></textarea>` +
+    `<div class="ac-review-actions"><button type="submit" class="btn btn--primary">写进输入框</button></div>` +
+    `</form>` +
+    `</div>`;
+  const root = body.querySelector(".ac-office");
+  showOfficePage(root, 0);
+  bindOfficeChrome(root);
+}
+
+function bindOfficeChrome(root) {
+  if (!root || root.dataset.bound === "1") return;
+  root.dataset.bound = "1";
+  const current = () => Number(root.dataset.index) || 0;
+  root.querySelector(".ac-office-prev")?.addEventListener("click", () => {
+    showOfficePage(root, current() - 1);
+  });
+  root.querySelector(".ac-office-next")?.addEventListener("click", () => {
+    showOfficePage(root, current() + 1);
+  });
+  root.querySelectorAll(".ac-office-num").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      showOfficePage(root, Number(btn.getAttribute("data-index")));
+    });
+  });
+}
+
+/**
  * 按类型把容器渲染成对应预览。产物画布（run 产物）与文件预览覆盖层
  * （任意白名单内本地文件）共用这一段——类型分派、超大截断、iframe 沙箱、
  * 「先转义再变换」纪律只有一份，不会两处漂移。
  *
  * @param {HTMLElement} body 渲染容器
- * @param {{ path:string, url:string, siteUrl?:string, fetch:Function|null, isStale?:()=>boolean, inspect?:boolean }} opts
+ * @param {{ path:string, url:string, siteUrl?:string, officePreviewUrl?:string, fetch:Function|null, isStale?:()=>boolean, inspect?:boolean }} opts
  *   path 只做类型分派与标题；url 是单文件取件（图/文/下载）；HTML 预览用 siteUrl。
+ *   Office（pptx/docx）走 officePreviewUrl JSON。
  *   isStale 返回 true 表示调用方已切走，放弃渲染并返回 null。
- *   inspect 仅 HTML：同一整站 URL 加 ?inspect=1，由服务端注入点选钩子。
+ *   inspect：HTML 加 ?inspect=1；Office 展开本页点评表。
  * @returns {Promise<{ size:number|null }|null>}
  *   读到的字节数（不可得/未读取为 null）；isStale 中途成立时整体返回 null。
  */
@@ -480,8 +639,8 @@ export async function renderPreviewBody(body, opts) {
   switch (kind) {
     case "browser": {
       body.innerHTML =
-        `<iframe class="ac-frame ac-frame--web" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-same-origin allow-downloads" ` +
-        `referrerpolicy="no-referrer" src="${esc(path)}" title="${esc(browserTabLabel(path))}"></iframe>` +
+        `<iframe class="ac-frame ac-frame--web" sandbox="${PREVIEW_BROWSER_SANDBOX}" ` +
+        `allow="${PREVIEW_IFRAME_ALLOW}" referrerpolicy="no-referrer" src="${esc(path)}" title="${esc(browserTabLabel(path))}"></iframe>` +
         `<p class="ac-note">内置浏览器。部分网站禁止被嵌入，页面空白时用「在系统浏览器打开」。</p>`;
       return { size: null };
     }
@@ -490,9 +649,9 @@ export async function renderPreviewBody(body, opts) {
       const frameSrc = opts.siteUrl || url;
       const note = opts.inspect
         ? `<p class="ac-note">点评模式：点页面元素后填写意见，会写进输入框。整站资源仍可用；沙箱不含 same-origin。</p>`
-        : `<p class="ac-note">整站预览：相对 CSS/JS 按目录解析。若有 .slide 可翻页。沙箱不含 same-origin。</p>`;
+        : `<p class="ac-note">整站预览：相对 CSS/JS 按目录解析。若有 .slide 可翻页（注入脚本切可见页，沙箱不含 same-origin）。三维页若仍提示没有 WebGL，用「在系统浏览器打开」。</p>`;
       body.innerHTML =
-        `<iframe class="ac-frame" sandbox="allow-scripts" referrerpolicy="no-referrer" ` +
+        `<iframe class="ac-frame" sandbox="${PREVIEW_HTML_SANDBOX}" allow="${PREVIEW_IFRAME_ALLOW}" referrerpolicy="no-referrer" ` +
         `src="${esc(frameSrc)}" title="${esc(name)}"></iframe>` +
         note;
       return { size: null };
@@ -553,6 +712,40 @@ export async function renderPreviewBody(body, opts) {
           ? `<p class="ac-note">仅显示前 ${CSV_MAX_ROWS} 行（共 ${totalRows} 行），完整内容请下载。</p>`
           : "");
       return { size: new TextEncoder().encode(raw).length };
+    }
+    case "pptx":
+    case "docx": {
+      body.innerHTML = '<p class="ac-note">正在读取…</p>';
+      const previewUrl = String(opts.officePreviewUrl ?? "");
+      if (!fetchImpl || !previewUrl) {
+        renderPreviewErrorCard(body, "无法预览——缺少预览地址。");
+        return { size: null };
+      }
+      try {
+        const res = await fetchImpl(previewUrl);
+        if (isStale()) return null;
+        if (!res || res.ok === false) {
+          let message = "读取失败——文件可能已被移动、损坏或已加密。";
+          try {
+            const payload = await res.json();
+            if (payload?.error) message = String(payload.error);
+          } catch { /* 用默认文案 */ }
+          renderPreviewErrorCard(body, message);
+          return { size: null };
+        }
+        const payload = await res.json();
+        if (isStale()) return null;
+        if (!payload || !Array.isArray(payload.pages) || payload.pages.length === 0) {
+          renderPreviewErrorCard(body, "不是有效的 Office 文件，或已损坏。");
+          return { size: null };
+        }
+        paintOfficePreview(body, { kind, pages: payload.pages }, { inspect: Boolean(opts.inspect) });
+        return { size: null };
+      } catch {
+        if (isStale()) return null;
+        renderPreviewErrorCard(body, "读取失败——文件可能已被移动、损坏或已加密。");
+        return { size: null };
+      }
     }
     default: {
       // 二进制/未知：降级信息卡。大小仍需一次取件——读完即弃，只留字节数
@@ -760,16 +953,19 @@ export function initArtifactCanvas(host = {}, env = {}) {
 
   function paintReviewChrome(kind) {
     const html = kind === "html";
+    const office = isOfficeKind(kind);
     const image = kind === "image";
     const web = kind === "browser";
-    inspectBtn.hidden = !html;
+    inspectBtn.hidden = !(html || office);
     exportBtn.hidden = !runId || web;
     revealBtn.hidden = web;
     if (!html) hideExportMenu();
     annotateBtn.hidden = !image;
-    if (!html) {
+    if (!html && !office) {
       inspectOn = false;
       resetDeck();
+      hideDesignPanel();
+    } else if (!html) {
       hideDesignPanel();
     }
     if (!image) annotateOn = false;
@@ -777,6 +973,7 @@ export function initArtifactCanvas(host = {}, env = {}) {
     inspectBtn.classList.toggle("is-active", inspectOn);
     annotateBtn.setAttribute("aria-pressed", annotateOn ? "true" : "false");
     annotateBtn.classList.toggle("is-active", annotateOn);
+    if (kind !== "html") hideWebglBanner();
     paintDeckChrome();
     paintReviewList();
   }
@@ -919,6 +1116,7 @@ export function initArtifactCanvas(host = {}, env = {}) {
     if (slide) deckPinnedSlide = slide;
   }
 
+  /** 点评点选钉住的页；不自动写进续跑正文。 */
   function getEditScope() {
     const slide = String(deckPinnedSlide ?? "").trim();
     if (!slide) return null;
@@ -1146,8 +1344,41 @@ export function initArtifactCanvas(host = {}, env = {}) {
   exportStatus.hidden = true;
   exportStatus.setAttribute("role", "status");
 
+  const webglBanner = doc.createElement("div");
+  webglBanner.className = "ac-webgl-banner";
+  webglBanner.id = "ac-webgl-banner";
+  webglBanner.hidden = true;
+  webglBanner.setAttribute("role", "status");
+  const webglText = doc.createElement("p");
+  webglText.textContent =
+    "预览里拿不到 WebGL。若三维已经在转、只挡着「没有 WebGL」对话框，是页自己的失败遮罩没藏住（display:flex 盖掉了 hidden），不是显卡坏了。先刷新；仍是黑屏再在系统浏览器打开。";
+  const webglOpen = doc.createElement("button");
+  webglOpen.type = "button";
+  webglOpen.className = "btn btn--ghost";
+  webglOpen.id = "ac-webgl-open";
+  webglOpen.textContent = "在系统浏览器打开";
+  webglBanner.appendChild(webglText);
+  webglBanner.appendChild(webglOpen);
+
+  function hideWebglBanner() {
+    webglBanner.hidden = true;
+  }
+
+  function showWebglBanner() {
+    webglBanner.hidden = false;
+  }
+
+  webglOpen.addEventListener("click", () => {
+    if (!openExt.href || openExt.hidden) {
+      host.onAnnounce?.("没有可打开的预览地址");
+      return;
+    }
+    openExt.click();
+  });
+
   body.parentElement?.insertBefore(browserBar, body);
   body.parentElement?.insertBefore(deckBar, body);
+  body.parentElement?.insertBefore(webglBanner, body);
   body.parentElement?.insertBefore(exportStatus, body);
   body.parentElement?.insertBefore(designPanel, body);
   body.parentElement?.appendChild(reviewList);
@@ -1284,6 +1515,7 @@ export function initArtifactCanvas(host = {}, env = {}) {
     const url = artifactUrl(path, cacheBust);
 
     resetDeck({ keepPin: Boolean(keepDeckPin || cacheBust) });
+    hideWebglBanner();
     nameEl.textContent = previewTabLabel(path);
     nameEl.title = path;
     badgeEl.textContent = rendererKindLabel(kind, { deck: false });
@@ -1299,12 +1531,43 @@ export function initArtifactCanvas(host = {}, env = {}) {
       path,
       url,
       siteUrl: kind === "html" ? siteUrlFor(path, { cacheBust, inspect: inspectOn }) : undefined,
+      officePreviewUrl: isOfficeKind(kind) && runId ? officePreviewUrl(runId, path) : undefined,
       fetch: fetchImpl,
       isStale: () => token !== renderToken,
-      inspect: inspectOn && kind === "html",
+      inspect: inspectOn && (kind === "html" || isOfficeKind(kind)),
     });
     if (result && token === renderToken) setSize(result.size);
     if (token === renderToken && annotateOn && kind === "image") mountImageAnnotator();
+    if (token === renderToken && isOfficeKind(kind)) bindOfficeReview();
+  }
+
+  function bindOfficeReview() {
+    const root = body.querySelector(".ac-office");
+    if (!root) return;
+    const form = root.querySelector(".ac-office-review");
+    if (form && form.dataset.reviewBound !== "1") {
+      form.dataset.reviewBound = "1";
+      form.addEventListener("submit", (event) => {
+        event.preventDefault();
+        const slide = String((Number(root.dataset.index) || 0) + 1);
+        const comment = form.querySelector(".ac-office-comment")?.value ?? "";
+        const line = formatReviewComment("slide", comment, slide);
+        pinDeckSlide(slide);
+        reviewNotes.push({ line, slide });
+        paintReviewList();
+        host.onAppendReview?.(line);
+        host.onAnnounce?.("点评已写入输入框");
+      });
+    }
+    if (form) form.hidden = !inspectOn;
+    if (root.dataset.pinBound === "1") return;
+    root.dataset.pinBound = "1";
+    const pinFromRoot = () => pinDeckSlide(String((Number(root.dataset.index) || 0) + 1));
+    root.querySelector(".ac-office-prev")?.addEventListener("click", pinFromRoot);
+    root.querySelector(".ac-office-next")?.addEventListener("click", pinFromRoot);
+    root.querySelectorAll(".ac-office-num").forEach((btn) => {
+      btn.addEventListener("click", pinFromRoot);
+    });
   }
 
   // ---- 开关与切换 ----
@@ -1389,6 +1652,7 @@ export function initArtifactCanvas(host = {}, env = {}) {
     hideExportMenu();
     dropAnnotator();
     hideDesignPanel();
+    hideWebglBanner();
     dock.close();
   }
 
@@ -1425,8 +1689,11 @@ export function initArtifactCanvas(host = {}, env = {}) {
     urlInput.value = previewAddressValue(path);
     urlInput.title = path;
     const web = isBrowserPreviewPath(path);
-    openExt.hidden = !web;
-    openExt.href = web ? path : "";
+    const html = artifactRendererKind(path) === "html";
+    openExt.hidden = !(web || html);
+    if (web) openExt.href = path;
+    else if (html && runId) openExt.href = siteUrlFor(path);
+    else openExt.href = "";
   }
 
   function focusAddress() {
@@ -1536,8 +1803,10 @@ export function initArtifactCanvas(host = {}, env = {}) {
   });
   inspectBtn.addEventListener("click", () => {
     inspectOn = !inspectOn;
-    paintReviewChrome("html");
-    void renderCurrent({ keepDeckPin: true });
+    const kind = artifactRendererKind(currentArtifactPath());
+    paintReviewChrome(kind);
+    if (kind === "html") void renderCurrent({ keepDeckPin: true });
+    else if (isOfficeKind(kind)) bindOfficeReview();
   });
   annotateBtn.addEventListener("click", () => {
     annotateOn = !annotateOn;
@@ -1575,6 +1844,11 @@ export function initArtifactCanvas(host = {}, env = {}) {
       paintDeckChrome();
       return;
     }
+    if (isWebglStatus(data)) {
+      if (data.ok) hideWebglBanner();
+      else showWebglBanner();
+      return;
+    }
     if (!inspectOn) return;
     if (!isInspectPick(data)) return;
     if (data.slide) pinDeckSlide(data.slide);
@@ -1585,7 +1859,16 @@ export function initArtifactCanvas(host = {}, env = {}) {
   doc.addEventListener("keydown", (event) => {
     if (!dock.isOpen() || dock.isCollapsed()) return;
     if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+    if (event.target instanceof HTMLTextAreaElement || event.target instanceof HTMLInputElement) return;
     if (event.target instanceof Element && tablist.contains(event.target)) return;
+    const officeRoot = body.querySelector(".ac-office");
+    if (officeRoot && officeRoot.querySelectorAll(".ac-office-page").length > 1) {
+      event.preventDefault();
+      const next = (Number(officeRoot.dataset.index) || 0) + (event.key === "ArrowLeft" ? -1 : 1);
+      showOfficePage(officeRoot, next);
+      pinDeckSlide(String((Number(officeRoot.dataset.index) || 0) + 1));
+      return;
+    }
     if (!(deckActive && deckTotal > 1)) return;
     event.preventDefault();
     postDeckGoto({ delta: event.key === "ArrowLeft" ? -1 : 1 });

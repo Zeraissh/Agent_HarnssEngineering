@@ -22,6 +22,7 @@
  */
 
 import { SHORTCUTS } from "./command-palette.js";
+import { humanizeHttpFailure } from "./humanize-error.js";
 import { persistPromptChoice } from "./notifications.js";
 import { attachUsagePanel } from "./usage.js";
 import {
@@ -1368,7 +1369,7 @@ export function initSettingsView(host = {}, env = {}) {
       if (data?.ok) {
         setFormStatus("连接成功——端点、Key 与模型名都可用");
       } else {
-        setFormStatus(data?.error ?? `测试失败（HTTP ${res.status}）`, true);
+        setFormStatus(humanizeHttpFailure(res.status, data?.error ?? "测试没做成"), true);
       }
     } catch {
       setFormStatus("测试请求未能发出——请检查网络或服务端状态", true);
@@ -1385,7 +1386,7 @@ export function initSettingsView(host = {}, env = {}) {
     try {
       const res = await fetcher(MODELS_API_URL);
       if (!res.ok) {
-        setModelsStatus(`模型配置加载失败（HTTP ${res.status}）`, true);
+        setModelsStatus(humanizeHttpFailure(res.status, "模型配置没加载出来"), true);
         return;
       }
       const parsed = parseModelsPayload(await res.json());
@@ -1428,7 +1429,7 @@ export function initSettingsView(host = {}, env = {}) {
       });
       const data = await res.json().catch(() => null);
       if (!res.ok) {
-        setModelsStatus(data?.error ?? `保存失败（HTTP ${res.status}）`, true);
+        setModelsStatus(humanizeHttpFailure(res.status, data?.error ?? "保存没做成"), true);
         return false;
       }
       const parsed = parseModelsPayload(data);
@@ -1463,7 +1464,7 @@ export function initSettingsView(host = {}, env = {}) {
       const res = await fetcher("/api/models/sync-env", { method: "POST" });
       const data = await res.json().catch(() => null);
       if (!res.ok) {
-        setModelsStatus(data?.error ?? `同步失败（HTTP ${res.status}）`, true);
+        setModelsStatus(humanizeHttpFailure(res.status, data?.error ?? "同步没做成"), true);
         return;
       }
       const n = Array.isArray(data?.changed) ? data.changed.length : 0;
@@ -1640,7 +1641,7 @@ export function initSettingsView(host = {}, env = {}) {
     });
     const data = await res.json().catch(() => null);
     if (!res.ok) {
-      mcpStatus.textContent = data?.error ?? `请求失败（HTTP ${res.status}）`;
+      mcpStatus.textContent = humanizeHttpFailure(res.status, data?.error ?? "请求没做成");
       return;
     }
     mcpStatus.textContent = data?.message ?? "已更新";
@@ -1714,7 +1715,7 @@ export function initSettingsView(host = {}, env = {}) {
     }).then(async (res) => {
       const data = await res.json().catch(() => null);
       if (!res.ok) {
-        mcpStatus.textContent = data?.error ?? `保存失败（HTTP ${res.status}）`;
+        mcpStatus.textContent = humanizeHttpFailure(res.status, data?.error ?? "保存没做成");
         return;
       }
       void refreshMcp();
@@ -1796,7 +1797,7 @@ export function initSettingsView(host = {}, env = {}) {
       const data = await res.json().catch(() => null);
       const parsed = parsePacksPayload(data);
       if (!res.ok || !parsed) {
-        packsStatus.textContent = data?.error ?? `领域包列表加载失败（HTTP ${res.status}）`;
+        packsStatus.textContent = humanizeHttpFailure(res.status, data?.error ?? "专用工具列表没加载出来");
         return;
       }
       renderPackCards(packsDrafts, parsed.drafts, "没有待安装的草稿。对话里可用 draft_domain_pack 起草。", true);
@@ -1819,7 +1820,7 @@ export function initSettingsView(host = {}, env = {}) {
         .then(async (res) => {
           const data = await res.json().catch(() => null);
           if (!res.ok) {
-            packsStatus.textContent = data?.error ?? `安装失败（HTTP ${res.status}）`;
+            packsStatus.textContent = humanizeHttpFailure(res.status, data?.error ?? "安装没做成");
             return;
           }
           host.onAnnounce?.(`已安装领域包 ${name}`);
@@ -1834,7 +1835,7 @@ export function initSettingsView(host = {}, env = {}) {
         .then(async (res) => {
           const data = await res.json().catch(() => null);
           if (!res.ok) {
-            packsStatus.textContent = data?.error ?? `丢弃失败（HTTP ${res.status}）`;
+            packsStatus.textContent = humanizeHttpFailure(res.status, data?.error ?? "丢弃没做成");
             return;
           }
           host.onAnnounce?.(`已丢弃草稿 ${name}`);
