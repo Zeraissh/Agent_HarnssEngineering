@@ -4973,6 +4973,22 @@ body.sidebar-collapsed .sidebar {
 .cite-picker-item:focus { background: var(--surface-2); }
 .cite-picker-title { font-size: var(--font-sm); }
 .cite-picker-task { font-size: var(--font-xs); color: var(--text-3); }
+.cite-picker-filter {
+  display: block;
+  width: 100%;
+  margin: 0 0 4px;
+  padding: 6px 8px;
+  border: 1px solid var(--border-1);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text-1);
+  font: inherit;
+  font-size: var(--font-sm);
+}
+.cite-picker-filter:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
 .cite-picker-empty {
   margin: 0;
   padding: 8px;

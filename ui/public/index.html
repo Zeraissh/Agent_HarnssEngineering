@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>FATHOM 控制台</title>
+<title>FATHOM</title>
 <link rel="icon" href="/fathom-mark.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/vendor/phosphor/style.css">
 <link rel="stylesheet" href="/vendor/katex/katex.min.css">
@@ -28,7 +28,7 @@
      详情页头承担，故 sr-only 隐藏。必须包在 header（banner 地标）里——裸 h1
      游离于所有地标之外会触发 axe region 规则（页面内容须归属地标） -->
 <header class="sr-only">
-  <h1>FATHOM 控制台</h1>
+  <h1>FATHOM</h1>
 </header>
 
 <!-- 侧栏：品牌 → 顶栏图标 → 分脸 → 新建 → 搜索 → 会话列表；其余工具留底栏 -->
@@ -566,6 +566,8 @@ import {
   composerCiteTrigger,
   formatCiteChip,
   packOptionLabel,
+  applyDocumentTabTitle,
+  filterWorkspaceFileEntries,
 } from "/app.js";
 import {
   loadSettings,
@@ -1696,6 +1698,7 @@ function writeHash(runId, tab) {
   usageApi?.close();
   artifactCanvasApi?.close();
   pendingArtifact = null;
+  applyDocumentTabTitle(runId ? "run" : "home");
   // hashchange 是异步派发的，标志位要等它跑完再清
   setTimeout(() => { suppressHashHandling = false; }, 0);
 }
@@ -1874,6 +1877,7 @@ function openGalleryArtifact(card) {
 
 function applyHash() {
   const route = parseRoute();
+  applyDocumentTabTitle(route.kind);
   if (route.kind === "settings") {
     schedulesApi?.close();
     boardApi?.close();
@@ -3448,6 +3452,7 @@ function paintCiteChips() {
 
 function hideCitePicker() {
   filePickerToken += 1;
+  workspacePickerFiles = [];
   const picker = document.getElementById("cite-picker");
   if (picker) {
     picker.hidden = true;
@@ -3457,6 +3462,52 @@ function hideCitePicker() {
 }
 
 let filePickerToken = 0;
+/** 最近一次浅列，给过滤框本地再筛，不重打整树。 */
+let workspacePickerFiles = [];
+
+function bindWorkspacePickerFilter(picker, files, initial) {
+  const filter = document.createElement("input");
+  filter.type = "search";
+  filter.className = "cite-picker-filter";
+  filter.placeholder = "按文件名过滤";
+  filter.value = String(initial ?? "");
+  filter.setAttribute("aria-label", "按文件名过滤");
+  filter.addEventListener("keydown", (ev) => ev.stopPropagation());
+  filter.addEventListener("input", () => {
+    renderWorkspaceFilePickerItems(picker, files, filter.value);
+  });
+  picker.appendChild(filter);
+  return filter;
+}
+
+function renderWorkspaceFilePickerItems(picker, files, filterText) {
+  picker.querySelectorAll(".cite-picker-item, .cite-picker-empty").forEach((el) => el.remove());
+  const shown = filterWorkspaceFileEntries(files, filterText);
+  if (!shown.length) {
+    const empty = document.createElement("p");
+    empty.className = "cite-picker-empty";
+    empty.textContent = filterText ? "这个文件夹里没有匹配的文件。" : "这个文件夹里还没有可点名的文件。";
+    picker.appendChild(empty);
+    return;
+  }
+  for (const f of shown.slice(0, 12)) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "cite-picker-item";
+    btn.setAttribute("role", "option");
+    btn.dataset.filePath = f.relative;
+    btn.dataset.fileKind = f.kind;
+    const title = document.createElement("span");
+    title.className = "cite-picker-title";
+    title.textContent = f.kind === "directory" ? `${f.relative}/` : f.relative;
+    btn.appendChild(title);
+    btn.addEventListener("mousedown", (ev) => {
+      ev.preventDefault();
+      insertWorkspaceFileMention(f.relative, f.kind);
+    });
+    picker.appendChild(btn);
+  }
+}
 
 function insertWorkspaceFileMention(relative, kind) {
   const mention = `@${String(relative ?? "").replace(/\\/g, "/")}`;
@@ -3500,33 +3551,11 @@ async function paintWorkspaceFilePicker(query) {
     }
     const body = await res.json().catch(() => null);
     const files = Array.isArray(body?.files) ? body.files : [];
+    workspacePickerFiles = files;
     picker.replaceChildren();
-    if (!files.length) {
-      const empty = document.createElement("p");
-      empty.className = "cite-picker-empty";
-      empty.textContent = query ? "这个文件夹里没有匹配的文件。" : "这个文件夹里还没有可点名的文件。";
-      picker.appendChild(empty);
-      picker.hidden = false;
-      return;
-    }
     picker.hidden = false;
-    for (const f of files.slice(0, 12)) {
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "cite-picker-item";
-      btn.setAttribute("role", "option");
-      btn.dataset.filePath = f.relative;
-      btn.dataset.fileKind = f.kind;
-      const title = document.createElement("span");
-      title.className = "cite-picker-title";
-      title.textContent = f.kind === "directory" ? `${f.relative}/` : f.relative;
-      btn.appendChild(title);
-      btn.addEventListener("mousedown", (ev) => {
-        ev.preventDefault();
-        insertWorkspaceFileMention(f.relative, f.kind);
-      });
-      picker.appendChild(btn);
-    }
+    bindWorkspacePickerFilter(picker, files, query);
+    renderWorkspaceFilePickerItems(picker, files, query);
   } catch {
     if (token !== filePickerToken) return;
     hideCitePicker();

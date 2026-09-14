@@ -82,13 +82,15 @@ describe("CLI argument contract", () => {
     expect(() => parseCliArgs(["run", "--doctor", "task"])).toThrow(/不能.*同时/);
   });
 
-  it("--help 写清换模型、--plan 不等人改、非 TTY 要 --yes、飞行中不能热续", () => {
+  it("--help 写清换模型、--plan 有确认门、非 TTY 要 --yes、飞行中不能热续", () => {
     const help = cliHelpText();
     expect(help).toContain("npm run agent -- run --help");
     expect(help).toContain("AGENT_MODEL");
     expect(help).toMatch(/暂不能 --model/);
-    expect(help).toMatch(/拆完计划后立刻执行并核查/);
-    expect(help).toMatch(/不会停下来给你改/);
+    expect(help).toMatch(/拆完计划后停下等确认再执行并核查/);
+    expect(help).toMatch(/TTY 打印子任务短表并问是否开跑/);
+    expect(help).toMatch(/非 TTY 须加 --yes/);
+    expect(help).not.toMatch(/没有计划确认门/);
     expect(help).toMatch(/没有交互终端时请加 --yes/);
     expect(help).toMatch(/飞行中杀掉不能接着工具/);
     expect(help).toMatch(/不会当新任务重开/);
@@ -105,6 +107,8 @@ describe("CLI argument contract", () => {
     expect(cli).toMatch(/formatCliNeedsConfirmMessage/);
     expect(cli).toMatch(/CLI_NEEDS_CONFIRM_EXIT/);
     expect(cli).toMatch(/cliCanPrompt/);
+    expect(cli).toMatch(/confirmCliPlan/);
+    expect(cli).toMatch(/CliPlanRejectedError/);
     expect(cli).not.toMatch(/if \(autoYes \|\| !rl\)/);
   });
 

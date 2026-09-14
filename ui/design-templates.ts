@@ -24,6 +24,7 @@ export type DesignPalette = {
 };
 
 const TITLE_HINTS: Record<string, string> = {
+  "webgl-object": "三维对象",
   "deck-basic": "多页幻灯",
   "landing-basic": "单页落地",
   "social-basic": "社媒方图",

@@ -94,6 +94,13 @@ describe("D3 permission modes", () => {
     expect(noLine).toMatch(/不会自动放行/);
     expect(matchPermissionMode(no)).toBe("manual");
 
+    const planned = cliRuntimePermissionSwitches({ autoYes: false, planMode: true });
+    expect(planned.planGate).toBe(true);
+    expect(matchPermissionMode(planned)).toBe("plan");
+    const plannedLine = formatPermissionBanner(matchPermissionMode(planned), planned);
+    expect(plannedLine).toMatch(/gate=true/);
+    expect(plannedLine).toMatch(/先出计划/);
+
     const cli = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "src", "cli.ts"), "utf8");
     expect(cli).toMatch(/cliRuntimePermissionSwitches/);
     expect(cli).toMatch(/formatPermissionBanner/);

@@ -8,7 +8,7 @@
 
 | 面 | 命令 | 现在实际进哪 |
 |---|---|---|
-| **Web** | `npm run ui` | `ui/serve.ts`，默认 `http://127.0.0.1:4173`（`AGENT_UI_PORT` / `PORT`）。页标题是「FATHOM 控制台」 |
+| **Web** | `npm run ui` | `ui/serve.ts`，默认 `http://127.0.0.1:4173`（`AGENT_UI_PORT` / `PORT`）。页标题与桌面对齐：首页 `FATHOM`、对话 `FATHOM · 对话` |
 | **CLI** | `npm run agent -- …`（`npm run cli` 同入口） | `src/cli.ts`。用法：`npm run agent -- --help` |
 | **桌面** | `npm run desktop` | Electron 壳：本机 4173 已健康就贴上；没有就拉起当前 `ui/serve.ts`。窗框首页 `FATHOM`、对话 `FATHOM · 对话`。**没有开始菜单项**。详见 [`cross-app/README.md`](cross-app/README.md) |
 
@@ -16,9 +16,9 @@
 
 ### 权限默认与页面上的字（已落地）
 
-- **CLI**：不加 `--yes` 时 ask 级要确认。非 TTY 印「需要确认，请加 `--yes`」，退出码 2，不摔 readline。`--yes` 横幅跟真实档位（`yes=true` / 会自动放行）。`--resume-run` 读不到检查点就停，印原任务/终态，不当新任务重开。`run --help` 可用；顶层帮助写用 `AGENT_MODEL` 换模型。`--plan` 拆完就执行并核查，CLI 没有计划确认门。`permission: deny`、圈禁、SSRF **打不穿**。
+- **CLI**：不加 `--yes` 时 ask 级要确认。非 TTY 印「需要确认，请加 `--yes`」，退出码 2，不摔 readline。`--yes` 横幅跟真实档位（`yes=true` / 会自动放行）。`--resume-run` 读不到检查点就停，印原任务/终态，不当新任务重开。`run --help` 可用；顶层帮助写用 `AGENT_MODEL` 换模型。`--plan`：TTY 出计划后问「开跑？ [y/N]」（可改一行标题）；非 TTY 无 `--yes` 退出码 2、印「需要确认，请加 `--yes`」。帮助不再写「没有计划确认门」。`permission: deny`、圈禁、SSRF **打不穿**。
 - **Web 服务端**：`WEB_DEFAULT_AUTO_APPROVE = false`，`WEB_DEFAULT_PERMISSION_MODE = "manual"`；`GET /api/harness.defaults.autoApprove === false`。Work 没点稿件芯片不再 409，直接建 run。4xx / 429 正文走人话，不甩 HTTP / 领域包 / `Mutation rate limit`（429：「前面还有人在交，请等几秒。」）。计划确认门：`POST /api/runs/:id/plan-approval` 的 `edits` 只写活计划的 `title` / `description`，再按改过的计划执行。门上点停止 → `stopReason=aborted`（「已停止」），不是否决；否决按钮才是 `plan_rejected`。
-- **Web 页面（`ui/public`）**：默认 Work 脸。发送按钮和 label「发送」，占位「说要做什么…」（选了稿件标题时「要「标题」做什么…」）。「自动放行」默认不勾，说明「默认先问；勾上才自动放行」。独立核查在「运行设置」里，不挂发送栏。新手卡 1/4「打一句话，回车」；写入圈在设置「只能改这些文件夹」；3/4「需要时再开运行设置」，不再点名领域包 / 计划编排 / 独立核查。批准卡主文案「要新建或改 …」，按钮「允许」「拒绝」。有写盘不出现「本次运行没有写盘操作」；有本场文件不说「还没有产物」。停→「已停止」；完成→「运行已完成」；否决→「计划未获批准」。计划门上点停止也是「已停止」（不是否决）；否决按钮才是否决；停/否决后不再钉「批准并开跑」。计划卡叫「计划」，提问卡叫「助手」。失败条（含 composer 以外：删除 / 停止 / 上传 / 设置等）429/HTTP/领域包改成一句人话，不自拼「提交失败（HTTP …）」。计划确认门可改子任务标题/短说明（只这两项）。`@` 列出圈禁内工作区文件/目录，插入 `@path`（目录带尾 `/`）；`#` `/` `$` 仍不吃。「引用会话」仍是旧对话。侧栏「全部项目」默认勾上；勾选 vs 设为主说人话（点名=下次写入这里，勾选=这次也可以读写）。空态「现在只能在这个窗口下指令。」「输入 @ 可点名这个文件夹里的文件。旧对话用「引用会话」。」；GitHub 没连不给假开 PR。对话有来源表 +「导出链接列表」；领域包「consult · 查资料」。侧栏顶栏 / 指挥中心：「今日 $」/「这次 $」。预览走页内坞/浮层，不跳 `file://`。
+- **Web 页面（`ui/public`）**：默认 Work 脸。浏览器标签首页 `FATHOM`、对话 `FATHOM · 对话`，不再写「FATHOM 控制台」。发送按钮和 label「发送」，占位「说要做什么…」（选了稿件标题时「要「标题」做什么…」）。「自动放行」默认不勾，说明「默认先问；勾上才自动放行」。独立核查在「运行设置」里，不挂发送栏。新手卡 1/4「打一句话，回车」；写入圈在设置「只能改这些文件夹」；3/4「需要时再开运行设置」，不再点名领域包 / 计划编排 / 独立核查。批准卡主文案「要新建或改 …」，按钮「允许」「拒绝」。有写盘不出现「本次运行没有写盘操作」；有本场文件不说「还没有产物」。停→「已停止」；完成→「运行已完成」；否决→「计划未获批准」。计划门上点停止也是「已停止」（不是否决）；否决按钮才是否决；停/否决后不再钉「批准并开跑」。计划卡叫「计划」，提问卡叫「助手」。失败条（含 composer 以外：删除 / 停止 / 上传 / 设置等）429/HTTP/领域包改成一句人话，不自拼「提交失败（HTTP …）」。计划确认门可改子任务标题/短说明（只这两项）。`@` 列出圈禁内工作区文件/目录，插入 `@path`（目录带尾 `/`）；picker 可按文件名过滤浅列表；`#` `/` `$` 仍不吃。「引用会话」仍是旧对话。正文未到但本轮已有 `assistant_thinking` 时直播条「正在想…」；`thinking_delta` 不进时间线。设计包失败遮罩须 `[hidden]{display:none!important}` 或成功后摘 DOM；三维 starter `templates/design/webgl-object/`。侧栏「全部项目」默认勾上；勾选 vs 设为主说人话（点名=下次写入这里，勾选=这次也可以读写）。空态「现在只能在这个窗口下指令。」「输入 @ 可点名这个文件夹里的文件。旧对话用「引用会话」。」；GitHub 没连不给假开 PR。对话有来源表 +「导出链接列表」；领域包「consult · 查资料」。侧栏顶栏 / 指挥中心：「今日 $」/「这次 $」。预览走页内坞/浮层，不跳 `file://`。
 
 评测怎么读：[`eval/persona-ux/README.md`](eval/persona-ux/README.md)。walks / VERIFY 仍是改前活页，不是「问题已消失」。
 
@@ -94,7 +94,7 @@ npm run agent -- run "阅读 docs/ 下所有文档，生成 SUMMARY.md"    # 新
 npm run agent -- run --yes "……"                                  # 自动批准 ask（CI / 非 TTY）
 npm run agent -- run --verify "……"                               # 完成后 verifier 独立核查，未通过自动返工
 npm run agent -- run --ask "……"                                  # 允许执行前集中提出 1~4 个选择题（可自由输入）
-npm run agent -- run --plan --parallel 3 "……"                    # CLI --plan 拆完就执行并核查；没有计划确认门
+npm run agent -- run --plan --parallel 3 "……"                    # TTY 出计划后 y/n（可改一行标题）；非 TTY 须 --yes
 npm run agent -- run --plan --resume-run cli-123                 # 半截 DAG 续发射（至少一枚 passed；预算耗尽则拒）
 npm run agent -- run --resume-run cli-123                        # 有已提交检查点才热续；飞行中杀掉不能接着工具
 npm run agent -- --help                                           # 与 src/cli-args.ts cliHelpText() 同源
@@ -305,7 +305,7 @@ powershell ... -EnvironmentId "<Agent 面板 Environment 卡片里的 ID>"
 
 ## Web 控制台与跨端 App
 
-浏览器页标题是 **「FATHOM 控制台」**（`ui/public/index.html`）。桌面窗框按路由自定：首页 `FATHOM`、对话 `FATHOM · 对话`（设置 / 指挥中心 / 产物 / 定时任务 / 消耗同款前缀），不抄页标题。控制台在 [`ui/`](ui/)
+浏览器页标题与桌面窗框同一套：首页 `FATHOM`、对话 `FATHOM · 对话`（设置 / 指挥中心 / 产物 / 定时任务 / 消耗同款前缀）。控制台在 [`ui/`](ui/)
 （`ui/server.ts` + `ui/public`：提交 / SSE / 审批 / 核查 / 计划确认门可改短句 / 产物页内预览）。
 桌面端（Electron）与移动端（Capacitor Android）外壳在 [`cross-app/`](cross-app/)——
 连接同一套宿主，不是另一套执行引擎。开发入口 `npm run desktop`；**现在没有开始菜单项**：

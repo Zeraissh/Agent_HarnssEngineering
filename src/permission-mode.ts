@@ -110,7 +110,7 @@ export function formatPermissionBanner(
 
 /**
  * CLI 实际生效的开关。不抄 AGENT_PERMISSION_MODE 标签：
- * `--yes` 才自动放行；`--plan` 会拆完就执行，没有计划确认门。
+ * `--yes` 才自动放行工具；`--plan` 有确认门（TTY 问 y/n；非 TTY 须 --yes）。
  */
 export function cliRuntimePermissionSwitches(opts: {
   autoYes: boolean;
@@ -119,7 +119,7 @@ export function cliRuntimePermissionSwitches(opts: {
   return {
     approvalDefault: opts.autoYes ? "auto" : "ask",
     planMode: Boolean(opts.planMode),
-    planGate: false,
+    planGate: Boolean(opts.planMode),
     autoYes: opts.autoYes,
   };
 }

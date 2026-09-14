@@ -67,6 +67,9 @@ import {
   composerCiteTrigger,
   buildWorkspaceFilesUrl,
   filterCiteCandidates,
+  filterWorkspaceFileEntries,
+  documentTabTitle,
+  applyDocumentTabTitle,
   sameWorkdirCiteRuns,
   packOptionLabel,
   deriveChatSources,
@@ -242,6 +245,15 @@ describe("reduceEvent", () => {
     expect(types).not.toContain("text_delta");
     expect(state.timeline).toHaveLength(2);
     expect(types).toEqual(["turn_start", "assistant_text"]);
+  });
+
+  it("2b. thinking_delta 与 text_delta 一样不进时间线", () => {
+    let state = createInitialState("r2b", "task", false);
+    state = reduceEvent(state, sse("main", "turn_start", { turn: 1 }));
+    const before = state;
+    state = reduceEvent(state, sse("main", "thinking_delta", { text: "先想一步" }));
+    expect(state).toBe(before);
+    expect(state.timeline.map((e) => e.type)).not.toContain("thinking_delta");
   });
 
   // ---- AC3-3: verifier 事件归入核查面板 ----
@@ -660,8 +672,12 @@ describe("reduceEvent", () => {
 
   it("14c. 文档标题与侧栏字标落地 FATHOM", () => {
     const html = readFileSync(join(__dirname, "..", "ui", "public", "index.html"), "utf-8");
-    expect(html).toContain("<title>FATHOM 控制台</title>");
-    expect(html).toContain("<h1>FATHOM 控制台</h1>");
+    expect(html).toContain("<title>FATHOM</title>");
+    expect(html).toContain("<h1>FATHOM</h1>");
+    expect(html).not.toContain("FATHOM 控制台");
+    expect(html).toContain("applyDocumentTabTitle(");
+    expect(html).toContain("filterWorkspaceFileEntries(");
+    expect(html).toContain("cite-picker-filter");
     expect(html).toContain("fathom-plumb");
     expect(html).toContain("FATHOM<span class=\"fw-dot\">.</span>");
     expect(html).toContain('id="workspace-face"');
@@ -672,6 +688,29 @@ describe("reduceEvent", () => {
     expect(html).not.toMatch(/id="workspace-face-office"[^>]*>办公</);
     expect(html).not.toMatch(/id="workspace-face-code"[^>]*>编码</);
     expect(html).not.toContain("项目与对话");
+  });
+
+  it("14c-tab. 浏览器标签与桌面七路对齐，不写控制台", () => {
+    expect(documentTabTitle("home")).toBe("FATHOM");
+    expect(documentTabTitle(undefined)).toBe("FATHOM");
+    expect(documentTabTitle("run")).toBe("FATHOM · 对话");
+    expect(documentTabTitle("settings")).toBe("FATHOM · 设置");
+    expect(documentTabTitle("board")).toBe("FATHOM · 指挥中心");
+    expect(documentTabTitle("artifacts")).toBe("FATHOM · 产物");
+    expect(documentTabTitle("artifact")).toBe("FATHOM · 产物");
+    expect(documentTabTitle("schedules")).toBe("FATHOM · 定时任务");
+    expect(documentTabTitle("usage")).toBe("FATHOM · 消耗");
+    const titles = ["home", "run", "settings", "board", "artifacts", "artifact", "schedules", "usage"]
+      .map((k) => documentTabTitle(k));
+    for (const t of titles) expect(t).not.toMatch(/控制台/);
+    const heading = { textContent: "旧" };
+    const doc = {
+      title: "旧",
+      querySelector: () => heading,
+    };
+    expect(applyDocumentTabTitle("run", doc)).toBe("FATHOM · 对话");
+    expect(doc.title).toBe("FATHOM · 对话");
+    expect(heading.textContent).toBe("FATHOM · 对话");
   });
 
   it("14d. 侧栏：通知与主题在顶栏，底栏留其余工具，新建在列表之上", () => {
@@ -3258,6 +3297,13 @@ describe("点名引用（composer + derive）", () => {
     expect(composerCiteTrigger("参考 @规格")).toEqual({ start: 3, query: "规格", kind: "file" });
     expect(buildWorkspaceFilesUrl("D:\\work", "src/a")).toContain("/api/workspace/files?");
     expect(buildWorkspaceFilesUrl("D:\\work", "src/a")).toContain("q=src");
+    const listed = [
+      { name: "hello.txt", relative: "hello.txt", kind: "file" },
+      { name: "src", relative: "src", kind: "directory" },
+    ];
+    expect(filterWorkspaceFileEntries(listed, "hel").map((f) => f.name)).toEqual(["hello.txt"]);
+    expect(filterWorkspaceFileEntries(listed, "SRC").map((f) => f.relative)).toEqual(["src"]);
+    expect(filterWorkspaceFileEntries(listed, "")).toHaveLength(2);
   });
 
   it("consult 包在运行设置里写清查资料", () => {

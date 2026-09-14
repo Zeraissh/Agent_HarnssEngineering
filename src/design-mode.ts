@@ -11,7 +11,7 @@
  */
 import { writeFile } from "node:fs/promises";
 import { routeToPack, type RouteDecision } from "./router.js";
-import { PACKS, type DomainPack } from "./presets.js";
+import { HIDDEN_ATTR_FIX_CSS, PACKS, type DomainPack } from "./presets.js";
 import { resolveInWorkdir } from "./tools/fs-util.js";
 import type { AgentConfig, ModelClient, TurnEvent } from "./types.js";
 
@@ -715,9 +715,9 @@ export async function routeDesignTask(opts: {
   }
 }
 
-/** R3 / 空白起步用的最小 HTML。不写后导出、不提 Office 引擎。 */
+/** R3 / 空白起步用的最小 HTML。不写后导出、不提 Office 引擎。失败遮罩纪律见 HIDDEN_ATTR_FIX_CSS。 */
 export const BLANK_DESIGN_INDEX_HTML =
-  "<!DOCTYPE html>\n<html lang=\"zh-CN\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title></title>\n</head>\n<body>\n</body>\n</html>\n";
+  `<!DOCTYPE html>\n<html lang="zh-CN">\n<head>\n<meta charset="utf-8">\n<meta name="viewport" content="width=device-width, initial-scale=1">\n<title></title>\n<style>${HIDDEN_ATTR_FIX_CSS}</style>\n</head>\n<body>\n</body>\n</html>\n`;
 
 export async function writeBlankDesignIndex(workdir: string): Promise<string> {
   const abs = resolveInWorkdir(workdir, "index.html");
@@ -727,7 +727,7 @@ export async function writeBlankDesignIndex(workdir: string): Promise<string> {
 
 /** 规格 + 幻灯的预览入口：链到两份子目录，不假装已拆成两次路由。 */
 export const DESIGN_BUNDLE_HUB_HTML =
-  "<!DOCTYPE html>\n<html lang=\"zh-CN\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>规格 + 幻灯</title>\n<style>\nbody{font-family:system-ui,sans-serif;margin:2rem;line-height:1.5;color:#1a1814;background:#f4f1ea}\na{color:#b0522f}\n</style>\n</head>\n<body>\n<h1>规格 + 幻灯</h1>\n<p>两份制品，命名路径播种；不是通用多命中拆分。</p>\n<ul>\n<li><a href=\"./pm-spec/index.html\">产品规格</a></li>\n<li><a href=\"./deck-basic/index.html\">汇报幻灯</a></li>\n</ul>\n</body>\n</html>\n";
+  `<!DOCTYPE html>\n<html lang="zh-CN">\n<head>\n<meta charset="utf-8">\n<meta name="viewport" content="width=device-width, initial-scale=1">\n<title>规格 + 幻灯</title>\n<style>\n${HIDDEN_ATTR_FIX_CSS}\nbody{font-family:system-ui,sans-serif;margin:2rem;line-height:1.5;color:#1a1814;background:#f4f1ea}\na{color:#b0522f}\n</style>\n</head>\n<body>\n<h1>规格 + 幻灯</h1>\n<p>两份制品，命名路径播种；不是通用多命中拆分。</p>\n<ul>\n<li><a href="./pm-spec/index.html">产品规格</a></li>\n<li><a href="./deck-basic/index.html">汇报幻灯</a></li>\n</ul>\n</body>\n</html>\n`;
 
 export async function writeDesignBundleHub(workdir: string): Promise<string> {
   const abs = resolveInWorkdir(workdir, "index.html");

@@ -8,9 +8,9 @@
  *               与 --yes 互斥（无人值守没人可问，给了会提示并忽略）。
  *               verifier/planner 永远拿不到这个工具（harness 层强制）。
  *               每次提交 1~4 个问题，每题带 2~4 个候选，回车跳过单题
- *   --plan      三角编排：planner 拆解子任务（自选领域包+依赖图）→ 立刻执行→核查→交接；
- *               CLI 没有计划确认门，不会停下来给人改。互不依赖的子任务默认并发
- *               （并行度 auto = min(3, 计划层宽)）
+ *   --plan      三角编排：planner 拆解子任务（自选领域包+依赖图）→ 确认门 → 执行→核查→交接；
+ *               TTY 打印短表问 y/n（可改一行标题）；非 TTY 须 --yes 才自动开跑，否则退出码 2。
+ *               互不依赖的子任务默认并发（并行度 auto = min(3, 计划层宽)）
  *   --resume-run ID  同 run 热续。不带 --plan：从已提交的 main 检查点续跑；
  *                    带 --plan：半截 DAG 续发射（至少一枚 passed，不重跑 planner）。
  *                    读不到热续检查点就停并印原任务/终态，不当新任务重开。
@@ -160,6 +160,13 @@ import {
   planNodesFromSubtasks,
   type PlanNodeState,
 } from "./planner.js";
+import {
+  applyCliPlanTitleEdits,
+  CliPlanRejectedError,
+  confirmCliPlan,
+  formatCliPlanShortTable,
+  resolveCliPlanGateMode,
+} from "./cli-plan-gate.js";
 import { readArchivedState, readArchivedTranscript } from "../ui/history.js";
 import { seedDurableBudget, snapshotDurableBudget } from "./run-state.js";
 import { resolveVerifierReadOnlyCommands, type VerifyOutcome } from "./verifier.js";
@@ -1723,7 +1730,9 @@ async function main(): Promise<void> {
     } else {
       cliDurable?.apply({ type: "plan_begin" });
     }
-    const outcome = await runPlanned(config, modelClient, plannedTask, {
+    let outcome: Awaited<ReturnType<typeof runPlanned>> | undefined;
+    try {
+    outcome = await runPlanned(config, modelClient, plannedTask, {
       packs: allPacks(),
       concurrency,
       plannerProtocol: planProtocol,
@@ -1748,28 +1757,11 @@ async function main(): Promise<void> {
         );
         cliDurable?.noteHostEvent(hostPlanReplanEvent(diff));
       },
-      onPlan: (plan) => {
+      onPlan: async (plan) => {
         planRef = plan;
         planReadyAt = Date.now();
         if (concurrency === "auto") {
           effectiveConcurrency = Math.min(AUTO_CONCURRENCY_CAP, planParallelWidth(plan.subtasks));
-        }
-        if (!cliPlanResume) {
-          livePlanNodes = planNodesFromSubtasks(plan.subtasks, "pending");
-          cliDurable?.apply({
-            type: "plan_ready",
-            plan: durablePlanFromPlan(plan, planProtocol, livePlanNodes),
-            gated: false,
-          });
-          cliDurable?.noteHostEvent(
-            hostPlanEvent({
-              concurrency: effectiveConcurrency,
-              concurrencyMode: concurrency === "auto" ? "auto" : "fixed",
-              plannerMs: planReadyAt - startedAt,
-              subtasks: hostPlanSubtaskViews(plan.subtasks, (name) => getPack(name)?.resources),
-              gated: false,
-            }),
-          );
         }
         endStreamLine();
         console.log(
@@ -1777,10 +1769,74 @@ async function main(): Promise<void> {
             `\n═══ 计划${effectiveConcurrency > 1 ? c.dim(`（并行度 ${effectiveConcurrency}${concurrency === "auto" ? " auto" : ""}）`) : ""} ═══`,
           ),
         );
+        console.log(formatCliPlanShortTable(plan));
         for (const s of plan.subtasks) {
-          const deps = s.dependsOn.length > 0 ? c.dim(` ⇐ ${s.dependsOn.join(",")}`) : "";
-          console.log(`${c.cyan(s.id)} ${s.title}${s.pack ? c.dim(` [pack: ${s.pack}]`) : ""}${deps}`);
           for (const a of s.acceptance) console.log(c.dim(`    验收: ${a}`));
+        }
+
+        const skipGate = Boolean(cliPlanResume);
+        const gateMode = resolveCliPlanGateMode({ autoYes, canPrompt });
+        const gated = !skipGate && gateMode !== "auto";
+
+        if (!cliPlanResume) {
+          livePlanNodes = planNodesFromSubtasks(plan.subtasks, "pending");
+          if (gated) {
+            cliDurable?.apply({
+              type: "plan_ready",
+              plan: durablePlanFromPlan(plan, planProtocol, livePlanNodes),
+              gated: true,
+            });
+          }
+        }
+
+        if (!skipGate) {
+          const decision = await confirmCliPlan({
+            plan,
+            autoYes,
+            canPrompt,
+            question: async (prompt) => {
+              if (!rl) {
+                throw Object.assign(new Error("readline was closed"), { code: "ERR_USE_AFTER_CLOSE" });
+              }
+              return rl.question(prompt);
+            },
+          });
+          if (decision.kind === "need_yes") {
+            console.error(c.red(formatCliNeedsConfirmMessage()));
+            process.exit(CLI_NEEDS_CONFIRM_EXIT);
+          }
+          if (decision.kind === "reject") {
+            cliDurable?.apply({ type: "plan_rejected", at: Date.now() });
+            throw new CliPlanRejectedError();
+          }
+          if (decision.edits.length) {
+            applyCliPlanTitleEdits(plan, decision.edits);
+            livePlanNodes = planNodesFromSubtasks(plan.subtasks, "pending");
+            console.log(
+              c.dim(`已改标题：${decision.edits.map((e) => `${e.id} → ${e.title}`).join("；")}`),
+            );
+          }
+        }
+
+        if (!cliPlanResume) {
+          if (gated) {
+            cliDurable?.apply({ type: "plan_approved", at: Date.now() });
+          } else {
+            cliDurable?.apply({
+              type: "plan_ready",
+              plan: durablePlanFromPlan(plan, planProtocol, livePlanNodes),
+              gated: false,
+            });
+          }
+          cliDurable?.noteHostEvent(
+            hostPlanEvent({
+              concurrency: effectiveConcurrency,
+              concurrencyMode: concurrency === "auto" ? "auto" : "fixed",
+              plannerMs: planReadyAt - startedAt,
+              subtasks: hostPlanSubtaskViews(plan.subtasks, (name) => getPack(name)?.resources),
+              gated,
+            }),
+          );
         }
       },
       onSubtaskStart: (sub) => {
@@ -1905,6 +1961,25 @@ async function main(): Promise<void> {
         await renderEvent(event);
       },
     });
+    } catch (err) {
+      if (err instanceof CliPlanRejectedError) {
+        console.log(c.yellow(`\n${err.message}`));
+        ledgerFacts = {
+          stopReason: "plan_rejected",
+          error: null,
+          turns: 0,
+          reworks: 0,
+          finalPassed: false,
+          verifications: [],
+        };
+        process.exitCode = err.exitCode;
+      } else {
+        throw err;
+      }
+    }
+    if (!outcome) {
+      // 确认门否决：档案已写 plan_rejected（closed），不要再 markFailed 盖成 error
+    } else {
     const finishedAt = Date.now();
     const totalWallMs = finishedAt - startedAt;
     const wallMs = finishedAt - planReadyAt; // 子任务阶段墙钟（排除 planner）
@@ -1959,6 +2034,7 @@ async function main(): Promise<void> {
     }
     if (outcome.completed) cliDurable?.markCompleted();
     else cliDurable?.markFailed();
+    }
   } else if (cliSingleResume) {
     const loop = new AgentLoop(config, modelClient);
     const feedback = task || "接着上次的检查点继续";
@@ -2101,8 +2177,8 @@ async function main(): Promise<void> {
       agentMd: agentMdBundle
         ? { files: agentMdBundle.files.length, chars: agentMdBundle.chars, truncated: agentMdBundle.truncated }
         : null,
-      // 档位跟实际开关走，不跟 AGENT_PERMISSION_MODE 标签：CLI --plan 没有计划确认门，
-      // 对不上 plan 预设就记 null（自定义），不许把标签抄进台账。
+      // 档位跟实际开关走，不跟 AGENT_PERMISSION_MODE 标签：CLI --plan 有确认门，
+      // 无 --yes 时对得上 plan 预设；--plan --yes 是自定义，不许把标签抄进台账。
       permissionMode: matchPermissionMode(permissionSwitches),
       approvals: ledgerApprovals,
       // 窗口 / 预算各带来源：事后才能回答"这次运行的压缩阈值到底是谁定的、离窗口多远"
@@ -2345,6 +2421,10 @@ main().catch(async (err) => {
   if (err instanceof CliArgumentError) {
     console.error(c.red(err.message));
     console.error(c.dim("使用 --help 查看用法。"));
+    process.exit(err.exitCode);
+  }
+  if (err instanceof CliPlanRejectedError) {
+    console.error(c.yellow(err.message));
     process.exit(err.exitCode);
   }
   console.error(c.red(err instanceof Error ? err.stack ?? err.message : String(err)));

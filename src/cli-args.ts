@@ -220,7 +220,7 @@ export function cliHelpText(): string {
     "Run options:",
     "  --yes          自动批准工具请求（仅用于明确接受风险的无人值守运行）",
     "  --verify       独立核查，未通过时有界返工",
-    "  --plan         拆完计划后立刻执行并核查子任务；CLI 不会停下来给你改（没有计划确认门）",
+    "  --plan         拆完计划后停下等确认再执行并核查。TTY 打印子任务短表并问是否开跑（y/n，可选改一行标题）；非 TTY 须加 --yes 才自动开跑，否则退出码 2 并印「需要确认，请加 --yes」",
     "  --parallel N   plan 并行度；也接受 --parallel=N，省略 N 表示 auto",
     "  --auto         自动选择单领域 pack",
     "  --ask          允许 agent 在执行前集中提问（与 --yes 互斥）",

@@ -80,10 +80,19 @@ describe("domain packs", () => {
     expect(p!.systemPrompt).toContain("write_pptx");
     expect(p!.systemPrompt).toContain("[改稿范围]");
     expect(p!.systemPrompt).toContain("[点评][slide:");
+    expect(p!.systemPrompt).toContain("识图门");
+    expect(p!.systemPrompt).toContain("即使带了上述标记，也按整份修");
+    expect(p!.systemPrompt).toContain("[hidden]{display:none!important}");
+    expect(p!.systemPrompt).toContain("禁止只靠 hidden 属性配 display:flex");
+    expect(p!.systemPrompt).toContain("templates/design/webgl-object");
+    expect(p!.verify.instructions).toContain("路径存在不够");
+    expect(p!.verify.instructions).toContain("describe_image");
+    expect(p!.verify.rubric).toContain("配图对不对题是客观项");
     expect(p!.builtinTools).toEqual(
-      expect.arrayContaining(["read_file", "write_file", "write_pptx", "bash", "web_search", "fetch_url"]),
+      expect.arrayContaining(["read_file", "write_file", "write_pptx", "bash", "web_search", "fetch_url", "describe_image"]),
     );
     expect(p!.builtinTools).toContain("write_pptx");
+    expect(p!.builtinTools).toContain("describe_image");
   });
 
   it("write_pptx 只挂在 design 包，其它内置包不声明", () => {
@@ -271,6 +280,31 @@ describe("kicad 包的眼睛（describe_image，案例 #9 收官催生）", () =
     const face = selectPackTools(PACKS["kicad"], basePool, []);
     expect(face.some((t) => t.name === "describe_image")).toBe(false);
     expect(face).toHaveLength(3);
+  });
+});
+
+describe("design 包的眼睛（配图必须被看过）", () => {
+  const basePool = [
+    makeTool({ name: "bash" }),
+    makeTool({ name: "read_file" }),
+    makeTool({ name: "write_file" }),
+    makeTool({ name: "write_pptx" }),
+    makeTool({ name: "glob" }),
+    makeTool({ name: "grep" }),
+    makeTool({ name: "generate_image" }),
+    makeTool({ name: "web_search" }),
+    makeTool({ name: "fetch_url" }),
+  ];
+
+  it("配了视觉模型 → design 工具面带识图", () => {
+    const pool = [...basePool, makeTool({ name: "describe_image" })];
+    const face = selectPackTools(PACKS.design, pool, []);
+    expect(face.some((t) => t.name === "describe_image")).toBe(true);
+  });
+
+  it("没配视觉模型 → 干净缺席", () => {
+    const face = selectPackTools(PACKS.design, basePool, []);
+    expect(face.some((t) => t.name === "describe_image")).toBe(false);
   });
 });
 

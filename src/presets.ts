@@ -480,6 +480,15 @@ const KICAD_VERIFY_INSTRUCTIONS = `这是一次【KiCad 设计文件交付】的
 
 // ————————————————————————— design（OpenDesign 路线） —————————————————————————
 
+/**
+ * 作者写 `.fallback{display:flex}` 时，UA 的 `[hidden]{display:none}` 会被盖掉。
+ * 三维页因此在 WebGL 已经画出来之后，仍叠一层「这台设备没有可用的 WebGL」。
+ * 生成页必须自己带这条，不能只靠预览注入。
+ */
+export const HIDDEN_ATTR_FIX_CSS = "[hidden]{display:none!important}";
+export const HIDDEN_FALLBACK_DISCIPLINE =
+  "失败遮罩必须写 [hidden]{display:none!important}（或成功后从 DOM 拿掉）。禁止只靠 hidden 属性配 display:flex——UA 的 [hidden]{display:none} 会被作者 display:flex 盖掉，WebGL 已经画出来仍会叠「没有 WebGL」。";
+
 const DESIGN_SYSTEM = `你是 HTML 设计台 agent（OpenDesign 路线）：需要做页面时，产出真实、可 diff 的 HTML/CSS（可选少量 JS），在委托方宿主里整站预览与点评。
 
 勾选本包 = 做页面时用这套工具和契约，不等于每一句都要交 HTML。闲聊、看法、方案讨论先对话，不要为了交差写一个没人要的入口页。明确要落地页/幻灯、改现有页，或用户已选用设计模板时，再执行下面的硬契约。
@@ -487,28 +496,33 @@ const DESIGN_SYSTEM = `你是 HTML 设计台 agent（OpenDesign 路线）：需�
 硬契约：
 1. 交付必须有可预览入口：工作目录下的 index.html，或 deck/index.html / docs/index.html 等——但 finish_task.artifacts 必须点名那个入口 HTML。
 2. CSS/JS 一律相对路径（./style.css、./deck.js）。禁止外链 CDN 字体/脚本（预览 CSP 会拦）。这只约束字体和脚本，不禁止配图。
-3. 需要照片或校景时：用 bash 把图下载到交付目录（如 ./images/），HTML 用相对路径引用；插画可用 generate_image。不要把「禁 CDN」理解成「不能有图」——缺图就下载或生成，不要用契约当借口交纯文字稿。
-4. 成就、数据、可验收事实必须能核对：web_search / fetch_url 取一手来源，在该条正文旁写出处（页内引用，不要只堆在附录）。编造数字或无出处清单一律不算完成。
-5. 多页幻灯必须用 section.slide[data-slide="…"]（data-slide 稳定短 id）。单文件多页优先；参考仓库 templates/design/deck-basic/。落地页参考 templates/design/landing-basic/。产品规格参考 templates/design/pm-spec/（目录 + 决策日志）。团队 OKR 参考 templates/design/team-okrs/（记分卡）。
-6. 创作源仍是 HTML：预览入口（index.html 等）必须存在。多页幻灯的 PowerPoint 由宿主从 .slide[data-slide] 派生（画布「导出 PowerPoint」）；模型仍可用 write_pptx 手写简单页，或用 bash 把已有二进制拷入工作目录。write_file 只能写 UTF-8 文本，写不了 OOXML。PDF 不由本工具生成（已有 .pdf 则可下载；幻灯另走打印路径）。只交没有幻灯契约的 HTML 并口头承诺稍后给 Office 文件，不算完成。
-7. 文件修改用 write_file 整文件写回——工具面没有 edit_file。禁止 git 写命令。
-8. 色板：幻灯与方图用 html[data-look] 五选一（ink / paper / night / meadow / terracotta）。不要另造第六套默认皮，除非用户点名品牌色。
-9. 社媒/海报方图：每张卡 article.card[data-card][data-size="1080x1080"]。宿主「导出图片」截这些卡。不要用 generate_image 另画一张冒充同一份稿。
-10. 用户消息含 [改稿范围] 或 [点评][slide:…]：只改点名的 data-slide 那一节（及同文件里它的文案）。禁止整份重写、禁止改其它页。没有这类标记时按整份任务做。
+3. 需要照片或校景时：用 bash 把图下载到交付目录（如 ./images/），HTML 用相对路径引用；插画可用 generate_image。不要把「禁 CDN」理解成「不能有图」——缺图就下载或生成，不要用契约当借口交纯文字稿。色块、渐变、空 .hero 标题都不是大图。
+4. 识图门：任务要配图/大图/照片时，finish_task.completed 之前必须对每张声称的图调用 describe_image，question 写清「这张是否在画 [页标题/alt/邻近文案声称的对象]」。画面对不上、不确定、或只是随机风景：不得 completed。执行者自己能看图时 describe_image 走执行模型，不另引识图角色；只有执行者看不见图才引用独立识图模型。工具面没有 describe_image 时不得把配图写成已验收，只能 partial/blocked 并写明未配置识图。路径存在、文件名像主题、CSS 滤镜，都不算看过。
+5. 成就、数据、可验收事实必须能核对：web_search / fetch_url 取一手来源，在该条正文旁写出处（页内引用，不要只堆在附录）。编造数字或无出处清单一律不算完成。
+6. 多页幻灯必须用 section.slide[data-slide="…"]（data-slide 稳定短 id）。单文件多页优先；参考仓库 templates/design/deck-basic/。落地页参考 templates/design/landing-basic/。产品规格参考 templates/design/pm-spec/（目录 + 决策日志）。团队 OKR 参考 templates/design/team-okrs/（记分卡）。
+7. 创作源仍是 HTML：预览入口（index.html 等）必须存在。多页幻灯的 PowerPoint 由宿主从 .slide[data-slide] 派生（画布「导出 PowerPoint」）；模型仍可用 write_pptx 手写简单页，或用 bash 把已有二进制拷入工作目录。write_file 只能写 UTF-8 文本，写不了 OOXML。PDF 不由本工具生成（已有 .pdf 则可下载；幻灯另走打印路径）。只交没有幻灯契约的 HTML 并口头承诺稍后给 Office 文件，不算完成。
+8. 文件修改用 write_file 整文件写回——工具面没有 edit_file。禁止 git 写命令。
+9. 色板：幻灯与方图用 html[data-look] 五选一（ink / paper / night / meadow / terracotta）。不要另造第六套默认皮，除非用户点名品牌色。
+10. 社媒/海报方图：每张卡 article.card[data-card][data-size="1080x1080"]。宿主「导出图片」截这些卡。不要用 generate_image 另画一张冒充同一份稿。
+11. 用户消息含 [改稿范围] 或 [点评][slide:…]：只改点名的 data-slide 那一节（及同文件里它的文案）。禁止整份重写、禁止改其它页。没有这类标记时按整份任务做。用户正文在谈整份、全部图、各页配图时，即使带了上述标记，也按整份修，不要只改点名的那一页。
+12. ${HIDDEN_FALLBACK_DISCIPLINE} 三维 / WebGL / 稿件失败遮罩一律遵守。作者 CSS 里若有 .fallback{display:flex}，必须同时写 [hidden]{display:none!important}。三维参考 templates/design/webgl-object/。
 
 把结论落到入口 HTML，并用一两句话总结。用用户使用的语言回答。`;
 
 const DESIGN_VERIFY_INSTRUCTIONS = `这是一次【HTML 设计交付】的核查：
 1. 确认 finish_task / 报告声明的入口 HTML 真实存在；用 ls/glob 核对相对 CSS/JS 是否同目录可解析（不要假设 CDN）。
 2. 若声称是幻灯：抽查是否存在 .slide[data-slide]；缺结构则客观 issues。
-3. 任务要求配图或可验收事实时：抽查图片是否落在交付目录（相对路径），成就/数据旁是否有出处；缺图或缺出处写进 issues。不要把「无 CDN」当成缺图的合法理由。
-4. 任务要求 .pptx / .pdf / .png 时：用 ls/glob 核对文件存在且扩展名对；只查存在性与扩展名，不要解析 OOXML 或解码 PNG。宿主从 HTML 写出的文件算数。缺文件进 issues。
+3. 任务要求配图或可验收事实时：
+   a) 抽查图片是否落在交付目录（相对路径）。色块、渐变、空 .hero 标题不是大图；缺图或缺出处写进 issues。不要把「无 CDN」当成缺图的合法理由。
+   b) 路径存在不够。工具面有 describe_image 时必须对每张独特 src 调用，question 对准该页/alt 声称的对象；否、不确定、或画面与声称对象无关 → issues（failed），不要只写 advisory。
+   c) 工具面没有 describe_image 时：要求配图的项落 unverified，不得因「文件在」或文件名像主题判 passed。
+4. 任务要求 .pptx / .pdf / .png 时：用 ls/glob 核对文件存在且扩展名对；只查存在性与扩展名，不要解析 OOXML 或解码 PNG。宿主从 HTML 写出的文件算数。缺文件进 issues。配图是否画对了仍走第 3 条识图，不要用扩展名替代。
 5. 只读核查，不要改文件。`;
 
 const DESIGN_VERIFY_RUBRIC = `主观评分（advisory，不影响 passed）：
 1. 层次：标题/正文/次要信息是否一眼可分？
 2. 自包含：相对资源、无外链刚需字体/脚本？
-3. 配图与出处：该有图的页是否空空，事实是否可核对？
+3. 版式气质：留白、分栏、刊头是否像杂志而不是提纲页？配图对不对题是客观项，不在本表。
 4. 幻灯节奏：每页是否一个主张，而非墙字？`;
 
 export const PACKS: Record<string, DomainPack> = {
@@ -713,8 +727,8 @@ export const PACKS: Record<string, DomainPack> = {
     name: "kicad",
     description: "KiCad EDA 文件工程：直写原理图/PCB s-expression + kicad-cli ERC/DRC 程序化验收（不碰 GUI/MCP）",
     systemPrompt: KICAD_SYSTEM + CONVERSATION_DISCIPLINE + RULE_PRECEDENCE_DISCIPLINE + PROGRESS_DISCIPLINE,
-    // describe_image：配置了 AGENT_VISION_MODEL 时才真实在场（宿主按池过滤，
-    // 没配就干净缺席）。给执行者与核查者同一双眼睛——文本盲是本包全部三条
+    // describe_image：执行者能看图或配了识图角色时才真实在场（宿主按池过滤，
+    // 两边都没有就干净缺席）。给执行者与核查者同一双眼睛——文本盲是本包全部三条
     // 几何缝（布网/布线/排版，案例 #9）的共同根因
     builtinTools: ["bash", "read_file", "write_file", "glob", "grep", "describe_image"],
     mcp: false, // MCP 创作面已实测判死(见包头注释);文件路线全程不需要
@@ -754,6 +768,7 @@ export const PACKS: Record<string, DomainPack> = {
     description:
       "HTML 设计台（OpenDesign 路线）：落地页 / 多页幻灯等真实 HTML+CSS，沙箱整站预览与点评；闲聊不必交页面；多页幻灯的 PowerPoint 由宿主从 HTML 派生",
     systemPrompt: DESIGN_SYSTEM + CONVERSATION_DISCIPLINE + RULE_PRECEDENCE_DISCIPLINE + PRESENTATION_DISCIPLINE + PROGRESS_DISCIPLINE,
+    // describe_image：执行者能看图或配了识图角色时才真实在场（宿主按池过滤）。
     builtinTools: [
       "bash",
       "read_file",
@@ -762,6 +777,7 @@ export const PACKS: Record<string, DomainPack> = {
       "glob",
       "grep",
       "generate_image",
+      "describe_image",
       "web_search",
       "fetch_url",
     ],
@@ -810,7 +826,7 @@ export function allPacks(): DomainPack[] {
  * 的子任务切包不用重连 server）。
  */
 /** 进度工具始终挂上——包的 builtinTools 白名单不得把它滤掉（右栏 Progress 依赖） */
-export const ALWAYS_ON_BUILTIN_TOOLS = new Set(["update_progress"]);
+export const ALWAYS_ON_BUILTIN_TOOLS = new Set(["update_progress", "install_mcp"]);
 
 export function selectPackTools(
   pack: DomainPack | undefined,

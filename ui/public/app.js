@@ -512,12 +512,12 @@ export function reduceEvent(state, sseEvent) {
   const { seq, source, event } = sseEvent;
   const type = /** @type {string} */ (event.type);
 
-  // text_delta 不进 state——它走 `event: delta` 命名通道、不占 seq、不进服务端
-  // 事件缓冲（V-15），重连重放时根本不存在；进了 state 就会打破"同批事件重放
-  // 两次状态深相等"。逐字显示由控制器单独持有缓冲、作为 renderRunDetail 的
-  // liveText 入参喂进直播条（backlog §4）。这条分支守的是"万一它混进了durable
-  // 流也不改状态"。
-  if (type === "text_delta") return state;
+  // text_delta / thinking_delta 不进 state——它们走 `event: delta` 命名通道、
+  // 不占 seq、不进服务端事件缓冲（V-15），重连重放时根本不存在；进了 state
+  // 就会打破"同批事件重放两次状态深相等"。逐字显示由控制器单独持有缓冲、
+  // 作为 renderRunDetail 的 liveText / liveThinking 入参喂进对话与直播条。
+  // 这条分支守的是"万一它混进了 durable 流也不改状态"。
+  if (type === "text_delta" || type === "thinking_delta") return state;
 
   // ---- 路由 ----
   if (type === "verdict") {
@@ -3884,6 +3884,35 @@ export function resolveDisplayedTitle(stored, task, max = 24) {
 }
 
 /** 页内眉标：FATHOM · RUN + runId 前 6 位大写（去连字符）。 */
+/**
+ * 浏览器标签与桌面窗框同一套：首页 `FATHOM`，对话 `FATHOM · 对话`，
+ * 设置 / 指挥中心 / 产物 / 定时任务 / 消耗同款。不要写「FATHOM 控制台」。
+ */
+export const DOCUMENT_TAB_LABELS = Object.freeze({
+  home: null,
+  run: "对话",
+  settings: "设置",
+  schedules: "定时任务",
+  board: "指挥中心",
+  artifacts: "产物",
+  artifact: "产物",
+  usage: "消耗",
+});
+
+export function documentTabTitle(kind) {
+  const label = DOCUMENT_TAB_LABELS[kind];
+  return label ? `FATHOM · ${label}` : "FATHOM";
+}
+
+export function applyDocumentTabTitle(kind, doc = typeof document !== "undefined" ? document : null) {
+  const title = documentTabTitle(kind);
+  if (!doc) return title;
+  if (doc.title !== title) doc.title = title;
+  const h1 = doc.querySelector?.("header.sr-only h1");
+  if (h1 && h1.textContent !== title) h1.textContent = title;
+  return title;
+}
+
 export function formatRunKicker(runId) {
   const raw = String(runId ?? "").replace(/-/g, "");
   const short = raw.slice(0, 6).toUpperCase() || "------";
@@ -4877,6 +4906,24 @@ export function buildWorkspaceFilesUrl(workdir, query) {
   if (workdir) q.set("workdir", workdir);
   if (query) q.set("q", query);
   return `/api/workspace/files?${q}`;
+}
+
+/**
+ * `@` 后缀 / 过滤框：在浅列结果上再按文件名筛一层。
+ * 服务端已经按前缀浅列；这里允许包含匹配，不递归整树。
+ */
+export function filterWorkspaceFileEntries(files, query) {
+  const list = Array.isArray(files) ? files : [];
+  const raw = String(query ?? "").trim().replace(/\\/g, "/");
+  if (!raw) return list;
+  const prefix = raw.includes("/") ? raw.slice(raw.lastIndexOf("/") + 1) : raw;
+  const needle = prefix.toLowerCase();
+  if (!needle) return list;
+  return list.filter((f) => {
+    const name = String(f?.name ?? "").toLowerCase();
+    const rel = String(f?.relative ?? "").replace(/\\/g, "/").toLowerCase();
+    return name.includes(needle) || rel.includes(needle);
+  });
 }
 
 /**
@@ -6445,13 +6492,16 @@ function patchLiveStrip(parts, state, isRunning, liveText = "", liveThinking = "
   }
   const spin = deriveSpinState(state);
   const costWarn = deriveCostWarning(state, harness);
+  const thinkingNow = Boolean(latestExecutorThinkingText(state, lastUserMessageSeq(state)));
   const label = spin
     ? spin.label
     : costWarn
       ? costWarn.label
-      : text
-        ? String(text.text ?? "").slice(0, 80)
-        : "等待模型响应…";
+      : thinkingNow && !text
+        ? "正在想…"
+        : text
+          ? String(text.text ?? "").slice(0, 80)
+          : "等待模型响应…";
 
   const sig = signature([label, spin ? "stall" : "", costWarn ? "cost" : ""]);
   if (parts.sig.live === sig) return;

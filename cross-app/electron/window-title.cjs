@@ -1,7 +1,7 @@
 /**
  * 桌面窗标题：产品名 + 当前页含义。纯 Node，不依赖 electron——
- * 宿主页 <title> 是「FATHOM 控制台」口号，BrowserWindow 默认会跟过去；
- * 标题必须由壳按 hash 路由自己定，测试才能在 vitest 里锁契约。
+ * 宿主页 <title> 现已按路由写（首页 FATHOM / 对话 FATHOM · 对话）。
+ * 壳仍按 hash 自己定标题，挡住旧页「FATHOM 控制台」口号或其它 page-title-updated。
  */
 'use strict';
 
@@ -62,7 +62,7 @@ function applyDesktopWindowTitle(win, href) {
 }
 
 /**
- * 拦住 page-title-updated：否则宿主 <title>「FATHOM 控制台」会盖掉壳标题。
+ * 拦住 page-title-updated：否则页标题抖动或旧口号会盖掉壳标题。
  * hash 变了走 did-navigate-in-page（同文档内路由，不会重载）。
  */
 function wireDesktopWindowTitle(win) {

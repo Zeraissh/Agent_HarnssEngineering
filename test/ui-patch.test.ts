@@ -1303,6 +1303,26 @@ describe("流式输出直接长在对话里", () => {
     expect(strip()).toContain("等待模型响应");
   });
 
+  it("本轮已有思考、还没有正文增量时直播条说正在想，不假死等待", () => {
+    let s = runningState();
+    s = reduceEvents(s, [
+      sse(1, "main", "assistant_thinking", { text: "先确认路径在不在工作目录内", redacted: false }),
+    ]);
+    renderRunDetail(s, { activeTab: "loop" });
+    expect(strip()).toContain("正在想");
+    expect(strip()).not.toContain("等待模型响应");
+    expect(document.querySelector("details.chat-thinking--live")).toBeTruthy();
+  });
+
+  it("thinking_delta 不进 RunState；正文 delta 为 0 时靠 liveThinking 让直播条让位", () => {
+    let s = runningState();
+    s = reduceEvents(s, [sse(1, "main", "thinking_delta", { text: "hmm" })]);
+    expect(s.timeline.map((e) => e.type)).not.toContain("thinking_delta");
+    renderRunDetail(s, { activeTab: "loop", liveThinking: "hmm" });
+    expect((document.querySelector(".live-strip") as HTMLElement).hasAttribute("hidden")).toBe(true);
+    expect(document.querySelector("details.chat-thinking--live")?.textContent).toContain("hmm");
+  });
+
   it("空转时直播条说可停止，对话里也留一行", () => {
     let s = runningState();
     s = reduceEvents(s, [

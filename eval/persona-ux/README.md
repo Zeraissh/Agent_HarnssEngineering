@@ -23,11 +23,12 @@
 
 ## 和活产品的关系
 
-评测是 2026-09-14 当时。之后 **CLI、服务端、前端第一/二/三批都已改**（未 commit）：
+评测是 2026-09-14 当时。之后第一至四批 + CLI `--plan` 确认门已入库（第三批起 `162c6c4`）：
 
 - 第一批：发送 / 「说要做什么…」、自动放行默认不勾、批准卡「允许」「拒绝」、默认 Work、停/完成/否决三分。
 - 第二批：计划门可改标题/短说明且 `edits` 写入活计划；`@` 当时不弹旧对话（第三批起列文件）；「引用会话」是按钮；「全部项目」默认勾；空态「现在只能在这个窗口下指令」；GitHub 没连不给假开 PR；来源表；`consult · 查资料`；侧栏/指挥中心「今日 $」/「这次 $」；预览页内坞，不跳 `file://`；桌面窗框 `FATHOM` / `FATHOM · 对话`，`npm run desktop`，没有开始菜单项。
 - 第三批：计划门上点停止 = 「已停止」（不是否决）；否决按钮才是否决；停/否决后不再钉「批准并开跑」。`@` 列出圈禁内文件/目录，插入 `@path`；「引用会话」仍是旧对话。失败条（含 composer 以外）429/HTTP/领域包改成一句人话。
-- CLI `--plan` 仍是拆完就执行，没有确认门。
+- 第四批：设计包失败遮罩 `[hidden]{display:none!important}` 或成功摘 DOM；starter `templates/design/webgl-object/`。浏览器标签首页 `FATHOM`、对话 `FATHOM · 对话`，不再写「FATHOM 控制台」。正文未到但有 `assistant_thinking` 时直播条「正在想…」；`thinking_delta` 不进时间线。`@` picker 可按文件名过滤浅列表。
+- CLI `--plan`：TTY 出计划后 y/n（可改一行标题）；非 TTY 无 `--yes` 退出码 2「需要确认，请加 --yes」。帮助不再写「没有计划确认门」。
 
-**前端已改，VERIFY 仍是改前活页。** walks / VERIFY / BACKLOG / REPORT **不要改写成「问题已消失」**。回走用原角色剧本。可见变化对照 [`_fix-notes-web.md`](_fix-notes-web.md)、[`_fix-notes-web2-app.md`](_fix-notes-web2-app.md)、[`_fix-notes-web2-usage.md`](_fix-notes-web2-usage.md)、[`_fix-notes-web2-preview.md`](_fix-notes-web2-preview.md)、[`_fix-notes-desktop.md`](_fix-notes-desktop.md)、[`_fix-notes-plan-edits.md`](_fix-notes-plan-edits.md)、[`_fix-notes-web3.md`](_fix-notes-web3.md)。
+**前端已改，VERIFY 仍是改前活页**（档案仍可能写「FATHOM 控制台」）。walks / VERIFY / BACKLOG / REPORT **不要改写成「问题已消失」**。回走用原角色剧本。可见变化对照 [`_fix-notes-web.md`](_fix-notes-web.md)、[`_fix-notes-web2-app.md`](_fix-notes-web2-app.md)、[`_fix-notes-web2-usage.md`](_fix-notes-web2-usage.md)、[`_fix-notes-web2-preview.md`](_fix-notes-web2-preview.md)、[`_fix-notes-desktop.md`](_fix-notes-desktop.md)、[`_fix-notes-plan-edits.md`](_fix-notes-plan-edits.md)、[`_fix-notes-web3.md`](_fix-notes-web3.md)、[`_fix-notes-web4.md`](_fix-notes-web4.md)、[`_fix-notes-cli-plan-gate.md`](_fix-notes-cli-plan-gate.md)。

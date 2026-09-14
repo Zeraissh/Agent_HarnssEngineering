@@ -51,8 +51,15 @@ describe("listDesignTemplates / copyDesignTemplate", () => {
         "hr-onboarding",
         "meeting-brief",
         "raid-brief",
+        "webgl-object",
       ]),
     );
+    expect(list.find((t) => t.id === "webgl-object")?.title).toBe("三维对象");
+    const three = await readFile(join(realTemplates, "webgl-object", "index.html"), "utf8");
+    expect(three).toContain("[hidden]{display:none!important}");
+    expect(three).toContain("fallback");
+    const landingCss = await readFile(join(realTemplates, "landing-basic", "style.css"), "utf8");
+    expect(landingCss).toContain("[hidden]{display:none!important}");
     expect(list.find((t) => t.id === "meeting-brief")?.title).toBe("会前简报");
     expect(list.find((t) => t.id === "raid-brief")?.title).toBe("战役任务书");
     expect(list.find((t) => t.id === "eng-runbook")?.title).toBe("工程手册");

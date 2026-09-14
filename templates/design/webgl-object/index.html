@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>三维对象</title>
+  <style>
+    /* 失败遮罩：只靠 hidden 配 display:flex 会被盖掉，WebGL 画出来仍叠「没有 WebGL」。 */
+    [hidden]{display:none!important}
+    html, body { margin: 0; height: 100%; background: #111214; color: #eee; font-family: system-ui, sans-serif; }
+    canvas { display: block; width: 100%; height: 100%; }
+    .fallback {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #111214;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="scene"></canvas>
+  <div class="fallback" id="fallback" hidden>这台设备没有可用的 WebGL</div>
+  <script>
+    var canvas = document.getElementById("scene");
+    var fallback = document.getElementById("fallback");
+    var gl = canvas.getContext("webgl2") || canvas.getContext("webgl") || canvas.getContext("experimental-webgl");
+    if (!gl) {
+      fallback.removeAttribute("hidden");
+    } else {
+      fallback.remove();
+      function fit() {
+        var dpr = Math.min(window.devicePixelRatio || 1, 2);
+        canvas.width = Math.floor(canvas.clientWidth * dpr);
+        canvas.height = Math.floor(canvas.clientHeight * dpr);
+        gl.viewport(0, 0, canvas.width, canvas.height);
+      }
+      fit();
+      window.addEventListener("resize", fit);
+      gl.clearColor(0.08, 0.09, 0.12, 1);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+    }
+  </script>
+</body>
+</html>

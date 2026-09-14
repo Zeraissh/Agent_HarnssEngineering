@@ -8,6 +8,7 @@ import { describe, expect, it } from "vitest";
 import { startMockProvider } from "../eval/mock-provider.js";
 import {
   BLANK_DESIGN_INDEX_HTML,
+  DESIGN_BUNDLE_HUB_HTML,
   DESIGN_CATALOG,
   DESIGN_CATALOG_IDS,
   DESIGN_PACK_LEGACY_HINT,
@@ -34,7 +35,7 @@ import {
   writeBlankDesignIndex,
   writeDesignBundleHub,
 } from "../src/design-mode.js";
-import { getPack, PACKS, type DomainPack } from "../src/presets.js";
+import { getPack, HIDDEN_ATTR_FIX_CSS, HIDDEN_FALLBACK_DISCIPLINE, PACKS, type DomainPack } from "../src/presets.js";
 import { fakeMessage, textBlock, FakeModelClient } from "./helpers.js";
 
 const CFG = { systemPrompt: "router", tools: [], workdir: process.cwd() };
@@ -591,7 +592,16 @@ describe("blank index.html", () => {
     expect(path).toBe("index.html");
     const html = await readFile(join(dir, "index.html"), "utf8");
     expect(html).toBe(BLANK_DESIGN_INDEX_HTML);
+    expect(html).toContain(HIDDEN_ATTR_FIX_CSS);
     expect(html).not.toMatch(/PPTX|后导出/);
+  });
+
+  it("设计包与空白/入口 HTML 都钉失败遮罩 [hidden]{display:none!important}", () => {
+    expect(HIDDEN_ATTR_FIX_CSS).toBe("[hidden]{display:none!important}");
+    expect(BLANK_DESIGN_INDEX_HTML).toContain(HIDDEN_ATTR_FIX_CSS);
+    expect(DESIGN_BUNDLE_HUB_HTML).toContain(HIDDEN_ATTR_FIX_CSS);
+    expect(getPack("design")!.systemPrompt).toContain(HIDDEN_FALLBACK_DISCIPLINE);
+    expect(getPack("design")!.systemPrompt).toContain(HIDDEN_ATTR_FIX_CSS);
   });
 
   it("规格+幻灯入口链到两份子目录", async () => {
