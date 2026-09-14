@@ -138,9 +138,9 @@ export const MCP_MARKET_HEADER = "本宿主目录，安装才写入。MCP 需 AG
  * 长笔记（webhook / stdio vs HTTP / 不是 pack）只进 details。
  */
 export const MCP_MARKET_COPY = {
-  "feishu-lark": { title: "飞书", blurb: "文档、日历、会话。" },
-  slack: { title: "Slack", blurb: "读频道、发消息。" },
-  github: { title: "GitHub", blurb: "仓库、议题与拉取请求。" },
+  "feishu-lark": { title: "飞书", blurb: "文档、日历、会话。装了也不会在这个窗口派活。" },
+  slack: { title: "Slack", blurb: "读频道、发消息。装了配方也不等于已接通。" },
+  github: { title: "GitHub", blurb: "仓库、议题与拉取请求。没连上时只会改这个文件夹。" },
   filesystem: { title: "文件系统", blurb: "额外的目录访问，不是内置读写的替代。" },
   notion: { title: "Notion", blurb: "连接 Notion 工作区。" },
   superpowers: { title: "Superpowers", blurb: "技能包，安装后注入后续对话。" },
@@ -181,10 +181,13 @@ export function mcpMarketTitle(item) {
   return mapped?.title || fallback || "未命名";
 }
 
-export function mcpMarketBlurb(item) {
+export function mcpMarketBlurb(item, opts = {}) {
   const mapped = item?.id ? MCP_MARKET_COPY[item.id] : null;
-  if (mapped?.blurb) return mapped.blurb;
-  return mcpOneLine(item?.description || item?.notes || item?.command || item?.url || "");
+  let blurb = mapped?.blurb || mcpOneLine(item?.description || item?.notes || item?.command || item?.url || "");
+  if ((item?.id === "feishu-lark" || item?.id === "slack") && opts.installed) {
+    blurb = `${blurb} 写入配方不等于已接通。`;
+  }
+  return blurb;
 }
 
 export function mcpMarketKindLabel(item) {
@@ -237,7 +240,7 @@ export function filterMcpMarketItems(items, query) {
  */
 export function renderMcpMarketCardHtml(item, opts = {}) {
   const title = mcpMarketTitle(item);
-  const blurb = mcpMarketBlurb(item);
+  const blurb = mcpMarketBlurb(item, { installed: opts.installed === true });
   const kind = mcpMarketKindLabel(item);
   const initial = mcpMarketInitial(title);
   const details = mcpDetailsParts(item);
@@ -2009,8 +2012,13 @@ export function initSettingsView(host = {}, env = {}) {
   }
   shortcutSection.appendChild(scList);
 
-  // ---- 分组：消耗（侧栏不再单列入口，台账图画在这里）----
+  // ---- 分组：消耗（侧栏 / 看板看今日花费，这里按下钻）----
   const usageSection = addSection("settings-usage", "消耗");
+  const usageLede = doc.createElement("p");
+  usageLede.className = "settings-card-note";
+  usageLede.id = "settings-usage-lede";
+  usageLede.textContent = "今日花费在侧栏和指挥中心。这里按模型下钻轮次，不是套餐余额。";
+  usageSection.appendChild(usageLede);
   /** @type {{ refresh: () => Promise<void> } | null} */
   let usagePanel = null;
   if (typeof host.fetchUsage === "function") {
@@ -2019,11 +2027,6 @@ export function initSettingsView(host = {}, env = {}) {
       now: typeof host.nowUsage === "function" ? host.nowUsage : undefined,
       idPrefix: "settings-usage",
     });
-  } else {
-    const usageNote = doc.createElement("p");
-    usageNote.className = "settings-card-note";
-    usageNote.textContent = "本机台账里的运行轮次与已计价成本。台账不记 token 原文，图上按模型堆叠的是轮次。";
-    usageSection.appendChild(usageNote);
   }
 
   // ---- 分组六：关于 ----

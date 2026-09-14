@@ -536,7 +536,9 @@ describe("initSettingsView 视图行为", () => {
     api.open();
     expect(api.element.querySelector("#settings-usage")).toBeTruthy();
     expect(api.element.querySelector("#settings-usage-cards")).toBeNull();
-    expect(api.element.querySelector("#settings-usage .settings-card-note")?.textContent).toContain("台账");
+    expect(api.element.querySelector("#settings-usage-lede")?.textContent).toContain("今日花费");
+    expect(api.element.querySelector("#settings-usage-lede")?.textContent).toContain("下钻");
+    expect(api.element.querySelector("#settings-usage-lede")?.textContent).not.toContain("还剩几次");
 
     document.body.innerHTML = `<main id="main-panel"></main>`;
     const host = makeHost({
@@ -555,6 +557,7 @@ describe("initSettingsView 视图行为", () => {
     api2.open();
     await Promise.resolve();
     await Promise.resolve();
+    expect(api2.element.querySelector("#settings-usage-lede")?.textContent).toContain("今日花费");
     expect(api2.element.querySelector("#settings-usage-cards")?.textContent).toContain("pro");
     expect(api2.element.querySelector("#settings-usage-cards")?.textContent).toContain("8 轮");
     expect(api2.element.querySelectorAll("#settings-usage .usage-col")).toHaveLength(7);

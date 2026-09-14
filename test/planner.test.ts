@@ -7,12 +7,15 @@ import {
   SHARDS_TOOL_NAME,
   createPlanTool,
   createShardsTool,
+  applyPlanShortEdits,
   parsePlan,
   parseShardInventory,
   planFromObject,
+  resolvePlanShortEdits,
   runPlanner,
   runStructuredPlanner,
   shardInventoryFromObject,
+  type Plan,
 } from "../src/planner.js";
 import { runPlanned } from "../src/orchestrate.js";
 import { PACKS } from "../src/presets.js";
@@ -42,6 +45,91 @@ const PLAN_JSON =
   '{"id": "s1", "title": "改固件", "pack": "stm32-coding", "description": "修改 main.c 并构建", "acceptance": ["ELF 存在"]},' +
   '{"id": "s2", "title": "烧录验证", "pack": "stm32-debug", "description": "烧录 build/x.elf 到板子", "acceptance": ["heartbeat 递增"]}' +
   "]}";
+
+function samplePlan(): Plan {
+  return {
+    subtasks: [
+      {
+        id: "s1",
+        title: "第一步",
+        pack: "ts-coding",
+        description: "做 A",
+        acceptance: ["A 完成"],
+        dependsOn: [],
+      },
+      {
+        id: "s2",
+        title: "第二步",
+        description: "做 B",
+        acceptance: ["B 完成"],
+        dependsOn: ["s1"],
+      },
+    ],
+  };
+}
+
+describe("计划门短句 edits（只改 title/description）", () => {
+  it("按 id 覆盖标题和短说明；pack / dependsOn / 验收原样", () => {
+    const plan = samplePlan();
+    const resolved = resolvePlanShortEdits(plan, [
+      {
+        id: "s1",
+        title: "先读 CRC",
+        description: "对照手册改 RCC",
+        pack: "stm32-debug",
+        dependsOn: ["s2"],
+        acceptance: ["被改掉"],
+      },
+    ]);
+    expect(resolved.ok).toBe(true);
+    if (!resolved.ok) return;
+    expect(resolved.patches).toEqual([{ id: "s1", title: "先读 CRC", description: "对照手册改 RCC" }]);
+    applyPlanShortEdits(plan, resolved.patches);
+    expect(plan.subtasks[0]).toMatchObject({
+      id: "s1",
+      title: "先读 CRC",
+      description: "对照手册改 RCC",
+      pack: "ts-coding",
+      dependsOn: [],
+      acceptance: ["A 完成"],
+    });
+    expect(plan.subtasks[1]?.title).toBe("第二步");
+  });
+
+  it("不传 edits 或空数组：原计划，不算失败", () => {
+    const plan = samplePlan();
+    expect(resolvePlanShortEdits(plan, undefined)).toEqual({ ok: true, patches: [], ignored: [] });
+    expect(resolvePlanShortEdits(plan, [])).toEqual({ ok: true, patches: [], ignored: [] });
+    applyPlanShortEdits(plan, []);
+    expect(plan.subtasks[0]?.description).toBe("做 A");
+  });
+
+  it("edits 不是数组 → 失败", () => {
+    const resolved = resolvePlanShortEdits(samplePlan(), { id: "s1", title: "x" });
+    expect(resolved.ok).toBe(false);
+  });
+
+  it("非法 id 一条都贴不上 → 失败，不默默当没改", () => {
+    const plan = samplePlan();
+    const resolved = resolvePlanShortEdits(plan, [{ id: "nope", title: "x", description: "y" }]);
+    expect(resolved.ok).toBe(false);
+    if (resolved.ok) return;
+    expect(resolved.error).toMatch(/did not match/);
+    expect(plan.subtasks[0]?.title).toBe("第一步");
+  });
+
+  it("能改的就改，未知 id 进 ignored", () => {
+    const plan = samplePlan();
+    const resolved = resolvePlanShortEdits(plan, [
+      { id: "ghost", title: "不存在" },
+      { id: "s2", title: "汇总结论" },
+    ]);
+    expect(resolved.ok).toBe(true);
+    if (!resolved.ok) return;
+    expect(resolved.patches).toEqual([{ id: "s2", title: "汇总结论" }]);
+    expect(resolved.ignored).toEqual([{ id: "ghost", reason: "unknown_id" }]);
+  });
+});
 
 describe("parsePlan（宽容解析，fail-closed）", () => {
   it("纯 JSON 计划", () => {

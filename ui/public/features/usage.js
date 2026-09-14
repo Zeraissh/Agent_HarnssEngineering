@@ -56,6 +56,71 @@ export function parseUsageReport(payload) {
   };
 }
 
+/**
+ * 本地日历日对应的台账行。没有当天行不是 $0.00。
+ * @param {ReturnType<typeof parseUsageReport>|null|undefined} report
+ * @param {number} [now]
+ */
+export function todayUsageOf(report, now = Date.now()) {
+  const day = formatLocalDay(new Date(now));
+  const parsed = report && typeof report === "object" ? parseUsageReport(report) : parseUsageReport(null);
+  const row = (parsed.byDay || []).find((d) => String(d.day) === day);
+  return {
+    day,
+    runs: row ? Number(row.runs) || 0 : 0,
+    usd: row && typeof row.usd === "number" ? row.usd : null,
+    unpricedRuns: row ? Number(row.unpricedRuns) || 0 : 0,
+  };
+}
+
+/**
+ * 单次 run 的人话花费。只信 runEnd.cost.usd，不把 token 折成钱。
+ * @param {{ usd?: number|null }|null|undefined} cost
+ * @returns {string|null}
+ */
+export function formatThisRunSpend(cost) {
+  if (!cost || typeof cost !== "object") return null;
+  if (typeof cost.usd === "number" && Number.isFinite(cost.usd)) {
+    const money = formatUsd(cost.usd);
+    return cost.usd > 0 && cost.usd < 0.01 ? `这次约 ${money}` : `这次 ${money}`;
+  }
+  return "这次未计价";
+}
+
+/**
+ * 首页 / 看板用的花费脸：今日 $（或未计价）+ 今日已用 N 次 + 可选本次。
+ * 没有次数配额，不写「还剩几次」。
+ * @param {{ usage?: unknown, runCost?: { usd?: number|null }|null, now?: number }} [input]
+ */
+export function deriveSpendFace(input = {}) {
+  const now = Number(input.now) || Date.now();
+  const today = todayUsageOf(input.usage, now);
+  const todayMoney =
+    today.usd == null
+      ? today.runs === 0
+        ? "今日还没花费"
+        : "今日未计价"
+      : `今日 ${formatUsd(today.usd)}`;
+  const todayUsed = `今日已用 ${today.runs} 次`;
+  const unpriced = today.unpricedRuns ? `${today.unpricedRuns} 未计价` : "";
+  const thisRunText = formatThisRunSpend(input.runCost ?? null);
+  const todayLine = [todayMoney, unpriced].filter(Boolean).join(" · ");
+  const chipText = thisRunText ? `${thisRunText} · ${todayMoney}` : todayMoney;
+  const chipTitle = [thisRunText, todayMoney, todayUsed, unpriced].filter(Boolean).join(" · ");
+  return {
+    todayDay: today.day,
+    todayUsd: today.usd,
+    todayRuns: today.runs,
+    todayUnpriced: today.unpricedRuns,
+    todayMoney,
+    todayUsed,
+    todayLine,
+    thisRunText,
+    chipText,
+    chipTitle,
+  };
+}
+
 export function formatLocalDay(date) {
   const d = date instanceof Date ? date : new Date(date);
   const y = d.getFullYear();

@@ -200,8 +200,9 @@ describe("renderWorkdirMenu + initWorkdirCombobox", () => {
     expect(rows).toHaveLength(2);
     expect(rows[0].textContent).toContain("D:\\Work");
     expect(rows[1].classList.contains("is-primary")).toBe(true);
-    expect(menu.querySelector(".wd-menu-hint")?.textContent).toContain("读写");
-    expect(menu.querySelector(".wd-menu-hint")?.textContent).toContain("设为主只换默认写入点");
+    expect(menu.querySelector(".wd-menu-hint")?.textContent).toContain("下次写入这里");
+    expect(menu.querySelector(".wd-menu-hint")?.textContent).toContain("这次也可以读写");
+    expect(menu.querySelector(".wd-primary-btn")?.textContent).toMatch(/正在写入|改到这里/);
     expect(menu.querySelector(".wd-add")?.textContent).toContain("添加目录");
     expect(menu.querySelector("option")).toBeNull();
   });

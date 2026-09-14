@@ -1,6 +1,7 @@
 const { app, BrowserWindow, Menu, dialog, safeStorage, session, shell } = require('electron');
 const path = require('node:path');
 const launcher = require('./host-launcher.cjs');
+const { desktopWindowTitle, wireDesktopWindowTitle } = require('./window-title.cjs');
 const modelSettingsStore = require('./model-settings-store.cjs');
 const { isLoopbackHostname } = require('./network-policy.cjs');
 const { createSettingsController } = require('./settings-window.cjs');
@@ -356,7 +357,7 @@ function createWindow() {
   const win = new BrowserWindow({
     width: 1280,
     height: 800,
-    title: 'Agent Harness',
+    title: desktopWindowTitle(),
     backgroundColor: '#171717',
     show: false,
     webPreferences: {
@@ -369,6 +370,7 @@ function createWindow() {
   harnessWindows.add(win);
   win.on('closed', () => harnessWindows.delete(win));
   win.once('ready-to-show', () => win.show());
+  wireDesktopWindowTitle(win);
 
   win.webContents.setWindowOpenHandler(({ url }) => {
     try {

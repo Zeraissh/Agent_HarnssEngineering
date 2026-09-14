@@ -25,6 +25,8 @@ import {
   deriveBoardModel,
   summarizeAutoApprovedWrites,
   initCommandCenterView,
+  deriveSpendFace,
+  paintHomeSpend,
 } from "../ui/public/features/command-center.js";
 import {
   createNotificationStore,
@@ -367,10 +369,15 @@ describe("initCommandCenterView DOM 层", () => {
 
   function mount(extraHost = {}) {
     document.body.innerHTML = `
-      <aside><button type="button" id="board-open-btn">指挥中心</button></aside>
+      <aside>
+        <button type="button" id="board-open-btn">指挥中心</button>
+        <button type="button" id="home-spend" class="home-spend">
+          <span data-spend-text>今日已用 0 次</span>
+        </button>
+      </aside>
       <main id="main-panel"><div id="action-dock"></div></main>
     `;
-    const calls = { openConv: [], revealDock: [], stop: [], announce: [], newChat: 0, close: 0, open: 0 };
+    const calls = { openConv: [], revealDock: [], stop: [], announce: [], newChat: 0, close: 0, open: 0, openUsage: 0 };
     host = {
       getRuns: () => runs,
       getRunState: (id) => states.get(id) ?? null,
@@ -383,6 +390,7 @@ describe("initCommandCenterView DOM 层", () => {
       onStopRun: (id) => calls.stop.push(id),
       onNewChat: () => { calls.newChat++; },
       onAnnounce: (m) => calls.announce.push(m),
+      onOpenUsage: () => { calls.openUsage++; },
       ...extraHost,
     };
     const api = initCommandCenterView(host, { now: () => clock });
@@ -559,5 +567,61 @@ describe("initCommandCenterView DOM 层", () => {
     clock = NOW + 10 * 60_000;
     api.refresh();
     expect(api.element.querySelector('[data-col="decision"]').textContent).toContain("已等待 15 分钟");
+  });
+
+  it("看板与侧栏挂今日 $ / 今日已用；空看板也留花费；点芯片进消耗", () => {
+    const noon = Date.parse("2026-09-14T12:00:00");
+    clock = noon;
+    const { api, calls } = mount({
+      getUsageReport: () => ({
+        byDay: [{ day: "2026-09-14", runs: 110, usd: 0.71, unpricedRuns: 26 }],
+      }),
+      getSelectedRunCost: () => ({ usd: 0.04 }),
+    });
+    api.open();
+    const boardSpend = api.element.querySelector("[data-spend='board']");
+    expect(boardSpend).toBeTruthy();
+    expect(boardSpend.querySelector("[data-spend-today-money]").textContent).toBe("今日 $0.71");
+    expect(boardSpend.querySelector("[data-spend-today-used]").textContent).toBe("今日已用 110 次");
+    expect(boardSpend.querySelector("[data-spend-this-run]").textContent).toBe("这次 $0.04");
+    expect(boardSpend.querySelector("[data-spend-this-run]").hidden).toBe(false);
+    expect(boardSpend.textContent).not.toMatch(/还剩几次|token/i);
+    expect(boardSpend.hidden).toBe(false);
+
+    const chip = document.getElementById("home-spend");
+    expect(chip.querySelector("[data-spend-text]").textContent).toBe("这次 $0.04 · 今日 $0.71");
+    expect(chip.getAttribute("aria-label")).toContain("今日已用 110 次");
+
+    api.element.querySelector("[data-spend='today']").click();
+    expect(calls.openUsage).toBe(1);
+  });
+
+  it("空看板仍显示花费条，不假装有套餐余额", () => {
+    clock = Date.parse("2026-09-14T12:00:00");
+    const { api } = mount({
+      getUsageReport: () => ({ byDay: [] }),
+      getSelectedRunCost: () => null,
+    });
+    api.open();
+    expect(api.element.querySelector(".cc-empty").hidden).toBe(false);
+    const boardSpend = api.element.querySelector("[data-spend='board']");
+    expect(boardSpend.hidden).toBe(false);
+    expect(boardSpend.querySelector("[data-spend-today-money]").textContent).toBe("今日还没花费");
+    expect(boardSpend.querySelector("[data-spend-today-used]").textContent).toBe("今日已用 0 次");
+    expect(boardSpend.querySelector("[data-spend-this-run]").hidden).toBe(true);
+    expect(boardSpend.textContent).not.toContain("还剩");
+  });
+
+  it("paintHomeSpend 把已有 usage 写进顶栏芯片", () => {
+    const el = document.createElement("button");
+    el.innerHTML = '<span data-spend-text></span>';
+    const face = deriveSpendFace({
+      now: Date.parse("2026-09-14T12:00:00"),
+      usage: { byDay: [{ day: "2026-09-14", runs: 2, usd: 0.71, unpricedRuns: 0 }] },
+    });
+    paintHomeSpend(el, face);
+    expect(el.querySelector("[data-spend-text]").textContent).toBe("今日 $0.71");
+    expect(el.getAttribute("aria-label")).toContain("今日已用 2 次");
+    expect(el.hidden).toBe(false);
   });
 });

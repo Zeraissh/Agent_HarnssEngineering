@@ -2667,9 +2667,9 @@ describe("ui-server", () => {
     ];
   }
 
-  async function startGatedRun() {
+  async function startGatedRun(model: FakeModelClient = new FakeModelClient(gatedPlanScript())) {
     handle = createUiServer({
-      modelClient: new FakeModelClient(gatedPlanScript()),
+      modelClient: model,
       tools: [autoTool("noop")],
       workdir: process.cwd(),
     });
@@ -2681,6 +2681,10 @@ describe("ui-server", () => {
       body: JSON.stringify({ task: "需要签字的任务", mode: "plan", planGate: true }),
     })).json() as { runId: string };
     return runId;
+  }
+
+  function firstUserText(req: { messages: Array<{ content: unknown }> }): string {
+    return JSON.stringify(req.messages[0]?.content ?? "");
   }
 
   /** 轮询直到计划门挂起（列表元数据由服务端持有，不必订阅 SSE——V-14 口径） */
@@ -2805,6 +2809,108 @@ describe("ui-server", () => {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ decision: "maybe" }),
     })).status).toBe(409);
+  });
+
+  it("计划门批准带 edits：执行者与下游看到改过的短句，响应带回采用的计划", async () => {
+    const model = new FakeModelClient(gatedPlanScript());
+    const runId = await startGatedRun(model);
+    await waitForPlanGate(runId);
+
+    const res = await fetch(`${base}/api/runs/${runId}/plan-approval`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        decision: "approve",
+        edits: [
+          { id: "s1", title: "先读 CRC 再改位号", description: "对照手册改 RCC" },
+          { id: "ghost", title: "不存在的一步", description: "应被忽略" },
+        ],
+      }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json() as {
+      acknowledged: boolean;
+      applied: Array<{ id: string; title?: string; description?: string }>;
+      ignored: Array<{ id: string; reason: string }>;
+      plan: { subtasks: Array<{ id: string; title: string; description: string; pack?: string | null; acceptance: string[] }> };
+    };
+    expect(body.acknowledged).toBe(true);
+    expect(body.applied).toEqual([{ id: "s1", title: "先读 CRC 再改位号", description: "对照手册改 RCC" }]);
+    expect(body.ignored).toEqual([{ id: "ghost", reason: "unknown_id" }]);
+    expect(body.plan.subtasks.map((s) => ({ id: s.id, title: s.title, description: s.description }))).toEqual([
+      { id: "s1", title: "先读 CRC 再改位号", description: "对照手册改 RCC" },
+      { id: "s2", title: "第二步", description: "做 B" },
+    ]);
+    expect(body.plan.subtasks[0]?.acceptance).toEqual(["A 完成"]);
+
+    await waitForDone(base, runId);
+
+    const afterPlanner = model.requests.slice(1).map((req) => firstUserText(req));
+    expect(afterPlanner.some((t) => t.includes("对照手册改 RCC")), "执行者任务书必须是改过的短说明").toBe(true);
+    expect(afterPlanner.some((t) => t.includes("做 A")), "原短说明不得再进执行面").toBe(false);
+    expect(afterPlanner.some((t) => t.includes("先读 CRC 再改位号")), "下游交接必须带改过的标题").toBe(true);
+
+    const events = await readSSEAll(await fetch(`${base}/api/runs/${runId}/events`));
+    const planEvents = events.filter((e: any) => e.event.type === "plan");
+    expect(planEvents.length).toBeGreaterThanOrEqual(2);
+    const adopted = (planEvents.at(-1) as any).event.subtasks as Array<{ id: string; title: string; description: string }>;
+    expect(adopted.find((s) => s.id === "s1")).toMatchObject({
+      title: "先读 CRC 再改位号",
+      description: "对照手册改 RCC",
+    });
+    const resolved = events.find((e: any) => e.event.type === "plan_approval_resolved") as any;
+    expect(resolved.event.edits).toEqual([{ id: "s1", title: "先读 CRC 再改位号", description: "对照手册改 RCC" }]);
+    const result = events.find((e: any) => e.event.type === "plan_result") as any;
+    expect(result.event.steps.find((st: any) => st.id === "s1").title).toBe("先读 CRC 再改位号");
+  });
+
+  it("计划门批准不传 edits：仍走原计划（变异：短句补丁被摘掉时这条该绿、上一条该红）", async () => {
+    const model = new FakeModelClient(gatedPlanScript());
+    const runId = await startGatedRun(model);
+    await waitForPlanGate(runId);
+
+    const res = await fetch(`${base}/api/runs/${runId}/plan-approval`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: "approve" }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json() as {
+      applied: unknown[];
+      plan: { subtasks: Array<{ id: string; title: string; description: string }> };
+    };
+    expect(body.applied).toEqual([]);
+    expect(body.plan.subtasks[0]).toMatchObject({ id: "s1", title: "第一步", description: "做 A" });
+
+    await waitForDone(base, runId);
+    const s1Input = firstUserText(model.requests[1]!);
+    expect(s1Input).toContain("做 A");
+    expect(s1Input).not.toContain("对照手册改 RCC");
+  });
+
+  it("计划门 edits 全是非法 id：400，门仍挂着，不会用旧计划假装改了", async () => {
+    const runId = await startGatedRun();
+    await waitForPlanGate(runId);
+
+    const res = await fetch(`${base}/api/runs/${runId}/plan-approval`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        decision: "approve",
+        edits: [{ id: "nope", title: "改不了", description: "也不该开跑" }],
+      }),
+    });
+    expect(res.status).toBe(400);
+    const err = await res.json() as { error: string };
+    expect(err.error).toMatch(/did not match|edits/);
+
+    const list = await (await fetch(`${base}/api/runs`)).json() as any[];
+    const summary = list.find((x) => x.runId === runId);
+    expect(summary.awaitingPlanApproval).toBe(true);
+    expect(summary.status).toBe("running");
+
+    expect((await fetch(`${base}/api/runs/${runId}/plan-approval`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: "approve" }),
+    })).status).toBe(200);
+    await waitForDone(base, runId);
   });
 
   // ---- Web 宿主的 MCP 接线（案例 #8 前置修复）----

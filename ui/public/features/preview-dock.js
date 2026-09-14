@@ -171,9 +171,16 @@ export function createPreviewDock(opts = {}, env = {}) {
   const closeBtn = doc.createElement("button");
   closeBtn.type = "button";
   closeBtn.className = "btn btn--ghost ac-close pd-collapse";
-  closeBtn.innerHTML = '<i class="ph ph-caret-right" aria-hidden="true"></i>';
-  closeBtn.setAttribute("aria-label", "收起预览");
-  closeBtn.title = "收起预览（Esc / Ctrl+Shift+B）";
+  if (opts.overlay) {
+    closeBtn.classList.add("pd-close-label");
+    closeBtn.innerHTML = '<i class="ph ph-x" aria-hidden="true"></i><span>关闭</span>';
+    closeBtn.setAttribute("aria-label", "关闭预览");
+    closeBtn.title = "关闭预览，回到对话（Esc）";
+  } else {
+    closeBtn.innerHTML = '<i class="ph ph-caret-right" aria-hidden="true"></i>';
+    closeBtn.setAttribute("aria-label", "收起预览");
+    closeBtn.title = "收起预览（Esc / Ctrl+Shift+B）";
+  }
   closeBtn.setAttribute("aria-keyshortcuts", "Escape Control+Shift+B Meta+Shift+B");
   closeBtn.setAttribute("aria-expanded", "true");
 

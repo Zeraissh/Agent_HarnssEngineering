@@ -4,9 +4,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   formatGitTitle,
   formatGitTriggerLabel,
+  githubMcpConnected,
   initWorkspaceGitChip,
   renderDirtyCheckoutPrompt,
   renderGitMenu,
+  workspaceGitHonesty,
 } from "../ui/public/features/workspace-git.js";
 
 const flush = () => new Promise((r) => setTimeout(r, 0));
@@ -25,6 +27,29 @@ function mountChip() {
 
 beforeEach(() => {
   document.body.innerHTML = "";
+});
+
+describe("workspaceGitHonesty", () => {
+  it("没连 GitHub MCP 就不给开 PR，只说人话", () => {
+    expect(githubMcpConnected({ servers: [{ name: "github", status: "skipped" }] })).toBe(false);
+    const local = workspaceGitHonesty({ present: true, branch: "main" }, null);
+    expect(local.offerPr).toBe(false);
+    expect(local.note).toContain("只会改这个文件夹");
+    const named = workspaceGitHonesty({
+      present: true, github: { owner: "acme", repo: "app" },
+    }, { servers: [{ name: "github", status: "skipped" }] });
+    expect(named.offerPr).toBe(false);
+    expect(named.note).toContain("acme/app");
+    expect(named.note).toContain("没连上");
+  });
+
+  it("仓库在且 MCP 已连才给开 PR 弱入口", () => {
+    const ready = workspaceGitHonesty({
+      present: true, github: { owner: "acme", repo: "app" },
+    }, { servers: [{ name: "github", status: "connected", toolCount: 4 }] });
+    expect(ready.offerPr).toBe(true);
+    expect(ready.prHref).toBe("https://github.com/acme/app/compare");
+  });
 });
 
 describe("formatGitTriggerLabel / formatGitTitle", () => {
@@ -54,6 +79,8 @@ describe("renderGitMenu / initWorkspaceGitChip", () => {
       branches: ["main", "feature"],
     });
     expect(menu.textContent).toContain("acme/app");
+    expect(menu.textContent).toContain("只会改这个文件夹");
+    expect(menu.querySelector(".git-pr-link")).toBeNull();
     const buttons = [...menu.querySelectorAll("[data-branch]")];
     expect(buttons.map((b) => b.dataset.branch)).toEqual(["main", "feature"]);
     expect(buttons[0].disabled).toBe(true);

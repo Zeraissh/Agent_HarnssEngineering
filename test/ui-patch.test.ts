@@ -1470,14 +1470,39 @@ describe("计划确认门的签字位", () => {
     const review = rail().querySelector(".plan-gate-review") as HTMLElement;
     expect(review, "步骤正文必须在确认门卡片上").toBeTruthy();
     expect(review.getAttribute("tabindex")).toBe("0");
-    expect(review.textContent).toContain("读仓库里现有的 CRC 实现");
+    expect((review.querySelector("[data-plan-edit='description'][data-plan-id='s1']") as HTMLInputElement)?.value)
+      .toContain("读仓库里现有的 CRC 实现");
     expect(review.textContent).toContain("对照参考实现逐字节一致");
-    expect(review.textContent).toContain("按 L1 数据手册改 RCC 时钟位");
-    expect(review.querySelector(".plan-node-brief")).toBeTruthy();
+    expect((review.querySelector("[data-plan-edit='description'][data-plan-id='s2']") as HTMLInputElement)?.value)
+      .toContain("按 L1 数据手册改 RCC 时钟位");
+    expect(review.querySelector(".plan-node-brief-edit")).toBeTruthy();
+    expect(review.querySelectorAll("[data-plan-edit='title']").length).toBe(2);
     expect(review.querySelector(".plan-node-checks")).toBeTruthy();
     expect(review.querySelector("details"), "确认门验收必须摊开，不能再藏进折叠").toBeNull();
     expect(rail().textContent).not.toContain("详见 Plan 面");
     expect(rail().querySelectorAll("button")).toHaveLength(2);
+  });
+
+  it("计划卡每条短句可改，批准时带上改过的文本", () => {
+    const seen: { d: string, extra?: { edits?: { id: string, title: string, description: string }[] } }[] = [];
+    renderRunDetail(gatedState(), {
+      activeTab: "loop",
+      onPlanDecision: (d: string, extra?: { edits?: { id: string, title: string, description: string }[] }) => {
+        seen.push({ d, extra });
+      },
+    });
+    const title = rail().querySelector("[data-plan-edit='title'][data-plan-id='s1']") as HTMLInputElement;
+    const brief = rail().querySelector("[data-plan-edit='description'][data-plan-id='s1']") as HTMLInputElement;
+    expect(title).toBeTruthy();
+    expect(brief).toBeTruthy();
+    title.value = "先读 CRC 再改位号";
+    brief.value = "对照手册改 RCC";
+    (rail().querySelector("[data-action='approve']") as HTMLElement).click();
+    expect(seen).toHaveLength(1);
+    expect(seen[0].d).toBe("approve");
+    expect(seen[0].extra?.edits).toEqual([
+      { id: "s1", title: "先读 CRC 再改位号", description: "对照手册改 RCC" },
+    ]);
   });
 
   it("点击真的把决定送出去（行为断言，不是「按钮在不在」）", () => {
@@ -2200,7 +2225,11 @@ describe("deriveChatItems：对话从事件流派生，因此实时", () => {
     expect(document.querySelectorAll(".chat-tool-group")).toHaveLength(0);
     const chat = document.querySelector(".conversation")!.textContent ?? "";
     expect(chat).toContain("可以校准");
-    expect(chat).not.toContain("https://a.example");
+    // 工具组仍收起：答文气泡不泄 URL。出处表（#26）才把抓页链接摊开。
+    const assistant = document.querySelector(".chat-msg--assistant")?.textContent ?? "";
+    expect(assistant).toContain("可以校准");
+    expect(assistant).not.toContain("https://a.example");
+    expect(document.querySelector(".chat-sources")?.textContent).toContain("https://a.example");
   });
 
   it("直播工具组摘要是关键字高亮，点开只给当前指令", () => {
@@ -2789,6 +2818,38 @@ describe("deriveChatItems：对话从事件流派生，因此实时", () => {
     expect(onOpenCanvas).toHaveBeenCalledTimes(2);
   });
 
+  it("点击预览不离开页面", () => {
+    const hrefBefore = location.href;
+    const onOpenCanvas = vi.fn();
+    const s = run(
+      sse(0, "main", "tool_call", { toolUseId: "w", name: "write_file", input: { path: "deck-q3/index.html" } }),
+      sse(1, "main", "tool_result", { toolUseId: "w", result: { content: "ok", isError: false } }),
+    );
+    renderRunDetail(s, {
+      activeTab: "loop",
+      previewFiles: selectPreviewArtifacts(deriveSessionFiles(s)),
+      onOpenCanvas,
+    });
+    const preview = [...document.querySelectorAll(".artifact-btn")].find((el) => el.textContent === "预览");
+    expect(preview).toBeTruthy();
+    expect(preview.tagName).toBe("BUTTON");
+    preview.click();
+    expect(onOpenCanvas).toHaveBeenCalledWith("deck-q3/index.html");
+    expect(location.href).toBe(hrefBefore);
+    expect(location.protocol).not.toBe("file:");
+    expect(String(location.href)).not.toMatch(/^file:/i);
+
+    const trap = document.createElement("a");
+    trap.className = "artifact-btn";
+    trap.href = "file:///D:/scratch/deck-q3/index.html";
+    trap.textContent = "预览";
+    document.querySelector(".artifacts")!.appendChild(trap);
+    trap.click();
+    expect(location.href).toBe(hrefBefore);
+    expect(location.protocol).not.toBe("file:");
+    expect(onOpenCanvas).toHaveBeenCalledWith("D:/scratch/deck-q3/index.html");
+  });
+
   it("对话路径链接左键进画布，不新开标签", async () => {
     let state = createInitialState("run-path-canvas", "生成文件", false);
     state = reduceEvents(state, [
@@ -3346,12 +3407,27 @@ describe("装配状态条", () => {
     const items = deriveChatItems(s, null);
     expect(items.some((it) => it.kind === "cite")).toBe(true);
     const html = items.filter((it) => it.kind === "cite").map((it) => renderChatItem(it)).join("");
-    expect(html).toContain("引用");
+    expect(html).toContain("引用的会话");
     expect(html).toContain("规格草案");
     expect(html).toContain("pm-spec/index.html");
     expect(html).toContain("DESIGN.md");
     expect(html).not.toContain("transcript");
     expect(html).not.toContain("events");
+  });
+
+  it("问资料时对话里画出来源表，并可导出链接列表", () => {
+    const s = reduceEvents(createInitialState("r-src", "沸点", false), [
+      sse(0, "main", "assistant_text", {
+        text: "水在 100°C 沸腾。[Wikipedia](https://en.wikipedia.org/wiki/Boiling_point)",
+      }),
+    ]);
+    const items = deriveChatItems(s, null);
+    expect(items.some((it) => it.kind === "sources")).toBe(true);
+    const html = items.filter((it) => it.kind === "sources").map((it) => renderChatItem(it)).join("");
+    expect(html).toContain("来源");
+    expect(html).toContain("该页说的");
+    expect(html).toContain("导出链接列表");
+    expect(html).toContain("wikipedia.org");
   });
 
   it("门禁 chip：无看板隐藏，有下一门才占位", () => {
@@ -4306,6 +4382,7 @@ describe("空态给的是能点的例子", () => {
     expect(OFFICE_STARTER_JOBS.map((j) => j.label)).toEqual(["做纪要", "做一页", "带出处问答"]);
     expect(document.querySelector(".empty-state--design")).toBeNull();
     expect(document.querySelector(".empty-tagline")?.textContent).toContain("说要做什么");
+    expect(document.querySelector(".empty-window-note")?.textContent).toContain("现在只能在这个窗口下指令");
     const html = readFileSync(join(UI_DIR, "index.html"), "utf-8");
     expect(html).toMatch(/designModeActive:\s*officeCatalogOpen/);
   });
@@ -4598,6 +4675,15 @@ describe("空态给的是能点的例子", () => {
     expect(html).toContain('id="gate-chip"');
     expect(html).toContain('id="design-drafts-hint"');
     expect(html).toContain('id="cite-picker"');
+    expect(html).toContain('id="cite-session-btn"');
+    expect(html).toContain('aria-label="引用会话"');
+    expect(html).not.toContain("引用同目录会话");
+    expect(html).toContain("sidebar-all-projects");
+    expect(html).toMatch(/id="sidebar-all-projects"[^>]*checked/);
+    expect(html).toContain("查资料选 consult");
+    expect(html).toContain("packOptionLabel");
+    expect(html).toContain("submittedWorkdir");
+    expect(html).toContain("submittedProjectId");
   });
 
   it("composer 是紧凑胶囊：对话与欢迎共用，起步卡只在欢迎", () => {

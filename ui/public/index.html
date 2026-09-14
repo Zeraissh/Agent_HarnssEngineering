@@ -60,6 +60,11 @@
       <i class="ph ph-bell" aria-hidden="true"></i>
       <span class="notifications-badge" id="notifications-badge" hidden>0</span>
     </button>
+    <button type="button" class="home-spend" id="home-spend"
+      aria-label="花费：今日已用 0 次">
+      <i class="ph ph-currency-dollar" aria-hidden="true"></i>
+      <span data-spend-text>今日已用 0 次</span>
+    </button>
     <div class="theme-picker" id="theme-picker">
       <button type="button" class="theme-toggle icon-btn" id="theme-toggle"
         aria-label="选择配色主题" aria-haspopup="menu" aria-expanded="false">
@@ -117,7 +122,7 @@
       </button>
       <div class="sidebar-filter-menu" id="sidebar-filter-menu" hidden>
         <label class="sidebar-project-filter">
-          <input type="checkbox" id="sidebar-all-projects" />
+          <input type="checkbox" id="sidebar-all-projects" checked />
           全部项目
         </label>
         <select class="run-filter" id="run-filter" aria-label="按状态筛选对话">
@@ -307,7 +312,7 @@
          不能放进 .composer-input-row——它是 flex 行，chips 会被挤成内联一员 -->
     <div id="queue-chips" class="queue-chips" hidden></div>
     <div id="cite-chips" class="cite-chips" hidden></div>
-    <div id="cite-picker" class="cite-picker" hidden role="listbox" aria-label="引用同目录会话"></div>
+    <div id="cite-picker" class="cite-picker" hidden role="listbox" aria-label="引用会话"></div>
     <div class="composer-compose" id="composer-compose">
     <div id="composer-media" class="composer-media" hidden></div>
     <div class="composer-compose-main">
@@ -326,6 +331,11 @@
       <i class="ph ph-plus" aria-hidden="true"></i>
       <span class="sr-only">附件</span>
     </label>
+    <button type="button" id="cite-session-btn" class="btn btn--ghost cite-session-btn"
+      aria-label="引用会话" title="引用会话（不是文献出处）">
+      <i class="ph ph-chat-teardrop-text" aria-hidden="true"></i>
+      <span class="sr-only">引用会话</span>
+    </button>
     <button type="submit" class="btn btn--primary submit-btn" id="submit-btn">
       <span id="submit-btn-label" class="sr-only">发送</span>
       <i class="ph ph-arrow-up" aria-hidden="true"></i>
@@ -388,8 +398,11 @@
     <!-- V-24：harness 的旋钮此前只能靠重启换环境变量。默认折叠，不打扰
          "填个任务就跑"的主路径 -->
     <div class="run-knobs" id="run-knobs" hidden>
-      <div class="knob-row" id="pack-row" title="用默认提示与全部内置工具。选包后工具面和核查纪律跟着换。">
-        <span class="knob-row-name" id="pack-row-label">领域包</span>
+      <div class="knob-row" id="pack-row" title="用默认提示与全部内置工具。选包后工具面和核查纪律跟着换。查资料选 consult。">
+        <span class="knob-row-copy">
+          <span class="knob-row-name" id="pack-row-label">领域包</span>
+          <span class="knob-row-desc" id="pack-row-desc">查资料选 consult</span>
+        </span>
         <select id="pack-select" aria-labelledby="pack-row-label">
           <option value="">不用领域包</option>
         </select>
@@ -550,6 +563,7 @@ import {
   filterCiteCandidates,
   composerCiteTrigger,
   formatCiteChip,
+  packOptionLabel,
 } from "/app.js";
 import {
   loadSettings,
@@ -596,6 +610,8 @@ import {
   isCommandCenterRoute,
   COMMAND_CENTER_HASH,
   initCommandCenterView,
+  deriveSpendFace,
+  paintHomeSpend,
 } from "/features/command-center.js";
 import {
   isArtifactsRoute,
@@ -606,6 +622,7 @@ import {
   isUsageRoute,
   USAGE_HASH,
   initUsageView,
+  parseUsageReport,
 } from "/features/usage.js";
 import { upgradeSelects } from "/features/theme-select.js";
 
@@ -636,6 +653,8 @@ let citeCandidates = [];
 let settingsApi = /** @type {null|{ open:()=>void, close:()=>void, isOpen:()=>boolean, refresh:()=>void }} */ (null);
 let onboardingApi = /** @type {null|{ start:(opts?:{force?:boolean})=>boolean, replay:()=>boolean, isOpen:()=>boolean }} */ (null);
 let usageApi = /** @type {null|{ open:()=>void, close:()=>void }} */ (null);
+/** GET /api/usage 缓存：侧栏 / 指挥中心花费芯片共用，不另算汇率 */
+let usageReportCache = null;
 
 /**
  * 变更审查（T8）实例，由文件末尾的动态 import 赋值；未加载时为 null，所有调用点可选链。
@@ -1525,6 +1544,7 @@ async function loadRuns() {
     notificationsApi?.syncRuns();
     // 指挥中心随列表对账一起刷新（运行中/最近完成两栏的数据源就是这份列表）
     boardApi?.refresh();
+    void refreshUsageSpend();
     void refreshCiteCandidates();
   } catch {
     // 服务器未就绪时静默
@@ -1536,9 +1556,19 @@ runFilter.addEventListener("change", () => {
   currentFilter = runFilter.value;
   refreshRunListView();
 });
-document.getElementById("sidebar-all-projects")?.addEventListener("change", () => {
-  refreshRunListView();
-});
+{
+  const allBox = document.getElementById("sidebar-all-projects");
+  if (allBox) {
+    try {
+      if (localStorage.getItem("agent.ui.pref.sidebarAllProjects") === "0") allBox.checked = false;
+      else allBox.checked = true;
+    } catch { allBox.checked = true; }
+    allBox.addEventListener("change", () => {
+      try { localStorage.setItem("agent.ui.pref.sidebarAllProjects", allBox.checked ? "1" : "0"); } catch { /* ignore */ }
+      refreshRunListView();
+    });
+  }
+}
 {
   const filterBtn = document.getElementById("sidebar-filter-btn");
   const filterMenu = document.getElementById("sidebar-filter-menu");
@@ -1588,6 +1618,7 @@ function selectRun(runId, opts = {}) {
   announceStatus(`已选择运行：${state.task}`);
   ensureSubscription(runId);
   syncAutoApprove(runId);
+  paintSpendSurfaces();
 }
 
 /** 谱系上的父 run 也要有事件流，对话才能按收官形态拼出来。 */
@@ -1690,6 +1721,33 @@ async function fetchUsageReport() {
   const res = await fetch("/api/usage");
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
+}
+
+function selectedRunCost() {
+  if (!selectedRunId) return null;
+  return runStates.get(selectedRunId)?.runEnd?.cost ?? null;
+}
+
+function currentSpendFace() {
+  return deriveSpendFace({
+    usage: usageReportCache,
+    runCost: selectedRunCost(),
+    now: Date.now(),
+  });
+}
+
+function paintSpendSurfaces() {
+  paintHomeSpend(document.getElementById("home-spend"), currentSpendFace());
+  boardApi?.refresh();
+}
+
+async function refreshUsageSpend() {
+  try {
+    usageReportCache = parseUsageReport(await fetchUsageReport());
+  } catch {
+    usageReportCache = parseUsageReport(null);
+  }
+  paintSpendSurfaces();
 }
 
 /** 进入消耗视图：走 hash，浏览器前进/后退天然可用。侧栏入口已收进设置。 */
@@ -1837,6 +1895,7 @@ function applyHash() {
     usageApi?.close();
     artifactCanvasApi?.close();
     pendingArtifact = null;
+    void refreshUsageSpend();
     boardApi?.open();
     return;
   }
@@ -1953,7 +2012,7 @@ function renderDetailWithState(state) {
     harness: harnessSnapshot,
     liveText: revealedSlice(runId, liveTexts.get(runId) ?? "", false),
     liveThinking: revealedSlice(runId, liveThinking.get(runId) ?? "", true),
-    onPlanDecision: (decision) => postPlanDecision(runId, decision),
+    onPlanDecision: (decision, extra) => postPlanDecision(runId, decision, extra),
     onHandoffDecision: (decision) => postHandoffDecision(runId, decision),
     onAnswer: (answers) => postAnswer(runId, answers),
     onReveal: (path) => revealArtifact(runId, path),
@@ -2713,11 +2772,13 @@ function applySseBatch(runId, queue) {
     const next = reduceEvents(state, annotated);
     runStates.set(runId, next);
 
-    // 产物画布「运行中自动刷新」（T10 升级）：本批写盘工具碰了正在预览的产物，
-    // 就（模块内 500ms 防抖）重拉一次内容——用户在右侧直接看到 agent 改网站的效果
-    if (selectedRunId === runId && artifactCanvasApi?.isOpen()) {
+    // 产物画布：写完若坞关着就打开（#17）；已开则防抖重拉当前预览。
+    if (selectedRunId === runId) {
       const written = deriveWrittenPaths(state, queue);
-      if (written.length > 0) artifactCanvasApi.noteWrites(written);
+      if (written.length > 0) {
+        if (artifactCanvasApi?.isOpen()) artifactCanvasApi.noteWrites(written);
+        else openArtifactByPath(runId, written.find((p) => /\.html?$/i.test(p)) ?? written[written.length - 1]);
+      }
     }
 
     if (selectedRunId === runId) renderDetailWithState(next);
@@ -2929,12 +2990,16 @@ async function postHandoffDecision(runId, decision) {
   }
 }
 
-async function postPlanDecision(runId, decision) {
+async function postPlanDecision(runId, decision, extra) {
   try {
+    const edits = extra?.edits;
     const res = await fetch(`/api/runs/${runId}/plan-approval`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ decision }),
+      body: JSON.stringify({
+        decision,
+        ...(decision === "approve" && Array.isArray(edits) && edits.length ? { edits } : {}),
+      }),
     });
     if (res.status === 409) return; // 已决或已收尾——重复点击不该报错
     if (!res.ok) {
@@ -3176,7 +3241,19 @@ taskInput.addEventListener("input", () => {
 taskInput.addEventListener("focus", syncWelcomeComposerField);
 taskInput.addEventListener("blur", () => {
   syncWelcomeComposerField();
-  window.setTimeout(() => hideCitePicker(), 150);
+  window.setTimeout(() => {
+    if (document.activeElement?.closest?.("#cite-picker, #cite-session-btn")) return;
+    hideCitePicker();
+  }, 150);
+});
+document.getElementById("cite-session-btn")?.addEventListener("mousedown", (ev) => {
+  ev.preventDefault();
+  const picker = document.getElementById("cite-picker");
+  if (picker && !picker.hidden) {
+    hideCitePicker();
+    return;
+  }
+  paintCitePicker("");
 });
 document.getElementById("gate-chip")?.addEventListener("click", () => {
   memoryPanelApi?.open();
@@ -3543,6 +3620,10 @@ async function submitNewRun({ text: task }) {
     const state = createInitialState(runId, task, verify, { createdAt: Date.now() });
     runStates.set(runId, state);
 
+    const submittedWorkdir = workdirSelect?.value && workdirSelect.value !== WORKDIR_ADD_VALUE
+      ? workdirSelect.value
+      : undefined;
+    const submittedProjectId = selectedComposerProject()?.id;
     runs.unshift({
       runId,
       task,
@@ -3551,6 +3632,8 @@ async function submitNewRun({ text: task }) {
       createdAt: Date.now(),
       finishedAt: null,
       workspace: workspaceFace,
+      ...(submittedWorkdir ? { workdir: submittedWorkdir } : {}),
+      ...(submittedProjectId ? { projectId: submittedProjectId } : {}),
       ...(workspaceFace === "office" ? { packName: "design", mode: "design" } : {}),
     });
     selectedRunId = runId;
@@ -3783,7 +3866,7 @@ function populateKnobs(snap) {
     for (const p of snap.availablePacks) {
       const opt = document.createElement("option");
       opt.value = p.name;
-      opt.textContent = p.name;
+      opt.textContent = packOptionLabel(p);
       if (p.description) opt.title = p.description;
       packSelect.appendChild(opt);
     }
@@ -3945,6 +4028,7 @@ const PREF_WORKDIR = "agent.ui.pref.workdir";
 const PREF_WORKDIR_EXTRAS = "agent.ui.pref.workdirExtras";
 const PREF_WORKDIR_BY_FACE = "agent.ui.pref.workdirByFace";
 const PREF_PROJECT = "agent.ui.pref.projectId";
+const PREF_ALL_PROJECTS = "agent.ui.pref.sidebarAllProjects";
 const PREF_AUTO_PACK = "agent.ui.pref.autoPack";
 const PREF_WORKSPACE_FACE = "agent.ui.pref.workspaceFace";
 function readPref(key, fallback) {
@@ -4581,6 +4665,7 @@ if (workdirSelect) {
           if (!workdirSelect) return "";
           return getWorkdirSelection(workdirSelect).primary || workdirSelect.value || "";
         },
+        getMcp: () => harnessSnapshot?.mcp ?? null,
         onAnnounce: (msg) => announceStatus(msg),
       });
       void workspaceGitChipApi?.refresh();
@@ -4963,6 +5048,12 @@ try {
     getRunState: (runId) => runStates.get(runId) ?? null,
     getDecisionItems: () => notificationsApi?.getStore?.()?.items ?? [],
     isStopping: (runId) => stoppingRuns.has(runId),
+    getUsageReport: () => usageReportCache,
+    getSelectedRunCost: () => selectedRunCost(),
+    onOpenUsage: () => {
+      navigateToSettings();
+      settingsApi?.open("settings-usage");
+    },
     onOpenBoard: () => navigateToBoard(),
     onCloseBoard: () => closeBoardRoute(),
     onOpenConversation: (runId) => selectRun(runId),
@@ -4971,6 +5062,10 @@ try {
     onStopRun: (runId) => { void stopRun(runId); },
     onNewChat: () => newChatBtn?.click(),
     onAnnounce: (msg) => announceStatus(msg),
+  });
+  document.getElementById("home-spend")?.addEventListener("click", () => {
+    navigateToSettings();
+    settingsApi?.open("settings-usage");
   });
   import("./features/command-palette.js").then((palette) => {
     palette.registerPaletteCommand({

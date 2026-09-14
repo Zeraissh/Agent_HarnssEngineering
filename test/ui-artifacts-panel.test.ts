@@ -13,7 +13,7 @@ import {
   artifactWorkdirLabel,
   initArtifactsView,
 } from "../ui/public/features/artifacts.js";
-import { renderRunList } from "../ui/public/app.js";
+import { renderRunList, isLocalFileHref, localPathFromFileHref, stayInPageForPreviewClick } from "../ui/public/app.js";
 
 describe("路由与纯函数", () => {
   it("仅认 #/artifacts，不跟指挥中心抢 hash", () => {
@@ -200,5 +200,58 @@ describe("侧栏项目组产物入口", () => {
       { onOpenArtifacts: () => {} },
     );
     expect(document.querySelector(".run-group-artifacts")?.hidden).toBe(true);
+  });
+});
+
+describe("预览点击不离开页面", () => {
+  it("认出 file:// 与盘符路径", () => {
+    expect(isLocalFileHref("file:///D:/scratch/deck-q3/index.html")).toBe(true);
+    expect(isLocalFileHref("D:\\scratch\\deck-q3\\index.html")).toBe(true);
+    expect(isLocalFileHref("/api/runs/r/artifact?path=deck-q3/index.html")).toBe(false);
+    expect(localPathFromFileHref("file:///D:/scratch/deck-q3/index.html")).toBe("D:/scratch/deck-q3/index.html");
+  });
+
+  it("点击画廊卡片不改 location，只走 onOpenArtifact", async () => {
+    const hrefBefore = location.href;
+    const opened = [];
+    const { api, el } = bootDom({
+      filter: { projectId: "p1" },
+      host: { onOpenArtifact: (card) => opened.push(card) },
+      routes: {
+        "/api/artifacts?projectId=p1": () => ({
+          data: {
+            artifacts: [{
+              rel: "deck-q3/index.html",
+              workdir: "D:\\work\\alpha",
+              kind: "landing",
+              title: "Q3 幻灯",
+              mtimeMs: 1,
+              runId: "r1",
+            }],
+          },
+        }),
+      },
+    });
+    api.open({ projectId: "p1" });
+    await new Promise((r) => setTimeout(r, 0));
+    el.querySelector(".artifact-card").click();
+    expect(opened[0].rel).toBe("deck-q3/index.html");
+    expect(location.href).toBe(hrefBefore);
+    expect(location.protocol).not.toBe("file:");
+  });
+
+  it("stayInPageForPreviewClick 拦住 file:// 并交给回调", () => {
+    const hrefBefore = location.href;
+    const opened = [];
+    document.body.innerHTML = '<a id="trap" href="file:///D:/scratch/a.html">预览</a>';
+    const trap = document.getElementById("trap");
+    const ev = new window.MouseEvent("click", { bubbles: true, cancelable: true, button: 0 });
+    trap.addEventListener("click", (e) => {
+      expect(stayInPageForPreviewClick(e, (p) => opened.push(p))).toBe(true);
+    });
+    trap.dispatchEvent(ev);
+    expect(ev.defaultPrevented).toBe(true);
+    expect(opened).toEqual(["D:/scratch/a.html"]);
+    expect(location.href).toBe(hrefBefore);
   });
 });

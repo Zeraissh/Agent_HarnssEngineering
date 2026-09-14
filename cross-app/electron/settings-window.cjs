@@ -44,7 +44,7 @@ function createSettingsController({ getState, saveState }) {
       height: 780,
       minWidth: 640,
       minHeight: 640,
-      title: '模型与运行设置 · Agent Harness',
+      title: 'FATHOM · 模型与运行设置',
       parent: parent && !parent.isDestroyed() ? parent : undefined,
       modal: false,
       show: false,

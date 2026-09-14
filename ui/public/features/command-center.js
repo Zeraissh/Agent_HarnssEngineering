@@ -18,6 +18,24 @@
  */
 
 import { formatRelTime, classifyRunEndForNotify, collapseDecisionItems } from "./notifications.js";
+import { deriveSpendFace } from "./usage.js";
+
+export { deriveSpendFace, formatThisRunSpend, todayUsageOf } from "./usage.js";
+
+/**
+ * 侧栏顶栏花费芯片。数据来自 deriveSpendFace，点进去是设置「消耗」。
+ * @param {HTMLElement|null} el
+ * @param {ReturnType<typeof deriveSpendFace>} face
+ */
+export function paintHomeSpend(el, face) {
+  if (!el || !face) return face;
+  const text = el.querySelector("[data-spend-text]") ?? el;
+  text.textContent = face.chipText;
+  el.setAttribute("title", face.chipTitle);
+  el.setAttribute("aria-label", `花费：${face.chipTitle}`);
+  el.hidden = false;
+  return face;
+}
 
 // ---------------------------------------------------------------
 // 常量
@@ -290,6 +308,9 @@ const FINISHED_TONE_BADGE = { ok: "cc-badge--ok", warn: "cc-badge--warn", bad: "
  *   onStopRun(runId)          → 走宿主既有 stop API
  *   onNewChat()               → 空态「新建任务」入口
  *   onAnnounce(msg)           → aria-live 播报（可选）
+ *   getUsageReport()          → GET /api/usage 缓存（今日 $ / 已用次数）
+ *   getSelectedRunCost()      → 当前会话 runEnd.cost（这次 $，没有就不画）
+ *   onOpenUsage()             → 侧栏/看板花费芯片点进设置「消耗」下钻
  *
  * env（测试注入）：doc / win / now / tickMs
  *
@@ -371,6 +392,37 @@ export function initCommandCenterView(host = {}, env = {}) {
     statChips[key] = chip;
   }
 
+  // 花费条：今日 $ / 今日已用 N 次 / 这次 $。空看板也留着——用量要在首页看得见。
+  const spend = doc.createElement("div");
+  spend.className = "cc-spend";
+  spend.setAttribute("data-spend", "board");
+  spend.setAttribute("role", "status");
+  const spendTodayBtn = doc.createElement("button");
+  spendTodayBtn.type = "button";
+  spendTodayBtn.className = "cc-spend-chip";
+  spendTodayBtn.setAttribute("data-spend", "today");
+  const spendTodayMoney = doc.createElement("span");
+  spendTodayMoney.className = "cc-stat-num";
+  spendTodayMoney.setAttribute("data-spend-today-money", "");
+  spendTodayMoney.textContent = "今日还没花费";
+  const spendTodayLabel = doc.createElement("span");
+  spendTodayLabel.className = "cc-stat-label";
+  spendTodayLabel.textContent = "今日花费";
+  spendTodayBtn.appendChild(spendTodayMoney);
+  spendTodayBtn.appendChild(spendTodayLabel);
+  const spendUsed = doc.createElement("span");
+  spendUsed.className = "cc-spend-used";
+  spendUsed.setAttribute("data-spend-today-used", "");
+  spendUsed.textContent = "今日已用 0 次";
+  const spendRun = doc.createElement("span");
+  spendRun.className = "cc-spend-run";
+  spendRun.setAttribute("data-spend-this-run", "");
+  spendRun.hidden = true;
+  spend.appendChild(spendTodayBtn);
+  spend.appendChild(spendUsed);
+  spend.appendChild(spendRun);
+  spendTodayBtn.addEventListener("click", () => host.onOpenUsage?.());
+
   // 三栏
   const board = doc.createElement("div");
   board.className = "cc-board";
@@ -426,6 +478,7 @@ export function initCommandCenterView(host = {}, env = {}) {
 
   shell.appendChild(head);
   shell.appendChild(stats);
+  shell.appendChild(spend);
   shell.appendChild(board);
   shell.appendChild(emptyState);
   view.appendChild(shell);
@@ -593,6 +646,18 @@ export function initCommandCenterView(host = {}, env = {}) {
       `运行中 ${model.stats.running}，待决定 ${model.stats.deciding}，今日完成 ${model.stats.doneToday}`,
     );
 
+    const face = deriveSpendFace({
+      usage: host.getUsageReport?.() ?? null,
+      runCost: host.getSelectedRunCost?.() ?? null,
+      now: now(),
+    });
+    spendTodayMoney.textContent = face.todayMoney;
+    spendUsed.textContent = face.todayUsed;
+    spendRun.textContent = face.thisRunText ?? "";
+    spendRun.hidden = !face.thisRunText;
+    spend.setAttribute("aria-label", face.chipTitle);
+    paintHomeSpend(doc.getElementById("home-spend"), face);
+
     /** @type {Record<string, (card:any) => HTMLElement>} */
     const builders = {
       decision: buildDecisionCard,
@@ -617,6 +682,7 @@ export function initCommandCenterView(host = {}, env = {}) {
 
     board.hidden = model.empty;
     stats.hidden = model.empty;
+    spend.hidden = false;
     emptyState.hidden = !model.empty;
   }
 
@@ -671,7 +737,19 @@ export function initCommandCenterView(host = {}, env = {}) {
     close: closeView,
     isOpen: () => open,
     element: view,
-    /** 宿主在 SSE 批处理节拍 / run 列表刷新后调用；关闭时是 no-op（不白渲染） */
-    refresh: () => { if (open) render(); },
+    /** 宿主在 SSE 批处理节拍 / run 列表刷新后调用。看板关着也要刷侧栏花费。 */
+    refresh: () => {
+      if (open) render();
+      else {
+        paintHomeSpend(
+          doc.getElementById("home-spend"),
+          deriveSpendFace({
+            usage: host.getUsageReport?.() ?? null,
+            runCost: host.getSelectedRunCost?.() ?? null,
+            now: now(),
+          }),
+        );
+      }
+    },
   };
 }

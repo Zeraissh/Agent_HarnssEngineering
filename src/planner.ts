@@ -106,6 +106,97 @@ export function planFromNodes(nodes: PlanNodeState[]): Plan {
   };
 }
 
+/** 计划确认门上允许改的短句。pack / dependsOn / acceptance 不走这条口。 */
+export type PlanShortEditPatch = {
+  id: string;
+  title?: string;
+  description?: string;
+};
+
+export type PlanShortEditIgnored = {
+  id: string;
+  reason: "unknown_id" | "invalid" | "no_short_fields";
+};
+
+export type ResolvePlanShortEditsResult =
+  | { ok: true; patches: PlanShortEditPatch[]; ignored: PlanShortEditIgnored[] }
+  | { ok: false; error: string };
+
+/**
+ * 把委托方在确认门上改的短句收成补丁。不改 plan。
+ * 缺省 / 空数组 = 原计划；非数组或一条都贴不上 = 失败（别假装改了还开跑）。
+ */
+export function resolvePlanShortEdits(plan: Plan, edits: unknown): ResolvePlanShortEditsResult {
+  if (edits === undefined || edits === null) {
+    return { ok: true, patches: [], ignored: [] };
+  }
+  if (!Array.isArray(edits)) {
+    return { ok: false, error: "edits must be an array of {id, title?, description?}" };
+  }
+  if (edits.length === 0) {
+    return { ok: true, patches: [], ignored: [] };
+  }
+
+  const current = new Map(plan.subtasks.map((s) => [s.id, { title: s.title, description: s.description }]));
+  const patches: PlanShortEditPatch[] = [];
+  const ignored: PlanShortEditIgnored[] = [];
+
+  for (const raw of edits) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      ignored.push({ id: "", reason: "invalid" });
+      continue;
+    }
+    const rec = raw as Record<string, unknown>;
+    const id = typeof rec.id === "string" ? rec.id.trim() : "";
+    if (!id) {
+      ignored.push({ id: "", reason: "invalid" });
+      continue;
+    }
+    const live = current.get(id);
+    if (!live) {
+      ignored.push({ id, reason: "unknown_id" });
+      continue;
+    }
+    const titleIn = typeof rec.title === "string" ? rec.title.trim() : undefined;
+    const descIn = typeof rec.description === "string" ? rec.description.trim() : undefined;
+    const title = titleIn !== undefined && titleIn !== "" && titleIn !== live.title ? titleIn : undefined;
+    const description = descIn !== undefined && descIn !== "" && descIn !== live.description ? descIn : undefined;
+    if (title === undefined && description === undefined) {
+      ignored.push({ id, reason: "no_short_fields" });
+      continue;
+    }
+    const existing = patches.find((p) => p.id === id);
+    if (existing) {
+      if (title !== undefined) existing.title = title;
+      if (description !== undefined) existing.description = description;
+    } else {
+      patches.push({
+        id,
+        ...(title !== undefined ? { title } : {}),
+        ...(description !== undefined ? { description } : {}),
+      });
+    }
+    if (title !== undefined) live.title = title;
+    if (description !== undefined) live.description = description;
+  }
+
+  if (patches.length === 0) {
+    return { ok: false, error: "edits did not match any subtask title or description" };
+  }
+  return { ok: true, patches, ignored };
+}
+
+/** 把短句补丁写进活计划。只动 title / description。 */
+export function applyPlanShortEdits(plan: Plan, patches: readonly PlanShortEditPatch[]): void {
+  const byId = new Map(plan.subtasks.map((s) => [s.id, s]));
+  for (const p of patches) {
+    const sub = byId.get(p.id);
+    if (!sub) continue;
+    if (p.title !== undefined) sub.title = p.title;
+    if (p.description !== undefined) sub.description = p.description;
+  }
+}
+
 export function durableNodeFromPlanNode(n: PlanNodeState): DurablePlanNode {
   return {
     id: n.id,

@@ -193,7 +193,7 @@ export function renderWorkdirMenu(menu, workdirs, selection = {}) {
 
   const hint = doc.createElement("p");
   hint.className = "wd-menu-hint";
-  hint.textContent = "勾选的目录本次都可以读写。设为主只换默认写入点，不会把旧主目录自动勾回。";
+  hint.textContent = "点文件夹名：下次写入这里。勾选：这次也可以读写这个文件夹。改写入点不会把旧目录自动勾回来。";
   menu.appendChild(hint);
 
   const list = doc.createElement("div");
@@ -221,7 +221,7 @@ export function renderWorkdirMenu(menu, workdirs, selection = {}) {
     const mark = doc.createElement("button");
     mark.type = "button";
     mark.className = "wd-primary-btn";
-    mark.textContent = isPrimary ? "主目录" : "设为主";
+    mark.textContent = isPrimary ? "正在写入" : "改到这里";
     mark.disabled = isPrimary;
 
     row.appendChild(check);

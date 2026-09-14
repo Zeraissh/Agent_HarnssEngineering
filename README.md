@@ -10,22 +10,22 @@
 |---|---|---|
 | **Web** | `npm run ui` | `ui/serve.ts`，默认 `http://127.0.0.1:4173`（`AGENT_UI_PORT` / `PORT`）。页标题是「FATHOM 控制台」 |
 | **CLI** | `npm run agent -- …`（`npm run cli` 同入口） | `src/cli.ts`。用法：`npm run agent -- --help` |
-| **桌面** | `npm run desktop` | Electron 壳：本机 4173 已健康就贴上；没有就拉起当前 `ui/serve.ts`。详见 [`cross-app/README.md`](cross-app/README.md) |
+| **桌面** | `npm run desktop` | Electron 壳：本机 4173 已健康就贴上；没有就拉起当前 `ui/serve.ts`。窗框首页 `FATHOM`、对话 `FATHOM · 对话`。**没有开始菜单项**。详见 [`cross-app/README.md`](cross-app/README.md) |
 
 编译产物：`npm run build && npm start`（`dist/ui/serve.js`）。静态自检：`npm run doctor`（不联网）。
 
 ### 权限默认与页面上的字（已落地）
 
 - **CLI**：不加 `--yes` 时 ask 级要确认。非 TTY 印「需要确认，请加 `--yes`」，退出码 2，不摔 readline。`--yes` 横幅跟真实档位（`yes=true` / 会自动放行）。`--resume-run` 读不到检查点就停，印原任务/终态，不当新任务重开。`run --help` 可用；顶层帮助写用 `AGENT_MODEL` 换模型。`--plan` 拆完就执行并核查，CLI 没有计划确认门。`permission: deny`、圈禁、SSRF **打不穿**。
-- **Web 服务端**：`WEB_DEFAULT_AUTO_APPROVE = false`，`WEB_DEFAULT_PERMISSION_MODE = "manual"`；`GET /api/harness.defaults.autoApprove === false`。Work 没点稿件芯片不再 409，直接建 run。4xx 正文去掉 HTTP / 领域包 / Prototype。
-- **Web 页面（`ui/public`）**：默认 Work 脸。发送按钮和 label「发送」，占位「说要做什么…」（选了稿件标题时「要「标题」做什么…」）。「自动放行」默认不勾，说明「默认先问；勾上才自动放行」。独立核查在「运行设置」里，不挂发送栏。新手卡 1/4「打一句话，回车」；写入圈在设置「只能改这些文件夹」；3/4「需要时再开运行设置」，不再点名领域包 / 计划编排 / 独立核查。批准卡主文案「要新建或改 …」，按钮「允许」「拒绝」。有写盘不出现「本次运行没有写盘操作」；有本场文件不说「还没有产物」。停→「已停止」；完成→「运行已完成」；否决→「计划未获批准」。计划卡叫「计划」，提问卡叫「助手」。失败优先人话，不自拼「提交失败（HTTP …）」。
+- **Web 服务端**：`WEB_DEFAULT_AUTO_APPROVE = false`，`WEB_DEFAULT_PERMISSION_MODE = "manual"`；`GET /api/harness.defaults.autoApprove === false`。Work 没点稿件芯片不再 409，直接建 run。4xx 正文去掉 HTTP / 领域包 / Prototype。计划确认门：`POST /api/runs/:id/plan-approval` 的 `edits` 只写活计划的 `title` / `description`，再按改过的计划执行。
+- **Web 页面（`ui/public`）**：默认 Work 脸。发送按钮和 label「发送」，占位「说要做什么…」（选了稿件标题时「要「标题」做什么…」）。「自动放行」默认不勾，说明「默认先问；勾上才自动放行」。独立核查在「运行设置」里，不挂发送栏。新手卡 1/4「打一句话，回车」；写入圈在设置「只能改这些文件夹」；3/4「需要时再开运行设置」，不再点名领域包 / 计划编排 / 独立核查。批准卡主文案「要新建或改 …」，按钮「允许」「拒绝」。有写盘不出现「本次运行没有写盘操作」；有本场文件不说「还没有产物」。停→「已停止」；完成→「运行已完成」；否决→「计划未获批准」。计划卡叫「计划」，提问卡叫「助手」。失败优先人话，不自拼「提交失败（HTTP …）」。计划确认门可改子任务标题/短说明（只这两项）。`@` `#` `/` `$` 不再弹出旧对话；「引用会话」是明确按钮。侧栏「全部项目」默认勾上；勾选 vs 设为主说人话（点名=下次写入这里，勾选=这次也可以读写）。空态「现在只能在这个窗口下指令。」；GitHub 没连不给假开 PR。对话有来源表 +「导出链接列表」；领域包「consult · 查资料」。侧栏顶栏 / 指挥中心：「今日 $」/「这次 $」。预览走页内坞/浮层，不跳 `file://`。
 
 评测怎么读：[`eval/persona-ux/README.md`](eval/persona-ux/README.md)。walks / VERIFY 仍是改前活页，不是「问题已消失」。
 
 ### 诚实边界
 
-- 本地单操作员控制台，不是 IDE 插件，也不是飞书/微信入站网关。
-- GitHub / 飞书在设置 → MCP；Web **默认不连** MCP，要 `AGENT_UI_MCP=1`。
+- 本地单操作员控制台，不是 IDE 插件，也不是飞书/微信入站网关。空态写「现在只能在这个窗口下指令。」
+- GitHub / 飞书在设置 → MCP；Web **默认不连** MCP，要 `AGENT_UI_MCP=1`。没连 GitHub 只说「现在只会改这个文件夹」，不给开 PR。
 - 工具写入圈在工作目录白名单内。Android 仍是实验客户端。
 - 运行历史落到 `<cwd>/.agent-run-history`（`AGENT_RUN_HISTORY_DIR` / `AGENT_RUN_HISTORY_KEEP`，缺省保留 50）。
 
@@ -305,10 +305,10 @@ powershell ... -EnvironmentId "<Agent 面板 Environment 卡片里的 ID>"
 
 ## Web 控制台与跨端 App
 
-浏览器页标题是 **「FATHOM 控制台」**（`ui/public/index.html`）。控制台在 [`ui/`](ui/)
-（`ui/server.ts` + `ui/public`：提交 / SSE / 审批 / 核查 / 计划确认门 / 产物取件）。
+浏览器页标题是 **「FATHOM 控制台」**（`ui/public/index.html`）。桌面窗框按路由自定：首页 `FATHOM`、对话 `FATHOM · 对话`（设置 / 指挥中心 / 产物 / 定时任务 / 消耗同款前缀），不抄页标题。控制台在 [`ui/`](ui/)
+（`ui/server.ts` + `ui/public`：提交 / SSE / 审批 / 核查 / 计划确认门可改短句 / 产物页内预览）。
 桌面端（Electron）与移动端（Capacitor Android）外壳在 [`cross-app/`](cross-app/)——
-连接同一套宿主，不是另一套执行引擎：
+连接同一套宿主，不是另一套执行引擎。开发入口 `npm run desktop`；**现在没有开始菜单项**：
 
 ```powershell
 npm run ui                              # 浏览器控制台 http://127.0.0.1:4173

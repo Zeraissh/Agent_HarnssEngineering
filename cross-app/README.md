@@ -6,8 +6,8 @@ Agent_Design 项目的跨端 App 外壳：把仓库 [`ui/public`](../ui/public) 
 控制台本身**不执行 agent**——执行宿主仍是仓库根的 Web UI（`ui/serve.ts` 拉起 `createUiServer`，
 默认 `http://127.0.0.1:4173`，能执行 bash、批准写文件，所以只绑本机）。
 App 外壳负责提供与 WebUI 完全一致的界面与交互，通过网络连接宿主。
-窗口标题跟宿主页走，评测当时是「FATHOM 控制台」。开发态 `npm run desktop` **不会**
-往开始菜单写快捷方式；可点的安装项是签名安装包的事（2026-09-14 VERIFY #21）。
+窗口标题由壳定为产品名 + 当前页，不跟宿主页的「FATHOM 控制台」口号走：首页 `FATHOM`，对话 `FATHOM · 对话`，以及 `FATHOM · 设置` / `指挥中心` / `产物` / `定时任务` / `消耗`。
+开发用 `npm run desktop`（没人先开 4173 时启动器会自拉起宿主）。**现在没有开始菜单项**，请用这条命令打开，不要假装已装进开始菜单。
 
 ## 为什么不是"文本编辑器"
 
@@ -57,7 +57,8 @@ npm run dev
 npm run desktop
 ```
 
-一条命令：没有宿主就自动拉起当前 `ui/serve.ts`（见上节顺序），有就直连。
+开发入口就是这一条：没有宿主就自动拉起当前 `ui/serve.ts`（见上节顺序），有就直连。
+现在没有安装包、也没有开始菜单快捷方式——要打开桌面壳请用 `npm run desktop`。
 要最新 Web UI，先确认 4173 上不是一台旧宿主。远程 Harness 渲染器启用
 context isolation 与 sandbox，不暴露 preload/Node 桥；只有本地打包的设置窗口拥有
 经过 sender 校验的窄 IPC。

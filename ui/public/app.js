@@ -4841,12 +4841,12 @@ export function deriveCitedChat(cited) {
   return { kind: "cite", refs };
 }
 
-/** 输入框末尾的 @查询：没有 @ 触发则 null。 */
-export function composerCiteTrigger(text) {
-  const s = String(text ?? "");
-  const m = s.match(/(^|[\s])@([^\s@]*)$/);
-  if (!m) return null;
-  return { query: m[2] ?? "", start: (m.index ?? 0) + m[1].length };
+/**
+ * 输入框末尾的触发符。`@` `#` `/` `$` 都不当补全——没有文件补全就不要
+ * 弹出旧对话。引用会话走明确按钮，不占 `@`。
+ */
+export function composerCiteTrigger(_text) {
+  return null;
 }
 
 /**
@@ -4855,6 +4855,84 @@ export function composerCiteTrigger(text) {
  */
 export function sameWorkdirCiteRuns(runs, workdir) {
   return visibleConversationRuns(filterRunsByComposerWorkdir(runs, workdir, false));
+}
+
+/** 领域包下拉：consult 写清「查资料」，不把包从名单里搬走。 */
+export function packOptionLabel(pack) {
+  const name = String(pack?.name ?? "").trim();
+  if (!name) return "";
+  if (name === "consult" || pack?.groundedConsult === true) return `${name} · 查资料`;
+  return name;
+}
+
+/**
+ * 对话里的出处表：从答文链接和 fetch_url / web_search 收来。
+ * 模型已经写成「来源 / 该页说的 / 链接」时也再抄一份，方便看见和导出。
+ */
+export function deriveChatSources(state) {
+  const rows = [];
+  const seen = new Set();
+  const add = (url, title, quote) => {
+    const href = String(url ?? "").replace(/[),.]+$/, "").trim();
+    if (!/^https?:\/\//i.test(href) || seen.has(href)) return;
+    seen.add(href);
+    rows.push({
+      url: href,
+      title: String(title ?? "").trim(),
+      quote: String(quote ?? "").replace(/\s+/g, " ").trim().slice(0, 160),
+    });
+  };
+  const fromText = (text) => {
+    const s = String(text ?? "");
+    const md = /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g;
+    let m;
+    while ((m = md.exec(s))) add(m[2], m[1], "");
+    const bare = /https?:\/\/[^\s)\]>'"]+/gi;
+    while ((m = bare.exec(s))) add(m[0], "", "");
+  };
+  for (const e of state?.timeline ?? []) {
+    if (e.type === "assistant_text") fromText(e.text);
+    if (e.type === "tool_call" && (e.name === "fetch_url" || e.name === "web_search")) {
+      const input = e.input && typeof e.input === "object" ? e.input : {};
+      add(input.url || input.href, input.query || input.title || "", "");
+    }
+    if (e.type === "tool_result" && !e.resultIsError) {
+      const raw = e.result;
+      fromText(typeof raw === "string"
+        ? raw
+        : (raw && typeof raw === "object" ? String(raw.content ?? raw.text ?? raw.result ?? "") : ""));
+    }
+  }
+  return rows;
+}
+
+export function formatSourceExport(rows) {
+  const lines = ["来源\t该页说的\t链接"];
+  for (const r of rows ?? []) {
+    lines.push([r.title || "", r.quote || "", r.url || ""].join("\t"));
+  }
+  return lines.join("\n");
+}
+
+/** 计划门上改过的短句。只收有改动的子任务。 */
+export function collectPlanGateEdits(root, nodes) {
+  const list = Array.isArray(nodes) ? nodes : [];
+  const edits = [];
+  if (!root) return edits;
+  for (const n of list) {
+    const id = String(n?.id ?? "");
+    if (!id) continue;
+    const titleEl = root.querySelector(`[data-plan-edit="title"][data-plan-id="${id}"]`);
+    const descEl = root.querySelector(`[data-plan-edit="description"][data-plan-id="${id}"]`);
+    const title = titleEl ? String(titleEl.value ?? "").trim() : String(n.title ?? "");
+    const description = descEl ? String(descEl.value ?? "").trim() : String(n.description ?? "");
+    const origTitle = String(n.title ?? "");
+    const origDesc = String(n.description ?? "");
+    if (title !== origTitle || description !== origDesc) {
+      edits.push({ id, title, description });
+    }
+  }
+  return edits;
 }
 
 export function filterCiteCandidates(candidates, query) {
@@ -6208,12 +6286,12 @@ function patchPlanGate(parts, state, faces, callbacks) {
   parts.sig.planGate = sig;
   setAttr(parts.planGate, "hidden", null);
 
-  const review = plan ? renderPlanReviewHtml(plan, { revealAcceptance: true }) : "";
+  const review = plan ? renderPlanReviewHtml(plan, { revealAcceptance: true, editable: true }) : "";
   parts.planGate.innerHTML =
     '<div class="plan-gate-card">' +
     '<h3 class="rail-title">◈ 计划待你签字</h3>' +
     `<p class="plan-gate-body">计划已拆出 <strong>${count}</strong> 个子任务。` +
-    "下面是每一步要做什么——批准后才会发射第一个子任务；此刻否决没有任何副作用。</p>" +
+    "下面每条短句都能改；批准时会带上你改过的字。批准后才会发射第一个子任务；此刻否决没有任何副作用。</p>" +
     (review
       ? `<div class="plan-gate-review" tabindex="0">${review}</div>`
       : "") +
@@ -6223,7 +6301,10 @@ function patchPlanGate(parts, state, faces, callbacks) {
     "</div></div>";
   parts.planGate
     .querySelector("[data-action='approve']")
-    .addEventListener("click", () => callbacks.onPlanDecision?.("approve"));
+    .addEventListener("click", () => {
+      const edits = collectPlanGateEdits(parts.planGate, plan?.nodes);
+      callbacks.onPlanDecision?.("approve", edits.length ? { edits } : undefined);
+    });
   parts.planGate
     .querySelector("[data-action='reject']")
     .addEventListener("click", () => callbacks.onPlanDecision?.("reject"));
@@ -6681,23 +6762,13 @@ function bindLocalPathActions(host, callbacks) {
   if (host.__pathActionBound) return;
   host.__pathActionBound = true;
   host.addEventListener("click", (event) => {
-    const fileLink = event.target instanceof Element
-      ? event.target.closest("a.local-path-link[data-preview-path]")
-      : null;
-    if (fileLink && isPlainLeftClick(event)) {
-      event.preventDefault();
-      const path = fileLink.getAttribute("data-preview-path");
-      (host.__pathCanvas ?? host.__pathPreview)?.(path);
-      return;
-    }
+    if (stayInPageForPreviewClick(event, host.__pathCanvas ?? host.__pathPreview)) return;
     const target = event.target instanceof Element
-      ? event.target.closest("[data-path-preview], [data-path-reveal]")
+      ? event.target.closest("[data-path-reveal]")
       : null;
     if (!target) return;
     event.preventDefault();
-    const previewPath = target.getAttribute("data-path-preview");
-    if (previewPath) (host.__pathCanvas ?? host.__pathPreview)?.(previewPath);
-    else host.__pathReveal?.(target.getAttribute("data-path-reveal"));
+    host.__pathReveal?.(target.getAttribute("data-path-reveal"));
   });
 }
 
@@ -6964,13 +7035,7 @@ function patchConversation(parts, state, live, callbacks) {
     host.__revealBound = true;
     host.addEventListener("click", (e) => {
       const cb = host.__chatCallbacks ?? {};
-      const canvasBtn = e.target instanceof Element ? e.target.closest("[data-canvas-open]") : null;
-      if (canvasBtn) {
-        if (!isPlainLeftClick(e)) return;
-        e.preventDefault();
-        cb.onOpenCanvas?.(canvasBtn.getAttribute("data-canvas-open"));
-        return;
-      }
+      if (stayInPageForPreviewClick(e, cb.onOpenCanvas ?? cb.onPreviewPath)) return;
       const ext = e.target instanceof Element ? e.target.closest("a[href]") : null;
       if (ext && isPlainLeftClick(e) && typeof cb.onOpenBrowser === "function") {
         const href = parseBrowserUrl(ext.getAttribute("href") || ext.href);
@@ -7004,6 +7069,15 @@ function patchConversation(parts, state, live, callbacks) {
         const itemNode = actionBtn.closest(".chat-item");
         if (action === "copy") {
           cb.onCopyChat?.(chatTextFromNode(itemNode));
+          return;
+        }
+        if (action === "export-sources") {
+          const table = actionBtn.closest(".chat-sources")?.querySelector("tbody");
+          const rows = [...(table?.querySelectorAll("tr") ?? [])].map((tr) => {
+            const cells = [...tr.querySelectorAll("td")].map((td) => (td.textContent ?? "").trim());
+            return { title: cells[0] || "", quote: cells[1] || "", url: cells[2] || "" };
+          });
+          cb.onCopyChat?.(formatSourceExport(rows));
           return;
         }
         if (action === "fork") {
@@ -7431,7 +7505,8 @@ function patchProgressPanel(parts, progress) {
 /**
  * 产物清单。
  *
- * 「预览」与「下载」都走宿主的 `/api/runs/:id/artifact`——浏览器一律拦截
+ * 「预览」走页内坞（stayInPageForPreviewClick），不 `window.location` 到 `file://`。
+ * 「下载」走宿主的 `/api/runs/:id/artifact`——浏览器一律拦截
  * http 页面跳 `file://`，所以本地文件必须由宿主取给它。
  * 「在文件夹中显示」是**从网页请求启动本机进程**，圈禁在服务端（同一套
  * resolveInWorkdir），这里只负责把路径原样交上去。
@@ -7482,13 +7557,7 @@ function patchArtifacts(parts, files, runId, callbacks) {
   if (!host.__revealBound) {
     host.__revealBound = true;
     host.addEventListener("click", (e) => {
-      const canvasBtn = e.target instanceof Element ? e.target.closest("[data-canvas-open]") : null;
-      if (canvasBtn) {
-        if (!isPlainLeftClick(e)) return;
-        e.preventDefault();
-        callbacks.onOpenCanvas?.(canvasBtn.getAttribute("data-canvas-open"));
-        return;
-      }
+      if (stayInPageForPreviewClick(e, callbacks.onOpenCanvas ?? callbacks.onPreviewPath)) return;
       const btn = e.target instanceof Element ? e.target.closest("[data-reveal]") : null;
       if (btn) callbacks.onReveal?.(btn.getAttribute("data-reveal"));
     });
@@ -8342,8 +8411,13 @@ function renderPlanNode(n, maxDuration, opts = {}) {
   const acceptance = Array.isArray(n.acceptance) ? n.acceptance : [];
   let html = `<div class="plan-node plan-node--${n.status}${openable ? " plan-node--openable" : ""}">`;
   // 可点的是标题行，不是整张卡：卡里还有 <details>，套 role=button 会 nested-interactive。
-  html += `<div class="plan-node-head"${openable ? ` data-agent-id="${esc(n.id)}" role="button" tabindex="0"` : ""}><span class="plan-node-mark">${mark}</span>`;
-  html += `<code class="plan-node-id">${esc(n.id)}</code> <span class="plan-node-title">${esc(n.title)}</span></div>`;
+  const editable = opts.editable === true;
+  html += `<div class="plan-node-head"${openable && !editable ? ` data-agent-id="${esc(n.id)}" role="button" tabindex="0"` : ""}><span class="plan-node-mark">${mark}</span>`;
+  html += `<code class="plan-node-id">${esc(n.id)}</code> `;
+  html += editable
+    ? `<input class="plan-node-title-edit" data-plan-edit="title" data-plan-id="${esc(n.id)}" value="${esc(n.title)}" aria-label="改短句 ${esc(n.id)}" />`
+    : `<span class="plan-node-title">${esc(n.title)}</span>`;
+  html += "</div>";
   html += '<div class="plan-node-meta">';
   if (n.pack) html += `<span class="chip-perm">包 ${esc(n.pack)}</span>`;
   if (deps.length) html += `<span>⇐ ${esc(deps.join(", "))}</span>`;
@@ -8353,7 +8427,11 @@ function renderPlanNode(n, maxDuration, opts = {}) {
   if (n.durationMs != null) html += `<span>${formatDuration(n.durationMs)}</span>`;
   html += "</div>";
   if (pct > 0) html += `<div class="plan-bar"><div class="plan-bar-fill" style="width:${pct}%"></div></div>`;
-  if (brief) html += `<p class="plan-node-brief">${esc(brief)}</p>`;
+  if (editable) {
+    html += `<input class="plan-node-brief-edit" data-plan-edit="description" data-plan-id="${esc(n.id)}" value="${esc(brief)}" aria-label="改说明 ${esc(n.id)}" placeholder="这一步要做什么（可改）" />`;
+  } else if (brief) {
+    html += `<p class="plan-node-brief">${esc(brief)}</p>`;
+  }
   if (acceptance.length) {
     const list = `<ul class="plan-acceptance">${acceptance.map((a) => `<li>${esc(a)}</li>`).join("")}</ul>`;
     html += revealAcceptance
@@ -8378,7 +8456,7 @@ export function renderPlanReviewHtml(plan, opts = {}) {
       nodes.length > 1 ? `（${nodes.length} 个可并发）` : ""
     }</span>`;
     html += '<div class="plan-nodes">';
-    for (const n of nodes) html += renderPlanNode(n, plan.maxDuration, { revealAcceptance });
+    for (const n of nodes) html += renderPlanNode(n, plan.maxDuration, { revealAcceptance, editable: opts.editable === true });
     html += "</div></li>";
   });
   html += "</ol>";
@@ -8915,6 +8993,10 @@ export function deriveChatItems(state, live, opts = {}) {
   if (!agentId) {
     keyed = applyDeliveryKeepingCurrentTurn(keyed, state, files, state.status === "running");
     keyed = applyBlockedCard(keyed, state);
+    const sourceRows = deriveChatSources(state);
+    if (sourceRows.length) {
+      keyed.push({ kind: "sources", rows: sourceRows, seq: Number.MAX_SAFE_INTEGER });
+    }
   }
   for (const it of keyed) {
     it.key =
@@ -8926,6 +9008,7 @@ export function deriveChatItems(state, live, opts = {}) {
       : it.kind === "verdict" ? ("verdict:" + (it.judgedTurn ?? "x") + ":" + it.round)
       : it.kind === "artifacts" ? "artifacts"
       : it.kind === "blocked" ? "blocked"
+      : it.kind === "sources" ? "sources"
       : it.kind === "plan" ? "plan"
       : it.kind === "agents" ? "agents"
       : it.kind === "tool" ? ("tool:" + (it.toolUseId ?? it.seq ?? "x"))
@@ -9502,6 +9585,72 @@ function isPlainLeftClick(event) {
   const button = event?.button;
   return (button == null || button === 0)
     && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey;
+}
+
+/**
+ * 本地 file:// 或盘符路径。http 页一点就会整页开走，预览绝不能拿它当导航。
+ * @param {string|null|undefined} href
+ */
+export function isLocalFileHref(href) {
+  const raw = String(href ?? "").trim();
+  if (!raw) return false;
+  if (/^file:/i.test(raw)) return true;
+  if (/^[a-zA-Z]:[\\/]/.test(raw)) return true;
+  if (raw.startsWith("\\\\")) return true;
+  return false;
+}
+
+/**
+ * 从 file:// / 盘符 href 抽出本地路径，给页内画布用。抽不出就空串。
+ * @param {string|null|undefined} href
+ */
+export function localPathFromFileHref(href) {
+  const raw = String(href ?? "").trim();
+  if (!raw) return "";
+  if (/^file:/i.test(raw)) {
+    try {
+      const u = new URL(raw);
+      let path = decodeURIComponent(u.pathname || "");
+      if (/^\/[a-zA-Z]:/.test(path)) path = path.slice(1);
+      return path;
+    } catch {
+      return raw.replace(/^file:\/\//i, "");
+    }
+  }
+  if (/^[a-zA-Z]:[\\/]/.test(raw) || raw.startsWith("\\\\")) return raw;
+  return "";
+}
+
+/**
+ * 预览点击：拦默认导航（含 file://），交给页内坞。返回是否已接管。
+ * @param {Event} event
+ * @param {((path:string)=>void)|null|undefined} openFn
+ */
+export function stayInPageForPreviewClick(event, openFn) {
+  const el = event?.target instanceof Element
+    ? event.target.closest("[data-canvas-open], [data-path-preview], a[data-preview-path], a[href]")
+    : null;
+  if (!el) return false;
+  const href = el.getAttribute("href") || "";
+  const fromAttr = (
+    el.getAttribute("data-canvas-open")
+    || el.getAttribute("data-path-preview")
+    || el.getAttribute("data-preview-path")
+    || ""
+  ).trim();
+  const fileHref = isLocalFileHref(href);
+  if (!fromAttr && !fileHref) return false;
+  const path = fromAttr || localPathFromFileHref(href);
+  if (fileHref) {
+    event.preventDefault();
+    event.stopPropagation?.();
+    if (isPlainLeftClick(event) && typeof openFn === "function" && path) openFn(path);
+    return true;
+  }
+  if (!isPlainLeftClick(event)) return false;
+  event.preventDefault();
+  if (typeof openFn === "function" && path) openFn(path);
+  return true;
 }
 
 export const SIDEBAR_COLLAPSED_KEY = "agent-ui-sidebar-collapsed";
@@ -10280,9 +10429,26 @@ export function renderChatItem(it, thinkingOpen = false) {
         }).join("\n");
         html +=
           `<div class="chat-recap chat-cite" role="note">` +
-          `<div class="chat-recap-head">引用</div>` +
+          `<div class="chat-recap-head">引用的会话</div>` +
           `<p class="chat-recap-body">${esc(body)}</p>` +
           `</div>`;
+        break;
+      }
+      case "sources": {
+        const rows = Array.isArray(it.rows) ? it.rows : [];
+        html +=
+          `<aside class="chat-sources" role="region" aria-label="来源">` +
+          `<div class="chat-sources-head">来源</div>` +
+          `<div class="md-table-wrap"><table class="md-table chat-sources-table"><thead><tr>` +
+          `<th>来源</th><th>该页说的</th><th>链接</th>` +
+          `</tr></thead><tbody>` +
+          rows.map((r) =>
+            `<tr><td>${esc(r.title || "链接")}</td><td>${esc(r.quote || "")}</td>` +
+            `<td><a href="${esc(r.url)}" target="_blank" rel="noopener noreferrer">${esc(r.url)}</a></td></tr>`,
+          ).join("") +
+          `</tbody></table></div>` +
+          `<button type="button" class="btn btn--ghost chat-sources-export" data-chat-action="export-sources">导出链接列表</button>` +
+          `</aside>`;
         break;
       }
       case "recap": {
@@ -11577,6 +11743,8 @@ export function renderEmptyState(_hasRuns, _opts = {}) {
     '<p class="empty-brand">FATHOM<span class="fw-dot">.</span></p>' +
     '<p class="empty-tagline">说要做什么，回车就发。</p>' +
     '<p class="empty-tagline-cn">稿件、纪要、问答都可以从这里开始。</p>' +
+    '<p class="empty-window-note">现在只能在这个窗口下指令。</p>' +
+    '<p class="empty-cite-hint">用附件或工作目录，这里没有 @ 文件补全。</p>' +
     '<span class="empty-depthline" aria-hidden="true"></span>' +
     "</div>";
 }

@@ -289,13 +289,17 @@ import {
 import { DEFAULT_VERIFIER_MAX_TURNS, resolveVerifierReadOnlyCommands } from "../src/verifier.js";
 import type { Plan, PlanNodeState, SubTask } from "../src/planner.js";
 import {
+  applyPlanShortEdits,
   durableNodeFromPlanNode,
   durablePlanFromPlan,
   handoffsFromPlanNodes,
   planFromNodes,
   planNodesFromDurable,
   planNodesFromSubtasks,
+  resolvePlanShortEdits,
   resolvePlannerMaxTurns,
+  type PlanShortEditIgnored,
+  type PlanShortEditPatch,
 } from "../src/planner.js";
 import { resolveRecoveryPolicy } from "../src/recovery.js";
 import {
@@ -924,6 +928,11 @@ interface StoredRun {
 interface PendingPlan {
   requestSeq: number;
   at: number;
+  /** onPlan 里那份活对象：批准时改短句必须写回这里，执行者才看得到 */
+  plan: Plan;
+  concurrency: number;
+  concurrencyMode: "auto" | "fixed";
+  plannerMs: number;
   /** 由 waitForPlanDecision 装填：应答或过期时结束等待 */
   settle: (decision: "approve" | "reject" | "expired") => void;
 }
@@ -5218,7 +5227,15 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    *   · 决策必须进事件流，刷新/重连后仍能看到谁在什么时候批的；
    *   · run 收尾时必须宣告过期并解除挂起，否则编排协程永远吊在这里。
    */
-  function waitForPlanDecision(run: StoredRun): Promise<void> {
+  function waitForPlanDecision(
+    run: StoredRun,
+    pending: {
+      plan: Plan;
+      concurrency: number;
+      concurrencyMode: "auto" | "fixed";
+      plannerMs: number;
+    },
+  ): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       const requestSeq = pushSyntheticEvent(run, "host", {
         type: "plan_approval_request",
@@ -5227,6 +5244,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       run.pendingPlan = {
         requestSeq,
         at: Date.now(),
+        plan: pending.plan,
+        concurrency: pending.concurrency,
+        concurrencyMode: pending.concurrencyMode,
+        plannerMs: pending.plannerMs,
         settle: (decision) => {
           delete run.pendingPlan;
           if (decision === "approve") resolve();
@@ -5235,6 +5256,43 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       };
       broadcastLifecycle("run_updated", run);
     });
+  }
+
+  function adoptedPlanViews(plan: Plan) {
+    return hostPlanSubtaskViews(plan.subtasks, (name) => getPack(name)?.resources);
+  }
+
+  /** 短句补丁写进活计划、节点、落盘；再发一份 plan 事件让 Plan 面跟执行面同字。 */
+  function commitPlanShortEdits(run: StoredRun, pending: PendingPlan, patches: readonly PlanShortEditPatch[]): void {
+    if (patches.length === 0) return;
+    applyPlanShortEdits(pending.plan, patches);
+    if (run.injectedPlan && run.injectedPlan !== pending.plan) {
+      applyPlanShortEdits(run.injectedPlan, patches);
+    }
+    if (run.planNodes?.length) {
+      const byId = new Map(pending.plan.subtasks.map((s) => [s.id, s]));
+      run.planNodes = run.planNodes.map((n) => {
+        const sub = byId.get(n.id);
+        return sub ? { ...n, title: sub.title, description: sub.description } : n;
+      });
+      if (run.durableState?.plan) {
+        applyDurableTransition(run, {
+          type: "plan_progress",
+          nodes: run.planNodes.map(durableNodeFromPlanNode),
+        });
+      }
+    }
+    pushSyntheticEvent(
+      run,
+      "host",
+      hostPlanEvent({
+        concurrency: pending.concurrency,
+        concurrencyMode: pending.concurrencyMode,
+        plannerMs: pending.plannerMs,
+        subtasks: adoptedPlanViews(pending.plan),
+        gated: false,
+      }),
+    );
   }
 
   /**
@@ -7697,7 +7755,14 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             planReadyAt,
           );
           // 签字位：计划已发出、一个子任务都还没发射，此时停下是零副作用的
-          if (run.planGate) await waitForPlanDecision(run);
+          if (run.planGate) {
+            await waitForPlanDecision(run, {
+              plan,
+              concurrency: effectiveConcurrency,
+              concurrencyMode: concurrency === "auto" ? "auto" : "fixed",
+              plannerMs: planReadyAt - startedAt,
+            });
+          }
         },
         onSubtaskStart: (sub) => {
           const current = run.planNodes ?? [];
@@ -9502,7 +9567,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         }),
       );
       try {
-        await waitForPlanDecision(run);
+        await waitForPlanDecision(run, {
+          plan,
+          concurrency: 1,
+          concurrencyMode: "fixed",
+          plannerMs: 0,
+        });
       } catch (err) {
         if (err instanceof PlanRejectedError) {
           finalizeRun(run, {
@@ -13608,7 +13678,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         } catch (error) {
           return requestBodyFailure(res, error);
         }
-        let parsed: { decision?: string };
+        let parsed: { decision?: string; edits?: unknown };
         try {
           parsed = JSON.parse(body);
         } catch {
@@ -13616,6 +13686,18 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         }
         if (parsed.decision !== "approve" && parsed.decision !== "reject") {
           return badRequest(res, 'decision must be "approve" or "reject"');
+        }
+
+        const pendingPlan = run.pendingPlan;
+        let applied: PlanShortEditPatch[] = [];
+        let ignored: PlanShortEditIgnored[] = [];
+        // 批准才认 edits。先解析后动刀——非法短句 400 且门仍挂着，
+        // 不能 200 开跑还假装改过。否决带 edits 直接丢掉，不挡拒签。
+        if (parsed.decision === "approve") {
+          const resolved = resolvePlanShortEdits(pendingPlan.plan, parsed.edits);
+          if (!resolved.ok) return badRequest(res, resolved.error);
+          applied = resolved.patches;
+          ignored = resolved.ignored;
         }
 
         // 日预算门（评审：签字位是零副作用停点——批准即并行发射全部子任务，
@@ -13626,7 +13708,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           if (budgetRefusal) return rejectAtDailyBudget(res, budgetRefusal);
         }
 
-        const pendingPlan = run.pendingPlan;
+        if (parsed.decision === "approve" && applied.length) {
+          commitPlanShortEdits(run, pendingPlan, applied);
+        }
+
         const at = Date.now();
         run.planDecision = { decision: parsed.decision, at };
         // 决策进事件流：刷新/重连后仍能看到谁在什么时候签的（V-02 的口径）
@@ -13636,6 +13721,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           decision: parsed.decision,
           actor: "user",
           at,
+          ...(applied.length ? { edits: applied } : {}),
         });
         applyDurableTransition(
           run,
@@ -13648,7 +13734,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         observeWaitSeconds("plan_gate", Date.now() - pendingPlan.at);
         pendingPlan.settle(parsed.decision);
         broadcastLifecycle("run_updated", run);
-        return json(res, 200, { acknowledged: true });
+        return json(res, 200, {
+          acknowledged: true,
+          plan: { subtasks: adoptedPlanViews(pendingPlan.plan) },
+          applied,
+          ignored,
+        });
       }
 
       case "handoff": {

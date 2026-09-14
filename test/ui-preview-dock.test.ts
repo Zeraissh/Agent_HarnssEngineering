@@ -296,6 +296,18 @@ describe("createPreviewDock — 放大/还原与 Esc 两级", () => {
     expect(dock.root.classList.contains("preview-dock--expanded")).toBe(true);
   });
 
+  it("浮层有关闭，点了回到对话、不拆页", () => {
+    setupPage();
+    const dock = createPreviewDock({ id: "pd-close-label", label: "文件预览", overlay: true }, { closeAnimMs: 0 });
+    dock.open();
+    expect(dock.closeBtn.getAttribute("aria-label")).toBe("关闭预览");
+    expect(dock.closeBtn.textContent).toContain("关闭");
+    expect(dock.closeBtn.title).toContain("回到对话");
+    dock.closeBtn.click();
+    expect(dock.root.hidden).toBe(true);
+    expect(document.body.contains(dock.root)).toBe(true);
+  });
+
   it("insertHeadControl：特征控件在收起键之后、放大键恒在最右", () => {
     setupPage();
     const dock = createPreviewDock({ id: "pd-n", label: "预览" }, {});

@@ -9,6 +9,36 @@ export function formatGitTriggerLabel(git) {
   return git.dirty ? `${head} *` : head;
 }
 
+export function githubMcpConnected(mcp) {
+  return (mcp?.servers ?? []).some((s) =>
+    String(s?.name ?? "").toLowerCase() === "github" && s.status === "connected",
+  );
+}
+
+/**
+ * 工作单元上的 GitHub 诚实句。没连 MCP 就不给「开 PR」。
+ * @returns {{ offerPr: boolean, note: string, prHref?: string }}
+ */
+export function workspaceGitHonesty(git, mcp) {
+  if (!git || git.present !== true) return { offerPr: false, note: "" };
+  const owner = git.github?.owner;
+  const repo = git.github?.repo;
+  if (!owner || !repo) {
+    return { offerPr: false, note: "本地仓库。还没接 GitHub，现在只会改这个文件夹。" };
+  }
+  if (!githubMcpConnected(mcp)) {
+    return {
+      offerPr: false,
+      note: `仓库是 ${owner}/${repo}。GitHub 没连上，现在只会改这个文件夹。`,
+    };
+  }
+  return {
+    offerPr: true,
+    note: "",
+    prHref: `https://github.com/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/compare`,
+  };
+}
+
 export function formatGitTitle(git) {
   if (!git || git.present !== true) return "";
   const repo = git.github?.owner && git.github.repo
@@ -17,7 +47,7 @@ export function formatGitTitle(git) {
   return git.dirty ? `${repo} · 有未提交改动` : repo;
 }
 
-export function renderGitMenu(menu, git) {
+export function renderGitMenu(menu, git, mcp) {
   menu.replaceChildren();
   if (!git || git.present !== true) return;
   if (git.github?.owner && git.github.repo) {
@@ -25,6 +55,22 @@ export function renderGitMenu(menu, git) {
     hint.className = "wd-menu-hint";
     hint.textContent = `${git.github.owner}/${git.github.repo}`;
     menu.appendChild(hint);
+  }
+  const honesty = workspaceGitHonesty(git, mcp);
+  if (honesty.note) {
+    const note = menu.ownerDocument.createElement("p");
+    note.className = "wd-menu-hint git-honesty";
+    note.textContent = honesty.note;
+    menu.appendChild(note);
+  }
+  if (honesty.offerPr && honesty.prHref) {
+    const link = menu.ownerDocument.createElement("a");
+    link.className = "git-pr-link";
+    link.href = honesty.prHref;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.textContent = "开 PR";
+    menu.appendChild(link);
   }
   const list = menu.ownerDocument.createElement("div");
   list.className = "wd-menu-list";
@@ -93,6 +139,7 @@ export function renderDirtyCheckoutPrompt(menu, { branch, fromBranch, busy } = {
  * @param {HTMLElement} root
  * @param {{
  *   getWorkdir?: () => string,
+ *   getMcp?: () => { servers?: { name?: string, status?: string }[] }|null,
  *   onAnnounce?: (msg: string) => void,
  *   fetch?: typeof fetch,
  *   trigger?: HTMLElement,
@@ -145,7 +192,7 @@ export function initWorkspaceGitChip(root, hooks = {}, env = {}) {
           busy,
         });
       } else {
-        renderGitMenu(menu, snapshot);
+        renderGitMenu(menu, snapshot, hooks.getMcp?.() ?? null);
       }
     }
     return snapshot;

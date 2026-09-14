@@ -23,6 +23,10 @@
 
 ## 和活产品的关系
 
-评测是 2026-09-14 当时。之后 **CLI、服务端、前端先勾项都已改**（非 TTY 确认、`--yes` 横幅、`--resume-run` 停而不重开、Work 没点芯片不再 409、出厂先问；页面上：发送 / 「说要做什么…」、自动放行默认不勾、「打一句话，回车」、批准卡「要新建或改 …」+「允许」「拒绝」、默认 Work、核查进运行设置、停/完成/否决三分）。
+评测是 2026-09-14 当时。之后 **CLI、服务端、前端第一批 + 第二批都已改**：
 
-**前端已改，VERIFY 仍是改前活页。** walks / VERIFY / BACKLOG / REPORT **不要改写成「问题已消失」**。回走用原角色剧本。可见变化对照 [`_fix-notes-web.md`](_fix-notes-web.md)。
+- 第一批：发送 / 「说要做什么…」、自动放行默认不勾、批准卡「允许」「拒绝」、默认 Work、停/完成/否决三分。
+- 第二批：计划门可改标题/短说明且 `edits` 写入活计划；`@` `#` `/` `$` 不弹旧对话，「引用会话」是按钮；「全部项目」默认勾；空态「现在只能在这个窗口下指令」；GitHub 没连不给假开 PR；来源表；`consult · 查资料`；侧栏/指挥中心「今日 $」/「这次 $」；预览页内坞，不跳 `file://`；桌面窗框 `FATHOM` / `FATHOM · 对话`，`npm run desktop`，没有开始菜单项。
+- CLI `--plan` 仍是拆完就执行，没有确认门。
+
+**前端已改，VERIFY 仍是改前活页。** walks / VERIFY / BACKLOG / REPORT **不要改写成「问题已消失」**。回走用原角色剧本。可见变化对照 [`_fix-notes-web.md`](_fix-notes-web.md)、[`_fix-notes-web2-app.md`](_fix-notes-web2-app.md)、[`_fix-notes-web2-usage.md`](_fix-notes-web2-usage.md)、[`_fix-notes-web2-preview.md`](_fix-notes-web2-preview.md)、[`_fix-notes-desktop.md`](_fix-notes-desktop.md)、[`_fix-notes-plan-edits.md`](_fix-notes-plan-edits.md)。

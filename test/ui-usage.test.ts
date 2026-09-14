@@ -21,6 +21,9 @@ import {
   USAGE_OTHER_MODEL,
   initUsageView,
   attachUsagePanel,
+  deriveSpendFace,
+  formatThisRunSpend,
+  todayUsageOf,
 } from "../ui/public/features/usage.js";
 
 const NOW = Date.parse("2026-09-09T12:00:00");
@@ -213,5 +216,51 @@ describe("消耗 DOM", () => {
     expect(box.querySelector("#settings-usage-cards")?.textContent).toContain("pro");
     expect(box.querySelector("#usage-cards")).toBeNull();
     expect(box.querySelectorAll(".usage-col")).toHaveLength(7);
+  });
+});
+
+describe("deriveSpendFace 今日 / 本次花费", () => {
+  const noon = Date.parse("2026-09-14T12:00:00");
+
+  it("今日 $0.71 · 已用次数 · 未计价；不写还剩几次", () => {
+    const face = deriveSpendFace({
+      now: noon,
+      usage: {
+        byDay: [{ day: "2026-09-14", runs: 110, usd: 0.71, unpricedRuns: 26, turns: 1 }],
+      },
+    });
+    expect(todayUsageOf({ byDay: [{ day: "2026-09-14", runs: 110, usd: 0.71, unpricedRuns: 26 }] }, noon).usd).toBe(0.71);
+    expect(face.todayMoney).toBe("今日 $0.71");
+    expect(face.todayUsed).toBe("今日已用 110 次");
+    expect(face.todayLine).toContain("26 未计价");
+    expect(face.chipText).toBe("今日 $0.71");
+    expect(face.chipTitle).not.toMatch(/还剩|套餐|token/i);
+  });
+
+  it("没有当天行不是 $0.00；本次只信 cost.usd", () => {
+    const empty = deriveSpendFace({ now: noon, usage: { byDay: [] } });
+    expect(empty.todayUsd).toBeNull();
+    expect(empty.todayMoney).toBe("今日还没花费");
+    expect(empty.todayUsed).toBe("今日已用 0 次");
+    expect(empty.thisRunText).toBeNull();
+
+    const unpricedDay = deriveSpendFace({
+      now: noon,
+      usage: { byDay: [{ day: "2026-09-14", runs: 3, usd: null, unpricedRuns: 3 }] },
+    });
+    expect(unpricedDay.todayMoney).toBe("今日未计价");
+    expect(unpricedDay.todayMoney).not.toBe("$0.00");
+
+    expect(formatThisRunSpend({ usd: 0.04 })).toBe("这次 $0.04");
+    expect(formatThisRunSpend({ usd: 0.0031 })).toBe("这次约 $0.0031");
+    expect(formatThisRunSpend({ usd: null })).toBe("这次未计价");
+    expect(formatThisRunSpend(null)).toBeNull();
+
+    const withRun = deriveSpendFace({
+      now: noon,
+      usage: { byDay: [{ day: "2026-09-14", runs: 1, usd: 0.71, unpricedRuns: 0 }] },
+      runCost: { usd: 0.04 },
+    });
+    expect(withRun.chipText).toBe("这次 $0.04 · 今日 $0.71");
   });
 });

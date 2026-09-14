@@ -39,11 +39,34 @@ describe('production desktop shell', () => {
     expect(page).toContain("connect-src 'none'");
   });
 
+  it('窗口标题由壳按路由定，拦住宿主页「FATHOM 控制台」口号', () => {
+    const main = readFileSync(join(root, 'electron', 'main.cjs'), 'utf8');
+    const settingsWindow = readFileSync(join(root, 'electron', 'settings-window.cjs'), 'utf8');
+    const settingsPage = readFileSync(join(root, 'electron', 'settings.html'), 'utf8');
+    const readme = readFileSync(join(root, 'README.md'), 'utf8');
+    expect(main).toContain("require('./window-title.cjs')");
+    expect(main).toContain('desktopWindowTitle()');
+    expect(main).toContain('wireDesktopWindowTitle(win)');
+    expect(main).not.toMatch(/title:\s*'Agent Harness'/);
+    expect(main).not.toMatch(/title:\s*'FATHOM 控制台'/);
+    // 只锁 token 会让「听了事件却放行口号」的变异绿——必须含 preventDefault
+    expect(readFileSync(join(root, 'electron', 'window-title.cjs'), 'utf8')).toMatch(
+      /page-title-updated[\s\S]{0,120}?event\.preventDefault\(\)/,
+    );
+    expect(settingsWindow).toContain("title: 'FATHOM · 模型与运行设置'");
+    expect(settingsPage).toContain('<title>FATHOM · 模型与运行设置</title>');
+    expect(readme).toMatch(/现在没有开始菜单项/);
+    expect(readme).toContain('npm run desktop');
+    expect(readme).toContain('FATHOM · 对话');
+  });
+
   it('一键启动接线：先探已有宿主再自拉起，退出必收进程树，attach 模式不杀别人的宿主', () => {
     const main = readFileSync(join(root, 'electron', 'main.cjs'), 'utf8');
     expect(main).toContain("require('./host-launcher.cjs')");
     expect(main).toContain('probeHealthy'); // 老工作流（宿主已在跑）保持直连
     expect(main).toContain('resolveHostEntry');
+    expect(main).toContain('spawnHost'); // 4173 没人听时自拉起，不必先 npm run ui
+    expect(main).toMatch(/probeHealthy\(candidate\)[\s\S]{0,2500}?spawnHost/);
     expect(main).toContain("app.on('will-quit'");
     expect(main).toContain('stopHostTree'); // 关窗即收树，不留僵尸 node
     // 退出闸门：quitting 先无条件置位（封死启动窗口期关窗留孤儿宿主的微任务缝），

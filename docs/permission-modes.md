@@ -28,6 +28,9 @@
  * - CLI `--yes` 横幅跟 `cliRuntimePermissionSwitches`（`yes=true` / 会自动放行），不抄 env 标签。
  * - Web：`permissionMode` 选择器 + 装配条 / composer 一行人话（哪一档、会不会自动放行 ask）；
  *   展开开关仍在 why 里。`mode` 只跟实际开关反推，不跟点过的标签（追问改编排后对不上 → 自定义）
+ * - Web 计划确认门（`plan` 档）：卡上可改子任务 title/description；
+ *   `POST /api/runs/:id/plan-approval` 的 `edits` 写入活计划再执行。其它结构字段不写。
+ *   CLI `--plan` 拆完就执行，没有这扇门。
  * - 台账：`permissionMode` 记实际开关反推的档（自定义 → null），不是点过的标签；
  *   `approvals{asked,auto,denied}` 记工具审批结局（计划门不计）
  */

@@ -67,6 +67,9 @@ import {
   composerCiteTrigger,
   filterCiteCandidates,
   sameWorkdirCiteRuns,
+  packOptionLabel,
+  deriveChatSources,
+  formatSourceExport,
   suggestPlainModeInsteadOfPlan,
   pickWelcomeWorkdir,
 } from "../ui/public/app.js";
@@ -637,6 +640,8 @@ describe("reduceEvent", () => {
     expect(appSrc).toContain('class="empty-brand">FATHOM');
     expect(appSrc).toContain("说要做什么，回车就发。");
     expect(appSrc).toContain("稿件、纪要、问答都可以从这里开始。");
+    expect(appSrc).toContain("现在只能在这个窗口下指令。");
+    expect(appSrc).toContain("这里没有 @ 文件补全。");
     expect(appSrc).not.toContain("see every run to the bottom.");
     expect(appSrc).not.toContain("每一层都看得见。");
     expect(appSrc).not.toContain("尚无运行。提交一个任务开始。");
@@ -1388,6 +1393,7 @@ describe("AC6 窄屏 CSS", () => {
     const open = html.match(/function openArtifactByPath\([\s\S]*?\n\}/);
     expect(open?.[0]).toContain("rememberPreviewFile");
     expect(open?.[0]).not.toContain("previewLocalPath");
+    expect(html).toMatch(/if \(artifactCanvasApi\?\.isOpen\(\)\) artifactCanvasApi\.noteWrites\(written\);\s*else openArtifactByPath/);
   });
 
   it("主控制器不得重复 import 同名绑定——重复会让整页脚本解析失败", () => {
@@ -3241,10 +3247,29 @@ describe("formatGateChip", () => {
 });
 
 describe("点名引用（composer + derive）", () => {
-  it("composerCiteTrigger 只认末尾 @查询", () => {
+  it("composerCiteTrigger 不吃 @ # / $，没有文件补全就不弹 picker", () => {
     expect(composerCiteTrigger("写一份规格")).toBeNull();
-    expect(composerCiteTrigger("参考 @规格")).toEqual({ query: "规格", start: 3 });
-    expect(composerCiteTrigger("@")).toEqual({ query: "", start: 0 });
+    expect(composerCiteTrigger("参考 @规格")).toBeNull();
+    expect(composerCiteTrigger("@")).toBeNull();
+    expect(composerCiteTrigger("#tag")).toBeNull();
+    expect(composerCiteTrigger("/help")).toBeNull();
+    expect(composerCiteTrigger("$var")).toBeNull();
+  });
+
+  it("consult 包在运行设置里写清查资料", () => {
+    expect(packOptionLabel({ name: "consult", groundedConsult: true })).toBe("consult · 查资料");
+    expect(packOptionLabel({ name: "ts-coding" })).toBe("ts-coding");
+  });
+
+  it("deriveChatSources 从答文链接收来源表", () => {
+    let state = createInitialState("src1", "沸点", false);
+    state = reduceEvent(state, sse("main", "assistant_text", {
+      text: "水在 100°C 沸腾。[Wikipedia](https://en.wikipedia.org/wiki/Boiling_point) 也写了。",
+    }));
+    const rows = deriveChatSources(state);
+    expect(rows.some((r) => r.url.includes("wikipedia.org"))).toBe(true);
+    expect(formatSourceExport(rows)).toContain("链接");
+    expect(formatSourceExport(rows)).toContain("https://en.wikipedia.org/wiki/Boiling_point");
   });
 
   it("sameWorkdirCiteRuns 只用当前目录的可见会话", () => {
@@ -3290,6 +3315,8 @@ describe("项目多目录：侧栏可见性接线", () => {
     expect(html).toContain("filterRunsByWorkspaceFace(runs, workspaceFace)");
     expect(html).toContain("composerListMembership(project)");
     expect(html).toContain("filterRunsByComposerWorkdir(");
+    expect(html).toMatch(/id="sidebar-all-projects"[^>]*checked/);
+    expect(html).toContain("agent.ui.pref.sidebarAllProjects");
     expect(html).toContain("maybeRepaintWorkdirsForFace()");
     const filteredFn = html.match(/function getFilteredRuns\(\) \{[\s\S]*?\n\}/);
     expect(filteredFn?.[0]).not.toMatch(/getWorkdirSelection/);
