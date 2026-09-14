@@ -1,11 +1,17 @@
 import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
   buildStaticDoctorReport,
+  CLI_NEEDS_CONFIRM_EXIT,
   CLI_VERSION,
   CliArgumentError,
+  cliCanPrompt,
   cliHelpText,
+  formatCliNeedsConfirmMessage,
   formatStaticDoctor,
+  isReadlineClosedError,
   parseCliArgs,
 } from "../src/cli-args.js";
 
@@ -67,6 +73,39 @@ describe("CLI argument contract", () => {
     expect(() => parseCliArgs(["--doctor", "--verify"])).toThrow(/不能与任务或 run 参数/);
     expect(cliHelpText()).toContain("npm run agent -- doctor");
     expect(CLI_VERSION).toMatch(/^\d+\.\d+\.\d+$/);
+  });
+
+  it("run --help / run -h 能看用法，不报互斥", () => {
+    expect(parseCliArgs(["run", "--help"])).toMatchObject({ command: "help", task: "" });
+    expect(parseCliArgs(["run", "-h"])).toMatchObject({ command: "help" });
+    expect(parseCliArgs(["run", "--yes", "--help"]).command).toBe("help");
+    expect(() => parseCliArgs(["run", "--doctor", "task"])).toThrow(/不能.*同时/);
+  });
+
+  it("--help 写清换模型、--plan 不等人改、非 TTY 要 --yes、飞行中不能热续", () => {
+    const help = cliHelpText();
+    expect(help).toContain("npm run agent -- run --help");
+    expect(help).toContain("AGENT_MODEL");
+    expect(help).toMatch(/暂不能 --model/);
+    expect(help).toMatch(/拆完计划后立刻执行并核查/);
+    expect(help).toMatch(/不会停下来给你改/);
+    expect(help).toMatch(/没有交互终端时请加 --yes/);
+    expect(help).toMatch(/飞行中杀掉不能接着工具/);
+    expect(help).toMatch(/不会当新任务重开/);
+  });
+
+  it("非 TTY 需要确认：人话 + 退出码 2，不认成 readline 栈", () => {
+    expect(CLI_NEEDS_CONFIRM_EXIT).toBe(2);
+    expect(formatCliNeedsConfirmMessage()).toBe("需要确认，请加 --yes");
+    expect(cliCanPrompt({ stdin: { isTTY: false } })).toBe(false);
+    expect(cliCanPrompt({ stdin: { isTTY: true } })).toBe(true);
+    expect(isReadlineClosedError({ code: "ERR_USE_AFTER_CLOSE" })).toBe(true);
+    expect(isReadlineClosedError(new Error("readline was closed"))).toBe(false);
+    const cli = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "src", "cli.ts"), "utf8");
+    expect(cli).toMatch(/formatCliNeedsConfirmMessage/);
+    expect(cli).toMatch(/CLI_NEEDS_CONFIRM_EXIT/);
+    expect(cli).toMatch(/cliCanPrompt/);
+    expect(cli).not.toMatch(/if \(autoYes \|\| !rl\)/);
   });
 
   // 发布门只校验 tag == 根 package.json；--version 打印的常量与桌面壳版本不在那道门里，

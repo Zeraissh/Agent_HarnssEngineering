@@ -23,6 +23,8 @@ import {
   matchExplicitDesign,
   parseDesignChoiceInput,
   publicDesignCatalog,
+  hasPickedDesignTemplate,
+  designRouteBlocksCreate,
   resolveDesignModeIntent,
   routeDesignTask,
   seedForDesignId,
@@ -74,8 +76,8 @@ function spawnCli(
 }
 
 describe("design catalog v1", () => {
-  it("冻结 README 表（html-ppt-* 收成 html-ppt）+ 3d-object，共 21 条", () => {
-    expect(DESIGN_CATALOG).toHaveLength(21);
+  it("冻结 README 表（html-ppt-* 收成 html-ppt）+ 3d-object + meeting-brief/raid-brief，共 23 条", () => {
+    expect(DESIGN_CATALOG).toHaveLength(23);
     expect(DESIGN_CATALOG_IDS).toEqual([
       "web-prototype",
       "saas-landing",
@@ -92,6 +94,8 @@ describe("design catalog v1", () => {
       "eng-runbook",
       "finance-report",
       "hr-onboarding",
+      "meeting-brief",
+      "raid-brief",
       "guizang-ppt",
       "html-ppt",
       "hyperframes",
@@ -100,7 +104,7 @@ describe("design catalog v1", () => {
       "3d-object",
     ]);
     expect(DESIGN_CATALOG_IDS.some((id) => id.startsWith("html-ppt-"))).toBe(false);
-    expect(new Set(DESIGN_CATALOG_IDS).size).toBe(21);
+    expect(new Set(DESIGN_CATALOG_IDS).size).toBe(23);
   });
 
   it("每条含 id/tab/mode/title/description/pack/seed/export/capability，pack 恒为 design", () => {
@@ -109,7 +113,19 @@ describe("design catalog v1", () => {
       expect(DESIGN_TABS).toContain(e.tab);
       expect(e.export).toContain("html");
       expect(["ready", "missing"]).toContain(e.capability);
-      expect(["blank", "landing-basic", "deck-basic", "social-basic", "pm-spec", "team-okrs"]).toContain(e.seed);
+      expect([
+        "blank",
+        "landing-basic",
+        "deck-basic",
+        "social-basic",
+        "pm-spec",
+        "team-okrs",
+        "eng-runbook",
+        "finance-report",
+        "hr-onboarding",
+        "meeting-brief",
+        "raid-brief",
+      ]).toContain(e.seed);
       expect(e.title.length).toBeGreaterThan(0);
       expect(e.description.length).toBeGreaterThan(0);
     }
@@ -175,7 +191,7 @@ describe("design catalog v1", () => {
 });
 
 describe("seed mapping", () => {
-  it("saas-landing→landing-basic，幻灯→deck-basic，社媒/海报→social-basic，规格/OKR 有真种子，其余 blank", () => {
+  it("saas-landing→landing-basic，幻灯→deck-basic，社媒/海报→social-basic，文档 Template 有真种子，其余 blank", () => {
     expect(seedForDesignId("saas-landing")).toBe("landing-basic");
     expect(seedForDesignId("guizang-ppt")).toBe("deck-basic");
     expect(seedForDesignId("html-ppt")).toBe("deck-basic");
@@ -183,6 +199,11 @@ describe("seed mapping", () => {
     expect(seedForDesignId("magazine-poster")).toBe("social-basic");
     expect(seedForDesignId("pm-spec")).toBe("pm-spec");
     expect(seedForDesignId("team-okrs")).toBe("team-okrs");
+    expect(seedForDesignId("eng-runbook")).toBe("eng-runbook");
+    expect(seedForDesignId("finance-report")).toBe("finance-report");
+    expect(seedForDesignId("hr-onboarding")).toBe("hr-onboarding");
+    expect(seedForDesignId("meeting-brief")).toBe("meeting-brief");
+    expect(seedForDesignId("raid-brief")).toBe("raid-brief");
     expect(seedForDesignId("web-prototype")).toBe("blank");
     expect(seedForDesignId("3d-object")).toBe("blank");
     expect(seedForDesignId("hyperframes")).toBe("blank");
@@ -364,6 +385,14 @@ describe("R1/R2/R3", () => {
       kind: "id",
       entry: { id: "team-okrs" },
     });
+    expect(matchExplicitDesign({ explicitTemplate: "meeting-brief" })).toMatchObject({
+      kind: "id",
+      entry: { id: "meeting-brief", tab: "Template", seed: "meeting-brief" },
+    });
+    expect(matchExplicitDesign({ explicitTemplate: "raid-brief" })).toMatchObject({
+      kind: "id",
+      entry: { id: "raid-brief", tab: "Template", seed: "raid-brief" },
+    });
     expect(parseDesignChoiceInput("spec-plus-deck")).toMatchObject({
       kind: "bundle",
       bundle: "spec-plus-deck",
@@ -422,6 +451,19 @@ describe("explicit beats auto", () => {
       installedFilePacks: [extra],
     });
     expect(route).toMatchObject({ kind: "r1", pack: "brand-kit", seed: "blank", id: null });
+  });
+
+  it("页签不算点了模板芯片；R2 只在点了芯片时挡创建", () => {
+    expect(hasPickedDesignTemplate({})).toBe(false);
+    expect(hasPickedDesignTemplate({ designId: undefined, designTemplate: undefined, designFilePack: undefined })).toBe(false);
+    expect(hasPickedDesignTemplate({ designId: "saas-landing" })).toBe(true);
+    expect(hasPickedDesignTemplate({ designTemplate: "landing-basic" })).toBe(true);
+    expect(hasPickedDesignTemplate({ designFilePack: "brand-kit" })).toBe(true);
+    expect(hasPickedDesignTemplate({ designId: "  " })).toBe(false);
+    const r2 = { kind: "r2" as const };
+    expect(designRouteBlocksCreate(r2, false)).toBe(false);
+    expect(designRouteBlocksCreate(r2, true)).toBe(true);
+    expect(designRouteBlocksCreate({ kind: "r1" }, true)).toBe(false);
   });
 });
 
@@ -563,6 +605,25 @@ describe("blank index.html", () => {
       expect(html).toMatch(/不是通用多命中/);
     } finally {
       await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("Template document seeds", () => {
+  it("五条文档种子都有目录锚点与决策日志，不是 blank", async () => {
+    const ids = ["eng-runbook", "finance-report", "hr-onboarding", "meeting-brief", "raid-brief"] as const;
+    for (const id of ids) {
+      const entry = getDesignEntry(id);
+      expect(entry).toMatchObject({ tab: "Template", pack: "design", seed: id });
+      const html = await readFile(
+        fileURLToPath(new URL(`../templates/design/${id}/index.html`, import.meta.url)),
+        "utf8",
+      );
+      expect(html).toMatch(/目录/);
+      expect(html).toContain('class="toc"');
+      expect(html).toContain('id="decisions"');
+      expect(html).toMatch(/决策日志/);
+      expect(html).toContain(`href="#`);
     }
   });
 });

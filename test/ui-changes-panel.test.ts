@@ -299,6 +299,23 @@ describe("initChangesPanel DOM 层", () => {
     expect(document.querySelector(".changes-section .aside-peek").hidden).toBe(true);
   });
 
+  it("API 空但本场有写出文件时只列文件，不说没有写盘", async () => {
+    const fetchFn = vi.fn(async () =>
+      mockJsonResponse(200, { runId: "r3", workdir: "/proj", git: false, changes: [] }));
+    const { api } = mountApi(fetchFn);
+    api.setRun("r3");
+    await waitFor(() => {
+      const el = document.querySelector(".chg-hint");
+      return el && el.textContent === CHANGES_COPY.empty ? el : null;
+    });
+    api.setKnownWrites([{ path: "hello-verify-ask.txt", writes: 1 }]);
+    const rows = await waitFor(() => document.querySelectorAll(".chg-row"));
+    expect(rows).toHaveLength(1);
+    expect(rows[0].textContent).toContain("hello-verify-ask.txt");
+    expect(document.body.textContent).not.toContain(CHANGES_COPY.empty);
+    expect(document.querySelector(".chg-hint")).toBeNull();
+  });
+
   it("错误态：404 说档案不存在，500 给 HTTP 状态", async () => {
     const fetchFn = vi.fn(async () => mockJsonResponse(404, { error: "nope" }));
     const { api } = mountApi(fetchFn);

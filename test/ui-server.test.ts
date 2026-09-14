@@ -2143,7 +2143,9 @@ describe("ui-server", () => {
     // 静默降级是长期成本：设了 python-coding 却跑成默认配置，查起来很贵
     const badPack = await post({ task: "t", pack: "不存在的包" });
     expect(badPack.status).toBe(400);
-    expect((await badPack.json() as any).error).toContain("未知领域包");
+    const badPackBody = await badPack.json() as { error: string };
+    expect(badPackBody.error).toContain("没找到这个工具组合");
+    expect(badPackBody.error).not.toMatch(/HTTP|领域包/);
 
     const badEffort = await post({ task: "t", effort: "turbo" });
     expect(badEffort.status).toBe(400);

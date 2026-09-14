@@ -142,6 +142,11 @@ describe("产物画廊 DOM", () => {
     el.querySelector("#artifacts-new-btn").click();
     expect(news).toEqual(["new"]);
     expect(el.querySelector(".artifacts-empty").hidden).toBe(true);
+    expect(el.querySelector(".artifacts-empty").textContent).not.toContain("还没有产物");
+    expect(el.textContent).toContain("产品规格");
+    api.close();
+    expect(el.querySelector(".artifacts-empty").hidden).toBe(true);
+    expect(el.querySelector(".artifacts-empty").textContent).not.toContain("还没有产物");
   });
 
   it("侧栏入口按钮派发 onOpenArtifacts", () => {

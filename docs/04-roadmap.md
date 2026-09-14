@@ -1,5 +1,7 @@
 # 04 — 演进路线与验证标准
 
+> **档案，不是 2026-09 的开工清单。** 本文停在 v1.1。当前版本是 `package.json` **1.3.0**，变更见 [`CHANGELOG.md`](../CHANGELOG.md)；活交接见 [`06-backlog.md`](06-backlog.md) 第一屏与 [`08-maturity-optimization-checklist.md`](08-maturity-optimization-checklist.md)。下面「设计文档是活文档」那句已经过时——实现往前走了，本文不再逐版改写。
+
 原则：每个版本都以**可验证的行为**收尾，而不是以"代码写完了"收尾。checklist 里的每一项都必须能演示。
 
 ---

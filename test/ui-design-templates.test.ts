@@ -40,8 +40,22 @@ describe("listDesignTemplates / copyDesignTemplate", () => {
   it("仓库模板至少含 deck-basic 与 landing-basic", async () => {
     const list = await listDesignTemplates(realTemplates);
     expect(list.map((t) => t.id)).toEqual(
-      expect.arrayContaining(["deck-basic", "landing-basic", "social-basic", "pm-spec", "team-okrs"]),
+      expect.arrayContaining([
+        "deck-basic",
+        "landing-basic",
+        "social-basic",
+        "pm-spec",
+        "team-okrs",
+        "eng-runbook",
+        "finance-report",
+        "hr-onboarding",
+        "meeting-brief",
+        "raid-brief",
+      ]),
     );
+    expect(list.find((t) => t.id === "meeting-brief")?.title).toBe("会前简报");
+    expect(list.find((t) => t.id === "raid-brief")?.title).toBe("战役任务书");
+    expect(list.find((t) => t.id === "eng-runbook")?.title).toBe("工程手册");
   });
 
   it("非法 id 拒绝；拷贝进 workdir 默认不写 DESIGN.md", async () => {

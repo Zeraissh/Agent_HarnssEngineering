@@ -1,13 +1,49 @@
 # 待办清单（v2 UI 之后）
 
-# 交接：从这里接着做（2026-09-03 成熟度第二波）
+# 交接：从这里接着做（2026-09-14）
 
-**进行中**：按 `docs/08-maturity-optimization-checklist.md` Wave 2：
-`EVAL-03c → EVAL-01 → OBS-01 → RUN-01（Phase 2）→ MEM-01[~] → MODEL-01b[~]`。
-单操作员形态；GOV-* 与 SAFE-05 Phase 2B **本波不做**（除非已解锁且很小）。
-每项独立 commit + push，等 CI 绿再开下一项。
+**现在在干什么**：人格走查本波（CLI / 服务端 / 前端先勾项）**已落地**。评测档案结论不改。不要 revert 已合上的三路。
 
-**已落地（含第一波）**：
+- 前端已落地（页面上的字）：发送 / 「说要做什么…」；自动放行默认不勾、「默认先问」；新手卡「打一句话，回车」；批准卡「要新建或改 …」+「允许」「拒绝」；默认 Work 脸；独立核查在运行设置；停→「已停止」、完成→「运行已完成」、否决→「计划未获批准」；计划 / 助手；有写盘不说「本次运行没有写盘操作」
+- 服务端已落地：Work 没点稿件芯片不再 409；出厂先问
+- CLI 已落地：非 TTY 确认、`--yes` 横幅、`--resume-run` 停而不重开、`run --help`
+
+评测是 **2026-09-14 当时**的活页 / CLI 证据（VERIFY 仍是改前活页）。读法见 [`eval/persona-ux/README.md`](../eval/persona-ux/README.md)。`VERIFY.md`：**属实 21 / 部分属实 7 / 不属实 0**。回走用原角色剧本，不要另开新剧，也不要改 walks / VERIFY / BACKLOG / REPORT 的结论。
+
+## 开放（只列现在还该动手的）
+
+1. **persona-ux 其余条目**（[`BACKLOG.md`](../eval/persona-ux/BACKLOG.md) 28 条结论不改）。本波已改的先勾项见「已关闭」；还没动的例如用量首页、`@` 补全、预览整页开走、换项目空账号等。回走用原剧本，不要把 VERIFY 改成已修复。
+2. **`docs/08` 里仍标 `[~]` 的工程项**（SAFE-04/05/06、RUN-01 残余、OBS-02、E2E 签名包等）。与 UX 评测分开。**不要**从 2026-09-03 那段「下一刀：MEM-01 Phase B」开工——Phase B 已落地。
+3. **`docs/13-live-mu-backlog.md`**：共享宿主评测债 D1–D10 本波已标完成；对抗 U1 / U3–U6 已锁。不是「下一轮开案例 #9」。
+
+## 已关闭（勿当下一刀）
+
+- 案例 **#1–#11**：结案在 [`docs/cases/`](cases/)，保持档案，只修仍当手册用却已错的命令/路径。
+- 运行历史落盘（`.agent-run-history` / `AGENT_RUN_HISTORY_DIR`）；Web 可 `AGENT_UI_MCP=1` 接 MCP（默认仍不连）。
+- 核查预算三级：`AGENT_VERIFY_MAX_TURNS` > 包 `verify.maxTurns`（`stm32-debug` = 30）> 默认 15。不是写死 15。
+- 「宿主没接 MCP / 历史不落盘 / 核查永远 15」——这些旧交接已证伪。纪律还在：harness 加字段要同提交接宿主。
+- 2026-09-03 Wave 2 主项（EVAL-03c、held-out 仪器、OBS-01、RUN-01 Phase 1+2、MEM-01 A+B+C、MODEL-01b、v1.3.0）见下方档案。
+- 2026-08-08「784 单测 / 下一步案例 #9」：#9–#11 已交付；**不要再抄 784**。
+- A2「Web 没接 MemoryStore」：**已过时**（`ui/server.ts` 已接）。
+- CLI：非 TTY「需要确认，请加 --yes」退出码 2；`--yes` 横幅 `yes=true`；`--resume-run` 停而不重开；`run --help` 可用。
+- 服务端：Work 没点芯片不再 409；4xx 正文去 HTTP / 领域包 / Prototype；`GET /api/harness.defaults.autoApprove === false`。
+- 前端（`ui/public`）：发送 / 「说要做什么…」；自动放行默认不勾；新手卡「打一句话，回车」；批准卡「要新建或改 …」「允许」「拒绝」；默认 Work；核查进运行设置；收尾三分；计划 / 助手；写盘/产物空态不与本场文件对着干。详见 [`eval/persona-ux/_fix-notes-web.md`](../eval/persona-ux/_fix-notes-web.md)。
+
+## 不要做
+
+- 不要 revert 另三路产品代码；不要改他们的 `eval/persona-ux/_fix-notes-*.md`（除非只追加「文档侧已同步」）。
+- 不要重写 [`docs/05-findings.md`](05-findings.md) / `docs/cases/**` 当历史没发生过。
+- 不要把 VERIFY / walks 改成「已修复」。
+
+版本事实：根 / CLI `1.3.0`。工程残余以 [`docs/08-maturity-optimization-checklist.md`](08-maturity-optimization-checklist.md) 的 `[~]` 为准，不以本文件旧「下一刀」为准。
+
+---
+
+# 已关闭档案：2026-09-03 成熟度第二波
+
+下面是当时的交接全文。工程残余请回到 docs/08 的 `[~]` 行，不要从本段的「下一刀」开工。
+
+**当时已落地（含第一波）**：
 - TEST-01a / EVAL-02 / EVAL-03a / MODEL-01a / EVAL-03b — 见 docs/08。
 - **EVAL-03c** — release 质量/成本/延迟门 + 地板收紧（证据 nightly #33646201722 6/6）。
 - **EVAL-01[~]** — `eval/cases-heldout.ts` 25×`ho-*`；`AB_SUITE=heldout`；nightly/release 六件套已切 held-out。
@@ -235,13 +271,13 @@ git status / diff / log / show；刻意不含 find、解释器、sed）；`resol
 （无包：重定向 deny + cat 放行 + 快照 source=default）/ `v2-7c`（包沉默 source=none）/ `v2-8` 补 pack 来源；
 ui-faces 3 条。变异 4 处逐一打红：包沉默补缺省 / Web 装配忽略解析结果 / reducer 丢列表 / 缺省列表混入 find。
 
-以下为历史交接页（2026-08-08 收工），仍有参考价值；新开工优先看 `docs/08`。
+以下为 2026-08-08 收工档案；新开工看本文第一屏与 `docs/08`，不要从「784 单测 / 下一步案例 #9」接。
 
 ---
 
-# 交接：从这里接着做（2026-08-08 收工）
+# 已关闭档案：2026-08-08 收工（勿当下一刀）
 
-**至 `ddcc18a`（2026-08-09 晨）**：**784 单测 / 22 文件 + `tsc` 全绿**｜工作树干净。
+**至 `ddcc18a`（2026-08-09 晨）**：**784 单测 / 22 文件 + `tsc` 全绿**｜工作树干净。（单测数是当日快照，不要当现在的数。）
 B0（planner 三项修复）、B1（终止原因口径收敛，顺带修出 plan_gate_expired 潜伏缺陷）、
 B2（运行历史落盘）、B2b（backlog 补标注）、台账 `[object Object]` 修复——五个提交全部收口。
 **B 节已清空**（只剩 B3），下一步的主线在 C1（案例 #9）与 A1（攒 §2.1 样本），两者可一次做。
@@ -272,7 +308,7 @@ B2（运行历史落盘）、B2b（backlog 补标注）、台账 `[object Object
   **不能跨重启续跑**（界面会照实说）。
 - 台账在 `.agent-runs.jsonl`（已 gitignore），`npm run ledger` 读数。
 
-## 还开着的事（按优先级）
+## 还开着的事（按优先级）（2026-08-08 档案；开工看第一屏）
 
 ### A. 等证据类——不是"没做"，是"证据还不够"
 
@@ -284,8 +320,7 @@ B2（运行历史落盘）、B2b（backlog 补标注）、台账 `[object Object
 
 **A2. 9.9 `write_memory` 观察项：改为自动检出，等第二次出现。**
 台账按角色记工具直方图，verifier 侧的写类调用会单独列出。
-→ **注意**：这个现象**只有 CLI + 领域包那条路能产生**——Web 宿主根本没接
-`MemoryStore`（`ui/server.ts` 零命中）。要它出证据，得跑 CLI 带 pack 的真机任务。
+→ 2026-08 原文写「Web 宿主根本没接 MemoryStore」。**2026-09-14 核过：已过时**——`ui/server.ts` 已 `import { MemoryStore }` 并按 workdir 建店。要观察项仍须带 pack 的真机任务，但不再是「Web 没接」。
 
 **A3. NVDA 听感（AC-06 的非结构部分）。** 需要真人戴耳机听，自动化替不了。
 结构层已由 axe 常驻门禁覆盖。

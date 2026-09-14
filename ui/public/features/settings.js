@@ -555,7 +555,7 @@ const EFFORT_LABELS = { low: "低", medium: "中", high: "高", xhigh: "很高",
 export function defaultSettings() {
   return {
     version: SETTINGS_SCHEMA_VERSION,
-    defaults: { effort: "", verify: false, autoApprove: true },
+    defaults: { effort: "", verify: false, autoApprove: false },
     badge: true,
   };
 }
@@ -666,7 +666,7 @@ export function composerDefaults(settings) {
   return {
     effort: settings?.defaults?.effort ?? "",
     verify: Boolean(settings?.defaults?.verify),
-    autoApprove: settings?.defaults?.autoApprove !== false,
+    autoApprove: settings?.defaults?.autoApprove === true,
   };
 }
 
@@ -1881,8 +1881,13 @@ export function initSettingsView(host = {}, env = {}) {
     defaultsSection.appendChild(row);
     return input;
   };
-  const verifyInput = buildToggle("settings-verify", "独立核查", "新对话默认开启独立核查。单轮对话可在提交栏关掉；计划编排的子任务默认仍会核查，此勾改不了编排。");
-  const autoApproveInput = buildToggle("settings-auto-approve", "自动放行工具", "新对话默认自动放行低风险工具；写入仍受工作目录边界约束。");
+  const verifyInput = buildToggle("settings-verify", "独立核查", "新对话默认关闭独立核查。需要时在运行设置里打开；计划编排的子任务默认仍会核查，此勾改不了编排。");
+  const autoApproveInput = buildToggle("settings-auto-approve", "自动放行工具", "新对话默认先问再放行。需要时再打开自动放行；写入仍只能改这些文件夹。");
+  const writeCircle = doc.createElement("p");
+  writeCircle.className = "settings-field-hint";
+  writeCircle.id = "settings-write-circle";
+  writeCircle.textContent = "只能改这些文件夹。工具写入被圈在工作目录白名单里。";
+  defaultsSection.appendChild(writeCircle);
 
   effortSelect.addEventListener("change", () => {
     settings = updateSettings(settings, { defaults: { effort: effortSelect.value } });

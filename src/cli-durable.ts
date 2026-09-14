@@ -8,7 +8,6 @@ import { existsSync, readFileSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import {
-  canReopenSameRun,
   canRestorePlanGate,
   canSameRunResume,
   durableBudgetExhausted,
@@ -190,8 +189,25 @@ const CLI_CRASH_PHASES = new Set([
 ]);
 
 export type CliPlanResumeDecision =
-  | { ok: true; state: DurableRunState; nodes: DurablePlanNode[]; kind?: "hot" | "reopen"; note?: string }
+  | { ok: true; state: DurableRunState; nodes: DurablePlanNode[]; kind?: "hot" }
   | { ok: false; reason: string };
+
+/** 读不到热续检查点：停，印原任务/终态，不当新任务重开。 */
+export function formatCliResumeStop(input: {
+  runId: string;
+  reason: string;
+  task?: string;
+  phase?: string;
+}): string {
+  const task = input.task?.trim() ? input.task.trim() : "（档案未写任务）";
+  const phase = input.phase?.trim() ? input.phase.trim() : "unknown";
+  return [
+    `不能续跑 ${input.runId}：${input.reason}`,
+    `原任务：${task}`,
+    `终态：${phase}`,
+    "飞行中杀掉不能接着工具。读不到热续检查点会停，不会当新任务重开。",
+  ].join("\n");
+}
 
 /**
  * CLI 半截 DAG 续跑准入。Ctrl+C / 硬杀常把 phase 留在 executing——
@@ -199,7 +215,7 @@ export type CliPlanResumeDecision =
  */
 export function prepareCliPlanResume(
   state: DurableRunState | null,
-  opts?: { hasTask?: boolean },
+  _opts?: { hasTask?: boolean },
 ): CliPlanResumeDecision {
   if (!state) return { ok: false, reason: "没有 state.json，不能续跑" };
   let current = state;
@@ -231,27 +247,11 @@ export function prepareCliPlanResume(
     plan: facts,
   });
   if (allowed) return { ok: true, state: current, nodes: current.plan?.nodes ?? [], kind: "hot" };
-  if (
-    canReopenSameRun({
-      phase: current.phase,
-      hasTask: Boolean(opts?.hasTask),
-      budgetExhausted,
-    })
-  ) {
-    const why = explainCliPlanResumeRefusal(current);
-    return {
-      ok: true,
-      state: current,
-      nodes: current.plan?.nodes ?? [],
-      kind: "reopen",
-      note: `${why} 将从任务正文重开一轮，不接着半截 DAG，也不假装有检查点。`,
-    };
-  }
   return { ok: false, reason: explainCliPlanResumeRefusal(current) };
 }
 
 export type CliSingleResumeDecision =
-  | { ok: true; state: DurableRunState; kind?: "hot" | "reopen"; note?: string }
+  | { ok: true; state: DurableRunState; kind?: "hot" }
   | { ok: false; reason: string };
 
 /**
@@ -282,21 +282,6 @@ export function prepareCliSingleResume(
     budgetExhausted,
   });
   if (allowed) return { ok: true, state: current, kind: "hot" };
-  if (
-    canReopenSameRun({
-      phase: current.phase,
-      hasTask: Boolean(opts.hasTask),
-      budgetExhausted,
-    })
-  ) {
-    const why = explainCliSingleResumeRefusal(current, hasCheckpoint);
-    return {
-      ok: true,
-      state: current,
-      kind: "reopen",
-      note: `${why} 将从任务正文重开一轮，不会接着飞行中的工具，也不假装有检查点。`,
-    };
-  }
   return { ok: false, reason: explainCliSingleResumeRefusal(current, hasCheckpoint) };
 }
 
@@ -327,7 +312,7 @@ export function explainCliPlanResumeRefusal(state: DurableRunState): string {
   const facts = planResumeFacts(state.plan);
   if (!facts) return "没有已批准的计划快照";
   if (!facts.hasPassedNode) {
-    return "零进度（没有 passed 节点）不能接着半截 DAG。同会话可用任务正文重开一轮，不假装有检查点。";
+    return "零进度（没有 passed 节点）不能接着半截 DAG";
   }
   if (facts.hasFailedNode) return "已有 failed 节点，不能同 run 续跑";
   if (!facts.hasRemainingNode) return "没有剩余的 pending/running 节点";

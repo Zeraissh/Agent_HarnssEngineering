@@ -21,6 +21,7 @@ import type { PlannedRunResult } from "../src/orchestrate.js";
 import {
   cliMetaCheckpoint,
   createCliDurable,
+  formatCliResumeStop,
   lastExecutorTranscriptMessages,
   nextArchiveEventSeq,
   prepareCliPlanResume,
@@ -257,11 +258,10 @@ describe("CLI 半截 DAG 续跑准入", () => {
       ok: false,
       reason: expect.stringMatching(/零进度/),
     });
-    const zeroReopen = prepareCliPlanResume(zero, { hasTask: true });
-    expect(zeroReopen).toMatchObject({ ok: true, kind: "reopen" });
-    if (zeroReopen.ok) {
-      expect(zeroReopen.note).toMatch(/不假装有检查点/);
-    }
+    expect(prepareCliPlanResume(zero, { hasTask: true })).toMatchObject({
+      ok: false,
+      reason: expect.stringMatching(/零进度/),
+    });
 
     const done = transitionRunState(half, { type: "complete" })!;
     expect(prepareCliPlanResume(done)).toEqual({
@@ -379,14 +379,13 @@ describe("CLI 单执行者同 run 续跑准入", () => {
       ok: false,
       reason: expect.stringMatching(/没有已提交的 main 检查点/),
     });
-    const noCpReopen = prepareCliSingleResume(executingWithCheckpoint(), {
+    expect(prepareCliSingleResume(executingWithCheckpoint(), {
       hasHistory: false,
       hasTask: true,
+    })).toMatchObject({
+      ok: false,
+      reason: expect.stringMatching(/没有已提交的 main 检查点/),
     });
-    expect(noCpReopen).toMatchObject({ ok: true, kind: "reopen" });
-    if (noCpReopen.ok) {
-      expect(noCpReopen.note).toMatch(/不假装有检查点/);
-    }
     expect(prepareCliSingleResume(transitionRunState(initialRunState("x"), { type: "start" })!, { hasHistory: true }))
       .toMatchObject({ ok: false });
     expect(prepareCliSingleResume(executingWithCheckpoint(), { hasHistory: true, verify: true })).toEqual({
@@ -400,9 +399,26 @@ describe("CLI 单执行者同 run 续跑准入", () => {
       reason: "终态 completed 没有可热续的检查点",
     });
     expect(prepareCliSingleResume(done, { hasHistory: true, hasTask: true })).toMatchObject({
-      ok: true,
-      kind: "reopen",
+      ok: false,
+      reason: "终态 completed 没有可热续的检查点",
     });
+    expect(formatCliResumeStop({
+      runId: "cli-1",
+      reason: "终态 completed 没有可热续的检查点",
+      task: "写下 hello.txt",
+      phase: "completed",
+    })).toBe(
+      [
+        "不能续跑 cli-1：终态 completed 没有可热续的检查点",
+        "原任务：写下 hello.txt",
+        "终态：completed",
+        "飞行中杀掉不能接着工具。读不到热续检查点会停，不会当新任务重开。",
+      ].join("\n"),
+    );
+    const cli = readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "cli.ts"), "utf8");
+    expect(cli).toMatch(/formatCliResumeStop/);
+    expect(cli).not.toMatch(/将从任务正文重开一轮/);
+    expect(cli).not.toMatch(/cliSingleResume\?\.reopen/);
 
     const planArchive = executingHalfDag();
     expect(prepareCliSingleResume(planArchive, { hasHistory: true })).toEqual({

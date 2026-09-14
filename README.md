@@ -1,6 +1,33 @@
 # Agent_Design — Harness Engineering 智能体框架
 
+版本 **1.3.0**（根 `package.json` 与 `src/cli-args.ts` 的 `CLI_VERSION`）。发布仓 [Zeraissh/Agent_HarnssEngineering](https://github.com/Zeraissh/Agent_HarnssEngineering)。
+
 一个从零手写的智能体（agent）框架，TypeScript 实现，直接构建在 Anthropic Messages API 之上。
+
+## 三面：Web / CLI / 桌面
+
+| 面 | 命令 | 现在实际进哪 |
+|---|---|---|
+| **Web** | `npm run ui` | `ui/serve.ts`，默认 `http://127.0.0.1:4173`（`AGENT_UI_PORT` / `PORT`）。页标题是「FATHOM 控制台」 |
+| **CLI** | `npm run agent -- …`（`npm run cli` 同入口） | `src/cli.ts`。用法：`npm run agent -- --help` |
+| **桌面** | `npm run desktop` | Electron 壳：本机 4173 已健康就贴上；没有就拉起当前 `ui/serve.ts`。详见 [`cross-app/README.md`](cross-app/README.md) |
+
+编译产物：`npm run build && npm start`（`dist/ui/serve.js`）。静态自检：`npm run doctor`（不联网）。
+
+### 权限默认与页面上的字（已落地）
+
+- **CLI**：不加 `--yes` 时 ask 级要确认。非 TTY 印「需要确认，请加 `--yes`」，退出码 2，不摔 readline。`--yes` 横幅跟真实档位（`yes=true` / 会自动放行）。`--resume-run` 读不到检查点就停，印原任务/终态，不当新任务重开。`run --help` 可用；顶层帮助写用 `AGENT_MODEL` 换模型。`--plan` 拆完就执行并核查，CLI 没有计划确认门。`permission: deny`、圈禁、SSRF **打不穿**。
+- **Web 服务端**：`WEB_DEFAULT_AUTO_APPROVE = false`，`WEB_DEFAULT_PERMISSION_MODE = "manual"`；`GET /api/harness.defaults.autoApprove === false`。Work 没点稿件芯片不再 409，直接建 run。4xx 正文去掉 HTTP / 领域包 / Prototype。
+- **Web 页面（`ui/public`）**：默认 Work 脸。发送按钮和 label「发送」，占位「说要做什么…」（选了稿件标题时「要「标题」做什么…」）。「自动放行」默认不勾，说明「默认先问；勾上才自动放行」。独立核查在「运行设置」里，不挂发送栏。新手卡 1/4「打一句话，回车」；写入圈在设置「只能改这些文件夹」；3/4「需要时再开运行设置」，不再点名领域包 / 计划编排 / 独立核查。批准卡主文案「要新建或改 …」，按钮「允许」「拒绝」。有写盘不出现「本次运行没有写盘操作」；有本场文件不说「还没有产物」。停→「已停止」；完成→「运行已完成」；否决→「计划未获批准」。计划卡叫「计划」，提问卡叫「助手」。失败优先人话，不自拼「提交失败（HTTP …）」。
+
+评测怎么读：[`eval/persona-ux/README.md`](eval/persona-ux/README.md)。walks / VERIFY 仍是改前活页，不是「问题已消失」。
+
+### 诚实边界
+
+- 本地单操作员控制台，不是 IDE 插件，也不是飞书/微信入站网关。
+- GitHub / 飞书在设置 → MCP；Web **默认不连** MCP，要 `AGENT_UI_MCP=1`。
+- 工具写入圈在工作目录白名单内。Android 仍是实验客户端。
+- 运行历史落到 `<cwd>/.agent-run-history`（`AGENT_RUN_HISTORY_DIR` / `AGENT_RUN_HISTORY_KEEP`，缺省保留 50）。
 
 ## 这是什么
 
@@ -18,24 +45,24 @@
 | **Loop** | 请求 → 分支 stop_reason → 执行工具 → 回填结果 → 循环，直到任务完成或触发护栏 |
 | **Tools** | 模型与世界交互的唯一通道；工具的粒度、schema、描述决定了模型能做什么、宿主能管控什么 |
 | **Context** | 上下文是稀缺资源：稳定内容在前（缓存友好），易变内容在后；窗口逼近时有压缩策略 |
-| **Verification** | 让 agent 的输出可被检验：结构化事件流、token 审计、（后续）独立上下文的验证子代理 |
+| **Verification** | 独立上下文的 verifier：三值裁决（客观 fail-closed / `unverified` / `advisory`）；返工只由客观 issues 驱动 |
 
 ## 文档导航
 
-| 文档 | 内容 |
+| 文档 | 现在当什么用 |
 |---|---|
-| [docs/01-philosophy.md](docs/01-philosophy.md) | Harness engineering 设计哲学与设计原则 |
-| [docs/02-architecture.md](docs/02-architecture.md) | 五层架构、模块职责、一轮 turn 的完整数据流、关键 API 事实 |
-| [docs/03-interfaces.md](docs/03-interfaces.md) | 核心 TypeScript 接口定义（实现蓝本） |
-| [docs/04-roadmap.md](docs/04-roadmap.md) | 演进路线（v0.1 → v1.1）与每阶段验证 checklist |
-| [docs/08-maturity-optimization-checklist.md](docs/08-maturity-optimization-checklist.md) | 对标成熟 Agent 的分阶段优化清单、优先级与验收证据 |
-| [docs/09-借鉴清单.md](docs/09-借鉴清单.md) | 他山机制的借鉴决策台账：机制对照表 + 借/变形借/不借的理由 + 待借条目的判据（阈值先写） |
-| [docs/10-design-mode-evolution.md](docs/10-design-mode-evolution.md) | 设计模式（已拍板）：统一入口 + 模式内选制品类型 |
-| [docs/11-design-mode-benchmarks-ext.md](docs/11-design-mode-benchmarks-ext.md) | 设计模式外部对标扩展 |
-| [docs/12-live-multiuser-harness-test.md](docs/12-live-multiuser-harness-test.md) | 共享宿主真机评测纪律（BASE-04 软件切片：并发、可数事实、证据三件套） |
-| [CHANGELOG.md](CHANGELOG.md) | 版本变更日志（Keep a Changelog；每条对应真实提交；Release 正文自动附对应小节） |
-| [docs/reference/README.md](docs/reference/README.md) | `src/` 全部 21 个模块的参考文档（签名与源码逐一核对；由 v1.1 并行编排自举生成，见案例 #2） |
-| [docs/cases/](docs/cases) | 真实任务案例：#1 遥测固件真机闭环、#2 并行编排交付参考文档（墙钟 −43%） |
+| [docs/README.md](docs/README.md) | 活交接 vs 结案档案怎么分 |
+| [docs/06-backlog.md](docs/06-backlog.md) | **第一屏才是开工交接**；后面大段是已关闭档案 |
+| [docs/08-maturity-optimization-checklist.md](docs/08-maturity-optimization-checklist.md) | 工程成熟度台账（`[x]` / `[~]` / `[ ]`） |
+| [docs/07-production-runbook.md](docs/07-production-runbook.md) | 单操作员生产部署 / 回滚 |
+| [docs/permission-modes.md](docs/permission-modes.md) | 权限三档对照 |
+| [CHANGELOG.md](CHANGELOG.md) | 版本变更（当前 1.3.0 + Unreleased） |
+| [eval/persona-ux/README.md](eval/persona-ux/README.md) | 2026-09-14 人格走查：怎么读，不要改写成已修复 |
+| [docs/01-philosophy.md](docs/01-philosophy.md) | 设计哲学（档案，不当操作手册） |
+| [docs/04-roadmap.md](docs/04-roadmap.md) | v0.1–v1.1 路线档案；**不是**现在的开工清单 |
+| [docs/05-findings.md](docs/05-findings.md) | 研究结论档案，不重写 |
+| [docs/cases/](docs/cases) | 真实任务案例 #1–#11 结案档案 |
+| [docs/reference/README.md](docs/reference/README.md) | 2026-08 的 `src/` 签名快照（当时写「21 个模块」；现在 `src/*.ts` 已远多于此） |
 
 ## 快速开始
 
@@ -64,24 +91,25 @@ ANTHROPIC_API_KEY=sk-ant-...
 # 静态自检：只读本地配置，不创建模型客户端、不联网、不启动执行 worker
 npm run doctor
 npm run agent -- run "阅读 docs/ 下所有文档，生成 SUMMARY.md"    # 新入口；交互审批 y/n
-npm run agent -- run --yes "……"                                  # 自动批准（CI）
+npm run agent -- run --yes "……"                                  # 自动批准 ask（CI / 非 TTY）
 npm run agent -- run --verify "……"                               # 完成后 verifier 独立核查，未通过自动返工
 npm run agent -- run --ask "……"                                  # 允许执行前集中提出 1~4 个选择题（可自由输入）
-npm run agent -- run --plan --parallel 3 "……"                    # 分离式并行度不会混入任务正文
-npm run agent -- run --plan --resume-run cli-123                 # 同 run 续发射半截 DAG（至少一枚 passed；预算耗尽则拒）
-npm run agent -- run --resume-run cli-123                        # 同 run 从 main 检查点续跑（飞行中无检查点则拒）
-npm run agent -- --help                                           # 严格参数说明
+npm run agent -- run --plan --parallel 3 "……"                    # CLI --plan 拆完就执行并核查；没有计划确认门
+npm run agent -- run --plan --resume-run cli-123                 # 半截 DAG 续发射（至少一枚 passed；预算耗尽则拒）
+npm run agent -- run --resume-run cli-123                        # 有已提交检查点才热续；飞行中杀掉不能接着工具
+npm run agent -- --help                                           # 与 src/cli-args.ts cliHelpText() 同源
+npm run agent -- run --help                                       # 子命令看用法（不再互斥报错）
 npm run agent -- --version
 
 # 兼容入口保留；已有脚本无需立即迁移
 npm run cli -- --verify "……"
-npm run eval                                                      # 全量用例回归基线（31 用例，纯产物评分）
+npm run eval                                                      # research 基线（eval/cases.ts，31 条，纯产物评分）
 npm run lab                                                       # A/B 实验向导：选端点/臂/用例，免拼环境变量
 npm run lab -- --last                                             # 重放上一次实验配置
 npm run smoke:local                                               # 离线端点冒烟（本地 Ollama 路径存活验证）
 npm test                                                          # 单元测试
 npm run test:coverage                                             # 覆盖率 + 棘轮阈值（TEST-01a）
-npm run test:mutation-smoke                                       # 8 个关键变异必须变红（TEST-01a）
+npm run test:mutation-smoke                                       # 固定清单关键变异必须变红（TEST-01a）
 npm run eval:stats                                                # A/B + 台账统计报告（EVAL-02）
 npm run build && npm run eval:deterministic                        # 确定性场景门（EVAL-03a）
 npm run eval:compare-baseline                                     # nightly 基线比对（EVAL-03b）
@@ -114,8 +142,8 @@ Release tag 门（`.github/workflows/release.yml` `gate`）在确定性场景门
 长任务可用以下总账与恢复参数（PowerShell）：
 
 ```powershell
-$env:AGENT_TOTAL_MAX_TURNS = "120"          # continuation/返工共用，不会每段重置
-$env:AGENT_TOTAL_TOKEN_BUDGET = "2000000"   # 执行谱系（main/返工/续跑）的 token 总账；不含 cache_read
+$env:AGENT_TOTAL_MAX_TURNS = "120"          # 可选。不设则不武装轮次硬顶
+$env:AGENT_TOTAL_TOKEN_BUDGET = "2000000"   # 可选。执行谱系 token 总账（不含 cache_read）；不设则不武装
 $env:AGENT_PROGRESS_EXTENSION_TURNS = "8"   # 仍有新证据时最多一次有界续跑（0 = 关）
 $env:AGENT_STAGNATION_WINDOW = "3"          # 连续相同调用+结果后要求换策略
 $env:AGENT_MAX_STAGNATION_RECOVERIES = "1"  # 换策略几次后仍停滞就强制收口
@@ -128,7 +156,7 @@ CLI 启动行与 Web 的 `run_config` / `/api/harness` 都报出生效值与来�
 显式 token 总账按完整模型调用结算，但**不含 cache_read**（与日预算 / 成本告警同口径）：
 长对话每轮重读缓存上下文不再把谱系额度吃光。单次在途响应可能自然越过剩余额度；
 并行子任务会在同一总账上串行取得调用资格，避免多条轨基于旧余额同时起跑、按并发数放大超支。
-Web 真实宿主缺省 200 万；续跑时若仍用尽会自动再续一段，不必先点「追加预算」。
+真实宿主**不再默认** 120 轮 / 200 万——未设这两条 env 则不武装，避免长对话被自己的缺省卡死（`ui/server.ts` 注释与 `.env.example` 同口径）。设了之后续跑仍用同一份总账。
 **口径要点**：这份总账只约束执行谱系——verifier / planner 各自另建等额的独立预算，
 不从此账扣（隔离是有意的：核查断粮会引入新失效形态），且**每轮核查各计一份**：
 带返工时名义总消耗可超 3 倍，计划编排下随子任务数×核查轮数继续放大。Web 宿主
@@ -142,8 +170,11 @@ Web 真实宿主缺省 200 万；续跑时若仍用尽会自动再续一段，�
 $env:AGENT_VERIFIER_MODEL    = "deepseek-v4-pro"                  # verifier 用的模型
 $env:AGENT_VERIFIER_BASE_URL = "https://api.deepseek.com/anthropic"  # 可选，独立端点
 $env:AGENT_VERIFIER_API_KEY  = "sk-..."                           # 可选，缺省沿用执行者
-npm run cli -- --verify "……"
+# $env:AGENT_VERIFY_MAX_TURNS = "15"                              # 可选。env > 包 verify.maxTurns > 默认 15
+npm run agent -- run --verify "……"
 ```
+
+`--resume-run` **已落地**：读不到检查点就停，印原任务/终态，不当新任务重开（`formatCliResumeStop`）。2026-09-14 评测当时会从任务正文重开（VERIFY #15）——那是档案，不是现在的行为。
 
 ### 设计模式
 
@@ -274,10 +305,10 @@ powershell ... -EnvironmentId "<Agent 面板 Environment 卡片里的 ID>"
 
 ## Web 控制台与跨端 App
 
-浏览器控制台在 [`ui/`](ui/)（`ui/server.ts` + `ui/public`，任务提交 / 事件流直播 /
-审批应答 / 核查裁决 / 计划编排确认门 / 产物取件）。桌面端（Electron）与移动端
-（Capacitor Android）外壳在 [`cross-app/`](cross-app/)——它是把 `ui/public` 原样
-打包成 App 的客户端，连接宿主机上的同一个 Harness UI 服务：
+浏览器页标题是 **「FATHOM 控制台」**（`ui/public/index.html`）。控制台在 [`ui/`](ui/)
+（`ui/server.ts` + `ui/public`：提交 / SSE / 审批 / 核查 / 计划确认门 / 产物取件）。
+桌面端（Electron）与移动端（Capacitor Android）外壳在 [`cross-app/`](cross-app/)——
+连接同一套宿主，不是另一套执行引擎：
 
 ```powershell
 npm run ui                              # 浏览器控制台 http://127.0.0.1:4173
@@ -364,7 +395,8 @@ HTTP，但在平台凭据存储、签名流水线和 HTTPS 真机验收完成前
   跨包试点闭环：stm32-coding 修固件产出 ELF → stm32-debug 真机烧录四项验收 → verifier 独立连板复核
 - **v1.0 ✅** — 计划单元 + 三角编排：planner 只读拆解（JSON 计划契约：子任务×领域包×可程序化验收清单）→ 逐子任务执行→核查→返工 → 交接下游，快速失败；`--plan` 一句话任务真机闭环（planner 自主选包，verifier 独立连板逐条复核 8 项验收）；随后补齐 verifier 只读命令白名单与 router 调度单元（`--auto` 任务→包路由）
 - **v1.1 ✅** — 并行编排：`SubTask.dependsOn` 依赖图契约（fail-closed 校验）+ ready-queue 调度器 + 审批互斥门，互不依赖的子任务并发执行（`--parallel`，缺省 auto）。A/B 实证（eval/ab-report-parallel.md）：同 DAG 墙钟 −56~−62% 且精确贴关键路径、token 持平；拆分摇摆（freeform ~50/50，强 planner 无效）由**结构化拆分协议**消除——planner 只枚举分片事实，拆不拆由宿主规则判定（`AGENT_PLAN_PROTOCOL=structured`，拆分率 5/5 零方差）。首个生产交付：本仓库 docs/reference/（案例 #2，墙钟 −43%）
-- **后续** — 结构化清单契约扩 deps 字段（统一 fan-out 与顺序链两协议）、server-side compaction、跨域真机任务上的并行编排（见 [docs/04-roadmap.md](docs/04-roadmap.md)）
+- **v1.3.0 ✅** — 见 [CHANGELOG.md](CHANGELOG.md)。当前活交接是 [docs/06-backlog.md](docs/06-backlog.md) 第一屏与 [docs/08](docs/08-maturity-optimization-checklist.md)，不是下面「更远」那几条。
+- **后续（04 档案里的「更远」）** — 不要当本周开工清单；UX 修复见 [`eval/persona-ux/`](eval/persona-ux/README.md)
 
 ## 技术基线
 

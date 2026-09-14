@@ -144,12 +144,12 @@ export function initArtifactsView(host = {}, env = {}) {
   grid.className = "artifacts-grid";
   grid.setAttribute("role", "list");
 
+  const EMPTY_HTML =
+    '<div class="empty-icon" aria-hidden="true"><i class="ph ph-folder"></i></div>' +
+    "<p>还没有产物</p>";
   const emptyEl = doc.createElement("div");
   emptyEl.className = "artifacts-empty";
   emptyEl.hidden = true;
-  emptyEl.innerHTML =
-    '<div class="empty-icon" aria-hidden="true"><i class="ph ph-folder"></i></div>' +
-    "<p>还没有产物</p>";
 
   body.appendChild(grid);
   body.appendChild(emptyEl);
@@ -197,8 +197,15 @@ export function initArtifactsView(host = {}, env = {}) {
   function render() {
     paintTitle();
     grid.innerHTML = "";
-    emptyEl.hidden = cards.length > 0;
-    grid.hidden = cards.length === 0;
+    if (cards.length > 0) {
+      emptyEl.hidden = true;
+      emptyEl.innerHTML = "";
+      grid.hidden = false;
+    } else {
+      emptyEl.hidden = false;
+      emptyEl.innerHTML = EMPTY_HTML;
+      grid.hidden = true;
+    }
     for (const card of cards) {
       grid.appendChild(renderCard(card));
     }
@@ -261,6 +268,8 @@ export function initArtifactsView(host = {}, env = {}) {
     if (!open) return;
     open = false;
     view.hidden = true;
+    emptyEl.hidden = true;
+    emptyEl.innerHTML = "";
     if (restoreFocusTo && typeof restoreFocusTo.focus === "function" && doc.contains?.(restoreFocusTo) !== false) {
       restoreFocusTo.focus();
     }

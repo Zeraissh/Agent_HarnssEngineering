@@ -686,6 +686,26 @@ describe("多主题：data-theme 切换不改变结构语义", () => {
     }
   });
 
+  it("侧栏搜索框有可访问名称；通知与主题在顶栏，分脸文案是 Work/Code", () => {
+    mountSkeleton();
+    const input = document.getElementById("run-search") as HTMLInputElement;
+    const label = document.querySelector('label[for="run-search"]');
+    expect(input).toBeTruthy();
+    expect(label).toBeTruthy();
+    expect(label?.textContent).toMatch(/筛选对话列表/);
+    const top = document.querySelector(".sidebar-top-tools");
+    const footer = document.querySelector(".sidebar-footer");
+    const bell = document.getElementById("notifications-btn");
+    const theme = document.getElementById("theme-picker");
+    expect(top?.contains(bell)).toBe(true);
+    expect(top?.contains(theme)).toBe(true);
+    expect(footer?.contains(bell)).toBe(false);
+    expect(footer?.contains(theme)).toBe(false);
+    expect(document.getElementById("workspace-face-office")?.textContent).toBe("Work");
+    expect(document.getElementById("workspace-face-code")?.textContent).toBe("Code");
+    expect(document.getElementById("theme-toggle")?.getAttribute("aria-haspopup")).toBe("menu");
+  });
+
   it("展开的主题菜单零 violations，当前项用单选语义表达", async () => {
     mountSkeleton();
     const menu = document.getElementById("theme-menu") as HTMLElement;
@@ -855,7 +875,7 @@ describe("统一 composer：一个框，两种去向", () => {
   it("没选中运行 → 新建；选中可续跑的 → 追加，且带上 runId", () => {
     const m0 = deriveComposerMode({ info: null });
     expect(m0.mode).toBe("new");
-    expect(m0.buttonLabel).toBe("运行任务");
+    expect(m0.buttonLabel).toBe("发送");
 
     const m1 = deriveComposerMode({ info: CONTINUABLE, localStatus: "done" });
     expect(m1.mode).toBe("append");
@@ -980,6 +1000,14 @@ describe("统一 composer：一个框，两种去向", () => {
     expect(toggle.checked, "缺省沿用上一轮：verify=true 的 run 追加时预勾").toBe(true);
     expect(label.textContent).toBe("本轮独立核查");
 
+    const planNew = deriveComposerMode({ info: null, planMode: true });
+    expect(planNew.verifyToggle.label).toContain("计划编排默认仍核查子任务");
+    const planRunning = deriveComposerMode({
+      info: { ...CONTINUABLE, mode: "plan", status: "running", canContinue: false },
+      localStatus: "running",
+    });
+    expect(planRunning.verifyToggle.label).toContain("计划编排默认仍核查子任务");
+
     // 用户在这一轮把它拨掉；后台 syncComposer 再跑一遍不能拨回去
     toggle.checked = false;
     patchComposer(deriveComposerMode({ info: { ...CONTINUABLE, verify: true }, localStatus: "done" }));
@@ -1075,8 +1103,8 @@ describe("统一 composer：一个框，两种去向", () => {
   it("切回新建模式时装配项解禁、说明行收起", () => {
     patchComposer(deriveComposerMode({ info: CONTINUABLE, localStatus: "done" }));
     patchComposer(deriveComposerMode({ info: null }));
-    expect(q("#submit-btn-label").textContent).toBe("运行任务");
-    expect(q('label[for="task-input"]').textContent).toBe("任务描述");
+    expect(q("#submit-btn-label").textContent).toBe("发送");
+    expect(q('label[for="task-input"]').textContent).toBe("发送");
     expect((q("#verify-toggle") as HTMLInputElement).disabled).toBe(false);
     expect((q("#rubric-input") as HTMLTextAreaElement).disabled).toBe(false);
     expect(q("#composer-note").hidden).toBe(true);

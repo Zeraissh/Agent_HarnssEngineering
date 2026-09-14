@@ -36,7 +36,18 @@ export type DesignOdMode =
   | "audio"
   | "utility";
 
-export type DesignSeed = "blank" | "landing-basic" | "deck-basic" | "social-basic" | "pm-spec" | "team-okrs";
+export type DesignSeed =
+  | "blank"
+  | "landing-basic"
+  | "deck-basic"
+  | "social-basic"
+  | "pm-spec"
+  | "team-okrs"
+  | "eng-runbook"
+  | "finance-report"
+  | "hr-onboarding"
+  | "meeting-brief"
+  | "raid-brief";
 export type DesignBundleId = "spec-plus-deck";
 export const SPEC_PLUS_DECK: DesignBundleId = "spec-plus-deck";
 export type DesignExport = "html" | "pptx" | "pdf" | "mp4" | "png";
@@ -231,9 +242,9 @@ const RAW_CATALOG: DesignCatalogEntry[] = [
     tab: "Template",
     mode: "prototype",
     title: "工程手册",
-    description: "事故处置手册",
+    description: "事故处置手册（含目录 + 决策日志）",
     pack: "design",
-    seed: "blank",
+    seed: "eng-runbook",
     export: ["html"],
     capability: "ready",
   },
@@ -242,9 +253,9 @@ const RAW_CATALOG: DesignCatalogEntry[] = [
     tab: "Template",
     mode: "prototype",
     title: "财务报告",
-    description: "管理层财务摘要",
+    description: "管理层财务摘要（含目录 + 决策日志）",
     pack: "design",
-    seed: "blank",
+    seed: "finance-report",
     export: ["html"],
     capability: "ready",
   },
@@ -253,9 +264,31 @@ const RAW_CATALOG: DesignCatalogEntry[] = [
     tab: "Template",
     mode: "prototype",
     title: "人事入职",
-    description: "岗位入职计划",
+    description: "岗位入职计划（含目录 + 决策日志）",
     pack: "design",
-    seed: "blank",
+    seed: "hr-onboarding",
+    export: ["html"],
+    capability: "ready",
+  },
+  {
+    id: "meeting-brief",
+    tab: "Template",
+    mode: "prototype",
+    title: "会前简报",
+    description: "会前简报（含目录 + 决策日志）",
+    pack: "design",
+    seed: "meeting-brief",
+    export: ["html"],
+    capability: "ready",
+  },
+  {
+    id: "raid-brief",
+    tab: "Template",
+    mode: "prototype",
+    title: "战役任务书",
+    description: "战役任务书（含目录 + 决策日志）",
+    pack: "design",
+    seed: "raid-brief",
     export: ["html"],
     capability: "ready",
   },
@@ -509,6 +542,21 @@ export function matchExplicitDesign(opts: {
   if (template === "team-okrs") {
     return { kind: "id", entry: BY_ID.get("team-okrs")! };
   }
+  if (template === "eng-runbook") {
+    return { kind: "id", entry: BY_ID.get("eng-runbook")! };
+  }
+  if (template === "finance-report") {
+    return { kind: "id", entry: BY_ID.get("finance-report")! };
+  }
+  if (template === "hr-onboarding") {
+    return { kind: "id", entry: BY_ID.get("hr-onboarding")! };
+  }
+  if (template === "meeting-brief") {
+    return { kind: "id", entry: BY_ID.get("meeting-brief")! };
+  }
+  if (template === "raid-brief") {
+    return { kind: "id", entry: BY_ID.get("raid-brief")! };
+  }
 
   const tabRaw = String(opts.explicitTab ?? "").trim();
   if (tabRaw && isDesignTab(tabRaw)) return { kind: "tab", tab: tabRaw };
@@ -744,6 +792,28 @@ export function parseDesignChoiceInput(
     explicitTab: t,
     explicitTemplate: t,
   });
+}
+
+/** 点了稿件模板 / 已装文件包才算选了芯片；页签（含 Prototype）不算。 */
+export function hasPickedDesignTemplate(input: {
+  designId?: string | null;
+  designTemplate?: string | null;
+  designFilePack?: string | null;
+}): boolean {
+  return [input.designId, input.designTemplate, input.designFilePack].some(
+    (value) => typeof value === "string" && value.trim() !== "",
+  );
+}
+
+/**
+ * 设计路由 R2 不得挡没点模板的普通发送。
+ * 只有用户点了芯片却仍拿不准时，才允许调用方拒绝。
+ */
+export function designRouteBlocksCreate(
+  route: { kind: DesignRouteKind },
+  pickedTemplate: boolean,
+): boolean {
+  return route.kind === "r2" && pickedTemplate;
 }
 
 export function publicDesignCatalog(): Array<{

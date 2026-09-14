@@ -9,28 +9,28 @@ export const ONBOARDING_STORAGE_KEY = "agent.ui.pref.onboardingDone";
 
 export const ONBOARDING_STEPS = [
   {
-    id: "workdir",
-    title: "先圈定工作目录",
-    body: "工具写入圈是白名单里的全部目录。主目录是这次的焦点；其它已添加的项目也可以直接改，不必绕路。",
-    target: "#workdir-combobox",
-  },
-  {
     id: "composer",
-    title: "用一句话写下目标",
-    body: "Enter 发送，Shift+Enter 换行。下面的例子只填进输入框，由你确认后再跑。",
+    title: "打一句话，回车",
+    body: "在输入框里写下要做的事，按 Enter 发送。Shift+Enter 换行。下面的例子只填进输入框，由你确认后再跑。",
     target: "#task-input",
-  },
-  {
-    id: "knobs",
-    title: "运行设置按次装配",
-    body: "领域包、计划编排、独立核查都在「运行设置」里。没开的能力不会假装在。",
-    target: "#knobs-toggle",
   },
   {
     id: "sidebar",
     title: "对话按项目分组",
     body: "左侧是历史。点项目名可以收起一组；标题会尽量收成短句，而不是整段任务。",
     target: "#run-list",
+  },
+  {
+    id: "knobs",
+    title: "需要时再开运行设置",
+    body: "更多选项收在「运行设置」里。日常对话不用先配任何东西。",
+    target: "#knobs-toggle",
+  },
+  {
+    id: "files",
+    title: "写完的文件会出现在旁边",
+    body: "这次写下的文件会列在对话右侧。设置里写着：只能改这些文件夹。",
+    target: "#main-area",
   },
 ];
 

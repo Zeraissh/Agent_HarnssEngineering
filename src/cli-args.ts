@@ -38,6 +38,39 @@ const COMMAND_FLAGS = new Map<string, CliCommand>([
   ["--doctor", "doctor"],
 ]);
 
+/** 非 TTY / readline 已关且需要确认：人话退出，不摔栈。 */
+export const CLI_NEEDS_CONFIRM_EXIT = 2;
+
+export function formatCliNeedsConfirmMessage(): string {
+  return "需要确认，请加 --yes";
+}
+
+export function cliCanPrompt(
+  io: { stdin?: { isTTY?: boolean | undefined } } = process,
+): boolean {
+  return Boolean(io.stdin?.isTTY);
+}
+
+export function isReadlineClosedError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const code = "code" in err ? (err as { code?: unknown }).code : undefined;
+  return code === "ERR_USE_AFTER_CLOSE";
+}
+
+function emptyRunFields(): Omit<ParsedCliArgs, "command"> {
+  return {
+    task: "",
+    autoYes: false,
+    verify: false,
+    plan: false,
+    auto: false,
+    ask: false,
+    concurrency: "auto",
+    parallelSpecified: false,
+    resumeRun: null,
+  };
+}
+
 function parseParallel(raw: string): number {
   if (!/^\d+$/.test(raw)) {
     throw new CliArgumentError(`--parallel 的值无效: "${raw}"（需为 >=1 的整数）`);
@@ -85,7 +118,10 @@ export function parseCliArgs(argv: readonly string[]): ParsedCliArgs {
     }
     const selected = COMMAND_FLAGS.get(arg);
     if (selected) {
-      if (explicitRun) throw new CliArgumentError(`run 不能与 ${arg} 同时使用`);
+      // `run --help` / `run --version` 是看用法，不是互斥错误。
+      if (explicitRun && selected !== "help" && selected !== "version") {
+        throw new CliArgumentError(`run 不能与 ${arg} 同时使用`);
+      }
       selectedCommands.add(selected);
       command = selected;
       continue;
@@ -132,6 +168,9 @@ export function parseCliArgs(argv: readonly string[]): ParsedCliArgs {
   if (selectedCommands.size > 1) {
     throw new CliArgumentError(`命令冲突: ${[...selectedCommands].join(" 与 ")}`);
   }
+  if (command === "help" || command === "version") {
+    return { command, ...emptyRunFields() };
+  }
   const hasRunOptions = seen.size > 0 || parallelSpecified || resumeRun != null;
   if (command !== "run" && (hasRunOptions || taskParts.length > 0)) {
     throw new CliArgumentError(`${command} 不能与任务或 run 参数同时使用`);
@@ -171,6 +210,7 @@ export function cliHelpText(): string {
     "",
     "Usage:",
     "  npm run agent -- run [options] \"task description\"",
+    "  npm run agent -- run --help",
     "  npm run agent -- doctor",
     "  npm run agent -- --help | --version",
     "",
@@ -180,12 +220,20 @@ export function cliHelpText(): string {
     "Run options:",
     "  --yes          自动批准工具请求（仅用于明确接受风险的无人值守运行）",
     "  --verify       独立核查，未通过时有界返工",
-    "  --plan         planner 拆解、执行并核查子任务",
+    "  --plan         拆完计划后立刻执行并核查子任务；CLI 不会停下来给你改（没有计划确认门）",
     "  --parallel N   plan 并行度；也接受 --parallel=N，省略 N 表示 auto",
     "  --auto         自动选择单领域 pack",
     "  --ask          允许 agent 在执行前集中提问（与 --yes 互斥）",
-    "  --resume-run ID  同 run 续跑（单执行者=检查点；--plan=半截 DAG；预算耗尽则拒）",
+    "  --resume-run ID  同 run 热续。须有已提交检查点；飞行中杀掉不能接着工具。读不到检查点会停并印原任务/终态，不会当新任务重开",
     "  --             后续内容一律视为任务文本",
+    "",
+    "Model:",
+    "  命令行暂不能 --model / --api-key / --workdir。",
+    "  换模型：环境变量 AGENT_MODEL（可选 AGENT_PROVIDER、ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL，或 OPENAI_API_KEY / OPENAI_BASE_URL）。",
+    "  工作目录即当前 cwd。doctor 可查看当前 provider / model / 是否有 Key。",
+    "",
+    "Confirm:",
+    "  没有交互终端时请加 --yes，否则会停在确认（退出码 2），不会摔 readline 栈。",
     "",
     "Doctor is static: it performs no network request and starts no execution worker.",
   ].join("\n");

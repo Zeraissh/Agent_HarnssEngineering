@@ -17,8 +17,9 @@
 
 ## 已验证基线
 
-- [x] **BASE-01 核心回归基线**：2026-09-01，`npm test` 为 31 个文件通过、
+- [x] **BASE-01 核心回归基线**：2026-09-01 快照，`npm test` 为 31 个文件通过、
   1 个真实 OCI 文件跳过；1173 passed、13 skipped，`npm run typecheck` 通过。
+  **不要把 1173 抄进新交接**——之后主线还在加测试；以当场 `npm test` 为准。
 - [x] **BASE-02 跨端契约基线**：2026-09-01，`cross-app` 为 31 passed、1 skipped。
 - [x] **BASE-03 CI 构建基线**：当前 `main` 的 core、desktop-shell、container job 成功。
 - [ ] **BASE-04 真实运行基线**：真实模型、浏览器 E2E、已安装 Electron、Android、

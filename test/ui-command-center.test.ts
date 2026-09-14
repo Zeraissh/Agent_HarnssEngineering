@@ -23,6 +23,7 @@ import {
   summarizeToolInput,
   deriveRunProgress,
   deriveBoardModel,
+  summarizeAutoApprovedWrites,
   initCommandCenterView,
 } from "../ui/public/features/command-center.js";
 import {
@@ -284,6 +285,30 @@ describe("deriveBoardModel 三栏归约", () => {
     expect(deriveBoardModel({ runs: [run({})], now: NOW }).empty).toBe(false);
     expect(deriveBoardModel({ runs: [], decisionItems: [decisionItem()], now: NOW }).empty).toBe(false);
   });
+
+  it("自动放行写盘留下文件名，不进待决定栏", () => {
+    const writes = summarizeAutoApprovedWrites(
+      [run({ runId: "auto1", status: "done" })],
+      () => ({
+        pendingApprovals: [
+          { actor: "auto-rule", status: "allowed", name: "write_file", input: { path: "hello.txt" } },
+          { actor: "user", status: "allowed", name: "write_file", input: { path: "other.txt" } },
+        ],
+      }),
+    );
+    expect(writes).toEqual(["hello.txt"]);
+    const model = deriveBoardModel({
+      runs: [run({ runId: "auto1", status: "done", finishedAt: NOW - 60_000, stopReason: "completed" })],
+      getState: () => ({
+        pendingApprovals: [
+          { actor: "auto-rule", status: "allowed", name: "write_file", input: { path: "notes/hello.txt" } },
+        ],
+      }),
+      now: NOW,
+    });
+    expect(model.columns.decision).toEqual([]);
+    expect(model.autoApprovedWrites).toEqual(["hello.txt"]);
+  });
 });
 
 // ---------------------------------------------------------------
@@ -474,6 +499,22 @@ describe("initCommandCenterView DOM 层", () => {
     expect(cards[1].querySelector(".cc-badge").textContent).toBe("被停止");
     cards[0].click();
     expect(calls.openConv).toEqual(["bad"]);
+  });
+
+  it("没有待决但有自动放行写盘时，待决定栏写已自动放行", () => {
+    runs = [run({ runId: "auto1", status: "done", finishedAt: NOW - 60_000, stopReason: "completed" })];
+    states.set("auto1", {
+      pendingApprovals: [
+        { actor: "auto-rule", status: "allowed", name: "write_file", input: { path: "hello-verify-ask.txt" } },
+      ],
+    });
+    const { api } = mount();
+    api.open();
+    const decCol = api.element.querySelector('[data-col="decision"]');
+    expect(decCol.querySelectorAll(".cc-card")).toHaveLength(0);
+    expect(decCol.querySelector(".cc-column-empty").hidden).toBe(false);
+    expect(decCol.textContent).toContain("已自动放行：写了 hello-verify-ask.txt");
+    expect(decCol.textContent).not.toContain("没有等你决定的事");
   });
 
   it("空态：三栏全空时显示空态与「新建任务」入口，点击派发到宿主", () => {

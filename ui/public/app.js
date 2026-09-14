@@ -296,6 +296,82 @@ export function classifyStopReason(stopReason) {
   }
 }
 
+/**
+ * 读屏 / 通知用的收尾句：停就是停，完成就是完成，否决不是停止。
+ * @param {{ stopReason?: string|null, status?: string, task?: string }|null|undefined} state
+ */
+export function runEndAnnouncement(state) {
+  const reason = state?.stopReason
+    ?? (state?.status === "done" ? "completed" : null);
+  const task = String(state?.task ?? "").trim();
+  const tail = task ? `：${task}` : "";
+  if (reason === "aborted") return `已停止${tail}`;
+  if (reason === "plan_rejected") return `计划未获批准${tail}`;
+  if (reason === "plan_gate_expired") return `计划门未应答${tail}`;
+  if (reason === "completed") return `运行已完成${tail}`;
+  const cls = classifyStopReason(reason);
+  if (cls.label === "运行中") return `运行已完成${tail}`;
+  return `${cls.label}${tail}`;
+}
+
+/**
+ * 提交失败优先用人话。不拼 HTTP 状态码，也不把「领域包」甩到脸上。
+ * @param {unknown} body
+ * @param {number} [status]
+ */
+export function humanizeSubmitError(body, status) {
+  const raw = typeof body === "string"
+    ? body.trim()
+    : body && typeof body === "object" && typeof /** @type {{error?: unknown}} */ (body).error === "string"
+      ? String(/** @type {{error: string}} */ (body).error).trim()
+      : "";
+  const cleaned = raw
+    .replace(/领域包/g, "这类任务")
+    .replace(/\bHTTP\s*\d{3}\b/gi, "")
+    .replace(/提交失败（\s*）/g, "")
+    .replace(/[（(]\s*[）)]/g, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+  if (cleaned) return cleaned;
+  if (status === 409) return "这次发不出去，请换种说法再试。";
+  if (status === 400) return "这次请求对不上，请改一下再发。";
+  if (status === 429) return "前面还有人在交，请等几秒。";
+  return "发送失败，请稍后再试。";
+}
+
+/**
+ * 批准卡主文案：说要新建/改哪个文件，不把工具名 + JSON 当第一眼。
+ * @param {string|null|undefined} name
+ * @param {unknown} input
+ */
+export function describeApprovalAction(name, input) {
+  const tool = String(name ?? "").replace(/^.*__/, "").trim();
+  let obj = {};
+  if (input && typeof input === "object") obj = /** @type {Record<string, unknown>} */ (input);
+  else if (typeof input === "string") {
+    try {
+      const parsed = JSON.parse(input);
+      if (parsed && typeof parsed === "object") obj = parsed;
+    } catch { /* 非 JSON 入参当没有路径 */ }
+  }
+  const path = String(obj.path ?? obj.file_path ?? "").trim();
+  const base = path.split(/[\\/]/).filter(Boolean).pop() || path;
+  const content = typeof obj.content === "string" ? obj.content : "";
+  const first = content.split(/\r?\n/).find((l) => l.trim()) ?? "";
+  const preview = first.length > 40 ? `${first.slice(0, 40)}…` : first;
+  if (tool === "write_file") {
+    if (base && preview) return `要新建或改 ${base}，写入「${preview}」`;
+    if (base) return `要新建或改 ${base}`;
+  }
+  if (tool === "edit_file") return base ? `要改 ${base}` : "要改一个文件";
+  if (tool === "bash" && typeof obj.command === "string" && obj.command.trim()) {
+    const cmd = obj.command.replace(/\s+/g, " ").trim();
+    return `要运行：${cmd.length > 72 ? `${cmd.slice(0, 72)}…` : cmd}`;
+  }
+  if (base) return `要用工具处理 ${base}`;
+  return tool ? `要使用 ${tool}` : "要执行一项操作";
+}
+
 // ---------------------------------------------------------------
 // 纯函数：reduceEvent
 // ---------------------------------------------------------------
@@ -2641,12 +2717,9 @@ export const COMPOSER_SEND_HINT = "Enter 发送，Shift+Enter 换行";
  * @param {{ designMode?: boolean, designTitle?: string|null }} [opts]
  */
 export function newRunPlaceholder(workdir, opts) {
-  if (opts?.designMode) {
-    const title = String(opts.designTitle ?? "").trim();
-    return title ? `要「${title}」做什么…` : "要这份稿做什么…";
-  }
-  const name = composerFolderName(workdir);
-  return name ? `要「${name}」做什么…` : "要这个目录做什么…";
+  const title = String(opts?.designTitle ?? "").trim();
+  if (opts?.designMode && title) return `要「${title}」做什么…`;
+  return "说要做什么…";
 }
 
 /**
@@ -2716,7 +2789,7 @@ export function deriveComposerMode({ info, localStatus, submitting, error, stopp
       mode: "submitting",
       kind: null,
       buttonLabel: "提交中…",
-      labelText: "任务描述",
+      labelText: "发送",
       placeholder: "",
       note: "",
       canSubmit: false,
@@ -2730,8 +2803,8 @@ export function deriveComposerMode({ info, localStatus, submitting, error, stopp
       ...base,
       mode: "new",
       kind: "new",
-      buttonLabel: "运行任务",
-      labelText: "任务描述",
+      buttonLabel: "发送",
+      labelText: "发送",
       placeholder: newRunPlaceholder(base.workdir, { designMode, designTitle }),
       note: "",
       canSubmit: true,
@@ -2761,7 +2834,7 @@ export function deriveComposerMode({ info, localStatus, submitting, error, stopp
         mode: "running",
         kind: null,
         buttonLabel: "正在停止…",
-        labelText: "任务描述",
+        labelText: "发送",
         placeholder: "正在停止…",
         note: "已发出停止，正在收尾。已完成的写入不会回滚。",
         canSubmit: false,
@@ -2779,7 +2852,7 @@ export function deriveComposerMode({ info, localStatus, submitting, error, stopp
        * 不要再并排两个「插队 / 排队」键——发送本身就是插入。
        */
       buttonLabel: hasDraft ? "立即插入" : "停止",
-      labelText: "任务描述",
+      labelText: "发送",
       placeholder: "运行进行中，直接发送会立即插入…",
       note: "",
       canSubmit: true,
@@ -3138,7 +3211,7 @@ export function buildNewRunRequest({
     : (preset ? preset.planGate : planGate);
   const effectiveAutoApprove = autoApprove !== undefined
     ? Boolean(autoApprove)
-    : (preset ? (preset.autoYes || preset.approvalDefault === "auto") : true);
+    : (preset ? (preset.autoYes || preset.approvalDefault === "auto") : false);
   // 正交旋钮：计划模式 = 确认门；多 agent = DAG 并行。任一为真即编排。
   // 兼容旧契约：只传 mode=plan 且未显式 planGate:false → 仍开确认门。
   const wantPlanGate =
@@ -6082,7 +6155,7 @@ function patchUserQuestion(parts, faces, callbacks) {
 
   parts.userQuestion.innerHTML =
     '<div class="question-card">' +
-    `<h3 class="rail-title">◆ ${esc(ROLE_PERSONA.main)} 有 ${n} 个问题需要你定</h3>` +
+    `<h3 class="rail-title">◆ 有 ${n} 个问题需要你定</h3>` +
     blocks +
     '<div class="question-actions">' +
     '<button class="btn btn--allow" data-action="send">提交答复</button>' +
@@ -6139,7 +6212,7 @@ function patchPlanGate(parts, state, faces, callbacks) {
   parts.planGate.innerHTML =
     '<div class="plan-gate-card">' +
     '<h3 class="rail-title">◈ 计划待你签字</h3>' +
-    `<p class="plan-gate-body">${ROLE_PERSONA.planner}（planner）已拆出 <strong>${count}</strong> 个子任务。` +
+    `<p class="plan-gate-body">计划已拆出 <strong>${count}</strong> 个子任务。` +
     "下面是每一步要做什么——批准后才会发射第一个子任务；此刻否决没有任何副作用。</p>" +
     (review
       ? `<div class="plan-gate-review" tabindex="0">${review}</div>`
@@ -6358,13 +6431,16 @@ function patchApprovalRail(parts, state, isRunning, callbacks) {
         '<span class="approval-tool-name"></span>' +
         '<span class="approval-result" hidden></span>' +
         "</div>" +
+        '<p class="approval-summary"></p>' +
+        '<details class="approval-details">' +
+        "<summary>详情</summary>" +
         '<pre class="approval-input"></pre>' +
+        '<button type="button" class="btn btn--allow-always" data-action="allow-always">短期允许相同参数</button>' +
+        "</details>" +
         '<div class="approval-resolved" hidden></div>' +
         '<div class="approval-actions" hidden>' +
-        '<button type="button" class="btn btn--allow" data-action="allow">允许本次</button>' +
-        // 规则只复用同一工具 + 完全相同参数，并受 TTL/次数/工具策略限制
-        '<button type="button" class="btn btn--allow-always" data-action="allow-always">短期允许相同参数</button>' +
-        '<button type="button" class="btn btn--deny" data-action="deny">拒绝并说明</button>' +
+        '<button type="button" class="btn btn--allow" data-action="allow">允许</button>' +
+        '<button type="button" class="btn btn--deny" data-action="deny">拒绝</button>' +
         '<input class="deny-reason" placeholder="拒绝理由（可选）" />' +
         "</div>" +
         '<div class="approval-meta" hidden></div>' +
@@ -6408,7 +6484,9 @@ function updateApprovalCard(card, a, isRunning) {
 
   setClass(card, "approval-card--resolved", resolved);
   card.setAttribute("data-tool-name", a.name ?? "");
-  setText(card.querySelector(".approval-tool-name"), `⚠ ${a.name}`);
+  const human = describeApprovalAction(a.name, a.input);
+  setText(card.querySelector(".approval-tool-name"), human);
+  setText(card.querySelector(".approval-summary"), human);
 
   const resultEl = card.querySelector(".approval-result");
   if (resolved) {
@@ -7026,12 +7104,15 @@ function patchAgentOverlay(parts, state, callbacks, live = null) {
       for (const a of pending) {
         html +=
           `<div class="approval-card" data-approval-id="${esc(a.approvalId || a.toolUseId)}" data-tool-name="${esc(a.name ?? "")}">` +
-          `<div class="approval-card-header"><span class="approval-tool-name">${esc(a.name ?? "工具")}</span></div>` +
+          `<div class="approval-card-header"><span class="approval-tool-name">${esc(describeApprovalAction(a.name, a.input))}</span></div>` +
+          `<p class="approval-summary">${esc(describeApprovalAction(a.name, a.input))}</p>` +
+          `<details class="approval-details"><summary>详情</summary>` +
           `<pre class="approval-input">${esc(typeof a.input === "string" ? a.input : JSON.stringify(a.input ?? {}, null, 2))}</pre>` +
-          `<div class="approval-actions">` +
-          `<button type="button" class="btn btn--allow" data-action="allow">允许本次</button>` +
           `<button type="button" class="btn btn--allow-always" data-action="allow-always">短期允许相同参数</button>` +
-          `<button type="button" class="btn btn--deny" data-action="deny">拒绝并说明</button>` +
+          `</details>` +
+          `<div class="approval-actions">` +
+          `<button type="button" class="btn btn--allow" data-action="allow">允许</button>` +
+          `<button type="button" class="btn btn--deny" data-action="deny">拒绝</button>` +
           `<input class="deny-reason" placeholder="拒绝理由（可选）" />` +
           `</div></div>`;
       }
@@ -10576,30 +10657,23 @@ function firstLine(text, max) {
 }
 
 /**
- * 角色人名（backlog D4，委托方要求）。**显示层别名 only**：
- * source/事件流/台账/正史全部保持结构名（planner/verifier/sN/main），
- * 人名只在渲染时映射——进了协议层就是记录串味、改名即漂移。
- *
- * 姓名即角色：计明远——"计"划，谋定而后动，只看不改；施敢当——"施"工 +
- * 石敢当（顶得住事的那位，返工也是他，同一个人回来修自己的活）；
- * 严不苟——"严"格 + 一丝不苟，拒签是他的本职。
- * 人名必须与角色语义**并列显示**：严不苟的公信力来自"全新上下文"这个
- * 结构事实，不来自名字——名字不许把它盖住。
+ * 角色显示名（只在渲染层）。事件流 / 台账仍用 planner / main / verifier。
+ * 不要署剧名：计划卡就叫计划，提问卡就叫助手。
  */
 export const ROLE_PERSONA = {
-  planner: "计明远",
-  main: "施敢当",
-  rework: "施敢当",
-  verifier: "严不苟",
+  planner: "计划",
+  main: "助手",
+  rework: "助手",
+  verifier: "核查",
 };
 
 /** 段分界：main→verifier 用 ━，返工用 CLI 同款 ↺（src/cli.ts:449） */
 function renderSegmentBoundary(seg) {
   const label = {
-    verifier: `${ROLE_PERSONA.verifier} · 核查（全新上下文独立复核）`,
+    verifier: `${ROLE_PERSONA.verifier} · 全新上下文独立复核`,
     rework: `${ROLE_PERSONA.rework} · 核查未通过，返工（第 ${seg.round} 轮）`,
-    planner: `${ROLE_PERSONA.planner} · 计划单元（只读拆解）`,
-    main: `${ROLE_PERSONA.main} · Agent 执行`,
+    planner: `${ROLE_PERSONA.planner} · 只读拆解`,
+    main: `${ROLE_PERSONA.main} · 执行`,
   }[seg.role];
   const mark = seg.role === "rework" ? "↺" : seg.role === "verifier" ? "◆" : seg.role === "planner" ? "❑" : "▸";
   // 编排模式下来源形如 "s1/main"：并行时多个子任务的日志按 seq 交错，
@@ -10674,7 +10748,7 @@ function renderApprovalCards(state, isRunning) {
 
     html += `<div class="approval-card ${resolved ? "approval-card--resolved" : ""}" data-approval-id="${esc(cardId)}">`;
     html += `<div class="approval-card-header">`;
-    html += `<span class="approval-tool-name">⚠ ${esc(app.name)}</span>`;
+    html += `<span class="approval-tool-name">${esc(describeApprovalAction(app.name, app.input))}</span>`;
 
     if (resolved) {
       const decisionLabel =
@@ -10687,12 +10761,13 @@ function renderApprovalCards(state, isRunning) {
     }
     html += `</div>`;
 
-    html += `<pre class="approval-input">${esc(formatInput(app.input))}</pre>`;
+    html += `<p class="approval-summary">${esc(describeApprovalAction(app.name, app.input))}</p>`;
+    html += `<details class="approval-details"><summary>详情</summary><pre class="approval-input">${esc(formatInput(app.input))}</pre></details>`;
 
     if (operable) {
       html += `<div class="approval-actions">`;
-      html += `<button class="btn btn--allow" data-action="allow" data-approval-id="${esc(cardId)}">允许本次</button>`;
-      html += `<button class="btn btn--deny" data-action="deny" data-approval-id="${esc(cardId)}">拒绝并说明</button>`;
+      html += `<button class="btn btn--allow" data-action="allow" data-approval-id="${esc(cardId)}">允许</button>`;
+      html += `<button class="btn btn--deny" data-action="deny" data-approval-id="${esc(cardId)}">拒绝</button>`;
       // aria-label 而非只靠 placeholder：placeholder 虽按 accname 规范算兜底名称，
       // 但输入后即从视觉上消失，屏幕阅读器用户失去上下文
       html += `<input class="deny-reason" data-approval-id="${esc(cardId)}" aria-label="拒绝 ${esc(app.name)} 的理由（可选）" placeholder="拒绝理由（可选）" />`;
@@ -11379,6 +11454,28 @@ export const CODE_STARTER_JOBS = [
   },
 ];
 
+/** Work 脸第一屏：稿件 / 纪要 / 出处，不是仓库作业。 */
+export const OFFICE_STARTER_JOBS = [
+  {
+    id: "minutes",
+    label: "做纪要",
+    hint: "把材料收成可转发的短纪要",
+    text: "根据当前工作目录里最近的材料，写一份短纪要：结论、待办、未决问题各一段。",
+  },
+  {
+    id: "page",
+    label: "做一页",
+    hint: "一页介绍，浏览器里预览",
+    text: "做一页介绍：主题自拟，相对 CSS，不要外链。写完告诉我打开哪里预览。",
+  },
+  {
+    id: "sources",
+    label: "带出处问答",
+    hint: "回答时列出来说 / 该页说的 / 链接",
+    text: "按我的问题查资料并回答。每个要点都带来源：该页说的、链接。没有出处就标明不确定。",
+  },
+];
+
 /** @deprecated 教具三字已退役；兼容旧 import，内容就是编码作业。 */
 export const EXAMPLE_TASKS = CODE_STARTER_JOBS;
 
@@ -11478,8 +11575,8 @@ export function renderEmptyState(_hasRuns, _opts = {}) {
     '<circle class="fathom-bob" cx="16.6" cy="17.4" r="1.9"/>' +
     "</svg></span>" +
     '<p class="empty-brand">FATHOM<span class="fw-dot">.</span></p>' +
-    '<p class="empty-tagline">see every run to the bottom.</p>' +
-    '<p class="empty-tagline-cn">每一层都看得见。</p>' +
+    '<p class="empty-tagline">说要做什么，回车就发。</p>' +
+    '<p class="empty-tagline-cn">稿件、纪要、问答都可以从这里开始。</p>' +
     '<span class="empty-depthline" aria-hidden="true"></span>' +
     "</div>";
 }
@@ -11984,19 +12081,14 @@ export function renderStarterGallery(opts = {}) {
     return;
   }
   if (face === "office") {
-    const selected = opts.selectedTemplate ? String(opts.selectedTemplate) : "";
     const tiles = [
-      ...DESIGN_STARTER_TEMPLATES.map((t) => {
-        const on = t.id === selected;
-        return (
-          `<li><button type="button" class="starter-tile${on ? " is-selected" : ""}" ` +
-          `data-design-template="${esc(t.id)}" aria-pressed="${on ? "true" : "false"}"` +
-          (t.hint ? ` title="${esc(t.hint)}"` : "") + `>` +
-          `<span class="starter-tile-title">${esc(t.title)}</span>` +
-          `<span class="starter-tile-hint">${esc(t.hint)}</span>` +
-          "</button></li>"
-        );
-      }),
+      ...OFFICE_STARTER_JOBS.map((e) =>
+        renderJobTile({
+          title: e.label,
+          hint: e.hint,
+          attrs: `data-example="${esc(e.text)}"`,
+        }),
+      ),
       renderJobTile({
         title: OFFICE_MORE_DRAFTS.title,
         hint: OFFICE_MORE_DRAFTS.hint,

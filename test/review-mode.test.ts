@@ -1,16 +1,20 @@
+// @vitest-environment jsdom
 // @ts-nocheck
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   INSPECT_MESSAGE_TYPE,
   INSPECT_HOOK_SOURCE,
   DECK_READY_MESSAGE_TYPE,
+  DECK_GOTO_MESSAGE_TYPE,
+  DECK_STATE_MESSAGE_TYPE,
+  DECK_RUNTIME_SOURCE,
+  DECK_VISIBILITY_CSS,
   PRINT_HOOK_SOURCE,
   appendReviewToInput,
-  attachDesignEditScope,
   buildCssSelector,
-  formatDesignEditScope,
   formatReviewComment,
-  normalizeDesignEditScope,
+  isWholeDeckRevision,
+  stripSlideLockMarkers,
   formatImageReview,
   injectInspectHook,
   appendInspectHook,
@@ -29,6 +33,15 @@ describe("buildCssSelector / formatReviewComment", () => {
     expect(buildCssSelector({ tag: "li", nth: 2, parent: "ul.nav" })).toBe("ul.nav > li:nth-of-type(2)");
   });
 
+  it("不再导出自动页锁 helper；点评行仍带 slide", () => {
+    return import("../ui/public/features/review-mode.js").then((mod) => {
+      expect(mod.formatDesignEditScope).toBeUndefined();
+      expect(mod.attachDesignEditScope).toBeUndefined();
+      expect(mod.normalizeDesignEditScope).toBeUndefined();
+      expect(typeof mod.formatReviewComment).toBe("function");
+    });
+  });
+
   it("点评行是纯文本，可接到已有输入后面；可带 slide", () => {
     expect(formatReviewComment("h1.hero", "对比度不够")).toBe("[点评] h1.hero: 对比度不够");
     expect(formatReviewComment("h1.hero", "对比度不够", "3")).toBe("[点评][slide:3] h1.hero: 对比度不够");
@@ -37,25 +50,22 @@ describe("buildCssSelector / formatReviewComment", () => {
     expect(appendReviewToInput("", "[点评] h1: 太大")).toBe("[点评] h1: 太大");
   });
 
-  it("选中范围进入续跑正文；未选中不误伤", () => {
-    expect(normalizeDesignEditScope(null)).toBeNull();
-    expect(normalizeDesignEditScope({ slide: "" })).toBeNull();
-    expect(normalizeDesignEditScope({ slide: '3" onclick' })).toBeNull();
-    expect(normalizeDesignEditScope({ slide: "3", path: "out/index.html" })).toEqual({
-      slide: "3",
-      path: "out/index.html",
-    });
-    expect(attachDesignEditScope("缩短标题", null)).toBe("缩短标题");
-    expect(attachDesignEditScope("缩短标题", {})).toBe("缩短标题");
-    const scoped = attachDesignEditScope("缩短标题", { slide: "3", path: "out/index.html" });
-    expect(scoped).toContain('[改稿范围] 只改 data-slide="3"（文件 out/index.html）');
-    expect(scoped).toContain("缩短标题");
-    expect(scoped).toContain("不要整份重写");
-    expect(attachDesignEditScope("[点评][slide:2] h1: 太大", { slide: "3" })).toBe(
-      "[点评][slide:2] h1: 太大",
+  it("整份配图不对时点评不加 [slide:]；页锁标记可剥掉", () => {
+    const complaint = "图片你自己有审核过吗？完全与介绍的科技不相关";
+    expect(isWholeDeckRevision(complaint)).toBe(true);
+    expect(isWholeDeckRevision("缩短标题")).toBe(false);
+    expect(formatReviewComment("img.hero", "这些图都与科技不相关", "back")).toBe(
+      "[点评] img.hero: 这些图都与科技不相关",
     );
-    const already = formatDesignEditScope({ slide: "1" });
-    expect(attachDesignEditScope(`${already}\n再改`, { slide: "9" })).toBe(`${already}\n再改`);
+    expect(formatReviewComment("img.hero", "对比度不够", "back")).toBe(
+      "[点评][slide:back] img.hero: 对比度不够",
+    );
+    expect(stripSlideLockMarkers("[点评][slide:back] img: 全部图都不对")).toBe("[点评] img: 全部图都不对");
+    expect(stripSlideLockMarkers('[改范围]只改 data-slide="back"（文件 index.html）。\n图片核对过吗'))
+      .toBe("图片核对过吗");
+    expect(stripSlideLockMarkers(
+      `[改稿范围] 只改 data-slide="3"（文件 out/index.html）。不要改其它页，不要整份重写。\n缩短标题`,
+    )).toBe("缩短标题");
   });
 });
 
@@ -83,6 +93,10 @@ describe("inspect hook 注入", () => {
     expect(hooked).toContain(DECK_READY_MESSAGE_TYPE);
     expect(hooked).toContain(INSPECT_MESSAGE_TYPE);
     expect(hooked).toContain("closest");
+    expect(hooked).toContain("agent-deck-visibility");
+    expect(hooked).toContain("display:none!important");
+    expect(hooked).toContain(".slide[data-slide].is-active");
+    expect(hooked).toContain("position:relative!important");
   });
 
   it("点评钩子含悬停外描边；点击后短暂固定（pinUntil）", () => {
@@ -103,6 +117,97 @@ describe("inspect hook 注入", () => {
     expect(isInspectPick({ type: INSPECT_MESSAGE_TYPE, selector: "h1" })).toBe(true);
     expect(isInspectPick({ type: INSPECT_MESSAGE_TYPE, selector: "  " })).toBe(false);
     expect(isInspectPick({ type: "other", selector: "h1" })).toBe(false);
+  });
+});
+
+describe("deck runtime 翻页可见性", () => {
+  afterEach(() => {
+    window.__agentDeckHooked = false;
+    document.head?.querySelector("#agent-deck-visibility")?.remove();
+    document.body.innerHTML = "";
+  });
+
+  it("选第 N 页后只有那一页可见，不依赖稿面自带 display:none", async () => {
+    document.body.innerHTML = [
+      '<style>.slide{display:flex;min-height:100vh}</style>',
+      '<section class="slide is-active" data-slide="title">三体·科技图鉴</section>',
+      '<section class="slide" data-slide="sixiang">思想钢印</section>',
+    ].join("");
+    const states = [];
+    const onMsg = (ev) => {
+      if (ev.data?.type === DECK_STATE_MESSAGE_TYPE || ev.data?.type === DECK_READY_MESSAGE_TYPE) {
+        states.push(ev.data);
+      }
+    };
+    window.addEventListener("message", onMsg);
+    try {
+      (0, eval)(DECK_RUNTIME_SOURCE);
+      const [title, thought] = document.querySelectorAll(".slide");
+      expect(title.classList.contains("is-active")).toBe(true);
+      expect(title.hasAttribute("hidden")).toBe(false);
+      expect(thought.classList.contains("is-active")).toBe(false);
+      expect(thought.getAttribute("aria-hidden")).toBe("true");
+      expect(document.getElementById("agent-deck-visibility")?.textContent).toContain("display:none!important");
+      expect(document.getElementById("agent-deck-visibility")?.textContent).toContain(".slide[data-slide].is-active");
+      expect(document.getElementById("agent-deck-visibility")?.textContent).toContain("not print");
+
+      window.dispatchEvent(new MessageEvent("message", {
+        data: { type: DECK_GOTO_MESSAGE_TYPE, index: 1 },
+      }));
+      expect(title.classList.contains("is-active")).toBe(false);
+      expect(title.getAttribute("aria-hidden")).toBe("true");
+      expect(thought.classList.contains("is-active")).toBe(true);
+      expect(thought.hasAttribute("hidden")).toBe(false);
+      expect(thought.getAttribute("aria-hidden")).toBe("false");
+      expect(thought.getAttribute("data-slide")).toBe("sixiang");
+      expect(thought.textContent).toContain("思想钢印");
+      await new Promise((r) => setTimeout(r, 0));
+      expect(states.some((s) => s.type === DECK_STATE_MESSAGE_TYPE && s.slide === "sixiang" && s.index === 1)).toBe(true);
+
+      window.dispatchEvent(new MessageEvent("message", {
+        data: { type: DECK_GOTO_MESSAGE_TYPE, slide: "title" },
+      }));
+      expect(title.hasAttribute("hidden")).toBe(false);
+      expect(title.classList.contains("is-active")).toBe(true);
+      expect(thought.classList.contains("is-active")).toBe(false);
+    } finally {
+      window.removeEventListener("message", onMsg);
+    }
+  });
+
+  it("杂志叠层 goto 第 2 页：目标页不是 hidden，computed display 不是 none，有盒子", () => {
+    expect(DECK_VISIBILITY_CSS).toContain("position:relative!important");
+    expect(DECK_VISIBILITY_CSS).toContain("min-height:100vh!important");
+    document.body.innerHTML = [
+      "<style>",
+      "html,body{margin:0;background:#05070d;color:#f4f1ea;height:100%}",
+      ".slide{display:flex;min-height:100vh;position:absolute;inset:0}",
+      ".slide:first-child{background:#0b1020}",
+      "</style>",
+      '<section class="slide is-active" data-slide="title">三体·科技图鉴</section>',
+      '<section class="slide" data-slide="sixiang"><h2>思想钢印</h2><p>后来页</p></section>',
+    ].join("");
+    (0, eval)(DECK_RUNTIME_SOURCE);
+    window.dispatchEvent(new MessageEvent("message", {
+      data: { type: DECK_GOTO_MESSAGE_TYPE, index: 1 },
+    }));
+    const title = document.querySelector('[data-slide="title"]');
+    const thought = document.querySelector('[data-slide="sixiang"]');
+    const actives = [...document.querySelectorAll(".slide.is-active")];
+    expect(actives).toHaveLength(1);
+    expect(actives[0]).toBe(thought);
+    expect(thought.hasAttribute("hidden")).toBe(false);
+    expect(title.classList.contains("is-active")).toBe(false);
+    expect(getComputedStyle(thought).display).not.toBe("none");
+    const box = thought.getBoundingClientRect();
+    const hasBox = box.height > 0 || thought.offsetHeight > 0 || thought.scrollHeight > 0;
+    if (!hasBox) {
+      expect(DECK_VISIBILITY_CSS).toMatch(/min-height:100vh/);
+      expect(thought.getAttribute("aria-hidden")).toBe("false");
+    } else {
+      expect(hasBox).toBe(true);
+    }
+    expect(thought.textContent).toContain("思想钢印");
   });
 });
 

@@ -29,6 +29,11 @@ const TITLE_HINTS: Record<string, string> = {
   "social-basic": "社媒方图",
   "pm-spec": "产品规格",
   "team-okrs": "团队 OKR",
+  "eng-runbook": "工程手册",
+  "finance-report": "财务报告",
+  "hr-onboarding": "人事入职",
+  "meeting-brief": "会前简报",
+  "raid-brief": "战役任务书",
 };
 
 export function assertDesignTemplateId(id: string): string {

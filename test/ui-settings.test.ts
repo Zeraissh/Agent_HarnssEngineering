@@ -67,7 +67,7 @@ describe("设置读写与容错", () => {
   it("defaultSettings 形状完整", () => {
     const s = defaultSettings();
     expect(s.version).toBe(SETTINGS_SCHEMA_VERSION);
-    expect(s.defaults).toEqual({ effort: "", verify: false, autoApprove: true });
+    expect(s.defaults).toEqual({ effort: "", verify: false, autoApprove: false });
     expect(s.badge).toBe(true);
   });
 
@@ -77,7 +77,9 @@ describe("设置读写与容错", () => {
       "utf8",
     );
     expect(src).toContain("计划编排的子任务默认仍会核查");
+    expect(src).toContain("只能改这些文件夹");
     expect(src).not.toContain("提交栏里可逐次关掉。");
+    expect(src).not.toContain("新对话默认自动放行低风险工具");
   });
 
   it("parseSettings 合法 JSON 往返", () => {
@@ -137,7 +139,7 @@ describe("设置读写与容错", () => {
     const next = updateSettings(base, { defaults: { verify: true } });
     expect(base.defaults.verify).toBe(false);
     expect(next.defaults.verify).toBe(true);
-    expect(next.defaults.autoApprove).toBe(true); // 其余键保留
+    expect(next.defaults.autoApprove).toBe(false); // 其余键保留
   });
 });
 
@@ -176,7 +178,7 @@ describe("旧键迁移与 composer 默认值派生", () => {
       defaults: { effort: "medium", verify: true, autoApprove: false },
     });
     expect(composerDefaults(s)).toEqual({ effort: "medium", verify: true, autoApprove: false });
-    expect(composerDefaults(defaultSettings())).toEqual({ effort: "", verify: false, autoApprove: true });
+    expect(composerDefaults(defaultSettings())).toEqual({ effort: "", verify: false, autoApprove: false });
   });
 
   it("isValidEffort：空串恒合法；档位必须在服务端声明集合里", () => {
@@ -427,7 +429,7 @@ describe("initSettingsView 视图行为", () => {
     const api = initSettingsView(host, env);
     api.open();
     const toggle = api.element.querySelector("#settings-auto-approve");
-    expect(toggle.checked).toBe(true); // 默认开
+    expect(toggle.checked).toBe(false); // 新对话默认先问
     toggle.checked = false;
     toggle.dispatchEvent(new Event("change", { bubbles: true }));
     expect(parseSettings(env.storage.getItem(SETTINGS_STORAGE_KEY)).defaults.autoApprove).toBe(false);

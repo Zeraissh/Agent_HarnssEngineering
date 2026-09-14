@@ -3,12 +3,16 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
+  cliRuntimePermissionSwitches,
   describePermissionStance,
+  formatPermissionBanner,
   matchPermissionMode,
   PERMISSION_MODE_TABLE,
   permissionModeSwitches,
   resolvePermissionMode,
   resolveToolPermission,
+  WEB_DEFAULT_AUTO_APPROVE,
+  WEB_DEFAULT_PERMISSION_MODE,
 } from "../src/permission-mode.js";
 import { resolveMcpToolPermission } from "../src/mcp.js";
 import { ToolExecutor, ToolRegistry } from "../src/tools/registry.js";
@@ -43,6 +47,18 @@ describe("D3 permission modes", () => {
     expect(() => resolvePermissionMode("bypass")).toThrow(/AGENT_PERMISSION_MODE/);
   });
 
+  it("Web 新建 run 默认先问；CLI --yes 仍是 auto 档（变异：改回 auto 要红）", () => {
+    expect(WEB_DEFAULT_AUTO_APPROVE).toBe(false);
+    expect(WEB_DEFAULT_PERMISSION_MODE).toBe("manual");
+    expect(PERMISSION_MODE_TABLE[WEB_DEFAULT_PERMISSION_MODE].autoYes).toBe(false);
+    expect(PERMISSION_MODE_TABLE[WEB_DEFAULT_PERMISSION_MODE].approvalDefault).toBe("ask");
+    expect(PERMISSION_MODE_TABLE.auto.autoYes).toBe(true);
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "src", "permission-mode.ts"), "utf8");
+    expect(src).toMatch(/export const WEB_DEFAULT_AUTO_APPROVE = false/);
+    expect(src).not.toMatch(/export const WEB_DEFAULT_AUTO_APPROVE = true/);
+    expect(src).toMatch(/export const WEB_DEFAULT_PERMISSION_MODE: PermissionMode = "manual"/);
+  });
+
   it("describePermissionStance 一次说清档位与会不会自动放行", () => {
     expect(describePermissionStance("manual", PERMISSION_MODE_TABLE.manual)).toMatch(
       /手动.*不会自动放行/,
@@ -61,6 +77,27 @@ describe("D3 permission modes", () => {
         autoYes: true,
       }),
     ).toMatch(/自定义.*ask 级会自动放行/);
+  });
+
+  it("CLI --yes 横幅跟真实开关走，不说不会自动放行", () => {
+    const yes = cliRuntimePermissionSwitches({ autoYes: true });
+    const yesLine = formatPermissionBanner(matchPermissionMode(yes), yes);
+    expect(yesLine).toMatch(/yes=true/);
+    expect(yesLine).toMatch(/会自动放行/);
+    expect(yesLine).not.toMatch(/不会自动放行/);
+    expect(yesLine).not.toMatch(/yes=false/);
+    expect(matchPermissionMode(yes)).toBe("auto");
+
+    const no = cliRuntimePermissionSwitches({ autoYes: false });
+    const noLine = formatPermissionBanner(matchPermissionMode(no), no);
+    expect(noLine).toMatch(/yes=false/);
+    expect(noLine).toMatch(/不会自动放行/);
+    expect(matchPermissionMode(no)).toBe("manual");
+
+    const cli = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "src", "cli.ts"), "utf8");
+    expect(cli).toMatch(/cliRuntimePermissionSwitches/);
+    expect(cli).toMatch(/formatPermissionBanner/);
+    expect(cli).not.toMatch(/permissionModeSwitches\(permissionModeLabel\)/);
   });
 
   it("matchPermissionMode 反推档位；自定义组合返回 null", () => {

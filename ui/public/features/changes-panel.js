@@ -225,6 +225,8 @@ export function initChangesPanel(host = {}, env = {}) {
   let error = "";
   /** @type {ChangeEntry[]} */
   let changes = [];
+  /** @type {ChangeEntry[]} 本场已成功写出的文件（API 空时用来挡住空态谎话） */
+  let knownWrites = [];
   let gitRepo = false;
   /** @type {string|null} 当前展开预览的路径 */
   let expandedPath = null;
@@ -326,8 +328,9 @@ export function initChangesPanel(host = {}, env = {}) {
   }
 
   function render() {
-    countPeek.hidden = !(status === "ready" && changes.length > 0);
-    if (!countPeek.hidden) countPeek.textContent = String(changes.length);
+    const shownCount = (changes.length > 0 ? changes : knownWrites).length;
+    countPeek.hidden = !(status === "ready" && shownCount > 0);
+    if (!countPeek.hidden) countPeek.textContent = String(shownCount);
     body.innerHTML = "";
     if (!runId) {
       // 没选会话时整区收起（分区仍在骨架里，不闪）
@@ -350,7 +353,8 @@ export function initChangesPanel(host = {}, env = {}) {
       body.appendChild(box);
       return;
     }
-    if (changes.length === 0) {
+    const shown = changes.length > 0 ? changes : knownWrites;
+    if (shown.length === 0) {
       const empty = doc.createElement("p");
       empty.className = "chg-hint";
       empty.textContent = CHANGES_COPY.empty;
@@ -359,7 +363,7 @@ export function initChangesPanel(host = {}, env = {}) {
     }
     const list = doc.createElement("div");
     list.className = "chg-list";
-    for (const entry of changes) list.appendChild(renderRow(entry));
+    for (const entry of shown) list.appendChild(renderRow(entry));
     body.appendChild(list);
   }
 
@@ -471,11 +475,36 @@ export function initChangesPanel(host = {}, env = {}) {
       if (id === runId) return;
       runId = id;
       changes = [];
+      knownWrites = [];
       expandedPath = null;
       status = "idle";
       error = "";
       render();
       if (runId) void load();
+    },
+    /**
+     * 本场已写出的文件。API 变更列表为空时用它代替「没有写盘」。
+     * @param {Array<{path?:string, writes?:number}|string>|null|undefined} files
+     */
+    setKnownWrites(files) {
+      const next = [];
+      for (const f of files ?? []) {
+        const path = typeof f === "string" ? f : String(f?.path ?? "").trim();
+        if (!path) continue;
+        next.push({
+          path,
+          ops: ["write"],
+          count: typeof f === "object" && Number.isFinite(Number(f.writes)) ? Number(f.writes) : 1,
+          lastAt: null,
+          outOfScope: false,
+          exists: true,
+          sizeBytes: null,
+          mtimeMs: null,
+          git: null,
+        });
+      }
+      knownWrites = next;
+      if (status === "ready") render();
     },
     /** 手动刷新（测试与诊断用） */
     refresh: () => load(),

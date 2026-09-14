@@ -171,8 +171,7 @@ Treat history backups like model keys (plaintext transcripts). Local drills:
 offsite package + wrong-passphrase fail-closed). Encrypted drill passphrase:
 `AGENT_OPS_BACKUP_PASSPHRASE` or an ephemeral value printed once.
 
-## Rollback
- triggers and procedure
+## Rollback triggers and procedure
 
 Rollback immediately when any of these occur: two consecutive readiness failures, authentication or
 Origin bypass, history write degradation, inability to answer `ask_user`, graceful shutdown beyond

@@ -161,7 +161,9 @@ import {
 import { routeToPack } from "../src/router.js";
 import {
   DESIGN_TABS,
+  designRouteBlocksCreate,
   designRouteForRunConfig,
+  hasPickedDesignTemplate,
   installedFilePacksFrom,
   publicDesignCatalog,
   routeDesignTask,
@@ -300,8 +302,11 @@ import {
   matchPermissionMode,
   permissionModeSwitches,
   PERMISSION_MODES,
+  WEB_DEFAULT_AUTO_APPROVE,
+  WEB_DEFAULT_PERMISSION_MODE,
   type PermissionMode,
 } from "../src/permission-mode.js";
+import { sanitizeAdmissionPayload, toBrowserApiError } from "./api-errors.js";
 import type Anthropic from "@anthropic-ai/sdk";
 import { bashTool, SHELL_DESC } from "../src/tools/bash.js";
 import { ASK_USER_TOOL_NAME, createAskUserTool, type UserQuestion } from "../src/tools/ask-user.js";
@@ -1965,12 +1970,29 @@ function json(res: ServerResponse, status: number, body: unknown): void {
   res.end(JSON.stringify(body));
 }
 
+/** POST /api/runs 等准入失败：正文给人话，状态码只留在 HTTP 头。 */
+function jsonAdmission(res: ServerResponse, outcome: {
+  status: number;
+  payload: unknown;
+  headers?: Record<string, string>;
+}): void {
+  if (outcome.headers) {
+    for (const [name, value] of Object.entries(outcome.headers)) {
+      res.setHeader(name, value);
+    }
+  }
+  const payload = outcome.status >= 400
+    ? sanitizeAdmissionPayload(outcome.payload)
+    : outcome.payload;
+  json(res, outcome.status, payload);
+}
+
 function notFound(res: ServerResponse, detail?: string): void {
   json(res, 404, { error: detail ?? "Not found" });
 }
 
 function badRequest(res: ServerResponse, detail: string): void {
-  json(res, 400, { error: detail });
+  json(res, 400, { error: toBrowserApiError(detail) });
 }
 
 function requestBodyFailure(res: ServerResponse, error: unknown): void {
@@ -5000,7 +5022,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       if (parsed.pack === "") {
         delete target.packName;
       } else if (!getPack(parsed.pack)) {
-        return { ok: false, error: `未知领域包 "${parsed.pack}"。可选：${packNamesLine()}` };
+        return { ok: false, error: `没找到这个工具组合「${parsed.pack}」。可选：${packNamesLine()}` };
       } else {
         target.packName = parsed.pack;
       }
@@ -8421,6 +8443,14 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       // 本机 UI 添加的也在这个集合里——集合是活的，快照时铺平）
       availableWorkdirs: [...allowedWorkdirs],
       availableProjects: projects,
+      /**
+       * Web 新建对话出厂默认。前端设置项「新对话默认自动放行…」应对齐这里，
+       * 未显式打开时不要自己默认 autoApprove=true。
+       */
+      defaults: {
+        autoApprove: WEB_DEFAULT_AUTO_APPROVE,
+        permissionMode: WEB_DEFAULT_PERMISSION_MODE,
+      },
       campaignArmed: process.env.AGENT_CAMPAIGN === "1",
       spawnTaskArmed: process.env.AGENT_SPAWN_TASK === "1" || process.env.AGENT_CAMPAIGN === "1",
       roleModels: roleModelsView(),
@@ -9571,7 +9601,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     // python-coding"与实际行为长期不一致，查起来很贵（口径同 src/cli.ts 对
     // AGENT_EFFORT 的处理）
     if (parsed.pack !== undefined && parsed.pack !== "" && !getPack(parsed.pack)) {
-      return { status: 400, payload: { error: `未知领域包 "${parsed.pack}"。可选：${packNamesLine()}` } };
+      return { status: 400, payload: { error: `没找到这个工具组合「${parsed.pack}」。可选：${packNamesLine()}` } };
     }
     /**
      * 逐 run 上下文预算（MEM-01 窗口 / 预算分离）：区间 [32k, 窗口 − maxTokens − 边际]
@@ -9719,9 +9749,14 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
     let packRoute: { pack: string | null; reason: string } | undefined;
     let admittedDesignRoute: DesignRoute | undefined;
+    const pickedDesignTemplate = hasPickedDesignTemplate({
+      designId: typeof parsed.designId === "string" ? parsed.designId : undefined,
+      designTemplate: typeof parsed.designTemplate === "string" ? parsed.designTemplate : undefined,
+      designFilePack: typeof parsed.designFilePack === "string" ? parsed.designFilePack : undefined,
+    });
     if (willPromoteDirector) {
       /* 导演不走设计门面 / autoPack：拆役已由 detectCampaignSplit 裁定 */
-    } else if (wantsDesign) {
+    } else if (wantsDesign && pickedDesignTemplate) {
       const installed = installedFilePacksFrom(allPacks());
       const installedNames = installed.map((p) => p.name);
       // 设计模式锁定后端包为 design，除非点了已安装文件包。内置工程包忽略。
@@ -9744,19 +9779,20 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         explicitFilePack,
         installedFilePacks: installed,
       });
-      if (admittedDesignRoute.kind === "r2") {
+      // 没点芯片时普通发送直接走（上面已跳过路由）。点了芯片仍 R2 才用人话拒绝，不用 409。
+      if (designRouteBlocksCreate(admittedDesignRoute, pickedDesignTemplate)) {
         return {
-          status: 409,
+          status: 400,
           payload: {
-            error: admittedDesignRoute.reason,
-            designRoute: {
-              ...designRouteForRunConfig(admittedDesignRoute),
-              tab: admittedDesignRoute.tab ?? null,
-            },
+            error: "请先选一个稿件模板，或直接描述要做什么。",
           },
         };
       }
-      parsed.pack = admittedDesignRoute.pack;
+      if (admittedDesignRoute.kind !== "r2") {
+        parsed.pack = admittedDesignRoute.pack;
+      } else {
+        admittedDesignRoute = undefined;
+      }
     } else if (parsed.autoPack === true && !parsed.pack && !wantsOrchestrate) {
       try {
         const outcome = await routeToPack(
@@ -11094,12 +11130,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           return badRequest(res, "Invalid JSON body");
         }
         const outcome = await createRunFromBody({ ...parsed, campaign: true });
-        if (outcome.headers) {
-          for (const [name, value] of Object.entries(outcome.headers)) {
-            res.setHeader(name, value);
-          }
-        }
-        return json(res, outcome.status, outcome.payload);
+        return jsonAdmission(res, outcome);
       }
 
       case "campaignTranscript": {
@@ -13548,12 +13579,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           return badRequest(res, "Invalid JSON body");
         }
         const outcome = await createRunFromBody(parsed);
-        if (outcome.headers) {
-          for (const [name, value] of Object.entries(outcome.headers)) {
-            res.setHeader(name, value);
-          }
-        }
-        return json(res, outcome.status, outcome.payload);
+        return jsonAdmission(res, outcome);
       }
 
       case "events": {

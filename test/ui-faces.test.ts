@@ -27,6 +27,12 @@ import {
   normalizeTab,
   filterRunsByQuery,
   filterRunsByComposerWorkdir,
+  composerListMembership,
+  filterRunsByWorkspaceFace,
+  inferWorkdirFace,
+  workdirVisibleOnFace,
+  composerCwdForProject,
+  groupRunsByWorkdir,
   sameWorkdirPath,
   whitelistSourceLabel,
   VERDICT_PARSE_FAIL,
@@ -315,6 +321,12 @@ describe("deriveToolsFace", () => {
     expect(deriveToolsFace(s(), { ...HARNESS, history: undefined }).history).toBeNull();
   });
 
+  it("run_config.projectId 进 Tools 面（白名单投影）", () => {
+    const state = feed([ev("host", { type: "run_config", projectId: "board-1", workdir: "D:\\work\\alpha" })]);
+    expect(state.runConfig.projectId).toBe("board-1");
+    expect(deriveToolsFace(state, HARNESS).projectId).toBe("board-1");
+  });
+
   it("run_config.readRoots 覆盖进程快照（逐 run 勾选的额外目录）", () => {
     const state = feed([ev("host", {
       type: "run_config",
@@ -574,7 +586,7 @@ describe("filterRunsByComposerWorkdir（侧栏当前项目）", () => {
     { runId: "c", task: "别的", workdir: "D:\\proj\\beta" },
   ];
 
-  it("正反斜杠视为同一目录；默认只留当前项目", () => {
+  it("正反斜杠视为同一目录；未选项目时只留作曲栏路径", () => {
     expect(sameWorkdirPath("D:\\proj\\alpha", "D:/proj/alpha/")).toBe(true);
     expect(filterRunsByComposerWorkdir(runs, "D:/proj/alpha").map((r) => r.runId)).toEqual(["a", "b"]);
   });
@@ -582,6 +594,136 @@ describe("filterRunsByComposerWorkdir（侧栏当前项目）", () => {
   it("全部项目不过滤；空 workdir 不过滤", () => {
     expect(filterRunsByComposerWorkdir(runs, "D:/proj/alpha", true)).toBe(runs);
     expect(filterRunsByComposerWorkdir(runs, "")).toBe(runs);
+  });
+
+  it("选了项目：两个成员目录都可见；别的项目与同名末段藏住", () => {
+    const project = {
+      id: "p1",
+      name: "看板",
+      workdirs: ["D:\\work\\alpha", "D:\\work\\beta"],
+      primaryWorkdir: "D:\\work\\alpha",
+    };
+    const mixed = [
+      { runId: "primary", task: "主目录", workdir: "D:\\work\\alpha" },
+      { runId: "sibling", task: "兄弟目录", workdir: "D:/work/beta/" },
+      { runId: "tagged", task: "入项", workdir: "D:\\elsewhere", projectId: "p1" },
+      { runId: "other", task: "别的项目", workdir: "D:\\other\\alpha", projectId: "p2" },
+      { runId: "stray", task: "剩目录", workdir: "D:\\scratch\\lone" },
+    ];
+    // 作曲栏 cwd = primary。旧谓词 sameWorkdirPath(run.workdir, primary) 会丢掉 sibling。
+    expect(filterRunsByComposerWorkdir(mixed, "D:\\work\\alpha", false, project).map((r) => r.runId))
+      .toEqual(["primary", "sibling", "tagged"]);
+    expect(filterRunsByComposerWorkdir(mixed, "D:\\work\\alpha").map((r) => r.runId))
+      .toEqual(["primary"]);
+    expect(filterRunsByComposerWorkdir(mixed, "D:\\work\\alpha", true, project).map((r) => r.runId))
+      .toEqual(["primary", "sibling", "tagged", "other", "stray"]);
+  });
+
+  it("选了项目实体时：projectId 或任一成员目录都留下", () => {
+    const mixed = [
+      ...runs,
+      { runId: "d", task: "入项", workdir: "D:\\elsewhere", projectId: "p1" },
+    ];
+    const project = {
+      id: "p1",
+      name: "Alpha",
+      workdirs: ["D:\\proj\\alpha", "D:\\proj\\gamma"],
+      primaryWorkdir: "D:\\proj\\alpha",
+    };
+    expect(filterRunsByComposerWorkdir(mixed, "D:/proj/beta", false, project).map((r) => r.runId))
+      .toEqual(["a", "b", "d"]);
+  });
+
+  it("作曲栏已在成员目录上则不打回 primary", () => {
+    const project = {
+      id: "p1",
+      workdirs: ["D:\\work\\alpha", "D:\\work\\beta"],
+      primaryWorkdir: "D:\\work\\alpha",
+    };
+    expect(composerCwdForProject(project, "D:/work/beta/")).toBe("D:/work/beta/");
+    expect(composerCwdForProject(project, "D:\\scratch")).toBe("D:\\work\\alpha");
+  });
+
+  it("纯办公目录不进 Code 选择器，空目录两边都可见", () => {
+    const ags = "D:\\Work\\Wafer\\AGS";
+    const fathom = "C:\\Users\\rk302\\Fathom";
+    const pair = [
+      { runId: "ags-1", workdir: ags, workspace: "code" },
+      { runId: "fathom-1", workdir: fathom, workspace: "office" },
+    ];
+    expect(inferWorkdirFace(ags, pair)).toBe("code");
+    expect(inferWorkdirFace(fathom, pair)).toBe("office");
+    expect(inferWorkdirFace("D:\\empty", pair)).toBeNull();
+    expect(workdirVisibleOnFace(ags, "office", pair)).toBe(false);
+    expect(workdirVisibleOnFace(fathom, "code", pair)).toBe(false);
+    expect(workdirVisibleOnFace("D:\\empty", "code", pair)).toBe(true);
+    expect(workdirVisibleOnFace("D:\\empty", "office", pair)).toBe(true);
+  });
+
+  it("AGS+Fathom 同一项目：脸切开，勾选 extras 不改变可见性", () => {
+    const ags = "D:\\Work\\Wafer\\AGS";
+    const fathom = "C:\\Users\\rk302\\Fathom";
+    const project = {
+      id: "wafer-board",
+      name: "看板",
+      workdirs: [ags, fathom],
+      primaryWorkdir: ags,
+    };
+    const pair = [
+      { runId: "ags-1", task: "看看 AGS 源文件", workdir: ags, workspace: "code", packName: "ts-coding" },
+      { runId: "fathom-1", task: "杂志风幻灯", workdir: fathom, workspace: "office", packName: "design", mode: "design" },
+    ];
+    const inProject = filterRunsByComposerWorkdir(pair, ags, false, project);
+    expect(inProject.map((r) => r.runId)).toEqual(["ags-1", "fathom-1"]);
+    expect(filterRunsByWorkspaceFace(inProject, "code").map((r) => r.runId)).toEqual(["ags-1"]);
+    expect(filterRunsByWorkspaceFace(inProject, "office").map((r) => r.runId)).toEqual(["fathom-1"]);
+    expect(composerListMembership(null, ags, [fathom])).toBeNull();
+    expect(filterRunsByComposerWorkdir(pair, ags, false, composerListMembership(null, ags, [fathom])))
+      .toEqual(filterRunsByComposerWorkdir(pair, ags));
+  });
+});
+
+describe("groupRunsByWorkdir 按项目分组", () => {
+  it("不传 projects 时仍按路径末段分组（旧调用）", () => {
+    const groups = groupRunsByWorkdir([
+      { runId: "a", workdir: "D:\\work\\alpha", status: "done" },
+      { runId: "b", workdir: "D:\\other\\alpha", status: "done" },
+    ]);
+    expect(groups.map((g) => g.label)).toEqual(["alpha", "alpha"]);
+    expect(groups).toHaveLength(2);
+  });
+
+  it("入项的 run 跟项目名走；剩目录仍按路径末段", () => {
+    const projects = [{
+      id: "board-1",
+      name: "看板",
+      workdirs: ["D:\\work\\alpha", "D:\\work\\beta"],
+      primaryWorkdir: "D:\\work\\alpha",
+    }];
+    const groups = groupRunsByWorkdir([
+      { runId: "a", workdir: "D:\\work\\alpha", projectId: "board-1", status: "done" },
+      { runId: "b", workdir: "D:\\work\\beta", status: "done" },
+      { runId: "c", workdir: "D:\\scratch\\lone", status: "done" },
+    ], projects);
+    expect(groups).toHaveLength(2);
+    const named = groups.find((g) => g.key === "project:board-1");
+    expect(named?.label).toBe("看板");
+    expect(named?.runs.map((r) => r.runId)).toEqual(["a", "b"]);
+    expect(groups.find((g) => g.label === "lone")?.runs.map((r) => r.runId)).toEqual(["c"]);
+  });
+
+  it("跨项目同名末段不混组", () => {
+    const projects = [
+      { id: "p1", name: "甲", workdirs: ["D:\\work\\alpha"], primaryWorkdir: "D:\\work\\alpha" },
+      { id: "p2", name: "乙", workdirs: ["D:\\other\\alpha"], primaryWorkdir: "D:\\other\\alpha" },
+    ];
+    const groups = groupRunsByWorkdir([
+      { runId: "a", workdir: "D:\\work\\alpha", projectId: "p1", status: "done" },
+      { runId: "b", workdir: "D:\\other\\alpha", projectId: "p2", status: "done" },
+    ], projects);
+    expect(groups).toHaveLength(2);
+    expect(groups.find((g) => g.key === "project:p1")?.runs.map((r) => r.runId)).toEqual(["a"]);
+    expect(groups.find((g) => g.key === "project:p2")?.runs.map((r) => r.runId)).toEqual(["b"]);
   });
 });
 

@@ -22,6 +22,10 @@
  * - 求值：`resolveToolPermission` / `resolveMcpToolPermission`
  * - 执行器：`ToolExecutor` 在审批门前拦截 `deny`
  * - CLI 启动行打印展开后的开关值（不许只报模式名）
+ * - Web 出厂：`WEB_DEFAULT_PERMISSION_MODE=manual`、`WEB_DEFAULT_AUTO_APPROVE=false`；
+ *   `GET /api/harness.defaults.autoApprove === false`。页面「自动放行」默认不勾，
+ *   说明「默认先问；勾上才自动放行」。发送按钮和 label 是「发送」。
+ * - CLI `--yes` 横幅跟 `cliRuntimePermissionSwitches`（`yes=true` / 会自动放行），不抄 env 标签。
  * - Web：`permissionMode` 选择器 + 装配条 / composer 一行人话（哪一档、会不会自动放行 ask）；
  *   展开开关仍在 why 里。`mode` 只跟实际开关反推，不跟点过的标签（追问改编排后对不上 → 自定义）
  * - 台账：`permissionMode` 记实际开关反推的档（自定义 → null），不是点过的标签；

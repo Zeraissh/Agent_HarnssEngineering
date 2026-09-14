@@ -1,0 +1,100 @@
+:root {
+  --bg: #f6f3f8;
+  --fg: #1c1917;
+  --muted: #5b5560;
+  --accent: #5b4b8a;
+  --card: #fff;
+  --line: rgba(28, 25, 23, 0.1);
+  --th: #eee8f3;
+  font-family: "Iowan Old Style", "Palatino Linotype", "Songti SC", serif;
+}
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  line-height: 1.55;
+}
+
+.masthead,
+.toc,
+main {
+  max-width: 46rem;
+  margin: 0 auto;
+  padding: 0 clamp(1.25rem, 4vw, 2.5rem);
+}
+
+.masthead { padding-top: clamp(2rem, 7vw, 4rem); }
+.kicker {
+  margin: 0 0 0.5rem;
+  color: var(--accent);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  font-size: 0.8rem;
+  font-family: system-ui, sans-serif;
+}
+h1 { margin: 0 0 0.6rem; font-size: clamp(2rem, 5vw, 2.8rem); line-height: 1.12; }
+.lede { margin: 0 0 1.25rem; color: var(--muted); font-size: 1.1rem; }
+
+.meta {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr));
+  gap: 0.75rem 1.25rem;
+  margin: 0 0 2rem;
+  padding: 0;
+}
+.meta div { margin: 0; }
+.meta dt {
+  margin: 0;
+  font-family: system-ui, sans-serif;
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.meta dd { margin: 0.15rem 0 0; font-weight: 600; }
+
+.toc {
+  background: var(--card);
+  border: 1px solid var(--line);
+  padding: 1rem 1.25rem 1.15rem;
+  margin-bottom: 2rem;
+}
+.toc h2 { margin: 0 0 0.6rem; font-size: 1.05rem; }
+.toc ol { margin: 0; padding-left: 1.2rem; }
+.toc a { color: var(--fg); }
+.toc a:hover { color: var(--accent); }
+
+main { padding-bottom: 4rem; }
+section { margin: 0 0 2rem; }
+h2 { margin: 0 0 0.6rem; font-size: 1.35rem; }
+h3 { margin: 1rem 0 0.4rem; font-size: 1.05rem; }
+p, li { color: var(--fg); }
+p { margin: 0 0 0.75rem; }
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--card);
+  font-size: 0.95rem;
+}
+th, td {
+  border: 1px solid var(--line);
+  padding: 0.55rem 0.7rem;
+  text-align: left;
+  vertical-align: top;
+}
+th {
+  font-family: system-ui, sans-serif;
+  font-size: 0.78rem;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--muted);
+  background: var(--th);
+}
+
+@media print {
+  .toc { break-after: avoid; }
+}

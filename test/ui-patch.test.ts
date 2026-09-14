@@ -136,7 +136,12 @@ import {
   filterRunsByComposerWorkdir,
   runBelongsToOffice,
   CODE_STARTER_JOBS,
+  OFFICE_STARTER_JOBS,
   buildNewRunRequest,
+  describeApprovalAction,
+  runEndAnnouncement,
+  humanizeSubmitError,
+  ROLE_PERSONA,
 } from "../ui/public/app.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -4275,8 +4280,8 @@ describe("空态给的是能点的例子", () => {
     paintWelcome({ hasRuns: true });
     expect(document.querySelectorAll("[data-example]").length).toBe(3);
     expect(document.querySelector(".empty-brand")!.textContent).toMatch(/FATHOM/);
-    expect(document.querySelector(".empty-tagline")!.textContent).toContain("to the bottom");
-    expect(document.querySelector(".empty-tagline-cn")!.textContent).toContain("每一层都看得见");
+    expect(document.querySelector(".empty-tagline")!.textContent).toContain("说要做什么");
+    expect(document.querySelector(".empty-tagline-cn")!.textContent).toContain("稿件");
   });
 
   it("空态不再放工作目录/引导入口——composer 与设置里已有", () => {
@@ -4286,17 +4291,23 @@ describe("空态给的是能点的例子", () => {
     expect(document.getElementById("workdir-select")).toBeTruthy();
   });
 
-  it("办公空态是三块稿件加更多稿件，没有问/读/写和设计模式入口瓦", () => {
+  it("办公空态是纪要 / 一页 / 出处加更多稿件，没有仓库作业", () => {
     paintWelcome({ workspaceFace: "office" });
-    expect(document.querySelectorAll("#starter-gallery [data-design-template]").length).toBe(3);
-    expect(document.querySelector('[data-design-template="social-basic"]')?.textContent).toContain("社媒方图");
+    const titles = [...document.querySelectorAll("#starter-gallery .starter-tile-title")].map((e) => e.textContent);
+    expect(titles).toEqual(["做纪要", "做一页", "带出处问答", "更多稿件"]);
     expect(document.querySelector("[data-office-more]")?.textContent).toContain("更多稿件");
     expect(document.querySelector("[data-design-mode-enter]")).toBeNull();
     expect(document.querySelector("[data-design-mode-exit]")).toBeNull();
-    expect(document.querySelector("[data-example]")).toBeNull();
-    expect(document.getElementById("starter-gallery")?.textContent).not.toMatch(/不要调用工具|设计模式|问|读|写/);
-    paintWelcome({ workspaceFace: "office", selectedTemplate: "deck-basic" });
-    expect(document.querySelector('[data-design-template="deck-basic"]')?.classList.contains("is-selected")).toBe(true);
+    expect(document.querySelector("[data-design-template]")).toBeNull();
+    const gallery = document.getElementById("starter-gallery")?.textContent ?? "";
+    expect(gallery).not.toContain("从计划开始");
+    expect(gallery).not.toContain("修一处并跑通测试");
+    expect(gallery).not.toContain("看看这个仓库");
+    expect(OFFICE_STARTER_JOBS.map((j) => j.label)).toEqual(["做纪要", "做一页", "带出处问答"]);
+    expect(document.querySelector(".empty-state--design")).toBeNull();
+    expect(document.querySelector(".empty-tagline")?.textContent).toContain("说要做什么");
+    const html = readFileSync(join(UI_DIR, "index.html"), "utf-8");
+    expect(html).toMatch(/designModeActive:\s*officeCatalogOpen/);
   });
 
   it("更多稿件打开六页签；返回只回到办公四行", () => {
@@ -4539,27 +4550,29 @@ describe("空态给的是能点的例子", () => {
     expect(resolveDesignSampleChoice("media-free")?.prompt).not.toMatch(/data-card|social-basic/);
   });
 
-  it("新建 placeholder 带目录名，没有目录也不写「问任何问题」", () => {
+  it("新建 placeholder 是「说要做什么」，不写目录命令口吻", () => {
     expect(composerFolderName("D:\\\\Work\\\\Github_pros\\\\Agent_Design")).toBe("Agent_Design");
     expect(composerFolderName("/tmp/demo/")).toBe("demo");
     expect(composerFolderName("")).toBe("");
-    expect(newRunPlaceholder("D:\\\\Work\\\\Agent_Design")).toBe("要「Agent_Design」做什么…");
-    expect(newRunPlaceholder(null)).toBe("要这个目录做什么…");
-    expect(deriveComposerMode({ info: null }).placeholder).toBe("要这个目录做什么…");
+    expect(newRunPlaceholder("D:\\\\Work\\\\Agent_Design")).toBe("说要做什么…");
+    expect(newRunPlaceholder(null)).toBe("说要做什么…");
+    expect(deriveComposerMode({ info: null }).placeholder).toBe("说要做什么…");
     expect(deriveComposerMode({ info: null, workdir: "D:\\\\repo\\\\kicad" }).placeholder)
-      .toBe("要「kicad」做什么…");
+      .toBe("说要做什么…");
+    expect(deriveComposerMode({ info: null }).buttonLabel).toBe("发送");
+    expect(deriveComposerMode({ info: null }).labelText).toBe("发送");
   });
 
   it("设计模式 placeholder 用稿名，不把仓库文件夹写进框", () => {
     expect(newRunPlaceholder("D:\\\\Work\\\\Agent_Design", { designMode: true }))
-      .toBe("要这份稿做什么…");
+      .toBe("说要做什么…");
     expect(newRunPlaceholder("D:\\\\Work\\\\Agent_Design", { designMode: true, designTitle: "杂志风幻灯" }))
       .toBe("要「杂志风幻灯」做什么…");
     expect(deriveComposerMode({
       info: null,
       workdir: "D:\\\\Work\\\\Github_pros\\\\Agent_Design",
       designMode: true,
-    }).placeholder).toBe("要这份稿做什么…");
+    }).placeholder).toBe("说要做什么…");
     expect(deriveComposerMode({
       info: null,
       workdir: "D:\\\\Work\\\\Github_pros\\\\Agent_Design",
@@ -4592,7 +4605,7 @@ describe("空态给的是能点的例子", () => {
     expect(css).toContain("#submit-form:focus-within");
     expect(css).toMatch(/\.composer-input-row textarea \{\s*flex: 1 1 auto;\s*min-width: 0;\s*min-height: 36px;/);
     expect(css).toContain(".composer-quickbar > .auto-approve-label");
-    expect(css).toContain(".composer-quickbar > .verify-toggle-label");
+    expect(css).toMatch(/\.composer-quickbar > \.verify-toggle-label\s*\{\s*display:\s*none\s*!important;/);
     expect(css).not.toContain("#main-panel.is-welcome .composer-quickbar > .verify-toggle-label,\n#main-panel.is-welcome .composer-quickbar > .auto-approve-label");
     expect(css).toContain("#main-panel.is-welcome .starter-tiles {\n  display: flex;");
     expect(css).toContain("#main-panel.is-welcome .starter-tile-hint {\n  display: none;");
@@ -5320,7 +5333,10 @@ describe("并行子代理收进主对话卡片", () => {
     const overlay = document.getElementById("agent-overlay");
     expect(overlay?.hidden).toBe(false);
     expect(overlay?.textContent).toContain("我先打开官网");
-    expect(overlay?.textContent).toContain("允许本次");
+    expect(overlay?.textContent).toContain("允许");
+    expect(overlay?.textContent).not.toContain("允许本次");
+    expect(overlay?.textContent).toContain("要运行：curl example.com");
+    expect(overlay?.querySelector(".approval-details")).toBeTruthy();
   });
 });
 
@@ -5390,5 +5406,47 @@ describe("对话回退（回到这里）", () => {
     expect(thread.some((i) => i.kind === "text" && i.text === "先出一版")).toBe(true);
     expect(thread.some((i) => i.kind === "text" && i.text === "配色改完了")).toBe(false);
     expect(thread.some((i) => i.kind === "user" && i.text === "再改配色")).toBe(false);
+  });
+});
+
+describe("persona-ux 文案锁（#4/#5/#6/#9/#10/#25）", () => {
+  it("批准卡说要改哪个文件，按钮是允许/拒绝，JSON 在详情里", () => {
+    expect(describeApprovalAction("write_file", { path: "hello-verify-ask.txt", content: "ping\n" }))
+      .toBe("要新建或改 hello-verify-ask.txt，写入「ping」");
+    expect(describeApprovalAction("mcp__fs__write_file", { path: "notes/a.md" }))
+      .toBe("要新建或改 a.md");
+    renderRunDetail(stateWithPendingApproval(), { activeTab: "loop" });
+    const card = document.querySelector(".approval-card")!;
+    expect(card.querySelector(".approval-summary")?.textContent).toBe("要新建或改 a.txt");
+    expect(card.querySelector(".approval-tool-name")?.textContent).toBe("要新建或改 a.txt");
+    expect(card.textContent).not.toMatch(/write_file\s*\{/);
+    expect(card.querySelector("[data-action='allow']")?.textContent).toBe("允许");
+    expect(card.querySelector("[data-action='deny']")?.textContent).toBe("拒绝");
+    expect(card.querySelector(".approval-details summary")?.textContent).toBe("详情");
+    expect(card.querySelector(".approval-input")?.textContent).toContain("a.txt");
+  });
+
+  it("收尾句：停就是停，完成就是完成，否决不是停止", () => {
+    expect(runEndAnnouncement({ stopReason: "aborted", task: "写文件" })).toBe("已停止：写文件");
+    expect(runEndAnnouncement({ stopReason: "completed", task: "写文件" })).toBe("运行已完成：写文件");
+    expect(runEndAnnouncement({ stopReason: "plan_rejected", task: "拆计划" })).toBe("计划未获批准：拆计划");
+    expect(runEndAnnouncement({ stopReason: "plan_gate_expired" })).toBe("计划门未应答");
+    expect(runEndAnnouncement({ stopReason: "aborted" })).not.toContain("运行已完成");
+    expect(runEndAnnouncement({ stopReason: "aborted" })).not.toContain("否决");
+  });
+
+  it("提交失败优先人话，不报 HTTP 和领域包", () => {
+    expect(humanizeSubmitError({ error: "提交失败（HTTP 409）：不需要任何领域包" }, 409))
+      .not.toMatch(/HTTP|领域包/);
+    expect(humanizeSubmitError({}, 409)).toBe("这次发不出去，请换种说法再试。");
+    expect(humanizeSubmitError({}, 429)).toBe("前面还有人在交，请等几秒。");
+    expect(humanizeSubmitError("工作目录不属于项目", 400)).toBe("工作目录不属于项目");
+  });
+
+  it("提问卡 / 计划卡不署剧名，只叫助手 / 计划", () => {
+    expect(ROLE_PERSONA.planner).toBe("计划");
+    expect(ROLE_PERSONA.main).toBe("助手");
+    expect(ROLE_PERSONA.rework).toBe("助手");
+    expect(Object.values(ROLE_PERSONA).join("")).not.toMatch(/计明远|施敢当|严不苟/);
   });
 });

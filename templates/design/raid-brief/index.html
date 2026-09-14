@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>战役任务书</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="masthead">
+    <p class="kicker">战役任务书 · raid-brief</p>
+    <h1 id="title">一场战役的任务书</h1>
+    <p class="lede">复制本模板，改目标与分片；保持目录锚点与决策日志表头。本文是任务书，不是运行时拆役。</p>
+    <dl class="meta">
+      <div><dt>战役</dt><dd>待指定</dd></div>
+      <div><dt>导演</dt><dd>待指定</dd></div>
+      <div><dt>日期</dt><dd>YYYY-MM-DD</dd></div>
+    </dl>
+  </header>
+
+  <nav class="toc" aria-labelledby="toc-heading">
+    <h2 id="toc-heading">目录</h2>
+    <ol>
+      <li><a href="#goal">目标</a></li>
+      <li><a href="#slices">分片</a></li>
+      <li><a href="#artifacts">产物</a></li>
+      <li><a href="#acceptance">验收</a></li>
+      <li><a href="#constraints">约束</a></li>
+      <li><a href="#decisions">决策日志</a></li>
+    </ol>
+  </nav>
+
+  <main>
+    <section id="goal">
+      <h2>目标</h2>
+      <p>本场结束时委托方能收下什么。一句可判定成败的话，不要并列三个方向。</p>
+      <h3>非目标</h3>
+      <ul>
+        <li>明确不做、避免范围膨胀的项</li>
+      </ul>
+    </section>
+
+    <section id="slices">
+      <h2>分片</h2>
+      <ol>
+        <li><strong>A</strong> — 一份独立交付（写集不相交）。</li>
+        <li><strong>B</strong> — 另一份独立交付。</li>
+        <li><strong>收口</strong> — 只消费分片产物，不重新推导源数据。</li>
+      </ol>
+    </section>
+
+    <section id="artifacts">
+      <h2>产物</h2>
+      <ul>
+        <li>每片对应的入口路径（例如 <code>pm-spec/index.html</code>）。</li>
+        <li>收口页路径。没有收口页就写「无」。</li>
+      </ul>
+    </section>
+
+    <section id="acceptance">
+      <h2>验收</h2>
+      <ul>
+        <li>AC1 — 对应分片 A 的可观察结果。</li>
+        <li>AC2 — 对应分片 B 的可观察结果。</li>
+      </ul>
+    </section>
+
+    <section id="constraints">
+      <h2>约束</h2>
+      <ul>
+        <li>父上下文只收摘要与产物路径，不回灌子正史。</li>
+        <li>单领域能一次做完的不拆。规格+幻灯走命名路径，不写进本任务书冒充拆役。</li>
+      </ul>
+    </section>
+
+    <section id="decisions">
+      <h2>决策日志</h2>
+      <p>只记已拍板的决定。未决项放到进行中状态，不要写进本表冒充已决。</p>
+      <table>
+        <thead>
+          <tr>
+            <th>日期</th>
+            <th>决定</th>
+            <th>理由</th>
+            <th>拍板人</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>YYYY-MM-DD</td>
+            <td>示例：本场只交两份独立制品</td>
+            <td>写集不相交，收口另页</td>
+            <td>委托方</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+  </main>
+</body>
+</html>

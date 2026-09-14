@@ -22,6 +22,9 @@ function fakeStorage(seed = {}) {
 describe("onboarding 纯函数", () => {
   it("四步且每步有可定位目标", () => {
     expect(ONBOARDING_STEPS).toHaveLength(4);
+    expect(ONBOARDING_STEPS[0].title).toContain("打一句话");
+    expect(ONBOARDING_STEPS.map((s) => `${s.title}\n${s.body}`).join("\n"))
+      .not.toMatch(/领域包|计划编排|独立核查|写入圈/);
     for (const step of ONBOARDING_STEPS) {
       expect(step.target).toMatch(/^#/);
       expect(step.title).toBeTruthy();
@@ -54,7 +57,7 @@ describe("initOnboarding", () => {
     const api = initOnboarding({ storage, ownerDocument: document, onAnnounce });
     expect(api.start()).toBe(true);
     expect(api.isOpen()).toBe(true);
-    expect(document.getElementById("onboarding-title").textContent).toContain("工作目录");
+    expect(document.getElementById("onboarding-title").textContent).toContain("打一句话");
     document.getElementById("onboarding-skip").click();
     expect(api.isOpen()).toBe(false);
     expect(isOnboardingDone(storage)).toBe(true);

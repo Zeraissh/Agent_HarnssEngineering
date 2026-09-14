@@ -10,6 +10,13 @@ export type ToolPermission = "auto" | "ask" | "deny";
 export const PERMISSION_MODES = ["manual", "plan", "auto"] as const;
 
 /**
+ * Web 新建对话 / 新建 run 的出厂默认：先问，不自动放行写盘。
+ * CLI `--yes` 仍走 auto 档（autoYes=true），不读这两个常量。
+ */
+export const WEB_DEFAULT_PERMISSION_MODE: PermissionMode = "manual";
+export const WEB_DEFAULT_AUTO_APPROVE = false;
+
+/**
  * 三档各捆哪些开关的对照表（动手前先写清 —— docs/09 §4.3 / backlog D3）。
  *
  * | 档 | approvalDefault | plan 编排 | 计划确认门 | CLI --yes |
@@ -88,6 +95,33 @@ export function describePermissionStance(
   if (mode === "plan") return `计划 · 先出计划再动手；${danger}`;
   if (mode === "auto") return `自动 · ${danger}`;
   return `自定义 · ${danger}`;
+}
+
+/** 装配条 / CLI 横幅同一行：档位人话 + 展开后的真实开关。 */
+export function formatPermissionBanner(
+  mode: PermissionMode | null,
+  switches: Omit<PermissionModeSwitches, "mode">,
+): string {
+  return (
+    `permissionMode: ${describePermissionStance(mode, switches)}` +
+    ` (approval=${switches.approvalDefault} plan=${switches.planMode} gate=${switches.planGate} yes=${switches.autoYes})`
+  );
+}
+
+/**
+ * CLI 实际生效的开关。不抄 AGENT_PERMISSION_MODE 标签：
+ * `--yes` 才自动放行；`--plan` 会拆完就执行，没有计划确认门。
+ */
+export function cliRuntimePermissionSwitches(opts: {
+  autoYes: boolean;
+  planMode?: boolean;
+}): Omit<PermissionModeSwitches, "mode"> {
+  return {
+    approvalDefault: opts.autoYes ? "auto" : "ask",
+    planMode: Boolean(opts.planMode),
+    planGate: false,
+    autoYes: opts.autoYes,
+  };
 }
 
 export function matchPermissionMode(

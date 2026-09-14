@@ -8,10 +8,12 @@
  *               与 --yes 互斥（无人值守没人可问，给了会提示并忽略）。
  *               verifier/planner 永远拿不到这个工具（harness 层强制）。
  *               每次提交 1~4 个问题，每题带 2~4 个候选，回车跳过单题
- *   --plan      三角编排：planner 拆解子任务（自选领域包+依赖图）→ 执行→核查→交接；
- *               互不依赖的子任务默认并发执行（并行度 auto = min(3, 计划层宽)）
- *   --resume-run ID  同 run 续跑。不带 --plan：从已提交的 main 检查点续跑；
+ *   --plan      三角编排：planner 拆解子任务（自选领域包+依赖图）→ 立刻执行→核查→交接；
+ *               CLI 没有计划确认门，不会停下来给人改。互不依赖的子任务默认并发
+ *               （并行度 auto = min(3, 计划层宽)）
+ *   --resume-run ID  同 run 热续。不带 --plan：从已提交的 main 检查点续跑；
  *                    带 --plan：半截 DAG 续发射（至少一枚 passed，不重跑 planner）。
+ *                    读不到热续检查点就停并印原任务/终态，不当新任务重开。
  *                    谱系预算已用尽则拒；不能与 --verify 同时用。
  *   --parallel=N  显式并行度覆盖 auto；=1 退回全串行
  *   --auto      调度单元路由领域包（单领域任务免手选；显式 AGENT_PACK 优先）
@@ -24,10 +26,12 @@
  *   OPENAI_API_KEY      provider=openai 时的 key（必须显式配置，不跨 provider 复用）
  *   AGENT_MODEL         可选，模型名，默认 claude-opus-4-8；
  *                       非 claude-* 模型自动进入 compat 模式（去掉 Claude 专属参数）
- *   AGENT_VISION_MODEL  可选，视觉模型（+ _PROVIDER / _BASE_URL / _API_KEY）：
- *                       配了才注册 describe_image 工具，让纯文本执行者（DeepSeek/
- *                       Kimi 等）间接获得看图能力。若执行者自己必须看图才能推理
- *                       （如照着截图改 CSS），正解是换执行者模型而不是加这个工具
+ *   AGENT_VISION_MODEL  可选，独立识图模型（+ _PROVIDER / _BASE_URL / _API_KEY）：
+ *                       仅当执行者自己不能看图时才引用。执行者能看则
+ *                       describe_image 走执行模型，不构造这个角色。
+ *                       两边都没有 → 不把工具摆上工具面。
+ *                       若执行者必须看图才能推理（如照着截图改 CSS），
+ *                       正解是换执行者模型，而不是只加这个工具
  *   AGENT_IMAGE_MODEL   可选，生图模型（+ _PROVIDER / _BASE_URL / _API_KEY）：
  *                       配了才注册 generate_image。走 OpenAI 兼容 Images API，
  *                       不是 chat completions；没配就不把工具摆上工具面
@@ -86,6 +90,10 @@
  *   AGENT_EXECUTION_OCI_NAMESPACE required+OCI 必填的稳定部署分区，用于 durable lease/reaper
  *   AGENT_HOOKS_CONFIG  可选，指向 hooks JSON。不设 = 机制不存在。设了但文件缺失/非法则 exit 1。
  *                       只认 PreToolUse / PostToolUse / Stop 的 command handler；退出码 2 阻断、1 不阻断。
+ *   AGENT_FEISHU_WEBHOOK 可选，飞书自定义机器人 webhook。project_status 写入/清除时
+ *                       出站推一门卡片。只出站，无入站审批。勿把地址打进日志。
+ *                       与 AGENT_NOTIFY_WEBHOOK 二选一，飞书优先。
+ *   AGENT_NOTIFY_WEBHOOK 可选，通用 JSON webhook（同一卡片正文）。
  *   AGENT_MD_MAX_CHARS  可选，AGENT.md 加载总量上限（默认 16000，≥1000）。非法值 exit 1。
  *                       开关是文件本身：~/.agent/AGENT.md、项目 AGENT.md、.agent/rules/*.md
  *                       都不在 = 机制不存在。这是指导不是执行，不能授予权限。
@@ -97,10 +105,14 @@ import readline from "node:readline/promises";
 import { createExecutionBroker, parseExecutionPolicy } from "./execution-broker.js";
 import {
   buildStaticDoctorReport,
+  CLI_NEEDS_CONFIRM_EXIT,
   CLI_VERSION,
   CliArgumentError,
+  cliCanPrompt,
   cliHelpText,
+  formatCliNeedsConfirmMessage,
   formatStaticDoctor,
+  isReadlineClosedError,
   parseCliArgs,
 } from "./cli-args.js";
 import { AgentLoop, createRunBudget, DEFAULT_MAX_TOKENS, DEFAULT_MAX_TURNS } from "./loop.js";
@@ -117,6 +129,7 @@ import {
   configureCapabilityStore,
   learnContextWindow,
   probeVisionSupport,
+  shouldRunModelProbe,
   type EndpointIdentity,
 } from "./model-capability.js";
 import { connectMcpServers, filterMcpConfigForPack, loadMcpConfig, mcpConfigHasRunnableServers } from "./mcp.js";
@@ -130,6 +143,12 @@ import {
   readProjectStatus,
   scopedMemoryIndex,
 } from "./project-status.js";
+import {
+  createOfficeNotifier,
+  gateNotifyPayloadFromBoard,
+  notifyArmedHint,
+  resolveOfficeNotifyFromEnv,
+} from "./notify.js";
 import { AUTO_CONCURRENCY_CAP, plannedStopReason, planParallelWidth, runPlanned, runVerified } from "./orchestrate.js";
 import type { VerifiedRunResult } from "./orchestrate.js";
 import {
@@ -144,7 +163,7 @@ import {
 import { readArchivedState, readArchivedTranscript } from "../ui/history.js";
 import { seedDurableBudget, snapshotDurableBudget } from "./run-state.js";
 import { resolveVerifierReadOnlyCommands, type VerifyOutcome } from "./verifier.js";
-import { allPacks, getPack, DEFAULT_HOST_DISCIPLINES, selectPackTools, type DomainPack } from "./presets.js";
+import { allPacks, getPack, DEFAULT_HOST_DISCIPLINES, selectPackTools, ALWAYS_ON_BUILTIN_TOOLS, type DomainPack } from "./presets.js";
 import { loadInstalledFilePacksSync, packsRootFromEnv } from "./pack-files.js";
 import {
   DESIGN_CATALOG,
@@ -162,6 +181,8 @@ import {
 } from "./design-mode.js";
 import { copyDesignTemplate, designTemplatesRootFromRepo } from "../ui/design-templates.js";
 import { draftDomainPackTool } from "./tools/draft-domain-pack.js";
+import { installMcpTool } from "./tools/install-mcp.js";
+import { resolveSkillsDir, withEnabledSkills } from "./skills.js";
 import { resolveRecoveryPolicy } from "./recovery.js";
 import { routeToPack } from "./router.js";
 import { createFallbackClientIfConfigured, createRoleFallbackClient, executorBackupEndpoints, FallbackModelClient, sharedBreakerRegistry } from "./model-fallback.js";
@@ -176,7 +197,11 @@ import {
   withTaskCompletion,
 } from "./task-completion.js";
 import { bashTool, SHELL_DESC } from "./tools/bash.js";
-import { createDescribeImageTool } from "./tools/describe-image.js";
+import {
+  assembleDescribeImageTool,
+  resolveDescribeImageBacking,
+  resolveExecutorVisionSupport,
+} from "./design-image-review.js";
 import { createGenerateImageTool } from "./tools/generate-image.js";
 import { createOpenAIImageClient, DEFAULT_OPENAI_IMAGE_BASE } from "./image-client.js";
 import { assertSafeProviderEndpoint } from "./provider-config.js";
@@ -213,6 +238,7 @@ import {
   cliDurableEnabled,
   createCliDurable,
   ensureCliHistoryRoot,
+  formatCliResumeStop,
   lastExecutorTranscriptMessages,
   prepareCliPlanResume,
   prepareCliSingleResume,
@@ -226,7 +252,7 @@ import {
   hostPlanResumeEvent,
   hostPlanSubtaskViews,
 } from "./archive-event.js";
-import { describePermissionStance, matchPermissionMode, permissionModeSwitches, resolvePermissionMode } from "./permission-mode.js";
+import { cliRuntimePermissionSwitches, formatPermissionBanner, matchPermissionMode, resolvePermissionMode } from "./permission-mode.js";
 import {
   createHookRuntime,
   resolveHooksFromEnv,
@@ -331,11 +357,13 @@ async function promptDesignChoiceOnce(
   model: ModelClient,
   autoYes: boolean,
 ): Promise<DesignRoute> {
-  if (autoYes) {
+  if (autoYes || !cliCanPrompt()) {
     return {
       kind: "r3",
       id: null,
-      reason: "无人值守无法展示页签，已用 design 包从空白 index.html 起步",
+      reason: autoYes
+        ? "无人值守无法展示页签，已用 design 包从空白 index.html 起步"
+        : "没有交互终端，已用 design 包从空白 index.html 起步",
       seed: "blank",
       pack: "design",
     };
@@ -698,7 +726,16 @@ async function main(): Promise<void> {
   // MCP 工具（可选）：./mcp.json 存在即连接，AGENT_MCP_CONFIG 覆盖路径；
   // 领域包可整体关闭（mcp: false）；白名单/审批策略在最终工具面
   // 由 selectPackTools 统一解析，不再先改 server 配置。这样 CLI/Web/计划子任务同口径。
-  const mcpConfigRaw = await loadMcpConfig(process.env.AGENT_MCP_CONFIG ?? path.join(process.cwd(), "mcp.json"));
+  const mcpConfigPath = process.env.AGENT_MCP_CONFIG ?? path.join(process.cwd(), "mcp.json");
+  const catalogSkillRoot = resolveSkillsDir({ workdir: process.cwd(), realHost: true });
+  const catalogInstallTool = installMcpTool({
+    configPath: mcpConfigPath,
+    workdir: process.cwd(),
+    writesArmed: true,
+    mcpEnabled: true,
+    ...(catalogSkillRoot ? { skillRoot: catalogSkillRoot } : {}),
+  });
+  const mcpConfigRaw = await loadMcpConfig(mcpConfigPath);
   // 按包过滤要拉起的 server：ts-coding 只要 GitHub，不得顺带启动 stm32。
   // GitHub 是工作区连接器——python-coding 这类 mcp:false 仍可单独拉起 github。
   const mcpConfig = mcpConfigRaw
@@ -724,11 +761,25 @@ async function main(): Promise<void> {
   }
 
   /**
-   * 视觉模型（第四个角色模型）。配了才注册 describe_image——没配就不该在
-   * 工具面上摆一个一调用就报错的工具，那是在骗模型说自己能看图。
-   * 用途：DeepSeek / Kimi 这类纯文本执行者靠它间接获得视觉能力。
+   * 识图：执行者自己能看图 → describe_image 走执行模型，不另引识图角色。
+   * 执行者看不见（DeepSeek / 普通 Kimi）→ 才引用 AGENT_VISION_MODEL。
+   * 两边都没有 → 不摆一个一调用就报错的工具。
    */
-  const visionModelName = process.env.AGENT_VISION_MODEL;
+  let executorVisionProbed: boolean | null = null;
+  if (shouldRunModelProbe(process.env)) {
+    const executorVision = await probeVisionSupport({
+      identity: executorIdentity,
+      ...(process.env.ANTHROPIC_API_KEY || process.env.OPENAI_API_KEY
+        ? { apiKey: process.env.ANTHROPIC_API_KEY || process.env.OPENAI_API_KEY }
+        : {}),
+    });
+    if (executorVision.source === "probe") executorVisionProbed = executorVision.supportsVision;
+  }
+  const executorCanSee = resolveExecutorVisionSupport({
+    modelName: model,
+    probed: executorVisionProbed,
+  });
+  const visionModelName = executorCanSee ? undefined : process.env.AGENT_VISION_MODEL;
   const visionProvider = visionModelName
     ? await createModelClientWithProbe(visionModelName, {
         ...(process.env.AGENT_VISION_PROVIDER
@@ -878,9 +929,23 @@ async function main(): Promise<void> {
     console.log(c.dim(`fallback chain [vision]: ${visionClient.chain().join(" → ")}`));
   }
 
-  const visionTool = visionClient
-    ? createDescribeImageTool({ client: visionClient, modelName: visionModelName! })
-    : undefined;
+  const describeBacking = resolveDescribeImageBacking({
+    executorSupportsVision: executorCanSee,
+    visionRoleConfigured: Boolean(visionProvider && visionModelName),
+    visionRoleSupportsVision: visionSupportsVision,
+  });
+  const visionTool = assembleDescribeImageTool({
+    backing: describeBacking,
+    executor: { client: modelClient, modelName: model },
+    ...(visionClient && visionModelName
+      ? { vision: { client: visionClient, modelName: visionModelName } }
+      : {}),
+  });
+  if (describeBacking === "executor") {
+    console.log(c.dim(`describe_image: executor (${model})`));
+  } else if (describeBacking === "vision-role") {
+    console.log(c.dim(`describe_image: vision-role (${visionModelName})`));
+  }
   /**
    * 生图（第五个角色）。Images API 不是 chat——不包 ModelClient、不进降级链。
    * 配了才注册 generate_image，没配就不摆一个一调用就报错的工具。
@@ -920,6 +985,7 @@ async function main(): Promise<void> {
       grepTool,
       updateProgressTool,
       draftDomainPackTool(),
+      catalogInstallTool,
       ...(webSearchTool ? [webSearchTool] : []),
       ...(visionTool ? [visionTool] : []),
       ...(imageTool ? [imageTool] : []),
@@ -930,11 +996,11 @@ async function main(): Promise<void> {
    * 条件性内置工具：包可以声明，但只在宿主配好依赖时在场（缺席=干净省略+提示，
    * 不炸）。严格校验保留给真正的拼写错误——两类错误的处置必须不同：
    * 前者是合法配置组合，后者是包写错了。案例 #11 首发实测：kicad 包声明
-   * describe_image 而未配 AGENT_VISION_MODEL，启动即炸——省略才是正确语义
+   * describe_image 而执行者不能看图、也未配 AGENT_VISION_MODEL，启动即炸——省略才是正确语义
    * （plan 模式的 selectPackTools 本就静默过滤，两条装配路径的语义要一致）。
    */
   const CONDITIONAL_BUILTINS = new Set(["describe_image", "web_search", "generate_image"]);
-  const ALWAYS_ON = new Set(["update_progress"]);
+  const ALWAYS_ON = ALWAYS_ON_BUILTIN_TOOLS;
   const namesForPool = [...new Set([...builtinNames, ...ALWAYS_ON])];
   const builtins = namesForPool.flatMap((n) => {
     const t = builtinByName.get(n);
@@ -1033,9 +1099,19 @@ async function main(): Promise<void> {
     .filter(Boolean);
 
   const memShared = isSharedMemoryDir(process.cwd(), memory.dir);
+  const officeNotifier = createOfficeNotifier(resolveOfficeNotifyFromEnv(process.env) ?? { enabled: false });
+  const notifyHint = notifyArmedHint(officeNotifier.armed);
+  if (notifyHint) console.log(c.dim(notifyHint));
   const memTools = [
     ...createMemoryTools(memory),
-    createProjectStatusTool(() => memory, { sharedFor: () => memShared }),
+    createProjectStatusTool(() => memory, {
+      sharedFor: () => memShared,
+      onBoardChange: (status, project) => {
+        void officeNotifier.notify(gateNotifyPayloadFromBoard(status, project)).catch(() => {
+          /* 出站失败不打断 CLI 工具 */
+        });
+      },
+    }),
   ];
 
   /**
@@ -1046,8 +1122,12 @@ async function main(): Promise<void> {
    * `--yes`（无人值守）下即使显式开也不装：那条路径根本没有 readline，
    * 装了等于每个问题都立刻走"未应答"，白烧一轮往返。
    */
-  const askEnabled = parsedArgs.ask;
-  const rl = autoYes ? null : readline.createInterface({ input: process.stdin, output: process.stdout });
+  const canPrompt = cliCanPrompt();
+  const askEnabled = parsedArgs.ask && canPrompt;
+  if (parsedArgs.ask && !canPrompt) {
+    console.log(c.yellow("没有交互终端，--ask 未装。需要确认时请加 --yes 或在 TTY 里跑。"));
+  }
+  const rl = autoYes || !canPrompt ? null : readline.createInterface({ input: process.stdin, output: process.stdout });
   // 计划并发下多个执行者可能同时触发同一个 ask_user。readline 不能并排挂多个
   // question；这里把“向人提问”串行化，执行工具本身仍可并发。
   let terminalQuestionTail: Promise<unknown> = Promise.resolve();
@@ -1105,7 +1185,7 @@ async function main(): Promise<void> {
    * AGENT-02：默认关。AGENT_SPAWN_TASK=1 才装。子支线扣同一份谱系预算、深度 1。
    * Windows 隔离仍是 report（见 SAFE-05）——不假装 AGENT-03 完成。
    */
-  const spawnEnabled = process.env.AGENT_SPAWN_TASK === "1";
+  const spawnEnabled = process.env.AGENT_SPAWN_TASK === "1" || process.env.AGENT_CAMPAIGN === "1";
   const lineageBudget = createRunBudget({
     ...(maxTotalTurns !== undefined ? { maxTurns: maxTotalTurns } : {}),
     ...(maxTokensBudget !== undefined ? { maxTokens: maxTokensBudget } : {}),
@@ -1173,8 +1253,6 @@ async function main(): Promise<void> {
     | {
         state: import("./run-state.js").DurableRunState;
         history: import("./types.js").AgentRunResult["messages"];
-        reopen?: boolean;
-        note?: string;
       }
     | undefined;
   const historyRoot =
@@ -1186,40 +1264,36 @@ async function main(): Promise<void> {
     }
     const archiveDir = path.join(historyRoot!, resumeRun);
     const loaded = await readArchivedState(archiveDir);
+    const archiveTask = readCliArchiveTask(archiveDir);
+    const stopResume = (reason: string): never => {
+      console.error(
+        c.red(
+          formatCliResumeStop({
+            runId: resumeRun,
+            reason,
+            task: archiveTask || String(task ?? "").trim(),
+            phase: loaded?.phase,
+          }),
+        ),
+      );
+      process.exit(1);
+    };
     if (withPlan) {
-      const archiveTask = readCliArchiveTask(archiveDir);
       const decided = prepareCliPlanResume(loaded, {
         hasTask: Boolean(String(task ?? "").trim() || archiveTask),
       });
-      if (!decided.ok) {
-        console.error(c.red(`不能续跑 ${resumeRun}：${decided.reason}`));
-        process.exit(1);
-      }
-      if (decided.kind === "reopen") {
-        cliSingleResume = { state: decided.state, history: [], reopen: true, note: decided.note };
-      } else {
-        cliPlanResume = decided;
-      }
+      if (!decided.ok) stopResume(decided.reason);
+      else cliPlanResume = decided;
     } else {
       const history = lastExecutorTranscriptMessages(await readArchivedTranscript(archiveDir));
-      const archiveTask = readCliArchiveTask(archiveDir);
       const decided = prepareCliSingleResume(loaded, {
         hasHistory: Boolean(history?.length),
         verify: parsedArgs.verify,
         hasTask: Boolean(String(task ?? "").trim() || archiveTask),
       });
-      if (!decided.ok) {
-        console.error(c.red(`不能续跑 ${resumeRun}：${decided.reason}`));
-        process.exit(1);
-      }
-      if (decided.kind === "reopen") {
-        cliSingleResume = { state: decided.state, history: [], reopen: true, note: decided.note };
-      } else if (!history?.length) {
-        console.error(c.red(`不能续跑 ${resumeRun}：同 run 恢复缺少正史`));
-        process.exit(1);
-      } else {
-        cliSingleResume = { state: decided.state, history };
-      }
+      if (!decided.ok) stopResume(decided.reason);
+      else if (!history?.length) stopResume("同 run 恢复缺少正史");
+      else cliSingleResume = { state: decided.state, history };
     }
     const resumeState = cliPlanResume?.state ?? cliSingleResume?.state;
     if (!resumeState) {
@@ -1249,20 +1323,16 @@ async function main(): Promise<void> {
   activeCliDurable = cliDurable;
   activeCliLineageBudget = lineageBudget;
 
-  let permissionModeLabel: import("./permission-mode.js").PermissionMode = "manual";
   try {
-    permissionModeLabel = resolvePermissionMode(process.env.AGENT_PERMISSION_MODE);
-    const switches = permissionModeSwitches(permissionModeLabel);
-    console.log(
-      c.dim(
-        `permissionMode: ${describePermissionStance(permissionModeLabel, switches)}` +
-          ` (approval=${switches.approvalDefault} plan=${switches.planMode} gate=${switches.planGate} yes=${switches.autoYes})`,
-      ),
-    );
+    resolvePermissionMode(process.env.AGENT_PERMISSION_MODE);
   } catch (err) {
     console.error(c.red(err instanceof Error ? err.message : String(err)));
     process.exit(1);
   }
+  const permissionSwitches = cliRuntimePermissionSwitches({ autoYes, planMode: withPlan });
+  console.log(
+    c.dim(formatPermissionBanner(matchPermissionMode(permissionSwitches), permissionSwitches)),
+  );
 
   let hookSpec: NormalizedHookSpec | null = null;
   try {
@@ -1299,7 +1369,7 @@ async function main(): Promise<void> {
   if (workspaceGit.present) console.log(c.dim(`git: ${formatWorkspaceGitLine(workspaceGit)}`));
 
   const baseConfig: AgentConfig = {
-    systemPrompt: pack?.systemPrompt ?? SYSTEM_PROMPT,
+    systemPrompt: withEnabledSkills(pack?.systemPrompt ?? SYSTEM_PROMPT, catalogSkillRoot),
     tools: [
       ...selectPackTools(pack, builtins, mcp?.tools ?? []),
       ...memTools,
@@ -1462,6 +1532,39 @@ async function main(): Promise<void> {
     });
     event.respond(decision, reason);
   };
+  const settleCliApproval = async (
+    event: Extract<TurnEvent, { type: "approval_request" }>,
+    tag?: string,
+  ): Promise<void> => {
+    const head = tag ? `${tag} ` : "";
+    if (autoYes) {
+      console.log(c.yellow(`${head}⚠ auto-approved: ${formatApprovalPrompt(event)}`));
+      respondCliApproval(event, "allow", "auto");
+      return;
+    }
+    if (!rl) {
+      console.error(c.red(formatCliNeedsConfirmMessage()));
+      process.exit(CLI_NEEDS_CONFIRM_EXIT);
+    }
+    try {
+      const answer = await rl.question(
+        c.yellow(`${head}⚠ ${formatApprovalPrompt(event)}? [y/N] `),
+      );
+      if (answer.trim().toLowerCase() === "y") {
+        respondCliApproval(event, "allow", "user");
+        return;
+      }
+      const reasonPrompt = tag ? "  reason (optional): " : "  reason for the model (optional): ";
+      const reason = (await rl.question(c.dim(reasonPrompt))).trim();
+      respondCliApproval(event, "deny", "user", reason || undefined);
+    } catch (err) {
+      if (isReadlineClosedError(err)) {
+        console.error(c.red(formatCliNeedsConfirmMessage()));
+        process.exit(CLI_NEEDS_CONFIRM_EXIT);
+      }
+      throw err;
+    }
+  };
   let ledgerHitBudget = false;
   /** 三条路径各自把收尾事实归一到这里，最后统一写一行 */
   let ledgerFacts: {
@@ -1489,7 +1592,7 @@ async function main(): Promise<void> {
     }
   };
 
-  if (withPlan && !cliSingleResume?.reopen) {
+  if (withPlan) {
     // 三角编排：planner 拆解 → 逐子任务(执行→核查→返工) → 交接下游
     const builtinPool = [
       bashTool,
@@ -1502,6 +1605,7 @@ async function main(): Promise<void> {
       grepTool,
       updateProgressTool,
       draftDomainPackTool(),
+      catalogInstallTool,
       ...(webSearchTool ? [webSearchTool] : []),
       ...(visionTool ? [visionTool] : []),
       ...(imageTool ? [imageTool] : []),
@@ -1535,16 +1639,7 @@ async function main(): Promise<void> {
         }
         case "approval_request": {
           if (isVerifier) break; // verifier 审批由其内部自答，仅供观察，不提示
-          if (autoYes || !rl) {
-            console.log(c.yellow(`${tag} ⚠ auto-approved: ${formatApprovalPrompt(event)}`));
-            respondCliApproval(event, "allow", "auto");
-            break;
-          }
-          const answer = await rl.question(
-            c.yellow(`${tag} ⚠ ${formatApprovalPrompt(event)}? [y/N] `),
-          );
-          if (answer.trim().toLowerCase() === "y") respondCliApproval(event, "allow", "user");
-          else respondCliApproval(event, "deny", "user", (await rl.question(c.dim("  reason (optional): "))).trim() || undefined);
+          await settleCliApproval(event, tag);
           break;
         }
         case "compaction":
@@ -1732,7 +1827,9 @@ async function main(): Promise<void> {
         return {
           cfg: {
             ...config,
-            systemPrompt: p?.systemPrompt ?? SYSTEM_PROMPT,
+            systemPrompt: p?.systemPrompt
+              ? withEnabledSkills(p.systemPrompt, catalogSkillRoot)
+              : config.systemPrompt,
             tools: [
               ...selectPackTools(p, builtinPool, mcpPool),
               ...memTools,
@@ -1862,41 +1959,6 @@ async function main(): Promise<void> {
     }
     if (outcome.completed) cliDurable?.markCompleted();
     else cliDurable?.markFailed();
-  } else if (cliSingleResume?.reopen) {
-    const loop = new AgentLoop(config, modelClient);
-    const reopenTask = String(task ?? "").trim() || readCliArchiveTask(path.join(historyRoot!, resumeRun!));
-    cliDurable?.apply({ type: "reopen" });
-    console.log(c.yellow(`\n⚠ ${cliSingleResume.note ?? "没有检查点。从任务正文重开一轮。"}`));
-    try {
-      for await (const event of loop.run(reopenTask)) {
-        noteForLedger("main", event);
-        if (event.type === "done") {
-          persistCliExecutorCheckpoint(cliDurable, event);
-          ledgerFacts = {
-            stopReason: event.result.stopReason,
-            error:
-              event.result.stopReason === "error" && event.result.error
-                ? ledgerErrorClass(event.result.error)
-                : event.result.stopReason === "error"
-                  ? ledgerErrorClass("error")
-                  : null,
-            turns: event.result.usage.turns,
-            reworks: null,
-            finalPassed: null,
-            verifications: [],
-          };
-          if (event.result.stopReason === "error" || event.result.stopReason === "aborted") {
-            cliDurable?.markInterrupted();
-          } else {
-            cliDurable?.markCompleted();
-          }
-        }
-        await renderEvent(event);
-      }
-    } catch (err) {
-      cliDurable?.markFailed();
-      throw err;
-    }
   } else if (cliSingleResume) {
     const loop = new AgentLoop(config, modelClient);
     const feedback = task || "接着上次的检查点继续";
@@ -2041,12 +2103,7 @@ async function main(): Promise<void> {
         : null,
       // 档位跟实际开关走，不跟 AGENT_PERMISSION_MODE 标签：CLI --plan 没有计划确认门，
       // 对不上 plan 预设就记 null（自定义），不许把标签抄进台账。
-      permissionMode: matchPermissionMode({
-        approvalDefault: autoYes ? "auto" : "ask",
-        planMode: withPlan,
-        planGate: false,
-        autoYes,
-      }),
+      permissionMode: matchPermissionMode(permissionSwitches),
       approvals: ledgerApprovals,
       // 窗口 / 预算各带来源：事后才能回答"这次运行的压缩阈值到底是谁定的、离窗口多远"
       context: {
@@ -2121,20 +2178,7 @@ async function main(): Promise<void> {
       }
       case "approval_request": {
         endStreamLine();
-        if (autoYes || !rl) {
-          console.log(c.yellow(`⚠ auto-approved: ${formatApprovalPrompt(event)}`));
-          respondCliApproval(event, "allow", "auto");
-          break;
-        }
-        const answer = await rl.question(
-          c.yellow(`⚠ ${formatApprovalPrompt(event)}? [y/N] `),
-        );
-        if (answer.trim().toLowerCase() === "y") {
-          respondCliApproval(event, "allow", "user");
-        } else {
-          const reason = await rl.question(c.dim("  reason for the model (optional): "));
-          respondCliApproval(event, "deny", "user", reason.trim() || undefined);
-        }
+        await settleCliApproval(event);
         break;
       }
       case "usage": {

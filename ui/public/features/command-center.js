@@ -235,8 +235,35 @@ export function deriveBoardModel(input) {
   return {
     stats: { running: running.length, deciding: decision.length, doneToday },
     columns: { decision, running, finished: trimmedFinished },
+    autoApprovedWrites: summarizeAutoApprovedWrites(runs, getState),
     empty: decision.length === 0 && running.length === 0 && trimmedFinished.length === 0,
   };
+}
+
+/**
+ * 自动放行时待决定栏是空的。留下「已自动放行：写了 x」的痕迹。
+ * @param {{ runId:string }[]} runs
+ * @param {(runId:string) => any} getState
+ * @returns {string[]}
+ */
+export function summarizeAutoApprovedWrites(runs, getState) {
+  const names = [];
+  const seen = new Set();
+  for (const run of runs ?? []) {
+    const st = typeof getState === "function" ? getState(run.runId) : null;
+    for (const a of st?.pendingApprovals ?? []) {
+      if (a.actor !== "auto-rule" || a.status !== "allowed") continue;
+      const path = a.input && typeof a.input === "object"
+        ? String(a.input.path ?? a.input.file_path ?? "").trim()
+        : "";
+      if (!path) continue;
+      const base = path.split(/[\\/]/).filter(Boolean).pop() || path;
+      if (seen.has(base)) continue;
+      seen.add(base);
+      names.push(base);
+    }
+  }
+  return names;
 }
 
 // ---------------------------------------------------------------
@@ -579,6 +606,12 @@ export function initCommandCenterView(host = {}, env = {}) {
       for (const card of cards) ref.body.appendChild(builders[key](card));
       ref.count.textContent = String(cards.length);
       ref.count.hidden = cards.length === 0;
+      if (key === "decision" && cards.length === 0) {
+        const writes = model.autoApprovedWrites ?? [];
+        ref.empty.textContent = writes.length
+          ? `已自动放行：写了 ${writes.slice(0, 4).join("、")}`
+          : "没有等你决定的事";
+      }
       ref.empty.hidden = cards.length > 0;
     }
 

@@ -5,6 +5,7 @@ export const DECK_READY_MESSAGE_TYPE: string;
 export const DECK_GOTO_MESSAGE_TYPE: string;
 export const DECK_STATE_MESSAGE_TYPE: string;
 export const INSPECT_HOOK_SOURCE: string;
+export const DECK_VISIBILITY_CSS: string;
 export const DECK_RUNTIME_SOURCE: string;
 
 export function stripScripts(html: string): string;
@@ -22,8 +23,7 @@ export function formatReviewComment(
   comment?: string,
   slide?: string,
 ): string;
+export function isWholeDeckRevision(text: string): boolean;
+export function stripSlideLockMarkers(text: string): string;
 export function appendReviewToInput(existing: string, line: string): string;
-export function normalizeDesignEditScope(scope: unknown): { slide: string; path?: string; selector?: string } | null;
-export function formatDesignEditScope(scope: unknown): string;
-export function attachDesignEditScope(text: string, scope: unknown): string;
 export function isInspectPick(data: unknown): boolean;

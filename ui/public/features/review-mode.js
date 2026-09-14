@@ -5,7 +5,21 @@
  * 正解：整站仍走 `/site/*`（相对 CSS/JS 可用）；点评时由服务端在 HTML 响应里
  * 注入点选钩子（`?inspect=1`），不剥页面自己的脚本。点选经 postMessage 回来；
  * selector / 文案当不可信字符串，只写进输入框。
+ * 翻页也走同一条路：注入 runtime 收 goto、在 iframe 里切可见页。不读
+ * contentDocument，因此不需要放宽 same-origin。杂志风稿常省略
+ * `.slide{display:none}`，只改 is-active 会让封面一直挡着；只 hidden 掉
+ * 兄弟页又会让叠层后页失去尺寸/背景，变成黑框。runtime 同时藏非当前页
+ * 并强制当前页自己占满视口（打印媒体不套）。
  */
+
+import {
+  htmlHasTexDelimiters,
+  pageHasMathRenderer,
+  KATEX_CSS_HREF,
+  KATEX_JS_HREF,
+  KATEX_AUTO_HREF,
+  KATEX_RUNTIME_HREF,
+} from "../core/math.js";
 
 export const INSPECT_MESSAGE_TYPE = "agent-inspect-pick";
 export const DECK_READY_MESSAGE_TYPE = "agent-deck-ready";
@@ -33,10 +47,33 @@ export function buildCssSelector(node) {
   return parent ? `${parent} > ${bit}` : bit;
 }
 
+/**
+ * 用户在谈整份稿 / 全部配图时，点评不得带 [slide:…] 把意见箍在当前页。
+ * 那次「这些图与科技不相关」被箍在封底，错图整册没动。
+ * 先剥掉正文里的 [改稿范围]/[改范围]（手写或历史注入），只看用户原话。
+ */
+export function isWholeDeckRevision(text) {
+  const t = stripSlideLockMarkers(String(text ?? ""));
+  if (!t.trim()) return false;
+  return /全部(的)?(图|页|配图)|所有(的)?(图|页|配图)|整份(稿|图|幻灯|配图)|整套(图|幻灯|稿)|每一[页张]|各页|这些图|配图都不|图(片)?.{0,24}(审核|不相关|无关|都不对|都错|全错)|完全.{0,24}(不相关|无关)|每页都|all (the )?(images?|pictures?|slides?|pages?)|every (slide|page|image)|whole deck/i.test(
+    t,
+  );
+}
+
+export function stripSlideLockMarkers(text) {
+  return String(text ?? "")
+    .replace(/\[改稿范围\][^\n]*/g, "")
+    .replace(/\[改范围\][^\n]*/g, "")
+    .replace(/\[点评\]\[slide:[^\]]+\]/g, "[点评]")
+    .replace(/^\n+/, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 export function formatReviewComment(selector, comment, slide) {
   const sel = String(selector ?? "").trim() || "(未识别)";
   const note = String(comment ?? "").replace(/\s+/g, " ").trim();
-  const slideBit = String(slide ?? "").trim();
+  const slideBit = isWholeDeckRevision(note) ? "" : String(slide ?? "").trim();
   const head = slideBit ? `[点评][slide:${slideBit}]` : "[点评]";
   return note ? `${head} ${sel}: ${note}` : `${head} ${sel}`;
 }
@@ -46,43 +83,6 @@ export function appendReviewToInput(existing, line) {
   const next = String(line ?? "").trim();
   if (!next) return cur;
   return cur ? `${cur}\n${next}` : next;
-}
-
-/**
- * 画布点选的改稿范围。没有 slide 就不约束——未选中不得误伤整份稿。
- * slide id 只收短 token，避免把选择器/路径写进 data-slide 引号里。
- */
-export function normalizeDesignEditScope(scope) {
-  if (!scope || typeof scope !== "object") return null;
-  const slide = String(scope.slide ?? "").trim();
-  if (!slide || !/^[A-Za-z0-9._:-]+$/.test(slide)) return null;
-  const path = String(scope.path ?? "").replace(/\\/g, "/").trim();
-  const selector = String(scope.selector ?? "").replace(/\s+/g, " ").trim().slice(0, 160);
-  return {
-    slide,
-    ...(path && !path.includes("\n") ? { path } : {}),
-    ...(selector ? { selector } : {}),
-  };
-}
-
-export function formatDesignEditScope(scope) {
-  const n = normalizeDesignEditScope(scope);
-  if (!n) return "";
-  const fileBit = n.path ? `（文件 ${n.path}）` : "";
-  const selBit = n.selector ? ` 选择器 ${n.selector}。` : "";
-  return `[改稿范围] 只改 data-slide="${n.slide}"${fileBit}。${selBit}不要改其它页，不要整份重写。`;
-}
-
-/**
- * 续跑正文加上明确约束。输入里已有 [改稿范围] 或 [点评][slide:…] 时不覆盖。
- */
-export function attachDesignEditScope(text, scope) {
-  const body = String(text ?? "");
-  if (/\[改稿范围\]/.test(body) || /\[点评\]\[slide:/.test(body)) return body;
-  const line = formatDesignEditScope(scope);
-  if (!line) return body;
-  const trimmed = body.replace(/\s+$/g, "");
-  return trimmed ? `${line}\n${trimmed}` : line;
 }
 
 export function isInspectPick(data) {
@@ -209,7 +209,33 @@ export const INSPECT_HOOK_SOURCE = `(function(){
 /**
  * iframe 内翻页 runtime：发现 .slide[data-slide] 后向父页报到，并响应 goto。
  * 无幻灯则静默退出。与页面自带 deck.js 并存时以本 runtime 的 is-active 为准。
+ * 非当前页隐藏；当前页强制自成一屏（杂志叠层把尺寸/背景挂在第 1 页上，
+ * 只 display:none 兄弟会留下黑框）。不用 hidden 属性——UA 的
+ * [hidden]{display:none!important} 会和稿面 display:flex 互殴。
  */
+export const DECK_VISIBILITY_CSS = [
+  "@media not print{",
+  "html,body{min-height:100%;min-height:100vh}",
+  ".slide[data-slide]:not(.is-active){display:none!important}",
+  ".slide[data-slide].is-active{",
+  "display:flex!important;",
+  "visibility:visible!important;",
+  "opacity:1!important;",
+  "position:relative!important;",
+  "inset:auto!important;",
+  "top:auto!important;left:auto!important;right:auto!important;bottom:auto!important;",
+  "transform:none!important;",
+  "translate:none!important;",
+  "width:100%!important;",
+  "max-width:100%!important;",
+  "height:auto!important;",
+  "min-height:100vh!important;",
+  "pointer-events:auto!important;",
+  "box-sizing:border-box!important",
+  "}",
+  "}",
+].join("");
+
 export const DECK_RUNTIME_SOURCE = `(function(){
   if (window.__agentDeckHooked) return;
   window.__agentDeckHooked = true;
@@ -218,6 +244,13 @@ export const DECK_RUNTIME_SOURCE = `(function(){
   }
   var slides = collect();
   if (!slides.length) return;
+  if (!document.getElementById("agent-deck-visibility")) {
+    var css = document.createElement("style");
+    css.id = "agent-deck-visibility";
+    css.setAttribute("data-agent-deck", "1");
+    css.textContent = ${JSON.stringify(DECK_VISIBILITY_CSS)};
+    (document.head || document.documentElement).appendChild(css);
+  }
   var i = Math.max(0, slides.findIndex(function(s){ return s.classList.contains("is-active"); }));
   if (i < 0) i = 0;
   function idOf(idx){
@@ -232,10 +265,26 @@ export const DECK_RUNTIME_SOURCE = `(function(){
       slide: idOf(i)
     }, "*");
   }
+  function unpinTrack(el){
+    var n = el && el.parentElement;
+    var d = 0;
+    while (n && d < 3 && n !== document.body && n !== document.documentElement) {
+      n.style.setProperty("transform", "none", "important");
+      n.style.setProperty("translate", "none", "important");
+      n = n.parentElement;
+      d++;
+    }
+  }
   function show(n){
     if (!slides.length) return;
     i = ((n % slides.length) + slides.length) % slides.length;
-    slides.forEach(function(s, idx){ s.classList.toggle("is-active", idx === i); });
+    slides.forEach(function(s, idx){
+      var on = idx === i;
+      s.classList.toggle("is-active", on);
+      s.removeAttribute("hidden");
+      s.setAttribute("aria-hidden", on ? "false" : "true");
+    });
+    unpinTrack(slides[i]);
     emitState();
   }
   parent.postMessage({
@@ -296,16 +345,46 @@ export function appendPrintHook(html) {
   return appendScriptHook(html, PRINT_HOOK_SOURCE);
 }
 
+function appendHeadTag(html, tag) {
+  const raw = String(html ?? "");
+  if (/<\/head>/i.test(raw)) return raw.replace(/<\/head>/i, `${tag}</head>`);
+  if (/<html\b[^>]*>/i.test(raw)) return raw.replace(/<html\b[^>]*>/i, (m) => `${m}${tag}`);
+  return `${tag}${raw}`;
+}
+
+function appendBodySnippet(html, snippet) {
+  const raw = String(html ?? "");
+  if (/<\/body>/i.test(raw)) return raw.replace(/<\/body>/i, `${snippet}</body>`);
+  return `${raw}${snippet}`;
+}
+
 /**
- * 整站 HTML 响应钩子：按需叠加 deck / inspect / print。
+ * 稿面有 TeX 且没自带渲染器时，注入本机 KaTeX（与 deck runtime 同族：
+ * 旧产物不用改文件）。已有 katex/MathJax 的稿不重复注入。
+ */
+export function appendKatexRuntime(html) {
+  const raw = String(html ?? "");
+  if (pageHasMathRenderer(raw) || !htmlHasTexDelimiters(raw)) return raw;
+  let out = appendHeadTag(raw, `<link rel="stylesheet" href="${KATEX_CSS_HREF}">`);
+  const hooks = [
+    `<script src="${KATEX_JS_HREF}"></script>`,
+    `<script src="${KATEX_AUTO_HREF}"></script>`,
+    `<script type="module" src="${KATEX_RUNTIME_HREF}"></script>`,
+  ].join("");
+  return appendBodySnippet(out, hooks);
+}
+
+/**
+ * 整站 HTML 响应钩子：按需叠加 deck / inspect / print；TeX 缺渲染器时再叠 KaTeX。
  * @param {string} html
- * @param {{ deck?: boolean, inspect?: boolean, print?: boolean }} opts
+ * @param {{ deck?: boolean, inspect?: boolean, print?: boolean, katex?: boolean }} opts
  */
 export function appendSiteHooks(html, opts = {}) {
   let out = String(html ?? "");
   if (opts.deck) out = appendDeckRuntime(out);
   if (opts.inspect) out = appendInspectHook(out);
   if (opts.print) out = appendPrintHook(out);
+  if (opts.katex !== false) out = appendKatexRuntime(out);
   return out;
 }
 

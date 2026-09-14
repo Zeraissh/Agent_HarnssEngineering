@@ -635,8 +635,10 @@ describe("reduceEvent", () => {
 
     expect(appSrc).toContain("empty-brand");
     expect(appSrc).toContain('class="empty-brand">FATHOM');
-    expect(appSrc).toContain("see every run to the bottom.");
-    expect(appSrc).toContain("每一层都看得见。");
+    expect(appSrc).toContain("说要做什么，回车就发。");
+    expect(appSrc).toContain("稿件、纪要、问答都可以从这里开始。");
+    expect(appSrc).not.toContain("see every run to the bottom.");
+    expect(appSrc).not.toContain("每一层都看得见。");
     expect(appSrc).not.toContain("尚无运行。提交一个任务开始。");
     expect(appSrc).not.toContain("工作目录决定工具可触碰的边界");
     expect(appSrc).not.toContain("设计模板 · 开会话时选");
@@ -659,8 +661,8 @@ describe("reduceEvent", () => {
     expect(html).toContain('id="workspace-face"');
     expect(html).toContain('data-workspace-face="office"');
     expect(html).toContain('data-workspace-face="code"');
-    expect(html).toMatch(/id="workspace-face-office"[^>]*>Work</);
-    expect(html).toMatch(/id="workspace-face-code"[^>]*>Code</);
+    expect(html).toMatch(/id="workspace-face-office"[^>]*aria-checked="true"[^>]*>Work</);
+    expect(html).toMatch(/id="workspace-face-code"[^>]*aria-checked="false"[^>]*>Code</);
     expect(html).not.toMatch(/id="workspace-face-office"[^>]*>办公</);
     expect(html).not.toMatch(/id="workspace-face-code"[^>]*>编码</);
     expect(html).not.toContain("项目与对话");
@@ -1412,16 +1414,21 @@ describe("AC7 第 12 节文案", () => {
     const combined = html + "\n" + app;
 
     expect(combined).toContain("独立核查");
-    expect(combined).toContain("运行任务");
-    expect(combined).toContain("Agent 执行");
+    expect(combined).toContain("发送");
+    expect(app).toMatch(/main:\s*"助手"/);
+    expect(app).toContain("${ROLE_PERSONA.main} · 执行");
     expect(combined).toContain("核查 Agent");
-    expect(combined).toContain("允许本次");
-    expect(combined).toContain("拒绝并说明");
-    expect(combined).toContain("写入仍受工作目录边界约束");
+    expect(combined).toContain(">允许<");
+    expect(combined).toContain(">拒绝<");
+    expect(combined).toContain("只能改这些文件夹");
+    expect(combined).not.toContain("计明远");
+    expect(combined).not.toContain("施敢当");
 
-    const checkboxLabel = html.match(/<span>(核查|独立核查)<\/span>/);
-    expect(checkboxLabel).not.toBeNull();
-    expect(checkboxLabel[1]).toBe("独立核查");
+    expect(html).toMatch(/knob-row-name">独立核查/);
+    expect(html).not.toMatch(/id="auto-approve-toggle"[^>]*checked/);
+    const quickbar = html.match(/class="composer-quickbar"[\s\S]*?<\/div>\s*<!-- 模式说明/);
+    expect(quickbar?.[0] ?? "").not.toContain('id="verify-toggle"');
+    expect(html).toMatch(/id="run-knobs"[\s\S]*id="verify-toggle"/);
 
     expect(html).not.toContain('>提交</button>');
     expect(app).not.toContain("主时间线");
@@ -1955,14 +1962,17 @@ describe("AC6 无障碍语义 (R-05)", () => {
     expect(html).not.toContain("id=\"plan-gate-toggle\"");
     expect(html).not.toContain("id=\"ask-user-label\"");
     expect(html).not.toContain("id=\"plan-gate-label\"");
-    expect(buildNewRunRequest({ task: "t" })).toMatchObject({ askUser: true, autoApprove: true });
+    expect(buildNewRunRequest({ task: "t" })).toMatchObject({ askUser: true });
+    expect(buildNewRunRequest({ task: "t" })).not.toHaveProperty("autoApprove");
     expect(buildNewRunRequest({ task: "t", mode: "plan" })).toMatchObject({ planGate: true, askUser: true });
   });
 
-  it("交互式 Web 默认自动放行工具", () => {
+  it("交互式 Web 新对话默认先问，不自动放行", () => {
     const html = readFileSync(join(__dirname, "..", "ui", "public", "index.html"), "utf-8");
-    expect(html).toMatch(/id="auto-approve-toggle"[^>]*checked/);
-    expect(buildNewRunRequest({ task: "t" })).toMatchObject({ askUser: true, autoApprove: true });
+    expect(html).not.toMatch(/id="auto-approve-toggle"[^>]*checked/);
+    expect(buildNewRunRequest({ task: "t" })).toMatchObject({ askUser: true });
+    expect(buildNewRunRequest({ task: "t" })).not.toHaveProperty("autoApprove");
+    expect(buildNewRunRequest({ task: "t", autoApprove: true })).toMatchObject({ autoApprove: true });
     expect(buildNewRunRequest({ task: "t", mode: "plan" })).toMatchObject({ planGate: true, askUser: true });
     // 归档续跑 / 追问必须把勾选带上，否则界面开着、派生 run 仍逐条问
     expect(buildFollowUpRequest({ text: "继续" })).toEqual({ text: "继续" });

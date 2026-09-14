@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>工程手册</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="masthead">
+    <p class="kicker">工程手册 · eng-runbook</p>
+    <h1 id="title">事故处置手册</h1>
+    <p class="lede">复制本模板，改服务名与步骤；保持目录锚点与决策日志表头。</p>
+    <dl class="meta">
+      <div><dt>服务</dt><dd>待指定</dd></div>
+      <div><dt>值班</dt><dd>待指定</dd></div>
+      <div><dt>日期</dt><dd>YYYY-MM-DD</dd></div>
+    </dl>
+  </header>
+
+  <nav class="toc" aria-labelledby="toc-heading">
+    <h2 id="toc-heading">目录</h2>
+    <ol>
+      <li><a href="#scope">范围</a></li>
+      <li><a href="#symptoms">症状</a></li>
+      <li><a href="#steps">处置步骤</a></li>
+      <li><a href="#rollback">回滚</a></li>
+      <li><a href="#escalate">升级</a></li>
+      <li><a href="#decisions">决策日志</a></li>
+    </ol>
+  </nav>
+
+  <main>
+    <section id="scope">
+      <h2>范围</h2>
+      <p>本手册覆盖哪套系统、哪类故障。点名不在范围内的邻接系统，避免值班误扩。</p>
+    </section>
+
+    <section id="symptoms">
+      <h2>症状</h2>
+      <ul>
+        <li>可观察信号（告警名、错误率、用户可见现象）</li>
+        <li>用来排除「看起来像、其实不是」的对照</li>
+      </ul>
+    </section>
+
+    <section id="steps">
+      <h2>处置步骤</h2>
+      <ol>
+        <li><strong>S1</strong> — 确认影响面（谁、多大、是否仍在扩大）。</li>
+        <li><strong>S2</strong> — 止损动作（可回滚、可核对）。</li>
+        <li><strong>S3</strong> — 取证（日志、指标、变更窗口），再谈根因。</li>
+      </ol>
+    </section>
+
+    <section id="rollback">
+      <h2>回滚</h2>
+      <p>写清回滚命令或开关、谁有权限、回滚后如何确认恢复。没有回滚路径就写「无」，不要留空。</p>
+    </section>
+
+    <section id="escalate">
+      <h2>升级</h2>
+      <p>超时或影响面扩大时找谁。写人名或值班角色，不要写「相关同学」。</p>
+    </section>
+
+    <section id="decisions">
+      <h2>决策日志</h2>
+      <p>只记已拍板的决定。未决项放到进行中状态，不要写进本表冒充已决。</p>
+      <table>
+        <thead>
+          <tr>
+            <th>日期</th>
+            <th>决定</th>
+            <th>理由</th>
+            <th>拍板人</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>YYYY-MM-DD</td>
+            <td>示例：先止损再查根因</td>
+            <td>影响面仍在扩大</td>
+            <td>值班</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+  </main>
+</body>
+</html>

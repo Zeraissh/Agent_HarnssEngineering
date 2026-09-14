@@ -32,7 +32,7 @@
 </header>
 
 <!-- 侧栏：品牌 → 顶栏图标 → 分脸 → 新建 → 搜索 → 会话列表；其余工具留底栏 -->
-<aside class="sidebar" id="sidebar" data-workspace-face="code">
+<aside class="sidebar" id="sidebar" data-workspace-face="office">
   <div class="sidebar-header">
     <div class="sidebar-brand">
       <span class="sidebar-brand-mark" aria-hidden="true">
@@ -95,10 +95,10 @@
     </div>
   </div>
   <div class="workspace-face" id="workspace-face" role="radiogroup" aria-label="工作区">
-    <button type="button" class="workspace-face-tab" role="radio" id="workspace-face-office"
-      data-workspace-face="office" aria-checked="false">Work</button>
-    <button type="button" class="workspace-face-tab is-selected" role="radio" id="workspace-face-code"
-      data-workspace-face="code" aria-checked="true">Code</button>
+    <button type="button" class="workspace-face-tab is-selected" role="radio" id="workspace-face-office"
+      data-workspace-face="office" aria-checked="true">Work</button>
+    <button type="button" class="workspace-face-tab" role="radio" id="workspace-face-code"
+      data-workspace-face="code" aria-checked="false">Code</button>
   </div>
   <div class="sidebar-search">
     <button type="button" class="btn btn--primary new-chat-btn" id="new-chat-btn">
@@ -188,8 +188,8 @@
           </svg>
         </span>
         <p class="empty-brand">FATHOM<span class="fw-dot">.</span></p>
-        <p class="empty-tagline">see every run to the bottom.</p>
-        <p class="empty-tagline-cn">每一层都看得见。</p>
+        <p class="empty-tagline">说要做什么，回车就发。</p>
+        <p class="empty-tagline-cn">稿件、纪要、问答都可以从这里开始。</p>
         <span class="empty-depthline" aria-hidden="true"></span>
       </div>
     </div>
@@ -210,7 +210,7 @@
        哪都看得见，从结构上消掉了"内容变高把待办推出视野"那个问题。
        共用一个框的理由：分开纯粹是实现遗留（一个打 /api/runs、一个打 /messages），
        对用户来说它们长得一样、位置也挨着。选中一个可续跑的运行 → 「继续对话」，
-       没选中 → 「运行任务」；文案、placeholder、说明行、data-mode 四处一起变。
+       没选中 → 「发送」；文案、placeholder、说明行、data-mode 四处一起变。
        派生逻辑在 app.js 的 deriveComposerMode / patchComposer 里（因此可测）。
        新建对话时 #main-panel.is-welcome 把同一份表单抬到中央，不搬 DOM。
        胶囊铬（chip / 图标发送 / 紧凑输入）对话态与欢迎态共用；欢迎只多居中和起步卡。 -->
@@ -315,8 +315,8 @@
     <div class="composer-input-row">
     <!-- 文案由 patchComposer 按模式改写（「任务描述」↔「追加指令」）。
          for/id 不许动：整页 axe 与文案闸门都钉着这一对。 -->
-    <label for="task-input" class="task-label">任务描述</label>
-    <textarea id="task-input" placeholder="要这个目录做什么…" title="Enter 发送，Shift+Enter 换行" rows="1"></textarea>
+    <label for="task-input" class="task-label">发送</label>
+    <textarea id="task-input" placeholder="说要做什么…" title="Enter 发送，Shift+Enter 换行" rows="1"></textarea>
     <!-- input **排在 label 之前**：它是 sr-only（宽高 1px + clip），焦点环会被
          整个裁掉，键盘用户 Tab 到附件时屏幕上没有任何反应。把它放前面，
          就能用最朴素的相邻兄弟选择器把环画到那个可见的 label 上
@@ -327,17 +327,13 @@
       <span class="sr-only">附件</span>
     </label>
     <button type="submit" class="btn btn--primary submit-btn" id="submit-btn">
-      <span id="submit-btn-label" class="sr-only">运行任务</span>
+      <span id="submit-btn-label" class="sr-only">发送</span>
       <i class="ph ph-arrow-up" aria-hidden="true"></i>
     </button>
     </div>
     </div>
     </div>
     <div class="composer-quickbar">
-      <label class="checkbox-label verify-toggle-label">
-        <input type="checkbox" id="verify-toggle" />
-        <span>独立核查</span>
-      </label>
       <button type="button" id="gate-chip" class="gate-chip" hidden></button>
       <button type="button" id="design-template-chip" class="design-template-chip" hidden></button>
       <span class="composer-quick-hint sr-only">写入仍受工作目录边界约束</span>
@@ -431,12 +427,19 @@
         </span>
         <input type="checkbox" id="multi-agent-toggle" />
       </label>
-      <label class="knob-row" title="自动放行 ask 级工具。写入仍受工作目录边界约束。">
+      <label class="knob-row" title="打开后 ask 级工具不再逐次问。默认先问。写入只能改这些文件夹。">
         <span class="knob-row-copy">
           <span class="knob-row-name">自动放行</span>
-          <span class="knob-row-desc">工具调用不再逐次问</span>
+          <span class="knob-row-desc">默认先问；勾上才自动放行</span>
         </span>
-        <input type="checkbox" id="auto-approve-toggle" checked />
+        <input type="checkbox" id="auto-approve-toggle" />
+      </label>
+      <label class="knob-row verify-toggle-label" title="本轮结束后由独立角色再验一遍产物。">
+        <span class="knob-row-copy">
+          <span class="knob-row-name">独立核查</span>
+          <span class="knob-row-desc">默认关；需要时再开</span>
+        </span>
+        <input type="checkbox" id="verify-toggle" />
       </label>
       <div class="knob-row" title="控制模型想多深，不是 token 上限">
         <span class="knob-row-name" id="effort-row-label">思考强度</span>
@@ -536,6 +539,8 @@ import {
   permissionModeSwitches,
   matchPermissionMode,
   describePermissionStance,
+  humanizeSubmitError,
+  runEndAnnouncement,
   annotateResolvedApprovals,
   createReplayGate,
   createApprovalSettleGate,
@@ -1068,7 +1073,7 @@ let submitting = false;
 let selectedDesignTemplate = /** @type {string|null} */ (null);
 /** 空态设计模式门面：输入框 + 6 页签 chip + 样例卡 */
 let designModeActive = false;
-let workspaceFace = "code";
+let workspaceFace = "office";
 let officeCatalogOpen = false;
 let codeVerifyPref = true;
 let selectedDesignTab = /** @type {string|null} */ (null);
@@ -1294,7 +1299,9 @@ function paintEmptyState() {
   if (gallery) gallery.hidden = false;
   renderEmptyState(runs.length > 0, {
     selectedTemplate: selectedDesignTemplate,
-    designModeActive: workspaceFace === "office",
+    workspaceFace,
+    // 只有点开「更多稿件」才进设计目录；日常 Work 空态要看得见「说要做什么」。
+    designModeActive: officeCatalogOpen,
   });
   renderStarterGallery({
     selectedTemplate: selectedDesignTemplate,
@@ -1999,6 +2006,9 @@ function renderDetailWithState(state) {
     const railBody = document.querySelector("#main-area .rail-body");
     if (railBody) changesApi.mount(railBody);
     changesApi.setRun(runId);
+    changesApi.setKnownWrites?.(
+      conversationArtifactFiles(runId).filter((f) => f && f.kind !== "upload"),
+    );
   }
   syncChangesCommand();
   // T12 阅读模式：对话渲染落定后做后处理（聚焦模式藏过程元素、插摘要行；
@@ -2145,7 +2155,7 @@ async function postRunningMessage(qMode, textOverride) {
     });
     if (!res.ok) {
       const b = await res.json().catch(() => ({}));
-      showSubmitError(b.error ?? `发送失败（HTTP ${res.status}）`);
+      showSubmitError(humanizeSubmitError(b, res.status));
       return false;
     }
     if (textOverride === undefined) {
@@ -2305,7 +2315,7 @@ async function postFollowUp(runId, text, verify) {
       body: JSON.stringify(buildFollowUpRequest({
         text,
         verify,
-        autoApprove: autoApproveToggle?.checked !== false,
+        autoApprove: autoApproveToggle?.checked === true,
         // 追问续的是对话。计划/并行旋钮只约束「新开一轮」；完成态 plan
         // 再带 planMode 会另起 planner，其 run_end 会拆掉还在跑的执行者。
         effort: effortSelect?.value,
@@ -2318,12 +2328,11 @@ async function postFollowUp(runId, text, verify) {
       })),
     });
     if (!res.ok) {
-      let detail = `HTTP ${res.status}`;
+      let body = null;
       try {
-        const b = await res.json();
-        if (b?.error) detail = b.error;
-      } catch { /* 非 JSON 响应体，保留状态码 */ }
-      followUpErrors.set(runId, detail);
+        body = await res.json();
+      } catch { /* 非 JSON 响应体 */ }
+      followUpErrors.set(runId, humanizeSubmitError(body, res.status));
       const st = runStates.get(runId);
       if (st) renderDetailWithState(st);
       return false;
@@ -2735,7 +2744,7 @@ function applySseBatch(runId, queue) {
           // 收尾前多半已经吃过一次 error（服务端 res.end 先到、run_end 后 flush），
           // 横幅正挂着。close 不触发任何事件，不在这儿落它就会一直挂到下次切换。
           setConnectionState(runId, "live");
-          announceStatus(`运行已完成：${next.task}`);
+          announceStatus(runEndAnnouncement(next));
           refreshTranscriptIfWatching(runId);
           // 不在看的那条跑完了 → 记一颗未读星（在看的那条不必提醒，你就在看）
           if (selectedRunId !== runId) unreadRuns.add(runId);
@@ -3023,7 +3032,7 @@ async function postAutoApprove(runId, enabled) {
 function syncAutoApprove(runId) {
   const info = runs.find((r) => r.runId === runId);
   if (!info || info.status !== "running") return;
-  const want = autoApproveToggle?.checked !== false;
+  const want = autoApproveToggle?.checked === true;
   if (Boolean(info.autoApprove) === want) return;
   void postAutoApprove(runId, want);
 }
@@ -3476,7 +3485,7 @@ async function submitNewRun({ text: task }) {
         lineageBudget: false,
         dailyBudget: false,
         askUser: true,
-        autoApprove: autoApproveToggle?.checked !== false,
+        autoApprove: autoApproveToggle?.checked === true,
         permissionMode: permissionModeSelect?.value || undefined,
         workdir: workdirSelect?.value && workdirSelect.value !== WORKDIR_ADD_VALUE
           ? workdirSelect.value
@@ -3506,7 +3515,7 @@ async function submitNewRun({ text: task }) {
         designRouteHint = body.designRoute.reason || body.error || "请选择页签或模板";
         paintEmptyState();
       }
-      newRunError = `提交失败（HTTP ${res.status}）${detail}`;
+      newRunError = humanizeSubmitError(body, res.status);
       return;
     }
     const { runId } = await res.json();
@@ -3640,7 +3649,10 @@ async function failedActionMessage(action, res) {
       if (text) detail = `：${text}`;
     } catch { /* 响应体读失败就只报状态码 */ }
   }
-  return `${action}失败（HTTP ${res.status}）${detail}`;
+  return humanizeSubmitError(
+    { error: detail ? `${action}失败${detail}` : `${action}失败` },
+    res.status,
+  );
 }
 
 function showSubmitError(message) {
@@ -4226,7 +4238,7 @@ if (autoPackToggle) {
 }
 
 {
-  const savedFace = readPrefString(PREF_WORKSPACE_FACE, "code");
+  const savedFace = readPrefString(PREF_WORKSPACE_FACE, "office");
   applyWorkspaceFace(savedFace === "office" ? "office" : "code", { persist: false, refresh: false });
   document.getElementById("workspace-face")?.addEventListener("click", (event) => {
     const tab = event.target.closest?.("[data-workspace-face]");
@@ -4279,7 +4291,7 @@ if (newChatBtn) {
     newRunError = null;
     syncComposer();
     taskInput.focus();
-    announceStatus("已开始新对话，请输入任务描述");
+    announceStatus("已开始新对话，说要做什么");
   });
 }
 
@@ -5004,6 +5016,9 @@ import("./features/changes-panel.js").then((changes) => {
     const railBody = document.querySelector("#main-area .rail-body");
     if (railBody) changesApi.mount(railBody);
     changesApi.setRun(selectedRunId);
+    changesApi.setKnownWrites?.(
+      conversationArtifactFiles(selectedRunId).filter((f) => f && f.kind !== "upload"),
+    );
   }
   syncChangesCommand();
 }).catch(() => { /* 变更审查是增强项，加载失败静默降级 */ });

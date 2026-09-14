@@ -3,9 +3,11 @@
 Agent_Design 项目的跨端 App 外壳：把仓库 [`ui/public`](../ui/public) 的 Web 控制台
 原样打包成浏览器预览 / Electron 桌面 / Capacitor Android 三端可用的 Agent 客户端。
 
-控制台本身**不执行 agent**——执行宿主仍是仓库根目录的 `ui/server.ts`
-（默认 `http://127.0.0.1:4173`，能执行 bash、批准写文件，所以只绑本机）。
+控制台本身**不执行 agent**——执行宿主仍是仓库根的 Web UI（`ui/serve.ts` 拉起 `createUiServer`，
+默认 `http://127.0.0.1:4173`，能执行 bash、批准写文件，所以只绑本机）。
 App 外壳负责提供与 WebUI 完全一致的界面与交互，通过网络连接宿主。
+窗口标题跟宿主页走，评测当时是「FATHOM 控制台」。开发态 `npm run desktop` **不会**
+往开始菜单写快捷方式；可点的安装项是签名安装包的事（2026-09-14 VERIFY #21）。
 
 ## 为什么不是"文本编辑器"
 
@@ -23,11 +25,13 @@ Electron 桌面壳自己决定宿主来源，按序：
 2. **本机候选端口已有健康宿主**（`AGENT_UI_PORT`，缺省 4173，探 `/health`）
    → 直连。老的"先 `npm run ui` 再开壳"工作流原样保留，关壳不影响宿主。
 3. **都没有 → 自动拉起**：入口解析顺序为 `AGENT_UI_HOST_ENTRY` 显式指定 >
-   仓库检出的 `ui/serve.ts`（tsx，源码永远新鲜）> `dist/ui/serve.js` 编译版；
+   仓库检出的 `ui/serve.ts`（tsx，源码永远新鲜：项目 / 产物 / 日程 / 战役 /
+   Office 预览+点评+对话改稿）> `dist/ui/serve.js` 编译版；
    用 Electron 自带 Node 运行，端口取 `AGENT_UI_PORT` 或随机空闲位，
    `.env` 按 node `--env-file` 同款语义装载（已存在的环境变量优先）。
    **关窗即走**：退出时宿主连同 bash/MCP 子进程一起收干净（Windows
    `taskkill /T`，POSIX 进程组信号），不留僵尸。
+   开发检出不要用陈旧 `dist` 顶包；打包态才走 `resources/harness` 里的编译宿主。
 
 正式安装包会把编译宿主和 production dependencies 放进 `resources/harness`，因此离开
 源码检出也能一键启动。`AGENT_UI_HOST_ENTRY` 仍可用于开发诊断；`AGENT_UI_URL` 可切到
@@ -49,10 +53,12 @@ npm run dev
 ### Electron 桌面
 
 ```bash
+# 仓库根或本目录均可
 npm run desktop
 ```
 
-一条命令：没有宿主就自动拉起（见上节顺序），有就直连。远程 Harness 渲染器启用
+一条命令：没有宿主就自动拉起当前 `ui/serve.ts`（见上节顺序），有就直连。
+要最新 Web UI，先确认 4173 上不是一台旧宿主。远程 Harness 渲染器启用
 context isolation 与 sandbox，不暴露 preload/Node 桥；只有本地打包的设置窗口拥有
 经过 sender 校验的窄 IPC。
 

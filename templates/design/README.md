@@ -9,6 +9,11 @@ Agent 用真实 HTML/CSS 做设计交付；宿主整站预览 + 点评 + 翻页�
 | `social-basic/` | 社媒/海报方图：`article.card[data-card][data-size]` |
 | `pm-spec/` | 产品规格：目录锚点 + 决策日志 |
 | `team-okrs/` | 团队 OKR 记分卡 |
+| `eng-runbook/` | 工程手册：事故处置（目录 + 决策日志） |
+| `finance-report/` | 财务报告：管理层摘要（目录 + 决策日志） |
+| `hr-onboarding/` | 人事入职：岗位计划（目录 + 决策日志） |
+| `meeting-brief/` | 会前简报：议程与待决（目录 + 决策日志） |
+| `raid-brief/` | 战役任务书：分片与产物（目录 + 决策日志） |
 | `DESIGN.md.example` | 可选品牌契约。需要时自己复制到任务 workdir 根并改名为 `DESIGN.md`；宿主不会自动写入，画布也不展示色板 |
 
 ## 宿主一键拷贝
