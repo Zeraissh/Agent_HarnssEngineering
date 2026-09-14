@@ -4,7 +4,7 @@
 
 评论组 B 的定性必须跟着走：D1 是文档化整表白名单过宽，不是意外泄漏；D3 是勾选不控 `runPlanned` 成文路径；D2 是门面/归档分叉，不是 persist 写错字段。优先级按评论组 C。
 
-未测项单列「下轮对抗必做」，不要用绿测试假装本波能关。对抗-2（宿主 PID 39672）：U1 / U3 / U6 已锁；U2 / U4 / U5 仍未测。
+未测项单列「下轮对抗必做」，不要用绿测试假装本波能关。对抗-2（宿主 PID 39672）：U1 / U3 / U4 / U5 / U6 已锁。U2 日预算是用户可选项，不是必测门；不要为勾选去武装本机宿主。
 
 ---
 
@@ -104,15 +104,15 @@
 
 ## 下轮对抗必做
 
-对抗-2（2026-09-14，PID 39672，证据 `evidence/adversarial-2/`）：U1 / U3 / U6 已锁。U2 / U4 / U5 仍未测，不要绿测假装关。
+对抗-2（2026-09-14，PID 39672，证据 `evidence/adversarial-2/`）：U1 / U3 / U4 / U5 / U6 已锁。U2 不是必测门。
 
 | ID | 项 | 状态 | 说明 |
 |---|---|---|---|
 | U1 | 第 5 个 run 429 | **对抗已锁** | `activeRuns=4` 后第 5 POST 429 `Active run limit reached (4)`；四 holder 仍 running；否决后 0 |
-| U2 | 日预算 429 | **仍未测** | `dailyConfigured=false`，本宿主未武装，未编造 429 |
+| U2 | 日预算 429 | **可选，不测本机** | 日预算是用户可选项，不是必测门；不要为勾选去武装本机宿主（`AGENT_UI_DAILY_TOKEN_BUDGET`）。坐镇本机不必开；对抗不要求武装。`dailyConfigured=false` 保持原样 |
 | U3 | ask_user | **对抗已锁** | `d7074a6e-…` 真调 `ask_user` + `POST /answer` 200，同 run 写 `notes-a.md` |
-| U4 | 真隐藏标签约 20s | **仍未测** | `document.hidden` 从未 true；Playwright / 最小化不进 hidden 生命周期 |
-| U5 | 战役 / spawn_task | **仍未测** | `campaignArmed=false`，未 POST `/api/campaigns` |
+| U4 | 真隐藏标签约 20s | **对抗已锁** | `document.hidden===true` ~19s（`5a43b0c0-…`）；藏着时仍有 `assistant_text` / `run_end`。Playwright/CDP 连着时永远 visible。见 `u4u5-retry/HANDOFF.md` |
+| U5 | 战役 / spawn_task | **对抗已锁** | `POST /api/campaigns` 导演 `a7c65e6f-…` + 子对话 `3f860e9c-…`；规格+幻灯 409。`campaignArmed` 只报 env 自动升导演，不是唯一入口 |
 | U6 | 客户端计划 SSE | **对抗已锁** | `a58993fa-…` planner `done` seq 26 后页面仍收到 `plan_result` / `run_end` |
 
 ---
@@ -129,6 +129,6 @@ Step 1 完成：D1、D3（文案 + 列表字段）、D4。
 
 Step 2 完成：D2、D5、D6、D7、D8、D9（便宜刀）、D10（UI 默认）。未拆 `runPlanned` 内置核查。未 git commit。未开真机对抗。
 
-对抗-2：U1 / U3 / U6 对抗已锁；U2 / U4 / U5 仍未测（日预算未武装 / 真隐藏未做成 / 战役干净缺席）。未 git commit。宿主测完仍 4173 PID 39672，flash，idle。
+对抗-2：U1 / U3 / U4 / U5 / U6 对抗已锁。U2 改为可选用户设置，坐镇本机不必开，对抗不要求武装。U4/U5 证据 `adversarial-2/u4u5-retry/HANDOFF.md`。未 git commit。宿主仍 4173 PID 39672。
 
 绿测（FakeModelClient）：`ui-design-archive`、`ui-cite-api`、`ui-zip`、`ui-artifacts-api`、`ui-artifacts-panel`；`ui-app` 定点 cite/welcome；`ui-patch` 定点 office 脸；`ui-server` 定点 transcript / plan 追问 / site-zip。细节见证据目录 `待做项目.md`。
