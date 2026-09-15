@@ -11,7 +11,7 @@
 | [`08-maturity-optimization-checklist.md`](08-maturity-optimization-checklist.md) | 工程成熟度台账（`[x]` / `[~]` / `[ ]`） |
 | [`07-production-runbook.md`](07-production-runbook.md) | 单操作员生产部署 / canary / 回滚 |
 | [`permission-modes.md`](permission-modes.md) | 权限三档对照（与 `src/permission-mode.ts` 同源） |
-| [`../.env.example`](../.env.example) | 环境变量名与注释 |
+| [`../.env.example`](../.env.example) | 环境变量名与注释；端点配置与兼容性说明 |
 | [`../eval/persona-ux/README.md`](../eval/persona-ux/README.md) | 2026-09-14 人格走查：怎么读评测 |
 | [`13-live-mu-backlog.md`](13-live-mu-backlog.md) | 共享宿主 flash 评测债（D1–D10 本波已标完成） |
 | [`12-live-multiuser-harness-test.md`](12-live-multiuser-harness-test.md) | 共享宿主评测纪律 |
