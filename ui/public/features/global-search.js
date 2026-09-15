@@ -1,10 +1,12 @@
 /**
  * features/global-search — 全局搜索（T6）。
  *
- * 侧栏搜索框升级为两档：
+ * 侧栏搜索框是同一个控件的两档：
  *   1) 输入时即时本地标题过滤（宿主既有行为，本模块不碰）；
- *   2) 回车或点「按正文全局搜索」按钮 → 调 GET /api/search?q=...，
+ *   2) 回车或点框内紧凑 Enter 提示 → 调 GET /api/search?q=...，
  *      在浮层里展示跨全部历史档案的标题/正文命中。
+ * 不另开第三套搜索；#global-search-trigger 嵌在 .run-search-field 里，
+ * 不再当 flex 兄弟去挤窄输入框。
  *
  * 与 command-palette / notifications / memory-panel 同一约定：
  *   1) 纯函数层（响应整形 / 高亮切分）——可单测；
@@ -20,6 +22,7 @@
  */
 
 import { formatRelTime } from "./notifications.js";
+import { humanizeHttpFailure } from "./humanize-error.js";
 
 // ---------------------------------------------------------------
 // 纯函数层
@@ -109,8 +112,8 @@ export const SEARCH_COPY = {
   panelTitle: "全局搜索",
   loading: "正在搜索全部历史对话…",
   empty: (query) => `没有找到包含「${query}」的对话`,
-  error: (status) => (status === 400 ? "请输入至少 2 个字符再搜索" : `搜索失败（HTTP ${status}）`),
-  networkError: "搜索失败（网络错误）",
+  error: (status) => (status === 400 ? "请输入至少 2 个字符再搜索" : humanizeHttpFailure(status, "搜索没做成")),
+  networkError: "网络断了，搜索没做成",
   retry: "重试",
   titleHitBadge: "标题命中",
   truncatedNote: "历史较多，只扫描了最近 500 条档案，更早的结果可能未列出",
@@ -221,18 +224,21 @@ export function initGlobalSearch(host = {}, env = {}) {
   overlay.appendChild(panel);
   doc.body.appendChild(overlay);
 
-  // ---- 触发入口：侧栏搜索框下方的「按正文全局搜索」按钮 ----
+  // ---- 触发入口：嵌在搜索框内的紧凑 Enter 提示（点按 ≡ 回车）----
   const trigger = doc.createElement("button");
   trigger.type = "button";
   trigger.className = "gs-trigger";
   trigger.id = "global-search-trigger";
-  trigger.innerHTML =
-    '<i class="ph ph-textbox" aria-hidden="true"></i>' +
-    `<span>${SEARCH_COPY.trigger}</span>` +
-    '<kbd class="palette-kbd" aria-hidden="true">Enter</kbd>';
-  const searchField = doc.querySelector(".run-search-field");
-  if (searchField && searchField.parentNode) {
-    searchField.parentNode.insertBefore(trigger, searchField.nextSibling);
+  trigger.setAttribute("aria-label", SEARCH_COPY.trigger);
+  trigger.setAttribute("title", `${SEARCH_COPY.trigger}（Enter）`);
+  trigger.innerHTML = '<kbd class="palette-kbd" aria-hidden="true">Enter</kbd>';
+  const searchField = doc.querySelector(".run-search-field")
+    ?? input?.closest?.(".run-search-field")
+    ?? null;
+  if (searchField) {
+    searchField.appendChild(trigger);
+  } else if (input?.parentNode) {
+    input.parentNode.insertBefore(trigger, input.nextSibling);
   }
 
   // ---- 渲染 ----

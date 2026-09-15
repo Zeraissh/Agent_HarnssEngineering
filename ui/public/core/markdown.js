@@ -19,6 +19,15 @@
  */
 
 import { highlight, normalizeLang } from "./highlight.js";
+import {
+  unescapeTexDelimiters,
+  unescapeTexOutsideFences,
+  holdMathInEscaped,
+  restoreHeldMath,
+  matchDisplayMathBlock,
+  isDisplayMathStart,
+  renderTexHtml,
+} from "./math.js";
 
 const ESC = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
 const escapeHtml = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ESC[c]);
@@ -156,6 +165,13 @@ function inline(text) {
   });
 
   /**
+   * 公式在粗体/斜体之前抽出：`\mathbf{h} * \left(` 里的 `*` 不是强调。
+   * 行内代码已占位，围栏块走另一条路径，不会把代码里的 `\(` 当公式。
+   */
+  const math = holdMathInEscaped(s);
+  s = math.text;
+
+  /**
    * 图片：`![说明](https://img… "https://源页…")`
    * title 若是 http(s) 则作为源网页链接（咨询插图纪律）；否则退化为图本身。
    * 必须在普通链接之前匹配（否则 `![…](…)` 会先被链接触掉感叹号）。
@@ -198,6 +214,8 @@ function inline(text) {
   s = s.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
   s = s.replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
   s = s.replace(/~~([^~\n]+)~~/g, "<del>$1</del>");
+
+  s = restoreHeldMath(s, math.held);
 
   return s.replace(/C(\d+)/g, (_, i) => {
     const item = codes[Number(i)];
@@ -242,13 +260,14 @@ function linkBarePathCitations(text) {
  * 渲染 Markdown 子集为安全 HTML。
  * 支持：标题、粗体/斜体/删除线、行内代码、围栏代码块、有序/无序列表、
  * 引用、分隔线、**GFM 表格**、**图片（含可选源页 title）**、段落、
- * **裸 http(s) 网址自动成链**、**文件引用（`file.ts：说明` / `src/a.ts:12`）挂探测标记**。
+ * **裸 http(s) 网址自动成链**、**文件引用（`file.ts：说明` / `src/a.ts:12`）挂探测标记**、
+ * **TeX（`$…$` / `$$…$$` / `\(` `\)` / `\[` `\]`，含一层 `\\(` 反转义）走 KaTeX**。
  * **不支持原始 HTML（见上方安全纪律）。**
  * @param {string} src
  * @returns {string} 可直接 innerHTML 的 HTML 串
  */
 export function renderMarkdown(src) {
-  const text = escapeHtml(src).replace(/\r\n?/g, "\n");
+  const text = escapeHtml(unescapeTexOutsideFences(src)).replace(/\r\n?/g, "\n");
   const lines = text.split("\n");
   const out = [];
   let i = 0;
@@ -284,6 +303,13 @@ export function renderMarkdown(src) {
         `<pre class="md-code${key ? ` md-code--${key}` : ""}"${langAttr}>` +
           `<code>${highlight(body.join("\n"), raw)}</code></pre>`,
       );
+      continue;
+    }
+
+    const displayMath = matchDisplayMathBlock(lines, i);
+    if (displayMath) {
+      out.push(`<div class="md-math-block">${renderTexHtml(displayMath.tex, true)}</div>`);
+      i = displayMath.end;
       continue;
     }
 
@@ -378,6 +404,7 @@ export function renderMarkdown(src) {
         /^\s*[-*+]\s+/.test(l) ||
         /^\s*\d+[.)]\s+/.test(l) ||
         /^\s*(---+|\*\*\*+|___+)\s*$/.test(l) ||
+        isDisplayMathStart(l) ||
         (para.length > 0 && isTableStart(lines, i))
       ) {
         break;
@@ -396,5 +423,5 @@ export function renderMarkdown(src) {
  * 块级渲染会在本该是一行的地方塞进 `<p>`，把行高与对齐全打乱。
  */
 export function renderMarkdownInline(src) {
-  return inline(escapeHtml(src).replace(/\n+/g, " "));
+  return inline(escapeHtml(unescapeTexDelimiters(src)).replace(/\n+/g, " "));
 }

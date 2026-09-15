@@ -8,7 +8,7 @@
  *             dragHasFiles / filesFromDrop / filesFromPaste（提取与改名、
  *             同批重名追加序号）、buildFilePreviewUrl（编码/workdir/download）
  *   覆盖层  ：initFilePreview 打开/按类型分派渲染（md/html/图片/csv/代码/
- *             二进制降级卡）/Esc 与遮罩关闭/取件失败错误卡/幂等
+ *             Office JSON 翻页/二进制降级卡）/Esc 与遮罩关闭/取件失败错误卡/幂等
  *   入口层  ：initFileIntake 拖拽高亮（enter/over/leave/drop）、只有文件才接管、
  *             文本拖拽还给默认行为、window 全局兜底防页面被文件替换、
  *             paste 提取文件与命名、文本+文件并存时文本照常插入
@@ -150,6 +150,7 @@ describe("initFilePreview 停靠面板", () => {
     expect(frame).toBeTruthy();
     expect(frame.getAttribute("sandbox")).toBe("allow-scripts");
     expect(frame.getAttribute("sandbox")).not.toContain("allow-same-origin");
+    expect(frame.getAttribute("allow")).toMatch(/webgl \*/);
     expect(frame.getAttribute("src")).toContain("/api/file-preview");
 
     api.open({ path: "shot.png", url: "/api/file-preview?path=shot.png" });
@@ -184,6 +185,66 @@ describe("initFilePreview 停靠面板", () => {
     await flush();
     expect(api.element.querySelector(".ac-fallback")).toBeTruthy();
     expect(api.element.querySelector(".ac-size").textContent).toBe("3 B");
+  });
+
+  it("pptx 走 office-preview JSON，翻页，文案是预览+点评+对话改稿", async () => {
+    const urls = [];
+    const api = initFilePreview({}, {
+      fetch: async (url) => {
+        urls.push(String(url));
+        if (String(url).includes("/api/office-preview")) {
+          return {
+            ok: true,
+            json: async () => ({
+              kind: "pptx",
+              pages: [
+                { index: 1, title: "页一", texts: ["页一"] },
+                { index: 2, title: "页二", texts: ["页二"] },
+              ],
+            }),
+          };
+        }
+        return { ok: false };
+      },
+    });
+    api.open({ path: "talks/deck.pptx", url: "/api/file-preview?path=talks%2Fdeck.pptx" });
+    await flush();
+    expect(urls.some((u) => u.includes("/api/office-preview") && u.includes("talks%2Fdeck.pptx"))).toBe(true);
+    expect(api.element.querySelector(".ac-office")).toBeTruthy();
+    expect(api.element.querySelector(".ac-note")?.textContent).toContain("预览 + 点评 + 对话改稿");
+    expect(api.element.querySelector(".ac-badge")?.textContent).toBe("幻灯");
+    api.element.querySelector(".ac-office-next").click();
+    expect(api.element.querySelector(".ac-office-page:not([hidden]) .ac-office-title")?.textContent).toBe("页二");
+  });
+
+  it("docx 走 office-preview；取件 URL 的 workdir 抄过去", async () => {
+    const urls = [];
+    const api = initFilePreview({}, {
+      fetch: async (url) => {
+        urls.push(String(url));
+        if (String(url).includes("/api/office-preview")) {
+          return {
+            ok: true,
+            json: async () => ({
+              kind: "docx",
+              pages: [{ index: 1, title: "章一", texts: ["章一"] }],
+            }),
+          };
+        }
+        return { ok: false };
+      },
+    });
+    api.open({
+      path: "briefs/note.docx",
+      url: "/api/file-preview?path=briefs%2Fnote.docx&workdir=D%3A%2Fproj",
+    });
+    await flush();
+    expect(urls).toHaveLength(1);
+    expect(urls[0]).toContain("/api/office-preview");
+    expect(urls[0]).toContain("path=briefs%2Fnote.docx");
+    expect(urls[0]).toContain("workdir=D%3A%2Fproj");
+    expect(api.element.querySelector(".ac-badge")?.textContent).toBe("文档");
+    expect(api.element.querySelector(".ac-office-title")?.textContent).toBe("章一");
   });
 
   it("取件失败画错误卡", async () => {

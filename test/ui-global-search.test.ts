@@ -6,7 +6,7 @@
  * 分层覆盖：
  *   纯函数层：响应整形 / 高亮切分 / 最短长度判定 / 文案常量
  *   DOM 层  ：jsdom 里真实初始化 + 注入 fetchFn，验证两档交互（本地过滤
- *             不被动、Enter/按钮触发全局搜索）、加载态、结果渲染与 <mark>
+ *             不被动、Enter/框内提示触发全局搜索）、加载态、结果渲染与 <mark>
  *             高亮、点击跳转、空态、错误态与重试、截断标注、关闭行为
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
@@ -98,6 +98,16 @@ describe("isSearchable 最短长度判定", () => {
   });
 });
 
+describe("SEARCH_COPY 错误人话", () => {
+  it("500 / 网络失败脸上不写 HTTP 状态码", () => {
+    expect(SEARCH_COPY.error(500)).toBe("搜索没做成");
+    expect(SEARCH_COPY.error(500)).not.toMatch(/HTTP\s*\d/i);
+    expect(SEARCH_COPY.error(429)).not.toMatch(/HTTP\s*\d/i);
+    expect(SEARCH_COPY.networkError).not.toMatch(/HTTP\s*\d/i);
+    expect(SEARCH_COPY.error(400)).toContain("至少 2 个字符");
+  });
+});
+
 // ---------------------------------------------------------------
 // DOM 层
 // ---------------------------------------------------------------
@@ -159,13 +169,18 @@ describe("initGlobalSearch DOM 层", () => {
   beforeEach(setupDom);
   afterEach(() => { document.body.innerHTML = ""; });
 
-  it("挂载「按正文全局搜索」入口到搜索框下方", () => {
+  it("挂载紧凑全局搜索提示到搜索框内，不另开兄弟槽", () => {
     initGlobalSearch({}, { fetchFn: vi.fn(), now: () => NOW });
     const trigger = document.getElementById("global-search-trigger");
+    const field = document.querySelector(".run-search-field");
     expect(trigger).toBeTruthy();
-    expect(trigger.textContent).toContain(SEARCH_COPY.trigger);
-    expect(trigger.previousElementSibling.classList.contains("run-search-field")).toBe(true);
-    expect(trigger.querySelector(".ph")).toBeTruthy(); // Phosphor 图标
+    expect(field.contains(trigger)).toBe(true);
+    expect(trigger.getAttribute("aria-label")).toBe(SEARCH_COPY.trigger);
+    const kbd = trigger.querySelector("kbd.palette-kbd");
+    expect(kbd).toBeTruthy();
+    expect(kbd.getAttribute("aria-hidden")).toBe("true");
+    expect(kbd.textContent).toBe("Enter");
+    expect(trigger.textContent.trim()).toBe("Enter");
   });
 
   it("Enter 触发搜索：URL 编码查询词，先转圈后渲染结果", async () => {

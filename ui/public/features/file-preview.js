@@ -4,11 +4,12 @@
  * 零依赖原生 ESM。三件事共住一个模块，因为它们共用同一份「这是什么文件、
  * 去哪儿取」的判断：
  *   1) initFilePreview——预览停靠面板：md 渲染排版文档、HTML 进沙箱 iframe、
- *      图片直显、CSV 成表、代码高亮、二进制降级信息卡。**渲染主体复用
+ *      图片直显、CSV 成表、代码高亮、Office（pptx/docx）走 /api/office-preview
+ *      JSON 翻页、二进制降级信息卡。**渲染主体复用
  *      features/artifact-canvas.js 抽出的 renderPreviewBody**，外壳复用
  *      features/preview-dock.js（覆盖变体）——类型分派、沙箱纪律与
  *      停靠行为都只有一份；本模块只负责取件地址（/api/file-preview，
- *      圈禁在服务端）。
+ *      Office 改走 /api/office-preview，圈禁在服务端）。
  *   2) initFileIntake——composer 的拖拽与粘贴：dataTransfer/clipboardData
  *      里有 files 才接管上传；纯文本拖拽/粘贴走浏览器默认行为（插入文字）。
  *   3) 纯函数层（命名、提取、URL 构造）——可单测。
@@ -23,6 +24,8 @@ import {
   artifactBasename,
   formatBytes,
   renderPreviewBody,
+  isOfficeKind,
+  officePreviewUrlFromFileUrl,
 } from "./artifact-canvas.js";
 import { createPreviewDock } from "./preview-dock.js";
 
@@ -213,6 +216,7 @@ export function initFilePreview(host = {}, env = {}) {
     void renderPreviewBody(body, {
       path,
       url,
+      officePreviewUrl: isOfficeKind(kind) ? officePreviewUrlFromFileUrl(path, url) : undefined,
       fetch: fetchImpl,
       isStale: () => token !== renderToken,
     }).then((result) => {
