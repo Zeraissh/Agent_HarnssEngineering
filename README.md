@@ -77,10 +77,16 @@ CLI 没有 `--api-key` 参数；不要把真实密钥写进 argv 或 PowerShell 
 `.env` 中选择一种端点配置（完整字段与 OCI 配置见 [`.env.example`](.env.example)）：
 
 ```dotenv
-# Anthropic 官方（默认模型 claude-opus-4-8）
+# ① Anthropic 官方 Messages API（sk-ant-...；不是 Claude.ai 网页/consumer 账号）
 ANTHROPIC_API_KEY=sk-ant-...
+# AGENT_MODEL=claude-opus-4-8
 
-# 若改用 OpenAI wire 协议，则设置：
+# ② 第三方 Anthropic 兼容（DeepSeek / Kimi 等：各自的 key + BASE_URL）
+# ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic
+# ANTHROPIC_API_KEY=sk-...
+# AGENT_MODEL=deepseek-v4-flash
+
+# ③ OpenAI wire 协议
 # AGENT_PROVIDER=openai
 # OPENAI_BASE_URL=https://api.example.com
 # OPENAI_API_KEY=sk-...
@@ -402,4 +408,14 @@ HTTP，但在平台凭据存储、签名流水线和 HTTPS 真机验收完成前
 
 - 语言：TypeScript（Node.js ≥ 22）
 - SDK：`@anthropic-ai/sdk`（仅用其类型与 HTTP 客户端，agent loop 全部自研）
-- 默认模型：`claude-opus-4-8`，adaptive thinking，`output_config.effort` 可配；兼容任何说 Anthropic Messages API 的端点
+- 默认模型：`claude-opus-4-8`，adaptive thinking，`output_config.effort` 可配；第三方兼容与 OpenAI wire 见下节，不支持 Claude.ai consumer / 浏览器端点
+
+## 端点兼容性与 API 支持
+
+L0 只认三类端点（完整字段见 [`.env.example`](.env.example)）：
+
+1. **Anthropic 官方** Messages API（`sk-ant-...`，`ANTHROPIC_BASE_URL` 留空）。官方协议是一等公民。
+2. **第三方 Anthropic 兼容**（DeepSeek、Kimi、GLM、Ollama 等）：各自的 key + `ANTHROPIC_BASE_URL`，按 Messages 协议工作。本仓库长期用 DeepSeek 兼容端点做研究与真机任务；Kimi 做过跨厂商核查。各厂商自己的 ToS。
+3. **OpenAI wire**（`AGENT_PROVIDER=openai`）：chat-completions 端点。密钥必须显式填写，不跨 provider 隐式复用。
+
+**不支持**用 Claude.ai consumer 网页账号、浏览器会话或未公开的网页端点当 API。那条路未实现，也不符合 Anthropic 对 consumer 产品的使用条款。
