@@ -101,8 +101,8 @@ describe("listWorkspaceFiles", () => {
 
     const escaped = await listWorkspaceFiles(root, "../secret/");
     expect(escaped.files).toHaveLength(1);
-    expect(escaped.files[0].notice).toBe(TREE_NOTICE.escaped);
-    expect(escaped.files[0].relative).toBe("../secret");
+    expect(escaped.files[0]?.notice).toBe(TREE_NOTICE.escaped);
+    expect(escaped.files[0]?.relative).toBe("../secret");
     expect(escaped.files.every((f) => !f.name)).toBe(true);
   });
 
@@ -114,7 +114,7 @@ describe("listWorkspaceFiles", () => {
     const deep = ["a", "b", "c", "d", "e", "f", "g", "h", "i"].join("/");
     await mkdir(join(root, deep), { recursive: true });
     const tooDeep = await listWorkspaceFiles(root, treeQueryForDir(deep));
-    expect(tooDeep.files[0].notice).toBe(TREE_NOTICE.tooDeep);
+    expect(tooDeep.files[0]?.notice).toBe(TREE_NOTICE.tooDeep);
 
     const wide = await scratch();
     for (let i = 0; i < WORKSPACE_TREE_LAYER_MAX + 3; i += 1) {

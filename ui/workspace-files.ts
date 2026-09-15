@@ -4,6 +4,7 @@
  * 隐藏目录 / 凭据形状 / node_modules 不进菜单。每条路径都走 resolveInWorkdir。
  * 服务端只转发 files[]，人话提示挂在条目的 notice 上（不是 HTTP 码）。
  */
+import type { Dirent } from "node:fs";
 import { readdir } from "node:fs/promises";
 import path from "node:path";
 import { credentialLikeName, resolveInWorkdir } from "../src/tools/fs-util.js";
@@ -103,11 +104,11 @@ function resolveListed(root: string, relative: string): string | null {
 }
 
 async function readDirSafe(abs: string): Promise<{
-  dents: Awaited<ReturnType<typeof readdir>>;
+  dents: Dirent<string>[];
   error: string | null;
 }> {
   try {
-    return { dents: await readdir(abs, { withFileTypes: true }), error: null };
+    return { dents: await readdir(abs, { withFileTypes: true, encoding: "utf8" }), error: null };
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     return { dents: [], error: code ?? "FAILED" };
