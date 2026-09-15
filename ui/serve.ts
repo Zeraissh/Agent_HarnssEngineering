@@ -35,8 +35,13 @@
  *                          飞书优先于企微、再才是通用 webhook。不印 URL。
  *   AGENT_FEISHU_ENCRYPT_KEY  可选，飞书事件订阅入站签名。无此密钥不启入站。
  *   AGENT_FEISHU_VERIFICATION_TOKEN  可选，入站 url_verification / header.token 对账
+ *   AGENT_IM_PUBLIC_BASE  可选，操作员自己的公网 HTTPS 根（隧道/反代）。
+ *                          入站已武装时启动行印「回调路径 /api/im/feishu」+
+ *                          「飞书云到不了 127.0.0.1，需要公网 HTTPS」，并拼此根。
+ *                          未配不炸。不印 encrypt key / webhook。签名不关。
  *   入站路径 POST /api/im/feishu（签名即凭证，不走 ACCESS_TOKEN）。
  *   企业微信只出站；个微/公众号入站本仓不提供。无配置启动行写「飞书/微信宿主未开」。
+ *   npm run im:tunnel 只打印 cloudflared 命令，不拉起隧道、不裸开整站。
  *   其余 AGENT_* 旋钮见 src/cli.ts 头部注释
  *
  * 默认只绑 127.0.0.1。非 loopback 不再只打印 warning：缺少强令牌或 TLS 边界会
@@ -52,8 +57,7 @@ import {
   createLocalImStartRun,
   createLocalImWaitRun,
   createOfficeNotifier,
-  formatImHostHint,
-  resolveImHostStatus,
+  formatImStartupBanner,
   resolveOfficeNotifyFromEnv,
 } from "../src/notify.js";
 
@@ -128,7 +132,7 @@ handle.server.listen(port, host, () => {
   if (hint) console.log(`  open:    ${hint}`);
   const addr = handle.server.address();
   if (addr && typeof addr === "object") boundPort = addr.port;
-  console.log(`  ${formatImHostHint(resolveImHostStatus(process.env))}`);
+  console.log(`  ${formatImStartupBanner(process.env)}`);
   if (policy.remote) {
     console.log(`  remote boundary: ${policy.trustProxy ? "trusted TLS proxy" : "insecure HTTP explicitly acknowledged"}`);
   }

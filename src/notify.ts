@@ -6,6 +6,9 @@
  *
  * 入站（仅飞书事件订阅）：校验 X-Lark-Signature，把文本消息变成一次 run，
  * 结果走同一条出站 webhook。无 ENCRYPT_KEY 不启入站，启动行写「未开」。
+ * 飞书云到不了 127.0.0.1：武装入站时启动行印回调路径 /api/im/feishu，
+ * 以及「需要公网 HTTPS」。操作员自己的隧道写 AGENT_IM_PUBLIC_BASE（可印
+ * 拼好的回调，不印 encrypt key / webhook）。签名不因隧道关掉。
  *
  * 企业微信：本仓只做群机器人出站。个微 / 公众号入站需要调用方自己的 App
  * 凭证与公网回调，这里不伪造、不假装能收私聊。
@@ -21,10 +24,13 @@ export const NOTIFY_WEBHOOK_ENV = "AGENT_NOTIFY_WEBHOOK";
 export const WECOM_WEBHOOK_ENV = "AGENT_WECOM_WEBHOOK";
 export const FEISHU_ENCRYPT_KEY_ENV = "AGENT_FEISHU_ENCRYPT_KEY";
 export const FEISHU_VERIFICATION_TOKEN_ENV = "AGENT_FEISHU_VERIFICATION_TOKEN";
+/** 操作员自己的公网 HTTPS 根（隧道/反代）。只用于启动行拼回调，不启入站。 */
+export const IM_PUBLIC_BASE_ENV = "AGENT_IM_PUBLIC_BASE";
 
 export const IM_STATUS_PATH = "/api/im";
 export const IM_FEISHU_PATH = "/api/im/feishu";
 export const IM_WECOM_PATH = "/api/im/wecom";
+export const IM_INBOUND_REACH_NOTE = "飞书云到不了 127.0.0.1，需要公网 HTTPS";
 
 export const FEISHU_TIMESTAMP_MAX_SKEW_MS = 60 * 60 * 1000;
 const IM_BODY_MAX_BYTES = 256 * 1024;
@@ -148,7 +154,9 @@ export function resolveImHostStatus(env: NodeJS.ProcessEnv = process.env): ImHos
 
 /**
  * 启动行 / CLI 横幅。boolean 旧口径保留：armed →「飞书门禁通知已开」，未开 → undefined。
- * 传入 ImHostStatus 时无配置也诚实写「未开」，且永不带 URL / token。
+ * 传入 ImHostStatus 时无配置也诚实写「未开」。永不带 encrypt key / webhook。
+ * 入站已武装时附回调路径与「飞书云到不了 127.0.0.1」。可再传入 env 印
+ * AGENT_IM_PUBLIC_BASE 拼好的 HTTPS 回调；未配或非法不炸、不印。
  */
 export function notifyArmedHint(armed: boolean | ImHostStatus): string | undefined {
   if (typeof armed === "boolean") {
@@ -157,7 +165,45 @@ export function notifyArmedHint(armed: boolean | ImHostStatus): string | undefin
   return formatImHostHint(armed);
 }
 
-export function formatImHostHint(status: ImHostStatus): string {
+const BANNED_IM_PUBLIC_BASE = /open\.feishu\.cn\/open-apis\/bot|qyapi\.weixin\.qq\.com|hooks\.slack/i;
+
+/**
+ * 读 AGENT_IM_PUBLIC_BASE。空 / 非 https / 带用户信息 / 像出站 webhook → null。
+ * 剥 query/hash，避免把误贴的 token 打进启动行。未配不抛。
+ */
+export function resolveImPublicBase(env: NodeJS.ProcessEnv = process.env): string | null {
+  const raw = env[IM_PUBLIC_BASE_ENV]?.trim() ?? "";
+  if (!raw) return null;
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "https:") return null;
+  if (url.username || url.password) return null;
+  if (BANNED_IM_PUBLIC_BASE.test(url.href)) return null;
+  const path = url.pathname.replace(/\/+$/, "");
+  return `${url.origin}${path === "" || path === "/" ? "" : path}`;
+}
+
+/** 把公网根拼成飞书「请求网址」。已带 /api/im/feishu 的不叠。 */
+export function formatImPublicCallbackUrl(publicBase: string): string {
+  const base = publicBase.replace(/\/+$/, "");
+  if (base.endsWith(IM_FEISHU_PATH)) return base;
+  return `${base}${IM_FEISHU_PATH}`;
+}
+
+/** 入站已武装时的可达性一句。publicBase 可空。 */
+export function formatImInboundReachHint(publicBase?: string | null): string {
+  const cleaned = publicBase?.trim() ? publicBase.trim() : "";
+  if (cleaned) {
+    return `回调路径 ${IM_FEISHU_PATH} → ${formatImPublicCallbackUrl(cleaned)}。${IM_INBOUND_REACH_NOTE}`;
+  }
+  return `回调路径 ${IM_FEISHU_PATH}。${IM_INBOUND_REACH_NOTE}`;
+}
+
+export function formatImHostHint(status: ImHostStatus, env?: NodeJS.ProcessEnv): string {
   const bits: string[] = [];
   if (status.feishuInbound && (status.feishuOutbound || status.genericOutbound)) {
     bits.push("飞书宿主已开（入站收消息 + 出站回结果）");
@@ -175,8 +221,57 @@ export function formatImHostHint(status: ImHostStatus): string {
   if (status.genericOutbound && !status.feishuOutbound && !status.wecomOutbound) {
     bits.push("通用 webhook 门禁通知已开");
   }
+  if (status.feishuInbound) {
+    bits.push(formatImInboundReachHint(env ? resolveImPublicBase(env) : null));
+  }
   if (bits.length === 0) return "飞书/微信宿主未开";
   return bits.join("；");
+}
+
+/** 启动行入口：status + 可选公网根，一次拼完。 */
+export function formatImStartupBanner(env: NodeJS.ProcessEnv = process.env): string {
+  return formatImHostHint(resolveImHostStatus(env), env);
+}
+
+/**
+ * `npm run im:tunnel` 正文。只打印命令，不 spawn cloudflared，不暴露无签名整站。
+ * 不接收、不回显 encrypt key / webhook。
+ */
+export function formatImTunnelInstructions(opts?: {
+  port?: number;
+  publicBase?: string | null;
+}): string {
+  const port = Number.isInteger(opts?.port) && (opts?.port ?? 0) >= 1 && (opts?.port ?? 0) <= 65_535
+    ? opts!.port!
+    : 4173;
+  const publicBase = opts?.publicBase?.trim() ? opts.publicBase.trim() : null;
+  const callback = publicBase
+    ? formatImPublicCallbackUrl(publicBase)
+    : `https://<隧道主机>${IM_FEISHU_PATH}`;
+  return [
+    "飞书入站隧道：只打印命令，不会拉起 cloudflared，也不会裸开整站。",
+    `本机回调路径：${IM_FEISHU_PATH}`,
+    `${IM_INBOUND_REACH_NOTE}。`,
+    "",
+    "1. 先在本机起 UI（默认只绑 127.0.0.1）：",
+    "   npm run ui",
+    "",
+    "2. 另开终端，把本机端口映到临时 HTTPS（需已安装 cloudflared）：",
+    `   cloudflared tunnel --url http://127.0.0.1:${port}`,
+    "",
+    "3. 把 cloudflared 印出的 https://xxxx.trycloudflare.com 写入 .env：",
+    "   AGENT_IM_PUBLIC_BASE=https://xxxx.trycloudflare.com",
+    "   Encrypt Key / webhook 只写 .env，不要贴进终端。",
+    "",
+    "4. 飞书开放平台 → 事件与回调 → 请求网址：",
+    `   ${callback}`,
+    "",
+    "注意：这条 quick tunnel 会把整个端口暴露到该主机名。",
+    `${IM_FEISHU_PATH} 仍校验 X-Lark-Signature，不会因隧道关掉签名。`,
+    "UI 页面没有飞书签名。远程访问请设 AGENT_UI_ACCESS_TOKEN（至少 32 字符）。",
+    `更好：反代只转发 POST ${IM_FEISHU_PATH}，不要把整站推上网。`,
+    "",
+  ].join("\n");
 }
 
 export function imHostStatusSnapshot(status: ImHostStatus): {

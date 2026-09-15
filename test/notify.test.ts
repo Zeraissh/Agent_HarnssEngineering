@@ -4,7 +4,7 @@
  */
 import { afterEach, describe, expect, it } from "vitest";
 import { mkdtemp, rm, readFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemoryStore } from "../src/memory.js";
@@ -16,6 +16,8 @@ import {
   FEISHU_VERIFICATION_TOKEN_ENV,
   FEISHU_WEBHOOK_ENV,
   IM_FEISHU_PATH,
+  IM_INBOUND_REACH_NOTE,
+  IM_PUBLIC_BASE_ENV,
   IM_STATUS_PATH,
   IM_WECOM_PATH,
   NOTIFY_WEBHOOK_ENV,
@@ -27,12 +29,15 @@ import {
   formatGateCardText,
   formatImHostHint,
   formatImRunResultText,
+  formatImStartupBanner,
+  formatImTunnelInstructions,
   gateNotifyPayloadFromBoard,
   notifyArmedHint,
   officeNotifySnapshot,
   parseFeishuInboundEvent,
   resolveFeishuInboundFromEnv,
   resolveImHostStatus,
+  resolveImPublicBase,
   resolveOfficeNotifyFromEnv,
   sanitizeNotifyUrlForLog,
   verifyFeishuSignature,
@@ -205,6 +210,93 @@ describe("sanitizeNotifyUrlForLog / hint / env", () => {
     }))).toContain("入站收消息");
     expect(JSON.stringify(resolveImHostStatus({ [FEISHU_ENCRYPT_KEY_ENV]: ENCRYPT_KEY })))
       .not.toContain(ENCRYPT_KEY);
+  });
+
+  it("未配 public base 不炸；armed 文案含回调路径；密钥不进 banner", () => {
+    expect(() => formatImStartupBanner({})).not.toThrow();
+    expect(formatImStartupBanner({})).toBe("飞书/微信宿主未开");
+    expect(formatImStartupBanner({ [IM_PUBLIC_BASE_ENV]: "https://im.example.test" }))
+      .toBe("飞书/微信宿主未开");
+
+    const armedNoBase = {
+      [FEISHU_ENCRYPT_KEY_ENV]: ENCRYPT_KEY,
+      [FEISHU_WEBHOOK_ENV]: LEAK,
+    };
+    const noBase = formatImStartupBanner(armedNoBase);
+    expect(noBase).toContain(IM_FEISHU_PATH);
+    expect(noBase).toContain(IM_INBOUND_REACH_NOTE);
+    expect(noBase).not.toContain(ENCRYPT_KEY);
+    expect(noBase).not.toContain("NOTIFY-LEAK");
+    expect(noBase).not.toContain(LEAK);
+    expect(noBase).not.toMatch(/sk-|hook\/[A-Za-z0-9]/);
+
+    const armedWithBase = {
+      ...armedNoBase,
+      [IM_PUBLIC_BASE_ENV]: "https://im.example.test/bridge",
+    };
+    const banner = formatImStartupBanner(armedWithBase);
+    expect(banner).toContain(`${IM_FEISHU_PATH} → https://im.example.test/bridge${IM_FEISHU_PATH}`);
+    expect(banner).toContain(IM_INBOUND_REACH_NOTE);
+    expect(banner).not.toContain(ENCRYPT_KEY);
+    expect(banner).not.toContain(LEAK);
+
+    expect(() => formatImStartupBanner({
+      ...armedNoBase,
+      [IM_PUBLIC_BASE_ENV]: "not a url",
+    })).not.toThrow();
+    const bad = formatImStartupBanner({
+      ...armedNoBase,
+      [IM_PUBLIC_BASE_ENV]: "not a url",
+    });
+    expect(bad).toContain(IM_FEISHU_PATH);
+    expect(bad).toContain(IM_INBOUND_REACH_NOTE);
+    expect(bad).not.toContain("not a url");
+  });
+
+  it("public base 只收干净 HTTPS；webhook / http / 用户信息不进 banner", () => {
+    expect(resolveImPublicBase({})).toBeNull();
+    expect(resolveImPublicBase({ [IM_PUBLIC_BASE_ENV]: "   " })).toBeNull();
+    expect(resolveImPublicBase({ [IM_PUBLIC_BASE_ENV]: LEAK })).toBeNull();
+    expect(resolveImPublicBase({ [IM_PUBLIC_BASE_ENV]: "http://im.example.test" })).toBeNull();
+    expect(resolveImPublicBase({ [IM_PUBLIC_BASE_ENV]: "https://user:pass@im.example.test" })).toBeNull();
+    expect(resolveImPublicBase({
+      [IM_PUBLIC_BASE_ENV]: "https://im.example.test/cb?token=secret#frag",
+    })).toBe("https://im.example.test/cb");
+    expect(resolveImPublicBase({ [IM_PUBLIC_BASE_ENV]: "https://im.example.test/" }))
+      .toBe("https://im.example.test");
+
+    const leakBanner = formatImStartupBanner({
+      [FEISHU_ENCRYPT_KEY_ENV]: ENCRYPT_KEY,
+      [IM_PUBLIC_BASE_ENV]: LEAK,
+    });
+    expect(leakBanner).toContain(IM_FEISHU_PATH);
+    expect(leakBanner).not.toContain("NOTIFY-LEAK");
+    expect(leakBanner).not.toContain(LEAK);
+  });
+
+  it("隧道说明只打印命令，不含密钥，不裸开无签名整站", () => {
+    const text = formatImTunnelInstructions({
+      port: 4173,
+      publicBase: "https://im.example.test",
+    });
+    expect(text).toContain("只打印命令");
+    expect(text).toContain("不会拉起 cloudflared");
+    expect(text).toContain("也不会裸开整站");
+    expect(text).toContain("cloudflared tunnel --url http://127.0.0.1:4173");
+    expect(text).toContain(IM_FEISHU_PATH);
+    expect(text).toContain("https://im.example.test/api/im/feishu");
+    expect(text).toContain("AGENT_UI_ACCESS_TOKEN");
+    expect(text).toContain("仍校验 X-Lark-Signature");
+    expect(text).toContain("反代只转发 POST");
+    expect(text).not.toContain(ENCRYPT_KEY);
+    expect(text).not.toContain("NOTIFY-LEAK");
+    expect(text).not.toContain(LEAK);
+    expect(formatImTunnelInstructions({ port: 0 })).toContain("127.0.0.1:4173");
+    const script = readFileSync(join(process.cwd(), "scripts", "im-tunnel.ts"), "utf8");
+    expect(script).toContain("formatImTunnelInstructions");
+    expect(script).not.toMatch(/node:child_process|execFile\(|execSync\(|spawn\(/);
+    expect(script).not.toContain("AGENT_FEISHU_ENCRYPT_KEY");
+    expect(script).not.toContain("AGENT_FEISHU_WEBHOOK");
   });
 
   it("快照只有 kind/armed", () => {

@@ -16,6 +16,7 @@
     "cli": "tsx --env-file-if-exists=.env src/cli.ts",
     "doctor": "tsx --env-file-if-exists=.env src/cli.ts --doctor",
     "ui": "tsx --env-file-if-exists=.env ui/serve.ts",
+    "im:tunnel": "tsx --env-file-if-exists=.env scripts/im-tunnel.ts",
     "desktop": "npm run desktop --prefix cross-app",
     "eval": "tsx --env-file-if-exists=.env eval/run.ts",
     "ab": "tsx --env-file-if-exists=.env eval/ab.ts",

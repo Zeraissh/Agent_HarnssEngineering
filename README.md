@@ -25,7 +25,7 @@
 ### 诚实边界
 
 - 本地单操作员控制台，不是 IDE 插件。空态写「现在只能在这个窗口下指令。」
-- **飞书：** 配 `AGENT_FEISHU_ENCRYPT_KEY` 才开入站（事件订阅签名 → 开 run → `AGENT_FEISHU_WEBHOOK` 回结果）。没配启动行写「飞书/微信宿主未开」。本仓不帮你注册飞书应用；入站还要公网可达。
+- **飞书：** 配 `AGENT_FEISHU_ENCRYPT_KEY` 才开入站（事件订阅签名 → 开 run → `AGENT_FEISHU_WEBHOOK` 回结果）。回调固定 `POST /api/im/feishu`，签名不会关。飞书云到不了 `127.0.0.1`，需要公网 HTTPS：自己反代只转发该路径，或 `npm run im:tunnel` 只打印 cloudflared 命令（不自动拉隧道、不裸开无签名整站）。把隧道根写入 `AGENT_IM_PUBLIC_BASE`，启动行会印完整回调。没配启动行写「飞书/微信宿主未开」。本仓不帮你注册飞书应用。Encrypt Key / webhook 不进 stdout。
 - **企业微信：** 仅 `AGENT_WECOM_WEBHOOK` 群机器人出站。个微 / 公众号入站要你自己的 App 凭证，本仓不伪造、不收私聊。
 - GitHub / 飞书 OpenAPI 在设置 → MCP；Web **默认不连** MCP，要 `AGENT_UI_MCP=1`。没连 GitHub 只说「现在只会改这个文件夹」，不给开 PR。
 - 工具写入圈在工作目录白名单内。Android 仍是实验客户端。

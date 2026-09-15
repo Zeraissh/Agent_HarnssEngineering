@@ -97,6 +97,8 @@
  *   AGENT_NOTIFY_WEBHOOK 可选，通用 JSON webhook（同一卡片正文）。
  *   AGENT_FEISHU_ENCRYPT_KEY 可选，飞书事件订阅入站签名。无此密钥不启入站。
  *   AGENT_FEISHU_VERIFICATION_TOKEN 可选，入站 url_verification / header.token 对账。
+ *   AGENT_IM_PUBLIC_BASE 可选，操作员自己的公网 HTTPS 根。入站已武装时启动行
+ *                       印 /api/im/feishu +「飞书云到不了 127.0.0.1」。不印密钥。
  *   AGENT_MD_MAX_CHARS  可选，AGENT.md 加载总量上限（默认 16000，≥1000）。非法值 exit 1。
  *                       开关是文件本身：~/.agent/AGENT.md、项目 AGENT.md、.agent/rules/*.md
  *                       都不在 = 机制不存在。这是指导不是执行，不能授予权限。
@@ -148,9 +150,8 @@ import {
 } from "./project-status.js";
 import {
   createOfficeNotifier,
-  formatImHostHint,
+  formatImStartupBanner,
   gateNotifyPayloadFromBoard,
-  resolveImHostStatus,
   resolveOfficeNotifyFromEnv,
 } from "./notify.js";
 import { AUTO_CONCURRENCY_CAP, plannedStopReason, planParallelWidth, runPlanned, runVerified } from "./orchestrate.js";
@@ -1111,7 +1112,7 @@ async function main(): Promise<void> {
 
   const memShared = isSharedMemoryDir(process.cwd(), memory.dir);
   const officeNotifier = createOfficeNotifier(resolveOfficeNotifyFromEnv(process.env) ?? { enabled: false });
-  console.log(c.dim(formatImHostHint(resolveImHostStatus(process.env))));
+  console.log(c.dim(formatImStartupBanner(process.env)));
   const memTools = [
     ...createMemoryTools(memory),
     createProjectStatusTool(() => memory, {
