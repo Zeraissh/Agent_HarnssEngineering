@@ -26,7 +26,17 @@ import {
   buildInspectHookSource,
   formatObject3dReview,
   isReviewChrome,
+  isReviewLabel,
   isReviewOverlay,
+  isReviewHelper,
+  isVisibleReviewMesh,
+  nearestVisibleDescendant,
+  resolveReviewObject3d,
+  pickVisibleRayHit,
+  nearestGroupMeshAlongRay,
+  findThreeLib,
+  findThreeContext,
+  resolveLabelReview,
   shouldSkipInvisibleMaterial,
   isInspectPick,
   isInspectSet,
@@ -148,11 +158,186 @@ describe("inspect hook 注入", () => {
     const label = { closest: (sel) => (sel.includes(".label") ? {} : null) };
     expect(isReviewChrome(chrome)).toBe(true);
     expect(isReviewChrome(label)).toBe(false);
-    expect(isReviewOverlay(label)).toBe(true);
+    expect(isReviewLabel(label)).toBe(true);
+    expect(isReviewOverlay(label)).toBe(false);
     expect(isInspectSet({ type: INSPECT_SET_MESSAGE_TYPE, on: true })).toBe(true);
     expect(isInspectSet({ type: INSPECT_SET_MESSAGE_TYPE, on: "yes" })).toBe(false);
   });
 
+  it("三维点评钩子含空 Group / app.scene / CSS 标签，不要求页面挂 THREE", () => {
+    const src = buildInspectHookSource({ startOn: false });
+    expect(src).toContain("app.scene");
+    expect(src).toContain("isWebGLRenderer");
+    expect(src).toContain("isCSS2DObject");
+    expect(src).toContain("data-review-label");
+    expect(src).toContain("nearestVis");
+    expect(src).toContain("function isLabel");
+    expect(src).toContain("window.scene");
+  });
+});
+
+function meshAt(name, pos, extra = {}) {
+  return {
+    name,
+    type: "Mesh",
+    isMesh: true,
+    visible: true,
+    geometry: { type: "BoxGeometry" },
+    material: { visible: true },
+    position: pos,
+    userData: {},
+    children: [],
+    ...extra,
+  };
+}
+
+describe("三维点评选不中的缺口", () => {
+  it("空 Group 落到最近的可见后代；隐形盒不当命中；没有可见后代不编造", () => {
+    const invis = meshAt("pickBox", { x: 0, y: 0, z: 0 }, {
+      material: { visible: false },
+      userData: { slot: 3 },
+    });
+    const near = meshAt("Wafer", { x: 1, y: 0, z: 0 });
+    const far = meshAt("Shell", { x: 20, y: 0, z: 0 });
+    const group = {
+      name: "Slot3",
+      type: "Group",
+      isGroup: true,
+      visible: true,
+      userData: { slot: 3 },
+      position: { x: 0, y: 0, z: 0 },
+      children: [invis, near, far],
+    };
+    invis.parent = group;
+    near.parent = group;
+    far.parent = group;
+
+    expect(isVisibleReviewMesh(group)).toBe(false);
+    expect(isVisibleReviewMesh(invis)).toBe(false);
+    expect(isVisibleReviewMesh(near)).toBe(true);
+    expect(nearestVisibleDescendant(group, { from: { x: 0, y: 0, z: 0 } })).toBe(near);
+    expect(resolveReviewObject3d(group)).toBe(near);
+    expect(resolveReviewObject3d(invis)).toBe(near);
+    expect(pickVisibleRayHit([{ object: invis, point: { x: 0, y: 0, z: 0 } }])).toBe(near);
+    expect(formatObject3dReview(resolveReviewObject3d(invis))).toEqual({
+      selector: "mesh:Wafer",
+      text: "Wafer",
+    });
+    const generic = meshAt("Mesh", { x: 0.2, y: 0, z: 0 });
+    generic.parent = group;
+    expect(formatObject3dReview(generic)).toEqual({ selector: "mesh:slot-3", text: "槽位 3" });
+
+    const empty = { name: "Empty", type: "Group", isGroup: true, visible: true, userData: {}, children: [] };
+    expect(nearestVisibleDescendant(empty)).toBeNull();
+    expect(resolveReviewObject3d(empty)).toBeNull();
+    expect(pickVisibleRayHit([{ object: empty }])).toBeNull();
+  });
+
+  it("没有 window.THREE 也能从 app.scene / 挂着的 WebGLRenderer 取到上下文", () => {
+    const canvas = { tagName: "CANVAS" };
+    const scene = { isScene: true, type: "Scene", children: [] };
+    const camera = { isCamera: true, type: "PerspectiveCamera" };
+    const renderer = {
+      isWebGLRenderer: true,
+      domElement: canvas,
+      render() {},
+      __agentLastScene: scene,
+      __agentLastCamera: camera,
+    };
+    const root = { app: { scene, camera, renderer } };
+    const ctx = findThreeContext(root, canvas);
+    expect(ctx.THREE).toBeNull();
+    expect(ctx.scene).toBe(scene);
+    expect(ctx.camera).toBe(camera);
+    expect(ctx.renderer).toBe(renderer);
+
+    const loose = { orphanRenderer: renderer };
+    expect(findThreeContext(loose, canvas).renderer).toBe(renderer);
+    expect(findThreeContext(loose, canvas).scene).toBe(scene);
+    expect(findThreeLib({ three: { Raycaster() {}, Vector2: true, Scene: true } })).toBeTruthy();
+  });
+
+  it("CSS 标签绑到对象（含 CSS2D parent）；没绑定就点评标签自己；侧栏仍是 chrome", () => {
+    const door = meshAt("Door", { x: 0, y: 0, z: 0 }, { userData: { reviewId: "door" } });
+    const scene = { isScene: true, type: "Scene", children: [door], userData: {} };
+    door.parent = scene;
+
+    const label = {
+      closest(sel) { return sel.includes(".label") ? this : null; },
+      getAttribute(name) { return name === "data-review-id" ? "door" : ""; },
+    };
+    const bound = resolveLabelReview(label, scene);
+    expect(bound.kind).toBe("mesh");
+    expect(bound.mesh.selector).toBe('[data-review-id="door"]');
+
+    const labelEl = { id: "css-door" };
+    const css = {
+      isCSS2DObject: true,
+      type: "CSS2DObject",
+      element: { contains: (el) => el === labelEl },
+      parent: door,
+      userData: {},
+      children: [],
+    };
+    const scene2 = { isScene: true, type: "Scene", children: [door, css] };
+    css.parent = door;
+    const fromCss = resolveLabelReview(labelEl, scene2);
+    expect(fromCss.kind).toBe("mesh");
+    expect(fromCss.mesh.selector).toBe('[data-review-id="door"]');
+
+    const orphan = {
+      closest(sel) { return sel.includes(".label") ? this : null; },
+      getAttribute() { return ""; },
+    };
+    expect(resolveLabelReview(orphan, scene)).toEqual({ kind: "dom", el: orphan });
+
+    const atmos = { closest: (sel) => (sel.includes(".atmos") ? {} : null) };
+    expect(isReviewOverlay(atmos)).toBe(true);
+    expect(isReviewChrome({ closest: (s) => (s.includes("button") ? {} : null) })).toBe(true);
+    expect(isReviewHelper({ type: "BoxHelper" })).toBe(true);
+  });
+
+  it("有名空 Group 的包围盒能落到可见后代；匿名 Group 不抢背景", () => {
+    const wafer = meshAt("Wafer", { x: 0, y: 0, z: 0 });
+    const named = {
+      name: "Carrier",
+      type: "Group",
+      isGroup: true,
+      visible: true,
+      userData: {},
+      children: [wafer],
+    };
+    wafer.parent = named;
+    const anon = {
+      name: "Group",
+      type: "Group",
+      isGroup: true,
+      visible: true,
+      userData: {},
+      children: [meshAt("HiddenShell", { x: 0, y: 0, z: 0 })],
+    };
+    const scene = { isScene: true, type: "Scene", children: [named, anon] };
+    const THREE = {
+      Box3: function Box3() {
+        this.setFromObject = () => {};
+        this.isEmpty = () => false;
+      },
+    };
+    const ray = {
+      origin: { x: 0, y: 0, z: 10 },
+      intersectBox(_box, target) {
+        target.x = 0;
+        target.y = 0;
+        target.z = 0;
+        return target;
+      },
+    };
+    expect(nearestGroupMeshAlongRay(scene, ray, THREE)).toBe(wafer);
+    expect(nearestGroupMeshAlongRay({ isScene: true, children: [anon] }, ray, THREE)).toBeNull();
+  });
+});
+
+describe("inspect hook 其余注入", () => {
   it("print 钩子调起 window.print", () => {
     expect(PRINT_HOOK_SOURCE).toContain("window.print");
     const hooked = appendSiteHooks("<html><body>x</body></html>", { print: true });
@@ -219,6 +404,83 @@ describe("inspect runtime 就地开关", () => {
       expect(document.documentElement.getAttribute("data-agent-inspect")).toBeNull();
     } finally {
       window.removeEventListener("message", onMsg);
+    }
+  });
+
+  it("runtime：标签绑对象、未绑定标签走自己、侧栏当 chrome、隐形盒落到可见后代", async () => {
+    const invis = meshAt("pickBox", { x: 0, y: 0, z: 0 }, {
+      material: { visible: false },
+      userData: { slot: 7 },
+    });
+    const wafer = meshAt("WaferA", { x: 0.5, y: 0, z: 0 });
+    const slot = {
+      name: "Slot7",
+      type: "Group",
+      isGroup: true,
+      visible: true,
+      userData: { slot: 7 },
+      position: { x: 0, y: 0, z: 0 },
+      children: [invis, wafer],
+    };
+    invis.parent = slot;
+    wafer.parent = slot;
+    const door = meshAt("Door", { x: 0, y: 0, z: 0 }, { userData: { reviewId: "door" } });
+    const scene = { isScene: true, type: "Scene", children: [slot, door] };
+    slot.parent = scene;
+    door.parent = scene;
+
+    document.body.innerHTML = [
+      '<div class="panel"><button id="go">开始</button></div>',
+      '<div class="labels"><div class="label" id="lbl-door" data-review-id="door">舱门</div></div>',
+      '<div class="label" id="lbl-free">独立标注</div>',
+      '<canvas id="stage"></canvas>',
+    ].join("");
+    const canvas = document.getElementById("stage");
+    canvas.getBoundingClientRect = () => ({ left: 0, top: 0, width: 100, height: 100, right: 100, bottom: 100 });
+
+    window.scene = scene;
+    window.camera = { isCamera: true, type: "PerspectiveCamera" };
+    window.THREE = {
+      Vector2: function Vector2(x, y) { this.x = x; this.y = y; },
+      Raycaster: function Raycaster() {
+        this.setFromCamera = function setFromCamera() {};
+        this.intersectObjects = function intersectObjects() {
+          return [{ object: invis, point: { x: 0, y: 0, z: 0 } }];
+        };
+      },
+      WebGLRenderer: { prototype: { render() {} } },
+    };
+
+    const picks = [];
+    const onMsg = (ev) => {
+      if (ev.data?.type === INSPECT_MESSAGE_TYPE) picks.push(ev.data);
+    };
+    window.addEventListener("message", onMsg);
+    try {
+      (0, eval)(buildInspectHookSource({ startOn: true }));
+      const click = (el) => el.dispatchEvent(new MouseEvent("click", {
+        bubbles: true, cancelable: true, clientX: 10, clientY: 10,
+      }));
+      click(document.getElementById("go"));
+      await new Promise((r) => setTimeout(r, 0));
+      expect(picks.some((p) => /button|#go/.test(String(p.selector)))).toBe(true);
+
+      click(document.getElementById("lbl-door"));
+      await new Promise((r) => setTimeout(r, 0));
+      expect(picks.some((p) => p.selector === '[data-review-id="door"]')).toBe(true);
+
+      click(document.getElementById("lbl-free"));
+      await new Promise((r) => setTimeout(r, 0));
+      expect(picks.some((p) => /label|lbl-free/.test(String(p.selector)))).toBe(true);
+
+      click(canvas);
+      await new Promise((r) => setTimeout(r, 0));
+      expect(picks.some((p) => p.selector === "mesh:slot-7" || p.selector === "mesh:WaferA")).toBe(true);
+    } finally {
+      window.removeEventListener("message", onMsg);
+      delete window.THREE;
+      delete window.scene;
+      delete window.camera;
     }
   });
 });

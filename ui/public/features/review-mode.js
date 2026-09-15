@@ -8,9 +8,11 @@
  * 开机即开（换文件重挂时沿用），不是进入点评的必经导航。
  * 点选经 postMessage 回来；selector / 文案当不可信字符串，只写进输入框。
  * 三维页（FOUP / liquid-demo）：钩子包一层 THREE.WebGLRenderer.render
- * 记下 scene/camera，再射线打可见 mesh；跳过 material.visible=false 的
- * 隐形拾取盒、Helper、UI chrome。CSS 标注 / atmos 用 elementsFromPoint
- * 穿透到 canvas，避免覆盖层把槽位/壳体点丢了。
+ * 记下 scene/camera，也认 window.scene / app.scene / 页内 WebGLRenderer，
+ * 不要求页面改源码挂 THREE。射线打可见 mesh；跳过 material.visible=false
+ * 的隐形拾取盒、Helper。空 Group 落到最近的可见后代。CSS2D / `.label`
+ * 点标签：绑到对象就点对象，没绑就点评标签自己，不当透明穿透。
+ * `.atmos` / loading 仍穿透。侧栏 / HUD / 按钮仍走 DOM，不当三维。
  * 翻页也走同一条路：注入 runtime 收 goto、在 iframe 里切可见页。不读
  * contentDocument，因此不需要放宽 same-origin。
  */
@@ -133,9 +135,16 @@ export function isReviewChrome(el) {
   return Boolean(el.closest(".panel, .hud, header, footer, nav, button, a, input, textarea, select, [data-review-ignore]"));
 }
 
-/** 大气层、CSS 标注、载入遮罩：挡在 canvas 上，点评时应穿透去射三维。 */
+/** CSS 标注 / CSS2D 标签：要点它自己或它绑的对象，不当透明层。 */
+export function isReviewLabel(el) {
+  if (!el || typeof el.closest !== "function") return false;
+  return Boolean(el.closest(".label, [data-review-label]"));
+}
+
+/** 大气层、载入遮罩、标注层空档：挡在 canvas 上，点评时应穿透去射三维。标签本身不是 overlay。 */
 export function isReviewOverlay(el) {
   if (!el || typeof el.closest !== "function") return false;
+  if (isReviewLabel(el)) return false;
   return Boolean(el.closest("#agent-inspect-ring, .atmos, .labels, .tip, .loading, .fallback, [data-review-overlay]"));
 }
 
@@ -149,9 +158,369 @@ export function shouldSkipInvisibleMaterial(obj) {
   return mat.visible === false;
 }
 
+/** Helper / Gizmo / CSS2D 本体不当成被点中的形体（标签走 DOM/绑定，不走这条）。 */
+export function isReviewHelper(obj) {
+  if (!obj) return true;
+  const t = String(obj.type || "");
+  return /Helper|Gizmo|TransformControls/.test(t) || Boolean(obj.isCSS2DObject || obj.isCSS3DObject);
+}
+
+/** 看得见的体积：Mesh 族 + geometry + 可见材质。空 Group / 隐形盒不算。 */
+export function isVisibleReviewMesh(obj) {
+  if (!obj || obj.visible === false) return false;
+  if (isReviewHelper(obj) || shouldSkipInvisibleMaterial(obj)) return false;
+  if (!(obj.isMesh || obj.isInstancedMesh || obj.isSkinnedMesh)) return false;
+  return Boolean(obj.geometry && obj.material);
+}
+
+function object3dWorldPos(obj) {
+  if (!obj) return { x: 0, y: 0, z: 0 };
+  if (typeof obj.getWorldPosition === "function") {
+    try {
+      const out = obj.getWorldPosition({ x: 0, y: 0, z: 0 });
+      if (out) return { x: Number(out.x) || 0, y: Number(out.y) || 0, z: Number(out.z) || 0 };
+    } catch {
+      /* ignore */
+    }
+  }
+  let x = 0;
+  let y = 0;
+  let z = 0;
+  let n = obj;
+  let depth = 0;
+  while (n && depth < 16) {
+    const p = n.position;
+    if (p) {
+      x += Number(p.x) || 0;
+      y += Number(p.y) || 0;
+      z += Number(p.z) || 0;
+    }
+    n = n.parent;
+    depth += 1;
+  }
+  return { x, y, z };
+}
+
+function dist3(a, b) {
+  const dx = (a?.x || 0) - (b?.x || 0);
+  const dy = (a?.y || 0) - (b?.y || 0);
+  const dz = (a?.z || 0) - (b?.z || 0);
+  return Math.sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+/**
+ * 空 Group / 只有变换的节点：落到空间上最近的可见后代 mesh。
+ * `opts.from` 缺省用节点自身世界坐标（点隐形盒时用命中点）。
+ */
+export function nearestVisibleDescendant(root, opts = {}) {
+  if (!root) return null;
+  if (isVisibleReviewMesh(root)) return root;
+  const from = opts.from || object3dWorldPos(root);
+  let best = null;
+  let bestD = Infinity;
+  const stack = Array.isArray(root.children) ? root.children.slice() : [];
+  const seen = typeof WeakSet === "function" ? new WeakSet() : null;
+  let steps = 0;
+  while (stack.length && steps++ < 400) {
+    const n = stack.shift();
+    if (!n || n.visible === false) continue;
+    if (seen) {
+      if (seen.has(n)) continue;
+      seen.add(n);
+    }
+    if (isVisibleReviewMesh(n)) {
+      const d = dist3(from, object3dWorldPos(n));
+      if (d < bestD) {
+        bestD = d;
+        best = n;
+      }
+    }
+    if (Array.isArray(n.children) && n.children.length) {
+      for (const child of n.children) stack.push(child);
+    }
+  }
+  return best;
+}
+
+/** 点到空 Group / 隐形盒时收成可见后代；已经是可见 mesh 则原样返回。 */
+export function resolveReviewObject3d(obj, opts = {}) {
+  if (!obj) return null;
+  if (isVisibleReviewMesh(obj)) return obj;
+  const from = opts.from;
+  if (obj.parent && !obj.parent.isScene && (shouldSkipInvisibleMaterial(obj) || !obj.geometry)) {
+    return nearestVisibleDescendant(obj.parent, { from }) || nearestVisibleDescendant(obj, { from });
+  }
+  return nearestVisibleDescendant(obj, { from });
+}
+
+/** 射线命中列表：跳过 Helper / 隐形盒，空节点落到最近可见后代。 */
+export function pickVisibleRayHit(hits) {
+  const list = Array.isArray(hits) ? hits : [];
+  for (const hit of list) {
+    const obj = hit && hit.object;
+    if (!obj || isReviewHelper(obj)) continue;
+    if (shouldSkipInvisibleMaterial(obj) || !isVisibleReviewMesh(obj)) {
+      const vis = resolveReviewObject3d(obj, { from: hit.point });
+      if (vis) return vis;
+      continue;
+    }
+    return obj;
+  }
+  return null;
+}
+
+function isNamedReviewGroup(n) {
+  if (!n || n.isScene) return false;
+  if (!(n.isGroup || n.type === "Group")) return false;
+  const ud = n.userData || {};
+  if (ud.reviewId || ud.slot != null) return true;
+  const name = String(n.name || "").trim();
+  return Boolean(name && !/^(Object3D|Group|Scene)$/i.test(name));
+}
+
+/**
+ * 射线没打到 mesh 时：用有名 Group 的包围盒（含可见后代）再收一次。
+ * 匿名空 Group 不抢背景点击。
+ */
+export function nearestGroupMeshAlongRay(scene, ray, THREE) {
+  if (!scene || !ray || !THREE || typeof THREE.Box3 !== "function") return null;
+  const box = new THREE.Box3();
+  const target = typeof THREE.Vector3 === "function" ? new THREE.Vector3() : { x: 0, y: 0, z: 0 };
+  let best = null;
+  let bestD = Infinity;
+  const visit = (n) => {
+    if (!n || n.visible === false) return;
+    if (isNamedReviewGroup(n)) {
+      const mesh = nearestVisibleDescendant(n, { from: ray.origin });
+      if (mesh && typeof box.setFromObject === "function") {
+        box.setFromObject(n);
+        const empty = typeof box.isEmpty === "function" && box.isEmpty();
+        if (!empty && typeof ray.intersectBox === "function" && ray.intersectBox(box, target)) {
+          const d = dist3(ray.origin || { x: 0, y: 0, z: 0 }, target);
+          if (d < bestD) {
+            bestD = d;
+            best = mesh;
+          }
+        }
+      }
+    }
+    const kids = n.children || [];
+    for (const child of kids) visit(child);
+  };
+  visit(scene);
+  return best;
+}
+
+function isSceneLike(o) {
+  return Boolean(o && typeof o === "object" && (o.isScene === true || o.type === "Scene"));
+}
+
+function isCameraLike(o) {
+  return Boolean(o && typeof o === "object" && (o.isCamera === true || /Camera$/.test(String(o.type || ""))));
+}
+
+function isRendererLike(o) {
+  return Boolean(
+    o
+    && typeof o === "object"
+    && (o.isWebGLRenderer === true || (o.domElement && typeof o.render === "function")),
+  );
+}
+
+function isThreeLib(o) {
+  return Boolean(o && typeof o === "object" && typeof o.Raycaster === "function" && o.Vector2);
+}
+
+const THREE_CONTEXT_BAGS = ["app", "App", "viewer", "world", "game", "stage", "demo", "engine", "threeApp", "foup", "main"];
+const THREE_CONTEXT_SKIP = new Set([
+  "parent", "top", "frames", "self", "window", "document", "location",
+  "navigator", "performance", "console", "localStorage", "sessionStorage",
+  "history", "speechSynthesis", "chrome", "external",
+]);
+
+function takeThreeFromBag(bag, acc, canvas) {
+  if (!bag || typeof bag !== "object") return;
+  if (!acc.THREE && isThreeLib(bag.THREE)) acc.THREE = bag.THREE;
+  if (!acc.THREE && isThreeLib(bag.three)) acc.THREE = bag.three;
+  if (!acc.THREE && isThreeLib(bag)) acc.THREE = bag;
+  if (!acc.scene && isSceneLike(bag.scene)) acc.scene = bag.scene;
+  if (!acc.camera && isCameraLike(bag.camera)) acc.camera = bag.camera;
+  if (!acc.renderer && isRendererLike(bag.renderer)) acc.renderer = bag.renderer;
+  if (!acc.scene && isSceneLike(bag)) acc.scene = bag;
+  if (!acc.camera && isCameraLike(bag)) acc.camera = bag;
+  if (isRendererLike(bag)) {
+    if (canvas && bag.domElement === canvas) acc.renderer = bag;
+    else if (!acc.renderer) acc.renderer = bag;
+  }
+}
+
+/** 找 THREE 命名空间：window.THREE / window.three / 常见袋里的 THREE。 */
+export function findThreeLib(root = globalThis) {
+  const acc = { THREE: null, scene: null, camera: null, renderer: null };
+  takeThreeFromBag(root, acc);
+  if (acc.THREE) return acc.THREE;
+  if (!root || typeof root !== "object") return null;
+  for (const key of THREE_CONTEXT_BAGS) {
+    try {
+      takeThreeFromBag(root[key], acc);
+    } catch {
+      /* ignore */
+    }
+    if (acc.THREE) return acc.THREE;
+  }
+  try {
+    const keys = Object.keys(root);
+    for (let i = 0; i < keys.length && i < 80; i++) {
+      if (THREE_CONTEXT_SKIP.has(keys[i])) continue;
+      let v;
+      try { v = root[keys[i]]; } catch { continue; }
+      if (isThreeLib(v)) return v;
+    }
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
+/**
+ * 找 scene / camera / renderer，不要求页面改源码挂 window.THREE。
+ * 认 window.scene、app.scene、挂着的 WebGLRenderer（含 canvas.domElement 对上的）。
+ */
+export function findThreeContext(root = globalThis, canvas) {
+  const acc = { THREE: findThreeLib(root), scene: null, camera: null, renderer: null };
+  const bags = [root];
+  if (root && typeof root === "object") {
+    for (const key of THREE_CONTEXT_BAGS) {
+      try {
+        const bag = root[key];
+        if (bag && typeof bag === "object") bags.push(bag);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+  for (const bag of bags) takeThreeFromBag(bag, acc, canvas);
+  if (root && typeof root === "object") {
+    if (!acc.scene && isSceneLike(root.scene)) acc.scene = root.scene;
+    if (!acc.camera && isCameraLike(root.camera)) acc.camera = root.camera;
+    if (!acc.scene && root.app && isSceneLike(root.app.scene)) acc.scene = root.app.scene;
+    if (!acc.camera && root.app && isCameraLike(root.app.camera)) acc.camera = root.app.camera;
+  }
+  if (canvas) {
+    const attached = [canvas.__renderer, canvas._renderer, canvas.renderer];
+    for (const r of attached) {
+      if (isRendererLike(r)) acc.renderer = r;
+    }
+  }
+  try {
+    const keys = root && typeof root === "object" ? Object.keys(root) : [];
+    for (let i = 0; i < keys.length && i < 80; i++) {
+      if (THREE_CONTEXT_SKIP.has(keys[i])) continue;
+      let v;
+      try { v = root[keys[i]]; } catch { continue; }
+      if (!v || typeof v !== "object") continue;
+      takeThreeFromBag(v, acc, canvas);
+      if (canvas && isRendererLike(v) && v.domElement === canvas) acc.renderer = v;
+    }
+  } catch {
+    /* ignore */
+  }
+  if (canvas && acc.renderer && acc.renderer.domElement && acc.renderer.domElement !== canvas) {
+    acc.renderer = null;
+    for (const bag of bags) {
+      if (isRendererLike(bag.renderer) && bag.renderer.domElement === canvas) acc.renderer = bag.renderer;
+    }
+  }
+  const rend = acc.renderer;
+  if (rend) {
+    if (!acc.scene && isSceneLike(rend.__agentLastScene)) acc.scene = rend.__agentLastScene;
+    if (!acc.camera && isCameraLike(rend.__agentLastCamera)) acc.camera = rend.__agentLastCamera;
+    if (!acc.scene && isSceneLike(rend.scene)) acc.scene = rend.scene;
+    if (!acc.camera && isCameraLike(rend.camera)) acc.camera = rend.camera;
+  }
+  return acc;
+}
+
+export function readLabelBinding(el) {
+  if (!el) return null;
+  const node = typeof el.closest === "function"
+    ? (el.closest(".label, [data-review-label]") || el)
+    : el;
+  if (typeof node.getAttribute !== "function") return { el: node, reviewId: "", slot: "", target: "" };
+  const reviewId = String(node.getAttribute("data-review-id") || "").trim();
+  const slotRaw = node.getAttribute("data-slot") ?? node.getAttribute("data-review-slot");
+  const target = String(
+    node.getAttribute("data-target")
+    || node.getAttribute("data-for")
+    || node.getAttribute("data-object")
+    || node.getAttribute("data-mesh")
+    || "",
+  ).trim();
+  return { el: node, reviewId, slot: slotRaw == null ? "" : String(slotRaw), target };
+}
+
+function walkObject3d(root, pred) {
+  if (!root) return null;
+  let found = null;
+  const visit = (n) => {
+    if (!n || found) return;
+    if (pred(n)) {
+      found = n;
+      return;
+    }
+    const kids = n.children || [];
+    for (let i = 0; i < kids.length && !found; i++) visit(kids[i]);
+  };
+  visit(root);
+  return found;
+}
+
+export function findObject3dByBinding(scene, binding) {
+  if (!scene || !binding) return null;
+  const rid = binding.reviewId ? String(binding.reviewId) : "";
+  const slot = binding.slot;
+  const target = binding.target ? String(binding.target) : "";
+  if (!rid && (slot == null || slot === "") && !target) return null;
+  return walkObject3d(scene, (n) => {
+    const ud = n.userData || {};
+    if (rid && String(ud.reviewId) === rid) return true;
+    if (slot != null && slot !== "" && Number.isFinite(Number(slot)) && Number(ud.slot) === Number(slot)) return true;
+    if (target && (n.name === target || String(ud.name ?? "") === target)) return true;
+    return false;
+  });
+}
+
+export function findCss2dOwner(scene, el) {
+  if (!scene || !el) return null;
+  return walkObject3d(scene, (n) => {
+    if (!(n.isCSS2DObject || n.isCSS3DObject)) return false;
+    const node = n.element;
+    return Boolean(node && (node === el || (typeof node.contains === "function" && node.contains(el))));
+  });
+}
+
+/** 点 CSS 标签：有绑定就收成三维对象（空 Group 再落到可见后代），没有就点评标签自己。 */
+export function resolveLabelReview(el, scene) {
+  if (!el) return null;
+  const binding = readLabelBinding(el);
+  const node = (binding && binding.el) || el;
+  let start = findCss2dOwner(scene, node);
+  if (start) {
+    const ud = start.userData || {};
+    const bound = ud.target || ud.object || (start.parent && !start.parent.isScene ? start.parent : null);
+    start = bound || start;
+  }
+  if (!start) start = findObject3dByBinding(scene, binding);
+  if (start) {
+    const obj = resolveReviewObject3d(start) || start;
+    return { kind: "mesh", mesh: formatObject3dReview(obj) };
+  }
+  return { kind: "dom", el: node };
+}
+
 /**
  * 三维命中 → 点评行用的 selector。优先 data-review-id / userData.reviewId / slot / 非泛名。
- * 空 Group 射不中（没有形体），由调用方走 mesh 再向上收口。
+ * 空 Group 先由 resolveReviewObject3d 落到可见后代，再走这里向上收口。
  */
 export function formatObject3dReview(obj) {
   if (!obj || typeof obj !== "object") return { selector: "mesh:(未识别)", text: "" };
@@ -184,7 +553,8 @@ export function formatObject3dReview(obj) {
 
 /**
  * iframe 内点评 runtime。默认休眠；`startOn` 或收到 `agent-inspect-set` 才开。
- * 三维：包 WebGLRenderer.render 记住 scene/camera，射线打可见 mesh。
+ * 三维：包 WebGLRenderer.render，并找 window.scene / app.scene / WebGLRenderer；
+ * 空 Group 落到可见后代；CSS 标签绑对象或点评自己。
  */
 export function buildInspectHookSource(opts = {}) {
   const startOn = Boolean(opts.startOn);
@@ -226,8 +596,13 @@ export function buildInspectHookSource(opts = {}) {
     if (el.closest(".labels, .label, .atmos, .tip, #agent-inspect-ring")) return false;
     return Boolean(el.closest(".panel, .hud, header, footer, nav, button, a, input, textarea, select, [data-review-ignore]"));
   }
+  function isLabel(el){
+    if (!el || !el.closest) return false;
+    return Boolean(el.closest(".label, [data-review-label]"));
+  }
   function isOverlay(el){
     if (!el || !el.closest) return false;
+    if (el.closest(".label, [data-review-label]")) return false;
     return Boolean(el.closest("#agent-inspect-ring, .atmos, .labels, .tip, .loading, .fallback, [data-review-overlay]"));
   }
   function skipInv(obj){
@@ -244,6 +619,69 @@ export function buildInspectHookSource(opts = {}) {
   function isHelper(obj){
     var t = String(obj && obj.type || "");
     return /Helper|Gizmo|TransformControls/.test(t) || Boolean(obj && (obj.isCSS2DObject || obj.isCSS3DObject));
+  }
+  function isVisMesh(obj){
+    if (!obj || obj.visible === false || skipInv(obj) || isHelper(obj)) return false;
+    if (!(obj.isMesh || obj.isInstancedMesh || obj.isSkinnedMesh)) return false;
+    return Boolean(obj.geometry && obj.material);
+  }
+  function wpos(obj){
+    if (obj && typeof obj.getWorldPosition === "function") {
+      try {
+        var o = obj.getWorldPosition({ x:0, y:0, z:0 });
+        if (o) return { x: +o.x || 0, y: +o.y || 0, z: +o.z || 0 };
+      } catch (e) {}
+    }
+    var x=0,y=0,z=0,n=obj,d=0;
+    while (n && d++ < 16) {
+      var p = n.position;
+      if (p) { x += +p.x || 0; y += +p.y || 0; z += +p.z || 0; }
+      n = n.parent;
+    }
+    return { x:x, y:y, z:z };
+  }
+  function nearestVis(root, from){
+    if (!root) return null;
+    if (isVisMesh(root)) return root;
+    var origin = from || wpos(root);
+    var best=null, bestD=1e15;
+    var stack = root.children ? root.children.slice() : [];
+    var steps=0;
+    while (stack.length && steps++ < 400) {
+      var n = stack.shift();
+      if (!n || n.visible === false) continue;
+      if (isVisMesh(n)) {
+        var p = wpos(n);
+        var dx=origin.x-p.x, dy=origin.y-p.y, dz=origin.z-p.z;
+        var dist = Math.sqrt(dx*dx+dy*dy+dz*dz);
+        if (dist < bestD) { bestD=dist; best=n; }
+      }
+      if (n.children && n.children.length) {
+        for (var ci=0;ci<n.children.length;ci++) stack.push(n.children[ci]);
+      }
+    }
+    return best;
+  }
+  function resolve3d(obj, from){
+    if (!obj) return null;
+    if (isVisMesh(obj)) return obj;
+    if (obj.parent && !obj.parent.isScene && (skipInv(obj) || !obj.geometry)) {
+      return nearestVis(obj.parent, from) || nearestVis(obj, from);
+    }
+    return nearestVis(obj, from);
+  }
+  function pickHits(hits){
+    for (var hi=0; hi<hits.length; hi++) {
+      var h = hits[hi], obj = h && h.object;
+      if (!obj || isHelper(obj)) continue;
+      if (skipInv(obj) || !isVisMesh(obj)) {
+        var vis = resolve3d(obj, h.point);
+        if (vis) return vis;
+        continue;
+      }
+      return obj;
+    }
+    return null;
   }
   function describe3d(obj){
     var n = obj, depth = 0;
@@ -264,21 +702,76 @@ export function buildInspectHookSource(opts = {}) {
     var geom = obj.geometry && obj.geometry.type ? String(obj.geometry.type).replace(/[^\\w]/g, "") : "";
     return { selector: geom ? "mesh:" + type + "(" + geom + ")" : "mesh:" + type, text: type };
   }
+  function isScn(o){ return Boolean(o && (o.isScene || o.type === "Scene")); }
+  function isCam(o){ return Boolean(o && (o.isCamera || /Camera$/.test(String(o.type||"")))); }
+  function isRend(o){ return Boolean(o && (o.isWebGLRenderer || (o.domElement && typeof o.render === "function"))); }
+  function isLib(o){ return Boolean(o && typeof o.Raycaster === "function" && o.Vector2); }
   var hookedRenderers = [];
-  function hookThree(){
-    var THREE = window.THREE;
-    if (!THREE || !THREE.WebGLRenderer) return false;
-    var proto = THREE.WebGLRenderer.prototype;
-    if (proto.__agentInspectRender) return true;
-    proto.__agentInspectRender = true;
-    var orig = proto.render;
-    proto.render = function(scene, camera){
+  function findCtx(canvas){
+    var root = window;
+    var THREE = isLib(root.THREE) ? root.THREE : (isLib(root.three) ? root.three : null);
+    var scene=null, camera=null, renderer=null;
+    if (isScn(window.scene) || isScn(root.scene)) scene = window.scene || root.scene;
+    if (isCam(window.camera) || isCam(root.camera)) camera = window.camera || root.camera;
+    if (isRend(root.renderer)) renderer = root.renderer;
+    if (!scene && root.app && isScn(root.app.scene)) scene = root.app.scene;
+    if (!camera && root.app && isCam(root.app.camera)) camera = root.app.camera;
+    if (!renderer && root.app && isRend(root.app.renderer)) renderer = root.app.renderer;
+    var bags = ["app","App","viewer","world","game","stage","demo","engine","threeApp","foup","main"];
+    for (var bi=0; bi<bags.length; bi++) {
+      var bag; try { bag = root[bags[bi]]; } catch (e) { bag = null; }
+      if (!bag || typeof bag !== "object") continue;
+      if (!THREE && isLib(bag.THREE)) THREE = bag.THREE;
+      if (!scene && isScn(bag.scene)) scene = bag.scene;
+      if (!camera && isCam(bag.camera)) camera = bag.camera;
+      if (!renderer && isRend(bag.renderer)) renderer = bag.renderer;
+    }
+    try {
+      var keys = Object.keys(root);
+      for (var k=0; k<keys.length && k<80; k++) {
+        if (/^(parent|top|frames|self|window|document|location|navigator|performance|console)$/.test(keys[k])) continue;
+        var v; try { v = root[keys[k]]; } catch (e) { continue; }
+        if (!v || typeof v !== "object") continue;
+        if (!THREE && isLib(v)) THREE = v;
+        if (!scene && isScn(v)) scene = v;
+        if (!camera && isCam(v)) camera = v;
+        if (isRend(v) && (!canvas || v.domElement === canvas)) renderer = v;
+        if (!scene && isScn(v.scene)) scene = v.scene;
+        if (!camera && isCam(v.camera)) camera = v.camera;
+        if (!renderer && isRend(v.renderer)) renderer = v.renderer;
+      }
+    } catch (e) {}
+    if (canvas) {
+      var att = [canvas.__renderer, canvas._renderer, canvas.renderer];
+      for (var ai=0; ai<att.length; ai++) if (isRend(att[ai])) renderer = att[ai];
+    }
+    if (renderer) {
+      if (!scene && isScn(renderer.__agentLastScene)) scene = renderer.__agentLastScene;
+      if (!camera && isCam(renderer.__agentLastCamera)) camera = renderer.__agentLastCamera;
+      if (hookedRenderers.indexOf(renderer) < 0) hookedRenderers.push(renderer);
+    }
+    return { THREE: THREE, scene: scene, camera: camera, renderer: renderer };
+  }
+  function wrapRender(target){
+    if (!target || target.__agentInspectRender || typeof target.render !== "function") return;
+    target.__agentInspectRender = true;
+    var orig = target.render;
+    target.render = function(scene, camera){
       this.__agentLastScene = scene;
       this.__agentLastCamera = camera;
       if (hookedRenderers.indexOf(this) < 0) hookedRenderers.push(this);
       return orig.apply(this, arguments);
     };
-    return true;
+  }
+  function hookThree(){
+    var ctx = findCtx();
+    if (ctx.renderer) {
+      wrapRender(ctx.renderer);
+      if (ctx.renderer.constructor && ctx.renderer.constructor.prototype) wrapRender(ctx.renderer.constructor.prototype);
+    }
+    var THREE = ctx.THREE;
+    if (THREE && THREE.WebGLRenderer && THREE.WebGLRenderer.prototype) wrapRender(THREE.WebGLRenderer.prototype);
+    return Boolean(THREE || (ctx.scene && ctx.camera));
   }
   var threeTries = 0;
   (function waitThree(){
@@ -291,16 +784,52 @@ export function buildInspectHookSource(opts = {}) {
     }
     return hookedRenderers[0] || null;
   }
+  function namedGroup(n){
+    if (!n || n.isScene) return false;
+    if (!(n.isGroup || n.type === "Group")) return false;
+    var ud = n.userData || {};
+    if (ud.reviewId || ud.slot != null) return true;
+    var name = String(n.name || "").trim();
+    return Boolean(name && !/^(Object3D|Group|Scene)$/i.test(name));
+  }
+  function pickGroupBox(scene, ray, THREE){
+    if (!scene || !ray || !THREE || typeof THREE.Box3 !== "function") return null;
+    var box = new THREE.Box3();
+    var target = THREE.Vector3 ? new THREE.Vector3() : { x:0, y:0, z:0 };
+    var best=null, bestD=1e15;
+    function visit(n){
+      if (!n || n.visible === false) return;
+      if (namedGroup(n)) {
+        var mesh = nearestVis(n, ray.origin);
+        if (mesh && typeof box.setFromObject === "function") {
+          box.setFromObject(n);
+          var empty = typeof box.isEmpty === "function" && box.isEmpty();
+          if (!empty && ray.intersectBox && ray.intersectBox(box, target)) {
+            var o = ray.origin || { x:0, y:0, z:0 };
+            var dx=o.x-target.x, dy=o.y-target.y, dz=o.z-target.z;
+            var d = Math.sqrt(dx*dx+dy*dy+dz*dz);
+            if (d < bestD) { bestD=d; best=mesh; }
+          }
+        }
+      }
+      var kids = n.children || [];
+      for (var gi=0; gi<kids.length; gi++) visit(kids[gi]);
+    }
+    visit(scene);
+    return best;
+  }
   function pickWebgl(canvas, cx, cy){
-    var THREE = window.THREE;
-    if (!THREE || !THREE.Raycaster) return null;
     hookThree();
-    var rend = rendererFor(canvas);
-    var scene = rend && rend.__agentLastScene;
-    var camera = rend && rend.__agentLastCamera;
-    if ((!scene || !camera) && window.scene && window.scene.isScene) scene = window.scene;
-    if ((!camera) && window.camera && window.camera.isCamera) camera = window.camera;
-    if (!scene || !camera) return null;
+    var ctx = findCtx(canvas);
+    var THREE = ctx.THREE;
+    var scene = ctx.scene;
+    var camera = ctx.camera;
+    var rend = rendererFor(canvas) || ctx.renderer;
+    if (rend) {
+      if (!scene) scene = rend.__agentLastScene;
+      if (!camera) camera = rend.__agentLastCamera;
+    }
+    if (!THREE || !THREE.Raycaster || !scene || !camera) return null;
     var rect = canvas.getBoundingClientRect();
     if (!rect.width || !rect.height) return null;
     var ndc = new THREE.Vector2(((cx - rect.left) / rect.width) * 2 - 1, -((cy - rect.top) / rect.height) * 2 + 1);
@@ -308,13 +837,59 @@ export function buildInspectHookSource(opts = {}) {
     if (typeof ray.setFromCamera !== "function") return null;
     ray.setFromCamera(ndc, camera);
     var hits = ray.intersectObjects(scene.children || [], true);
-    for (var i = 0; i < hits.length; i++) {
-      var obj = hits[i].object;
-      if (skipInv(obj) || isHelper(obj)) continue;
-      if (!(obj.isMesh || obj.isInstancedMesh || obj.isSkinnedMesh || (obj.userData && (obj.userData.reviewId || obj.userData.slot != null)))) continue;
-      return describe3d(obj);
+    var obj = pickHits(hits);
+    if (!obj) obj = pickGroupBox(scene, ray, THREE);
+    if (!obj) return null;
+    return describe3d(obj);
+  }
+  function walkFind(scene, pred){
+    var found=null;
+    function visit(n){
+      if (!n || found) return;
+      if (pred(n)) { found=n; return; }
+      var kids=n.children||[];
+      for (var wi=0; wi<kids.length && !found; wi++) visit(kids[wi]);
     }
-    return null;
+    visit(scene);
+    return found;
+  }
+  function cssOwner(scene, el){
+    if (!scene || !el) return null;
+    return walkFind(scene, function(n){
+      if (!(n.isCSS2DObject || n.isCSS3DObject)) return false;
+      var node = n.element;
+      return Boolean(node && (node === el || (node.contains && node.contains(el))));
+    });
+  }
+  function bindObj(scene, el){
+    if (!scene || !el || !el.getAttribute) return null;
+    var node = el.closest ? (el.closest(".label, [data-review-label]") || el) : el;
+    var rid = String(node.getAttribute("data-review-id") || "").trim();
+    var slot = node.getAttribute("data-slot");
+    if (slot == null) slot = node.getAttribute("data-review-slot");
+    var target = String(node.getAttribute("data-target") || node.getAttribute("data-for") || node.getAttribute("data-object") || node.getAttribute("data-mesh") || "").trim();
+    return walkFind(scene, function(n){
+      var ud = n.userData || {};
+      if (rid && String(ud.reviewId) === rid) return true;
+      if (slot != null && slot !== "" && isFinite(Number(slot)) && Number(ud.slot) === Number(slot)) return true;
+      if (target && (n.name === target || String(ud.name) === target)) return true;
+      return false;
+    });
+  }
+  function resolveLabel(el, scene){
+    var node = (el && el.closest && el.closest(".label, [data-review-label]")) || el;
+    var start = cssOwner(scene, node);
+    if (start) {
+      var ud = start.userData || {};
+      var bound = ud.target || ud.object || (start.parent && !start.parent.isScene ? start.parent : null);
+      start = bound || start;
+    }
+    if (!start) start = bindObj(scene, node);
+    if (start) {
+      var obj = resolve3d(start) || start;
+      return { kind: "mesh", mesh: describe3d(obj), el: node };
+    }
+    return { kind: "dom", el: node };
   }
   function stackAt(ev){
     var list = [];
@@ -329,12 +904,14 @@ export function buildInspectHookSource(opts = {}) {
     var canvas = null;
     var chrome = null;
     var dom = null;
+    var label = null;
     for (var i = 0; i < stack.length; i++) {
       var el = stack[i];
       if (!el || el.id === "agent-inspect-ring") continue;
       if (el.tagName === "CANVAS") { canvas = el; break; }
-      if (isOverlay(el)) continue;
       if (isChrome(el)) { chrome = el; break; }
+      if (isLabel(el)) { label = el; break; }
+      if (isOverlay(el)) continue;
       if (el.nodeType === 1 && el !== document.documentElement && el !== document.body) {
         dom = el;
         break;
@@ -344,10 +921,13 @@ export function buildInspectHookSource(opts = {}) {
       for (var j = 0; j < stack.length; j++) if (stack[j] && stack[j].tagName === "CANVAS") { canvas = stack[j]; break; }
     }
     if (chrome) return { kind: "dom", el: chrome };
+    var scene = findCtx(canvas).scene;
+    if (label) return resolveLabel(label, scene);
+    if (dom && scene && cssOwner(scene, dom)) return resolveLabel(dom, scene);
     if (canvas) {
       var mesh = pickWebgl(canvas, ev.clientX, ev.clientY);
       if (mesh) return { kind: "mesh", mesh: mesh, canvas: canvas, x: ev.clientX, y: ev.clientY };
-      if (dom && !isOverlay(dom) && !isChrome(dom)) return { kind: "dom", el: dom };
+      if (dom && !isOverlay(dom) && !isChrome(dom) && !isLabel(dom)) return { kind: "dom", el: dom };
       return { kind: "dom", el: canvas };
     }
     return dom ? { kind: "dom", el: dom } : null;
@@ -411,8 +991,10 @@ export function buildInspectHookSource(opts = {}) {
     if (!enabled || Date.now() < pinUntil) return;
     var hit = resolvePick(ev);
     if (!hit) { hideRing(); return; }
-    if (hit.kind === "mesh") showRingAt(hit.x, hit.y);
-    else showRing(hit.el);
+    if (hit.kind === "mesh") {
+      if (hit.el) showRing(hit.el);
+      else showRingAt(hit.x, hit.y);
+    } else showRing(hit.el);
   }, true);
   document.addEventListener("mouseleave", function(){
     if (!enabled || Date.now() < pinUntil) return;
@@ -434,7 +1016,8 @@ export function buildInspectHookSource(opts = {}) {
     if (!hit) return;
     pinUntil = Date.now() + 2500;
     if (hit.kind === "mesh") {
-      showRingAt(hit.x, hit.y);
+      if (hit.el) showRing(hit.el);
+      else showRingAt(hit.x, hit.y);
       parent.postMessage({
         type: PICK,
         selector: hit.mesh.selector,
