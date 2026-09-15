@@ -272,7 +272,7 @@ export function classifyStopReason(stopReason) {
         hint: "谱系额度用完了，不是崩溃。已写入的产物还在——直接在下面接着说下一句，发送时会自动续一段跑道",
       };
     case "refusal":
-      return { tone: "bad", label: "模型拒答", hint: "模型拒绝继续，需要改写任务描述" };
+      return { tone: "bad", label: "模型拒答", hint: "模型拒绝继续，换一种说法再试" };
     case "plan_rejected":
       // 不是失败，是决定——所以 warn 不是 bad，文案也不说"终止/异常"
       return {
@@ -2251,17 +2251,21 @@ export function deriveSegments(state) {
  * Progress 面：执行者清单 +（若有）编排子任务。两套并列不互相覆盖。
  * @param {RunState} state
  * @param {ReturnType<typeof derivePlanFace>} plan
+ * @param {{ hasSessionFiles?: boolean }} [extras]
  */
-export function deriveProgressFace(state, plan) {
+export function deriveProgressFace(state, plan, extras) {
   const items = Array.isArray(state.progressItems) ? state.progressItems : null;
   const settled = state?.status === "done";
+  const hasSessionFiles = Boolean(extras?.hasSessionFiles);
   return {
     items,
-    waiting: settled ? false : (!items || items.length === 0),
+    // 右栏已经有落盘文件时再写「等待拆步…」就是和产物条对着干。
+    waiting: settled || hasSessionFiles ? false : (!items || items.length === 0),
     doneCount: items ? items.filter((i) => i.status === "done").length : 0,
     total: items ? items.length : 0,
     plan,
     settled,
+    hasSessionFiles,
   };
 }
 
@@ -5250,7 +5254,9 @@ export function renderRunDetail(state, callbacks) {
     action: deriveActionState(state),
     plan: derivePlanFace(state),
   };
-  faces.progress = deriveProgressFace(state, faces.plan);
+  faces.progress = deriveProgressFace(state, faces.plan, {
+    hasSessionFiles: deriveSessionFiles(state).length > 0,
+  });
 
   // V-10：骨架建一次，之后逐区补丁。此前每条 SSE 事件重建整页 innerHTML——
   // 实测拒绝理由输入框的字被清空、日志滚动归零、长运行退化成 O(n²)。
@@ -7553,7 +7559,7 @@ function patchDetailRail(parts, state, faces, callbacks) {
   if (toggle && !parts.rail.classList.contains("detail-rail--collapsed")) {
     toggle.textContent = "Progress ⟩";
   }
-  patchProgressPanel(parts, progress);
+  patchProgressPanel(parts, progress, { hasSessionFiles: showFiles });
   // 编排细节：对话里已有分层卡；右栏 plan-board 作 Progress 下钻（层号 / 耗时条）
   if (plan) patchPlanBoard(parts, parts.railBoard, plan);
   else {
@@ -7565,24 +7571,41 @@ function patchDetailRail(parts, state, faces, callbacks) {
 }
 
 /** Progress 卡：Cursor 风格勾选清单 + 编排子任务摘要 */
-function patchProgressPanel(parts, progress) {
+function patchProgressPanel(parts, progress, extras) {
   const host = parts.progressPanel;
   if (!host || !progress) return;
+  const hasFiles = Boolean(extras?.hasSessionFiles || progress.hasSessionFiles);
+  const showWaiting = Boolean(progress.waiting && !progress.plan && !hasFiles);
+  const hasItems = Boolean(progress.items && progress.items.length > 0);
+  const hasPlan = Boolean(progress.plan);
   const planSig = progress.plan
     ? progress.plan.nodes.map((n) => `${n.id}:${n.status}`).join(",")
     : "";
   const itemSig = progress.items
     ? progress.items.map((i) => `${i.id}:${i.status}`).join(",")
     : "null";
-  const sig = signature([itemSig, planSig, progress.waiting, progress.settled ? "settled" : ""]);
+  const sig = signature([
+    itemSig,
+    planSig,
+    showWaiting ? "waiting" : "",
+    progress.settled ? "settled" : "",
+    hasFiles ? "files" : "",
+  ]);
   if (parts.sig.progress === sig) return;
   parts.sig.progress = sig;
+
+  if (!showWaiting && !hasItems && !hasPlan) {
+    host.innerHTML = "";
+    setAttr(host, "hidden", "");
+    return;
+  }
+  setAttr(host, "hidden", null);
 
   let html =
     '<details class="progress-card" open>' +
     '<summary class="progress-card-summary">Progress</summary>';
 
-  if (progress.waiting && !progress.plan) {
+  if (showWaiting) {
     html += '<p class="progress-waiting">等待拆步…</p>';
   }
 

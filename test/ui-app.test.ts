@@ -1183,6 +1183,20 @@ describe("v2 R1 · stopReason 六值分档 (V-04)", () => {
     expect(deliveryFace("completed", [{ path: "index.html" }]).tone).toBe("ok");
   });
 
+  it("有落盘文件时 Progress 不再写等待拆步；空跑仍 waiting", () => {
+    const running = createInitialState("prog-files", "t", false);
+    expect(deriveProgressFace(running, null).waiting).toBe(true);
+    expect(deriveProgressFace(running, null, { hasSessionFiles: true }).waiting).toBe(false);
+    expect(deriveProgressFace(running, null, { hasSessionFiles: true }).settled).toBe(false);
+  });
+
+  it("拒答提示不说任务描述", () => {
+    const face = classifyStopReason("refusal");
+    expect(face.tone).toBe("bad");
+    expect(face.hint).toContain("换一种说法");
+    expect(face.hint).not.toContain("任务描述");
+  });
+
   it("status=done 后 Progress 不再像还在跑", () => {
     let s = createInitialState("prog-done", "t", false);
     s = reduceEvents(s, [
