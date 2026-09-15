@@ -115,6 +115,15 @@ describe("信息队列 · 渲染", () => {
     expect(html).toContain("&lt;img");
   });
 
+  it("排队 chip 不画宿主 [改范围] chrome", () => {
+    const html = renderQueueChips([
+      `[改范围]只改 data-slide="back"（文件 index.html）。不要改其他页，不要整页重写。\n图片你自己有核对过吗？完全与介绍的科技不相关`,
+    ]);
+    expect(html).not.toContain("[改范围]");
+    expect(html).not.toContain("[改稿范围]");
+    expect(html).toContain("图片你自己有核对过吗");
+  });
+
   it("steering 在对话里渲染为带「插队指令」标注的用户气泡", () => {
     let s = createInitialState("r1", "任务", false);
     s = reduceEvent(s, sse(0, "main", "steering", { text: "别查了，直接给结论" }));

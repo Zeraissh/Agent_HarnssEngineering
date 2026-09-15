@@ -229,6 +229,15 @@ describe("信息队列 · 运行中发消息", () => {
     const q1 = await postMessage(base, runId, { text: "排队指令A", mode: "queue" });
     expect(q1.status).toBe(202);
     expect(q1.body).toMatchObject({ mode: "queue", queued: 1 });
+    // live-mu 2026-09-14：在飞 POST 必须当时落 message_queued，不能等续跑才补事件
+    const queuedNow = await waitForEvent(
+      base,
+      runId,
+      (ev) => eventOf(ev).type === "message_queued" && eventOf(ev).text === "排队指令A",
+    );
+    expect(queuedNow, "运行中 mode=queue 必须立刻落 message_queued").toBeDefined();
+    const queuedEvt = queuedNow!.find((ev) => eventOf(ev).type === "message_queued" && eventOf(ev).text === "排队指令A");
+    expect(eventOf(queuedEvt!)).toMatchObject({ mode: "queue", text: "排队指令A" });
     // 不带 mode = 缺省 queue
     const q2 = await postMessage(base, runId, { text: "排队指令B" });
     expect(q2.status).toBe(202);
@@ -292,6 +301,16 @@ describe("信息队列 · 运行中发消息", () => {
     });
     expect(delOne.status).toBe(200);
     expect(((await delOne.json()) as { pending: string[] }).pending).toEqual(["要保留的"]);
+    // live-mu 2026-09-14：DELETE 后必须有 message_queue_updated；被删条不得变成 user_message
+    const afterDel = await waitForEvent(
+      base,
+      runId,
+      (ev) =>
+        eventOf(ev).type === "message_queue_updated" &&
+        Array.isArray(eventOf(ev).pending) &&
+        JSON.stringify(eventOf(ev).pending) === JSON.stringify(["要保留的"]),
+    );
+    expect(afterDel, "DELETE 单条后必须落 message_queue_updated").toBeDefined();
 
     // 越界 index → 400
     const delBad = await fetch(`${base}/api/runs/${runId}/queue`, {
@@ -314,10 +333,11 @@ describe("信息队列 · 运行中发消息", () => {
     const after = await waitForEvent(base, runId, (ev, seen) => seen.some(
       (e) => eventOf(e).type === "user_message",
     ), 1500);
-    expect(
-      after?.filter((e) => eventOf(e).type === "user_message") ?? [],
-      "队列已清空，不得再自动续跑",
-    ).toHaveLength(0);
+    const userTexts = (after ?? firstEnd ?? [])
+      .filter((e) => eventOf(e).type === "user_message")
+      .map((e) => String(eventOf(e).text ?? ""));
+    expect(userTexts, "队列已清空，不得再自动续跑").toEqual([]);
+    expect(userTexts.join("\n")).not.toContain("要取消的");
     // 模型只被调用脚本内的轮次（tool_use → end_turn 共 2 次），没有第三轮
     expect(model.requests).toHaveLength(2);
   });

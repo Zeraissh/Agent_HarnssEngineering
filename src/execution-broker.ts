@@ -1679,7 +1679,8 @@ export async function inspectOciOwnerLiveness(
   if (record.ownerPid === current.pid) {
     return record.ownerStartTicks === current.startTicks ? { state: "alive" } : { state: "dead" };
   }
-  if (process.platform === "win32") {
+  // Production win32 uses CIM CreationDate. Injected probes (tests / hidepid) own visibility.
+  if (process.platform === "win32" && probe === DEFAULT_OCI_OWNER_PROBE) {
     try {
       const foreign = await readWindowsOciOwnerIdentity(record.ownerPid);
       if (foreign.boot !== record.ownerBoot || foreign.pidNamespace !== record.ownerPidNamespace) {

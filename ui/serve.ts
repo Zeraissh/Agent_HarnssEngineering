@@ -30,6 +30,8 @@
  *   AGENT_PLANNER_MODEL    可选,独立 planner 模型（同上一组后缀）
  *                          密钥只在服务端解析,不下发浏览器
  *   AGENT_PACK / AGENT_PRESET  领域包
+ *   AGENT_FEISHU_WEBHOOK / AGENT_NOTIFY_WEBHOOK  可选，看板变更出站推飞书/通用 webhook
+ *                          （只出站；armed 时启动行印「飞书门禁通知已开」，不印 URL）
  *   其余 AGENT_* 旋钮见 src/cli.ts 头部注释
  *
  * 默认只绑 127.0.0.1。非 loopback 不再只打印 warning：缺少强令牌或 TLS 边界会
@@ -40,6 +42,7 @@ import { createUiServer } from "./server.js";
 import { accessHintLine, resolveUiLaunchPolicy } from "./production.js";
 import { warnEnvConflicts } from "../src/env-check.js";
 import { configuredExecutionStatus } from "../src/execution-broker.js";
+import { notifyArmedHint, resolveOfficeNotifyFromEnv } from "../src/notify.js";
 
 // 桌面壳（cross-app/electron）用 ELECTRON_RUN_AS_NODE=1 拉起本进程；这个变量
 // 不该再透传给 bash 工具的子命令——否则 agent 在 bash 里启动任何 Electron 系
@@ -96,6 +99,8 @@ handle.server.listen(port, host, () => {
   // 令牌本体不进 stdout（占位符引导，见 accessHintLine 的注释）
   const hint = accessHintLine(policy, localUrl);
   if (hint) console.log(`  open:    ${hint}`);
+  const notifyHint = notifyArmedHint(Boolean(resolveOfficeNotifyFromEnv(process.env)));
+  if (notifyHint) console.log(`  ${notifyHint}`);
   if (policy.remote) {
     console.log(`  remote boundary: ${policy.trustProxy ? "trusted TLS proxy" : "insecure HTTP explicitly acknowledged"}`);
   }

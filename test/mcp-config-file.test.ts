@@ -32,6 +32,20 @@ describe("mcp-config-file", () => {
     expect(gone.demo).toBeUndefined();
   });
 
+  it("env / requiredEnv 合并进已有 server，不拆其他字段", () => {
+    const next = applyMcpServerPatch(
+      { demo: { command: "npx", includeTools: ["a"], env: { KEEP: "1" } } },
+      "demo",
+      { env: { TOKEN: "${TOKEN}" }, requiredEnv: ["TOKEN"] },
+    );
+    expect(next.demo).toMatchObject({
+      command: "npx",
+      includeTools: ["a"],
+      env: { KEEP: "1", TOKEN: "${TOKEN}" },
+      requiredEnv: ["TOKEN"],
+    });
+  });
+
   it("serialize 带换行，round-trip", () => {
     const text = serializeMcpConfig({ a: { command: "npx", enabled: false } });
     expect(text.endsWith("\n")).toBe(true);

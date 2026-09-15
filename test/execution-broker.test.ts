@@ -618,6 +618,34 @@ describe("ToolContext broker propagation", () => {
     expect(results[0]?.content).toContain("broker-ok");
   });
 
+  it("bash rewrites relative Chrome --user-data-dir before spawn", async () => {
+    let captured: ShellExecutionRequest | undefined;
+    const boundary = status("report-only", "host", "report");
+    const broker: ExecutionBroker = {
+      boundaryId: boundary.boundaryId,
+      status: () => boundary,
+      probe: async () => boundary,
+      executeShell: async (request) => {
+        captured = request;
+        return resultFor(request, boundary);
+      },
+    };
+    await createBashTool().execute(
+      { command: "chrome --user-data-dir=./chrome-profile http://127.0.0.1/" },
+      {
+        workdir,
+        toolUseId: "tu_chrome_profile",
+        signal: new AbortController().signal,
+        executionBroker: broker,
+      },
+    );
+    expect(captured?.command).toBeTruthy();
+    expect(captured!.command).not.toMatch(/--user-data-dir=\.\/chrome-profile/);
+    const m = captured!.command.match(/--user-data-dir=(\S+)/);
+    expect(m?.[1]).toBeTruthy();
+    expect(path.isAbsolute(m![1]!)).toBe(true);
+  });
+
   it("bash strips provider secrets before handing a direct-capable broker the request", async () => {
     let captured: ShellExecutionRequest | undefined;
     const boundary = status("report-only", "host", "report");

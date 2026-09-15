@@ -12,6 +12,7 @@ import {
   parseProjectStatusMarkdown,
   projectSlugFromWorkdir,
   readProjectStatus,
+  resolveProjectSlug,
   scopedMemoryIndex,
 } from "../src/project-status.js";
 
@@ -19,6 +20,12 @@ describe("project slug / shared / classify", () => {
   it("slug 取 workdir 末段", () => {
     expect(projectSlugFromWorkdir("D:/work/alpha")).toBe("alpha");
     expect(projectSlugFromWorkdir("D:\\work\\alpha")).toBe("alpha");
+  });
+
+  it("选了项目实体时 slug 跟 id，非法 id 回落末段", () => {
+    expect(resolveProjectSlug("D:/one/alpha", "board-1")).toBe("board-1");
+    expect(resolveProjectSlug("D:/one/alpha", "not a slug!")).toBe("alpha");
+    expect(resolveProjectSlug("D:/one/alpha")).toBe("alpha");
   });
 
   it("共享记忆目录：不是 <workdir>/.agent-memory", () => {
@@ -116,5 +123,34 @@ describe("project_status tool + scoped index", () => {
     expect(sharedIndex).toContain("lessons/shell.md");
     expect(sharedIndex).toContain("projects/alpha/in-progress.md");
     expect(sharedIndex).not.toContain("stray.md");
+  });
+
+  it("共享记忆下两个同名目录用不同 project.id 互不覆盖", async () => {
+    dir = await mkdtemp(path.join(tmpdir(), "project-status-iso-"));
+    const shared = new MemoryStore(path.join(dir, "shared"));
+    const one = path.join(dir, "one", "alpha");
+    const two = path.join(dir, "two", "alpha");
+    const tool = createProjectStatusTool(() => shared, {
+      sharedFor: () => true,
+      resolveProject: (wd) => (wd.includes(`${path.sep}one${path.sep}`) || wd.includes("/one/")
+        ? "proj-one"
+        : "proj-two"),
+    });
+    const signal = new AbortController().signal;
+    await tool.execute({ summary: "甲看板" }, { workdir: one, toolUseId: "t1", signal });
+    await tool.execute({ summary: "乙看板" }, { workdir: two, toolUseId: "t2", signal });
+
+    expect((await shared.read("projects/proj-one/in-progress.md"))).toContain("甲看板");
+    expect((await shared.read("projects/proj-two/in-progress.md"))).toContain("乙看板");
+    const indexOne = await scopedMemoryIndex(shared, one, "proj-one");
+    const indexTwo = await scopedMemoryIndex(shared, two, "proj-two");
+    expect(indexOne).toContain("projects/proj-one/in-progress.md");
+    expect(indexOne).not.toContain("projects/proj-two/in-progress.md");
+    expect(indexTwo).toContain("projects/proj-two/in-progress.md");
+    expect(indexTwo).not.toContain("projects/proj-one/in-progress.md");
+    expect(await readProjectStatus(shared, one, true, "proj-one")).toMatchObject({
+      summary: "甲看板",
+      project: "proj-one",
+    });
   });
 });
