@@ -1126,15 +1126,16 @@ async function main(): Promise<void> {
    * 与计划确认门同一条理由：CLI 也被脚本化驱动（eval、契约测试、cron），
    * 默认开会让那些场景挂死等一个不会来的人。
    *
-   * `--yes`（无人值守）下即使显式开也不装：那条路径根本没有 readline，
-   * 装了等于每个问题都立刻走"未应答"，白烧一轮往返。
+   * `--yes` 与 `--ask` 在 parse 期互斥，无人值守装不上这把工具。
+   * 显式 `--ask` 必须能从 stdin 读答复——确定性门和脚本化宿主都是 pipe，
+   * 不能跟 TTY 绑死，否则 CI 上这条路径永远装不上。
    */
   const canPrompt = cliCanPrompt();
-  const askEnabled = parsedArgs.ask && canPrompt;
-  if (parsedArgs.ask && !canPrompt) {
-    console.log(c.yellow("没有交互终端，--ask 未装。需要确认时请加 --yes 或在 TTY 里跑。"));
-  }
-  const rl = autoYes || !canPrompt ? null : readline.createInterface({ input: process.stdin, output: process.stdout });
+  const askEnabled = parsedArgs.ask;
+  const rl =
+    autoYes || (!canPrompt && !askEnabled)
+      ? null
+      : readline.createInterface({ input: process.stdin, output: process.stdout });
   // 计划并发下多个执行者可能同时触发同一个 ask_user。readline 不能并排挂多个
   // question；这里把“向人提问”串行化，执行工具本身仍可并发。
   let terminalQuestionTail: Promise<unknown> = Promise.resolve();

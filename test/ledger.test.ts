@@ -449,7 +449,11 @@ describe("D3 审批计数（docs/09 §4.3 判据 4）", () => {
     expect(cli).toMatch(/tallyApprovalOutcome\(ledgerApprovals/);
     expect(cli).toMatch(/permissionMode:\s*matchPermissionMode\(/);
     expect(cli).toMatch(/approvals:\s*ledgerApprovals/);
-    expect((cli.match(/respondCliApproval\(/g) ?? []).length).toBeGreaterThanOrEqual(5);
+    expect(cli).toMatch(/const settleCliApproval/);
+    expect(cli).toMatch(/respondCliApproval\(event, "allow", "auto"\)/);
+    expect(cli).toMatch(/respondCliApproval\(event, "allow", "user"\)/);
+    expect(cli).toMatch(/respondCliApproval\(event, "deny", "user"/);
+    expect((cli.match(/respondCliApproval\(/g) ?? []).length).toBe(3);
     expect(report).toMatch(/s\.approvals/);
   });
 

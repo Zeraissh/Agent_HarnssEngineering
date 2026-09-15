@@ -110,6 +110,9 @@ describe("CLI argument contract", () => {
     expect(cli).toMatch(/confirmCliPlan/);
     expect(cli).toMatch(/CliPlanRejectedError/);
     expect(cli).not.toMatch(/if \(autoYes \|\| !rl\)/);
+    expect(cli).toMatch(/const askEnabled = parsedArgs\.ask;/);
+    expect(cli).not.toMatch(/askEnabled = parsedArgs\.ask && canPrompt/);
+    expect(cli).not.toMatch(/没有交互终端，--ask 未装/);
   });
 
   // 发布门只校验 tag == 根 package.json；--version 打印的常量与桌面壳版本不在那道门里，

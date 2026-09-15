@@ -131,18 +131,32 @@ function buildRichState() {
   return s;
 }
 
+/** 串行化：上一例超时后 axe.run 仍在飞，下一例会直接抛 "Axe is already running"。 */
+let axeTail = Promise.resolve();
+
 /** 在当前 document 上跑 axe，返回 violations（按 id 归并，便于断言与报错可读） */
 async function runAxe(options: Record<string, unknown> = {}) {
-  const results = await axe.run(document, {
-    resultTypes: ["violations"],
-    ...options,
+  let release = () => {};
+  const turn = new Promise<void>((resolve) => {
+    release = resolve;
   });
-  return results.violations.map((v) => ({
-    id: v.id,
-    impact: v.impact,
-    help: v.help,
-    nodes: v.nodes.map((nd) => nd.html.slice(0, 120)),
-  }));
+  const wait = axeTail;
+  axeTail = turn;
+  await wait;
+  try {
+    const results = await axe.run(document, {
+      resultTypes: ["violations"],
+      ...options,
+    });
+    return results.violations.map((v) => ({
+      id: v.id,
+      impact: v.impact,
+      help: v.help,
+      nodes: v.nodes.map((nd) => nd.html.slice(0, 120)),
+    }));
+  } finally {
+    release();
+  }
 }
 
 /**
@@ -1215,7 +1229,7 @@ describe("统一 composer：一个框，两种去向", () => {
         expect(violations, `${theme}/${mode.mode}: ${JSON.stringify(violations, null, 2)}`).toEqual([]);
       }
     }
-  });
+  }, 30_000);
 });
 
 describe("侧栏按工作目录分组", () => {
