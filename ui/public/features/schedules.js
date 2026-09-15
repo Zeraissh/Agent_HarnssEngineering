@@ -13,6 +13,15 @@
  */
 
 import { upgradeSelects } from "./theme-select.js";
+import { humanizeHttpFailure } from "./humanize-error.js";
+
+/** 空态与错误态文案（测试与 UI 共用同一份，避免两处漂移）。 */
+export const SCHEDULES_COPY = {
+  empty: "还没有定时任务——让 Agent 每天定时帮你干活",
+  emptyProject: "这个项目还没有定时任务——点下面一张卡片，或自己建一条",
+  listError: (status, fallback) => humanizeHttpFailure(status, fallback ?? "定时任务列表没加载出来"),
+  listNetworkError: "定时任务列表加载失败（网络错误）",
+};
 
 // ---------------------------------------------------------------
 // 常量
@@ -23,6 +32,60 @@ export const SCHEDULES_HASH = "#/schedules";
 
 /** 与服务端 scheduler.ts 的 MIN_INTERVAL_MS 对齐：间隔下限 1 分钟 */
 export const MIN_INTERVAL_MS = 60_000;
+
+/** 周一到周五（0=周日 … 6=周六）。与 ui/scheduler.ts WEEKDAYS 同口径。 */
+export const WEEKDAYS = [1, 2, 3, 4, 5];
+
+const WEEKDAY_LABELS = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
+
+/**
+ * 六个定时预设：只写 task + 默认规则，点一下才 POST 进 .agent-schedules.json。
+ * 不是预装二进制，也不实现 Keep-awake。
+ */
+export const SCHEDULE_PRESETS = [
+  {
+    id: "daily-brief",
+    name: "每日简报",
+    blurb: "昨天到现在的进展、待办和风险，一页说清。",
+    task: "整理昨天到现在的进展、待办和风险，写成一份一页简报（要点 / 决策 / 下一步），写入 daily-brief.md。",
+    schedule: { kind: "weekly", days: [...WEEKDAYS], hhmm: "08:00" },
+  },
+  {
+    id: "inbox-triage",
+    name: "收件箱分拣",
+    blurb: "按紧急/重要分拣，列出今天必须处理的几项。",
+    task: "检查收件箱与待处理事项，按紧急/重要分拣，列出今天必须处理的 5 项，写入 inbox-triage.md。",
+    schedule: { kind: "weekly", days: [...WEEKDAYS], hhmm: "08:00" },
+  },
+  {
+    id: "meeting-prep",
+    name: "会前准备",
+    blurb: "今天每场会的目的、材料和待决问题。",
+    task: "查看今天的会议安排，为每场会准备一页会前简报（目的 / 材料 / 待决问题），写入 meeting-brief.md。",
+    schedule: { kind: "weekly", days: [...WEEKDAYS], hhmm: "08:00" },
+  },
+  {
+    id: "weekly-review",
+    name: "每周复盘",
+    blurb: "本周做成了什么、卡在哪、下周先做哪件。",
+    task: "回顾本周已完成、未完成与卡点，写一份周五复盘（做得好 / 问题 / 下周优先），写入 weekly-review.md。",
+    schedule: { kind: "weekly", days: [5], hhmm: "16:00" },
+  },
+  {
+    id: "topic-draft",
+    name: "选题备稿",
+    blurb: "本周可推进的选题、角度和材料缺口。",
+    task: "根据当前项目方向列出 3 个本周可推进的选题，每个给出角度、材料缺口和初稿提纲，写入 topic-draft.md。",
+    schedule: { kind: "weekly", days: [1], hhmm: "09:00" },
+  },
+  {
+    id: "watch-topic",
+    name: "盯一个主题",
+    blurb: "指定主题的最新动态，五条摘要带回含义。",
+    task: "追踪当前项目里指定的主题，整理最新动态成 5 条摘要（来源 + 要点 + 对本项目的含义），写入 topic-watch.md。若还没指定主题，先在文件开头写「待指定主题」并列出候选。",
+    schedule: { kind: "daily", hhmm: "09:00" },
+  },
+];
 
 // ---------------------------------------------------------------
 // 纯函数层
@@ -44,8 +107,9 @@ const pad2 = (n) => String(n).padStart(2, "0");
  * 调度规则的人话文案。
  *   once     → "一次性 · 9月6日 08:00"（跨年补年份）
  *   daily    → "每天 09:30"
+ *   weekly   → "工作日 08:00" / "每周五 16:00"
  *   interval → "每 2 小时" / "每 30 分钟"
- * @param {{ kind:string, at?:number, hhmm?:string, everyMs?:number }} schedule
+ * @param {{ kind:string, at?:number, hhmm?:string, everyMs?:number, days?:number[] }} schedule
  * @param {number} [now] 用于判断 once 是否跨年；缺省取当前时刻
  * @returns {string}
  */
@@ -62,6 +126,17 @@ export function describeSchedule(schedule, now = Date.now()) {
   if (schedule.kind === "daily" && typeof schedule.hhmm === "string") {
     return `每天 ${schedule.hhmm}`;
   }
+  if (schedule.kind === "weekly" && typeof schedule.hhmm === "string" && Array.isArray(schedule.days)) {
+    const days = [...new Set(schedule.days.filter((d) => Number.isInteger(d) && d >= 0 && d <= 6))]
+      .sort((a, b) => a - b);
+    if (!days.length) return "未知规则";
+    const weekdaySet = new Set(WEEKDAYS);
+    const isWeekdays = days.length === WEEKDAYS.length && days.every((d) => weekdaySet.has(d));
+    if (isWeekdays) return `工作日 ${schedule.hhmm}`;
+    const shorts = ["日", "一", "二", "三", "四", "五", "六"];
+    if (days.length === 1) return `每周${shorts[days[0]]} ${schedule.hhmm}`;
+    return `每周${days.map((d) => shorts[d]).join("、")} ${schedule.hhmm}`;
+  }
   if (schedule.kind === "interval" && typeof schedule.everyMs === "number") {
     const ms = schedule.everyMs;
     if (ms % 3_600_000 === 0) return `每 ${ms / 3_600_000} 小时`;
@@ -69,6 +144,19 @@ export function describeSchedule(schedule, now = Date.now()) {
     return `每 ${Math.round(ms / 1000)} 秒`;
   }
   return "未知规则";
+}
+
+/**
+ * 当前选了项目时只留同一 projectId 的条目；未选则原样返回。
+ * 与服务端 GET /api/schedules?projectId= 同口径。
+ * @param {Array<Record<string, any>>} entries
+ * @param {string|null|undefined} projectId
+ * @returns {Array<Record<string, any>>}
+ */
+export function filterSchedulesByProject(entries, projectId) {
+  const want = String(projectId ?? "").trim();
+  if (!want) return Array.isArray(entries) ? [...entries] : [];
+  return (Array.isArray(entries) ? entries : []).filter((entry) => entry?.projectId === want);
 }
 
 /**
@@ -128,8 +216,9 @@ export function summarizeTask(task, max = 60) {
  * 新建表单载荷构造 + 前端预校验（服务端仍会再校验一遍——双保险，不是替代）。
  *
  * @param {{
- *   name?:string, task?:string, workdir?:string, verify?:boolean,
+ *   name?:string, task?:string, workdir?:string, verify?:boolean, projectId?:string,
  *   kind?:string, onceAtMs?:number|null, dailyHhmm?:string, intervalHours?:number|string,
+ *   weeklyDays?:number[], weeklyHhmm?:string,
  * }} input
  * @returns {{ ok:true, payload:Record<string,unknown> } | { ok:false, error:string }}
  */
@@ -147,6 +236,14 @@ export function buildCreatePayload(input) {
     const hhmm = String(input.dailyHhmm ?? "");
     if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(hhmm)) return { ok: false, error: "请选择每天的触发时刻（HH:MM）" };
     schedule = { kind: "daily", hhmm };
+  } else if (input?.kind === "weekly") {
+    const hhmm = String(input.weeklyHhmm ?? "");
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(hhmm)) return { ok: false, error: "请选择每周的触发时刻（HH:MM）" };
+    const rawDays = Array.isArray(input.weeklyDays) ? input.weeklyDays : [];
+    const days = [...new Set(rawDays.filter((d) => Number.isInteger(d) && d >= 0 && d <= 6))]
+      .sort((a, b) => a - b);
+    if (!days.length) return { ok: false, error: "请至少选择一个星期几" };
+    schedule = { kind: "weekly", days, hhmm };
   } else if (input?.kind === "interval") {
     const hours = Number(input.intervalHours);
     if (!Number.isFinite(hours) || hours <= 0) return { ok: false, error: "请填写间隔小时数（大于 0）" };
@@ -156,6 +253,7 @@ export function buildCreatePayload(input) {
   } else {
     return { ok: false, error: "请选择调度类型" };
   }
+  const projectId = String(input?.projectId ?? "").trim();
   return {
     ok: true,
     payload: {
@@ -164,8 +262,28 @@ export function buildCreatePayload(input) {
       workdir: String(input.workdir).trim(),
       verify: input?.verify === true,
       schedule,
+      ...(projectId ? { projectId } : {}),
     },
   };
+}
+
+/**
+ * 预设 → 创建载荷。点卡片才调用；workdir / projectId 来自当前宿主上下文。
+ * @param {{ name:string, task:string, schedule:Record<string, unknown> }} preset
+ * @param {{ workdir?:string, projectId?:string, verify?:boolean }} ctx
+ */
+export function buildPresetPayload(preset, ctx = {}) {
+  return buildCreatePayload({
+    name: preset?.name,
+    task: preset?.task,
+    workdir: ctx.workdir,
+    projectId: ctx.projectId,
+    verify: ctx.verify === true,
+    kind: preset?.schedule?.kind,
+    dailyHhmm: preset?.schedule?.hhmm,
+    weeklyHhmm: preset?.schedule?.hhmm,
+    weeklyDays: preset?.schedule?.days,
+  });
 }
 
 // ---------------------------------------------------------------
@@ -179,6 +297,7 @@ const VIEW_ID = "schedules-view";
  *
  * host 回调：
  *   getHarnessSnapshot()  → /api/harness 快照或 null（工作目录白名单数据源）
+ *   getCurrentProject()   → 当前作曲栏项目 {id, primaryWorkdir, workdirs} 或 null
  *   onOpenSchedules()     → 侧栏入口点击（宿主写 hash 路由）
  *   onCloseSchedules()    → 返回上一视图
  *   onOpenRun(runId)      → 上次运行跳转到对应 run
@@ -214,6 +333,9 @@ export function initSchedulesView(host = {}, env = {}) {
   let entries = [];
   let serverTime = Date.now();
   let formVisible = false;
+  let listError = "";
+  /** 列表没拉下来：不能把失败装成「还没有任务」 */
+  let loadFailed = false;
   /** @type {HTMLElement|null} */
   let restoreFocusTo = null;
   /** @type {ReturnType<typeof setInterval>|null} */
@@ -242,7 +364,7 @@ export function initSchedulesView(host = {}, env = {}) {
   newBtn.type = "button";
   newBtn.className = "btn schedules-new-btn";
   newBtn.id = "schedules-new-btn";
-  newBtn.innerHTML = '<i class="ph ph-plus" aria-hidden="true"></i><span>新建任务</span>';
+  newBtn.innerHTML = '<i class="ph ph-plus" aria-hidden="true"></i><span>新任务</span>';
   head.appendChild(backBtn);
   head.appendChild(title);
   head.appendChild(newBtn);
@@ -256,10 +378,46 @@ export function initSchedulesView(host = {}, env = {}) {
   const emptyEl = doc.createElement("div");
   emptyEl.className = "schedules-empty";
   emptyEl.hidden = true;
-  emptyEl.innerHTML =
-    '<div class="empty-icon" aria-hidden="true"><i class="ph ph-clock-countdown"></i></div>' +
-    "<p>还没有定时任务——让 Agent 每天定时帮你干活</p>";
+  const listErrorEl = doc.createElement("p");
+  listErrorEl.className = "schedules-form-error";
+  listErrorEl.id = "schedules-list-error";
+  listErrorEl.setAttribute("role", "alert");
+  listErrorEl.hidden = true;
 
+  const emptyLead = doc.createElement("div");
+  emptyLead.className = "schedules-empty-lead";
+  emptyLead.innerHTML =
+    `<div class="empty-icon" aria-hidden="true"><i class="ph ph-clock-countdown"></i></div>` +
+    `<p>${SCHEDULES_COPY.empty}</p>`;
+  const emptyLeadP = emptyLead.querySelector("p");
+  const presetGrid = doc.createElement("div");
+  presetGrid.className = "schedules-presets";
+  presetGrid.setAttribute("role", "list");
+  for (const preset of SCHEDULE_PRESETS) {
+    const card = doc.createElement("button");
+    card.type = "button";
+    card.className = "schedule-preset";
+    card.dataset.presetId = preset.id;
+    card.setAttribute("role", "listitem");
+    const nameEl = doc.createElement("strong");
+    nameEl.className = "schedule-preset-name";
+    nameEl.textContent = preset.name;
+    const whenEl = doc.createElement("span");
+    whenEl.className = "schedule-preset-when";
+    whenEl.textContent = describeSchedule(preset.schedule);
+    const blurbEl = doc.createElement("span");
+    blurbEl.className = "schedule-preset-blurb";
+    blurbEl.textContent = preset.blurb;
+    card.appendChild(nameEl);
+    card.appendChild(whenEl);
+    card.appendChild(blurbEl);
+    card.addEventListener("click", () => { void applyPreset(preset); });
+    presetGrid.appendChild(card);
+  }
+  emptyEl.appendChild(emptyLead);
+  emptyEl.appendChild(presetGrid);
+
+  body.appendChild(listErrorEl);
   body.appendChild(listEl);
   body.appendChild(emptyEl);
 
@@ -317,6 +475,7 @@ export function initSchedulesView(host = {}, env = {}) {
   const KINDS = [
     { id: "once", label: "一次性", icon: "ph-calendar-dot" },
     { id: "daily", label: "每天", icon: "ph-calendar-check" },
+    { id: "weekly", label: "每周", icon: "ph-calendar" },
     { id: "interval", label: "每隔几小时", icon: "ph-arrows-clockwise" },
   ];
   /** @type {HTMLInputElement[]} */
@@ -354,6 +513,35 @@ export function initSchedulesView(host = {}, env = {}) {
   dailyInput.value = "09:30";
   const dailyRow = fieldRow("每天时刻", dailyInput, dailyInput.id);
   dailyRow.dataset.forKind = "daily";
+
+  const weeklyDaysBox = doc.createElement("div");
+  weeklyDaysBox.className = "schedules-weekly-days";
+  weeklyDaysBox.id = "schedules-form-weekly-days";
+  /** @type {HTMLInputElement[]} */
+  const weeklyDayChecks = [];
+  for (let day = 0; day < 7; day++) {
+    const dayLabel = doc.createElement("label");
+    dayLabel.className = "schedules-weekly-day";
+    const check = doc.createElement("input");
+    check.type = "checkbox";
+    check.value = String(day);
+    check.checked = WEEKDAYS.includes(day);
+    weeklyDayChecks.push(check);
+    dayLabel.appendChild(check);
+    const dayText = doc.createElement("span");
+    dayText.textContent = WEEKDAY_LABELS[day];
+    dayLabel.appendChild(dayText);
+    weeklyDaysBox.appendChild(dayLabel);
+  }
+  const weeklyDaysRow = fieldRow("星期", weeklyDaysBox, weeklyDaysBox.id);
+  weeklyDaysRow.dataset.forKind = "weekly";
+
+  const weeklyInput = doc.createElement("input");
+  weeklyInput.type = "time";
+  weeklyInput.id = "schedules-form-weekly";
+  weeklyInput.value = "08:00";
+  const weeklyTimeRow = fieldRow("每周时刻", weeklyInput, weeklyInput.id);
+  weeklyTimeRow.dataset.forKind = "weekly";
 
   const intervalInput = doc.createElement("input");
   intervalInput.type = "number";
@@ -413,29 +601,95 @@ export function initSchedulesView(host = {}, env = {}) {
 
   // ---- 数据 ----
   async function api(path, opts = {}) {
-    const res = await fetchFn(path, {
-      ...opts,
-      headers: { "Content-Type": "application/json", ...(opts.headers ?? {}) },
-    });
-    let data = null;
-    try { data = await res.json(); } catch { /* 非 JSON 响应当 null 处理 */ }
-    return { status: res.status, data };
+    try {
+      const res = await fetchFn(path, {
+        ...opts,
+        headers: { "Content-Type": "application/json", ...(opts.headers ?? {}) },
+      });
+      let data = null;
+      try { data = await res.json(); } catch { /* 非 JSON 响应当 null 处理 */ }
+      return { status: res.status, data };
+    } catch {
+      return { status: 0, data: null };
+    }
+  }
+
+  function currentProject() {
+    const project = host.getCurrentProject?.() ?? null;
+    if (!project || typeof project !== "object") return null;
+    const id = String(project.id ?? "").trim();
+    return id ? { ...project, id } : null;
+  }
+
+  function visibleEntries() {
+    return filterSchedulesByProject(entries, currentProject()?.id);
   }
 
   async function reload() {
-    const { status, data } = await api("/api/schedules");
-    if (status !== 200 || !data || !Array.isArray(data.schedules)) return;
+    const project = currentProject();
+    const path = project
+      ? `/api/schedules?projectId=${encodeURIComponent(project.id)}`
+      : "/api/schedules";
+    const { status, data } = await api(path);
+    if (status !== 200 || !data || !Array.isArray(data.schedules)) {
+      loadFailed = true;
+      listError = status === 0
+        ? SCHEDULES_COPY.listNetworkError
+        : SCHEDULES_COPY.listError(status, data?.error);
+      renderList();
+      host.onAnnounce?.(listError);
+      return;
+    }
+    loadFailed = false;
+    listError = "";
     entries = data.schedules;
     if (typeof data.serverTime === "number") serverTime = data.serverTime;
     renderList();
   }
 
+  async function applyPreset(preset) {
+    const snap = host.getHarnessSnapshot?.() ?? null;
+    const project = currentProject();
+    const workdir = (typeof project?.primaryWorkdir === "string" && project.primaryWorkdir.trim())
+      || (typeof snap?.workdir === "string" && snap.workdir.trim())
+      || (Array.isArray(snap?.availableWorkdirs) ? snap.availableWorkdirs[0] : "")
+      || "";
+    const built = buildPresetPayload(preset, {
+      workdir,
+      projectId: project?.id,
+      verify: false,
+    });
+    if (!built.ok) {
+      host.onAnnounce?.(built.error);
+      return;
+    }
+    const { status, data } = await api("/api/schedules", {
+      method: "POST",
+      body: JSON.stringify(built.payload),
+    });
+    if (status === 201 || status === 200) {
+      host.onAnnounce?.(`定时任务「${data?.schedule?.name ?? preset.name}」已创建`);
+      await reload();
+    } else {
+      const msg = `创建失败：${status === 0 ? SCHEDULES_COPY.listNetworkError : humanizeHttpFailure(status, data?.error)}`;
+      listError = msg;
+      renderList();
+      host.onAnnounce?.(msg);
+    }
+  }
+
   // ---- 渲染 ----
   function renderList() {
     listEl.innerHTML = "";
-    emptyEl.hidden = entries.length > 0 || formVisible;
+    const visible = visibleEntries();
+    if (emptyLeadP) {
+      emptyLeadP.textContent = currentProject() ? SCHEDULES_COPY.emptyProject : SCHEDULES_COPY.empty;
+    }
+    listErrorEl.textContent = listError;
+    listErrorEl.hidden = !listError || formVisible;
+    emptyEl.hidden = visible.length > 0 || formVisible || loadFailed;
     // 最新创建的在前
-    const sorted = [...entries].sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
+    const sorted = [...visible].sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
     for (const entry of sorted) {
       listEl.appendChild(renderCard(entry));
     }
@@ -515,7 +769,7 @@ export function initSchedulesView(host = {}, env = {}) {
       if (status === 200) {
         host.onAnnounce?.(toggle.checked ? `已启用「${entry.name}」` : `已停用「${entry.name}」`);
       } else {
-        host.onAnnounce?.(`更新失败：${data?.error ?? `HTTP ${status}`}`);
+        host.onAnnounce?.(`更新失败：${humanizeHttpFailure(status, data?.error)}`);
       }
       await reload();
     });
@@ -539,7 +793,7 @@ export function initSchedulesView(host = {}, env = {}) {
           host.onAnnounce?.(`已启动一次「${entry.name}」`);
           if (data?.runId && typeof host.onOpenRun === "function") host.onOpenRun(data.runId);
         } else {
-          host.onAnnounce?.(`触发失败：${data?.error ?? `HTTP ${status}`}`);
+          host.onAnnounce?.(`触发失败：${humanizeHttpFailure(status, data?.error)}`);
         }
       } finally {
         runBtn.disabled = false;
@@ -561,7 +815,7 @@ export function initSchedulesView(host = {}, env = {}) {
       if (status === 200) {
         host.onAnnounce?.(`已删除「${entry.name}」`);
       } else {
-        host.onAnnounce?.(`删除失败：${data?.error ?? `HTTP ${status}`}`);
+        host.onAnnounce?.(`删除失败：${humanizeHttpFailure(status, data?.error)}`);
       }
       await reload();
     });
@@ -578,7 +832,7 @@ export function initSchedulesView(host = {}, env = {}) {
 
   function syncKindRows() {
     const kind = currentKind();
-    for (const row of [onceRow, dailyRow, intervalRow]) {
+    for (const row of [onceRow, dailyRow, weeklyDaysRow, weeklyTimeRow, intervalRow]) {
       row.hidden = row.dataset.forKind !== kind;
     }
   }
@@ -587,6 +841,7 @@ export function initSchedulesView(host = {}, env = {}) {
     formVisible = true;
     form.hidden = false;
     emptyEl.hidden = true;
+    listErrorEl.hidden = true;
     formError.hidden = true;
     // 工作目录下拉：与 composer 同源（/api/harness 的 availableWorkdirs）
     const snap = host.getHarnessSnapshot?.() ?? null;
@@ -627,9 +882,12 @@ export function initSchedulesView(host = {}, env = {}) {
       task: taskInput.value,
       workdir: workdirSelect.value,
       verify: verifyInput.checked,
+      projectId: currentProject()?.id,
       kind: currentKind(),
       onceAtMs: onceInput.value ? new Date(onceInput.value).getTime() : null,
       dailyHhmm: dailyInput.value,
+      weeklyHhmm: weeklyInput.value,
+      weeklyDays: weeklyDayChecks.filter((c) => c.checked).map((c) => Number(c.value)),
       intervalHours: intervalInput.value,
     });
     if (!built.ok) {
@@ -650,7 +908,7 @@ export function initSchedulesView(host = {}, env = {}) {
         hideForm();
         await reload();
       } else {
-        formError.textContent = data?.error ?? `创建失败（HTTP ${status}）`;
+        formError.textContent = humanizeHttpFailure(status, data?.error ?? "创建没做成");
         formError.hidden = false;
       }
     } finally {

@@ -23,13 +23,17 @@ import {
   ScheduleRunner,
   advanceAfterMiss,
   advanceAfterTrigger,
+  WEEKDAYS,
   computeNextRunAt,
+  filterSchedulesByProject,
   isDue,
   isMissed,
+  isWeekdays,
   loadSchedules,
   parseHhmm,
   parseScheduleEntry,
   parseScheduleSpec,
+  parseWeeklyDays,
   saveSchedules,
   schedulesFilePath,
   type ScheduleEntry,
@@ -77,9 +81,19 @@ describe("调度规则校验", () => {
     expect(parseHhmm("")).toBeNull();
   });
 
-  it("parseScheduleSpec：三种合法形态", () => {
+  it("parseScheduleSpec：四种合法形态", () => {
     expect(parseScheduleSpec({ kind: "once", at: 123 })).toEqual({ kind: "once", at: 123 });
     expect(parseScheduleSpec({ kind: "daily", hhmm: "08:00" })).toEqual({ kind: "daily", hhmm: "08:00" });
+    expect(parseScheduleSpec({ kind: "weekly", days: [5, 1, 1], hhmm: "16:00" })).toEqual({
+      kind: "weekly",
+      days: [1, 5],
+      hhmm: "16:00",
+    });
+    expect(parseScheduleSpec({ kind: "weekly", days: [...WEEKDAYS], hhmm: "08:00" })).toEqual({
+      kind: "weekly",
+      days: [1, 2, 3, 4, 5],
+      hhmm: "08:00",
+    });
     expect(parseScheduleSpec({ kind: "interval", everyMs: MIN_INTERVAL_MS })).toEqual({
       kind: "interval",
       everyMs: MIN_INTERVAL_MS,
@@ -90,11 +104,24 @@ describe("调度规则校验", () => {
     expect(parseScheduleSpec(null)).toBeNull();
     expect(parseScheduleSpec("daily")).toBeNull();
     expect(parseScheduleSpec({ kind: "weekly" })).toBeNull();
+    expect(parseScheduleSpec({ kind: "weekly", days: [], hhmm: "08:00" })).toBeNull();
+    expect(parseScheduleSpec({ kind: "weekly", days: [7], hhmm: "08:00" })).toBeNull();
+    expect(parseScheduleSpec({ kind: "weekly", days: [1], hhmm: "25:00" })).toBeNull();
     expect(parseScheduleSpec({ kind: "once", at: "明天" })).toBeNull();
     expect(parseScheduleSpec({ kind: "once", at: Number.NaN })).toBeNull();
     expect(parseScheduleSpec({ kind: "daily", hhmm: "25:00" })).toBeNull();
     expect(parseScheduleSpec({ kind: "interval", everyMs: 1000 })).toBeNull(); // 低于 1 分钟下限
     expect(parseScheduleSpec({ kind: "interval", everyMs: 90_000.5 })).toBeNull(); // 非整数
+  });
+
+  it("parseWeeklyDays / isWeekdays：0=周日…6=周六，工作日=1–5", () => {
+    expect(parseWeeklyDays([1, 2, 3, 4, 5])).toEqual([1, 2, 3, 4, 5]);
+    expect(parseWeeklyDays([5, 0])).toEqual([0, 5]);
+    expect(parseWeeklyDays([-1])).toBeNull();
+    expect(parseWeeklyDays([1.5])).toBeNull();
+    expect(isWeekdays(WEEKDAYS)).toBe(true);
+    expect(isWeekdays([1, 2, 3, 4])).toBe(false);
+    expect(isWeekdays([0, 1, 2, 3, 4, 5])).toBe(false);
   });
 });
 
@@ -128,6 +155,22 @@ describe("computeNextRunAt", () => {
     // 无 base（新建）：从 now 起
     expect(computeNextRunAt(spec, now, null)).toBe(now + 3_600_000);
   });
+
+  it("weekly：下一个落在 days 里的本地时刻（严格大于 now）", () => {
+    expect(new Date(now).getDay()).toBe(0); // 2026-09-06 是周日
+    expect(computeNextRunAt({ kind: "weekly", days: [1, 2, 3, 4, 5], hhmm: "08:00" }, now))
+      .toBe(localTime(2026, 9, 7, 8, 0)); // 周一
+    expect(computeNextRunAt({ kind: "weekly", days: [5], hhmm: "16:00" }, now))
+      .toBe(localTime(2026, 9, 11, 16, 0)); // 周五
+    expect(computeNextRunAt({ kind: "weekly", days: [1], hhmm: "09:00" }, now))
+      .toBe(localTime(2026, 9, 7, 9, 0));
+    const mondayMorning = localTime(2026, 9, 7, 7, 0);
+    expect(computeNextRunAt({ kind: "weekly", days: [...WEEKDAYS], hhmm: "08:00" }, mondayMorning))
+      .toBe(localTime(2026, 9, 7, 8, 0));
+    const friday1600 = localTime(2026, 9, 11, 16, 0);
+    expect(computeNextRunAt({ kind: "weekly", days: [5], hhmm: "16:00" }, friday1600))
+      .toBe(localTime(2026, 9, 18, 16, 0));
+  });
 });
 
 // ---------------------------------------------------------------
@@ -144,13 +187,18 @@ describe("到期 / 错过 / 顺推", () => {
     expect(isDue(makeEntry({ nextRunAt: null }), now)).toBe(false);
   });
 
-  it("isMissed：once/daily 超过 24h 才算；interval 永不 missed", () => {
+  it("isMissed：once/daily/weekly 超过 24h 才算；interval 永不 missed", () => {
     const daily = makeEntry({ schedule: { kind: "daily", hhmm: "07:00" }, nextRunAt: now - MISSED_WINDOW_MS - 1 });
     expect(isMissed(daily, now)).toBe(true);
     const justIn = makeEntry({ schedule: { kind: "daily", hhmm: "07:00" }, nextRunAt: now - MISSED_WINDOW_MS });
     expect(isMissed(justIn, now)).toBe(false);
     const once = makeEntry({ schedule: { kind: "once", at: 1 }, nextRunAt: now - MISSED_WINDOW_MS - 1 });
     expect(isMissed(once, now)).toBe(true);
+    const weekly = makeEntry({
+      schedule: { kind: "weekly", days: [5], hhmm: "16:00" },
+      nextRunAt: now - MISSED_WINDOW_MS - 1,
+    });
+    expect(isMissed(weekly, now)).toBe(true);
     const interval = makeEntry({ nextRunAt: now - MISSED_WINDOW_MS * 3 });
     expect(isMissed(interval, now)).toBe(false);
     expect(isMissed(makeEntry({ enabled: false, nextRunAt: 1 }), now)).toBe(false);
@@ -169,6 +217,10 @@ describe("到期 / 错过 / 顺推", () => {
     const interval = makeEntry({ schedule: { kind: "interval", everyMs: 3_600_000 } });
     advanceAfterTrigger(interval, now);
     expect(interval.nextRunAt).toBe(now + 3_600_000);
+
+    const weekly = makeEntry({ schedule: { kind: "weekly", days: [5], hhmm: "16:00" } });
+    advanceAfterTrigger(weekly, now);
+    expect(weekly.nextRunAt).toBe(localTime(2026, 9, 11, 16, 0));
   });
 
   it("advanceAfterMiss：once 禁用；daily 顺推到下一个未来时刻", () => {
@@ -214,6 +266,27 @@ describe("持久化", () => {
     const loaded = await loadSchedules(file);
     expect(loaded.recovered).toBe(false);
     expect(loaded.entries).toEqual([entry]);
+  });
+
+  it("round-trip：weekly + projectId 不丢", async () => {
+    const entry = makeEntry({
+      id: "rt-weekly",
+      schedule: { kind: "weekly", days: [1, 2, 3, 4, 5], hhmm: "08:00" },
+      projectId: "board-1",
+    });
+    await saveSchedules(file, [entry]);
+    const loaded = await loadSchedules(file);
+    expect(loaded.entries).toEqual([entry]);
+    expect(loaded.entries[0]!.projectId).toBe("board-1");
+  });
+
+  it("filterSchedulesByProject：未选不过滤；选了只留同一 projectId", () => {
+    const a = makeEntry({ id: "a", projectId: "p1" });
+    const b = makeEntry({ id: "b", projectId: "p2" });
+    const loose = makeEntry({ id: "c" });
+    expect(filterSchedulesByProject([a, b, loose], null).map((e) => e.id)).toEqual(["a", "b", "c"]);
+    expect(filterSchedulesByProject([a, b, loose], "p1").map((e) => e.id)).toEqual(["a"]);
+    expect(filterSchedulesByProject([a, b, loose], "p2").map((e) => e.id)).toEqual(["b"]);
   });
 
   it("缺文件 → 空表且非 recovered", async () => {
@@ -307,6 +380,17 @@ describe("ScheduleRunner", () => {
     expect(launches).toBe(0);
     expect(future.lastTrigger).toBeNull();
     expect(disabled.lastTrigger).toBeNull();
+  });
+
+  it("到期 weekly 任务被发起并顺推到下一个星期几", async () => {
+    const entry = makeEntry({
+      schedule: { kind: "weekly", days: [1, 2, 3, 4, 5], hhmm: "08:00" },
+      nextRunAt: t0,
+    });
+    const runner = makeRunner({ entries: [entry] });
+    await runner.tick();
+    expect(entry.lastTrigger?.outcome).toBe("launched");
+    expect(entry.nextRunAt).toBe(localTime(2026, 9, 7, 8, 0));
   });
 
   it("once 触发后禁用且清空 nextRunAt", async () => {

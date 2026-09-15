@@ -14,7 +14,7 @@
  *   g. 持久化：重启宿主（同一文件）后任务仍在
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createUiServer, type UiServerHandle } from "../ui/server.js";
@@ -44,6 +44,7 @@ interface ScheduleDto {
   lastRunId: string | null;
   nextRunAt: number | null;
   lastTrigger: { at: number; outcome: string; runId: string | null; note: string | null } | null;
+  projectId?: string;
 }
 
 describe("T9 /api/schedules 端点", () => {
@@ -273,5 +274,110 @@ describe("T9 /api/schedules 端点", () => {
     expect(list.map((s) => s.id)).toEqual([id]);
     expect(list[0]!.name).toBe("跨重启");
     expect(list[0]!.nextRunAt).toBeGreaterThan(0);
+  });
+
+  it("h. weekly 规则创建 → 201，nextRunAt 落在未来的指定星期", async () => {
+    const base = await boot();
+    const created = await createSchedule(base, {
+      name: "每周复盘",
+      task: "写复盘",
+      schedule: { kind: "weekly", days: [5], hhmm: "16:00" },
+    });
+    expect(created.status).toBe(201);
+    expect(created.data.schedule!.schedule).toEqual({ kind: "weekly", days: [5], hhmm: "16:00" });
+    expect(created.data.schedule!.nextRunAt).toBeGreaterThan(Date.now());
+    const bad = await createSchedule(base, {
+      task: "x",
+      schedule: { kind: "weekly", days: [7], hhmm: "08:00" },
+    });
+    expect(bad.status).toBe(400);
+  });
+
+  it("i. 创建带 projectId；GET ?projectId= 过滤；未知项目 / 目录不属于项目 → 400", async () => {
+    const extra = join(dir, "extra");
+    await mkdir(extra, { recursive: true });
+    await handle?.close();
+    handle = undefined;
+    handle = createUiServer({
+      modelClient: new FakeModelClient([fakeMessage([textBlock("完成")], "end_turn")]),
+      tools: [],
+      workdir: dir,
+      workdirs: [extra],
+    });
+    const base = `http://127.0.0.1:${await startServer(handle)}`;
+
+    const p1 = await (await fetch(`${base}/api/projects`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "甲", workdirs: [dir] }),
+    })).json() as { project: { id: string } };
+    const p2 = await (await fetch(`${base}/api/projects`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "乙", workdirs: [extra] }),
+    })).json() as { project: { id: string } };
+
+    const a = await createSchedule(base, {
+      name: "甲的简报",
+      task: "甲",
+      projectId: p1.project.id,
+      schedule: { kind: "weekly", days: [1, 2, 3, 4, 5], hhmm: "08:00" },
+    });
+    expect(a.status).toBe(201);
+    expect(a.data.schedule!.projectId).toBe(p1.project.id);
+    expect(a.data.schedule!.workdir).toBe(dir);
+
+    const b = await createSchedule(base, {
+      name: "乙的简报",
+      task: "乙",
+      projectId: p2.project.id,
+      schedule: { kind: "daily", hhmm: "09:00" },
+    });
+    expect(b.status).toBe(201);
+
+    const unknown = await createSchedule(base, {
+      task: "x",
+      projectId: "no-such-project",
+      schedule: { kind: "daily", hhmm: "09:00" },
+    });
+    expect(unknown.status).toBe(400);
+
+    const outsider = await createSchedule(base, {
+      task: "x",
+      projectId: p1.project.id,
+      workdir: extra,
+      schedule: { kind: "daily", hhmm: "09:00" },
+    });
+    expect(outsider.status).toBe(400);
+    expect(outsider.data.error).toContain("不属于项目");
+
+    const filtered = await (await fetch(`${base}/api/schedules?projectId=${encodeURIComponent(p1.project.id)}`)).json() as {
+      schedules: ScheduleDto[];
+    };
+    expect(filtered.schedules.map((s) => s.name)).toEqual(["甲的简报"]);
+
+    const all = await listSchedules(base);
+    expect(all.map((s) => s.name).sort()).toEqual(["乙的简报", "甲的简报"]);
+  });
+
+  it("j. 手动触发带 projectId 的任务：run 继承项目", async () => {
+    const base = await boot();
+    const createdProject = await (await fetch(`${base}/api/projects`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "看板", workdirs: [dir] }),
+    })).json() as { project: { id: string } };
+    const created = await createSchedule(base, {
+      name: "项目里的定时",
+      task: "说一句完成",
+      projectId: createdProject.project.id,
+      schedule: { kind: "once", at: futureOnce() },
+    });
+    const id = created.data.schedule!.id;
+    const fired = await fetch(`${base}/api/schedules/${id}/run`, { method: "POST" });
+    expect(fired.status).toBe(200);
+    const { runId } = (await fired.json()) as { runId: string };
+    const runs = await (await fetch(`${base}/api/runs`)).json() as { runId: string; projectId?: string }[];
+    expect(runs.find((r) => r.runId === runId)?.projectId).toBe(createdProject.project.id);
   });
 });
