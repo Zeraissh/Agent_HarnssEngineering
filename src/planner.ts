@@ -440,6 +440,9 @@ export function buildPlanFromInventory(task: string, inv: ShardInventory, rule: 
  * "计划不该比执行贵"仍然成立——由 presets 测试锁不等式，不在运行时夹断。
  */
 export const DEFAULT_PLANNER_MAX_TURNS = 12;
+/** 杂志/幻灯/大图必须留在 design 包——改派 python-coding 画色块是那次幻觉的第一道闸。 */
+export const PLANNER_DESIGN_PACK_RULE =
+  "杂志风、幻灯、落地页、刊头/大图/配图类任务的 pack 必须是 design；不得改派 python-coding / ts-coding 用脚本画色块交差。验收必须能核对照片文件，色块与几何填充不算大图。";
 
 /**
  * 预算用尽后"收口续跑"的额外轮次上限（9.7 的 planner 版）。
@@ -695,6 +698,7 @@ ${packList}
 3. 每个分片：description 必须自包含（执行 agent 看不到你的上下文,绝对路径/命令/口径写全）;acceptance 可被独立核查者逐条程序化验证;estTurns 为预计工具调用轮数（整数,粗估即可）。
 4. 若各分片结果需要合并,输出 join（汇总步,会在全部分片完成后执行）:它【只消费分片的产物,不得重新推导源数据】——把这一句写进 join 的 description。无需合并则省略 join。
 5. 你的探索仅限只读;不要修改、创建或删除任何东西。
+6. ${PLANNER_DESIGN_PACK_RULE}
 
 你的最后一条消息必须只包含一个 JSON 对象（不要代码围栏、不要多余文字）：
 {"shards": [{"id": "s1", "title": "短标题", "pack": "包名或 null", "description": "自包含任务书", "acceptance": ["验收点"], "estTurns": 2}], "join": {"title": "...", "pack": null, "description": "...", "acceptance": ["..."]}}
@@ -1005,6 +1009,7 @@ ${packList}
 4. 并行冲突纪律：互不依赖的子任务不得写同一个文件、目录或独占资源（调试探针、端口、服务）；会冲突就用 dependsOn 串行化。
 5. 需要汇总多个并行分支的结果时，加一个收尾子任务，dependsOn 列出全部相关分支；汇总子任务的 description 里必须写明：只消费上游交接的产物（文件/摘要），不得重新推导源数据。
 6. 你的探索仅限只读；不要修改、创建或删除任何东西。
+7. ${PLANNER_DESIGN_PACK_RULE}
 
 你的最后一条消息必须只包含一个 JSON 对象（不要代码围栏、不要多余文字）：
 {"subtasks": [{"id": "s1", "title": "短标题", "pack": "包名或 null", "description": "自包含的任务书", "acceptance": ["验收点，每条一个字符串"], "dependsOn": ["依赖的子任务 id"]}]}`;

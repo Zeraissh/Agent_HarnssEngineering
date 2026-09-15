@@ -4,6 +4,7 @@ import {
   DEFAULT_PLANNER_MAX_TURNS,
   PLANNER_WRAPUP_MAX_TURNS,
   PLAN_TOOL_NAME,
+  PLANNER_DESIGN_PACK_RULE,
   SHARDS_TOOL_NAME,
   createPlanTool,
   createShardsTool,
@@ -202,6 +203,32 @@ describe("runPlanner", () => {
       fakeMessage([textBlock(PLAN_JSON)], "end_turn"),
     ]);
     expect((await runPlanner(baseConfig, prose, "任务", [])).recovery).toBe("reformat");
+  });
+
+  it("拆分纪律写死：杂志/大图必须留在 design 包", async () => {
+    const model = new ScriptedClient([fakeMessage([textBlock(PLAN_JSON)], "end_turn")]);
+    await runPlanner(baseConfig, model, "做一套杂志风幻灯", Object.values(PACKS));
+    const first = JSON.stringify(model.requests[0]!.messages);
+    expect(first).toContain(PLANNER_DESIGN_PACK_RULE);
+    expect(PLANNER_DESIGN_PACK_RULE).toMatch(/pack 必须是 design/);
+    expect(PLANNER_DESIGN_PACK_RULE).toMatch(/色块/);
+  });
+});
+
+describe("runStructuredPlanner 设计包纪律", () => {
+  it("结构化协议同款：杂志/大图必须留在 design 包", async () => {
+    const model = new ScriptedClient([
+      fakeMessage(
+        [
+          textBlock(
+            '{"shards": [{"id": "s1", "title": "杂志风幻灯", "pack": "design", "description": "每页一张大图", "acceptance": ["照片文件可核对"], "estTurns": 4}]}',
+          ),
+        ],
+        "end_turn",
+      ),
+    ]);
+    await runStructuredPlanner(baseConfig, model, "做一套杂志风幻灯", Object.values(PACKS));
+    expect(JSON.stringify(model.requests[0]!.messages)).toContain(PLANNER_DESIGN_PACK_RULE);
   });
 });
 

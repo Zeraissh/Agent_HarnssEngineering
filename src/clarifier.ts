@@ -21,6 +21,10 @@ import type {
 
 export const REQUIREMENTS_TOOL_NAME = "submit_requirements";
 export const DEFAULT_CLARIFIER_MAX_TURNS = 4;
+/** 澄清门不得把「大图」改写成色块——那次杂志风幻灯的第一推。 */
+export const CLARIFIER_VISUAL_RULE =
+  "不得把 <original_task> 已写明的视觉交付（杂志风、幻灯、落地页、大图、配图、照片、刊头图）改写成色块/几何替代，也不得从 acceptance 删掉。" +
+  "色块与几何填充不算大图。推荐选项不得与 original_task 的视觉要求相反，不得把「用色块代替大图」列成可选项。";
 
 export interface ClarificationOutcome {
   task: string;
@@ -121,6 +125,7 @@ ${task}
 若不存在，不要为了显得谨慎而提问，直接调用 ${REQUIREMENTS_TOOL_NAME} 原样提交任务。
 同工作目录里其它会话、其它文件夹、记忆条目不是本任务的候选解释；不得把它们列进 ask_user 选项。
 相对指代（继续 / 未完成）只指向 <original_task> 已写明的对象，不要改成「选一个未完成项目」。
+${CLARIFIER_VISUAL_RULE}
 不得用普通文本收尾。`;
 }
 

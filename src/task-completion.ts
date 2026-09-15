@@ -7,6 +7,10 @@
  * completed / partial / blocked 三态保真带回宿主。
  */
 import {
+  unreviewedImageCompletion,
+  wrapDescribeImageForReview,
+} from "./design-image-review.js";
+import {
   DEFAULT_MAX_STAGNATION_RECOVERIES,
   DEFAULT_PROGRESS_EXTENSION_TURNS,
   DEFAULT_STAGNATION_WINDOW,
@@ -23,6 +27,24 @@ export const FINISH_TASK_REMINDER =
   "如果缺少只有委托方知道的事实且 ask_user 可用，请立即调用 ask_user；" +
   `否则继续完成剩余工作，或调用 ${FINISH_TASK_TOOL_NAME} 如实提交 completed / partial / blocked。` +
   "不要只用文字说“完成了”或只留下一个问题。";
+
+/** 工具面真有 describe_image 时，完成声明上的硬提示。 */
+export const FINISH_TASK_IMAGE_GATE_WHEN_PRESENT =
+  "若交付含配图/大图/照片，或 artifacts 含图片文件，completed 前必须先成功调用 describe_image；" +
+  "只报路径存在、文件名像主题，都不算看过。";
+
+/**
+ * 工具面没有识图时只靠提示：优先 partial，不得在 resolveTerminal 一刀切打成无效。
+ * flash 设计活经常没有 describe_image——完成方式=做对，不是原样合上缺工具的门。
+ */
+export const FINISH_TASK_IMAGE_GATE_WHEN_ABSENT =
+  "若交付含配图/大图/照片，或 artifacts 含图片文件，而本段没有 describe_image：" +
+  "不要把配图写成已验收，优先 partial 并写明未审图；只报路径存在、文件名像主题，都不算看过。";
+
+const FINISH_TASK_IMAGE_REMINDER_WHEN_PRESENT =
+  "若本段声称交了配图/大图/照片，completed 前必须已成功调用 describe_image。";
+const FINISH_TASK_IMAGE_REMINDER_WHEN_ABSENT =
+  "本段没有 describe_image：配图/大图不得写成已验收，优先 partial 并写明未审图。";
 
 function stringArray(value: unknown): string[] | undefined {
   if (value === undefined) return [];
@@ -56,14 +78,18 @@ export function taskCompletionFromObject(input: unknown): TaskCompletion | undef
   return { status, summary, artifacts, verification, assumptions, blockers };
 }
 
-export function createFinishTaskTool(): Tool {
+export function createFinishTaskTool(opts: { describeImageOnFace?: boolean } = {}): Tool {
+  const imageGate = opts.describeImageOnFace
+    ? FINISH_TASK_IMAGE_GATE_WHEN_PRESENT
+    : FINISH_TASK_IMAGE_GATE_WHEN_ABSENT;
   return {
     name: FINISH_TASK_TOOL_NAME,
     description:
       "提交本次任务的最终状态并结束执行。只有调用此工具才算业务层收尾：" +
       "completed=全部完成并已给出验证证据；partial=交付了可用部分但仍有未完成项；" +
       "blocked=因明确外部条件无法继续。若缺少只有委托方知道的事实且 ask_user 可用，" +
-      "应先调用 ask_user，不能把一个可以提问解决的问题直接伪装成完成。",
+      "应先调用 ask_user，不能把一个可以提问解决的问题直接伪装成完成。" +
+      imageGate,
     inputSchema: {
       type: "object",
       properties: {
@@ -129,17 +155,32 @@ export function withTaskCompletion(
   cfg: AgentConfig,
   opts: TaskCompletionOptions = {},
 ): AgentConfig {
+  const described = new Set<string>();
+  const describeImageOnFace = cfg.tools.some((t) => t.name === "describe_image");
+  const tools = cfg.tools
+    .filter((t) => t.name !== FINISH_TASK_TOOL_NAME)
+    .map((t) => (t.name === "describe_image" ? wrapDescribeImageForReview(t, described) : t));
+  tools.push(createFinishTaskTool({ describeImageOnFace }));
   return {
     ...cfg,
-    tools: [...cfg.tools.filter((t) => t.name !== FINISH_TASK_TOOL_NAME), createFinishTaskTool()],
+    tools,
     terminalTool: FINISH_TASK_TOOL_NAME,
     requireTerminalTool: true,
-    terminalReminder: FINISH_TASK_REMINDER,
+    terminalReminder:
+      FINISH_TASK_REMINDER +
+      (describeImageOnFace
+        ? FINISH_TASK_IMAGE_REMINDER_WHEN_PRESENT
+        : FINISH_TASK_IMAGE_REMINDER_WHEN_ABSENT),
     resolveTerminal: (input) => {
       const completion = taskCompletionFromObject(input);
-      return completion
-        ? { stopReason: completion.status, completion }
-        : undefined;
+      // 硬拒只在本段工具面真有 describe_image 时成立；缺工具只靠提示走 partial。
+      if (
+        !completion ||
+        (describeImageOnFace && unreviewedImageCompletion(completion, described.size))
+      ) {
+        return undefined;
+      }
+      return { stopReason: completion.status, completion };
     },
     recovery: {
       progressExtensionTurns:

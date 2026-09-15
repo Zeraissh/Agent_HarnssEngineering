@@ -28,7 +28,10 @@ export function claimsDeliveredImages(
   );
 }
 
-/** completed 且声称有图，但本段一次识图都没有 → 不许收尾。 */
+/**
+ * 事实：completed 且声称有图，但本段一次识图都没有。
+ * 硬拒只在调用方确认工具面真有 describe_image 时成立——缺工具不得把这当成无效完成。
+ */
 export function unreviewedImageCompletion(
   completion: Pick<TaskCompletion, "status" | "summary" | "artifacts" | "verification">,
   describedCount: number,

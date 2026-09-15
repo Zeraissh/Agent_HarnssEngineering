@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  CLARIFIER_VISUAL_RULE,
   REQUIREMENTS_TOOL_NAME,
   runClarificationGate,
 } from "../src/clarifier.js";
@@ -85,6 +86,36 @@ describe("planner 前结构化需求澄清门", () => {
       "ask_user",
       REQUIREMENTS_TOOL_NAME,
     ].sort());
+    expect(JSON.stringify(model.requests[0]!.messages)).toContain(CLARIFIER_VISUAL_RULE);
+  });
+
+  it("澄清纪律写死：大图不得改写成色块，选项不得反着视觉要求", async () => {
+    const ask = createAskUserTool({
+      ask: async () => {
+        throw new Error("无歧义时不该提问");
+      },
+    });
+    const model = new FakeModelClient([
+      fakeMessage(
+        [
+          toolUseBlock("requirements", REQUIREMENTS_TOOL_NAME, {
+            task: "做一套杂志风幻灯，每页一张大图",
+            acceptance: ["每页有配图"],
+            assumptions: [],
+          }),
+        ],
+        "tool_use",
+      ),
+    ]);
+    await runClarificationGate(
+      { ...baseConfig, tools: [ask] },
+      model,
+      "做一套杂志风幻灯，每页一张大图",
+    );
+    const first = JSON.stringify(model.requests[0]!.messages);
+    expect(first).toContain(CLARIFIER_VISUAL_RULE);
+    expect(CLARIFIER_VISUAL_RULE).toMatch(/色块/);
+    expect(CLARIFIER_VISUAL_RULE).toMatch(/不得把「用色块代替大图」列成可选项/);
   });
 
   it("runPlanned 必须等澄清门完成，planner 收到精炼任务而不是原始歧义句", async () => {
