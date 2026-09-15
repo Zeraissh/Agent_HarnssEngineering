@@ -1845,8 +1845,9 @@ export function resolveVendorFile(urlPath: string): string | undefined {
   const exact = VENDOR_STATIC.get(urlPath);
   if (exact) return exact;
   const font = urlPath.match(KATEX_FONT_RE);
-  if (font) {
-    const abs = join(KATEX_DIR, "fonts", font[1]);
+  const fontName = font?.[1];
+  if (fontName) {
+    const abs = join(KATEX_DIR, "fonts", fontName);
     if (existsSync(abs)) return abs;
   }
   return undefined;

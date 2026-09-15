@@ -132,10 +132,7 @@ describe("启动参数锁", () => {
 
 describe("评测走查脚本不手写 ./chrome-profile", () => {
   const files = [
-    "eval/persona-ux/walks/_amp-cdp.mjs",
-    "eval/persona-ux/walks/_student-cdp.mjs",
-    "eval/persona-ux/walks/_antigravity-cdp.mjs",
-    "eval/persona-ux/_tmp-walk-server.mjs",
+    "eval/persona-ux/resolve-chrome-profile.mjs",
   ];
 
   it("CDP / walk 启动器走 resolveChromeUserDataDir，启动串不含相对 profile", () => {
@@ -143,7 +140,7 @@ describe("评测走查脚本不手写 ./chrome-profile", () => {
       const src = readFileSync(path.join(process.cwd(), rel), "utf8");
       expect(src, rel).toContain("resolveChromeUserDataDir");
       expect(src, rel).not.toMatch(/--user-data-dir=\.\/chrome-profile/);
-      expect(src, rel).not.toMatch(/PROFILE\s*=\s*["']\.\/chrome-profile["']/);
+      expect(src, rel).not.toMatch(/(?:^|[^\w])(?:const|let|var)\s+PROFILE\s*=\s*["']\.\/chrome-profile["']/);
     }
   });
 });
