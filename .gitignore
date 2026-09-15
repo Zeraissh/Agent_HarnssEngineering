@@ -69,3 +69,18 @@ _qa/
 /index.html
 shanghai-michelin-guide.html
 assets/images/
+
+# 本机项目 / 日程 / 战役数据：留仓库根，不进仓
+.agent-projects.json
+.agent-schedules.json
+.agent-campaigns/
+
+# persona-ux 走查草稿（正式 walks/*.md 仍进仓；截图与下划线脚本已搬到 D:\Work\scratch\persona-ux-walks-20260915）
+eval/persona-ux/_verify-shots/
+eval/persona-ux/walks/_*
+eval/persona-ux/_verify-live*
+eval/persona-ux/_tmp-*
+eval/persona-ux/_api-usage.json
+/hello-*.txt
+/*-cli-*.txt
+/approve-chatgpt.txt
