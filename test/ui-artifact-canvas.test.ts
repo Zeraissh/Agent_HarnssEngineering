@@ -43,7 +43,7 @@ import {
   PREVIEW_HTML_SANDBOX,
   PREVIEW_IFRAME_ALLOW,
 } from "../ui/public/features/artifact-canvas.js";
-import { DECK_READY_MESSAGE_TYPE, DECK_GOTO_MESSAGE_TYPE, DECK_STATE_MESSAGE_TYPE, WEBGL_STATUS_MESSAGE_TYPE } from "../ui/public/features/review-mode.js";
+import { DECK_READY_MESSAGE_TYPE, DECK_GOTO_MESSAGE_TYPE, DECK_STATE_MESSAGE_TYPE, WEBGL_STATUS_MESSAGE_TYPE, INSPECT_SET_MESSAGE_TYPE } from "../ui/public/features/review-mode.js";
 import { deriveWrittenPaths } from "../ui/public/app.js";
 
 const flush = () => new Promise((r) => setTimeout(r, 0));
@@ -369,7 +369,7 @@ describe("initArtifactCanvas — 打开与 chrome", () => {
     expect(api.focusAddress()).toBe(true);
   });
 
-  it("点评模式仍走整站 URL，只加 inspect=1，不 fetch、不用 srcdoc", async () => {
+  it("点评模式不改 iframe src，只 postMessage 打开页内钩子", async () => {
     const fakeFetch = vi.fn(async (url) => {
       if (String(url).includes("design-md")) {
         return { ok: true, json: async () => ({ found: false }) };
@@ -380,17 +380,28 @@ describe("initArtifactCanvas — 打开与 chrome", () => {
     api.open(0);
     await flush();
     fakeFetch.mockClear();
+    const frame = document.querySelector("iframe.ac-frame");
+    const srcBefore = frame.getAttribute("src");
+    expect(srcBefore).toBe("/api/runs/run-1/site/out/index.html?deck=1");
+    const posts = [];
+    Object.defineProperty(frame, "contentWindow", {
+      value: { postMessage: (msg) => posts.push(msg) },
+      configurable: true,
+    });
     document.querySelector("#ac-inspect").click();
     await flush();
-    // inspect 重渲仍不 fetch 产物，也不拉 DESIGN.md
     expect(fakeFetch).not.toHaveBeenCalled();
-    const frame = document.querySelector("iframe.ac-frame");
+    expect(frame.getAttribute("src")).toBe(srcBefore);
+    expect(frame.getAttribute("srcdoc")).toBeNull();
     expect(frame.getAttribute("sandbox")).toBe("allow-scripts");
     expect(frame.getAttribute("sandbox")).not.toContain("allow-same-origin");
-    expect(frame.getAttribute("allow")).toMatch(/webgl \*/);
-    expect(frame.getAttribute("src")).toBe("/api/runs/run-1/site/out/index.html?deck=1&inspect=1");
-    expect(frame.getAttribute("srcdoc")).toBeNull();
+    expect(posts.some((p) => p?.type === INSPECT_SET_MESSAGE_TYPE && p.on === true)).toBe(true);
     expect(document.querySelector(".ac-note")?.textContent).toContain("点评模式");
+    expect(document.querySelector(".ac-note")?.textContent).toContain("不刷新");
+    document.querySelector("#ac-inspect").click();
+    await flush();
+    expect(frame.getAttribute("src")).toBe(srcBefore);
+    expect(posts.some((p) => p?.type === INSPECT_SET_MESSAGE_TYPE && p.on === false)).toBe(true);
   });
 
   it("iframe 报到没有 WebGL 时显示人话条，并接到「在系统浏览器打开」", async () => {

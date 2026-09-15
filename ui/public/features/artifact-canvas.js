@@ -19,7 +19,9 @@
  * 产物是模型生成的**不可信内容**，防线分两层：
  *   - 单文件扫一眼（/api/runs/:id/artifact）：CSP 禁脚本；下载仍走此通道；
  *   - HTML 预览一律整站（/api/runs/:id/site/*）：路径式取件让相对 CSS/JS 可解析，
- *     CSP 允许同源脚本；点评用 `?inspect=1` 由服务端注入点选钩子（不剥页面脚本）；
+ *     CSP 允许同源脚本；`/site` 每次出 HTML 都注入休眠点评 runtime。进入点评
+ *     只 postMessage，不改 iframe.src（刷掉会丢 WebGL/相机）。`?inspect=1`
+ *     只表示开机即开（换文件重挂时沿用）；
  *   - iframe `sandbox="allow-scripts"`：**故意不给 allow-same-origin**。给了它，
  *     产物脚本就能读宿主 localStorage、调同源 /api/*；不给则是无源文档，脚本
  *     即使绕过 CSP 也碰不到宿主。两层独立，各自失效时另一层仍在。
@@ -46,6 +48,7 @@ import {
   DECK_READY_MESSAGE_TYPE,
   DECK_GOTO_MESSAGE_TYPE,
   DECK_STATE_MESSAGE_TYPE,
+  INSPECT_SET_MESSAGE_TYPE,
 } from "./review-mode.js";
 
 // ---------------------------------------------------------------
@@ -611,7 +614,8 @@ function bindOfficeChrome(root) {
  *   path 只做类型分派与标题；url 是单文件取件（图/文/下载）；HTML 预览用 siteUrl。
  *   Office（pptx/docx）走 officePreviewUrl JSON。
  *   isStale 返回 true 表示调用方已切走，放弃渲染并返回 null。
- *   inspect：HTML 加 ?inspect=1；Office 展开本页点评表。
+   *   inspect：Office 展开本页点评表；HTML 文案切到点评（iframe src 由调用方决定，
+   *   进入点评不要为了钩子改 src）。
  * @returns {Promise<{ size:number|null }|null>}
  *   读到的字节数（不可得/未读取为 null）；isStale 中途成立时整体返回 null。
  */
@@ -645,10 +649,10 @@ export async function renderPreviewBody(body, opts) {
       return { size: null };
     }
     case "html": {
-      // 一律整站 /site/*；点评只加 ?inspect=1。沙箱纪律见文件头。
+      // 一律整站 /site/*。进入点评不改 src——runtime 已在文档里，postMessage 开关。
       const frameSrc = opts.siteUrl || url;
       const note = opts.inspect
-        ? `<p class="ac-note">点评模式：点页面元素后填写意见，会写进输入框。整站资源仍可用；沙箱不含 same-origin。</p>`
+        ? `<p class="ac-note">点评模式：点页面元素或三维对象后填写意见，会写进输入框。预览不刷新。</p>`
         : `<p class="ac-note">整站预览：相对 CSS/JS 按目录解析。若有 .slide 可翻页（注入脚本切可见页，沙箱不含 same-origin）。三维页若仍提示没有 WebGL，用「在系统浏览器打开」。</p>`;
       body.innerHTML =
         `<iframe class="ac-frame" sandbox="${PREVIEW_HTML_SANDBOX}" allow="${PREVIEW_IFRAME_ALLOW}" referrerpolicy="no-referrer" ` +
@@ -837,7 +841,7 @@ export function initArtifactCanvas(host = {}, env = {}) {
   let renderToken = 0;
   /** 内容更新自动刷新的防抖计时器（noteWrites） */
   let refreshTimer = 0;
-  /** HTML 点评：同一整站 URL 加 ?inspect=1 */
+  /** HTML 点评：已打开的 iframe 上 postMessage 开关，不改 src */
   let inspectOn = false;
   /** 图片画圈：叠一层 canvas，坐标写进输入框 */
   let annotateOn = false;
@@ -1208,6 +1212,33 @@ export function initArtifactCanvas(host = {}, env = {}) {
     iframe.contentWindow.postMessage({ type: DECK_GOTO_MESSAGE_TYPE, ...payload }, "*");
   }
 
+  function htmlPreviewFrame() {
+    return body.querySelector("iframe.ac-frame:not(.ac-frame--web)");
+  }
+
+  function postInspectSet(on) {
+    const iframe = htmlPreviewFrame();
+    if (!iframe?.contentWindow || typeof iframe.contentWindow.postMessage !== "function") return;
+    iframe.contentWindow.postMessage({ type: INSPECT_SET_MESSAGE_TYPE, on: Boolean(on) }, "*");
+  }
+
+  function bindInspectBridge(iframe) {
+    if (!iframe || iframe.dataset.inspectBridge === "1") return;
+    iframe.dataset.inspectBridge = "1";
+    iframe.addEventListener("load", () => {
+      if (inspectOn) postInspectSet(true);
+    });
+  }
+
+  function paintInspectNote() {
+    const note = body.querySelector(".ac-note");
+    if (!note) return;
+    if (artifactRendererKind(currentArtifactPath()) !== "html") return;
+    note.textContent = inspectOn
+      ? "点评模式：点页面元素或三维对象后填写意见，会写进输入框。预览不刷新。"
+      : "整站预览：相对 CSS/JS 按目录解析。若有 .slide 可翻页（注入脚本切可见页，沙箱不含 same-origin）。三维页若仍提示没有 WebGL，用「在系统浏览器打开」。";
+  }
+
   function mountImageAnnotator() {
     dropAnnotator();
     const wrap = body.querySelector(".ac-image-wrap");
@@ -1537,6 +1568,7 @@ export function initArtifactCanvas(host = {}, env = {}) {
       inspect: inspectOn && (kind === "html" || isOfficeKind(kind)),
     });
     if (result && token === renderToken) setSize(result.size);
+    if (token === renderToken && kind === "html") bindInspectBridge(htmlPreviewFrame());
     if (token === renderToken && annotateOn && kind === "image") mountImageAnnotator();
     if (token === renderToken && isOfficeKind(kind)) bindOfficeReview();
   }
@@ -1805,8 +1837,14 @@ export function initArtifactCanvas(host = {}, env = {}) {
     inspectOn = !inspectOn;
     const kind = artifactRendererKind(currentArtifactPath());
     paintReviewChrome(kind);
-    if (kind === "html") void renderCurrent({ keepDeckPin: true });
-    else if (isOfficeKind(kind)) bindOfficeReview();
+    if (kind === "html") {
+      paintInspectNote();
+      const iframe = htmlPreviewFrame();
+      if (iframe) {
+        bindInspectBridge(iframe);
+        postInspectSet(inspectOn);
+      }
+    } else if (isOfficeKind(kind)) bindOfficeReview();
   });
   annotateBtn.addEventListener("click", () => {
     annotateOn = !annotateOn;

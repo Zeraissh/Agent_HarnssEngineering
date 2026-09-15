@@ -3,6 +3,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
   INSPECT_MESSAGE_TYPE,
+  INSPECT_SET_MESSAGE_TYPE,
   INSPECT_HOOK_SOURCE,
   DECK_READY_MESSAGE_TYPE,
   DECK_GOTO_MESSAGE_TYPE,
@@ -22,7 +23,13 @@ import {
   injectInspectHook,
   appendInspectHook,
   appendSiteHooks,
+  buildInspectHookSource,
+  formatObject3dReview,
+  isReviewChrome,
+  isReviewOverlay,
+  shouldSkipInvisibleMaterial,
   isInspectPick,
+  isInspectSet,
   isWebglStatus,
   pathLength,
   pct,
@@ -96,11 +103,20 @@ describe("inspect hook 注入", () => {
     const hooked = appendSiteHooks(html, { deck: true, inspect: true });
     expect(hooked).toContain(DECK_READY_MESSAGE_TYPE);
     expect(hooked).toContain(INSPECT_MESSAGE_TYPE);
+    expect(hooked).toContain("var startOn = true");
     expect(hooked).toContain("closest");
     expect(hooked).toContain("agent-deck-visibility");
     expect(hooked).toContain("display:none!important");
     expect(hooked).toContain(".slide[data-slide].is-active");
     expect(hooked).toContain("position:relative!important");
+  });
+
+  it("整站默认注入休眠点评 runtime，不改 src 也能开点评", () => {
+    const hooked = appendSiteHooks("<html><body>x</body></html>");
+    expect(hooked).toContain(INSPECT_SET_MESSAGE_TYPE);
+    expect(hooked).toContain("var startOn = false");
+    expect(hooked).toContain("Raycaster");
+    expect(hooked).toContain("elementsFromPoint");
   });
 
   it("点评钩子含悬停外描边；点击后短暂固定（pinUntil）", () => {
@@ -109,6 +125,32 @@ describe("inspect hook 注入", () => {
     expect(INSPECT_HOOK_SOURCE).toContain("mousemove");
     expect(INSPECT_HOOK_SOURCE).toContain("pointer-events:none");
     expect(INSPECT_HOOK_SOURCE).toContain("pinUntil");
+    expect(INSPECT_HOOK_SOURCE).toContain(INSPECT_SET_MESSAGE_TYPE);
+  });
+
+  it("三维点评：有名 / slot / reviewId；隐形材质跳过；chrome 与 overlay 分开", () => {
+    expect(formatObject3dReview({ name: "Door", userData: {}, type: "Mesh" }))
+      .toEqual({ selector: "mesh:Door", text: "Door" });
+    expect(formatObject3dReview({ name: "", userData: { slot: 22 }, type: "Mesh" }))
+      .toEqual({ selector: "mesh:slot-22", text: "槽位 22" });
+    expect(formatObject3dReview({ name: "Mesh", userData: { reviewId: "wafer-upper" }, type: "Mesh" }))
+      .toEqual({ selector: '[data-review-id="wafer-upper"]', text: "wafer-upper" });
+    expect(formatObject3dReview({
+      name: "",
+      type: "Mesh",
+      geometry: { type: "BoxGeometry" },
+      userData: {},
+      parent: { name: "Group", userData: {}, parent: null },
+    })).toEqual({ selector: "mesh:Mesh(BoxGeometry)", text: "Mesh" });
+    expect(shouldSkipInvisibleMaterial({ visible: true, material: { visible: false } })).toBe(true);
+    expect(shouldSkipInvisibleMaterial({ visible: true, material: { visible: true } })).toBe(false);
+    const chrome = { closest: (sel) => (sel.includes(".panel") ? {} : null) };
+    const label = { closest: (sel) => (sel.includes(".label") ? {} : null) };
+    expect(isReviewChrome(chrome)).toBe(true);
+    expect(isReviewChrome(label)).toBe(false);
+    expect(isReviewOverlay(label)).toBe(true);
+    expect(isInspectSet({ type: INSPECT_SET_MESSAGE_TYPE, on: true })).toBe(true);
+    expect(isInspectSet({ type: INSPECT_SET_MESSAGE_TYPE, on: "yes" })).toBe(false);
   });
 
   it("print 钩子调起 window.print", () => {
@@ -139,6 +181,45 @@ describe("inspect hook 注入", () => {
     expect(isInspectPick({ type: INSPECT_MESSAGE_TYPE, selector: "h1" })).toBe(true);
     expect(isInspectPick({ type: INSPECT_MESSAGE_TYPE, selector: "  " })).toBe(false);
     expect(isInspectPick({ type: "other", selector: "h1" })).toBe(false);
+  });
+});
+
+describe("inspect runtime 就地开关", () => {
+  afterEach(() => {
+    window.__agentInspectHooked = false;
+    document.documentElement.removeAttribute("data-agent-inspect");
+    document.documentElement.style.cursor = "";
+    document.getElementById("agent-inspect-ring")?.remove();
+    document.body.innerHTML = "";
+  });
+
+  it("休眠钩子不抢点击；收到 inspect-set 才点选", async () => {
+    document.body.innerHTML = '<h1 id="hero">标题</h1>';
+    const picks = [];
+    const onMsg = (ev) => {
+      if (ev.data?.type === INSPECT_MESSAGE_TYPE) picks.push(ev.data);
+    };
+    window.addEventListener("message", onMsg);
+    try {
+      (0, eval)(buildInspectHookSource({ startOn: false }));
+      expect(document.documentElement.getAttribute("data-agent-inspect")).toBeNull();
+      document.getElementById("hero").dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+      await new Promise((r) => setTimeout(r, 0));
+      expect(picks).toHaveLength(0);
+      window.dispatchEvent(new MessageEvent("message", {
+        data: { type: INSPECT_SET_MESSAGE_TYPE, on: true },
+      }));
+      expect(document.documentElement.getAttribute("data-agent-inspect")).toBe("1");
+      document.getElementById("hero").dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+      await new Promise((r) => setTimeout(r, 0));
+      expect(picks.some((p) => String(p.selector).includes("hero") || String(p.selector).includes("h1"))).toBe(true);
+      window.dispatchEvent(new MessageEvent("message", {
+        data: { type: INSPECT_SET_MESSAGE_TYPE, on: false },
+      }));
+      expect(document.documentElement.getAttribute("data-agent-inspect")).toBeNull();
+    } finally {
+      window.removeEventListener("message", onMsg);
+    }
   });
 });
 

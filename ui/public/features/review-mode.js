@@ -1,15 +1,18 @@
 /**
  * features/review-mode — 网站预览里的点评。
  *
- * 沙箱 iframe 没有 allow-same-origin，父页读不到 contentDocument。
- * 正解：整站仍走 `/site/*`（相对 CSS/JS 可用）；点评时由服务端在 HTML 响应里
- * 注入点选钩子（`?inspect=1`），不剥页面自己的脚本。点选经 postMessage 回来；
- * selector / 文案当不可信字符串，只写进输入框。
+ * 沙箱 iframe 没有 allow-same-origin，父页读不到 contentDocument，不能
+ * 事后把 script 塞进已打开的文档。正解：`/site/*` 每次出 HTML 都注入
+ * **休眠**点评 runtime（跟 deck / WebGL 探针同族）；父页点「点评」只
+ * postMessage `agent-inspect-set`，不要改 iframe.src。`?inspect=1` 只表示
+ * 开机即开（换文件重挂时沿用），不是进入点评的必经导航。
+ * 点选经 postMessage 回来；selector / 文案当不可信字符串，只写进输入框。
+ * 三维页（FOUP / liquid-demo）：钩子包一层 THREE.WebGLRenderer.render
+ * 记下 scene/camera，再射线打可见 mesh；跳过 material.visible=false 的
+ * 隐形拾取盒、Helper、UI chrome。CSS 标注 / atmos 用 elementsFromPoint
+ * 穿透到 canvas，避免覆盖层把槽位/壳体点丢了。
  * 翻页也走同一条路：注入 runtime 收 goto、在 iframe 里切可见页。不读
- * contentDocument，因此不需要放宽 same-origin。杂志风稿常省略
- * `.slide{display:none}`，只改 is-active 会让封面一直挡着；只 hidden 掉
- * 兄弟页又会让叠层后页失去尺寸/背景，变成黑框。runtime 同时藏非当前页
- * 并强制当前页自己占满视口（打印媒体不套）。
+ * contentDocument，因此不需要放宽 same-origin。
  */
 
 import {
@@ -22,6 +25,7 @@ import {
 } from "../core/math.js";
 
 export const INSPECT_MESSAGE_TYPE = "agent-inspect-pick";
+export const INSPECT_SET_MESSAGE_TYPE = "agent-inspect-set";
 export const DECK_READY_MESSAGE_TYPE = "agent-deck-ready";
 export const DECK_GOTO_MESSAGE_TYPE = "agent-deck-goto";
 export const DECK_STATE_MESSAGE_TYPE = "agent-deck-state";
@@ -113,12 +117,88 @@ export function isWebglStatus(data) {
   );
 }
 
-/** iframe 内运行：只 postMessage，不碰父页。悬停用固定层描边，画在控件外侧。 */
-export const INSPECT_HOOK_SOURCE = `(function(){
+export function isInspectSet(data) {
+  return Boolean(
+    data
+    && typeof data === "object"
+    && data.type === INSPECT_SET_MESSAGE_TYPE
+    && typeof data.on === "boolean",
+  );
+}
+
+/** 侧栏 / HUD / 按钮是页面 chrome，点评点它们走 DOM，不拿去射三维。 */
+export function isReviewChrome(el) {
+  if (!el || typeof el.closest !== "function") return false;
+  if (el.closest(".labels, .label, .atmos, .tip, #agent-inspect-ring")) return false;
+  return Boolean(el.closest(".panel, .hud, header, footer, nav, button, a, input, textarea, select, [data-review-ignore]"));
+}
+
+/** 大气层、CSS 标注、载入遮罩：挡在 canvas 上，点评时应穿透去射三维。 */
+export function isReviewOverlay(el) {
+  if (!el || typeof el.closest !== "function") return false;
+  return Boolean(el.closest("#agent-inspect-ring, .atmos, .labels, .tip, .loading, .fallback, [data-review-overlay]"));
+}
+
+/** FOUP 槽位拾取盒用 visible:false 的材质；射中它不等于看见了形体。 */
+export function shouldSkipInvisibleMaterial(obj) {
+  if (!obj) return true;
+  if (obj.visible === false) return true;
+  const mat = obj.material;
+  if (!mat) return false;
+  if (Array.isArray(mat)) return mat.every((m) => m && m.visible === false);
+  return mat.visible === false;
+}
+
+/**
+ * 三维命中 → 点评行用的 selector。优先 data-review-id / userData.reviewId / slot / 非泛名。
+ * 空 Group 射不中（没有形体），由调用方走 mesh 再向上收口。
+ */
+export function formatObject3dReview(obj) {
+  if (!obj || typeof obj !== "object") return { selector: "mesh:(未识别)", text: "" };
+  let n = obj;
+  let depth = 0;
+  while (n && depth < 8) {
+    const reviewId = n.userData && n.userData.reviewId != null ? String(n.userData.reviewId).trim() : "";
+    if (reviewId && /^[A-Za-z][\w-]*$/.test(reviewId)) {
+      return { selector: `[data-review-id="${reviewId}"]`, text: reviewId };
+    }
+    if (n.userData && n.userData.slot != null && Number.isFinite(Number(n.userData.slot))) {
+      const slot = Number(n.userData.slot);
+      return { selector: `mesh:slot-${slot}`, text: `槽位 ${slot}` };
+    }
+    const name = String(n.name ?? "").trim();
+    if (name && !/^(Object3D|Group|Mesh|Scene|Line|Points)$/i.test(name)) {
+      const safe = name.replace(/[^\w.:-]/g, "").slice(0, 64);
+      if (safe) return { selector: `mesh:${safe}`, text: name.slice(0, 80) };
+    }
+    n = n.parent;
+    depth += 1;
+  }
+  const type = String(obj.type || "Mesh").replace(/[^\w]/g, "") || "Mesh";
+  const geom = obj.geometry && obj.geometry.type ? String(obj.geometry.type).replace(/[^\w]/g, "") : "";
+  return {
+    selector: geom ? `mesh:${type}(${geom})` : `mesh:${type}`,
+    text: type,
+  };
+}
+
+/**
+ * iframe 内点评 runtime。默认休眠；`startOn` 或收到 `agent-inspect-set` 才开。
+ * 三维：包 WebGLRenderer.render 记住 scene/camera，射线打可见 mesh。
+ */
+export function buildInspectHookSource(opts = {}) {
+  const startOn = Boolean(opts.startOn);
+  return `(function(){
   if (window.__agentInspectHooked) return;
   window.__agentInspectHooked = true;
+  var startOn = ${startOn ? "true" : "false"};
+  var enabled = false;
+  var SET = "${INSPECT_SET_MESSAGE_TYPE}";
+  var PICK = "${INSPECT_MESSAGE_TYPE}";
   function sel(el){
     if (!el || el.nodeType !== 1) return "";
+    var rid = el.getAttribute && el.getAttribute("data-review-id");
+    if (rid && /^[A-Za-z][\\w-]*$/.test(rid)) return '[data-review-id="' + rid + '"]';
     if (el.id && /^[A-Za-z][\\w-]*$/.test(el.id)) return "#" + el.id;
     var parts = [];
     var node = el;
@@ -140,6 +220,137 @@ export const INSPECT_HOOK_SOURCE = `(function(){
       depth++;
     }
     return parts.join(" > ");
+  }
+  function isChrome(el){
+    if (!el || !el.closest) return false;
+    if (el.closest(".labels, .label, .atmos, .tip, #agent-inspect-ring")) return false;
+    return Boolean(el.closest(".panel, .hud, header, footer, nav, button, a, input, textarea, select, [data-review-ignore]"));
+  }
+  function isOverlay(el){
+    if (!el || !el.closest) return false;
+    return Boolean(el.closest("#agent-inspect-ring, .atmos, .labels, .tip, .loading, .fallback, [data-review-overlay]"));
+  }
+  function skipInv(obj){
+    if (!obj || obj.visible === false) return true;
+    var mat = obj.material;
+    if (!mat) return false;
+    if (Object.prototype.toString.call(mat) === "[object Array]") {
+      var all = true;
+      for (var i = 0; i < mat.length; i++) if (!(mat[i] && mat[i].visible === false)) all = false;
+      return all;
+    }
+    return mat.visible === false;
+  }
+  function isHelper(obj){
+    var t = String(obj && obj.type || "");
+    return /Helper|Gizmo|TransformControls/.test(t) || Boolean(obj && (obj.isCSS2DObject || obj.isCSS3DObject));
+  }
+  function describe3d(obj){
+    var n = obj, depth = 0;
+    while (n && depth < 8) {
+      var ud = n.userData || {};
+      var rid = ud.reviewId != null ? String(ud.reviewId).trim() : "";
+      if (rid && /^[A-Za-z][\\w-]*$/.test(rid)) return { selector: '[data-review-id="' + rid + '"]', text: rid };
+      if (ud.slot != null && isFinite(Number(ud.slot))) return { selector: "mesh:slot-" + Number(ud.slot), text: "槽位 " + Number(ud.slot) };
+      var name = String(n.name || "").trim();
+      if (name && !/^(Object3D|Group|Mesh|Scene|Line|Points)$/i.test(name)) {
+        var safe = name.replace(/[^\\w.:-]/g, "").slice(0, 64);
+        if (safe) return { selector: "mesh:" + safe, text: name.slice(0, 80) };
+      }
+      n = n.parent;
+      depth++;
+    }
+    var type = String(obj.type || "Mesh").replace(/[^\\w]/g, "") || "Mesh";
+    var geom = obj.geometry && obj.geometry.type ? String(obj.geometry.type).replace(/[^\\w]/g, "") : "";
+    return { selector: geom ? "mesh:" + type + "(" + geom + ")" : "mesh:" + type, text: type };
+  }
+  var hookedRenderers = [];
+  function hookThree(){
+    var THREE = window.THREE;
+    if (!THREE || !THREE.WebGLRenderer) return false;
+    var proto = THREE.WebGLRenderer.prototype;
+    if (proto.__agentInspectRender) return true;
+    proto.__agentInspectRender = true;
+    var orig = proto.render;
+    proto.render = function(scene, camera){
+      this.__agentLastScene = scene;
+      this.__agentLastCamera = camera;
+      if (hookedRenderers.indexOf(this) < 0) hookedRenderers.push(this);
+      return orig.apply(this, arguments);
+    };
+    return true;
+  }
+  var threeTries = 0;
+  (function waitThree(){
+    if (hookThree() || threeTries++ > 80) return;
+    setTimeout(waitThree, 50);
+  })();
+  function rendererFor(canvas){
+    for (var i = 0; i < hookedRenderers.length; i++) {
+      if (hookedRenderers[i].domElement === canvas) return hookedRenderers[i];
+    }
+    return hookedRenderers[0] || null;
+  }
+  function pickWebgl(canvas, cx, cy){
+    var THREE = window.THREE;
+    if (!THREE || !THREE.Raycaster) return null;
+    hookThree();
+    var rend = rendererFor(canvas);
+    var scene = rend && rend.__agentLastScene;
+    var camera = rend && rend.__agentLastCamera;
+    if ((!scene || !camera) && window.scene && window.scene.isScene) scene = window.scene;
+    if ((!camera) && window.camera && window.camera.isCamera) camera = window.camera;
+    if (!scene || !camera) return null;
+    var rect = canvas.getBoundingClientRect();
+    if (!rect.width || !rect.height) return null;
+    var ndc = new THREE.Vector2(((cx - rect.left) / rect.width) * 2 - 1, -((cy - rect.top) / rect.height) * 2 + 1);
+    var ray = new THREE.Raycaster();
+    if (typeof ray.setFromCamera !== "function") return null;
+    ray.setFromCamera(ndc, camera);
+    var hits = ray.intersectObjects(scene.children || [], true);
+    for (var i = 0; i < hits.length; i++) {
+      var obj = hits[i].object;
+      if (skipInv(obj) || isHelper(obj)) continue;
+      if (!(obj.isMesh || obj.isInstancedMesh || obj.isSkinnedMesh || (obj.userData && (obj.userData.reviewId || obj.userData.slot != null)))) continue;
+      return describe3d(obj);
+    }
+    return null;
+  }
+  function stackAt(ev){
+    var list = [];
+    try {
+      if (document.elementsFromPoint) list = document.elementsFromPoint(ev.clientX, ev.clientY) || [];
+    } catch (e) {}
+    if (!list.length && ev.target) list = [ev.target];
+    return list;
+  }
+  function resolvePick(ev){
+    var stack = stackAt(ev);
+    var canvas = null;
+    var chrome = null;
+    var dom = null;
+    for (var i = 0; i < stack.length; i++) {
+      var el = stack[i];
+      if (!el || el.id === "agent-inspect-ring") continue;
+      if (el.tagName === "CANVAS") { canvas = el; break; }
+      if (isOverlay(el)) continue;
+      if (isChrome(el)) { chrome = el; break; }
+      if (el.nodeType === 1 && el !== document.documentElement && el !== document.body) {
+        dom = el;
+        break;
+      }
+    }
+    if (!canvas) {
+      for (var j = 0; j < stack.length; j++) if (stack[j] && stack[j].tagName === "CANVAS") { canvas = stack[j]; break; }
+    }
+    if (chrome) return { kind: "dom", el: chrome };
+    if (canvas) {
+      var mesh = pickWebgl(canvas, ev.clientX, ev.clientY);
+      if (mesh) return { kind: "mesh", mesh: mesh, canvas: canvas, x: ev.clientX, y: ev.clientY };
+      if (dom && !isOverlay(dom) && !isChrome(dom)) return { kind: "dom", el: dom };
+      return { kind: "dom", el: canvas };
+    }
+    return dom ? { kind: "dom", el: dom } : null;
   }
   var PAD = 3;
   var ring = document.createElement("div");
@@ -164,14 +375,6 @@ export const INSPECT_HOOK_SOURCE = `(function(){
   function hideRing(){
     ring.style.display = "none";
   }
-  function pickTarget(raw){
-    var t = raw;
-    if (!t || t === ring) return null;
-    if (t.nodeType !== 1) t = t.parentElement;
-    while (t && (t === ring || (t.id && t.id === "agent-inspect-ring"))) t = t.parentElement;
-    if (!t || t === document.documentElement || t === document.body) return null;
-    return t;
-  }
   function showRing(el){
     ensureRing();
     var r = el.getBoundingClientRect();
@@ -182,47 +385,90 @@ export const INSPECT_HOOK_SOURCE = `(function(){
     ring.style.width = Math.max(0, r.width + PAD * 2) + "px";
     ring.style.height = Math.max(0, r.height + PAD * 2) + "px";
   }
-  document.documentElement.setAttribute("data-agent-inspect", "1");
-  document.documentElement.style.cursor = "crosshair";
+  function showRingAt(x, y){
+    ensureRing();
+    var s = 16;
+    ring.style.display = "block";
+    ring.style.top = Math.max(0, y - s) + "px";
+    ring.style.left = Math.max(0, x - s) + "px";
+    ring.style.width = (s * 2) + "px";
+    ring.style.height = (s * 2) + "px";
+  }
+  function setEnabled(on){
+    enabled = !!on;
+    if (enabled) {
+      document.documentElement.setAttribute("data-agent-inspect", "1");
+      document.documentElement.style.cursor = "crosshair";
+      hookThree();
+    } else {
+      document.documentElement.removeAttribute("data-agent-inspect");
+      document.documentElement.style.cursor = "";
+      hideRing();
+    }
+  }
   var pinUntil = 0;
   document.addEventListener("mousemove", function(ev){
-    if (Date.now() < pinUntil) return;
-    var t = pickTarget(ev.target);
-    if (!t) { hideRing(); return; }
-    showRing(t);
+    if (!enabled || Date.now() < pinUntil) return;
+    var hit = resolvePick(ev);
+    if (!hit) { hideRing(); return; }
+    if (hit.kind === "mesh") showRingAt(hit.x, hit.y);
+    else showRing(hit.el);
   }, true);
   document.addEventListener("mouseleave", function(){
-    if (Date.now() < pinUntil) return;
+    if (!enabled || Date.now() < pinUntil) return;
     hideRing();
   }, true);
   document.addEventListener("scroll", function(){
-    if (Date.now() < pinUntil) return;
+    if (!enabled || Date.now() < pinUntil) return;
     hideRing();
   }, true);
   window.addEventListener("resize", function(){
-    if (Date.now() < pinUntil) return;
+    if (!enabled || Date.now() < pinUntil) return;
     hideRing();
   }, true);
   document.addEventListener("click", function(ev){
+    if (!enabled) return;
     ev.preventDefault();
     ev.stopPropagation();
-    var t = pickTarget(ev.target);
-    if (!t) return;
-    showRing(t);
+    var hit = resolvePick(ev);
+    if (!hit) return;
     pinUntil = Date.now() + 2500;
+    if (hit.kind === "mesh") {
+      showRingAt(hit.x, hit.y);
+      parent.postMessage({
+        type: PICK,
+        selector: hit.mesh.selector,
+        tag: "mesh",
+        text: hit.mesh.text,
+        slide: undefined
+      }, "*");
+      return;
+    }
+    var t = hit.el;
+    showRing(t);
     var text = String(t.innerText || t.textContent || "").replace(/\\s+/g, " ").trim().slice(0, 80);
     var slideEl = t.closest ? t.closest(".slide[data-slide]") : null;
     var slide = slideEl && slideEl.getAttribute ? String(slideEl.getAttribute("data-slide") || "").trim() : "";
     parent.postMessage({
-      type: "${INSPECT_MESSAGE_TYPE}",
+      type: PICK,
       selector: sel(t),
       tag: String(t.tagName || "").toLowerCase(),
       text: text,
       slide: slide || undefined
     }, "*");
   }, true);
+  window.addEventListener("message", function(ev){
+    var d = ev && ev.data;
+    if (!d || typeof d !== "object") return;
+    if (d.type === SET && typeof d.on === "boolean") setEnabled(d.on);
+  });
   ensureRing();
+  if (startOn) setEnabled(true);
 })();`;
+}
+
+/** 默认源（开机即开）——旧 srcdoc / 单测仍认这段字符串。 */
+export const INSPECT_HOOK_SOURCE = buildInspectHookSource({ startOn: true });
 
 /**
  * iframe 内翻页 runtime：发现 .slide[data-slide] 后向父页报到，并响应 goto。
@@ -372,8 +618,9 @@ function appendScriptHook(html, source) {
 }
 
 /** 在完整 HTML 末尾注入点选钩子（保留页面自带脚本——整站点评需要它们）。 */
-export function appendInspectHook(html) {
-  return appendScriptHook(html, INSPECT_HOOK_SOURCE);
+export function appendInspectHook(html, opts = {}) {
+  const startOn = opts.startOn === undefined ? true : Boolean(opts.startOn);
+  return appendScriptHook(html, buildInspectHookSource({ startOn }));
 }
 
 /** 注入幻灯翻页 runtime（无 .slide 时脚本自行 no-op）。 */
@@ -432,7 +679,7 @@ export function appendHiddenAttrFix(html) {
 export function appendSiteHooks(html, opts = {}) {
   let out = appendHiddenAttrFix(String(html ?? ""));
   if (opts.deck) out = appendDeckRuntime(out);
-  if (opts.inspect) out = appendInspectHook(out);
+  if (opts.inspectRuntime !== false) out = appendInspectHook(out, { startOn: Boolean(opts.inspect) });
   if (opts.print) out = appendPrintHook(out);
   if (opts.webgl !== false) out = appendWebglProbe(out);
   if (opts.katex !== false) out = appendKatexRuntime(out);

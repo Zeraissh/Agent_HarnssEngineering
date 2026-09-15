@@ -5281,12 +5281,20 @@ describe("整站预览：相对资源可解析，但仍无同源身份", () => {
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain("agent-inspect-pick");
+    expect(html).toContain("var startOn = true");
     expect(html).toContain('src="app.js"');
     expect(html).toContain("parent.postMessage");
     const css = await fetch(
       `${base}/api/runs/${runId}/site/demos/liquid/style.css?inspect=1`,
     );
     expect(await css.text()).toBe("h1{color:tomato}");
+  });
+
+  it("默认 /site HTML 带休眠点评 runtime，不必 ?inspect=1 才有钩子", async () => {
+    const html = await (await getSite("demos/liquid/index.html")).text();
+    expect(html).toContain("agent-inspect-set");
+    expect(html).toContain("var startOn = false");
+    expect(html).toContain("Raycaster");
   });
 
   it("含 .slide 的 HTML 自动注入 deck runtime；ZIP 打包同目录", async () => {
