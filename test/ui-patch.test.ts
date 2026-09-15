@@ -4028,6 +4028,10 @@ describe("装配条的办公出站通知那一格", () => {
 
     const off = deriveAssemblyBar(bare(), { notify: { kind: "feishu", armed: false } });
     expect(off.some((i) => i.key === "notify")).toBe(false);
+
+    const wecom = deriveAssemblyBar(bare(), { notify: { kind: "wecom", armed: true, webhookUrl: leak } });
+    expect(wecom.find((i) => i.key === "notify")?.chip).toBe("企业微信出站已开");
+    expect(JSON.stringify(wecom.find((i) => i.key === "notify"))).not.toContain(leak);
   });
 });
 

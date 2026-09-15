@@ -485,11 +485,11 @@ export function formatWorkspaceGitChip(git, opts = {}) {
  * `/api/harness` 的 notify 投影。只认 kind + armed，剥掉 webhook/url/token。
  * 缺席或非对象 → null（旧宿主）。
  * @param {object|null|undefined} raw
- * @returns {{kind:"feishu"|"webhook", armed:boolean}|null}
+ * @returns {{kind:"feishu"|"wecom"|"webhook", armed:boolean}|null}
  */
 export function normalizeNotifySnapshot(raw) {
   if (!raw || typeof raw !== "object") return null;
-  const kind = raw.kind === "webhook" ? "webhook" : "feishu";
+  const kind = raw.kind === "webhook" ? "webhook" : raw.kind === "wecom" ? "wecom" : "feishu";
   return { kind, armed: Boolean(raw.armed) };
 }
 
@@ -5984,7 +5984,13 @@ export function deriveAssemblyBar(state, harness) {
   const notifySnap = normalizeNotifySnapshot(harness?.notify);
   push(
     "notify",
-    notifySnap?.armed ? (notifySnap.kind === "webhook" ? "门禁通知已开" : "飞书门禁通知已开") : null,
+    notifySnap?.armed
+      ? (notifySnap.kind === "webhook"
+        ? "门禁通知已开"
+        : notifySnap.kind === "wecom"
+          ? "企业微信出站已开"
+          : "飞书门禁通知已开")
+      : null,
     "看板（project_status）写入或清除时向办公软件出站推一门卡片。" +
       "Webhook 只活在服务端，`/api/harness` 只报 kind 与 armed，不下发地址。",
   );

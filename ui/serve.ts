@@ -30,8 +30,13 @@
  *   AGENT_PLANNER_MODEL    可选,独立 planner 模型（同上一组后缀）
  *                          密钥只在服务端解析,不下发浏览器
  *   AGENT_PACK / AGENT_PRESET  领域包
- *   AGENT_FEISHU_WEBHOOK / AGENT_NOTIFY_WEBHOOK  可选，看板变更出站推飞书/通用 webhook
- *                          （只出站；armed 时启动行印「飞书门禁通知已开」，不印 URL）
+ *   AGENT_FEISHU_WEBHOOK / AGENT_WECOM_WEBHOOK / AGENT_NOTIFY_WEBHOOK
+ *                          可选出站：看板变更 + 飞书入站开的 run 收尾回结果。
+ *                          飞书优先于企微、再才是通用 webhook。不印 URL。
+ *   AGENT_FEISHU_ENCRYPT_KEY  可选，飞书事件订阅入站签名。无此密钥不启入站。
+ *   AGENT_FEISHU_VERIFICATION_TOKEN  可选，入站 url_verification / header.token 对账
+ *   入站路径 POST /api/im/feishu（签名即凭证，不走 ACCESS_TOKEN）。
+ *   企业微信只出站；个微/公众号入站本仓不提供。无配置启动行写「飞书/微信宿主未开」。
  *   其余 AGENT_* 旋钮见 src/cli.ts 头部注释
  *
  * 默认只绑 127.0.0.1。非 loopback 不再只打印 warning：缺少强令牌或 TLS 边界会
@@ -42,7 +47,15 @@ import { createUiServer } from "./server.js";
 import { accessHintLine, resolveUiLaunchPolicy } from "./production.js";
 import { warnEnvConflicts } from "../src/env-check.js";
 import { configuredExecutionStatus } from "../src/execution-broker.js";
-import { notifyArmedHint, resolveOfficeNotifyFromEnv } from "../src/notify.js";
+import {
+  attachImInbound,
+  createLocalImStartRun,
+  createLocalImWaitRun,
+  createOfficeNotifier,
+  formatImHostHint,
+  resolveImHostStatus,
+  resolveOfficeNotifyFromEnv,
+} from "../src/notify.js";
 
 // 桌面壳（cross-app/electron）用 ELECTRON_RUN_AS_NODE=1 拉起本进程；这个变量
 // 不该再透传给 bash 工具的子命令——否则 agent 在 bash 里启动任何 Electron 系
@@ -78,6 +91,20 @@ const handle = createUiServer({
   trustProxy: policy.trustProxy,
 });
 
+let boundPort = port;
+const officeNotifier = createOfficeNotifier(resolveOfficeNotifyFromEnv(process.env) ?? { enabled: false });
+attachImInbound(handle.server, {
+  startRun: createLocalImStartRun({
+    port: () => boundPort,
+    accessToken: policy.accessToken,
+  }),
+  waitForRun: createLocalImWaitRun({
+    port: () => boundPort,
+    accessToken: policy.accessToken,
+  }),
+  notifier: officeNotifier,
+});
+
 handle.server.listen(port, host, () => {
   const localUrl = `http://${host}:${port}`;
   console.log(`Harness UI → ${localUrl}`);
@@ -99,8 +126,9 @@ handle.server.listen(port, host, () => {
   // 令牌本体不进 stdout（占位符引导，见 accessHintLine 的注释）
   const hint = accessHintLine(policy, localUrl);
   if (hint) console.log(`  open:    ${hint}`);
-  const notifyHint = notifyArmedHint(Boolean(resolveOfficeNotifyFromEnv(process.env)));
-  if (notifyHint) console.log(`  ${notifyHint}`);
+  const addr = handle.server.address();
+  if (addr && typeof addr === "object") boundPort = addr.port;
+  console.log(`  ${formatImHostHint(resolveImHostStatus(process.env))}`);
   if (policy.remote) {
     console.log(`  remote boundary: ${policy.trustProxy ? "trusted TLS proxy" : "insecure HTTP explicitly acknowledged"}`);
   }

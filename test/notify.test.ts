@@ -9,22 +9,77 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemoryStore } from "../src/memory.js";
 import { createProjectStatusTool } from "../src/project-status.js";
+import { createServer } from "node:http";
+import { createCipheriv, createHash, randomBytes } from "node:crypto";
 import {
+  FEISHU_ENCRYPT_KEY_ENV,
+  FEISHU_VERIFICATION_TOKEN_ENV,
   FEISHU_WEBHOOK_ENV,
+  IM_FEISHU_PATH,
+  IM_STATUS_PATH,
+  IM_WECOM_PATH,
   NOTIFY_WEBHOOK_ENV,
+  WECOM_WEBHOOK_ENV,
+  attachImInbound,
   createOfficeNotifier,
+  feishuSignatureHex,
   formatFeishuGateCard,
   formatGateCardText,
+  formatImHostHint,
+  formatImRunResultText,
   gateNotifyPayloadFromBoard,
   notifyArmedHint,
   officeNotifySnapshot,
+  parseFeishuInboundEvent,
+  resolveFeishuInboundFromEnv,
+  resolveImHostStatus,
   resolveOfficeNotifyFromEnv,
   sanitizeNotifyUrlForLog,
+  verifyFeishuSignature,
 } from "../src/notify.js";
 import { createUiServer, type UiServerHandle } from "../ui/server.js";
 import { FakeModelClient, fakeMessage, textBlock, toolUseBlock } from "./helpers.js";
 
 const LEAK = "https://open.feishu.cn/open-apis/bot/v2/hook/NOTIFY-LEAK-TOKEN-9f3";
+const WECOM_LEAK = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=WECOM-LEAK-TOKEN-9f3";
+const ENCRYPT_KEY = "feishu-encrypt-key-for-tests";
+
+function signFeishu(timestamp: string, nonce: string, body: string, key = ENCRYPT_KEY): string {
+  return feishuSignatureHex(timestamp, nonce, key, body);
+}
+
+function encryptFeishuBody(plain: string, key = ENCRYPT_KEY): string {
+  const keyBuf = createHash("sha256").update(key).digest();
+  const iv = randomBytes(16);
+  const cipher = createCipheriv("aes-256-cbc", keyBuf, iv);
+  const enc = Buffer.concat([cipher.update(plain, "utf8"), cipher.final()]);
+  return Buffer.concat([iv, enc]).toString("base64");
+}
+
+function startImServer(opts: Parameters<typeof attachImInbound>[1]): Promise<{
+  port: number;
+  close: () => Promise<void>;
+}> {
+  const server = createServer((_req, res) => {
+    res.writeHead(404);
+    res.end("no");
+  });
+  attachImInbound(server, opts);
+  return new Promise((resolve, reject) => {
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      if (addr && typeof addr === "object") {
+        resolve({
+          port: addr.port,
+          close: () => new Promise((done, fail) => {
+            server.close((err) => (err ? fail(err) : done()));
+          }),
+        });
+      } else reject(new Error("Could not get server port"));
+    });
+    server.on("error", reject);
+  });
+}
 
 function cardText(payload: Parameters<typeof formatGateCardText>[0]): string {
   return formatFeishuGateCard(payload).content.text;
@@ -117,18 +172,39 @@ describe("sanitizeNotifyUrlForLog / hint / env", () => {
     expect(notifyArmedHint(true)).not.toContain("http");
   });
 
-  it("飞书 env 优先于通用 webhook", () => {
+  it("飞书 env 优先于企微与通用 webhook", () => {
     expect(
       resolveOfficeNotifyFromEnv({
         [FEISHU_WEBHOOK_ENV]: LEAK,
+        [WECOM_WEBHOOK_ENV]: WECOM_LEAK,
         [NOTIFY_WEBHOOK_ENV]: "https://example.test/generic",
       }),
     ).toEqual({ kind: "feishu", webhookUrl: LEAK });
+    expect(resolveOfficeNotifyFromEnv({ [WECOM_WEBHOOK_ENV]: WECOM_LEAK })).toEqual({
+      kind: "wecom",
+      webhookUrl: WECOM_LEAK,
+    });
     expect(resolveOfficeNotifyFromEnv({ [NOTIFY_WEBHOOK_ENV]: "https://example.test/generic" })).toEqual({
       kind: "webhook",
       webhookUrl: "https://example.test/generic",
     });
     expect(resolveOfficeNotifyFromEnv({})).toBeNull();
+  });
+
+  it("无 ENCRYPT_KEY 不启入站；hint 不含密钥", () => {
+    expect(resolveFeishuInboundFromEnv({})).toBeNull();
+    expect(resolveFeishuInboundFromEnv({ [FEISHU_VERIFICATION_TOKEN_ENV]: "tok" })).toBeNull();
+    const armed = resolveFeishuInboundFromEnv({ [FEISHU_ENCRYPT_KEY_ENV]: ENCRYPT_KEY });
+    expect(armed?.encryptKey).toBe(ENCRYPT_KEY);
+    const hint = formatImHostHint(resolveImHostStatus({}));
+    expect(hint).toBe("飞书/微信宿主未开");
+    expect(hint).not.toContain("ENCRYPT");
+    expect(formatImHostHint(resolveImHostStatus({
+      [FEISHU_WEBHOOK_ENV]: LEAK,
+      [FEISHU_ENCRYPT_KEY_ENV]: ENCRYPT_KEY,
+    }))).toContain("入站收消息");
+    expect(JSON.stringify(resolveImHostStatus({ [FEISHU_ENCRYPT_KEY_ENV]: ENCRYPT_KEY })))
+      .not.toContain(ENCRYPT_KEY);
   });
 
   it("快照只有 kind/armed", () => {
@@ -189,6 +265,261 @@ describe("createOfficeNotifier", () => {
       waiting: [],
     });
     expect(calls).toHaveLength(0);
+  });
+
+  it("wecom 出站用 msgtype/text.content，不含飞书 msg_type", async () => {
+    const calls: Array<{ url: string; body: string }> = [];
+    const notifier = createOfficeNotifier({
+      kind: "wecom",
+      webhookUrl: WECOM_LEAK,
+      fetchFn: async (url, init) => {
+        calls.push({ url: String(url), body: String(init?.body ?? "") });
+        return new Response("ok", { status: 200 });
+      },
+    });
+    await notifier.notify({
+      project: "alpha",
+      summary: "规格待签字",
+      nextGate: "规格确认门",
+      waiting: [],
+    });
+    expect(calls).toHaveLength(1);
+    const body = JSON.parse(calls[0]!.body) as { msgtype: string; text: { content: string } };
+    expect(body.msgtype).toBe("text");
+    expect(body.text.content).toContain("规格确认门");
+    expect(calls[0]!.body).not.toContain("msg_type");
+    expect(JSON.stringify(officeNotifySnapshot(notifier))).not.toContain("WECOM-LEAK");
+  });
+});
+
+describe("飞书入站签名与开 run", () => {
+  it("签名失败拒；无密钥不启；成功路径注入 startRun", async () => {
+    const started: Array<{ task: string; source: string }> = [];
+    const env = { [FEISHU_ENCRYPT_KEY_ENV]: ENCRYPT_KEY };
+    const now = 1_700_000_000_000;
+    const { port, close } = await startImServer({
+      env,
+      nowMs: () => now,
+      startRun: async (input) => {
+        started.push(input);
+        return { runId: "run_injected" };
+      },
+    });
+    const base = `http://127.0.0.1:${port}`;
+    try {
+      const noKey = await startImServer({ env: {}, startRun: async () => ({ runId: "nope" }) });
+      try {
+        const disabled = await fetch(`http://127.0.0.1:${noKey.port}${IM_FEISHU_PATH}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: "{}",
+        });
+        expect(disabled.status).toBe(503);
+        expect(await disabled.json()).toMatchObject({ error: "飞书入站未开", enabled: false });
+      } finally {
+        await noKey.close();
+      }
+
+      const event = {
+        schema: "2.0",
+        header: { event_type: "im.message.receive_v1", event_id: "evt_1" },
+        event: {
+          sender: { sender_type: "user" },
+          message: {
+            message_id: "om_1",
+            message_type: "text",
+            content: JSON.stringify({ text: "写一份周报" }),
+          },
+        },
+      };
+      const body = JSON.stringify(event);
+      const ts = String(Math.floor(now / 1000));
+      const nonce = "n1";
+
+      const bad = await fetch(`${base}${IM_FEISHU_PATH}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Lark-Request-Timestamp": ts,
+          "X-Lark-Request-Nonce": nonce,
+          "X-Lark-Signature": "deadbeef",
+        },
+        body,
+      });
+      expect(bad.status).toBe(401);
+      expect(await bad.json()).toMatchObject({ error: "签名无效" });
+      expect(started).toHaveLength(0);
+
+      const good = await fetch(`${base}${IM_FEISHU_PATH}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Lark-Request-Timestamp": ts,
+          "X-Lark-Request-Nonce": nonce,
+          "X-Lark-Signature": signFeishu(ts, nonce, body),
+        },
+        body,
+      });
+      expect(good.status).toBe(200);
+      expect(await good.json()).toEqual({ ok: true, runId: "run_injected" });
+      expect(started).toEqual([{ task: "写一份周报", source: "feishu", messageId: "om_1" }]);
+
+      const status = await fetch(`${base}${IM_STATUS_PATH}`);
+      const snap = await status.json() as Record<string, unknown>;
+      expect(snap.feishuInbound).toBe(true);
+      expect(snap.wechatPersonalInbound).toBe(false);
+      expect(JSON.stringify(snap)).not.toContain(ENCRYPT_KEY);
+
+      const wecom = await fetch(`${base}${IM_WECOM_PATH}`, { method: "POST", body: "{}" });
+      expect(wecom.status).toBe(501);
+      expect((await wecom.json() as { error: string }).error).toContain("不伪造");
+    } finally {
+      await close();
+    }
+  });
+
+  it("url_verification 回 challenge；结果回写出站", async () => {
+    const replies: string[] = [];
+    const now = 1_700_000_000_000;
+    const env = { [FEISHU_ENCRYPT_KEY_ENV]: ENCRYPT_KEY };
+    const notifier = createOfficeNotifier({
+      kind: "feishu",
+      webhookUrl: LEAK,
+      fetchFn: async (_url, init) => {
+        replies.push(String(init?.body ?? ""));
+        return new Response("ok", { status: 200 });
+      },
+    });
+    const { port, close } = await startImServer({
+      env,
+      nowMs: () => now,
+      notifier,
+      startRun: async () => ({ runId: "run_done" }),
+      waitForRun: async (runId) => ({
+        task: "写一份周报",
+        runId,
+        status: "done",
+        stopReason: "completed",
+        summary: "周报已写好",
+      }),
+    });
+    const base = `http://127.0.0.1:${port}`;
+    try {
+      const challengeBody = JSON.stringify({
+        type: "url_verification",
+        challenge: "ping-challenge",
+        token: "unused",
+      });
+      const ts = String(Math.floor(now / 1000));
+      const nonce = "n2";
+      const challenge = await fetch(`${base}${IM_FEISHU_PATH}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Lark-Request-Timestamp": ts,
+          "X-Lark-Request-Nonce": nonce,
+          "X-Lark-Signature": signFeishu(ts, nonce, challengeBody),
+        },
+        body: challengeBody,
+      });
+      expect(challenge.status).toBe(200);
+      expect(await challenge.json()).toEqual({ challenge: "ping-challenge" });
+
+      const encryptedPlain = JSON.stringify({ type: "url_verification", challenge: "enc-challenge" });
+      const encryptedBody = JSON.stringify({ encrypt: encryptFeishuBody(encryptedPlain) });
+      const enc = await fetch(`${base}${IM_FEISHU_PATH}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Lark-Request-Timestamp": ts,
+          "X-Lark-Request-Nonce": nonce,
+          "X-Lark-Signature": signFeishu(ts, nonce, encryptedBody),
+        },
+        body: encryptedBody,
+      });
+      expect(enc.status).toBe(200);
+      expect(await enc.json()).toEqual({ challenge: "enc-challenge" });
+
+      const event = {
+        schema: "2.0",
+        header: { event_type: "im.message.receive_v1" },
+        event: {
+          message: { message_id: "om_2", message_type: "text", content: "{\"text\":\"任务\"}" },
+        },
+      };
+      const body = JSON.stringify(event);
+      const run = await fetch(`${base}${IM_FEISHU_PATH}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Lark-Request-Timestamp": ts,
+          "X-Lark-Request-Nonce": nonce,
+          "X-Lark-Signature": signFeishu(ts, nonce, body),
+        },
+        body,
+      });
+      expect(run.status).toBe(200);
+      expect(await run.json()).toEqual({ ok: true, runId: "run_done" });
+      const deadline = Date.now() + 1000;
+      while (replies.length === 0 && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      expect(replies).toHaveLength(1);
+      expect(replies[0]).toContain("周报已写好");
+      expect(replies[0]).toContain("run_done");
+      expect(replies[0]).not.toContain("NOTIFY-LEAK");
+    } finally {
+      await close();
+    }
+  });
+
+  it("纯函数：坏签名 / 空密钥 / 解析消息", () => {
+    expect(verifyFeishuSignature({
+      timestamp: "1",
+      nonce: "n",
+      body: "{}",
+      encryptKey: "",
+      signature: "abc",
+    })).toBe(false);
+    expect(verifyFeishuSignature({
+      timestamp: "1",
+      nonce: "n",
+      body: "{}",
+      encryptKey: ENCRYPT_KEY,
+      signature: "nope",
+    })).toBe(false);
+    const body = "{\"x\":1}";
+    const good = signFeishu("1", "n", body);
+    expect(verifyFeishuSignature({
+      timestamp: "1",
+      nonce: "n",
+      body,
+      encryptKey: ENCRYPT_KEY,
+      signature: good,
+    })).toBe(true);
+
+    expect(parseFeishuInboundEvent({
+      type: "url_verification",
+      challenge: "c1",
+    })).toEqual({ kind: "challenge", challenge: "c1" });
+    expect(parseFeishuInboundEvent({
+      event: {
+        sender: { sender_type: "app" },
+        message: { message_type: "text", content: "{\"text\":\"hi\"}" },
+      },
+    }).kind).toBe("ignored");
+    expect(parseFeishuInboundEvent({
+      header: { event_type: "im.message.receive_v1" },
+      event: { message: { message_id: "om", message_type: "text", content: "{\"text\":\"@_user_1 开工\"}" } },
+    })).toEqual({ kind: "message", task: "开工", messageId: "om" });
+    expect(formatImRunResultText({
+      task: "t",
+      runId: "r",
+      status: "done",
+      stopReason: "completed",
+      summary: "ok",
+    })).toContain("打开本 run：r");
+    expect(encryptFeishuBody("{\"type\":\"url_verification\",\"challenge\":\"x\"}").length).toBeGreaterThan(16);
   });
 });
 

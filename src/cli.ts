@@ -91,9 +91,12 @@
  *   AGENT_HOOKS_CONFIG  可选，指向 hooks JSON。不设 = 机制不存在。设了但文件缺失/非法则 exit 1。
  *                       只认 PreToolUse / PostToolUse / Stop 的 command handler；退出码 2 阻断、1 不阻断。
  *   AGENT_FEISHU_WEBHOOK 可选，飞书自定义机器人 webhook。project_status 写入/清除时
- *                       出站推一门卡片。只出站，无入站审批。勿把地址打进日志。
- *                       与 AGENT_NOTIFY_WEBHOOK 二选一，飞书优先。
+ *                       出站推一门卡片；飞书入站开的 run 收尾也走这条。勿把地址打进日志。
+ *                       与 AGENT_WECOM_WEBHOOK / AGENT_NOTIFY_WEBHOOK 三选一，飞书优先。
+ *   AGENT_WECOM_WEBHOOK 可选，企业微信群机器人出站（同一段卡片正文）。不收个微/公众号。
  *   AGENT_NOTIFY_WEBHOOK 可选，通用 JSON webhook（同一卡片正文）。
+ *   AGENT_FEISHU_ENCRYPT_KEY 可选，飞书事件订阅入站签名。无此密钥不启入站。
+ *   AGENT_FEISHU_VERIFICATION_TOKEN 可选，入站 url_verification / header.token 对账。
  *   AGENT_MD_MAX_CHARS  可选，AGENT.md 加载总量上限（默认 16000，≥1000）。非法值 exit 1。
  *                       开关是文件本身：~/.agent/AGENT.md、项目 AGENT.md、.agent/rules/*.md
  *                       都不在 = 机制不存在。这是指导不是执行，不能授予权限。
@@ -145,8 +148,9 @@ import {
 } from "./project-status.js";
 import {
   createOfficeNotifier,
+  formatImHostHint,
   gateNotifyPayloadFromBoard,
-  notifyArmedHint,
+  resolveImHostStatus,
   resolveOfficeNotifyFromEnv,
 } from "./notify.js";
 import { AUTO_CONCURRENCY_CAP, plannedStopReason, planParallelWidth, runPlanned, runVerified } from "./orchestrate.js";
@@ -1107,8 +1111,7 @@ async function main(): Promise<void> {
 
   const memShared = isSharedMemoryDir(process.cwd(), memory.dir);
   const officeNotifier = createOfficeNotifier(resolveOfficeNotifyFromEnv(process.env) ?? { enabled: false });
-  const notifyHint = notifyArmedHint(officeNotifier.armed);
-  if (notifyHint) console.log(c.dim(notifyHint));
+  console.log(c.dim(formatImHostHint(resolveImHostStatus(process.env))));
   const memTools = [
     ...createMemoryTools(memory),
     createProjectStatusTool(() => memory, {
