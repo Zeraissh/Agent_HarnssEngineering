@@ -31,7 +31,7 @@
   <h1>FATHOM</h1>
 </header>
 
-<!-- 侧栏：品牌 → 顶栏图标 → 分脸 → 新建 → 搜索 → Code 脸文件树 → 会话列表；其余工具留底栏 -->
+<!-- 侧栏：品牌 → 顶栏图标 → 分脸 → 新建 → 搜索 → 会话列表；其余工具留底栏。文件树在右侧。 -->
 <aside class="sidebar" id="sidebar" data-workspace-face="office">
   <div class="sidebar-header">
     <div class="sidebar-brand">
@@ -134,9 +134,6 @@
       </div>
     </div>
   </div>
-  <!-- Code 脸资源管理器：展开走 /api/workspace/files?q=dir/。Work 脸用 CSS 藏。
-       不用 role=tree——空态没有 treeitem 会撞 aria-required-children（与 run-list 同族）。 -->
-  <div id="workspace-file-tree" class="workspace-file-tree"></div>
   <!-- role=listbox / aria-label 由 renderRunList 动态挂载：listbox 必须含 option
        子项（aria-required-children），空态/加载态若静态带着 role 反而是 critical
        违规——这条是 axe 扫描器上线首跑抓到的（s3d 手工修复引入的新问题） -->
@@ -201,6 +198,9 @@
         <span class="empty-depthline" aria-hidden="true"></span>
       </div>
     </div>
+    <!-- 右侧工作区文件：Work/Code 都有。展开走 /api/workspace/files?q=dir/。
+         不用 role=tree——空态没有 treeitem 会撞 aria-required-children（与 run-list 同族）。 -->
+    <aside id="workspace-file-tree" class="files-rail workspace-file-tree" aria-label="工作区文件"></aside>
   </div>
   <!-- 跳转箭头：**在滚动容器之外**，所以它自己不会被滚走。
        ↓ 回到底部（流式时往上翻过之后用），↑ 回到四决定因素（读进下钻面之后用）。 -->
@@ -664,7 +664,7 @@ let settingsApi = /** @type {null|{ open:()=>void, close:()=>void, isOpen:()=>bo
 let onboardingApi = /** @type {null|{ start:(opts?:{force?:boolean})=>boolean, replay:()=>boolean, isOpen:()=>boolean }} */ (null);
 let usageApi = /** @type {null|{ open:()=>void, close:()=>void }} */ (null);
 /** Code 脸文件树。host 回调在文件后部接线；未加载时为 null。 */
-let fileTreeApi = /** @type {null|{ reload:()=>Promise<void>, expand:(p:string)=>Promise<void>, element:HTMLElement }} */ (null);
+let fileTreeApi = /** @type {null|{ reload:()=>Promise<void>, expand:(p:string)=>Promise<void>, setCollapsed:(b:boolean)=>boolean, isCollapsed:()=>boolean, element:HTMLElement }} */ (null);
 /** GET /api/usage 缓存：侧栏 / 指挥中心花费芯片共用，不另算汇率 */
 let usageReportCache = null;
 
@@ -1322,7 +1322,7 @@ function applyWorkspaceFace(next, { persist = true, refresh = true } = {}) {
     refreshRunListView();
     syncComposer();
   }
-  if (face === "code") void fileTreeApi?.reload?.();
+  void fileTreeApi?.reload?.();
 }
 
 function paintEmptyState() {
@@ -1995,7 +1995,7 @@ function handleToggleEntry(seq) {
   // 取反，而表里没有这一条时取反得到 true，多数条目默认本来就是 true——
   // 于是第一次点一条默认折叠的条目等于把 true 写成 true，
   // 一次完全没有反馈的死点击（AC2-18 复验抓到）
-  const next = nextCollapseOverride(deriveLogEntries(state), overrides, seq);
+  const next = nextCollapseOverride(deriveLogEntries(state, currentLiveBuffers(selectedRunId)), overrides, seq);
   if (next === null) return;
   overrides.set(seq, next);
   renderDetailWithState(state);
@@ -2006,11 +2006,12 @@ function renderDetailWithState(state) {
   leaveWelcomeLayout();
   const runId = state.runId;
   const activeTab = normalizeTab(activeTabs.get(runId));
+  const live = currentLiveBuffers(runId);
 
   // 构建日志条目（应用折叠覆盖）
   // 与 handleToggleEntry 共用同一个应用函数——两处各写一份就会漂
   const logEntries = applyCollapseOverrides(
-    deriveLogEntries(state),
+    deriveLogEntries(state, live),
     logCollapseOverrides.get(runId),
   );
 
@@ -2025,8 +2026,8 @@ function renderDetailWithState(state) {
     logEntries,
     onToggleEntry: handleToggleEntry,
     harness: harnessSnapshot,
-    liveText: revealedSlice(runId, liveTexts.get(runId) ?? "", false),
-    liveThinking: revealedSlice(runId, liveThinking.get(runId) ?? "", true),
+    liveText: live.text,
+    liveThinking: live.thinking,
     onPlanDecision: (decision, extra) => postPlanDecision(runId, decision, extra),
     onHandoffDecision: (decision) => postHandoffDecision(runId, decision),
     onAnswer: (answers) => postAnswer(runId, answers),
@@ -2629,6 +2630,12 @@ async function loadHarness() {
 const liveTexts = new Map();
 /** 思考增量缓冲。与 liveTexts 同族（不进 RunState），但分开存——正文一来就清掉它 */
 const liveThinking = new Map();
+function currentLiveBuffers(runId) {
+  return {
+    text: revealedSlice(runId, liveTexts.get(runId) ?? "", false),
+    thinking: revealedSlice(runId, liveThinking.get(runId) ?? "", true),
+  };
+}
 /**
  * 正文缓冲**不再截尾**（2026-09-04 委托方：超过约 2000 字就丢前面、只剩尾巴）。
  * 当年 LIVE_TEXT_CAP=2000 是为防长生成占内存；配合 revealedWindow 虽不冻屏，
@@ -4855,7 +4862,7 @@ try {
       onCite: (path, kind) => insertWorkspaceFileMention(path, kind),
       onAnnounce: (msg) => announceStatus(msg),
     });
-    if (workspaceFace === "code") void fileTreeApi?.reload?.();
+    void fileTreeApi?.reload?.();
   }
 } catch { /* 文件树是增强项，初始化失败静默降级 */ }
 

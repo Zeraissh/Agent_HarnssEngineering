@@ -1,5 +1,7 @@
 # 文件树 MVP（persona-ux file-tree）
 
+> 后续：树已从左栏挪到右侧，见 `_fix-notes-file-tree-right.md`。下面是当时「Code 脸左栏」那一版。
+
 日期：2026-09-15  
 范围：`ui/workspace-files.ts`、`ui/public/features/file-tree.js`（新建）、`ui/public/index.html` 挂载、`ui/public/styles.css` 最小补、`test/workspace-files.test.ts`、`test/ui-workdirs-api.test.ts`、`test/ui-file-tree.test.ts`（新建）。  
 未 commit / 未 push。未碰 `ui/server.ts`、`ui/public/features/review-mode.js`、`artifact-canvas`、`cross-app/**`、`app.js`。

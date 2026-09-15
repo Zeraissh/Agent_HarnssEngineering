@@ -1,22 +1,34 @@
 // @vitest-environment jsdom
 // @ts-nocheck
 /**
- * Code 脸文件树（features/file-tree.js）回归锁。
+ * 右侧工作区文件栏（features/file-tree.js）回归锁。
  *
  * 纯函数：树 URL / 展开集合 / 人话失败 / files[] 拆成条目与 notice。
  * DOM：树形状、点文件夹展开（q=dir/）、圈禁逃逸与 403 不把 HTTP 码画到脸上。
+ * 挂载：在 #center-row 右侧，不在左栏；Work/Code 都能用，不绑 Code 脸。
  */
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import {
   FILE_TREE_COPY,
+  FILES_RAIL_PREF,
   treeQueryForDir,
   buildWorkspaceTreeUrl,
   isTreeNotice,
   splitTreeEntries,
   humanizeTreeFailure,
   toggleExpanded,
+  readFilesRailCollapsed,
+  writeFilesRailCollapsed,
   initFileTree,
 } from "../ui/public/features/file-tree.js";
+
+const here = dirname(fileURLToPath(import.meta.url));
+const htmlSrc = readFileSync(join(here, "..", "ui", "public", "index.html"), "utf-8");
+const cssSrc = readFileSync(join(here, "..", "ui", "public", "styles.css"), "utf-8");
+const treeSrc = readFileSync(join(here, "..", "ui", "public", "features", "file-tree.js"), "utf-8");
 
 const flush = () => new Promise((r) => setTimeout(r, 0));
 
@@ -31,7 +43,7 @@ function mockResponse(status, body) {
 function mountTree(host = {}, env = {}) {
   const root = document.createElement("div");
   document.body.appendChild(root);
-  const api = initFileTree({ mount: root, ...host }, env);
+  const api = initFileTree({ mount: root, ...host }, { storage: null, ...env });
   return { root, api };
 }
 
@@ -170,5 +182,90 @@ describe("initFileTree DOM", () => {
     await api.reload();
     await flush();
     expect(root.querySelector(".ft-empty")?.textContent).toBe(FILE_TREE_COPY.emptyRoot);
+  });
+
+  it("折叠栏：默认展开，点开关收起并记偏好", () => {
+    const store = new Map();
+    const storage = {
+      getItem: (k) => store.get(k) ?? null,
+      setItem: (k, v) => { store.set(k, String(v)); },
+      removeItem: (k) => { store.delete(k); },
+    };
+    const { root, api } = mountTree({ getWorkdir: () => "" }, { storage, fetch: vi.fn() });
+    expect(root.classList.contains("files-rail")).toBe(true);
+    expect(root.classList.contains("files-rail--collapsed")).toBe(false);
+    expect(api.isCollapsed()).toBe(false);
+    root.querySelector(".files-rail-toggle").click();
+    expect(api.isCollapsed()).toBe(true);
+    expect(root.classList.contains("files-rail--collapsed")).toBe(true);
+    expect(store.get(FILES_RAIL_PREF)).toBe("1");
+    expect(root.querySelector(".files-rail-toggle").getAttribute("aria-expanded")).toBe("false");
+    api.setCollapsed(false);
+    expect(api.isCollapsed()).toBe(false);
+    expect(store.has(FILES_RAIL_PREF)).toBe(false);
+  });
+
+  it("子节点缩进写 --ft-depth，不靠空格垫", async () => {
+    const fetchFn = vi.fn(async (url) => {
+      const u = String(url);
+      if (u.includes("q=src%2F")) {
+        return mockResponse(200, {
+          files: [{ name: "app.js", relative: "src/app.js", kind: "file" }],
+        });
+      }
+      return mockResponse(200, {
+        files: [{ name: "src", relative: "src", kind: "directory" }],
+      });
+    });
+    const { root } = mountTree({ getWorkdir: () => "D:/proj" }, { fetch: fetchFn });
+    await root.__fileTreeApi.reload();
+    await flush();
+    root.querySelector('.ft-row[data-path="src"] .ft-twist').click();
+    await flush();
+    await flush();
+    expect(root.querySelector('.ft-row[data-path="src"]').style.getPropertyValue("--ft-depth")).toBe("0");
+    expect(root.querySelector('.ft-row[data-path="src/app.js"]').style.getPropertyValue("--ft-depth")).toBe("1");
+  });
+});
+
+describe("挂载：右侧栏，不在左栏，不绑 Code 脸", () => {
+  it("HTML 把树挂在 #center-row、#main-area 之后；左栏没有树", () => {
+    const sidebarEnd = htmlSrc.indexOf('id="sidebar-expand"');
+    const sidebar = htmlSrc.slice(htmlSrc.indexOf('id="sidebar"'), sidebarEnd);
+    expect(sidebar).not.toContain('id="workspace-file-tree"');
+    expect(sidebar).toContain('id="run-list"');
+
+    const center = htmlSrc.slice(htmlSrc.indexOf('id="center-row"'), htmlSrc.indexOf('id="scroll-nav"'));
+    expect(center).toContain('id="workspace-file-tree"');
+    expect(center.indexOf('id="main-area"')).toBeLessThan(center.indexOf('id="workspace-file-tree"'));
+    expect(center).toMatch(/class="[^"]*files-rail/);
+  });
+
+  it("宿主按工作目录刷新，不按 Code 脸开关", () => {
+    expect(htmlSrc).not.toMatch(/if\s*\(\s*(?:face|workspaceFace)\s*===\s*"code"\s*\)\s*void fileTreeApi/);
+    expect(htmlSrc).toMatch(/void fileTreeApi\?\.reload/);
+    expect(treeSrc).not.toMatch(/workspaceFace|workspace-face|face === ["']code["']/);
+  });
+
+  it("CSS 不再把树藏进 Code 脸左栏", () => {
+    expect(cssSrc).not.toMatch(/\.sidebar\[data-workspace-face="code"\]\s+\.workspace-file-tree/);
+    expect(cssSrc).not.toMatch(/\.sidebar\[data-workspace-face="code"\]\s+\.run-list/);
+    expect(cssSrc).toMatch(/\.files-rail--collapsed/);
+    expect(cssSrc).toMatch(/--ft-depth/);
+    expect(cssSrc).toMatch(/padding-left:\s*calc\(8px \+ var\(--ft-depth\) \* 12px\)/);
+  });
+
+  it("折叠偏好读写：1 收起，去掉键即展开", () => {
+    const store = new Map();
+    const storage = {
+      getItem: (k) => store.get(k) ?? null,
+      setItem: (k, v) => { store.set(k, String(v)); },
+      removeItem: (k) => { store.delete(k); },
+    };
+    expect(readFilesRailCollapsed(storage)).toBe(false);
+    writeFilesRailCollapsed(storage, true);
+    expect(readFilesRailCollapsed(storage)).toBe(true);
+    writeFilesRailCollapsed(storage, false);
+    expect(readFilesRailCollapsed(storage)).toBe(false);
   });
 });

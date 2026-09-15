@@ -1,6 +1,7 @@
 /**
- * features/file-tree — Code 脸工作区资源管理器（MVP，不是完整 IDE）。
+ * features/file-tree — 右侧工作区文件栏（MVP，不是完整 IDE）。
  *
+ * 挂在 `#center-row` 最右，Work / Code 都有：对话在中间，文件在右边。
  * 展开走既有 `GET /api/workspace/files?q=dir/`（浅列 + resolveInWorkdir）。
  * 点文件走宿主 onPreview（预览坞 / 产物画布，不走 file://）。
  * 行内 @ 走宿主 onCite（同一套 insert @path）。不发明第三套交互。
@@ -14,6 +15,8 @@ import { humanizeHttpFailure } from "./humanize-error.js";
 /** 空态 / 按钮 / 失败（HTTP 码不进脸上）。截断与过深用服务端 notice。 */
 export const FILE_TREE_COPY = {
   title: "文件",
+  collapse: "收起文件",
+  expand: "显示文件",
   empty: "这个文件夹是空的。",
   emptyRoot: "这个工作目录里还没有可列出的文件。",
   noWorkdir: "先选一个工作目录。",
@@ -21,6 +24,9 @@ export const FILE_TREE_COPY = {
   cite: "插入 @ 引用",
   network: "文件列表加载失败（网络错误）",
 };
+
+/** 折叠偏好。1 = 收起。 */
+export const FILES_RAIL_PREF = "agent.ui.pref.filesRailCollapsed";
 
 /** `src` → `src/`，根是空字符串。与 ui/workspace-files.ts 的 treeQueryForDir 同形。 */
 export function treeQueryForDir(dir) {
@@ -82,6 +88,22 @@ export function toggleExpanded(expanded, relative) {
   return next;
 }
 
+export function readFilesRailCollapsed(storage) {
+  try {
+    return storage?.getItem?.(FILES_RAIL_PREF) === "1";
+  } catch {
+    return false;
+  }
+}
+
+export function writeFilesRailCollapsed(storage, collapsed) {
+  try {
+    if (!storage) return;
+    if (collapsed) storage.setItem(FILES_RAIL_PREF, "1");
+    else storage.removeItem(FILES_RAIL_PREF);
+  } catch { /* 存储不可写只丢偏好 */ }
+}
+
 function childDepth(relative) {
   const rel = String(relative ?? "").replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
   if (!rel) return 0;
@@ -96,7 +118,7 @@ function childDepth(relative) {
  *   onCite?: (path: string, kind: "file"|"directory") => void,
  *   onAnnounce?: (msg: string) => void,
  * }} [host]
- * @param {{ doc?: Document, fetch?: Function }} [env]
+ * @param {{ doc?: Document, fetch?: Function, storage?: Storage|null, collapsed?: boolean }} [env]
  */
 export function initFileTree(host = {}, env = {}) {
   const mount = host.mount;
@@ -106,18 +128,34 @@ export function initFileTree(host = {}, env = {}) {
   const doc = env.doc ?? mount.ownerDocument ?? document;
   const fetchImpl = env.fetch
     ?? (typeof fetch !== "undefined" ? fetch.bind(env.win ?? globalThis) : null);
+  const storage = env.storage !== undefined
+    ? env.storage
+    : (() => {
+        try { return (env.win ?? globalThis).localStorage ?? null; } catch { return null; }
+      })();
 
-  mount.classList.add("workspace-file-tree");
+  mount.classList.add("files-rail", "workspace-file-tree");
   mount.replaceChildren();
 
   const head = doc.createElement("div");
   head.className = "workspace-file-tree-head";
-  head.textContent = FILE_TREE_COPY.title;
+
+  const title = doc.createElement("span");
+  title.className = "files-rail-title";
+  title.textContent = FILE_TREE_COPY.title;
+
+  const toggle = doc.createElement("button");
+  toggle.type = "button";
+  toggle.className = "files-rail-toggle";
 
   const body = doc.createElement("div");
   body.className = "workspace-file-tree-body";
+  body.id = "workspace-file-tree-body";
   body.setAttribute("aria-label", "工作区文件");
 
+  toggle.setAttribute("aria-controls", body.id);
+  head.appendChild(title);
+  head.appendChild(toggle);
   mount.appendChild(head);
   mount.appendChild(body);
 
@@ -132,9 +170,31 @@ export function initFileTree(host = {}, env = {}) {
   /** @type {string} */
   let rootError = "";
   let loadToken = 0;
+  let collapsed = env.collapsed !== undefined
+    ? Boolean(env.collapsed)
+    : readFilesRailCollapsed(storage);
 
   function workdirNow() {
     return String(host.getWorkdir?.() ?? "").trim();
+  }
+
+  function syncCollapsedChrome() {
+    mount.classList.toggle("files-rail--collapsed", collapsed);
+    toggle.setAttribute("aria-expanded", String(!collapsed));
+    toggle.setAttribute("aria-label", collapsed ? FILE_TREE_COPY.expand : FILE_TREE_COPY.collapse);
+    toggle.textContent = collapsed ? `⟨ ${FILE_TREE_COPY.title}` : `${FILE_TREE_COPY.title} ⟩`;
+  }
+
+  function setCollapsed(next) {
+    const target = Boolean(next);
+    if (collapsed === target) {
+      syncCollapsedChrome();
+      return collapsed;
+    }
+    collapsed = target;
+    writeFilesRailCollapsed(storage, collapsed);
+    syncCollapsedChrome();
+    return collapsed;
   }
 
   function paint() {
@@ -275,8 +335,8 @@ export function initFileTree(host = {}, env = {}) {
         else cache.set(key, { entries: [], notices: [{ notice: message, relative: key }] });
         return;
       }
-      const body = await res.json().catch(() => null);
-      const split = splitTreeEntries(body?.files);
+      const parsed = await res.json().catch(() => null);
+      const split = splitTreeEntries(parsed?.files);
       cache.set(key, split);
       if (key === "") rootError = "";
     } catch {
@@ -314,9 +374,16 @@ export function initFileTree(host = {}, env = {}) {
     await loadDir("");
   }
 
+  toggle.addEventListener("click", () => {
+    setCollapsed(!collapsed);
+  });
+  syncCollapsedChrome();
+
   const api = {
     reload,
     expand: toggleDir,
+    setCollapsed,
+    isCollapsed: () => collapsed,
     element: mount,
   };
   mount.__fileTreeApi = api;
