@@ -3,6 +3,15 @@
  * 仓库/分支是工作区事实，跟 workdir 走，不是领域包。
  */
 
+import {
+  GITHUB_PR_API_URL,
+  GITHUB_PR_COPY,
+  buildCreatePrPayload,
+  githubPrReadyUrl,
+  prUrlFromResponse,
+  renderGithubPrPanel,
+} from "./github-pr.js";
+
 export function formatGitTriggerLabel(git) {
   if (!git || git.present !== true) return "";
   const head = git.detached ? `detached ${git.branch || "HEAD"}` : (git.branch || "HEAD");
@@ -16,27 +25,17 @@ export function githubMcpConnected(mcp) {
 }
 
 /**
- * 工作单元上的 GitHub 诚实句。没连 MCP 就不给「开 PR」。
- * @returns {{ offerPr: boolean, note: string, prHref?: string }}
+ * 工作单元上的 GitHub 诚实句。有远程才给真开 PR；令牌够不够由宿主端点说。
+ * @returns {{ offerPr: boolean, note: string }}
  */
-export function workspaceGitHonesty(git, mcp) {
+export function workspaceGitHonesty(git, _mcp) {
   if (!git || git.present !== true) return { offerPr: false, note: "" };
   const owner = git.github?.owner;
   const repo = git.github?.repo;
   if (!owner || !repo) {
     return { offerPr: false, note: "本地仓库。还没接 GitHub，现在只会改这个文件夹。" };
   }
-  if (!githubMcpConnected(mcp)) {
-    return {
-      offerPr: false,
-      note: `仓库是 ${owner}/${repo}。GitHub 没连上，现在只会改这个文件夹。`,
-    };
-  }
-  return {
-    offerPr: true,
-    note: "",
-    prHref: `https://github.com/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/compare`,
-  };
+  return { offerPr: true, note: "" };
 }
 
 export function formatGitTitle(git) {
@@ -47,7 +46,7 @@ export function formatGitTitle(git) {
   return git.dirty ? `${repo} · 有未提交改动` : repo;
 }
 
-export function renderGitMenu(menu, git, mcp) {
+export function renderGitMenu(menu, git, mcp, prState) {
   menu.replaceChildren();
   if (!git || git.present !== true) return;
   if (git.github?.owner && git.github.repo) {
@@ -63,14 +62,12 @@ export function renderGitMenu(menu, git, mcp) {
     note.textContent = honesty.note;
     menu.appendChild(note);
   }
-  if (honesty.offerPr && honesty.prHref) {
-    const link = menu.ownerDocument.createElement("a");
-    link.className = "git-pr-link";
-    link.href = honesty.prHref;
-    link.target = "_blank";
-    link.rel = "noopener noreferrer";
-    link.textContent = "开 PR";
-    menu.appendChild(link);
+  if (honesty.offerPr) {
+    const host = menu.ownerDocument.createElement("div");
+    host.dataset.githubPrHost = "1";
+    host.className = "git-pr-host";
+    menu.appendChild(host);
+    renderGithubPrPanel(host, { git, ...(prState ?? {}) });
   }
   const list = menu.ownerDocument.createElement("div");
   list.className = "wd-menu-list";
@@ -165,6 +162,23 @@ export function initWorkspaceGitChip(root, hooks = {}, env = {}) {
   let snapshot = { present: false };
   let busy = false;
   let pendingDirty = null;
+  let prReady = null;
+  let prBusy = false;
+  let prError = "";
+  let prUrl = "";
+  let prTitle = "";
+  let prBody = "";
+
+  function prState() {
+    return {
+      ready: prReady,
+      busy: prBusy,
+      error: prError,
+      url: prUrl,
+      title: prTitle,
+      body: prBody,
+    };
+  }
 
   function closeMenu() {
     pendingDirty = null;
@@ -192,7 +206,7 @@ export function initWorkspaceGitChip(root, hooks = {}, env = {}) {
           busy,
         });
       } else {
-        renderGitMenu(menu, snapshot, hooks.getMcp?.() ?? null);
+        renderGitMenu(menu, snapshot, hooks.getMcp?.() ?? null, prState());
       }
     }
     return snapshot;
@@ -211,8 +225,68 @@ export function initWorkspaceGitChip(root, hooks = {}, env = {}) {
     } catch {
       snapshot = { present: false };
     }
+    prReady = null;
+    prUrl = "";
+    prError = "";
     paint();
     return snapshot;
+  }
+
+  async function refreshPrReady() {
+    const workdir = hooks.getWorkdir?.();
+    if (!workdir || snapshot?.github?.owner == null) {
+      prReady = null;
+      return prReady;
+    }
+    try {
+      const res = await fetchFn(githubPrReadyUrl(workdir));
+      const data = await res.json().catch(() => ({}));
+      prReady = res.ok
+        ? data
+        : { ready: false, error: data.error || GITHUB_PR_COPY.readyError(res.status) };
+    } catch {
+      prReady = { ready: false, error: GITHUB_PR_COPY.networkError };
+    }
+    return prReady;
+  }
+
+  async function submitPr(fields) {
+    const workdir = hooks.getWorkdir?.();
+    if (!workdir || prBusy) return null;
+    prBusy = true;
+    prError = "";
+    prTitle = fields.title ?? "";
+    prBody = fields.body ?? "";
+    paint();
+    try {
+      const res = await fetchFn(GITHUB_PR_API_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(buildCreatePrPayload(workdir, {
+          title: prTitle,
+          body: prBody,
+          base: prReady?.base,
+          head: prReady?.head,
+        })),
+      });
+      const data = await res.json().catch(() => ({}));
+      const url = prUrlFromResponse(data);
+      if (!res.ok || !url) {
+        prError = data.error || GITHUB_PR_COPY.createError(res.status);
+        hooks.onAnnounce?.(prError);
+        return null;
+      }
+      prUrl = url;
+      hooks.onAnnounce?.(url);
+      return { url };
+    } catch (err) {
+      prError = err instanceof Error ? err.message : GITHUB_PR_COPY.networkError;
+      hooks.onAnnounce?.(prError);
+      return null;
+    } finally {
+      prBusy = false;
+      paint();
+    }
   }
 
   async function checkout(branch, dirtyAction) {
@@ -261,9 +335,24 @@ export function initWorkspaceGitChip(root, hooks = {}, env = {}) {
       pendingDirty = null;
       menu.hidden = false;
       paint();
+      void refreshPrReady().then(() => paint());
     } else {
       closeMenu();
     }
+  });
+
+  menu.addEventListener("submit", (event) => {
+    const form = event.target instanceof Element
+      ? event.target.closest("[data-github-pr='form']")
+      : null;
+    if (!form) return;
+    event.preventDefault();
+    const title = form.querySelector("[name='title']");
+    const body = form.querySelector("[name='body']");
+    void submitPr({
+      title: title && "value" in title ? title.value : "",
+      body: body && "value" in body ? body.value : "",
+    });
   });
 
   menu.addEventListener("click", (event) => {
@@ -300,7 +389,7 @@ export function initWorkspaceGitChip(root, hooks = {}, env = {}) {
     if (typeof trigger.focus === "function") trigger.focus();
   });
 
-  const api = { paint, refresh, checkout, close: closeMenu };
+  const api = { paint, refresh, checkout, close: closeMenu, submitPr, refreshPrReady };
   root.__workspaceGitChip = api;
   paint();
   return api;

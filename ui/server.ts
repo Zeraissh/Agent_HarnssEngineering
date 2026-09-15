@@ -223,6 +223,16 @@ import {
   type PublicWorkspaceGit,
   type WorkspaceDirtyAction,
 } from "../src/workspace-git.js";
+import {
+  createGithubPullRequest,
+  defaultCommandRunner,
+  GithubPrError,
+  inspectGithubPrReady,
+  publicGithubPrReady,
+  publicGithubPrResult,
+  resolveDefaultBase,
+  type CommandRunner,
+} from "./github-pr.js";
 import { resolveRunTitle, sanitizeGeneratedTitle, summarizeTitle, titleSourceText, TITLE_SYSTEM } from "./title.js";
 import { appendSiteHooks } from "./public/features/review-mode.js";
 import {
@@ -1674,6 +1684,16 @@ export interface UiServerOptions {
    * 快照只报 `{ kind, armed }`，永不带 URL。
    */
   notify?: OfficeNotifyConfig;
+  /**
+   * 开 PR 的命令执行器。缺省 execFile(`gh`, args)。测试注入，禁止真打 GitHub。
+   */
+  githubPrRunner?: CommandRunner;
+  /**
+   * 开 PR 用的环境（只读 GITHUB_TOKEN / GH_TOKEN / AGENT_GITHUB_TOKEN）。
+   * 真实宿主缺省 process.env；注入了 modelClient 的宿主缺省空对象，
+   * 开发机残留令牌不得武装测试。
+   */
+  githubPrEnv?: NodeJS.ProcessEnv;
 }
 
 /**
@@ -3087,6 +3107,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    */
   const notifyConfig = options.notify
     ?? (realHost ? resolveOfficeNotifyFromEnv(process.env) ?? undefined : undefined);
+  const githubPrRun = options.githubPrRunner ?? defaultCommandRunner;
+  const githubPrEnv = options.githubPrEnv ?? (realHost ? process.env : {});
   const officeNotifier = createOfficeNotifier(notifyConfig ?? { enabled: false });
   const fireGateNotify = (
     status: Parameters<typeof gateNotifyPayloadFromBoard>[0],
@@ -8793,6 +8815,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     "campaignChildCancel",
     "fsMkdir",
     "workspaceGitCheckout",
+    "workspaceGitPrCreate",
     "seedTemplate",
     "exportPptx",
     "exportPng",
@@ -9014,6 +9037,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     | { type: "workdirRemove" }
     | { type: "workspaceGitGet"; workdir: string | null }
     | { type: "workspaceGitCheckout" }
+    | { type: "workspaceGitPrGet"; workdir: string | null }
+    | { type: "workspaceGitPrCreate" }
     | { type: "fsList"; path: string | null }
     | { type: "fsMkdir" }
     | { type: "memoryList"; scope: "current" | "all"; workdir?: string }
@@ -9222,6 +9247,14 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     }
     if (method === "POST" && url === "/api/workspace/git/checkout") {
       return { type: "workspaceGitCheckout" };
+    }
+    const workspaceGitPrMatch = method === "GET" && url.match(/^\/api\/workspace\/git\/pr(?:\?(.*))?$/);
+    if (workspaceGitPrMatch) {
+      const params = new URLSearchParams(workspaceGitPrMatch[1] ?? "");
+      return { type: "workspaceGitPrGet", workdir: params.get("workdir") };
+    }
+    if (method === "POST" && url === "/api/workspace/git/pr") {
+      return { type: "workspaceGitPrCreate" };
     }
 
     /**
@@ -10330,6 +10363,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         "campaignCreate",
         "fsMkdir",
         "workspaceGitCheckout",
+        "workspaceGitPrCreate",
         "seedTemplate",
         "exportPptx",
         "exportPng",
@@ -11405,6 +11439,60 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           }
           const message = error instanceof Error ? error.message : String(error);
           if (message.startsWith("非法分支名")) return badRequest(res, message);
+          return json(res, 409, { error: message });
+        }
+      }
+
+      case "workspaceGitPrGet": {
+        const listed = listedWorkdir(route.workdir);
+        if (!listed.ok) return json(res, listed.status, { error: listed.error });
+        const git = await probeWorkspaceGit(listed.path);
+        let base: string | undefined;
+        if (git.present) {
+          try {
+            base = await resolveDefaultBase(git.root, githubPrRun);
+          } catch {
+            base = undefined;
+          }
+        }
+        return json(res, 200, publicGithubPrReady(inspectGithubPrReady(git, githubPrEnv, { base })));
+      }
+
+      case "workspaceGitPrCreate": {
+        if (!hostname || !isLoopbackHostname(hostname)) {
+          return json(res, 403, { error: "开 PR 仅本机（loopback）可用" });
+        }
+        let body: string;
+        try {
+          body = await readBody(req, requestBodyMaxBytes);
+        } catch (error) {
+          return requestBodyFailure(res, error);
+        }
+        let parsed: { workdir?: unknown; title?: unknown; body?: unknown; base?: unknown; head?: unknown };
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          return badRequest(res, "Invalid JSON body");
+        }
+        const listed = listedWorkdir(parsed.workdir);
+        if (!listed.ok) return json(res, listed.status, { error: listed.error });
+        try {
+          const created = await createGithubPullRequest({
+            workdir: listed.path,
+            title: typeof parsed.title === "string" ? parsed.title : undefined,
+            body: typeof parsed.body === "string" ? parsed.body : undefined,
+            base: typeof parsed.base === "string" ? parsed.base : undefined,
+            head: typeof parsed.head === "string" ? parsed.head : undefined,
+          }, {
+            run: githubPrRun,
+            env: githubPrEnv,
+          });
+          return json(res, 200, publicGithubPrResult(created));
+        } catch (error) {
+          if (error instanceof GithubPrError) {
+            return json(res, error.status, { error: error.message, code: error.code });
+          }
+          const message = error instanceof Error ? error.message : String(error);
           return json(res, 409, { error: message });
         }
       }
@@ -13020,7 +13108,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       /**
        * 整站预览取件：相对路径按 run workdir 圈禁；目录则回 index.html。
        * MIME 用 siteContentTypeOf（.js 可执行）；CSP 允许同源脚本/样式。
-       * `?inspect=1` 仅对 HTML 注入点选钩子（保留页面脚本），相对资源仍同源可取。
+       * 点评 runtime 每次 HTML 都注入（休眠）；`?inspect=1` 开机即开。相对资源仍同源可取。
        */
       case "site": {
         const run = runs.get(route.runId);
