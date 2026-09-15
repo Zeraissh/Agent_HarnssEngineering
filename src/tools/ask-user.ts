@@ -52,6 +52,7 @@
 import type { Tool } from "../types.js";
 import { PROPOSE_HANDOFF_TOOL_NAME } from "./propose-handoff.js";
 import { SPAWN_TASK_TOOL_NAME } from "./spawn-task.js";
+import { CAMPAIGN_MAIL_TOOL_NAME } from "./campaign-mail.js";
 
 export interface UserQuestion {
   /** 问题正文（模型写的） */
@@ -131,12 +132,14 @@ export const DEFAULT_MAX_ROUNDS = 3;
 export function withoutAskUser<T extends { name: string }>(tools: T[]): T[] {
   // 核查者 / 拆解者拿不到任何「对人说话」或「另开支线」的工具：
   // ask_user 会把独立核查换成要答案；propose_handoff 会让它们越权提议换世界；
-  // spawn_task 会放大隔离缺口并可能死锁审批门（§4.5）。
+  // spawn_task 会放大隔离缺口并可能死锁审批门（§4.5）；
+  // campaign_mail 是导演写 mailbox 的通道——核查者/拆解者写字条等于越权指挥子对话。
   return tools.filter(
     (t) =>
       t.name !== ASK_USER_TOOL_NAME
       && t.name !== PROPOSE_HANDOFF_TOOL_NAME
-      && t.name !== SPAWN_TASK_TOOL_NAME,
+      && t.name !== SPAWN_TASK_TOOL_NAME
+      && t.name !== CAMPAIGN_MAIL_TOOL_NAME,
   );
 }
 

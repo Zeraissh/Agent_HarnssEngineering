@@ -29,6 +29,8 @@ export interface SpawnTaskResult {
   error?: string;
   /** 子支线用了多少轮（观测用） */
   turns?: number;
+  /** 战役 / AGENT_CAMPAIGN=1 时真开的子 StoredRun */
+  runId?: string;
 }
 
 export interface SpawnTaskOptions {
@@ -109,11 +111,13 @@ export function createSpawnTaskTool(opts: SpawnTaskOptions): Tool {
         return { content: `支线失败：${message}`, isError: true };
       }
       opts.onDone?.(request, result);
+      const runLine = result.runId ? `\nrunId：${result.runId}` : "";
       if (!result.passed) {
         return {
           content:
             `支线未完成${result.error ? `：${result.error}` : ""}。` +
-            (result.summary ? `\n已有摘要：${result.summary}` : ""),
+            (result.summary ? `\n已有摘要：${result.summary}` : "") +
+            runLine,
           isError: true,
         };
       }
@@ -121,7 +125,7 @@ export function createSpawnTaskTool(opts: SpawnTaskOptions): Tool {
         result.artifacts?.length ? `\n产物：${result.artifacts.join("、")}` : "";
       return {
         content:
-          `【支线结论 · ${title}】\n${result.summary || "（无文字摘要）"}${arts}` +
+          `【支线结论 · ${title}】\n${result.summary || "（无文字摘要）"}${arts}${runLine}` +
           (result.turns !== undefined ? `\n（支线用了 ${result.turns} 轮）` : ""),
       };
     },

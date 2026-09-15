@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { withoutAskUser } from "../src/tools/ask-user.js";
+import { CAMPAIGN_MAIL_TOOL_NAME } from "../src/tools/campaign-mail.js";
 import {
   createSpawnTaskTool,
   SPAWN_TASK_TOOL_NAME,
@@ -13,9 +14,18 @@ import { FakeModelClient, fakeMessage, textBlock, toolUseBlock } from "./helpers
 
 describe("spawn_task (AGENT-02)", () => {
   it("withoutAskUser strips spawn_task (verifier/planner)", () => {
-    const tools = [{ name: "bash" }, { name: SPAWN_TASK_TOOL_NAME }, { name: "ask_user" }];
+    const tools = [
+      { name: "bash" },
+      { name: SPAWN_TASK_TOOL_NAME },
+      { name: "ask_user" },
+      { name: CAMPAIGN_MAIL_TOOL_NAME },
+    ];
     expect(withoutAskUser(tools).map((t) => t.name)).toEqual(["bash"]);
-    expect(withoutSpawnTask(tools).map((t) => t.name)).toEqual(["bash", "ask_user"]);
+    expect(withoutSpawnTask(tools).map((t) => t.name)).toEqual([
+      "bash",
+      "ask_user",
+      CAMPAIGN_MAIL_TOOL_NAME,
+    ]);
   });
 
   it("depth >= maxDepth rejects without calling spawn", async () => {
@@ -95,6 +105,55 @@ describe("spawn_task (AGENT-02)", () => {
     expect(result.content).toContain("支线结论：42");
     expect(result.content).toContain("out.txt");
     expect(budget.usedTurns).toBeGreaterThan(before);
+  });
+
+  it("tool result includes runId when spawn returns one", async () => {
+    const tool = createSpawnTaskTool({
+      depth: 0,
+      spawn: async () => ({
+        summary: "好了",
+        passed: true,
+        artifacts: ["a.elf"],
+        runId: "child-run-1",
+        turns: 2,
+      }),
+    });
+    const result = await tool.execute(
+      { title: "固件", description: "写固件" },
+      {
+        workdir: process.cwd(),
+        toolUseId: "t-runid",
+        signal: new AbortController().signal,
+      },
+    );
+    expect(result.isError).toBeFalsy();
+    expect(result.content).toContain("【支线结论 · 固件】");
+    expect(result.content).toContain("a.elf");
+    expect(result.content).toContain("runId：child-run-1");
+  });
+
+  it("failed spawn receipt still includes runId", async () => {
+    const tool = createSpawnTaskTool({
+      depth: 0,
+      spawn: async () => ({
+        summary: "半截",
+        passed: false,
+        error: "子对话 error",
+        runId: "child-run-fail",
+      }),
+    });
+    const result = await tool.execute(
+      { title: "固件", description: "写固件" },
+      {
+        workdir: process.cwd(),
+        toolUseId: "t-runid-fail",
+        signal: new AbortController().signal,
+      },
+    );
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("支线未完成：子对话 error");
+    expect(result.content).toContain("已有摘要：半截");
+    expect(result.content).toContain("runId：child-run-fail");
   });
 
   it("child AgentLoop does not re-expose spawn_task", async () => {
