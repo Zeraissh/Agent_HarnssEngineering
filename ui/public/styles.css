@@ -3572,11 +3572,12 @@ body.sidebar-collapsed .sidebar {
   padding: 0 6px 8px;
 }
 .ft-row {
+  --ft-depth: 0;
   display: flex;
   align-items: center;
   gap: 2px;
   min-height: 26px;
-  padding-left: calc(8px + var(--ft-depth, 0) * 12px);
+  padding-left: calc(8px + var(--ft-depth) * 12px);
   border-radius: calc(var(--radius) - 2px);
 }
 .ft-row:hover { background: var(--surface-2); }
