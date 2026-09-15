@@ -2,7 +2,15 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { listWorkspaceFiles, parseWorkspaceFileQuery } from "../ui/workspace-files.js";
+import {
+  listWorkspaceFiles,
+  parseWorkspaceFileQuery,
+  TREE_NOTICE,
+  WORKSPACE_TREE_LAYER_MAX,
+  WORKSPACE_TREE_MAX_DEPTH,
+  treeDepthOf,
+  treeQueryForDir,
+} from "../ui/workspace-files.js";
 
 const temps: string[] = [];
 
@@ -79,5 +87,41 @@ describe("listWorkspaceFiles", () => {
 
     const escaped = await listWorkspaceFiles(root, "../app");
     expect(escaped.files).toEqual([]);
+  });
+
+  it("q=dir/ 展开子层；圈外展开给人话，不列逃逸文件", async () => {
+    const root = await scratch();
+    await mkdir(join(root, "src", "nested"), { recursive: true });
+    await writeFile(join(root, "src", "app.js"), "x");
+    await writeFile(join(root, "hello.txt"), "x");
+
+    const { files } = await listWorkspaceFiles(root, treeQueryForDir("src"));
+    expect(files.map((f) => f.relative)).toEqual(["src/nested", "src/app.js"]);
+    expect(files.some((f) => f.relative === "hello.txt")).toBe(false);
+
+    const escaped = await listWorkspaceFiles(root, "../secret/");
+    expect(escaped.files).toHaveLength(1);
+    expect(escaped.files[0].notice).toBe(TREE_NOTICE.escaped);
+    expect(escaped.files[0].relative).toBe("../secret");
+    expect(escaped.files.every((f) => !f.name)).toBe(true);
+  });
+
+  it("过深与超大单层有护栏，不整盘扫", async () => {
+    expect(treeDepthOf("a/b/c/d/e/f/g/h")).toBe(8);
+    expect(treeDepthOf("a/b/c/d/e/f/g/h/i")).toBe(WORKSPACE_TREE_MAX_DEPTH + 1);
+
+    const root = await scratch();
+    const deep = ["a", "b", "c", "d", "e", "f", "g", "h", "i"].join("/");
+    await mkdir(join(root, deep), { recursive: true });
+    const tooDeep = await listWorkspaceFiles(root, treeQueryForDir(deep));
+    expect(tooDeep.files[0].notice).toBe(TREE_NOTICE.tooDeep);
+
+    const wide = await scratch();
+    for (let i = 0; i < WORKSPACE_TREE_LAYER_MAX + 3; i += 1) {
+      await writeFile(join(wide, `f-${String(i).padStart(3, "0")}.txt`), "x");
+    }
+    const listed = await listWorkspaceFiles(wide, "");
+    expect(listed.files.filter((f) => !f.notice)).toHaveLength(WORKSPACE_TREE_LAYER_MAX);
+    expect(listed.files.at(-1)?.notice).toBe(TREE_NOTICE.truncated);
   });
 });

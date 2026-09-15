@@ -432,6 +432,30 @@ describe("GET /api/workspace/files", () => {
     const outside = await fetch(`${base}/api/workspace/files?workdir=${encodeURIComponent(join(hostWorkdir, ".."))}`);
     expect(outside.status).toBe(403);
   });
+
+  it("q=dir/ 展开子层；圈外 q 给人话 notice，不把外面的文件列出来", async () => {
+    const { base, hostWorkdir } = await makeHost();
+    await writeFile(join(hostWorkdir, "hello.txt"), "x");
+    await mkdir(join(hostWorkdir, "src"));
+    await writeFile(join(hostWorkdir, "src", "app.js"), "x");
+
+    const expanded = await fetch(
+      `${base}/api/workspace/files?workdir=${encodeURIComponent(hostWorkdir)}&q=${encodeURIComponent("src/")}`,
+    );
+    expect(expanded.status).toBe(200);
+    const kids = (await expanded.json()) as { files: Array<{ relative: string; notice?: string }> };
+    expect(kids.files.map((f) => f.relative)).toEqual(["src/app.js"]);
+    expect(kids.files.some((f) => f.relative === "hello.txt")).toBe(false);
+
+    const escaped = await fetch(
+      `${base}/api/workspace/files?workdir=${encodeURIComponent(hostWorkdir)}&q=${encodeURIComponent("../secret/")}`,
+    );
+    expect(escaped.status).toBe(200);
+    const body = (await escaped.json()) as { files: Array<{ relative: string; notice?: string; name?: string }> };
+    expect(body.files.some((f) => f.notice)).toBe(true);
+    expect(body.files.every((f) => f.notice || !String(f.relative).includes(".."))).toBe(true);
+    expect(JSON.stringify(body)).not.toMatch(/HTTP\s*\d{3}/i);
+  });
 });
 
 // ------------------------------------------------------

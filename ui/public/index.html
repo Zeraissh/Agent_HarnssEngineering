@@ -31,7 +31,7 @@
   <h1>FATHOM</h1>
 </header>
 
-<!-- 侧栏：品牌 → 顶栏图标 → 分脸 → 新建 → 搜索 → 会话列表；其余工具留底栏 -->
+<!-- 侧栏：品牌 → 顶栏图标 → 分脸 → 新建 → 搜索 → Code 脸文件树 → 会话列表；其余工具留底栏 -->
 <aside class="sidebar" id="sidebar" data-workspace-face="office">
   <div class="sidebar-header">
     <div class="sidebar-brand">
@@ -134,6 +134,9 @@
       </div>
     </div>
   </div>
+  <!-- Code 脸资源管理器：展开走 /api/workspace/files?q=dir/。Work 脸用 CSS 藏。
+       不用 role=tree——空态没有 treeitem 会撞 aria-required-children（与 run-list 同族）。 -->
+  <div id="workspace-file-tree" class="workspace-file-tree"></div>
   <!-- role=listbox / aria-label 由 renderRunList 动态挂载：listbox 必须含 option
        子项（aria-required-children），空态/加载态若静态带着 role 反而是 critical
        违规——这条是 axe 扫描器上线首跑抓到的（s3d 手工修复引入的新问题） -->
@@ -631,6 +634,7 @@ import {
   parseUsageReport,
 } from "/features/usage.js";
 import { upgradeSelects } from "/features/theme-select.js";
+import { initFileTree } from "/features/file-tree.js";
 
 // ---- 状态 ----
 /** @type {Map<string, import('/app.js').RunState>} */
@@ -659,6 +663,8 @@ let citeCandidates = [];
 let settingsApi = /** @type {null|{ open:()=>void, close:()=>void, isOpen:()=>boolean, refresh:()=>void }} */ (null);
 let onboardingApi = /** @type {null|{ start:(opts?:{force?:boolean})=>boolean, replay:()=>boolean, isOpen:()=>boolean }} */ (null);
 let usageApi = /** @type {null|{ open:()=>void, close:()=>void }} */ (null);
+/** Code 脸文件树。host 回调在文件后部接线；未加载时为 null。 */
+let fileTreeApi = /** @type {null|{ reload:()=>Promise<void>, expand:(p:string)=>Promise<void>, element:HTMLElement }} */ (null);
 /** GET /api/usage 缓存：侧栏 / 指挥中心花费芯片共用，不另算汇率 */
 let usageReportCache = null;
 
@@ -1316,6 +1322,7 @@ function applyWorkspaceFace(next, { persist = true, refresh = true } = {}) {
     refreshRunListView();
     syncComposer();
   }
+  if (face === "code") void fileTreeApi?.reload?.();
 }
 
 function paintEmptyState() {
@@ -4803,6 +4810,7 @@ if (workdirSelect) {
           void workspaceGitChipApi?.refresh();
           void refreshGateChip();
           void refreshCiteCandidates();
+          void fileTreeApi?.reload?.();
           selectedCiteIds = [];
           paintCiteChips();
           hideCitePicker();
@@ -4825,6 +4833,31 @@ if (workdirSelect) {
     }
   } catch { /* 目录选择器是增强项，初始化失败静默降级 */ }
 }
+
+try {
+  const fileTreeMount = document.getElementById("workspace-file-tree");
+  if (fileTreeMount) {
+    fileTreeApi = initFileTree({
+      mount: fileTreeMount,
+      getWorkdir: () => composerWorkdir(),
+      onPreview: (path) => {
+        const wd = composerWorkdir();
+        if (!path || !wd) return;
+        if (selectedRunId) {
+          openArtifactByPath(selectedRunId, path);
+          return;
+        }
+        filePreviewApi?.open({
+          path,
+          url: buildFilePreviewUrl({ path, workdir: wd }),
+        });
+      },
+      onCite: (path, kind) => insertWorkspaceFileMention(path, kind),
+      onAnnounce: (msg) => announceStatus(msg),
+    });
+    if (workspaceFace === "code") void fileTreeApi?.reload?.();
+  }
+} catch { /* 文件树是增强项，初始化失败静默降级 */ }
 
 if (projectSelect) {
   projectSelect.addEventListener("change", () => {

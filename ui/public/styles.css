@@ -3540,6 +3540,95 @@ body.sidebar-collapsed .sidebar {
   text-transform: uppercase;
 }
 
+/* Code 脸工作区文件树：Work 脸藏起。不用 [hidden]——作者 display 会压过 UA。 */
+.workspace-file-tree {
+  display: none;
+  flex: 1 1 auto;
+  min-height: 0;
+  flex-direction: column;
+  border-top: 1px solid var(--border-1);
+}
+.sidebar[data-workspace-face="code"] .workspace-file-tree {
+  display: flex;
+}
+.sidebar[data-workspace-face="code"] .run-list {
+  flex: 0 1 34%;
+  max-height: 34%;
+  min-height: 4.5rem;
+}
+.workspace-file-tree-head {
+  flex: 0 0 auto;
+  padding: 8px 12px 4px;
+  color: var(--text-3);
+  font-size: var(--font-xs);
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.workspace-file-tree-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 0 6px 8px;
+}
+.ft-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-height: 26px;
+  padding-left: calc(8px + var(--ft-depth, 0) * 12px);
+  border-radius: calc(var(--radius) - 2px);
+}
+.ft-row:hover { background: var(--surface-2); }
+.ft-twist,
+.ft-cite {
+  flex: 0 0 auto;
+  width: 22px;
+  min-height: 22px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-3);
+  cursor: pointer;
+}
+.ft-twist-spacer { flex: 0 0 22px; }
+.ft-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 4px;
+  border: 0;
+  background: transparent;
+  color: var(--text-1);
+  font: inherit;
+  font-size: var(--font-sm);
+  text-align: left;
+  cursor: pointer;
+}
+.ft-name > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ft-name > .ph,
+.ft-twist > .ph { color: var(--text-3); }
+.ft-twist:focus-visible,
+.ft-name:focus-visible,
+.ft-cite:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+.ft-empty,
+.ft-error,
+.ft-notice {
+  margin: 8px 10px;
+  color: var(--text-2);
+  font-size: var(--font-sm);
+  line-height: 1.45;
+}
+
 .run-list { padding: var(--space-sm); }
 .run-group { padding: 0 0 var(--space-md); }
 .run-group + .run-group { margin-top: 0; }
@@ -4954,6 +5043,32 @@ body.sidebar-collapsed .sidebar {
   font-size: var(--font-sm);
   color: var(--accent);
 }
+.git-pr-host { padding: 4px 8px 8px; }
+.git-pr-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.git-pr-label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--text-2);
+  font-size: var(--font-xs);
+}
+.git-pr-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 6px 8px;
+  border: 1px solid var(--border-1);
+  border-radius: var(--radius);
+  background: var(--surface-1);
+  color: var(--text-1);
+  font: inherit;
+  font-size: var(--font-sm);
+}
+.git-pr-body { resize: vertical; min-height: 4.5em; }
+.git-pr-error { color: var(--text-2); }
 .git-honesty { margin: 6px 8px; }
 .cite-picker-item {
   display: flex;
