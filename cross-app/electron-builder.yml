@@ -1,5 +1,7 @@
 appId: com.self.agentharness
-productName: Agent Harness
+# 开始菜单 / 桌面快捷方式 / 安装目录显示名。appId 保持旧值，覆盖升级仍认同一应用。
+# Electron userData 仍由 main.cjs 的 app.setName('Agent Harness') 决定，不跟产品名走。
+productName: FATHOM
 directories:
   output: dist-electron
 asar: true
@@ -21,12 +23,17 @@ extraResources:
       - "**/*"
 win:
   target: nsis
+  executableName: FATHOM
   artifactName: ${productName}-${version}-${arch}-setup.${ext}
 nsis:
   oneClick: false
   allowToChangeInstallationDirectory: true
   runAfterFinish: false
   deleteAppDataOnUninstall: false
+  # 开始菜单始终有「FATHOM」。桌面图标是安装向导勾选项（true=默认勾，不是 always）。
+  createStartMenuShortcut: true
+  createDesktopShortcut: true
+  shortcutName: FATHOM
 mac:
   target: dmg
   hardenedRuntime: true

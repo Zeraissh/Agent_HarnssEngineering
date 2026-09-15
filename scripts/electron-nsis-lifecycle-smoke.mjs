@@ -68,6 +68,25 @@ if (process.platform !== "win32") {
 
 const installRoot = mkdtempSync(path.join(tmpdir(), "agent-harness-nsis-"));
 const installDir = path.join(installRoot, "AgentHarness");
+/** 与 electron-builder.yml productName/executableName 对齐；旧包名留给覆盖升级。 */
+const DESKTOP_EXE_NAMES = ["FATHOM.exe", "Agent Harness.exe"];
+
+function findInstalledExe(dir) {
+  for (const name of DESKTOP_EXE_NAMES) {
+    const candidate = path.join(dir, name);
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+function killInstalledGui() {
+  for (const name of DESKTOP_EXE_NAMES) {
+    spawnSync("taskkill", ["/IM", name, "/F"], {
+      windowsHide: true,
+      encoding: "utf8",
+    });
+  }
+}
 
 function findSetup(versionHint) {
   if (!existsSync(distDir)) return null;
@@ -89,17 +108,14 @@ function silentInstall(setupExe) {
     stdio: "ignore",
   });
   child.unref();
-  const exe = path.join(installDir, "Agent Harness.exe");
   const harnessMarker = path.join(installDir, "resources", "harness", "package.json");
   const deadline = Date.now() + 240_000;
   let sawHarness = false;
   while (Date.now() < deadline) {
-    if (existsSync(exe) && existsSync(harnessMarker)) {
+    const exe = findInstalledExe(installDir);
+    if (exe && existsSync(harnessMarker)) {
       sawHarness = true;
-      spawnSync("taskkill", ["/IM", "Agent Harness.exe", "/F"], {
-        windowsHide: true,
-        encoding: "utf8",
-      });
+      killInstalledGui();
       const names = existsSync(installDir) ? readdirSync(installDir) : [];
       const hasUninstaller = names.some((n) => /^uninstall/i.test(n) && /\.exe$/i.test(n));
       const installerGone = child.exitCode !== null || child.signalCode !== null;
@@ -269,14 +285,18 @@ try {
 
   silentInstall(setupA);
   if (doBuild || process.argv.includes("--require-health")) {
-    await probeInstalledExe(path.join(installDir, "Agent Harness.exe"));
+    const exeA = findInstalledExe(installDir);
+    if (!exeA) fail(`installed exe missing under ${installDir}`);
+    await probeInstalledExe(exeA);
   } else {
     console.log("ok: skip /health (reuse stale setup; pass --build or --require-health)");
   }
   // 覆盖安装 = NSIS 升级路径（同目录 /D=）。
   silentInstall(setupB);
   if (doBuild || process.argv.includes("--require-health")) {
-    await probeInstalledExe(path.join(installDir, "Agent Harness.exe"));
+    const exeB = findInstalledExe(installDir);
+    if (!exeB) fail(`installed exe missing under ${installDir} after upgrade`);
+    await probeInstalledExe(exeB);
   }
   silentUninstall();
   console.log("electron-nsis-lifecycle-smoke: pass");

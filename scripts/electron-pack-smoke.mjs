@@ -44,9 +44,8 @@ if (existsSync(main)) {
 }
 
 if (unpacked) {
-  const exe = path.join(unpacked, "Agent Harness.exe");
-  const alt = path.join(unpacked, "agent-harness.exe");
-  const target = existsSync(exe) ? exe : existsSync(alt) ? alt : null;
+  const candidates = ["FATHOM.exe", "Agent Harness.exe", "agent-harness.exe"];
+  const target = candidates.map((name) => path.join(unpacked, name)).find((p) => existsSync(p)) ?? null;
   if (!target) {
     console.error(`no Electron exe under ${unpacked}`);
     process.exit(1);

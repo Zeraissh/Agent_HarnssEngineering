@@ -10,7 +10,7 @@
 |---|---|---|
 | **Web** | `npm run ui` | `ui/serve.ts`，默认 `http://127.0.0.1:4173`（`AGENT_UI_PORT` / `PORT`）。页标题与桌面对齐：首页 `FATHOM`、对话 `FATHOM · 对话` |
 | **CLI** | `npm run agent -- …`（`npm run cli` 同入口） | `src/cli.ts`。用法：`npm run agent -- --help` |
-| **桌面** | `npm run desktop` | Electron 壳：本机 4173 已健康就贴上；没有就拉起当前 `ui/serve.ts`。窗框首页 `FATHOM`、对话 `FATHOM · 对话`。**没有开始菜单项**。详见 [`cross-app/README.md`](cross-app/README.md) |
+| **桌面** | `npm run desktop`；装完从开始菜单开 **FATHOM** | Electron 壳：本机 4173 已健康就贴上；没有就拉起当前 `ui/serve.ts`。窗框首页 `FATHOM`、对话 `FATHOM · 对话`。Windows 安装包带开始菜单快捷方式（桌面图标可选）。详见 [`cross-app/README.md`](cross-app/README.md) |
 
 编译产物：`npm run build && npm start`（`dist/ui/serve.js`）。静态自检：`npm run doctor`（不联网）。
 
@@ -24,8 +24,10 @@
 
 ### 诚实边界
 
-- 本地单操作员控制台，不是 IDE 插件，也不是飞书/微信入站网关。空态写「现在只能在这个窗口下指令。」
-- GitHub / 飞书在设置 → MCP；Web **默认不连** MCP，要 `AGENT_UI_MCP=1`。没连 GitHub 只说「现在只会改这个文件夹」，不给开 PR。
+- 本地单操作员控制台，不是 IDE 插件。空态写「现在只能在这个窗口下指令。」
+- **飞书：** 配 `AGENT_FEISHU_ENCRYPT_KEY` 才开入站（事件订阅签名 → 开 run → `AGENT_FEISHU_WEBHOOK` 回结果）。没配启动行写「飞书/微信宿主未开」。本仓不帮你注册飞书应用；入站还要公网可达。
+- **企业微信：** 仅 `AGENT_WECOM_WEBHOOK` 群机器人出站。个微 / 公众号入站要你自己的 App 凭证，本仓不伪造、不收私聊。
+- GitHub / 飞书 OpenAPI 在设置 → MCP；Web **默认不连** MCP，要 `AGENT_UI_MCP=1`。没连 GitHub 只说「现在只会改这个文件夹」，不给开 PR。
 - 工具写入圈在工作目录白名单内。Android 仍是实验客户端。
 - 运行历史落到 `<cwd>/.agent-run-history`（`AGENT_RUN_HISTORY_DIR` / `AGENT_RUN_HISTORY_KEEP`，缺省保留 50）。
 
@@ -314,15 +316,15 @@ powershell ... -EnvironmentId "<Agent 面板 Environment 卡片里的 ID>"
 浏览器页标题与桌面窗框同一套：首页 `FATHOM`、对话 `FATHOM · 对话`（设置 / 指挥中心 / 产物 / 定时任务 / 消耗同款前缀）。控制台在 [`ui/`](ui/)
 （`ui/server.ts` + `ui/public`：提交 / SSE / 审批 / 核查 / 计划确认门可改短句 / 产物页内预览）。
 桌面端（Electron）与移动端（Capacitor Android）外壳在 [`cross-app/`](cross-app/)——
-连接同一套宿主，不是另一套执行引擎。开发入口 `npm run desktop`；**现在没有开始菜单项**：
+连接同一套宿主，不是另一套执行引擎。开发入口 `npm run desktop`；Windows 装完从开始菜单点 **FATHOM**（桌面图标在安装向导里可选）：
 
 ```powershell
 npm run ui                              # 浏览器控制台 http://127.0.0.1:4173
 npm run desktop                         # Electron：无宿主则用 ui/serve.ts + tsx 拉起当前 Web UI
 cd cross-app
 npm run desktop                         # 同上（从外壳目录启动）
-npm run desktop:dist                    # 生产打包；Windows/macOS 缺签名凭据会拒绝
-npm run desktop:dist:unsigned           # 只供本机安装测试，不得发布
+npm run desktop:dist                    # 生产打包（NSIS：开始菜单 FATHOM）；Windows/macOS 缺签名凭据会拒绝
+npm run desktop:dist:unsigned           # 只供本机/CI 安装测试，不得发布
 ```
 
 桌面壳入口顺序：`AGENT_UI_HOST_ENTRY`（文件必须存在，否则 fail-closed）>

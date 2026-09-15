@@ -67,9 +67,44 @@ describe('production desktop shell', () => {
     );
     expect(settingsWindow).toContain("title: 'FATHOM · 模型与运行设置'");
     expect(settingsPage).toContain('<title>FATHOM · 模型与运行设置</title>');
-    expect(readme).toMatch(/现在没有开始菜单项/);
+    expect(readme).not.toMatch(/现在没有开始菜单项/);
+    expect(readme).toMatch(/开始菜单/);
     expect(readme).toContain('npm run desktop');
     expect(readme).toContain('FATHOM · 对话');
+  });
+
+  it('NSIS 安装包带 FATHOM 开始菜单快捷方式，桌面图标可选', () => {
+    const builder = readFileSync(join(root, 'electron-builder.yml'), 'utf8');
+    const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
+    const readme = readFileSync(join(root, 'README.md'), 'utf8');
+    expect(builder).toMatch(/^productName:\s*FATHOM\s*$/m);
+    expect(builder).not.toMatch(/productName:\s*Agent Harness/);
+    expect(builder).toMatch(/executableName:\s*FATHOM/);
+    expect(builder).toMatch(/createStartMenuShortcut:\s*true/);
+    expect(builder).not.toMatch(/createStartMenuShortcut:\s*false/);
+    // true=安装向导勾选项（可选）；always 会变成必装桌面图标
+    expect(builder).toMatch(/createDesktopShortcut:\s*true/);
+    expect(builder).not.toMatch(/createDesktopShortcut:\s*always/);
+    expect(builder).toMatch(/shortcutName:\s*FATHOM/);
+    expect(builder).toMatch(/oneClick:\s*false/);
+    expect(builder).toMatch(/target:\s*nsis/);
+    expect(pkg.scripts['desktop:dist']).toContain('electron-builder --config electron-builder.yml');
+    expect(pkg.scripts['desktop:dist:unsigned']).toContain('electron-builder --config electron-builder.yml');
+    expect(readme).toMatch(/开始菜单/);
+    expect(readme).toContain('FATHOM');
+    expect(readme).not.toMatch(/现在没有开始菜单项/);
+    expect(readme).not.toMatch(/现在没有安装包、也没有开始菜单/);
+    const rootReadme = readFileSync(join(root, '..', 'README.md'), 'utf8');
+    expect(rootReadme).not.toMatch(/没有开始菜单项/);
+    expect(rootReadme).toMatch(/开始菜单/);
+    expect(rootReadme).toContain('FATHOM');
+    const lifecycle = readFileSync(join(root, '..', 'scripts', 'electron-nsis-lifecycle-smoke.mjs'), 'utf8');
+    const packSmoke = readFileSync(join(root, '..', 'scripts', 'electron-pack-smoke.mjs'), 'utf8');
+    const packaged = readFileSync(join(root, 'scripts', 'smoke-packaged-desktop.mjs'), 'utf8');
+    expect(lifecycle).toContain('FATHOM.exe');
+    expect(lifecycle).toContain('desktop:dist:unsigned');
+    expect(packSmoke).toContain('FATHOM.exe');
+    expect(packaged).toContain('FATHOM.exe');
   });
 
   it('一键启动接线：先探已有宿主再自拉起，退出必收进程树，attach 模式不杀别人的宿主', () => {

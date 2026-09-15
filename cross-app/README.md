@@ -7,7 +7,7 @@ Agent_Design 项目的跨端 App 外壳：把仓库 [`ui/public`](../ui/public) 
 默认 `http://127.0.0.1:4173`，能执行 bash、批准写文件，所以只绑本机）。
 App 外壳负责提供与 WebUI 完全一致的界面与交互，通过网络连接宿主。
 窗口标题由壳定为产品名 + 当前页，不跟宿主页的「FATHOM 控制台」口号走：首页 `FATHOM`，对话 `FATHOM · 对话`，以及 `FATHOM · 设置` / `指挥中心` / `产物` / `定时任务` / `消耗`。
-开发用 `npm run desktop`（没人先开 4173 时启动器会自拉起宿主）。**现在没有开始菜单项**，请用这条命令打开，不要假装已装进开始菜单。
+开发用 `npm run desktop`（没人先开 4173 时启动器会自拉起宿主）。Windows 安装包会在开始菜单放 **FATHOM**（桌面图标可选）；点快捷方式走同一套 launcher：本机没有宿主就自拉起，有就 attach。
 
 ## 为什么不是"文本编辑器"
 
@@ -58,7 +58,7 @@ npm run desktop
 ```
 
 开发入口就是这一条：没有宿主就自动拉起当前 `ui/serve.ts`（见上节顺序），有就直连。
-现在没有安装包、也没有开始菜单快捷方式——要打开桌面壳请用 `npm run desktop`。
+装好之后从开始菜单点 **FATHOM** 也是同一条路径（可选勾桌面图标）。要最新源码界面仍用 `npm run desktop`。
 要最新 Web UI，先确认 4173 上不是一台旧宿主。远程 Harness 渲染器启用
 context isolation 与 sandbox，不暴露 preload/Node 桥；只有本地打包的设置窗口拥有
 经过 sender 校验的窄 IPC。
@@ -96,7 +96,9 @@ Desktop 设置对自管宿主优先于启动环境和仓库 `.env`。连接 `AGE
 `AGENT_UI_WORKDIR` / `AGENT_UI_WORKDIRS` 配置仍会合并进这份白名单。连接外部
 `AGENT_UI_URL` 时，目录白名单归外部宿主管理，桌面 App 不会擅自修改。
 
-### 桌面打包
+### 桌面打包（开始菜单入口）
+
+Windows 走已有的 electron-builder NSIS 目标，不是另造安装器：
 
 ```bash
 npm run desktop:dist
@@ -106,8 +108,9 @@ npm run desktop:settings-smoke
 npm run desktop:smoke
 ```
 
-产物输出在 `dist-electron/`。Windows/macOS 的 `desktop:dist` 有签名门禁；
-`desktop:dist:unsigned` 只允许本地验证。
+产物在 `dist-electron/`（`FATHOM-<version>-<arch>-setup.exe`）。装完开始菜单出现 **FATHOM**；安装向导里可勾选桌面图标。点快捷方式即启动本壳：4173 已健康则 attach，否则自拉起打包进 `resources/harness` 的宿主。
+
+Windows/macOS 的 `desktop:dist` 有签名门禁；`desktop:dist:unsigned` 只允许本地验证，不得当发布物。仓库根的 `npm run e2e:electron-lifecycle -- --build` 会调用 `desktop:dist:unsigned` 做静默安装/升级/卸载（CI 的 `desktop-nsis-lifecycle`），不要在本机对用户系统跑一遍。
 
 ### 移动端构建（Android）
 

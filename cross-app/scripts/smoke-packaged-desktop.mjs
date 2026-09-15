@@ -1,10 +1,14 @@
 import { spawn } from 'node:child_process';
-import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import launcher from '../electron/host-launcher.cjs';
 
-const executable = path.resolve('dist-electron', 'win-unpacked', 'Agent Harness.exe');
+const unpackedDir = path.resolve('dist-electron', 'win-unpacked');
+const executable =
+  ['FATHOM.exe', 'Agent Harness.exe']
+    .map((name) => path.join(unpackedDir, name))
+    .find((candidate) => existsSync(candidate)) ?? path.join(unpackedDir, 'FATHOM.exe');
 const userData = mkdtempSync(path.join(tmpdir(), 'agent-harness-packaged-smoke-'));
 const port = await launcher.pickFreePort();
 const sentinel = `desktop-smoke-${process.pid}`;
