@@ -1135,6 +1135,11 @@ export class AgentLoop {
                 is_error: true,
               })),
             });
+            // 与无效 finish_task 共用 terminalCorrectionUsed：兼容端点无视
+            // tool_choice 时恰好再给 1 轮签字。再 bash / 再 end_turn 仍 incomplete。
+            if (terminalCorrectionUsed) return await finish(forcedFailureReason);
+            terminalCorrectionUsed = true;
+            turnCeiling = turn + 1;
             continue;
           }
 

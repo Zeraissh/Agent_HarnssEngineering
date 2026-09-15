@@ -874,15 +874,65 @@ describe("目标级闭环：共享预算 + 结构化完成门", () => {
       fakeMessage([textBlock("文字收尾 2")], "end_turn"),
       // 第三轮已被宿主限定为 finish_task；兼容端点故意无视 tool_choice。
       fakeMessage([toolUseBlock("ignored", "probe", {})], "tool_use"),
+      // 拒非终结工具后共用 terminalCorrectionUsed，恰好再 1 轮。
+      fakeMessage([toolUseBlock("ignored2", "probe", {})], "tool_use"),
       fakeMessage([textBlock("不应再请求")], "end_turn"),
     ]);
     const cfg = withTaskCompletion({ ...baseConfig, tools: [probe] }, { progressExtensionTurns: 0 });
     const { result } = await collect(new AgentLoop(cfg, model).run("任务"));
 
     expect(result.stopReason).toBe("incomplete");
-    expect(model.requests).toHaveLength(3);
+    expect(result.completion).toBeUndefined();
+    expect(model.requests).toHaveLength(4);
     expect(model.requests[2]!.toolChoice).toEqual({ type: "tool", name: FINISH_TASK_TOOL_NAME });
+    expect(model.requests[3]!.toolChoice).toEqual({ type: "tool", name: FINISH_TASK_TOOL_NAME });
     expect(probeCalls).toBe(0);
+  });
+
+  it("强制收口补一轮时合法 finish_task 可以 completed / partial", async () => {
+    const runWith = async (status: "completed" | "partial") => {
+      let probeCalls = 0;
+      const probe = makeTool({
+        name: "probe",
+        execute: async () => {
+          probeCalls += 1;
+          return { content: "不应执行" };
+        },
+      });
+      const model = new FakeModelClient([
+        fakeMessage([textBlock("文字收尾 1")], "end_turn"),
+        fakeMessage([textBlock("文字收尾 2")], "end_turn"),
+        fakeMessage([toolUseBlock("ignored", "probe", {})], "tool_use"),
+        fakeMessage(
+          [
+            toolUseBlock("good", FINISH_TASK_TOOL_NAME, {
+              status,
+              summary: status === "completed" ? "补一轮后签字交付" : "写出了页面但仍缺收口",
+              artifacts: ["index.html"],
+              verification: ["index.html 已落盘"],
+              assumptions: [],
+              blockers: status === "partial" ? ["模型起初没签字"] : [],
+            }),
+          ],
+          "tool_use",
+        ),
+      ]);
+      const cfg = withTaskCompletion({ ...baseConfig, tools: [probe] }, { progressExtensionTurns: 0 });
+      const { result } = await collect(new AgentLoop(cfg, model).run("任务"));
+      return { result, requests: model.requests, probeCalls };
+    };
+
+    const completed = await runWith("completed");
+    expect(completed.result.stopReason).toBe("completed");
+    expect(completed.result.completion?.summary).toContain("签字");
+    expect(completed.requests).toHaveLength(4);
+    expect(completed.probeCalls).toBe(0);
+
+    const partial = await runWith("partial");
+    expect(partial.result.stopReason).toBe("partial");
+    expect(partial.result.completion?.blockers).toContain("模型起初没签字");
+    expect(partial.requests).toHaveLength(4);
+    expect(partial.probeCalls).toBe(0);
   });
 
   it("finish_task 入参无效时不许收尾：回 is_error 后给模型一次修正机会", async () => {

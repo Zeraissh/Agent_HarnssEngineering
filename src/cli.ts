@@ -1457,6 +1457,9 @@ async function main(): Promise<void> {
     model,
   });
   let streamingText = false;
+  const cliArtifactTools = new Set(["write_file", "write_pptx", "edit_file"]);
+  const pendingArtifactPaths = new Map<string, string>();
+  const writtenArtifactPaths = new Set<string>();
   const endStreamLine = () => {
     if (streamingText) {
       process.stdout.write("\n");
@@ -2214,6 +2217,11 @@ async function main(): Promise<void> {
       case "tool_call":
         endStreamLine();
         console.log(`${c.cyan("→ tool")} ${event.name} ${c.dim(JSON.stringify(event.input))}`);
+        if (cliArtifactTools.has(event.name) && event.input && typeof event.input === "object") {
+          const rec = event.input as Record<string, unknown>;
+          const path = String(rec.path ?? rec.file_path ?? "").trim();
+          if (path) pendingArtifactPaths.set(event.toolUseId, path);
+        }
         break;
       case "tool_prepared":
         endStreamLine();
@@ -2250,6 +2258,10 @@ async function main(): Promise<void> {
         const preview = head.length > 120 ? `${head.slice(0, 120)}…` : head;
         const tag = event.result.isError ? c.red("✗") : c.green("✓");
         console.log(`${tag} ${c.dim(`${event.durationMs}ms`)} ${preview}`);
+        if (!event.result.isError) {
+          const path = pendingArtifactPaths.get(event.toolUseId);
+          if (path) writtenArtifactPaths.add(path);
+        }
         break;
       }
       case "approval_request": {
@@ -2379,6 +2391,9 @@ async function main(): Promise<void> {
               `  末轮输出撞 max_tokens 被截断，已生成内容保留在结果中。若任务需要更长回复，提高 AGENT_MAX_TOKENS`,
             ),
           );
+        }
+        if (reason === "incomplete" && writtenArtifactPaths.size > 0) {
+          console.log(c.yellow(`  已写 ${writtenArtifactPaths.size} 个文件，未签字`));
         }
         if (event.result.completion) {
           const completion = event.result.completion;

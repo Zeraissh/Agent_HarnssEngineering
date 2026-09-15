@@ -81,13 +81,15 @@ describe("产物画廊 DOM", () => {
     document.body.innerHTML = "";
   });
 
-  it("空态：文件夹 + 「还没有产物」", async () => {
+  it("空态：文件夹 + 不和本场文件对着干", async () => {
     const { api, el } = bootDom();
     api.open();
     await new Promise((r) => setTimeout(r, 0));
     const empty = el.querySelector(".artifacts-empty");
     expect(empty.hidden).toBe(false);
-    expect(empty.textContent).toContain("还没有产物");
+    expect(empty.textContent).toContain("这里只列落地页和幻灯");
+    expect(empty.textContent).toContain("对话的产物条");
+    expect(empty.textContent).not.toContain("还没有产物");
     expect(empty.querySelector(".ph-folder")).not.toBeNull();
     expect(el.querySelector("#artifacts-new-btn")).not.toBeNull();
   });

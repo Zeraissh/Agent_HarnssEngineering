@@ -62,4 +62,22 @@ describe("listWorkspaceFiles", () => {
     const { files } = await listWorkspaceFiles(root, "../secret");
     expect(files).toEqual([]);
   });
+
+  it("带 q 时按文件名深搜，不把圈外和凭据列出来", async () => {
+    const root = await scratch();
+    await mkdir(join(root, "src", "nested"), { recursive: true });
+    await writeFile(join(root, "src", "nested", "app.js"), "x");
+    await writeFile(join(root, "hello.txt"), "x");
+    await mkdir(join(root, "node_modules", "pkg"), { recursive: true });
+    await writeFile(join(root, "node_modules", "pkg", "app.js"), "x");
+    await writeFile(join(root, ".env.app"), "SECRET=1");
+
+    const { files } = await listWorkspaceFiles(root, "app");
+    expect(files.map((f) => f.relative)).toEqual(["src/nested/app.js"]);
+    expect(files.some((f) => f.relative.includes("node_modules"))).toBe(false);
+    expect(files.some((f) => f.name.startsWith(".env"))).toBe(false);
+
+    const escaped = await listWorkspaceFiles(root, "../app");
+    expect(escaped.files).toEqual([]);
+  });
 });

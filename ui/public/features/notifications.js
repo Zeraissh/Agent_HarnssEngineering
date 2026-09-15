@@ -67,9 +67,13 @@ export function createNotificationStore() {
  *   - attention/预算耗尽：budget_exhausted
  *   - attention/运行错误：error
  * @param {string|null|undefined} stopReason
+ * @param {{kind?: string, tone?: string}|null|undefined} [face]
  * @returns {{ category:"finished"|"attention", kind:NotificationKind, tier:string, tone:"ok"|"warn"|"bad" }|null}
  */
-export function classifyRunEndForNotify(stopReason) {
+export function classifyRunEndForNotify(stopReason, face) {
+  if (stopReason === "incomplete" && face?.kind === "unsigned") {
+    return { category: "finished", kind: "run_end", tier: "未签字", tone: "warn" };
+  }
   switch (stopReason) {
     case "completed":
     case "max_tokens":
@@ -139,7 +143,8 @@ export function collapseDecisionItems(items) {
  *
  * @param {NotificationStore} store
  * @param {{ runId:string, runTitle:string, seq:number, source:string,
- *           event:Record<string,unknown>, now:number, runCreatedAt?:number|null }} input
+ *           event:Record<string,unknown>, now:number, runCreatedAt?:number|null,
+ *           face?: {kind?: string, tone?: string}|null }} input
  * @returns {{ store:NotificationStore, added:NotificationItem[] }}
  */
 export function applyRunEventToStore(store, input) {
@@ -245,7 +250,7 @@ export function applyRunEventToStore(store, input) {
       endedRunIds = [...endedRunIds, runId];
       items = dropPendingOfRun(items);
       const stopReason = event.mainStopReason != null ? String(event.mainStopReason) : null;
-      const cls = classifyRunEndForNotify(stopReason);
+      const cls = classifyRunEndForNotify(stopReason, input.face);
       const createdAt = Number.isFinite(Number(input.runCreatedAt)) ? Number(input.runCreatedAt) : null;
       const durationMs = createdAt !== null && at >= createdAt ? at - createdAt : null;
       pushFeed({
@@ -283,9 +288,10 @@ export function applyRunEventToStore(store, input) {
  * @param {NotificationStore} store
  * @param {RunListEntry[]} runs
  * @param {number} now
+ * @param {(run: RunListEntry) => {kind?: string, tone?: string}|null|undefined} [getFace]
  * @returns {{ store:NotificationStore, added:NotificationItem[] }}
  */
-export function syncRunsToStore(store, runs, now) {
+export function syncRunsToStore(store, runs, now, getFace) {
   /** @type {NotificationItem[]} */
   const added = [];
   let items = store.items;
@@ -302,7 +308,7 @@ export function syncRunsToStore(store, runs, now) {
       !endedRunIds.includes(run.runId)
     ) {
       endedRunIds = [...endedRunIds, run.runId];
-      const cls = classifyRunEndForNotify(run.stopReason ?? "completed");
+      const cls = classifyRunEndForNotify(run.stopReason ?? "completed", getFace?.(run) ?? null);
       const at = Number(run.finishedAt ?? now) || now;
       const createdAt = Number.isFinite(Number(run.createdAt)) ? Number(run.createdAt) : null;
       const item = {
@@ -869,13 +875,18 @@ export function initNotifications(host = {}, env = {}) {
       const runs = host.getRuns?.() ?? [];
       const createdAt = runs.find((r) => r.runId === runId)?.createdAt ?? null;
       const before = new Set(store.items.map((i) => i.id));
+      const event = sseEvent?.event ?? {};
+      const stopReason = event.type === "run_end" && event.mainStopReason != null
+        ? String(event.mainStopReason)
+        : null;
       const result = applyRunEventToStore(store, {
         runId, runTitle,
         seq: Number(sseEvent?.seq ?? 0),
         source: String(sseEvent?.source ?? "main"),
-        event: sseEvent?.event ?? {},
+        event,
         now: now(),
         runCreatedAt: createdAt,
+        face: host.getDeliveryFace?.(runId, stopReason) ?? null,
       });
       adoptStore(result.store);
       if (result.added.length === 0) {
@@ -889,7 +900,8 @@ export function initNotifications(host = {}, env = {}) {
     /** run 列表刷新后对账（生命周期流 / loadRuns 之后调用） */
     syncRuns() {
       const runs = host.getRuns?.() ?? [];
-      const result = syncRunsToStore(store, runs, now());
+      const result = syncRunsToStore(store, runs, now(), (run) =>
+        host.getDeliveryFace?.(run.runId, run.stopReason) ?? null);
       adoptStore(result.store);
       for (const item of result.added) maybeSystemNotify(item);
       render();

@@ -11,6 +11,7 @@
  *             全部已读、权限提示条、系统通知发送与降级
  */
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import { deliveryFace } from "../ui/public/app.js";
 import {
   MERGE_WINDOW_MS,
   MIN_NOTIFY_DURATION_MS,
@@ -68,6 +69,36 @@ describe("classifyRunEndForNotify 结果分档", () => {
   it("未知原因兜底进 finished，不抛错", () => {
     expect(classifyRunEndForNotify("something_new").category).toBe("finished");
     expect(classifyRunEndForNotify(null).category).toBe("finished");
+  });
+
+  it("有产物的 incomplete 不要进「未通过」红档（按 face）", () => {
+    const face = deliveryFace("incomplete", [{ path: "index.html" }]);
+    expect(classifyRunEndForNotify("incomplete", face)).toMatchObject({
+      category: "finished",
+      tone: "warn",
+    });
+    expect(classifyRunEndForNotify("incomplete", face).tier).not.toBe("未通过");
+    expect(classifyRunEndForNotify("incomplete")).toMatchObject({
+      category: "finished",
+      tier: "未通过",
+      tone: "bad",
+    });
+    expect(classifyRunEndForNotify("incomplete", deliveryFace("incomplete", []))).toMatchObject({
+      tier: "未通过",
+      tone: "bad",
+    });
+
+    const { store } = applyRunEventToStore(createNotificationStore(), {
+      runId: "r1",
+      runTitle: "落地页",
+      now: NOW,
+      seq: 20,
+      source: "main",
+      event: { type: "run_end", mainStopReason: "incomplete", at: NOW },
+      face,
+    });
+    expect(store.items[0].category).toBe("finished");
+    expect(store.items[0].label).not.toBe("未通过");
   });
 });
 

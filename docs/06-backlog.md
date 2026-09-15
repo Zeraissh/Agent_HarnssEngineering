@@ -2,12 +2,14 @@
 
 # 交接：从这里接着做（2026-09-14）
 
-**现在在干什么**：人格走查 UX 第一至四批 + CLI `--plan` 确认门已入库（第三批起 `162c6c4`）。评测档案结论不改。不要 revert 已合上的产品代码。
+**现在在干什么**：人格走查 UX 第一至五批 + 完成门分层 + CLI `--plan` 确认门已入库（第三批起 `162c6c4`；第四批 `88075b9`；第五批与完成门同一提交）。评测档案结论不改。不要 revert 已合上的产品代码。
 
 - 前端第一批：发送 / 「说要做什么…」；自动放行默认不勾、「默认先问」；新手卡「打一句话，回车」；批准卡「要新建或改 …」+「允许」「拒绝」；默认 Work 脸；独立核查在运行设置；停→「已停止」、完成→「运行已完成」、否决→「计划未获批准」；计划 / 助手
 - 前端第二批：`@` 当时还不弹旧对话（第三批起真列文件）；「引用会话」是按钮；「全部项目」默认勾上；勾选 vs 设为主说人话；空态「现在只能在这个窗口下指令」；GitHub 没连不给假开 PR；来源表 +「导出链接列表」；`consult · 查资料`；侧栏/指挥中心「今日 $」/「这次 $」；预览页内坞/浮层，不跳 `file://`；计划确认门可改标题/短说明
 - 前端第三批（已在 `162c6c4`）：计划门上点停止 = 「已停止」（不是否决）；否决按钮才是否决；停/否决后不再钉「批准并开跑」。`@` 列出圈禁内文件/目录，插入 `@path`；「引用会话」仍是旧对话。失败条（含 composer 以外）429/HTTP/领域包改成一句人话
 - 前端第四批：设计包失败遮罩 `[hidden]{display:none!important}` 或成功摘 DOM；starter `templates/design/webgl-object/`。浏览器标签首页 `FATHOM`、对话 `FATHOM · 对话`，不再写「FATHOM 控制台」。正文未到但有 `assistant_thinking` 时直播条「正在想…」；`thinking_delta` 不进时间线。`@` picker 可按文件名过滤浅列表
+- 前端第五批：`thinking_delta` 跟到直播条（「正在想…」+ 思考尾），仍不进 RunState；`GET /api/workspace/files?q=` 按文件名适度深搜；产物画廊空态改口，不再写「还没有产物」盖住本场文件
+- 完成门分层：没签字仍是 `incomplete`（空跑红）。有落盘产物走黄 face「页面已写出，模型没签字」，不把没签字改成 `partial` / 成功。兼容端点拒非终结工具与无效 `finish_task` 共用补一轮。`classifyStopReason("incomplete")` 仍是 bad
 - 服务端：Work 没点稿件芯片不再 409；出厂先问；`POST …/plan-approval` 的 `edits` 写入活计划再执行（只 title/description）。门上停止 → `aborted`，否决 → `plan_rejected`。429 正文「前面还有人在交，请等几秒。」
 - CLI：非 TTY 确认、`--yes` 横幅、`--resume-run` 停而不重开、`run --help`。`--plan`：TTY 出计划后 y/n（可改一行标题）；非 TTY 无 `--yes` 退出码 2「需要确认，请加 --yes」；帮助不再写「没有计划确认门」
 - 桌面：`npm run desktop`；窗框 `FATHOM` / `FATHOM · 对话`；没有开始菜单项
@@ -16,7 +18,7 @@
 
 ## 开放（只列现在还该动手的）
 
-1. **persona-ux 评测档案**（[`BACKLOG.md`](../eval/persona-ux/BACKLOG.md) 28 条结论不改）。一至四批可见行为见「已关闭」；**不要**再把用量首页、`@` 弹旧对话、预览跳 `file://`、计划门停止当否决、失败条甩 HTTP、浏览器「FATHOM 控制台」、CLI `--plan` 无确认门当活缺口。回走用原剧本，不要把 VERIFY 改成已修复。
+1. **persona-ux 评测档案**（[`BACKLOG.md`](../eval/persona-ux/BACKLOG.md) 28 条结论不改）。一至五批 + 完成门分层可见行为见「已关闭」；**不要**再把用量首页、`@` 弹旧对话、预览跳 `file://`、计划门停止当否决、失败条甩 HTTP、浏览器「FATHOM 控制台」、CLI `--plan` 无确认门、思考只写「正在想…」、`@` 只能浅列一层、产物画廊「还没有产物」、有页的 incomplete 红失败当活缺口。回走用原剧本，不要把 VERIFY 改成已修复。
 2. **`docs/08` 里仍标 `[~]` 的工程项**（SAFE-04/05/06、RUN-01 残余、OBS-02、E2E 签名包等）。与 UX 评测分开。**不要**从 2026-09-03 那段「下一刀：MEM-01 Phase B」开工——Phase B 已落地。
 3. **`docs/13-live-mu-backlog.md`**：共享宿主评测债 D1–D10 本波已标完成；对抗 U1 / U3–U6 已锁。不是「下一轮开案例 #9」。
 
@@ -36,6 +38,8 @@
 - 计划门 edits：批准体 `edits` 只写 title/description，写入活计划再执行。详见 [`_fix-notes-plan-edits.md`](../eval/persona-ux/_fix-notes-plan-edits.md)。
 - 前端第三批（`origin/main` `162c6c4`）：计划门停止 ≠ 否决（读屏「已停止」）；停/否决后不钉「批准并开跑」；`@` 圈内浅列文件插入 `@path`；失败条人话。详见 [`_fix-notes-web3.md`](../eval/persona-ux/_fix-notes-web3.md)。
 - 前端第四批：失败遮罩 `[hidden]{display:none!important}` / 摘 DOM；`templates/design/webgl-object/`；浏览器标签与桌面对齐；直播条「正在想…」；`@` 按文件名过滤。详见 [`_fix-notes-web4.md`](../eval/persona-ux/_fix-notes-web4.md)。
+- 前端第五批：思考增量跟直播条；`@` 按文件名检索工作目录（深度 4）；产物画廊空态不写「还没有产物」。详见 [`_fix-notes-web5.md`](../eval/persona-ux/_fix-notes-web5.md)。
+- 完成门分层：有产物的 `incomplete` 走黄 face，空跑仍红；loop 拒非终结工具补一轮。详见 [`_fix-notes-completion-face.md`](../eval/persona-ux/_fix-notes-completion-face.md)。
 - CLI `--plan` 确认门：TTY y/n（可改一行标题）；非 TTY 无 `--yes` 退出码 2。帮助不再写「没有计划确认门」。详见 [`_fix-notes-cli-plan-gate.md`](../eval/persona-ux/_fix-notes-cli-plan-gate.md)。
 - 桌面：窗框 `FATHOM` / `FATHOM · 对话`；`npm run desktop`；没有开始菜单项。详见 [`_fix-notes-desktop.md`](../eval/persona-ux/_fix-notes-desktop.md)。
 

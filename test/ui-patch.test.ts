@@ -1314,12 +1314,14 @@ describe("流式输出直接长在对话里", () => {
     expect(document.querySelector("details.chat-thinking--live")).toBeTruthy();
   });
 
-  it("thinking_delta 不进 RunState；正文 delta 为 0 时靠 liveThinking 让直播条让位", () => {
+  it("thinking_delta 不进 RunState；正文 delta 为 0 时直播条跟思考正文", () => {
     let s = runningState();
     s = reduceEvents(s, [sse(1, "main", "thinking_delta", { text: "hmm" })]);
     expect(s.timeline.map((e) => e.type)).not.toContain("thinking_delta");
     renderRunDetail(s, { activeTab: "loop", liveThinking: "hmm" });
-    expect((document.querySelector(".live-strip") as HTMLElement).hasAttribute("hidden")).toBe(true);
+    expect((document.querySelector(".live-strip") as HTMLElement).hasAttribute("hidden")).toBe(false);
+    expect(strip()).toContain("正在想");
+    expect(strip()).toContain("hmm");
     expect(document.querySelector("details.chat-thinking--live")?.textContent).toContain("hmm");
   });
 

@@ -297,8 +297,40 @@ export function classifyStopReason(stopReason) {
 }
 
 /**
+ * 交付呈现面。stopReason 仍是事实（没签字就是 incomplete）；
+ * 有落盘产物时不要把收尾条画成空跑红失败。
+ *
+ * @param {string|null|undefined} stopReason
+ * @param {Array<{path?: string}|string>|null|undefined} artifacts
+ * @returns {{kind:string, tone:"ok"|"warn"|"bad", label:string, hint:string|null, placeholder?:string}}
+ */
+export function deliveryFace(stopReason, artifacts) {
+  const list = Array.isArray(artifacts) ? artifacts : [];
+  const hasArtifacts = list.some((item) => {
+    if (typeof item === "string") return item.trim().length > 0;
+    return Boolean(item && String(item.path ?? "").trim());
+  });
+  if (stopReason === "incomplete" && hasArtifacts) {
+    return {
+      kind: "unsigned",
+      tone: "warn",
+      label: "页面已写出，模型没签字",
+      hint: "这一轮已经停了，产物在右侧",
+      placeholder: "接着改已有页面…",
+    };
+  }
+  const cls = classifyStopReason(stopReason);
+  return {
+    kind: stopReason == null ? "running" : String(stopReason),
+    tone: cls.tone,
+    label: cls.label,
+    hint: cls.hint,
+  };
+}
+
+/**
  * 读屏 / 通知用的收尾句：停就是停，完成就是完成，否决不是停止。
- * @param {{ stopReason?: string|null, status?: string, task?: string }|null|undefined} state
+ * @param {{ stopReason?: string|null, status?: string, task?: string, timeline?: any[] }|null|undefined} state
  */
 export function runEndAnnouncement(state) {
   const reason = state?.stopReason
@@ -309,9 +341,10 @@ export function runEndAnnouncement(state) {
   if (reason === "plan_rejected") return `计划未获批准${tail}`;
   if (reason === "plan_gate_expired") return `计划门未应答${tail}`;
   if (reason === "completed") return `运行已完成${tail}`;
-  const cls = classifyStopReason(reason);
-  if (cls.label === "运行中") return `运行已完成${tail}`;
-  return `${cls.label}${tail}`;
+  const artifacts = Array.isArray(state?.timeline) ? deriveArtifacts(state) : [];
+  const face = deliveryFace(reason, artifacts);
+  if (face.label === "运行中") return `运行已完成${tail}`;
+  return `${face.label}${tail}`;
 }
 
 /**
@@ -2221,12 +2254,14 @@ export function deriveSegments(state) {
  */
 export function deriveProgressFace(state, plan) {
   const items = Array.isArray(state.progressItems) ? state.progressItems : null;
+  const settled = state?.status === "done";
   return {
     items,
-    waiting: !items || items.length === 0,
+    waiting: settled ? false : (!items || items.length === 0),
     doneCount: items ? items.filter((i) => i.status === "done").length : 0,
     total: items ? items.length : 0,
     plan,
+    settled,
   };
 }
 
@@ -2359,7 +2394,7 @@ export function deriveLoopFace(state, harness) {
     maxTurns,
     ratio: maxTurns ? Math.min(turn / maxTurns, 1) : null,
     nearLimit: Boolean(maxTurns && turn / maxTurns >= 0.8),
-    stopReason: isRunning ? null : classifyStopReason(state.stopReason),
+    stopReason: isRunning ? null : deliveryFace(state.stopReason, deriveArtifacts(state)),
     chain,
     reworks: state.runEnd?.reworks ?? segments.filter((s) => s.role === "rework").length,
     retries: state.timeline.filter((e) => e.type === "api_retry"),
@@ -2768,9 +2803,10 @@ export function newRunPlaceholder(workdir, opts) {
  *   designMode?: boolean,        // 设计模式新建：placeholder 用稿名，不用文件夹名
  *   designTitle?: string|null,   // 当前样例 / 注册表标题
  *   planMode?: boolean,          // 新建勾了计划编排：核查勾改不了子任务核查
+ *   delivery?: {kind?: string, placeholder?: string, hint?: string}|null,
  * }} input
  */
-export function deriveComposerMode({ info, localStatus, submitting, error, stopping, workdir, draft, designMode, designTitle, planMode } = {}) {
+export function deriveComposerMode({ info, localStatus, submitting, error, stopping, workdir, draft, designMode, designTitle, planMode, delivery } = {}) {
   // runPlanned 成文仍走 runVerified。勾选只约束单轮对话，计划子任务默认仍核查。
   const planVerifiesSubtasks = Boolean(planMode) || (info?.mode === "plan" && info?.status === "running");
   const verifyLabelNew = planVerifiesSubtasks
@@ -2883,6 +2919,13 @@ export function deriveComposerMode({ info, localStatus, submitting, error, stopp
   if (info.canContinue) {
     // 追加轮的核查开关：缺省沿用该 run 上一轮的设置，可逐轮改（会话中心化）
     const verifyToggle = { enabled: true, defaultChecked: Boolean(info.verify), label: verifyLabelTurn };
+    const unsignedFollow = delivery?.kind === "unsigned";
+    const followPlaceholder = unsignedFollow
+      ? String(delivery.placeholder ?? "接着改已有页面…")
+      : "接着说…";
+    const unsignedNote = unsignedFollow
+      ? String(delivery.hint ?? "这一轮已经停了，产物在右侧")
+      : "";
     if (info.continuationMode === "same-run") {
       return {
         ...base,
@@ -2890,8 +2933,8 @@ export function deriveComposerMode({ info, localStatus, submitting, error, stopp
         kind: "append",
         buttonLabel: "继续对话",
         labelText: "追加指令",
-        placeholder: "接着说…",
-        note: "",
+        placeholder: followPlaceholder,
+        note: unsignedNote,
         canSubmit: true,
         optionsEnabled: true,
         verifyToggle,
@@ -2904,7 +2947,7 @@ export function deriveComposerMode({ info, localStatus, submitting, error, stopp
         kind: "append",
         buttonLabel: "继续对话",
         labelText: "追加指令",
-        placeholder: "接着说…",
+        placeholder: followPlaceholder,
         note: "计划还在确认门上。发送后回到门上批准，不会假装已经跑过子任务。",
         canSubmit: true,
         optionsEnabled: true,
@@ -2918,7 +2961,7 @@ export function deriveComposerMode({ info, localStatus, submitting, error, stopp
         kind: "append",
         buttonLabel: "继续对话",
         labelText: "追加指令",
-        placeholder: "接着说…",
+        placeholder: followPlaceholder,
         note: "没有可热续的检查点。发送会从任务正文重开一轮，不重放飞行中的工具。",
         canSubmit: true,
         optionsEnabled: true,
@@ -2932,8 +2975,8 @@ export function deriveComposerMode({ info, localStatus, submitting, error, stopp
         kind: "append",
         buttonLabel: "继续对话",
         labelText: "追加指令",
-        placeholder: "接着说…",
-        note: "",
+        placeholder: followPlaceholder,
+        note: unsignedNote,
         canSubmit: true,
         optionsEnabled: true,
         verifyToggle,
@@ -2945,8 +2988,8 @@ export function deriveComposerMode({ info, localStatus, submitting, error, stopp
       kind: "append",
       buttonLabel: "继续对话",
       labelText: "追加指令",
-      placeholder: "接着说…",
-      note: "",
+      placeholder: followPlaceholder,
+      note: unsignedNote,
       canSubmit: true,
       optionsEnabled: true,
       verifyToggle,
@@ -4909,8 +4952,8 @@ export function buildWorkspaceFilesUrl(workdir, query) {
 }
 
 /**
- * `@` 后缀 / 过滤框：在浅列结果上再按文件名筛一层。
- * 服务端已经按前缀浅列；这里允许包含匹配，不递归整树。
+ * `@` 后缀 / 过滤框：在已返回的结果上再按文件名筛一层。
+ * 服务端带 q= 时已按文件名深搜；这里是本地即时反馈，不是整棵 IDE 树。
  */
 export function filterWorkspaceFileEntries(files, query) {
   const list = Array.isArray(files) ? files : [];
@@ -6457,6 +6500,18 @@ function patchUnverifiedRail(parts, faces, callbacks = {}) {
  * assistant_text 都是已经发生完的。控制器在 turn_start / tool_call / done
  * 时清空缓冲，所以文本阶段一结束就自动让位给工具标签。
  */
+function paintLiveStripLabel(parts, label, flags = {}) {
+  const sig = signature([label, flags.stall ? "stall" : "", flags.cost ? "cost" : "", flags.think ? "think" : ""]);
+  if (parts.sig.live === sig) return;
+  parts.sig.live = sig;
+  setAttr(parts.liveStrip, "hidden", null);
+  setClass(parts.liveStrip, "live-strip--stall", Boolean(flags.stall));
+  setClass(parts.liveStrip, "live-strip--cost", Boolean(!flags.stall && flags.cost));
+  parts.liveStrip.innerHTML = '<span class="live-text thinking-shimmer"></span>';
+  setText(parts.liveStrip.querySelector(".live-text"), label);
+  if (flags.title) setAttr(parts.liveStrip, "title", flags.title);
+}
+
 function patchLiveStrip(parts, state, isRunning, liveText = "", liveThinking = "", harness = null) {
   if (!isRunning) {
     setAttr(parts.liveStrip, "hidden", "");
@@ -6468,16 +6523,17 @@ function patchLiveStrip(parts, state, isRunning, liveText = "", liveThinking = "
   const recent = [...state.timeline].reverse();
   const call = recent.find((e) => e.type === "tool_call");
   const text = recent.find((e) => e.type === "assistant_text");
-  // 优先级：正文 > 思考 > 工具 > 最后一句。思考排在工具之前是因为它是【此刻】
-  // 在发生的——委托方反馈的那段"只有一行流动对话"的空窗正是它
   /**
-   * **正文与思考已经在对话里逐字流了，这里不再重复**（V-16）。
-   * 直播条现在只说对话此刻说不出来的那几种：正在调哪个工具、以及还没开口的空窗。
-   * 两处同时滚同一段文字会让人不知道该看哪儿——那正是"过于难用"的一种。
+   * 正文已经在对话里逐字流，直播条让位（V-16）。
+   * 思考块默认折叠，thinking_delta 必须跟到这一条，否则人只看见「正在想…」。
    */
-  if (streaming || thinking) {
+  if (streaming) {
     setAttr(parts.liveStrip, "hidden", "");
     parts.sig.live = null;
+    return;
+  }
+  if (thinking) {
+    paintLiveStripLabel(parts, liveStripThinkingLabel(thinking), { think: true });
     return;
   }
   const results = new Set(
@@ -6503,17 +6559,11 @@ function patchLiveStrip(parts, state, isRunning, liveText = "", liveThinking = "
           ? String(text.text ?? "").slice(0, 80)
           : "等待模型响应…";
 
-  const sig = signature([label, spin ? "stall" : "", costWarn ? "cost" : ""]);
-  if (parts.sig.live === sig) return;
-  parts.sig.live = sig;
-  setAttr(parts.liveStrip, "hidden", null);
-  setClass(parts.liveStrip, "live-strip--stall", Boolean(spin));
-  setClass(parts.liveStrip, "live-strip--cost", Boolean(!spin && costWarn));
-  parts.liveStrip.innerHTML = '<span class="live-text thinking-shimmer"></span>';
-  setText(parts.liveStrip.querySelector(".live-text"), label);
-  if (spin?.detail || costWarn?.detail) {
-    setAttr(parts.liveStrip, "title", spin?.detail || costWarn?.detail || "");
-  }
+  paintLiveStripLabel(parts, label, {
+    stall: Boolean(spin),
+    cost: Boolean(!spin && costWarn),
+    title: spin?.detail || costWarn?.detail || "",
+  });
 }
 
 /**
@@ -6523,6 +6573,12 @@ function patchLiveStrip(parts, state, isRunning, liveText = "", liveThinking = "
 export function tailOf(s, n) {
   const flat = String(s ?? "").replace(/\s+/g, " ").trim();
   return flat.length <= n ? flat : `…${flat.slice(flat.length - n)}`;
+}
+
+/** 思考增量跟到直播条。对话里的 Thinking 默认折叠，正文才在对话里逐字流。 */
+export function liveStripThinkingLabel(thinking) {
+  const body = tailOf(thinking, 72);
+  return body ? `正在想… ${body}` : "正在想…";
 }
 
 function summarizeInput(input) {
@@ -7518,7 +7574,7 @@ function patchProgressPanel(parts, progress) {
   const itemSig = progress.items
     ? progress.items.map((i) => `${i.id}:${i.status}`).join(",")
     : "null";
-  const sig = signature([itemSig, planSig, progress.waiting]);
+  const sig = signature([itemSig, planSig, progress.waiting, progress.settled ? "settled" : ""]);
   if (parts.sig.progress === sig) return;
   parts.sig.progress = sig;
 
@@ -7534,7 +7590,7 @@ function patchProgressPanel(parts, progress) {
     html += '<ul class="progress-list" role="list">';
     for (const it of progress.items) {
       const done = it.status === "done";
-      const running = it.status === "running";
+      const running = !progress.settled && it.status === "running";
       const skipped = it.status === "skipped";
       const cls =
         "progress-item" +
@@ -7560,7 +7616,7 @@ function patchProgressPanel(parts, progress) {
     for (const n of p.nodes) {
       const done = n.status === "passed";
       const failed = n.status === "failed";
-      const running = n.status === "running";
+      const running = !progress.settled && n.status === "running";
       const skipped = n.status === "skipped";
       const cls =
         "progress-item" +
@@ -7675,7 +7731,7 @@ function patchOutcomeCard(parts, state, overview, faces, callbacks = {}) {
   }
   setAttr(parts.outcome, "hidden", null);
 
-  const cls = classifyStopReason(state.stopReason);
+  const cls = deliveryFace(state.stopReason, deriveArtifacts(state));
   const rework = loop.reworks > 0
     ? `<span class="outcome-note">返工 ${loop.reworks} 轮后${v.verdict && v.verdict.passed ? "通过" : "仍未过"}</span>`
     : "";
@@ -11038,7 +11094,7 @@ function renderOverviewTab(overview, state) {
 
   // 最终状态徽章（醒目）+ 补救提示（V-04）
   const isRunning = overview.finalStatus === "running";
-  const cls = classifyStopReason(isRunning ? null : state.stopReason);
+  const cls = isRunning ? classifyStopReason(null) : deliveryFace(state.stopReason, deriveArtifacts(state));
   const statusLabel = isRunning ? "运行中" : cls.label;
   const statusCls = isRunning ? "status--live" : toneClass(cls.tone);
   html += `<div class="overview-status">`;
@@ -11824,7 +11880,7 @@ export function renderEmptyState(_hasRuns, _opts = {}) {
     '<p class="empty-tagline">说要做什么，回车就发。</p>' +
     '<p class="empty-tagline-cn">稿件、纪要、问答都可以从这里开始。</p>' +
     '<p class="empty-window-note">现在只能在这个窗口下指令。</p>' +
-    '<p class="empty-cite-hint">输入 @ 可点名这个文件夹里的文件。旧对话用「引用会话」。</p>' +
+    '<p class="empty-cite-hint">输入 @ 可按文件名找这个文件夹里的文件。旧对话用「引用会话」。</p>' +
     '<span class="empty-depthline" aria-hidden="true"></span>' +
     "</div>";
 }

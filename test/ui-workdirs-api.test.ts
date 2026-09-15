@@ -424,6 +424,11 @@ describe("GET /api/workspace/files", () => {
     const q = await fetch(`${base}/api/workspace/files?workdir=${encodeURIComponent(hostWorkdir)}&q=hel`);
     expect(((await q.json()) as any).files.map((f: any) => f.relative)).toEqual(["hello.txt"]);
 
+    await mkdir(join(hostWorkdir, "src", "nested"), { recursive: true });
+    await writeFile(join(hostWorkdir, "src", "nested", "app.js"), "x");
+    const deep = await fetch(`${base}/api/workspace/files?workdir=${encodeURIComponent(hostWorkdir)}&q=app`);
+    expect(((await deep.json()) as any).files.map((f: any) => f.relative)).toEqual(["src/nested/app.js"]);
+
     const outside = await fetch(`${base}/api/workspace/files?workdir=${encodeURIComponent(join(hostWorkdir, ".."))}`);
     expect(outside.status).toBe(403);
   });

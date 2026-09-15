@@ -26,6 +26,10 @@ import {
   reduceEvent,
   reduceEvents,
   classifyStopReason,
+  deliveryFace,
+  deriveArtifacts,
+  deriveProgressFace,
+  deriveComposerMode,
   deriveContextUsage,
   markApprovalResolved,
   expirePendingApprovals,
@@ -654,7 +658,7 @@ describe("reduceEvent", () => {
     expect(appSrc).toContain("说要做什么，回车就发。");
     expect(appSrc).toContain("稿件、纪要、问答都可以从这里开始。");
     expect(appSrc).toContain("现在只能在这个窗口下指令。");
-    expect(appSrc).toContain("输入 @ 可点名这个文件夹里的文件。");
+    expect(appSrc).toContain("输入 @ 可按文件名找这个文件夹里的文件。");
     expect(appSrc).not.toContain("see every run to the bottom.");
     expect(appSrc).not.toContain("每一层都看得见。");
     expect(appSrc).not.toContain("尚无运行。提交一个任务开始。");
@@ -677,6 +681,7 @@ describe("reduceEvent", () => {
     expect(html).not.toContain("FATHOM 控制台");
     expect(html).toContain("applyDocumentTabTitle(");
     expect(html).toContain("filterWorkspaceFileEntries(");
+    expect(html).toContain("refetchWorkspaceFiles(");
     expect(html).toContain("cite-picker-filter");
     expect(html).toContain("fathom-plumb");
     expect(html).toContain("FATHOM<span class=\"fw-dot\">.</span>");
@@ -1148,6 +1153,63 @@ describe("v2 R1 · stopReason 六值分档 (V-04)", () => {
       }),
     ]);
     expect(s.error).toBe("上游端点 502");
+  });
+
+  it("deliveryFace：有产物的 incomplete 是 warn 且不是 ok；空跑仍是 bad", () => {
+    const unsigned = deliveryFace("incomplete", [{ path: "index.html" }]);
+    expect(unsigned.tone).toBe("warn");
+    expect(unsigned.tone).not.toBe("ok");
+    expect(unsigned.kind).toBe("unsigned");
+    expect(unsigned.label).toContain("没签字");
+    expect(unsigned.hint).toContain("产物在右侧");
+    expect(unsigned.placeholder).toBe("接着改已有页面…");
+
+    const empty = deliveryFace("incomplete", []);
+    expect(empty.tone).toBe("bad");
+    expect(empty.kind).not.toBe("unsigned");
+    expect(classifyStopReason("incomplete").tone).toBe("bad");
+    expect(classifyStopReason("incomplete").label).toBe(empty.label);
+  });
+
+  it("deliveryFace 不把没签字改写成成功，产物只当呈现证据", () => {
+    const face = deliveryFace("incomplete", deriveArtifacts({
+      timeline: [
+        { type: "tool_call", name: "write_file", toolUseId: "w1", seq: 1, input: { path: "index.html" } },
+        { type: "tool_result", toolUseId: "w1", seq: 2, resultIsError: false },
+      ],
+    }));
+    expect(face.kind).toBe("unsigned");
+    expect(face.tone).not.toBe("ok");
+    expect(deliveryFace("completed", [{ path: "index.html" }]).tone).toBe("ok");
+  });
+
+  it("status=done 后 Progress 不再像还在跑", () => {
+    let s = createInitialState("prog-done", "t", false);
+    s = reduceEvents(s, [
+      seqSse(0, "main", "progress", {
+        items: [
+          { id: "1", title: "写页面", status: "done" },
+          { id: "2", title: "收口", status: "running" },
+        ],
+      }),
+      seqSse(1, "main", "done", { stopReason: "incomplete", usage: null }),
+    ]);
+    const face = deriveProgressFace(s, null);
+    expect(s.status).toBe("done");
+    expect(face.waiting).toBe(false);
+    expect(face.settled).toBe(true);
+    expect(face.items?.some((i) => i.status === "running")).toBe(true);
+  });
+
+  it("unsigned 追问框用人话占位，不继续「接着说」", () => {
+    const delivery = deliveryFace("incomplete", [{ path: "index.html" }]);
+    const mode = deriveComposerMode({
+      info: { runId: "r1", status: "done", canContinue: true },
+      localStatus: "done",
+      delivery,
+    });
+    expect(mode.placeholder).toBe("接着改已有页面…");
+    expect(mode.note).toContain("产物在右侧");
   });
 });
 
@@ -3012,7 +3074,8 @@ describe("发送快捷键：Enter 发送（壳侧接线）", () => {
     expect(htmlSrc).not.toContain("Ctrl+Enter 发送");
     expect(appSrc).not.toContain("Ctrl+Enter 发送");
     expect(appSrc).toContain('COMPOSER_SEND_HINT = "Enter 发送，Shift+Enter 换行"');
-    expect(appSrc.match(/接着说…/g)?.length).toBeGreaterThanOrEqual(4);
+    expect(appSrc).toContain("接着说…");
+    expect(appSrc).toContain("接着改已有页面…");
     expect(paletteSrc).not.toContain("Ctrl / ⌘ + Enter");
     expect(paletteSrc).toMatch(/keys: "Enter", desc: "发送任务 \/ 追加指令/);
   });

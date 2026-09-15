@@ -19,6 +19,7 @@
 
 import { formatRelTime, classifyRunEndForNotify, collapseDecisionItems } from "./notifications.js";
 import { deriveSpendFace } from "./usage.js";
+import { deliveryFace, deriveArtifacts } from "../app.js";
 
 export { deriveSpendFace, formatThisRunSpend, todayUsageOf } from "./usage.js";
 
@@ -235,7 +236,9 @@ export function deriveBoardModel(input) {
       if (finishedAt === null) continue;
       if (sameLocalDay(finishedAt, nowMs)) doneToday++;
       if (nowMs - finishedAt > RECENT_WINDOW_MS) continue;
-      const cls = classifyRunEndForNotify(run.stopReason ?? null);
+      const state = getState(run.runId);
+      const face = deliveryFace(run.stopReason, state ? deriveArtifacts(state) : []);
+      const cls = classifyRunEndForNotify(run.stopReason ?? null, face);
       finished.push({
         runId: run.runId,
         title,

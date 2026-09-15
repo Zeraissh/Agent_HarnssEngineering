@@ -500,6 +500,8 @@ import {
   readSidebarCollapsed,
   writeSidebarCollapsed,
   deriveWrittenPaths,
+  deriveArtifacts,
+  deliveryFace,
   conversationChainIds,
   ancestorRunIds,
   filterRunsByStatus,
@@ -2161,9 +2163,10 @@ function syncComposer() {
   const welcomeWorkdir = workdirSelect?.value && workdirSelect.value !== WORKDIR_ADD_VALUE
     ? workdirSelect.value
     : null;
+  const selectedState = selectedRunId ? runStates.get(selectedRunId) : null;
   composerMode = deriveComposerMode({
     info: info ? { ...info, runId: selectedRunId } : null,
-    localStatus: selectedRunId ? runStates.get(selectedRunId)?.status ?? null : null,
+    localStatus: selectedState?.status ?? null,
     submitting,
     stopping: Boolean(selectedRunId && stoppingRuns.has(selectedRunId)),
     // 错误按 run 隔离：否则 run A 的 409 会原样挂在切过去的 run B 头上
@@ -2175,6 +2178,9 @@ function syncComposer() {
     designMode: workspaceFace === "office",
     designTitle: designComposerTitle(),
     planMode: planModeToggle?.checked === true,
+    delivery: selectedState
+      ? deliveryFace(info?.stopReason ?? selectedState.stopReason, deriveArtifacts(selectedState))
+      : null,
   });
   patchComposer(composerMode);
   paintPlanModeHint();
@@ -2812,6 +2818,16 @@ function applySseBatch(runId, queue) {
           // 横幅正挂着。close 不触发任何事件，不在这儿落它就会一直挂到下次切换。
           setConnectionState(runId, "live");
           announceStatus(runEndAnnouncement(next));
+          if (selectedRunId === runId) {
+            const arts = deriveArtifacts(next);
+            const face = deliveryFace(next.stopReason, arts);
+            if (face.kind === "unsigned" && !artifactCanvasApi?.isOpen()) {
+              const htmls = arts.filter((a) => /\.html?$/i.test(String(a.path ?? "")));
+              if (htmls.length > 0) {
+                openArtifactByPath(runId, htmls[htmls.length - 1].path);
+              }
+            }
+          }
           refreshTranscriptIfWatching(runId);
           // 不在看的那条跑完了 → 记一颗未读星（在看的那条不必提醒，你就在看）
           if (selectedRunId !== runId) unreadRuns.add(runId);
@@ -3452,6 +3468,7 @@ function paintCiteChips() {
 
 function hideCitePicker() {
   filePickerToken += 1;
+  window.clearTimeout(workspaceFilterTimer);
   workspacePickerFiles = [];
   const picker = document.getElementById("cite-picker");
   if (picker) {
@@ -3462,8 +3479,9 @@ function hideCitePicker() {
 }
 
 let filePickerToken = 0;
-/** 最近一次浅列，给过滤框本地再筛，不重打整树。 */
+/** 最近一次列结果。过滤框先本地再筛，防抖后再打服务端 q= 深搜。 */
 let workspacePickerFiles = [];
+let workspaceFilterTimer = 0;
 
 function bindWorkspacePickerFilter(picker, files, initial) {
   const filter = document.createElement("input");
@@ -3474,10 +3492,32 @@ function bindWorkspacePickerFilter(picker, files, initial) {
   filter.setAttribute("aria-label", "按文件名过滤");
   filter.addEventListener("keydown", (ev) => ev.stopPropagation());
   filter.addEventListener("input", () => {
-    renderWorkspaceFilePickerItems(picker, files, filter.value);
+    renderWorkspaceFilePickerItems(picker, workspacePickerFiles, filter.value);
+    window.clearTimeout(workspaceFilterTimer);
+    workspaceFilterTimer = window.setTimeout(() => {
+      void refetchWorkspaceFiles(filter.value);
+    }, 160);
   });
   picker.appendChild(filter);
   return filter;
+}
+
+async function refetchWorkspaceFiles(query) {
+  const picker = document.getElementById("cite-picker");
+  const wd = composerWorkdir();
+  if (!picker || picker.hidden || !wd) return;
+  const token = ++filePickerToken;
+  try {
+    const res = await fetch(buildWorkspaceFilesUrl(wd, query));
+    if (token !== filePickerToken) return;
+    if (!res.ok) return;
+    const body = await res.json().catch(() => null);
+    const files = Array.isArray(body?.files) ? body.files : [];
+    workspacePickerFiles = files;
+    renderWorkspaceFilePickerItems(picker, files, query);
+  } catch {
+    /* 保留上一页 */
+  }
 }
 
 function renderWorkspaceFilePickerItems(picker, files, filterText) {
@@ -4962,6 +5002,10 @@ import("./features/notifications.js").then((notifications) => {
     getRuns: () => runs,
     getRunTitle: (runId) =>
       runs.find((r) => r.runId === runId)?.task ?? runStates.get(runId)?.task ?? null,
+    getDeliveryFace: (runId, stopReason) => {
+      const state = runStates.get(runId);
+      return deliveryFace(stopReason ?? state?.stopReason, state ? deriveArtifacts(state) : []);
+    },
     onOpenConversation: (runId) => selectRun(runId),
     // 待决定类直达 action-dock：选中会话后让决定坞闪一下，视线落在该落的地方
     onRevealDock: (runId) => revealDecisionDock(runId),

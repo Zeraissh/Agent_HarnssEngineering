@@ -15,6 +15,9 @@ import { humanizeHttpFailure } from "./humanize-error.js";
 
 export const ARTIFACTS_HASH = "#/artifacts";
 
+/** 画廊只列落地页 / 幻灯，不和本场 txt 对着干。 */
+export const ARTIFACTS_EMPTY_COPY = "这里只列落地页和幻灯。本场写下的文件在对话的产物条里。";
+
 const KIND_ICON = {
   landing: "ph-browsers",
   spec: "ph-article",
@@ -148,7 +151,7 @@ export function initArtifactsView(host = {}, env = {}) {
 
   const EMPTY_HTML =
     '<div class="empty-icon" aria-hidden="true"><i class="ph ph-folder"></i></div>' +
-    "<p>还没有产物</p>";
+    `<p>${ARTIFACTS_EMPTY_COPY}</p>`;
   const emptyEl = doc.createElement("div");
   emptyEl.className = "artifacts-empty";
   emptyEl.hidden = true;
