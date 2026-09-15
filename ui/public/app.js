@@ -548,7 +548,8 @@ export function reduceEvent(state, sseEvent) {
   // text_delta / thinking_delta 不进 state——它们走 `event: delta` 命名通道、
   // 不占 seq、不进服务端事件缓冲（V-15），重连重放时根本不存在；进了 state
   // 就会打破"同批事件重放两次状态深相等"。逐字显示由控制器单独持有缓冲、
-  // 作为 renderRunDetail 的 liveText / liveThinking 入参喂进对话与直播条。
+  // 作为 renderRunDetail 的 liveText / liveThinking 入参喂进对话时间线与直播条。
+  // 思考正文跟在思考事件上（deriveLogEntries / 对话折叠块），不靠这条进正史。
   // 这条分支守的是"万一它混进了 durable 流也不改状态"。
   if (type === "text_delta" || type === "thinking_delta") return state;
 
@@ -3765,11 +3766,11 @@ export function deriveOverview(state) {
  * @param {RunState} state
  * @returns {LogEntry[]}
  */
-export function deriveLogEntries(state) {
+export function deriveLogEntries(state, live) {
   const all = [...state.timeline, ...state.verifierTimeline].sort(
     (a, b) => a.seq - b.seq,
   );
-  return all.map((e) => ({
+  const mapped = all.map((e) => ({
     ...e,
     // V-12：tool_result 事件本身不带 name（src/loop.ts:259-264），此前界面直接
     // 显示 `toolu_01AbC… 成功`。在派生层按 toolUseId 回填，渲染层不必知道这件事。
@@ -3778,6 +3779,34 @@ export function deriveLogEntries(state) {
       : {}),
     collapsed: defaultCollapsed(e),
   }));
+  return attachLiveThinkingToLog(mapped, state, live);
+}
+
+/**
+ * 把正在增长的思考正文贴到当前轮那条 `assistant_thinking` 上。
+ * live 缓冲不进 RunState（重放时不存在）；正文 `text` 一到就让位，只留终态。
+ */
+export function attachLiveThinkingToLog(entries, state, live) {
+  if (state?.status !== "running") return entries;
+  const thinking = String(live?.thinking ?? "").trim();
+  if (!thinking) return entries;
+  if (String(live?.text ?? "").trim()) return entries;
+  let followUp = Number.NEGATIVE_INFINITY;
+  for (const e of state.timeline ?? []) {
+    if (e.type === "user_message") followUp = e.seq;
+  }
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i];
+    if (e.type !== "assistant_thinking") continue;
+    if (!(e.seq > followUp)) continue;
+    const role = segmentRole(e.source);
+    if (role === "planner" || role === "verifier") continue;
+    if (e.redacted) continue;
+    const next = entries.slice();
+    next[i] = { ...e, text: thinking, live: true, collapsed: false };
+    return next;
+  }
+  return entries;
 }
 
 /**
@@ -5239,7 +5268,10 @@ export function renderRunDetail(state, callbacks) {
   if (!mainEl) return;
 
   const activeTab = normalizeTab(callbacks.activeTab);
-  const logEntries = callbacks.logEntries || deriveLogEntries(state);
+  const logEntries = callbacks.logEntries || deriveLogEntries(state, {
+    text: callbacks.liveText,
+    thinking: callbacks.liveThinking,
+  });
   const overview = deriveOverview(state);
   const harness = callbacks.harness ?? null;
 
@@ -7364,6 +7396,31 @@ function patchAgentOverlay(parts, state, callbacks, live = null) {
  *
  * @returns {boolean} 是否已就地更新完毕
  */
+function paintLiveThinkingSummary(details, text) {
+  const summary = details?.querySelector?.("summary");
+  if (!summary) return;
+  const body = String(text ?? "").trim();
+  let tail = summary.querySelector(".chat-thinking-live-tail");
+  let dots = summary.querySelector(".thinking-shimmer-dots");
+  if (body) {
+    if (dots) dots.remove();
+    if (!tail) {
+      tail = document.createElement("span");
+      tail.className = "chat-thinking-live-tail";
+      summary.appendChild(tail);
+    }
+    setText(tail, tailOf(body, 72));
+    return;
+  }
+  if (tail) tail.remove();
+  if (!dots) {
+    dots = document.createElement("span");
+    dots.className = "thinking-shimmer thinking-shimmer-dots";
+    dots.textContent = "...";
+    summary.appendChild(dots);
+  }
+}
+
 export function updateLiveNode(node, it) {
   const wantThinking = Boolean(String(it.thinking ?? "").trim()) || Boolean(it.waiting);
   const wantText = Boolean(String(it.text ?? "").trim());
@@ -7375,6 +7432,7 @@ export function updateLiveNode(node, it) {
   if (thinkEl) {
     const body = thinkEl.querySelector(".chat-live-thinking");
     if (body) body.innerHTML = renderMarkdown(it.thinking);
+    paintLiveThinkingSummary(thinkEl, it.thinking);
   }
   if (textEl) {
     const body = textEl.querySelector(".chat-live-text");
@@ -8423,12 +8481,17 @@ function patchLogPanel(container, logEntries, callbacks, state) {
         return node;
       },
       // 折叠状态是唯一会变的部分：重建内容但保留外层节点，
-      // 这样滚动锚点与 patchNodes 映射都不受影响
+      // 这样滚动锚点与 patchNodes 映射都不受影响。
+      // 直播思考除外：正文在同一条上增长，必须就地改 header/body，不能等折叠翻转。
       update: (node, e) => {
         const target = node.classList.contains("log-group")
           ? node.querySelector(".log-entry")
           : node;
         if (!target) return;
+        if (e.live && e.type === "assistant_thinking") {
+          updateLiveLogThinking(target, e);
+          return;
+        }
         const wasCollapsed = target.classList.contains("log-entry--collapsed");
         if (wasCollapsed === Boolean(e.collapsed)) return;
         const wrap = document.createElement("div");
@@ -10400,10 +10463,15 @@ function renderThinkingDetails(text, { open = false, live = false, redacted = fa
     live ? "chat-thinking--live" : "",
     redacted ? "chat-thinking--redacted" : "",
   ].filter(Boolean).join(" ");
+  const raw = String(text ?? "");
+  const tail = live ? tailOf(raw, 72) : "";
   const summary = live
-    ? `<span class="thinking-shimmer">Thinking</span><span class="thinking-shimmer thinking-shimmer-dots">...</span>`
+    ? `<span class="thinking-shimmer">Thinking</span>` +
+      (tail
+        ? `<span class="chat-thinking-live-tail">${esc(tail)}</span>`
+        : `<span class="thinking-shimmer thinking-shimmer-dots">...</span>`)
     : "Thought Process";
-  const body = redacted ? "（已省略）" : renderMarkdown(String(text ?? ""));
+  const body = redacted ? "（已省略）" : renderMarkdown(raw);
   const bodyCls = live ? "chat-body md chat-live-thinking" : "chat-body md";
   return (
     `<details class="${cls}"${open ? " open" : ""}>` +
@@ -11221,6 +11289,31 @@ function renderOverviewTab(overview, state) {
 // 不再有"把整份日志拼成一段 HTML"这一步（那正是 O(n²) 与滚动跳动的来源）。
 // 区块标题 "Agent 执行" 移到 patchTabContent 的骨架里（委托方 §12 文案不变）。
 
+function updateLiveLogThinking(target, e) {
+  const collapsed = Boolean(e.collapsed);
+  setClass(target, "log-entry--collapsed", collapsed);
+  setClass(target, "log-entry--live-thinking", true);
+  const action = target.querySelector(".log-entry-action");
+  if (action) setText(action, entryActionLabel(e));
+  const detail = target.querySelector(".log-entry-detail");
+  if (detail) setText(detail, tailOf(e.text, 60));
+  const expand = target.querySelector(".log-entry-expand");
+  if (expand) setText(expand, collapsed ? "▸" : "▾");
+  const header = target.querySelector(".log-entry-header");
+  if (header) header.setAttribute("aria-expanded", collapsed ? "false" : "true");
+  let body = target.querySelector(".log-thinking");
+  if (collapsed) {
+    if (body) body.remove();
+    return;
+  }
+  if (!body) {
+    body = document.createElement("div");
+    body.className = "log-entry-body log-thinking md";
+    target.appendChild(body);
+  }
+  body.innerHTML = renderMarkdown(e.text ?? "");
+}
+
 /** @returns {string} */
 function renderLogEntry(e) {
   const collapsed = e.collapsed;
@@ -11238,6 +11331,7 @@ function renderLogEntry(e) {
   if (e.type === "run_resumed") cls += " log-entry--warning";
   if (e.type === "compaction") cls += " log-entry--warning";
   if (e.type === "hook" && (e.outcome === "error" || e.outcome === "block")) cls += " log-entry--warning";
+  if (e.live && e.type === "assistant_thinking") cls += " log-entry--live-thinking";
   if (collapsed) cls += " log-entry--collapsed";
 
   // 折叠的工具调用也必须看得到路径入口：路径条独立于 body，避免用户为了打开
@@ -11486,6 +11580,7 @@ function entryActionLabel(e) {
     case "tool_result": return `${e.name ?? e.toolUseId ?? ""} ${e.resultIsError ? "失败" : "成功"}`;
     case "assistant_text": return "助手消息";
     case "assistant_thinking":
+      if (e.live) return `思考过程（${(e.text ?? "").length} 字 · 正在写）`;
       return e.redacted ? "思考过程（已加密）" : `思考过程（${(e.text ?? "").length} 字）`;
     case "approval_request": return `审批请求：${e.name ?? ""}`;
     case "api_retry": return `API 重试（第${e.attempt ?? "?"}次）`;
@@ -11571,6 +11666,8 @@ function entryDetail(e) {
       return truncate(e.resultContent ?? "", 60);
     case "assistant_text":
       return truncate(e.text ?? "", 80);
+    case "assistant_thinking":
+      return e.live ? tailOf(e.text, 60) : "";
     case "approval_request":
       return truncate(formatInput(e.input), 60);
     case "api_retry":

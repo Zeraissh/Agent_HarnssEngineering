@@ -260,6 +260,31 @@ describe("reduceEvent", () => {
     expect(state.timeline.map((e) => e.type)).not.toContain("thinking_delta");
   });
 
+  it("2c. 运行中 live 思考贴到已有 assistant_thinking；重放/正文到了不贴", () => {
+    let state = createInitialState("r2c", "task", false);
+    state = reduceEvent(state, { seq: 0, source: "main", event: { type: "turn_start", turn: 1 } });
+    state = reduceEvent(state, {
+      seq: 1,
+      source: "main",
+      event: { type: "assistant_thinking", turn: 1, text: "先读", redacted: false },
+    });
+    const live = deriveLogEntries(state, { thinking: "先读再写" }).find((e) => e.type === "assistant_thinking");
+    expect(live?.text).toBe("先读再写");
+    expect(live?.live).toBe(true);
+    expect(state.timeline.find((e) => e.type === "assistant_thinking")?.text).toBe("先读");
+
+    const yielded = deriveLogEntries(state, { thinking: "先读再写", text: "结论" })
+      .find((e) => e.type === "assistant_thinking");
+    expect(yielded?.text).toBe("先读");
+    expect(yielded?.live).toBeFalsy();
+
+    const done = { ...state, status: "done" };
+    const replay = deriveLogEntries(done, { thinking: "重放不该出现" })
+      .find((e) => e.type === "assistant_thinking");
+    expect(replay?.text).toBe("先读");
+    expect(replay?.live).toBeFalsy();
+  });
+
   // ---- AC3-3: verifier 事件归入核查面板 ----
   it("3. source=verifier 事件归入 verifierTimeline", () => {
     let state = createInitialState("r3", "verify task", true);

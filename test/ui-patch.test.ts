@@ -143,6 +143,7 @@ import {
   humanizeSubmitError,
   humanizeActionFailure,
   ROLE_PERSONA,
+  deriveLogEntries,
 } from "../ui/public/app.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -1415,6 +1416,88 @@ describe("流式输出直接长在对话里", () => {
     expect(document.querySelectorAll(".chat-item")[0]).toBe(first);
   });
 });
+
+describe("思考正文进对话时间线", () => {
+  function runningState() {
+    let s = createInitialState("run-think-tl", "思考进时间线", false);
+    return reduceEvents(s, [sse(0, "main", "turn_start", { turn: 1 })]);
+  }
+  const strip = () => document.querySelector(".live-strip .live-text")?.textContent ?? "";
+
+  it("thinking_delta 仍不进 RunState；增长正文出现在对话折叠块摘要里", () => {
+    let s = runningState();
+    s = reduceEvents(s, [sse(1, "main", "thinking_delta", { text: "先核对 CRC 位号" })]);
+    expect(s.timeline.map((e) => e.type)).not.toContain("thinking_delta");
+    renderRunDetail(s, { activeTab: "loop", liveThinking: "先核对 CRC 位号" });
+    const live = document.querySelector("details.chat-thinking--live") as HTMLDetailsElement;
+    expect(live, "对话时间线应当有一条正在跟流的 Thinking").toBeTruthy();
+    expect(live.open).toBe(false);
+    expect(live.querySelector(".chat-thinking-live-tail")?.textContent).toContain("CRC");
+    expect(live.querySelector(".chat-live-thinking")?.textContent).toContain("先核对 CRC 位号");
+    expect((document.querySelector(".live-strip") as HTMLElement).hasAttribute("hidden")).toBe(false);
+    expect(strip()).toContain("正在想");
+    expect(strip()).toContain("CRC");
+  });
+
+  it("已有 assistant_thinking 时，事件流那一行跟增长正文，不另造正史", () => {
+    let s = runningState();
+    s = reduceEvents(s, [
+      sse(1, "main", "assistant_thinking", { turn: 1, text: "先读", redacted: false }),
+    ]);
+    const before = s.timeline.length;
+    const logs = deriveLogEntries(s, { thinking: "先读，再对照手册" });
+    const think = logs.find((e) => e.type === "assistant_thinking");
+    expect(s.timeline).toHaveLength(before);
+    expect(think?.live).toBe(true);
+    expect(think?.collapsed).toBe(false);
+    expect(think?.text).toContain("再对照手册");
+    renderRunDetail(s, { activeTab: "loop", liveThinking: "先读，再对照手册" });
+    const row = [...document.querySelectorAll(".log-entries .log-entry")].find((r) =>
+      (r.textContent ?? "").includes("思考过程"),
+    );
+    expect(row, "事件流应当露出思考那一行").toBeTruthy();
+    expect(row?.classList.contains("log-entry--live-thinking")).toBe(true);
+    expect(row?.querySelector(".log-thinking")?.textContent).toContain("再对照手册");
+    expect(row?.querySelector(".log-entry-detail")?.textContent).toContain("手册");
+  });
+
+  it("重放没有 live 缓冲时只靠 assistant_thinking 终态，残留增量拉不回来", () => {
+    let s = runningState();
+    s = reduceEvents(s, [
+      sse(1, "main", "assistant_thinking", { turn: 1, text: "终态思考", redacted: false }),
+      sse(2, "main", "done", { stopReason: "completed", messageCount: 2, usage: {} }),
+      sse(3, "host", "run_end", { outcome: "completed" }),
+    ]);
+    const logs = deriveLogEntries(s, { thinking: "不该出现的增量" });
+    const think = logs.find((e) => e.type === "assistant_thinking");
+    expect(think?.text).toBe("终态思考");
+    expect(think?.live).toBeFalsy();
+    renderRunDetail(s, { activeTab: "loop", liveThinking: "不该出现的增量" });
+    expect(document.querySelector("details.chat-thinking--live")).toBeNull();
+    expect(document.body.textContent).toContain("终态思考");
+    expect(document.body.textContent).not.toContain("不该出现的增量");
+    const row = [...document.querySelectorAll(".log-entries .log-entry")].find((r) =>
+      (r.textContent ?? "").includes("思考过程"),
+    );
+    expect(row?.querySelector(".log-thinking")).toBeNull();
+    expect(row?.textContent).toContain("终态思考".length + " 字");
+  });
+
+  it("正文 text 到了思考条让位，事件流回到终态、不再跟增量", () => {
+    let s = runningState();
+    s = reduceEvents(s, [
+      sse(1, "main", "assistant_thinking", { turn: 1, text: "先读", redacted: false }),
+    ]);
+    const logs = deriveLogEntries(s, { thinking: "还在想", text: "结论如下" });
+    const think = logs.find((e) => e.type === "assistant_thinking");
+    expect(think?.text).toBe("先读");
+    expect(think?.live).toBeFalsy();
+    renderRunDetail(s, { activeTab: "loop", liveThinking: "还在想", liveText: "结论如下" });
+    expect((document.querySelector(".live-strip") as HTMLElement).hasAttribute("hidden")).toBe(true);
+    expect(document.querySelector(".chat-msg--live")?.textContent).toContain("结论如下");
+  });
+});
+
 describe("思考过程进事件流", () => {
   function withThinking(extra: Record<string, unknown>) {
     let s = createInitialState("run-t", "任务", false);
