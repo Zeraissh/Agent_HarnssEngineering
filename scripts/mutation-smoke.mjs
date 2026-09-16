@@ -149,7 +149,7 @@ const MUTANTS = [
   {
     id: "compact-tier2-skipped",
     file: "src/context.ts",
-    find: "    const needTier2 =\n      force || dropped === 0 || estimatedAfter >= this.contextTokenLimit * COMPACT_WATERMARK;",
+    find: "    const needTier2 =\n      force ||\n      (dropped === 0 && imagePass.degraded === 0) ||\n      estimatedAfter >= this.contextTokenLimit * COMPACT_WATERMARK;",
     replace:
       "    // MUTATION: tier 2 never runs — long assistant text / small results stay forever\n    const needTier2 = false as boolean;\n    void force; void estimatedAfter;",
     testFiles: ["test/compact-tier2.test.ts"],
