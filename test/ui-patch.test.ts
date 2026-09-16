@@ -4518,6 +4518,11 @@ describe("空态给的是能点的例子", () => {
     expect(gallery).not.toContain("修一处并跑通测试");
     expect(gallery).not.toContain("看看这个仓库");
     expect(OFFICE_STARTER_JOBS.map((j) => j.label)).toEqual(["做纪要", "做一页", "带出处问答"]);
+    const examples = [...document.querySelectorAll("[data-example]")];
+    const byPrompt = (re) => examples.find((el) => re.test(el.getAttribute("data-example") || ""));
+    expect(byPrompt(/短纪要/)?.hasAttribute("data-starter-design")).toBe(true);
+    expect(byPrompt(/做一页介绍/)?.hasAttribute("data-starter-design")).toBe(true);
+    expect(byPrompt(/每个要点都带来源/)?.hasAttribute("data-starter-design")).toBe(false);
     expect(document.querySelector(".empty-state--design")).toBeNull();
     expect(document.querySelector(".empty-tagline")?.textContent).toContain("说要做什么");
     expect(document.querySelector(".empty-window-note")?.textContent).toContain("现在只能在这个窗口下指令");

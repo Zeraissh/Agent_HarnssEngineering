@@ -61,9 +61,9 @@
       <span class="notifications-badge" id="notifications-badge" hidden>0</span>
     </button>
     <button type="button" class="home-spend" id="home-spend"
-      aria-label="花费：今日已用 0 次">
+      aria-label="本机今日花费（全部工作目录）还在加载">
       <i class="ph ph-currency-dollar" aria-hidden="true"></i>
-      <span data-spend-text>今日已用 0 次</span>
+      <span data-spend-text>本机花费</span>
     </button>
     <div class="theme-picker" id="theme-picker">
       <button type="button" class="theme-toggle icon-btn" id="theme-toggle"
@@ -541,6 +541,7 @@ import {
   composerSubmitPlan,
   suggestPlainModeInsteadOfPlan,
   buildNewRunRequest,
+  wantsDesignPipeline,
   buildFollowUpRequest,
   mergeForkedFollowUp,
   askRewindChoice,
@@ -1044,6 +1045,7 @@ function syncScrollNav() {
     const btn = e.target.closest?.("[data-example]");
     if (!btn) return;
     applyDesignTemplate(null);
+    officeDesignChip = btn.hasAttribute("data-starter-design");
     taskInput.value = btn.getAttribute("data-example");
     taskInput.focus();
     // 光标放到末尾，人可以直接接着改
@@ -1112,6 +1114,8 @@ let selectedDesignId = /** @type {string|null} */ (null);
 let selectedDesignSample = /** @type {string|null} */ (null);
 let selectedDesignLook = /** @type {string|null} */ (null);
 let selectedDesignFilePack = /** @type {string|null} */ (null);
+/** Work 空态点了「做一页 / 做纪要」才进稿件管线；普通人话不带 facade=design */
+let officeDesignChip = false;
 let designRouteHint = /** @type {string|null} */ (null);
 let designCatalog = [];
 let designFilePacks = [];
@@ -1322,7 +1326,7 @@ function applyWorkspaceFace(next, { persist = true, refresh = true } = {}) {
     refreshRunListView();
     syncComposer();
   }
-  void fileTreeApi?.reload?.();
+  syncFileTreeToComposer();
 }
 
 function paintEmptyState() {
@@ -1758,10 +1762,11 @@ function paintSpendSurfaces() {
 async function refreshUsageSpend() {
   try {
     usageReportCache = parseUsageReport(await fetchUsageReport());
+    paintSpendSurfaces();
   } catch {
-    usageReportCache = parseUsageReport(null);
+    // 断线时保留上次读数，不要闪「今日还没花费」
+    if (usageReportCache == null) paintSpendSurfaces();
   }
-  paintSpendSurfaces();
 }
 
 /** 进入消耗视图：走 hash，浏览器前进/后退天然可用。侧栏入口已收进设置。 */
@@ -3386,6 +3391,7 @@ function applyDraftsWorkdirSelection(draftsPath, list) {
   void refreshGateChip();
   void refreshCiteCandidates();
   syncComposer();
+  syncFileTreeToComposer();
   announceStatus("设计稿写到独立目录");
   hideDesignDraftsHint();
 }
@@ -3419,6 +3425,7 @@ async function ensureDesignDraftsWorkdir() {
       renderWorkdirOptions(workdirSelect, list, { selected: keep });
       applyWorkdirSelection(workdirSelect, list, { primary: keep, extras });
       workdirComboboxApi?.paint();
+      syncFileTreeToComposer();
     }
     if (body.reason === "host-repo") {
       showDesignDraftsHint(body.workdir);
@@ -3427,8 +3434,24 @@ async function ensureDesignDraftsWorkdir() {
 }
 
 function composerWorkdir() {
-  if (!workdirSelect || workdirSelect.value === WORKDIR_ADD_VALUE) return "";
-  return workdirSelect.value || "";
+  if (workdirSelect && workdirSelect.value && workdirSelect.value !== WORKDIR_ADD_VALUE) {
+    return getWorkdirSelection(workdirSelect).primary || workdirSelect.value;
+  }
+  const pref = readPrefString(PREF_WORKDIR, "");
+  if (pref) return pref;
+  const list = harnessSnapshot?.availableWorkdirs ?? [];
+  if (!list.length) return "";
+  return pickWelcomeWorkdir({
+    visible: workdirListForFace(list),
+    keep: "",
+    snapWorkdir: harnessSnapshot?.workdir,
+    hostWorkdirIsHarness: Boolean(harnessSnapshot?.designMode?.hostWorkdirIsHarness),
+    hasPref: false,
+  }) || "";
+}
+
+function syncFileTreeToComposer() {
+  void fileTreeApi?.reload?.();
 }
 
 async function refreshGateChip() {
@@ -3704,7 +3727,14 @@ async function submitNewRun({ text: task }) {
   newRunError = null;
   syncComposer();
   try {
-    if (workspaceFace === "office") {
+    const useDesign = wantsDesignPipeline({
+      designId: selectedDesignId,
+      designTemplate: selectedDesignTemplate,
+      designSample: selectedDesignSample,
+      designFilePack: selectedDesignFilePack,
+      officeDesignChip,
+    });
+    if (useDesign) {
       await ensureDesignDraftsWorkdir();
     }
     const verify = verifyToggle.checked;
@@ -3718,7 +3748,7 @@ async function submitNewRun({ text: task }) {
         effort: effortSelect?.value,
         rubric: rubricInput?.value,
         workspace: workspaceFace,
-        mode: workspaceFace === "office" ? "design" : "single",
+        mode: useDesign ? "design" : "single",
         designId: selectedDesignId || undefined,
         designTab: selectedDesignTab || undefined,
         designTemplate: selectedDesignTemplate || undefined,
@@ -3771,6 +3801,7 @@ async function submitNewRun({ text: task }) {
     selectedDesignId = null;
     selectedDesignSample = null;
     selectedDesignFilePack = null;
+    officeDesignChip = false;
     designRouteHint = null;
     paintDesignTemplateChip();
     if (pendingTemplate) {
@@ -3801,7 +3832,7 @@ async function submitNewRun({ text: task }) {
       workspace: workspaceFace,
       ...(submittedWorkdir ? { workdir: submittedWorkdir } : {}),
       ...(submittedProjectId ? { projectId: submittedProjectId } : {}),
-      ...(workspaceFace === "office" ? { packName: "design", mode: "design" } : {}),
+      ...(useDesign ? { packName: "design", mode: "design" } : {}),
     });
     selectedRunId = runId;
     activeTabs.set(runId, "loop");
@@ -4092,6 +4123,7 @@ function populateKnobs(snap) {
     workdirSelect.dataset.fixed = "false";
     workdirComboboxApi?.paint();
     void workspaceGitChipApi?.refresh();
+    syncFileTreeToComposer();
   }
 
   if (Array.isArray(snap.availableProjects)) {
@@ -4282,6 +4314,7 @@ function paintWorkdirsForFace(all) {
     extras,
   });
   workdirComboboxApi?.paint();
+  syncFileTreeToComposer();
 }
 
 function restoreWorkdirForFace(face) {
@@ -4298,6 +4331,7 @@ function restoreWorkdirForFace(face) {
   applyWorkdirSelection(workdirSelect, visible, { primary: next, extras });
   writePrefString(PREF_WORKDIR, next);
   workdirComboboxApi?.paint();
+  syncFileTreeToComposer();
 }
 
 function selectedComposerProject() {
@@ -4336,6 +4370,7 @@ function applyProjectMembership(project, opts = {}) {
   writePrefJson(PREF_WORKDIR_EXTRAS, extras);
   workdirComboboxApi?.paint();
   void workspaceGitChipApi?.refresh();
+  syncFileTreeToComposer();
 }
 
 function renderProjectOptions(selected) {
@@ -4817,7 +4852,7 @@ if (workdirSelect) {
           void workspaceGitChipApi?.refresh();
           void refreshGateChip();
           void refreshCiteCandidates();
-          void fileTreeApi?.reload?.();
+          syncFileTreeToComposer();
           selectedCiteIds = [];
           paintCiteChips();
           hideCitePicker();
@@ -4862,7 +4897,7 @@ try {
       onCite: (path, kind) => insertWorkspaceFileMention(path, kind),
       onAnnounce: (msg) => announceStatus(msg),
     });
-    void fileTreeApi?.reload?.();
+    syncFileTreeToComposer();
   }
 } catch { /* 文件树是增强项，初始化失败静默降级 */ }
 

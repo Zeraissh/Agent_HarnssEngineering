@@ -74,6 +74,9 @@ export const SETTINGS_SECTIONS = [
 
 export const MODELS_API_URL = "/api/models";
 export const MODELS_TEST_API_URL = "/api/models/test";
+export const VENDORS_API_URL = "/api/vendors";
+export const PRICING_API_URL = "/api/pricing";
+export const PRICING_REFRESH_API_URL = "/api/pricing/refresh";
 export const PACKS_API_URL = "/api/packs";
 export const MCP_API_URL = "/api/mcp";
 export const MCP_INSTALL_API_URL = "/api/mcp/install";
@@ -337,8 +340,8 @@ export const MODEL_PROVIDER_CHOICES = [
 
 /** model 输入框的 datalist 建议——只是提示，不拦任何合法输入。 */
 export const MODEL_NAME_SUGGESTIONS = {
-  anthropic: ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"],
-  openai: ["deepseek-v4-flash", "deepseek-v4-pro", "kimi-k2-thinking", "moonshot-v1-8k-vision-preview"],
+  anthropic: ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5", "kimi-k3", "deepseek-v4-flash"],
+  openai: ["gpt-4.1", "gpt-4.1-mini", "gpt-4o-mini", "deepseek-v4-flash", "deepseek-v4-pro"],
 };
 
 /**
@@ -384,6 +387,35 @@ export function parseModelsPayload(raw) {
     roles[key] = typeof id === "string" && seen.has(id) ? id : null;
   }
   return { models, roles, source: raw.source === "store" ? "store" : "env" };
+}
+
+/** GET /api/vendors：形状不对给空数组，不炸设置页。 */
+export function parseVendorsPayload(raw) {
+  const list = raw && typeof raw === "object" && Array.isArray(raw.vendors) ? raw.vendors : [];
+  return list.filter((v) => v && typeof v === "object" && typeof v.id === "string").map((v) => ({
+    id: v.id,
+    label: typeof v.label === "string" ? v.label : v.id,
+    hint: typeof v.hint === "string" ? v.hint : "",
+    provider: v.provider === "openai" ? "openai" : "anthropic",
+    baseUrl: typeof v.baseUrl === "string" ? v.baseUrl : "",
+    envKey: typeof v.envKey === "string" ? v.envKey : "",
+    connected: v.connected === true,
+    models: Array.isArray(v.models) ? v.models : [],
+  }));
+}
+
+/** GET /api/pricing：缺字段按未刷新处理。 */
+export function parsePricingPayload(raw) {
+  if (!raw || typeof raw !== "object") {
+    return { source: null, error: null, refreshedAt: null, override: false, entries: [] };
+  }
+  return {
+    source: typeof raw.source === "string" ? raw.source : null,
+    error: typeof raw.error === "string" ? raw.error : null,
+    refreshedAt: typeof raw.refreshedAt === "string" ? raw.refreshedAt : null,
+    override: raw.override === true,
+    entries: Array.isArray(raw.entries) ? raw.entries : [],
+  };
 }
 
 /** 客户端侧条目 id（服务端校验规则 [A-Za-z0-9:_-]{1,64}，冲突时服务端兜底重发）。 */
@@ -979,9 +1011,23 @@ export function initSettingsView(host = {}, env = {}) {
   const modelsNote = doc.createElement("p");
   modelsNote.className = "settings-card-note";
   modelsNote.textContent =
-    "模型库落在服务端工作目录的 .agent-models.json。添加、删除或改角色会立刻写盘；重启宿主仍在。" +
-    "切换执行模型后，新任务与下一轮对话立刻用新模型，并按该模型窗口能力重算水位；进行中的这一轮不受影响。";
+    "先选厂家、填一把 Key，该厂登记过的模型会写进库。花费按厂家端点计价，查不到的写「单价未登记」，绝不估成 $0。" +
+    "模型库落在服务端 .agent-models.json；Key 只存在本机，永不下发浏览器。";
   modelsSection.appendChild(modelsNote);
+
+  const vendorsHeading = doc.createElement("h4");
+  vendorsHeading.className = "settings-models-subhead";
+  vendorsHeading.textContent = "一键接入厂商";
+  modelsSection.appendChild(vendorsHeading);
+  const vendorsGrid = doc.createElement("div");
+  vendorsGrid.className = "settings-vendor-grid";
+  vendorsGrid.id = "settings-vendors";
+  modelsSection.appendChild(vendorsGrid);
+  const vendorsStatus = doc.createElement("p");
+  vendorsStatus.className = "settings-field-hint";
+  vendorsStatus.id = "settings-vendors-status";
+  vendorsStatus.setAttribute("role", "status");
+  modelsSection.appendChild(vendorsStatus);
 
   const modelsSource = doc.createElement("p");
   modelsSource.className = "settings-field-hint";
@@ -1402,6 +1448,146 @@ export function initSettingsView(host = {}, env = {}) {
       setModelsStatus("");
     } catch {
       setModelsStatus("模型配置加载失败——请检查服务端状态", true);
+    }
+  }
+
+  function setVendorsStatus(text, isError = false) {
+    vendorsStatus.textContent = text;
+    vendorsStatus.classList.toggle("settings-status--error", Boolean(isError && text));
+  }
+
+  function renderVendors(vendors) {
+    vendorsGrid.replaceChildren();
+    for (const vendor of vendors) {
+      const card = doc.createElement("article");
+      card.className = "settings-vendor-card";
+      card.dataset.vendorId = vendor.id;
+      const top = doc.createElement("div");
+      top.className = "settings-vendor-card-head";
+      const title = doc.createElement("strong");
+      title.textContent = vendor.label;
+      const badge = doc.createElement("span");
+      badge.className = vendor.connected ? "settings-badge settings-badge--ok" : "settings-badge";
+      badge.textContent = vendor.connected ? "已在库中" : "未接入";
+      top.appendChild(title);
+      top.appendChild(badge);
+      const hint = doc.createElement("p");
+      hint.className = "settings-vendor-card-desc";
+      hint.textContent = vendor.hint;
+      const modelsLine = doc.createElement("p");
+      modelsLine.className = "settings-field-hint";
+      modelsLine.textContent = vendor.models
+        .map((m) => `${m.label || m.model}${m.priced ? "" : "（未登记单价）"}`)
+        .join(" · ");
+      const keyInput = doc.createElement("input");
+      keyInput.type = "password";
+      keyInput.autocomplete = "off";
+      keyInput.className = "settings-vendor-key";
+      keyInput.id = `settings-vendor-key-${vendor.id}`;
+      keyInput.placeholder = vendor.connected ? "留空则保持已有 Key / 环境变量" : `粘贴 ${vendor.envKey} 或专用 Key`;
+      const enableBtn = doc.createElement("button");
+      enableBtn.type = "button";
+      enableBtn.className = "btn btn--primary";
+      enableBtn.dataset.vendorEnable = vendor.id;
+      enableBtn.textContent = vendor.connected ? "更新 Key 并同步模型" : "接入并写入模型库";
+      enableBtn.addEventListener("click", () => void enableVendor(vendor.id, keyInput));
+      card.appendChild(top);
+      card.appendChild(hint);
+      card.appendChild(modelsLine);
+      card.appendChild(keyInput);
+      card.appendChild(enableBtn);
+      vendorsGrid.appendChild(card);
+    }
+  }
+
+  async function loadVendors() {
+    if (!fetcher) return;
+    try {
+      const res = await fetcher(VENDORS_API_URL);
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        setVendorsStatus(humanizeHttpFailure(res.status, data?.error ?? "厂家列表没加载出来"), true);
+        return;
+      }
+      renderVendors(parseVendorsPayload(data));
+      setVendorsStatus("");
+    } catch {
+      setVendorsStatus("厂家列表加载失败", true);
+    }
+  }
+
+  async function enableVendor(vendorId, keyInput) {
+    if (!fetcher) return;
+    const apiKey = keyInput instanceof (win.HTMLInputElement ?? Object) ? keyInput.value : "";
+    setVendorsStatus("正在写入模型库…");
+    try {
+      const res = await fetcher(VENDORS_API_URL, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ vendorId, apiKey }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        setVendorsStatus(humanizeHttpFailure(res.status, data?.error ?? "接入没做成"), true);
+        return;
+      }
+      if (keyInput) keyInput.value = "";
+      const parsed = parseModelsPayload(data);
+      if (parsed) {
+        modelsState = parsed;
+        pendingApiKeys.clear();
+        modelsDirty = false;
+        resetModelForm();
+        renderModelsAll();
+      }
+      renderVendors(parseVendorsPayload(data));
+      const added = Number(data?.added) || 0;
+      const updated = Number(data?.updated) || 0;
+      setVendorsStatus(`已接入：新增 ${added}、更新 ${updated}。Key 只在服务端。`);
+      setModelsStatus("厂家模型已写入 .agent-models.json——到「角色分配」选执行者即可");
+      host.onAnnounce?.("厂家已接入");
+      host.onModelsSaved?.();
+    } catch {
+      setVendorsStatus("接入请求未能发出", true);
+    }
+  }
+
+  function renderPricing(payload) {
+    const parsed = parsePricingPayload(payload);
+    if (parsed.error) {
+      priceMeta.textContent = `单价表不可用：${parsed.error}。花费一律写未登记。`;
+    } else if (parsed.override) {
+      priceMeta.textContent = "当前用 AGENT_PRICE_TABLE 覆盖表（运维权威，刷新按钮会拒绝）。";
+    } else if (parsed.refreshedAt) {
+      priceMeta.textContent = `内置表 + 上次刷新 ${parsed.refreshedAt}。未列名的模型仍不估价。`;
+    } else {
+      priceMeta.textContent = "正在用内置官方单价。点刷新按厂家别名更新本机缓存。";
+    }
+    priceList.replaceChildren();
+    for (const row of parsed.entries) {
+      const li = doc.createElement("li");
+      const vendor = row.vendorLabel || row.vendor || "";
+      const inP = typeof row.inputPer1M === "number" ? `$${row.inputPer1M}` : "—";
+      const outP = typeof row.outputPer1M === "number" ? `$${row.outputPer1M}` : "—";
+      li.textContent = `${vendor ? `${vendor} · ` : ""}${row.model}  入 ${inP} / 出 ${outP} 每百万 token`;
+      priceList.appendChild(li);
+    }
+    priceRefreshBtn.disabled = parsed.override;
+  }
+
+  async function loadPricing() {
+    if (!fetcher) return;
+    try {
+      const res = await fetcher(PRICING_API_URL);
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        priceRefreshStatus.textContent = humanizeHttpFailure(res.status, "价表没加载出来");
+        return;
+      }
+      renderPricing(data);
+      priceRefreshStatus.textContent = "";
+    } catch {
+      priceRefreshStatus.textContent = "价表加载失败";
     }
   }
 
@@ -2018,8 +2204,53 @@ export function initSettingsView(host = {}, env = {}) {
   const usageLede = doc.createElement("p");
   usageLede.className = "settings-card-note";
   usageLede.id = "settings-usage-lede";
-  usageLede.textContent = "今日花费在侧栏和指挥中心。这里按模型下钻轮次，不是套餐余额。";
+  usageLede.textContent = "今日花费在侧栏和指挥中心。这里按模型下钻轮次，并列出本机正在用的单价表。";
   usageSection.appendChild(usageLede);
+
+  const priceBox = doc.createElement("div");
+  priceBox.className = "settings-price-box";
+  priceBox.id = "settings-pricing";
+  const priceMeta = doc.createElement("p");
+  priceMeta.className = "settings-field-hint";
+  priceMeta.id = "settings-pricing-meta";
+  const priceList = doc.createElement("ul");
+  priceList.className = "settings-price-list";
+  priceList.id = "settings-pricing-list";
+  const priceRefreshBtn = doc.createElement("button");
+  priceRefreshBtn.type = "button";
+  priceRefreshBtn.className = "btn btn--ghost";
+  priceRefreshBtn.id = "settings-pricing-refresh";
+  priceRefreshBtn.textContent = "刷新官方单价";
+  priceRefreshBtn.title = "按厂家别名拉 LiteLLM 编译表写入本机缓存；配了 AGENT_PRICE_TABLE 时拒绝";
+  const priceRefreshStatus = doc.createElement("p");
+  priceRefreshStatus.className = "settings-field-hint";
+  priceRefreshStatus.id = "settings-pricing-status";
+  priceRefreshStatus.setAttribute("role", "status");
+  priceBox.appendChild(priceMeta);
+  priceBox.appendChild(priceList);
+  priceBox.appendChild(priceRefreshBtn);
+  priceBox.appendChild(priceRefreshStatus);
+  usageSection.appendChild(priceBox);
+  priceRefreshBtn.addEventListener("click", async () => {
+    if (!fetcher) return;
+    priceRefreshBtn.disabled = true;
+    priceRefreshStatus.textContent = "正在拉价表…";
+    try {
+      const res = await fetcher(PRICING_REFRESH_API_URL, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        priceRefreshStatus.textContent = humanizeHttpFailure(res.status, data?.error ?? "刷新没做成");
+        return;
+      }
+      renderPricing(data);
+      const n = Array.isArray(data?.matched) ? data.matched.length : 0;
+      priceRefreshStatus.textContent = `已更新 ${n} 条具名别名。LiteLLM 没有的模型保持内置价。`;
+    } catch {
+      priceRefreshStatus.textContent = "刷新请求未能发出";
+    } finally {
+      priceRefreshBtn.disabled = false;
+    }
+  });
   /** @type {{ refresh: () => Promise<void> } | null} */
   let usagePanel = null;
   if (typeof host.fetchUsage === "function") {
@@ -2120,6 +2351,8 @@ export function initSettingsView(host = {}, env = {}) {
     renderAbout();
     // 模型库数据在服务端：每次打开都拉一次最新（外部可能刚 PUT 过）
     void loadModels();
+    void loadVendors();
+    void loadPricing();
     void loadPacks();
     void usagePanel?.refresh();
   }

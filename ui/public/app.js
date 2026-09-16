@@ -3225,8 +3225,9 @@ export function describePermissionStance(mode, switches) {
 
 /**
  * 新建运行的网络载荷。保持为纯函数，避免某个 UI 开关只在特定分支里“看起来接上”。
- * `askUser` 是执行方式，不是 plan 专属能力：single 任务遇到地点、环境或交付边界
- * 不明确时同样需要先问人。
+ * `askUser` 是执行方式，不是 plan 专属能力：计划也要能问，不能埋头拆完再动手。
+ * 题数由任务严不严、委托方有没有要求澄清决定（澄清门 + ask_user 描述），
+ * 不在载荷里把计划与提问互斥掉。计划门仍是签字位，提问卡仍是阻塞式。
  * `permissionMode` 只填没写明的旋钮；显式 planMode / planGate / autoApprove 优先。
  * 计划编排与自动放行是正交的——选了 plan 档不得把自动放行盖掉。
  */
@@ -3341,6 +3342,20 @@ export function buildNewRunRequest({
       : {}),
     workspace: workspaceFace,
   };
+}
+
+/**
+ * Work 脸普通人话不要进 facade=design。只有点了稿件芯片
+ * （做一页 / 做纪要 / 样例 / 模板 / 文件包）才走设计管线。
+ */
+export function wantsDesignPipeline({
+  designId,
+  designTemplate,
+  designSample,
+  designFilePack,
+  officeDesignChip,
+} = {}) {
+  return Boolean(designId || designTemplate || designSample || designFilePack || officeDesignChip);
 }
 
 /** 逐 run 预算控件的区间下限（与 src/context-window.ts MIN_CONTEXT_TOKEN_LIMIT 同值；宿主 400 是最终裁判） */
@@ -10148,12 +10163,11 @@ export function deriveArtifacts(state) {
 }
 
 /**
- * 本批事件里被写盘工具**成功**触碰的路径——产物画布「运行中自动刷新」的判据。
+ * 本批事件里被写盘工具**成功**触碰的路径——产物画布「运行中自动打开」的判据。
  *
- * tool_call 先记 toolUseId → path（含历史 timeline 里的调用：结果可能落在
- * 后面的批次），tool_result 成功（result.isError 不为真）才把路径计入。
- * 同时把本批 tool_call 的路径直接计入——结果还没到时先刷一次（顶多拿到旧
- * 内容），结果落地的那批再刷一次；防抖在画布侧，这里只如实上报。
+ * 只信成功的 tool_result。tool_call 先到、还在等批准或磁盘未落时不计——
+ * 否则会宣布「产物画布已打开」再报「读取失败」。历史 timeline 里的调用
+ * 用来给后到的 result 回填路径。
  *
  * @param {RunState|null|undefined} state 归约前的状态（历史 tool_call 在这里查）
  * @param {any[]} queue 本批 SSE 信封（{ event } 或裸事件都认）
@@ -10176,11 +10190,7 @@ export function deriveWrittenPaths(state, queue) {
     const e = item?.event ?? item;
     if (!e || typeof e !== "object") continue;
     collectCall(e);
-    if (e.type === "tool_call") {
-      // 结果未到的先计一次（见函数头注释）
-      const path = pathByCallId.get(String(e.toolUseId ?? ""));
-      if (path) written.add(path);
-    } else if (e.type === "tool_result" && e.toolUseId) {
+    if (e.type === "tool_result" && e.toolUseId) {
       const isError = Boolean(e.resultIsError ?? (e.result && typeof e.result === "object" ? e.result.isError : false));
       const path = pathByCallId.get(String(e.toolUseId));
       if (path && !isError) written.add(path);
@@ -11889,12 +11899,14 @@ export const OFFICE_STARTER_JOBS = [
     label: "做纪要",
     hint: "把材料收成可转发的短纪要",
     text: "根据当前工作目录里最近的材料，写一份短纪要：结论、待办、未决问题各一段。",
+    design: true,
   },
   {
     id: "page",
     label: "做一页",
     hint: "一页介绍，浏览器里预览",
     text: "做一页介绍：主题自拟，相对 CSS，不要外链。写完告诉我打开哪里预览。",
+    design: true,
   },
   {
     id: "sources",
@@ -12516,7 +12528,9 @@ export function renderStarterGallery(opts = {}) {
         renderJobTile({
           title: e.label,
           hint: e.hint,
-          attrs: `data-example="${esc(e.text)}"`,
+          attrs:
+            `data-example="${esc(e.text)}"` +
+            (e.design ? ` data-starter-design="1"` : ""),
         }),
       ),
       renderJobTile({
