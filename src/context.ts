@@ -464,8 +464,8 @@ export function formatCompactedImage(path: string, summary?: string): string {
   return `${head}\nsummary: ${clipLine(clipped, IMAGE_SUMMARY_MAX_CHARS)}`;
 }
 
-function isImageBlock(b: Anthropic.ContentBlockParam): b is Anthropic.ImageBlockParam {
-  return Boolean(b) && typeof b === "object" && b.type === "image";
+function isImageBlock(b: unknown): b is Anthropic.ImageBlockParam {
+  return Boolean(b) && typeof b === "object" && (b as { type?: unknown }).type === "image";
 }
 
 function normalizeImagePathKey(path: string): string {
