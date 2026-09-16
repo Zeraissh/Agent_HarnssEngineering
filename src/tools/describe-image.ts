@@ -39,13 +39,41 @@ const MEDIA_TYPES: Record<string, "image/jpeg" | "image/png" | "image/gif" | "im
  */
 const MAX_BYTES = 3_500_000;
 
+/**
+ * summary 档输出上限。类型 + 有无文字/报错/人物 + 一句话，百级即可。
+ * 工厂 `maxTokens` 是 full 档上限；summary 取二者较小，避免宿主把 full 预算套到摘要上。
+ */
+export const DESCRIBE_IMAGE_SUMMARY_MAX_TOKENS = 128;
+
+const DETAIL_VALUES = ["summary", "full"] as const;
+export type DescribeImageDetail = (typeof DETAIL_VALUES)[number];
+
+const SUMMARY_PROMPT =
+  "Give a short label only, not a full description. Report: (1) type — screenshot, photo, diagram, document, or other; (2) whether it has readable text, an error/warning, or people (yes/no each); (3) one sentence of what it shows. Do not transcribe text verbatim or describe pixels, contrast, or layout.";
+
+const FULL_PROMPT_DEFAULT =
+  "Describe this image in detail. Include any text that appears in it, verbatim.";
+
 export interface DescribeImageOptions {
   /** 视觉模型的客户端（宿主装配，与 verifier / planner 同一个机制） */
   client: ModelClient;
   /** 仅用于错误信息与审计，不参与请求构造 */
   modelName?: string;
-  /** 单次描述的输出上限 */
+  /** full 档单次描述的输出上限；summary 不走这个数 */
   maxTokens?: number;
+}
+
+function parseDetail(raw: unknown): DescribeImageDetail | { error: string } {
+  if (raw === undefined || raw === null) return "summary";
+  if (typeof raw !== "string") {
+    return { error: 'Invalid input: "detail" must be "summary" or "full".' };
+  }
+  const v = raw.trim().toLowerCase();
+  if (v === "") return "summary";
+  if (v === "summary" || v === "full") return v;
+  return {
+    error: `Invalid detail "${raw}". Use "summary" or "full". Start with summary; use full only for pixels, contrast, or layout.`,
+  };
 }
 
 /**
@@ -54,12 +82,12 @@ export interface DescribeImageOptions {
  * 不如让宿主在装配工具池时把依赖注进来——工具本来就是"值"。
  */
 export function createDescribeImageTool(opts: DescribeImageOptions): Tool {
-  const maxTokens = opts.maxTokens ?? 2048;
+  const fullMaxTokens = opts.maxTokens ?? 2048;
 
   return {
     name: "describe_image",
     description:
-      "Look at an image file and get a text description of it. Call this whenever you need to know what an image contains — screenshots, diagrams, photos, rendered output, scanned documents. You cannot see images yourself; this tool asks a vision-capable model and returns its answer as text. Supply a specific question to get a focused answer instead of a generic caption.",
+      "Look at an image file and return a text description. You cannot see images yourself; this tool asks a vision-capable model. Always start with detail=summary (the default): cheap short labels — type, whether it has text/errors/people, and one sentence. That is enough for \"what is this\" and counts as a successful describe_image for the image-delivery completion gate. Use detail=full only when the question is about pixels, contrast, or layout. Full is the existing detailed behavior (focused answer, or a detailed caption with verbatim text). Do not use full for a first look.",
     inputSchema: {
       type: "object",
       properties: {
@@ -70,7 +98,13 @@ export function createDescribeImageTool(opts: DescribeImageOptions): Tool {
         question: {
           type: "string",
           description:
-            "What you need to know about the image. Be specific — 'what error is shown in this screenshot' beats 'describe this'. Omit for a general description.",
+            "What you need to know about the image. Be specific — 'what error is shown in this screenshot' beats 'describe this'. Omit for a general description. With detail=summary the question is answered only at the short-label level.",
+        },
+        detail: {
+          type: "string",
+          enum: [...DETAIL_VALUES],
+          description:
+            'summary (default): short labels — type, text/error/people, one sentence. full: existing detailed behavior. Start with summary; use full only when the question is about pixels, contrast, or layout.',
         },
       },
       required: ["path"],
@@ -82,9 +116,17 @@ export function createDescribeImageTool(opts: DescribeImageOptions): Tool {
     approvalPolicy: { maxScope: "once" },
 
     async execute(input, ctx) {
-      const { path: p, question } = input as { path?: unknown; question?: unknown };
+      const { path: p, question, detail: rawDetail } = input as {
+        path?: unknown;
+        question?: unknown;
+        detail?: unknown;
+      };
       if (typeof p !== "string" || p.length === 0) {
         return { content: 'Invalid input: expected {"path": string}.', isError: true };
+      }
+      const detail = parseDetail(rawDetail);
+      if (typeof detail !== "string") {
+        return { content: detail.error, isError: true };
       }
 
       const ext = extname(p).toLowerCase();
@@ -117,10 +159,15 @@ export function createDescribeImageTool(opts: DescribeImageOptions): Tool {
       }
 
       const data = (await readFile(resolved)).toString("base64");
+      const asked = typeof question === "string" && question.trim() ? question.trim() : "";
       const prompt =
-        typeof question === "string" && question.trim()
-          ? question.trim()
-          : "Describe this image in detail. Include any text that appears in it, verbatim.";
+        detail === "summary"
+          ? asked
+            ? `${SUMMARY_PROMPT} The caller asked: ${asked} Answer only at this short-label level.`
+            : SUMMARY_PROMPT
+          : asked || FULL_PROMPT_DEFAULT;
+      const maxTokens =
+        detail === "summary" ? Math.min(DESCRIBE_IMAGE_SUMMARY_MAX_TOKENS, fullMaxTokens) : fullMaxTokens;
 
       const messages: Anthropic.MessageParam[] = [
         {

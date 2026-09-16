@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 import type Anthropic from "@anthropic-ai/sdk";
 import { COMPACT_LEDGER_MARKER, parseCompactLedgerText } from "../src/compact-ledger.js";
 import {
+  COMPACTED_IMAGE_MARKER,
   COMPACTED_TURNS_MARKER,
   DefaultContextManager,
+  formatCompactedImage,
   REACTIVE_PROTECT_RECENT,
   userMessageWithContext,
 } from "../src/context.js";
@@ -475,5 +477,241 @@ describe("diffRenderedRequests（缓存诊断）", () => {
     const d = diffRenderedRequests(a, b);
     expect(d.tier).toBe("messages");
     expect(d.index).toBe(0);
+  });
+});
+
+/**
+ * 图片懒加载 A'：compact 把保护窗外的 image 块换成路径+纪要。
+ * 变异锁：删 degrade 调用 →「窗外不再有 image」红；摘要扫描若丢掉 describe_image → 带 summary 的用例红。
+ */
+describe("保护窗外 image 块降级为纪要", () => {
+  const PIXEL = "iVBORw0KGgo".repeat(80);
+
+  function imageBlock(data = PIXEL): Anthropic.ImageBlockParam {
+    return { type: "image", source: { type: "base64", media_type: "image/png", data } };
+  }
+
+  function imageMsgs(blocks: Anthropic.ContentBlockParam[]): Anthropic.MessageParam {
+    return { role: "user", content: blocks };
+  }
+
+  function compactedImageTexts(messages: Anthropic.MessageParam[]): string[] {
+    const out: string[] = [];
+    for (const m of messages) {
+      if (typeof m.content === "string") {
+        if (m.content.startsWith(COMPACTED_IMAGE_MARKER)) out.push(m.content);
+        continue;
+      }
+      for (const b of m.content) {
+        if (b.type === "text" && b.text.includes(COMPACTED_IMAGE_MARKER)) out.push(b.text);
+        if (b.type === "tool_result" && Array.isArray(b.content)) {
+          for (const ib of b.content) {
+            if (ib.type === "text" && ib.text.includes(COMPACTED_IMAGE_MARKER)) out.push(ib.text);
+          }
+        }
+      }
+    }
+    return out;
+  }
+
+  function countImages(messages: Anthropic.MessageParam[], from = 0, to?: number): number {
+    const end = to ?? messages.length;
+    let n = 0;
+    for (let i = from; i < end; i++) {
+      const m = messages[i]!;
+      if (typeof m.content === "string") continue;
+      for (const b of m.content) {
+        if (b.type === "image") n += 1;
+        if (b.type === "tool_result" && Array.isArray(b.content)) {
+          n += b.content.filter((ib) => ib.type === "image").length;
+        }
+      }
+    }
+    return n;
+  }
+
+  it("formatCompactedImage：有摘要两行，无摘要只有 path 行", () => {
+    expect(formatCompactedImage("shots/hero.png", "红按钮白底卡片，无文字。")).toBe(
+      `${COMPACTED_IMAGE_MARKER} path=shots/hero.png\nsummary: 红按钮白底卡片，无文字。`,
+    );
+    expect(formatCompactedImage("shots/hero.png")).toBe(`${COMPACTED_IMAGE_MARKER} path=shots/hero.png`);
+  });
+
+  it("保护窗外的 image 换成带路径的短文本，窗内原图不动", () => {
+    const m = mgr(1000, 1);
+    m.noteUsage(usage(900));
+    const out = m.compact([
+      imageMsgs([{ type: "text", text: "[view_image] shots/old.png" }, imageBlock()]),
+      imageMsgs([{ type: "text", text: "[view_image] shots/recent.png" }, imageBlock("RECENTPIXEL")]),
+    ]);
+    expect(out.changed).toBe(true);
+    expect(countImages(out.messages, 0, out.messages.length - 1)).toBe(0);
+    expect(countImages([out.messages.at(-1)!])).toBe(1);
+    const texts = compactedImageTexts(out.messages);
+    expect(texts).toHaveLength(1);
+    expect(texts[0]).toBe(formatCompactedImage("shots/old.png"));
+    expect(JSON.stringify(out.messages)).not.toContain(PIXEL);
+    expect(JSON.stringify(out.messages)).toContain("RECENTPIXEL");
+  });
+
+  it("能扫到同路径 describe_image 的 tool_result 时带上最近一次摘要", () => {
+    const m = mgr(1000, 1);
+    m.noteUsage(usage(900));
+    const out = m.compact([
+      { role: "assistant", content: [toolUseBlock("tu_d1", "describe_image", { path: "shots/hero.png" })] },
+      {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "tu_d1", content: "旧摘要：风景图。" }],
+      },
+      { role: "assistant", content: [toolUseBlock("tu_d2", "describe_image", { path: "shots\\hero.png" })] },
+      {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "tu_d2", content: "红按钮白底卡片，无文字。" }],
+      },
+      imageMsgs([{ type: "text", text: "[view_image] shots/hero.png" }, imageBlock()]),
+      { role: "user", content: "latest" },
+    ]);
+    expect(out.changed).toBe(true);
+    expect(countImages(out.messages.slice(0, -1))).toBe(0);
+    expect(compactedImageTexts(out.messages)).toEqual([
+      formatCompactedImage("shots/hero.png", "红按钮白底卡片，无文字。"),
+    ]);
+  });
+
+  it("同路径既有 describe_image 又有 view_image 时优先 describe 摘要", () => {
+    const m = mgr(1000, 1);
+    m.noteUsage(usage(900));
+    const out = m.compact([
+      { role: "assistant", content: [toolUseBlock("tu_d", "describe_image", { path: "a.png" })] },
+      {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "tu_d", content: "一只猫蹲在篱笆上。" }],
+      },
+      { role: "assistant", content: [toolUseBlock("tu_v", "view_image", { path: "a.png" })] },
+      {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "tu_v", content: "Loaded a.png into this turn." }],
+      },
+      imageMsgs([{ type: "text", text: "[view_image] a.png" }, imageBlock()]),
+      { role: "user", content: "latest" },
+    ]);
+    expect(compactedImageTexts(out.messages)[0]).toBe(
+      formatCompactedImage("a.png", "一只猫蹲在篱笆上。"),
+    );
+  });
+
+  it("只有 view_image 回执时用它当摘要", () => {
+    const m = mgr(1000, 1);
+    m.noteUsage(usage(900));
+    const out = m.compact([
+      { role: "assistant", content: [toolUseBlock("tu_v", "view_image", { path: "board.png" })] },
+      {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "tu_v", content: "Loaded board.png. 原理图左上是 USB。" }],
+      },
+      imageMsgs([imageBlock()]),
+      { role: "user", content: "latest" },
+    ]);
+    expect(compactedImageTexts(out.messages)[0]).toBe(
+      formatCompactedImage("board.png", "Loaded board.png. 原理图左上是 USB。"),
+    );
+  });
+
+  it("扫不到摘要时只留路径；裸 image 且无邻近路径 → path=(unknown)", () => {
+    const m = mgr(1000, 1);
+    m.noteUsage(usage(900));
+    const withPath = m.compact([
+      imageMsgs([{ type: "text", text: "[view_image] shots/x.png" }, imageBlock()]),
+      { role: "user", content: "latest" },
+    ]);
+    expect(compactedImageTexts(withPath.messages)[0]).toBe(formatCompactedImage("shots/x.png"));
+    expect(compactedImageTexts(withPath.messages)[0]).not.toContain("summary:");
+
+    const unknown = m.compact([imageMsgs([imageBlock()]), { role: "user", content: "latest" }]);
+    expect(compactedImageTexts(unknown.messages)[0]).toBe(formatCompactedImage("(unknown)"));
+  });
+
+  it("tool_result 数组里的 image 按 tool_use.path 降级", () => {
+    const m = mgr(1000, 1);
+    m.noteUsage(usage(900));
+    const out = m.compact([
+      { role: "assistant", content: [toolUseBlock("tu_v", "view_image", { path: "wire.png" })] },
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "tu_v",
+            content: [imageBlock(), { type: "text", text: "Loaded wire.png" }],
+          },
+        ],
+      },
+      { role: "user", content: "latest" },
+    ]);
+    expect(countImages(out.messages)).toBe(0);
+    expect(compactedImageTexts(out.messages)[0]).toBe(
+      formatCompactedImage("wire.png", "Loaded wire.png"),
+    );
+  });
+
+  it("低于水位不降级；force 则忽略水位", () => {
+    const low = mgr(1000, 1);
+    low.noteUsage(usage(100));
+    const msgs: Anthropic.MessageParam[] = [
+      imageMsgs([{ type: "text", text: "[view_image] keep.png" }, imageBlock()]),
+      { role: "user", content: "mid" },
+      { role: "user", content: "latest" },
+    ];
+    const skipped = low.compact(msgs);
+    expect(skipped.changed).toBe(false);
+    expect(countImages(skipped.messages)).toBe(1);
+
+    // 反应式窗 = 2：三条里只有窗外那张被回收
+    const forced = low.compact(msgs, { force: true, protectRecent: REACTIVE_PROTECT_RECENT });
+    expect(forced.changed).toBe(true);
+    expect(countImages(forced.messages, 0, 1)).toBe(0);
+    expect(countImages(forced.messages, 1)).toBe(0);
+    expect(compactedImageTexts(forced.messages)[0]).toContain("path=keep.png");
+  });
+
+  it("幂等：已降级文本不再被改写，窗外不再出现 image 块", () => {
+    const m = mgr(1000, 1);
+    m.noteUsage(usage(900));
+    const first = m.compact([
+      imageMsgs([{ type: "text", text: "[view_image] shots/hero.png" }, imageBlock()]),
+      { role: "user", content: "latest" },
+    ]);
+    const before = compactedImageTexts(first.messages);
+    expect(before).toEqual([formatCompactedImage("shots/hero.png")]);
+    const second = m.compact(first.messages);
+    expect(second.droppedBlocks).toBe(0);
+    expect(compactedImageTexts(second.messages)).toEqual(before);
+    expect(countImages(second.messages)).toBe(0);
+  });
+
+  it("is_error 的 describe_image 不进摘要；长摘要被裁到上限", () => {
+    const m = mgr(1000, 1);
+    m.noteUsage(usage(900));
+    const long = `逐像素对照：${"色块 ".repeat(80)}结束`;
+    const out = m.compact([
+      { role: "assistant", content: [toolUseBlock("tu_e", "describe_image", { path: "big.png" })] },
+      {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "tu_e", is_error: true, content: "Image not found: big.png" }],
+      },
+      { role: "assistant", content: [toolUseBlock("tu_ok", "describe_image", { path: "big.png" })] },
+      {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "tu_ok", content: long }],
+      },
+      imageMsgs([{ type: "text", text: "path=big.png" }, imageBlock()]),
+      { role: "user", content: "latest" },
+    ]);
+    const text = compactedImageTexts(out.messages)[0]!;
+    expect(text).not.toContain("Image not found");
+    expect(text).toBe(formatCompactedImage("big.png", long));
+    const summary = text.split("\n").find((l) => l.startsWith("summary: "))!.slice("summary: ".length);
+    expect(summary.length).toBeLessThanOrEqual(200);
+    expect(summary.endsWith("…")).toBe(true);
   });
 });

@@ -11,7 +11,7 @@ import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type Anthropic from "@anthropic-ai/sdk";
-import { createDescribeImageTool } from "../src/tools/describe-image.js";
+import { createDescribeImageTool, DESCRIBE_IMAGE_SUMMARY_MAX_TOKENS } from "../src/tools/describe-image.js";
 import { toOpenAIMessages } from "../src/model-client-openai.js";
 
 /** 1×1 透明 PNG */
@@ -67,7 +67,7 @@ describe("describe_image", () => {
     const rec = recorder("屏幕上写着 Connection refused。");
     const tool = createDescribeImageTool({ client: rec.client, modelName: "kimi-vision" });
 
-    const out = await tool.execute({ path: "shot.png", question: "截图里报了什么错？" }, ctx());
+    const out = await tool.execute({ path: "shot.png", question: "截图里报了什么错？", detail: "full" }, ctx());
     expect(out.isError).toBeFalsy();
     expect(out.content).toBe("屏幕上写着 Connection refused。");
 
@@ -80,12 +80,13 @@ describe("describe_image", () => {
     expect(blocks.find((b: any) => b.type === "text").text).toBe("截图里报了什么错？");
   });
 
-  it("不给问题时用通用提示，并要求逐字带出图中文字", async () => {
+  it("detail=full 且不给问题时用通用提示，并要求逐字带出图中文字", async () => {
     const rec = recorder();
     const tool = createDescribeImageTool({ client: rec.client });
-    await tool.execute({ path: "shot.png" }, ctx());
+    await tool.execute({ path: "shot.png", detail: "full" }, ctx());
     const text = rec.seen[0].messages[0].content.find((b: any) => b.type === "text").text;
     expect(text).toContain("verbatim");
+    expect(rec.seen[0].maxTokens).toBe(2048);
   });
 
   /**
@@ -165,5 +166,96 @@ describe("describe_image", () => {
     const image = parts.find((p) => p.type === "image_url");
     expect(image, "compat 翻译把图丢了——视觉模型会收到一个没有图的请求").toBeDefined();
     expect(image.image_url.url).toBe(`data:image/png;base64,${PNG_B64}`);
+  });
+
+  it("schema 声明 detail=summary|full，缺省 summary", () => {
+    const tool = createDescribeImageTool({ client: recorder().client });
+    const detail = tool.inputSchema.properties.detail;
+    expect(detail).toBeDefined();
+    expect(detail.enum).toEqual(["summary", "full"]);
+    expect(detail.description).toMatch(/default/i);
+    expect(detail.description).toMatch(/summary/i);
+    expect(tool.inputSchema.required).toEqual(["path"]);
+  });
+
+  it("工具描述写死先 summary，只有像素/对比/排版才 full", () => {
+    const tool = createDescribeImageTool({ client: recorder().client });
+    expect(tool.description).toMatch(/detail=summary/i);
+    expect(tool.description).toMatch(/default/i);
+    expect(tool.description).toMatch(/pixel/i);
+    expect(tool.description).toMatch(/contrast/i);
+    expect(tool.description).toMatch(/layout/i);
+    expect(tool.description).toMatch(/detail=full/i);
+    expect(tool.description).toMatch(/Do not use full for a first look/i);
+  });
+
+  /**
+   * 缺省必须是便宜档：不传 detail、传 summary、空串，都走短标签提示，maxTokens 百级。
+   * 变异：若缺省仍用 2048 + verbatim 长描述，这条就红。
+   */
+  it("缺省 summary：短标签提示，maxTokens 压到百级，仍带着图", async () => {
+    const rec = recorder("screenshot · text · no people · 1×1 transparent PNG");
+    const tool = createDescribeImageTool({ client: rec.client });
+    const out = await tool.execute({ path: "shot.png" }, ctx());
+    expect(out.isError).toBeFalsy();
+    expect(out.content).toContain("screenshot");
+
+    const req = rec.seen[0];
+    expect(req.maxTokens).toBe(DESCRIBE_IMAGE_SUMMARY_MAX_TOKENS);
+    expect(req.maxTokens).toBeLessThanOrEqual(200);
+    const text = req.messages[0].content.find((b: any) => b.type === "text").text;
+    expect(text).toMatch(/type/i);
+    expect(text).toMatch(/text/i);
+    expect(text).toMatch(/error/i);
+    expect(text).toMatch(/people/i);
+    expect(text).toMatch(/one sentence/i);
+    expect(text).not.toMatch(/in detail/i);
+    expect(req.messages[0].content.find((b: any) => b.type === "image"), "summary 也必须真的送图").toBeDefined();
+  });
+
+  it("显式 detail=summary 与缺省同一条路；带 question 也只在短标签层回答", async () => {
+    const rec = recorder();
+    const tool = createDescribeImageTool({ client: rec.client, maxTokens: 4096 });
+    await tool.execute({ path: "shot.png", detail: "summary", question: "这是什么" }, ctx());
+    const req = rec.seen[0];
+    expect(req.maxTokens).toBe(DESCRIBE_IMAGE_SUMMARY_MAX_TOKENS);
+    const text = req.messages[0].content.find((b: any) => b.type === "text").text;
+    expect(text).toContain("这是什么");
+    expect(text).toMatch(/short-label/i);
+    expect(text).not.toBe("这是什么");
+  });
+
+  it("工厂 maxTokens 只约束 full；summary 不会被抬到 full 预算", async () => {
+    const rec = recorder();
+    const tool = createDescribeImageTool({ client: rec.client, maxTokens: 4096 });
+    await tool.execute({ path: "shot.png", detail: "full" }, ctx());
+    await tool.execute({ path: "shot.png", detail: "summary" }, ctx());
+    expect(rec.seen[0].maxTokens).toBe(4096);
+    expect(rec.seen[1].maxTokens).toBe(DESCRIBE_IMAGE_SUMMARY_MAX_TOKENS);
+  });
+
+  it("非法 detail 当场拒绝，不打视觉端点，错误写给模型看（P5）", async () => {
+    const rec = recorder();
+    const tool = createDescribeImageTool({ client: rec.client });
+    const out = await tool.execute({ path: "shot.png", detail: "pixels" }, ctx());
+    expect(out.isError).toBe(true);
+    expect(out.content).toMatch(/summary/i);
+    expect(out.content).toMatch(/full/i);
+    expect(rec.seen, "非法 detail 不该去烧视觉 token").toHaveLength(0);
+  });
+
+  /**
+   * 配图完成门认的是「成功调用过 describe_image」（!isError），不要求 full。
+   * 这条锁在工具层：缺省 summary 的成功回执不得被标成错误。
+   */
+  it("summary 成功也是成功调用：配图门不要求 full", async () => {
+    const rec = recorder("photo · no text · no error · no people · a red square");
+    const tool = createDescribeImageTool({ client: rec.client });
+    const omitted = await tool.execute({ path: "shot.png" }, ctx());
+    const explicit = await tool.execute({ path: "shot.png", detail: "summary" }, ctx());
+    expect(omitted.isError).toBeFalsy();
+    expect(explicit.isError).toBeFalsy();
+    expect(typeof omitted.content).toBe("string");
+    expect(omitted.content.length).toBeGreaterThan(0);
   });
 });

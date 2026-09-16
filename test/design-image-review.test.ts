@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { AgentLoop } from "../src/loop.js";
 import {
+  assembleViewImageTool,
   claimsDeliveredImages,
   nameSuggestsVision,
   normalizeImagePath,
@@ -143,9 +144,10 @@ describe("识图 backing：执行者能看就不引角色", () => {
     ["gpt-5", true],
     ["qwen-vl-max", true],
     ["deepseek-v4-flash-vision-exp", true],
+    ["deepseek-flash", true],
+    ["deepseek-v4-flash", true],
     ["moonshot-v1-8k-vision-preview", true],
     ["kimi-k2.6", false],
-    ["deepseek-v4-flash", false],
     ["deepseek-v4-pro", false],
     ["", false],
   ] as const)("%s → %s", (name, expected) => {
@@ -181,5 +183,10 @@ describe("识图 backing：执行者能看就不引角色", () => {
       executorSupportsVision: false,
       visionRoleConfigured: false,
     })).toBe("none");
+  });
+
+  it("view_image 只在执行者能看图时装配；文本执行者没有该工具", () => {
+    expect(assembleViewImageTool({ executorSupportsVision: false })).toBeUndefined();
+    expect(assembleViewImageTool({ executorSupportsVision: true })?.name).toBe("view_image");
   });
 });

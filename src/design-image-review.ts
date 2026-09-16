@@ -8,6 +8,7 @@
  * 识图角色只在执行者自己看不见图时才引用——执行者能看就走执行模型。
  */
 import { createDescribeImageTool } from "./tools/describe-image.js";
+import { createViewImageTool } from "./tools/view-image.js";
 import type { ModelClient, TaskCompletion, Tool } from "./types.js";
 
 export type DescribeImageBacking = "executor" | "vision-role" | "none";
@@ -39,13 +40,21 @@ export function unreviewedImageCompletion(
   return completion.status === "completed" && claimsDeliveredImages(completion) && describedCount === 0;
 }
 
-/** 名称上就看得出能看图的模型。宁可不认，也不要把纯文本 DeepSeek 当成 VL。 */
+/**
+ * 名称上就看得出能看图的模型。宁可不认，也不要把 DeepSeek Pro 当成 VL。
+ *
+ * DeepSeek 官方 2026-09-16：`deepseek-flash`（V4.1-Flash）带 Vision；
+ * 旧名 `deepseek-v4-flash` / `deepseek-v4-flash-vision-exp` 仍被接受并路由到同一模型。
+ * 本机活探针（api.deepseek.com/anthropic 红点图）三名均答出颜色；
+ * `deepseek-v4-pro` 回 200 但把图换成 `[Unsupported Image]`。
+ */
 export function nameSuggestsVision(modelName: string): boolean {
   const n = String(modelName ?? "").trim().toLowerCase();
   if (!n) return false;
   if (/(?:^|[^a-z])vision(?:[^a-z]|$)|-vl(?:-|$)|(?:^|[^a-z])vl-/.test(n)) return true;
   if (n.startsWith("claude-")) return true;
   if (n.startsWith("gpt-4o") || n.startsWith("gpt-4.1") || n.startsWith("gpt-5")) return true;
+  if (/^deepseek-(?:v4-)?flash(?:-vision-exp)?$/.test(n)) return true;
   return false;
 }
 
@@ -87,6 +96,15 @@ export function assembleDescribeImageTool(opts: {
     return createDescribeImageTool(opts.vision);
   }
   return undefined;
+}
+
+/**
+ * 仅执行者自己能看图时注册。文本执行者看不见像素，不摆这个工具。
+ * 队列由 AgentLoop 在注册时换成 loop 内部那一份——装配处不必持有队列。
+ */
+export function assembleViewImageTool(opts: { executorSupportsVision: boolean }): Tool | undefined {
+  if (!opts.executorSupportsVision) return undefined;
+  return createViewImageTool();
 }
 
 export function wrapDescribeImageForReview(tool: Tool, described: Set<string>): Tool {

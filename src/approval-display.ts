@@ -102,7 +102,7 @@ export function describeApprovalTargets(
 ): ApprovalPathTarget[] {
   if (!toolInput || typeof toolInput !== "object" || Array.isArray(toolInput)) return [];
   const obj = toolInput as Record<string, unknown>;
-  const readable = toolName === "read_file";
+  const readable = toolName === "read_file" || toolName === "view_image" || toolName === "describe_image";
   const out: ApprovalPathTarget[] = [];
   for (const field of pathFieldsForTool(toolName)) {
     const value = obj[field];

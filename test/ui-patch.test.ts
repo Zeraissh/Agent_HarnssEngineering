@@ -39,6 +39,7 @@ import {
   resolveDisplayedTitle,
   toolPeek,
   toolHeadline,
+  toolHumanVerb,
   foldChain,
   deriveRunListItems,
   deriveRunTitle,
@@ -3231,6 +3232,30 @@ describe("toolHeadline：摘要只留动词和对象", () => {
     const h = toolHeadline("read_file", { path: "src/tools/bash.ts" });
     expect(h.verb).toBe("read");
     expect(h.target).toBe("bash.ts");
+  });
+});
+
+describe("view_image / describe_image 工具名人话", () => {
+  it("对话工具条写「把原图载入本轮」；describe 按 detail 分摘要/详述", () => {
+    expect(toolHumanVerb("view_image", { path: "shots/hero.png" })).toBe("把原图载入本轮");
+    expect(toolHeadline("view_image", { path: "shots/hero.png" }).verb).toBe("把原图载入本轮");
+    expect(toolHeadline("describe_image", { path: "a.png" }).verb).toBe("看图摘要");
+    expect(toolHeadline("describe_image", { path: "a.png", detail: "summary" }).verb).toBe("看图摘要");
+    expect(toolHeadline("describe_image", { path: "a.png", detail: "full" }).verb).toBe("看图详述");
+    expect(describeApprovalAction("view_image", { path: "shots/hero.png" })).toBe("要把 hero.png 的原图载入本轮");
+
+    let s = createInitialState("run-view-img", "对照这两张图的排版", false);
+    s = reduceEvents(s, [
+      sse(0, "main", "tool_call", {
+        toolUseId: "v1",
+        name: "view_image",
+        input: { path: "shots/hero.png" },
+      }),
+    ]);
+    renderRunDetail(s, { activeTab: "loop" });
+    const bar = document.querySelector(".chat-tool-group--live")?.textContent ?? "";
+    expect(bar).toContain("把原图载入本轮");
+    expect(bar).toContain("hero.png");
   });
 });
 

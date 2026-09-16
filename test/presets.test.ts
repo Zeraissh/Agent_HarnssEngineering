@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { getPack, getPreset, PACKS, selectPackTools, DEFAULT_HOST_DISCIPLINES } from "../src/presets.js";
+import { getPack, getPreset, PACKS, selectPackTools, DEFAULT_HOST_DISCIPLINES, IMAGE_LAZY_DISCIPLINE } from "../src/presets.js";
 import { makeTool } from "./helpers.js";
 import { runVerified } from "../src/orchestrate.js";
 import type Anthropic from "@anthropic-ai/sdk";
@@ -37,6 +37,9 @@ describe("domain packs", () => {
     expect(DEFAULT_HOST_DISCIPLINES).toMatch(/Conversation vs task/);
     expect(DEFAULT_HOST_DISCIPLINES).toMatch(/does not apply to casual chat/);
     expect(DEFAULT_HOST_DISCIPLINES).toMatch(/Do not turn a chat into a report/);
+    expect(DEFAULT_HOST_DISCIPLINES).toContain(IMAGE_LAZY_DISCIPLINE);
+    expect(DEFAULT_HOST_DISCIPLINES).toMatch(/detail=summary/);
+    expect(DEFAULT_HOST_DISCIPLINES).toMatch(/view_image/);
   });
 
   it("consult 包：有据咨询 + fetch_url/web_search + rubric 核查 + 禁装饰 emoji", () => {
@@ -81,6 +84,10 @@ describe("domain packs", () => {
     expect(p!.systemPrompt).toContain("[改稿范围]");
     expect(p!.systemPrompt).toContain("[点评][slide:");
     expect(p!.systemPrompt).toContain("识图门");
+    expect(p!.systemPrompt).toContain("detail 缺省 summary");
+    expect(p!.systemPrompt).toContain("不要对整批 view_image");
+    expect(p!.systemPrompt).toContain("像素、对比或排版");
+    expect(p!.systemPrompt).toContain("上传本身不会自动识图");
     expect(p!.systemPrompt).toContain("即使带了上述标记，也按整份修");
     expect(p!.systemPrompt).toContain("[hidden]{display:none!important}");
     expect(p!.systemPrompt).toContain("禁止只靠 hidden 属性配 display:flex");
@@ -245,6 +252,11 @@ describe("domain packs", () => {
 describe("生图工具按包收窄（generate_image）", () => {
   it("ts-coding / consult 声明 generate_image；stm32 与 kicad 不声明", () => {
     expect(PACKS["ts-coding"]!.builtinTools).toContain("generate_image");
+    expect(PACKS["ts-coding"]!.builtinTools).toContain("describe_image");
+    expect(selectPackTools(PACKS["python-coding"], [
+      makeTool({ name: "bash" }),
+      makeTool({ name: "describe_image" }),
+    ], []).some((t) => t.name === "describe_image")).toBe(true);
     expect(PACKS.consult!.builtinTools).toContain("generate_image");
     expect(PACKS["stm32-coding"]!.builtinTools).not.toContain("generate_image");
     expect(PACKS["stm32-debug"]!.builtinTools).not.toContain("generate_image");
@@ -259,11 +271,19 @@ describe("生图工具按包收窄（generate_image）", () => {
       makeTool({ name: "glob" }),
       makeTool({ name: "grep" }),
       makeTool({ name: "generate_image" }),
+      makeTool({ name: "describe_image" }),
     ];
     expect(selectPackTools(PACKS["ts-coding"], pool, []).some((t) => t.name === "generate_image")).toBe(true);
+    expect(selectPackTools(PACKS["ts-coding"], pool, []).some((t) => t.name === "describe_image")).toBe(true);
     expect(selectPackTools(PACKS["ts-coding"], pool.filter((t) => t.name !== "generate_image"), [])
       .some((t) => t.name === "generate_image")).toBe(false);
     expect(selectPackTools(PACKS.kicad, pool, []).some((t) => t.name === "generate_image")).toBe(false);
+  });
+
+  it("池里有 view_image 时包白名单滤不掉（ALWAYS_ON，与 describe_image 同纪律）", () => {
+    const pool = [makeTool({ name: "bash" }), makeTool({ name: "view_image" })];
+    expect(selectPackTools(PACKS.kicad, pool, []).some((t) => t.name === "view_image")).toBe(true);
+    expect(selectPackTools(PACKS.kicad, [makeTool({ name: "bash" })], []).some((t) => t.name === "view_image")).toBe(false);
   });
 });
 

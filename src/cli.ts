@@ -211,6 +211,7 @@ import {
 import { bashTool, SHELL_DESC } from "./tools/bash.js";
 import {
   assembleDescribeImageTool,
+  assembleViewImageTool,
   resolveDescribeImageBacking,
   resolveExecutorVisionSupport,
 } from "./design-image-review.js";
@@ -953,11 +954,13 @@ async function main(): Promise<void> {
       ? { vision: { client: visionClient, modelName: visionModelName } }
       : {}),
   });
+  const viewImageTool = assembleViewImageTool({ executorSupportsVision: executorCanSee });
   if (describeBacking === "executor") {
     console.log(c.dim(`describe_image: executor (${model})`));
   } else if (describeBacking === "vision-role") {
     console.log(c.dim(`describe_image: vision-role (${visionModelName})`));
   }
+  if (viewImageTool) console.log(c.dim(`view_image: executor (${model})`));
   /**
    * 生图（第五个角色）。Images API 不是 chat——不包 ModelClient、不进降级链。
    * 配了才注册 generate_image，没配就不摆一个一调用就报错的工具。
@@ -1000,6 +1003,7 @@ async function main(): Promise<void> {
       catalogInstallTool,
       ...(webSearchTool ? [webSearchTool] : []),
       ...(visionTool ? [visionTool] : []),
+      ...(viewImageTool ? [viewImageTool] : []),
       ...(imageTool ? [imageTool] : []),
     ].map((t) => [t.name, t]),
   );
@@ -1011,7 +1015,7 @@ async function main(): Promise<void> {
    * describe_image 而执行者不能看图、也未配 AGENT_VISION_MODEL，启动即炸——省略才是正确语义
    * （plan 模式的 selectPackTools 本就静默过滤，两条装配路径的语义要一致）。
    */
-  const CONDITIONAL_BUILTINS = new Set(["describe_image", "web_search", "generate_image"]);
+  const CONDITIONAL_BUILTINS = new Set(["describe_image", "view_image", "web_search", "generate_image"]);
   const ALWAYS_ON = ALWAYS_ON_BUILTIN_TOOLS;
   const namesForPool = [...new Set([...builtinNames, ...ALWAYS_ON])];
   const builtins = namesForPool.flatMap((n) => {
@@ -1623,6 +1627,7 @@ async function main(): Promise<void> {
       catalogInstallTool,
       ...(webSearchTool ? [webSearchTool] : []),
       ...(visionTool ? [visionTool] : []),
+      ...(viewImageTool ? [viewImageTool] : []),
       ...(imageTool ? [imageTool] : []),
     ];
     const mcpPool = mcp?.tools ?? [];

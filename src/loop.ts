@@ -25,6 +25,11 @@ import { describeApprovalTargets } from "./approval-display.js";
 import { type DurableToolTx, type ToolTxController } from "./tool-tx.js";
 import { ToolExecutor, ToolRegistry } from "./tools/registry.js";
 import { parseProgressItems } from "./tools/update-progress.js";
+import {
+  appendViewImagesToMessages,
+  createViewImageQueue,
+  createViewImageTool,
+} from "./tools/view-image.js";
 import type {
   AgentConfig,
   AgentRunResult,
@@ -264,12 +269,21 @@ export class AgentLoop {
   private readonly errorRetryBackoffMs: number;
   /** SAFE-06：当前 run 的事务控制器（可无——无 runId 时不武装） */
   private toolTxCtrl: ToolTxController | undefined;
+  /**
+   * view_image 写入、下一轮发请求前 drain。不进 userInput，也不进 tool_result。
+   * 注册名为 view_image 的工具时换成绑了这份队列的实例。
+   */
+  private readonly viewImageQueue = createViewImageQueue();
 
   constructor(
     private readonly cfg: AgentConfig,
     private readonly model: ModelClient,
   ) {
-    for (const tool of cfg.tools) this.registry.register(tool);
+    for (const tool of cfg.tools) {
+      this.registry.register(
+        tool.name === "view_image" ? createViewImageTool({ queue: this.viewImageQueue }) : tool,
+      );
+    }
     this.executor = new ToolExecutor(
       this.registry,
       cfg.workdir,
@@ -799,6 +813,16 @@ export class AgentLoop {
             ...(compacted.collapsedTurns > 0 ? { collapsedTurns: compacted.collapsedTurns } : {}),
             ...(compacted.summaryApplied ? { summaryApplied: true } : {}),
           });
+        }
+
+        /**
+         * view_image 队列：compact 之后、render 之前并进正史。
+         * 排在 compact 后面，避免刚载入的原图还没给模型看就被降级。
+         * 写入 messages（不是只改 request 副本），同轮重试 / 反应式压缩重发仍带着图。
+         */
+        const pendingView = this.viewImageQueue.drain();
+        if (pendingView.length) {
+          messages = appendViewImagesToMessages(messages, pendingView);
         }
 
         const buildRequest = () => {

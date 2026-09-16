@@ -94,6 +94,16 @@ const MIN_COMPACTABLE_CHARS = 500;
  */
 export const COMPACTED_TURNS_MARKER = "[compacted_turns]";
 /**
+ * 保护窗外 image 块降级后的文本标记。界面附件缩略图不走这条路——回收的是模型正史。
+ * 形状：`[compacted_image] path=…`，扫到 describe_image / view_image 回执再追加 `summary:` 行。
+ */
+export const COMPACTED_IMAGE_MARKER = "[compacted_image]";
+/** 纪要摘要行上限（空白折叠后）；路径本身另有独立上限 */
+const IMAGE_SUMMARY_MAX_CHARS = 200;
+const IMAGE_PATH_MAX_CHARS = 120;
+const UNKNOWN_IMAGE_PATH = "(unknown)";
+const IMAGE_SUMMARY_TOOLS = new Set(["describe_image", "view_image"]);
+/**
  * 反应式压缩的保护窗：端点已经明说"装不下"，常规的 6 条（3 轮）保护窗此时是奢侈品；
  * 收到 2 = 只保最近一轮 assistant + 它的 tool_result（模型接着往下走至少要看见这个）。
  */
@@ -185,6 +195,9 @@ export class DefaultContextManager {
   /**
    * 同步压缩：分级流水线，便宜的先上。
    *
+   *  image（A'）：保护窗外的 `image` 块先换成 `[compacted_image]` 纪要（路径 + 最近一次
+   *    describe_image / view_image 的 tool_result 摘要，扫得到就带上）。必须赶在 tier 2 前面，
+   *    否则折叠会把像素默默丢掉、正史里连路径都没有。
    *  tier 1（Phase A）：保护窗外的大 tool_result 置换为语义占位 + 启发式 `[compact_ledger]`；
    *  tier 2（Phase C）：tier 1 之后**估计**仍在水位上（或根本没有可置换的块）时，把保护窗外、
    *    首条任务消息之后的旧轮（assistant 正文 + tool_use 摘要 + 结果首行 + user 文本）折叠成
@@ -220,10 +233,13 @@ export class DefaultContextManager {
     const priorLedger = findExistingLedger(messages);
     const scanned = scanConversationLedger(messages, cutoff, toolUses);
 
+    // ---- 保护窗外 image → 短文本纪要（须在 tier 2 之前，否则折叠会把像素默默丢掉）----
+    const imagePass = degradeUnprotectedImages(messages, cutoff, toolUses);
+
     // ---- tier 1：大 tool_result → 语义占位 ----
     let dropped = 0;
-    let savedChars = 0;
-    let out = messages.map((m, i) => {
+    let savedChars = imagePass.savedChars;
+    let out = imagePass.messages.map((m, i) => {
       if (i >= cutoff || typeof m.content === "string") return m;
       let touched = false;
       const blocks = m.content.map((b) => {
@@ -256,7 +272,9 @@ export class DefaultContextManager {
     // ---- tier 2：置换之后估计仍在水位上（或无可置换）→ 折叠旧轮 ----
     const estimatedAfter = this.lastCompactTokens - savedChars / CHARS_PER_TOKEN_ESTIMATE;
     const needTier2 =
-      force || dropped === 0 || estimatedAfter >= this.contextTokenLimit * COMPACT_WATERMARK;
+      force ||
+      (dropped === 0 && imagePass.degraded === 0) ||
+      estimatedAfter >= this.contextTokenLimit * COMPACT_WATERMARK;
     let collapsedTurns = 0;
     let collapsedLedger = emptyCompactLedger();
     if (needTier2) {
@@ -266,7 +284,18 @@ export class DefaultContextManager {
       collapsedLedger = folded.ledger;
     }
 
-    if (dropped === 0 && collapsedTurns === 0) return unchanged(out);
+    if (dropped === 0 && collapsedTurns === 0) {
+      if (imagePass.degraded === 0) return unchanged(out);
+      return {
+        messages: out,
+        droppedBlocks: 0,
+        ledgerEntries: 0,
+        ledger: empty,
+        summaryApplied: false,
+        collapsedTurns: 0,
+        changed: true,
+      };
+    }
 
     const ledger = mergeCompactLedgers(priorLedger, scanned, collapsedLedger);
     const withLedger = upsertCompactLedger(out, ledger);
@@ -421,6 +450,209 @@ export function estimateContextBreakdown(
     unallocated: api - sum,
     estimated: true,
   };
+}
+
+/**
+ * 保护窗外 image 降级后的正史文案。无摘要时只有首行。
+ * 例：`[compacted_image] path=shots/hero.png\nsummary: 红按钮白底卡片，无文字。`
+ */
+export function formatCompactedImage(path: string, summary?: string): string {
+  const shown = clipLine(path.trim() || UNKNOWN_IMAGE_PATH, IMAGE_PATH_MAX_CHARS);
+  const head = `${COMPACTED_IMAGE_MARKER} path=${shown}`;
+  const clipped = summary?.replace(/\s+/g, " ").trim();
+  if (!clipped) return head;
+  return `${head}\nsummary: ${clipLine(clipped, IMAGE_SUMMARY_MAX_CHARS)}`;
+}
+
+function isImageBlock(b: Anthropic.ContentBlockParam): b is Anthropic.ImageBlockParam {
+  return Boolean(b) && typeof b === "object" && b.type === "image";
+}
+
+function normalizeImagePathKey(path: string): string {
+  return path.replace(/\\/g, "/").replace(/^\.\//, "").trim().toLowerCase();
+}
+
+function pathFromToolInput(input: unknown): string | undefined {
+  if (!input || typeof input !== "object") return undefined;
+  const obj = input as Record<string, unknown>;
+  for (const key of ["path", "file"]) {
+    if (typeof obj[key] === "string" && obj[key].trim()) return obj[key].trim();
+  }
+  return undefined;
+}
+
+function extractPathFromText(text: string): string | undefined {
+  const labeled =
+    /(?:\[(?:view_image|describe_image|compacted_image)\]|\bpath\s*[=:])\s*([^\s"'<>]+)/i.exec(text);
+  if (labeled?.[1]) return labeled[1].replace(/^[[`']+|[\]`']+$/g, "");
+  const ext = /((?:[A-Za-z]:)?[^\s"'<>]+?\.(?:png|jpe?g|gif|webp|bmp|svg))\b/i.exec(text);
+  return ext?.[1];
+}
+
+function imageSourcePath(block: Anthropic.ImageBlockParam): string | undefined {
+  const src = block.source as { type?: string; url?: string } | undefined;
+  if (src?.type === "url" && typeof src.url === "string" && src.url.trim()) return src.url.trim();
+  return undefined;
+}
+
+function estimateImageChars(block: Anthropic.ImageBlockParam): number {
+  const src = block.source as { type?: string; data?: string; url?: string } | undefined;
+  if (src?.type === "base64" && typeof src.data === "string") return src.data.length;
+  if (src?.type === "url" && typeof src.url === "string") return src.url.length;
+  try {
+    return JSON.stringify(block).length;
+  } catch {
+    return 0;
+  }
+}
+
+function toolResultPlainText(content: Anthropic.ToolResultBlockParam["content"]): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const parts: string[] = [];
+  for (const b of content) {
+    if (b && typeof b === "object" && b.type === "text" && typeof b.text === "string") {
+      parts.push(b.text);
+    }
+  }
+  return parts.join("\n");
+}
+
+function indexImageSummaries(
+  messages: Anthropic.MessageParam[],
+  toolUses: Map<string, ToolUseRef>,
+): { describe: Map<string, string>; view: Map<string, string> } {
+  const describe = new Map<string, string>();
+  const view = new Map<string, string>();
+  for (const m of messages) {
+    if (typeof m.content === "string") continue;
+    for (const b of m.content) {
+      if (b.type !== "tool_result" || b.is_error === true) continue;
+      const tool = toolUses.get(b.tool_use_id);
+      if (!tool || !IMAGE_SUMMARY_TOOLS.has(tool.name)) continue;
+      const path = pathFromToolInput(tool.input);
+      if (!path) continue;
+      const text = toolResultPlainText(b.content).replace(/\s+/g, " ").trim();
+      if (!text) continue;
+      const key = normalizeImagePathKey(path);
+      if (tool.name === "describe_image") describe.set(key, text);
+      else view.set(key, text);
+    }
+  }
+  return { describe, view };
+}
+
+function summaryForPath(
+  path: string,
+  summaries: { describe: Map<string, string>; view: Map<string, string> },
+): string | undefined {
+  if (!path || path === UNKNOWN_IMAGE_PATH) return undefined;
+  const key = normalizeImagePathKey(path);
+  return summaries.describe.get(key) ?? summaries.view.get(key);
+}
+
+function resolveImagePath(args: {
+  block: Anthropic.ImageBlockParam;
+  siblingTexts: string[];
+  enclosingTool?: ToolUseRef;
+  nearestVisionTool?: ToolUseRef;
+}): string {
+  const fromEnclosing = pathFromToolInput(args.enclosingTool?.input);
+  if (fromEnclosing) return fromEnclosing;
+  for (const text of args.siblingTexts) {
+    const extracted = extractPathFromText(text);
+    if (extracted) return extracted;
+  }
+  const fromNearest = pathFromToolInput(args.nearestVisionTool?.input);
+  if (fromNearest) return fromNearest;
+  return imageSourcePath(args.block) ?? UNKNOWN_IMAGE_PATH;
+}
+
+function siblingTextsOf(content: Anthropic.ContentBlockParam[]): string[] {
+  const out: string[] = [];
+  for (const b of content) {
+    if (b.type === "text" && typeof b.text === "string") out.push(b.text);
+    else if (b.type === "tool_result") {
+      const text = toolResultPlainText(b.content);
+      if (text) out.push(text);
+    }
+  }
+  return out;
+}
+
+function replaceImageBlock(
+  block: Anthropic.ImageBlockParam,
+  path: string,
+  summaries: { describe: Map<string, string>; view: Map<string, string> },
+): { text: Anthropic.TextBlockParam; savedChars: number } {
+  const text = formatCompactedImage(path, summaryForPath(path, summaries));
+  return {
+    text: { type: "text", text },
+    savedChars: Math.max(0, estimateImageChars(block) - text.length),
+  };
+}
+
+/**
+ * 只改保护窗外的 image 块（含 tool_result 数组里的）。窗内原图不动。
+ * 不增删消息条数，所以 cutoff 下标仍然有效。
+ */
+function degradeUnprotectedImages(
+  messages: Anthropic.MessageParam[],
+  cutoff: number,
+  toolUses: Map<string, ToolUseRef>,
+): { messages: Anthropic.MessageParam[]; degraded: number; savedChars: number } {
+  const summaries = indexImageSummaries(messages, toolUses);
+  let degraded = 0;
+  let savedChars = 0;
+  let lastVision: ToolUseRef | undefined;
+  const out = messages.map((m, i) => {
+    if (typeof m.content !== "string" && m.role === "assistant") {
+      for (const b of m.content) {
+        if (b.type === "tool_use" && IMAGE_SUMMARY_TOOLS.has(b.name)) {
+          lastVision = { name: b.name, input: b.input };
+        }
+      }
+    }
+    if (i >= cutoff || typeof m.content === "string") return m;
+    const siblings = siblingTextsOf(m.content);
+    let touched = false;
+    const blocks = m.content.map((b) => {
+      if (isImageBlock(b)) {
+        touched = true;
+        degraded += 1;
+        const path = resolveImagePath({
+          block: b,
+          siblingTexts: siblings,
+          nearestVisionTool: lastVision,
+        });
+        const replaced = replaceImageBlock(b, path, summaries);
+        savedChars += replaced.savedChars;
+        return replaced.text;
+      }
+      if (b.type !== "tool_result" || !Array.isArray(b.content)) return b;
+      const tool = toolUses.get(b.tool_use_id);
+      let innerTouched = false;
+      const inner = b.content.map((ib) => {
+        if (!isImageBlock(ib)) return ib;
+        innerTouched = true;
+        degraded += 1;
+        const path = resolveImagePath({
+          block: ib,
+          siblingTexts: [toolResultPlainText(b.content), ...siblings].filter(Boolean),
+          enclosingTool: tool,
+          nearestVisionTool: lastVision,
+        });
+        const replaced = replaceImageBlock(ib, path, summaries);
+        savedChars += replaced.savedChars;
+        return replaced.text;
+      });
+      if (!innerTouched) return b;
+      touched = true;
+      return { ...b, content: inner };
+    });
+    return touched ? { ...m, content: blocks } : m;
+  });
+  return { messages: out, degraded, savedChars };
 }
 
 // ---------------------------------------------------------------- tier 2：折叠旧轮

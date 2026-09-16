@@ -373,6 +373,7 @@ import {
 } from "../src/task-completion.js";
 import {
   assembleDescribeImageTool,
+  assembleViewImageTool,
   resolveDescribeImageBacking,
   resolveExecutorVisionSupport,
   type DescribeImageBacking,
@@ -3463,6 +3464,9 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           }
         : undefined,
     }) ?? null;
+    const viewImageTool = assembleViewImageTool({
+      executorSupportsVision: imageBacking === "executor",
+    });
     // 生图不走 ModelClient / 降级链 / token 计量——Images API 不是 chat usage。
     const imageResolved = resolveImageRoleFromLibrary();
     imageRole = imageResolved
@@ -3482,6 +3486,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       ...enabledBuiltinPool,
       ...(webSearchTool ? [webSearchTool] : []),
       ...(visionTool ? [visionTool] : []),
+      ...(viewImageTool ? [viewImageTool] : []),
       ...(imageTool ? [imageTool] : []),
     ];
   }

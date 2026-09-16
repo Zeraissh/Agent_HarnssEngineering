@@ -408,6 +408,11 @@ export function describeApprovalAction(name, input) {
   const content = typeof obj.content === "string" ? obj.content : "";
   const first = content.split(/\r?\n/).find((l) => l.trim()) ?? "";
   const preview = first.length > 40 ? `${first.slice(0, 40)}…` : first;
+  if (tool === "view_image") return base ? `要把 ${base} 的原图载入本轮` : "要把原图载入本轮";
+  if (tool === "describe_image") {
+    const verb = obj.detail === "full" ? "看图详述" : "看图摘要";
+    return base ? `要${verb} ${base}` : `要${verb}`;
+  }
   if (tool === "write_file") {
     if (base && preview) return `要新建或改 ${base}，写入「${preview}」`;
     if (base) return `要新建或改 ${base}`;
@@ -10874,12 +10879,24 @@ const TOOL_VERB = {
   write_file: "write",
   write_pptx: "write",
   fetch_url: "fetch",
-  describe_image: "看图",
+  describe_image: "看图摘要",
+  view_image: "把原图载入本轮",
   generate_image: "生图",
   memory_read: "记忆",
   memory_write: "记忆",
   memory_search: "记忆",
 };
+
+/** 工具条/时间线人话动词。describe_image 按 detail 分摘要/详述；缺省当 summary。 */
+export function toolHumanVerb(name, input) {
+  const tool = String(name ?? "").replace(/^.*__/, "");
+  if (tool === "view_image") return "把原图载入本轮";
+  if (tool === "describe_image") {
+    const detail = input && typeof input === "object" ? /** @type {any} */ (input).detail : undefined;
+    return detail === "full" ? "看图详述" : "看图摘要";
+  }
+  return TOOL_VERB[tool] ?? tool;
+}
 
 function tokenizeShell(s) {
   const out = [];
@@ -11010,7 +11027,7 @@ export function toolHeadline(name, input) {
     };
   }
   const peek = toolPeek(name, input);
-  const verb = TOOL_VERB[tool] ?? tool;
+  const verb = toolHumanVerb(tool, input);
   const target = cleanHeadlineTarget(peek);
   return { verb, target, stages: [{ verb, target }], command: peek };
 }
