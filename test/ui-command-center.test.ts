@@ -372,7 +372,7 @@ describe("initCommandCenterView DOM 层", () => {
       <aside>
         <button type="button" id="board-open-btn">指挥中心</button>
         <button type="button" id="home-spend" class="home-spend">
-          <span data-spend-text>今日已用 0 次</span>
+          <span data-spend-text>本机花费</span>
         </button>
       </aside>
       <main id="main-panel"><div id="action-dock"></div></main>
@@ -590,6 +590,7 @@ describe("initCommandCenterView DOM 层", () => {
 
     const chip = document.getElementById("home-spend");
     expect(chip.querySelector("[data-spend-text]").textContent).toBe("这次 $0.04 · 今日 $0.71");
+    expect(chip.getAttribute("aria-label")).toContain("本机今日 $0.71（全部工作目录）");
     expect(chip.getAttribute("aria-label")).toContain("今日已用 110 次");
 
     api.element.querySelector("[data-spend='today']").click();
@@ -621,6 +622,7 @@ describe("initCommandCenterView DOM 层", () => {
     });
     paintHomeSpend(el, face);
     expect(el.querySelector("[data-spend-text]").textContent).toBe("今日 $0.71");
+    expect(el.getAttribute("aria-label")).toContain("本机今日 $0.71（全部工作目录）");
     expect(el.getAttribute("aria-label")).toContain("今日已用 2 次");
     expect(el.hidden).toBe(false);
   });

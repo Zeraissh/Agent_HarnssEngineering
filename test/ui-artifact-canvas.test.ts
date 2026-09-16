@@ -1168,8 +1168,8 @@ describe("deriveWrittenPaths — 事件流里的写入路径", () => {
   const okResult = (id) => ({ event: { type: "tool_result", toolUseId: id, result: { isError: false } } });
   const errResult = (id) => ({ event: { type: "tool_result", toolUseId: id, result: { isError: true } } });
 
-  it("tool_call 立即计入（结果未到先刷一次），成功结果也计入", () => {
-    expect(deriveWrittenPaths(null, [call("t1", "out/a.html")])).toEqual(["out/a.html"]);
+  it("未成功写盘不计路径，避免未批准就打开画布", () => {
+    expect(deriveWrittenPaths(null, [call("t1", "out/a.html")])).toEqual([]);
     expect(deriveWrittenPaths(null, [call("t1", "out/a.html"), okResult("t1")])).toEqual(["out/a.html"]);
   });
 
@@ -1186,9 +1186,14 @@ describe("deriveWrittenPaths — 事件流里的写入路径", () => {
 
   it("非写盘工具与缺路径的调用不算；去重；裸事件信封也认", () => {
     expect(deriveWrittenPaths(null, [call("t1", "", "bash")])).toEqual([]);
-    expect(deriveWrittenPaths(null, [{ type: "tool_call", toolUseId: "t9", name: "memory_write", input: { file_path: "m.md" } }])).toEqual(["m.md"]);
-    expect(deriveWrittenPaths(null, [call("t8", "src/foo.ts", "edit_file")])).toEqual(["src/foo.ts"]);
-    expect(deriveWrittenPaths(null, [call("t3", "talk.pptx", "write_pptx")])).toEqual(["talk.pptx"]);
+    expect(deriveWrittenPaths(null, [{ type: "tool_call", toolUseId: "t9", name: "memory_write", input: { file_path: "m.md" } }])).toEqual([]);
+    expect(deriveWrittenPaths(null, [
+      { type: "tool_call", toolUseId: "t9", name: "memory_write", input: { file_path: "m.md" } },
+      { type: "tool_result", toolUseId: "t9", result: { isError: false } },
+    ])).toEqual(["m.md"]);
+    expect(deriveWrittenPaths(null, [call("t8", "src/foo.ts", "edit_file")])).toEqual([]);
+    expect(deriveWrittenPaths(null, [call("t8", "src/foo.ts", "edit_file"), okResult("t8")])).toEqual(["src/foo.ts"]);
+    expect(deriveWrittenPaths(null, [call("t3", "talk.pptx", "write_pptx"), okResult("t3")])).toEqual(["talk.pptx"]);
     const batch = [call("t1", "out/a.html"), call("t2", "out/a.html"), okResult("t1")];
     expect(deriveWrittenPaths(null, batch)).toEqual(["out/a.html"]);
   });

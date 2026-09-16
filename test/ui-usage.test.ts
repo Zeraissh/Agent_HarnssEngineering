@@ -4,6 +4,9 @@
  * 消耗视图：区间切片、堆叠柱与主题化卡片。
  * 台账没有 token，图上按轮次堆叠；未计价不得画成 $0.00。
  */
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import {
   parseUsageReport,
@@ -235,14 +238,25 @@ describe("deriveSpendFace 今日 / 本次花费", () => {
     expect(face.todayLine).toContain("26 未计价");
     expect(face.chipText).toBe("今日 $0.71");
     expect(face.chipTitle).not.toMatch(/还剩|套餐|token/i);
+    expect(face.chipTitle).toContain("本机全部工作目录");
+    expect(face.chipAria).toBe("本机今日 $0.71（全部工作目录） · 今日已用 110 次 · 26 未计价");
   });
 
-  it("没有当天行不是 $0.00；本次只信 cost.usd", () => {
+  it("台账未到不写「今日还没花费」；当天无行才是还没花费", () => {
+    const pending = deriveSpendFace({ now: noon });
+    expect(pending.usageReady).toBe(false);
+    expect(pending.todayMoney).toBe("本机花费");
+    expect(pending.chipText).toBe("本机花费");
+    expect(pending.chipAria).toContain("全部工作目录");
+    expect(pending.chipAria).not.toContain("今日还没花费");
+
     const empty = deriveSpendFace({ now: noon, usage: { byDay: [] } });
+    expect(empty.usageReady).toBe(true);
     expect(empty.todayUsd).toBeNull();
     expect(empty.todayMoney).toBe("今日还没花费");
     expect(empty.todayUsed).toBe("今日已用 0 次");
     expect(empty.thisRunText).toBeNull();
+    expect(empty.chipAria).toBe("本机今日 还没花费（全部工作目录） · 今日已用 0 次");
 
     const unpricedDay = deriveSpendFace({
       now: noon,
@@ -262,5 +276,12 @@ describe("deriveSpendFace 今日 / 本次花费", () => {
       runCost: { usd: 0.04 },
     });
     expect(withRun.chipText).toBe("这次 $0.04 · 今日 $0.71");
+  });
+
+  it("宿主断线刷新不把已有台账抹成空", () => {
+    const html = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "ui", "public", "index.html"), "utf-8");
+    expect(html).toContain("断线时保留上次读数");
+    expect(html).toContain('data-spend-text>本机花费');
+    expect(html).toContain("本机今日花费（全部工作目录）还在加载");
   });
 });

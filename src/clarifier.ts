@@ -26,6 +26,47 @@ export const CLARIFIER_VISUAL_RULE =
   "不得把 <original_task> 已写明的视觉交付（杂志风、幻灯、落地页、大图、配图、照片、刊头图）改写成色块/几何替代，也不得从 acceptance 删掉。" +
   "色块与几何填充不算大图。推荐选项不得与 original_task 的视觉要求相反，不得把「用色块代替大图」列成可选项。";
 
+const USER_WANTS_QUESTIONS =
+  /先问我|问我确认|有疑问先问|不确定就问|先确认再|ask me|confirm with me/i;
+const STRICT_MARKERS = /必须|不得|验收|acceptance|按字面|完成标准|定义如下/gi;
+
+/**
+ * 题数跟任务走，不跟配额走。委托方要求先问 → 问他们点名要决定的；
+ * 任务书已经写严 → 默认 0 题；一句话很宽 → 更要先问，不能自己定完再拆。
+ */
+export function clarificationAskPolicy(task: string): {
+  preferZero: boolean;
+  preferAsk: boolean;
+  hint: string;
+} {
+  const text = String(task ?? "").trim();
+  if (USER_WANTS_QUESTIONS.test(text)) {
+    return {
+      preferZero: false,
+      preferAsk: true,
+      hint:
+        "委托方写明要先问。只问他们点名要决定、或猜错就要返工的项；不要另开问卷。",
+    };
+  }
+  const numbered = (text.match(/^\s*(?:\d+[.)]|[-*])\s+\S+/gm) ?? []).length;
+  const strictHits = text.match(STRICT_MARKERS)?.length ?? 0;
+  if ((text.length >= 200 && numbered >= 3) || strictHits >= 2) {
+    return {
+      preferZero: true,
+      preferAsk: false,
+      hint:
+        "任务书已经写严。默认 0 题，原样提交。只有「只有委托方知道且猜错必返工」才问，禁止凑满 3 题。",
+    };
+  }
+  return {
+    preferZero: false,
+    preferAsk: true,
+    hint:
+      "任务不够严，一句话越宽越要先问（选型、风格、做到哪一步、验收口径）。" +
+      "猜错就要返工的岔路一次问完，不要埋头按自己的默认拆。无关细节不要凑。",
+  };
+}
+
 export interface ClarificationOutcome {
   task: string;
   acceptance: string[];
@@ -73,7 +114,8 @@ export function createRequirementsTool(): Tool {
   return {
     name: REQUIREMENTS_TOOL_NAME,
     description:
-      "提交澄清后的完整任务书并结束需求澄清。若没有高代价歧义，直接原样提交任务；" +
+      "提交澄清后的完整任务书并结束需求澄清。任务书写严才可以直接原样提交；" +
+      "一句话很宽时必须先问过高代价岔路，不能自己定完再交。" +
       "若调用过 ask_user，把答复合并进 task，并把未获答复而采用的默认写入 assumptions。",
     inputSchema: {
       type: "object",
@@ -111,16 +153,24 @@ export function createRequirementsTool(): Tool {
 }
 
 function buildClarifierPrompt(task: string): string {
+  const policy = clarificationAskPolicy(task);
   return `你是执行前的需求澄清门。你的输出不会直接交付给委托方，而会成为 planner 的唯一任务输入。
 
 <original_task>
 ${task}
 </original_task>
 
+<ask_policy>
+${policy.hint}
+</ask_policy>
+
 只处理两类高代价未知：
 1. 多种合理解释会产生实质不同的交付物，猜错就必须返工（技术选型、UI 风格、交付深度、验收口径）；
 2. 只有委托方知道、靠代码与工具无法查到的事实。
 
+题数 = 真实未知的个数，不是「一次最多 4 题所以要问满」。${
+    policy.preferZero ? "本案默认 0 题。" : "本案任务不严，默认要问；越宽越要问。"
+  }
 若存在这些未知，调用 ${ASK_USER_TOOL_NAME}，把本轮所有正交问题一次提交；拿到答复后调用 ${REQUIREMENTS_TOOL_NAME}。
 若不存在，不要为了显得谨慎而提问，直接调用 ${REQUIREMENTS_TOOL_NAME} 原样提交任务。
 同工作目录里其它会话、其它文件夹、记忆条目不是本任务的候选解释；不得把它们列进 ask_user 选项。

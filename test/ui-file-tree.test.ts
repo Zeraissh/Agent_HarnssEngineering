@@ -243,7 +243,10 @@ describe("挂载：右侧栏，不在左栏，不绑 Code 脸", () => {
 
   it("宿主按工作目录刷新，不按 Code 脸开关", () => {
     expect(htmlSrc).not.toMatch(/if\s*\(\s*(?:face|workspaceFace)\s*===\s*"code"\s*\)\s*void fileTreeApi/);
-    expect(htmlSrc).toMatch(/void fileTreeApi\?\.reload/);
+    expect(htmlSrc).toMatch(/function syncFileTreeToComposer/);
+    expect(htmlSrc).toMatch(/function composerWorkdir\(\)[\s\S]*getWorkdirSelection/);
+    expect(htmlSrc).toMatch(/function paintWorkdirsForFace[\s\S]*syncFileTreeToComposer/);
+    expect(htmlSrc).toMatch(/function populateKnobs[\s\S]*syncFileTreeToComposer/);
     expect(treeSrc).not.toMatch(/workspaceFace|workspace-face|face === ["']code["']/);
   });
 

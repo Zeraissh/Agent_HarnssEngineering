@@ -44,6 +44,7 @@ import {
   conversationTipId,
   buildFollowUpRequest,
   buildNewRunRequest,
+  wantsDesignPipeline,
   nextDesignSampleState,
   resolveDesignSampleChoice,
   annotateResolvedApprovals,
@@ -2165,7 +2166,7 @@ describe("AC6 无障碍语义 (R-05)", () => {
     expect(html).toMatch(/const text = String\(textOverride \?\? taskInput\.value\)\.trim\(\)/);
   });
 
-  it("单任务与计划模式都把 ask_user 开关接进真实提交载荷", () => {
+  it("单任务和计划都带 ask_user；计划门是签字，不是关掉提问", () => {
     expect(buildNewRunRequest({
       task: "今天天气怎么样",
       verify: false,
@@ -2190,6 +2191,14 @@ describe("AC6 无障碍语义 (R-05)", () => {
       planGate: true,
       askUser: true,
     });
+    expect(buildNewRunRequest({
+      task: "开发 Desktop UI",
+      mode: "plan",
+      planGate: true,
+      askUser: true,
+    })).toMatchObject({ askUser: true, planGate: true });
+    expect(buildNewRunRequest({ task: "t", planMode: true, askUser: true })).toMatchObject({ askUser: true });
+    expect(buildNewRunRequest({ task: "t", askUser: false })).not.toHaveProperty("askUser");
 
     expect(buildNewRunRequest({
       task: "t",
@@ -2221,6 +2230,14 @@ describe("AC6 无障碍语义 (R-05)", () => {
     expect(buildNewRunRequest({ task: "修一处", workspace: "office" })).toMatchObject({
       workspace: "office",
     });
+    expect(buildNewRunRequest({ task: "修一处", workspace: "office" })).not.toHaveProperty("mode");
+    expect(wantsDesignPipeline({})).toBe(false);
+    expect(wantsDesignPipeline({ officeDesignChip: true })).toBe(true);
+    expect(wantsDesignPipeline({ designId: "web-prototype" })).toBe(true);
+    expect(wantsDesignPipeline({ designTemplate: "landing-basic" })).toBe(true);
+    const html = readFileSync(join(__dirname, "..", "ui", "public", "index.html"), "utf-8");
+    expect(html).toContain("wantsDesignPipeline");
+    expect(html).not.toMatch(/mode:\s*workspaceFace === ["']office["'] \? ["']design["']/);
     expect(buildNewRunRequest({ task: "修一处" })).toMatchObject({ workspace: "code" });
     expect(buildNewRunRequest({
       task: "做个落地页",

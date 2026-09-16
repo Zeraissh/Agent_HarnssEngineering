@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   CLARIFIER_VISUAL_RULE,
+  clarificationAskPolicy,
   REQUIREMENTS_TOOL_NAME,
   runClarificationGate,
 } from "../src/clarifier.js";
@@ -18,6 +19,79 @@ const baseConfig = {
 };
 
 describe("planner 前结构化需求澄清门", () => {
+  it("题数政策：委托方要求先问 / 任务书写严 / 其余可不问", () => {
+    expect(clarificationAskPolicy("做个东西，有疑问先问我").preferZero).toBe(false);
+    expect(clarificationAskPolicy("做个东西，有疑问先问我").hint).toMatch(/先问/);
+    const strict = [
+      "必须按字面验收：",
+      "1. 写 README",
+      "2. 加测试",
+      "3. 提交前跑 npm test",
+      "不得改任务书未点名的文件。",
+    ].join("\n");
+    expect(clarificationAskPolicy(strict).preferZero).toBe(true);
+    expect(clarificationAskPolicy(strict).preferAsk).toBe(false);
+    const wide = clarificationAskPolicy("开发一版 Desktop UI");
+    expect(wide.preferZero).toBe(false);
+    expect(wide.preferAsk).toBe(true);
+    expect(wide.hint).toMatch(/越宽越要先问/);
+  });
+
+  it("澄清提示写入本案题数政策，写严的任务带默认 0 题", async () => {
+    const ask = createAskUserTool({
+      ask: async () => {
+        throw new Error("无歧义时不该提问");
+      },
+    });
+    const model = new FakeModelClient([
+      fakeMessage(
+        [
+          toolUseBlock("requirements", REQUIREMENTS_TOOL_NAME, {
+            task: "必须按字面验收，不得改范围",
+            acceptance: ["按任务书"],
+            assumptions: [],
+          }),
+        ],
+        "tool_use",
+      ),
+    ]);
+    await runClarificationGate(
+      { ...baseConfig, tools: [ask] },
+      model,
+      "必须按字面验收，不得改范围",
+    );
+    const first = JSON.stringify(model.requests[0]!.messages);
+    expect(first).toContain("ask_policy");
+    expect(first).toContain("默认 0 题");
+  });
+
+  it("一句话很宽时提示默认要问，不写能 0 就 0", async () => {
+    const ask = createAskUserTool({
+      ask: async () => ["Tauri"],
+    });
+    const model = new FakeModelClient([
+      fakeMessage(
+        [
+          toolUseBlock("requirements", REQUIREMENTS_TOOL_NAME, {
+            task: "开发一版 Desktop UI",
+            acceptance: [],
+            assumptions: [],
+          }),
+        ],
+        "tool_use",
+      ),
+    ]);
+    await runClarificationGate(
+      { ...baseConfig, tools: [ask] },
+      model,
+      "开发一版 Desktop UI",
+    );
+    const first = JSON.stringify(model.requests[0]!.messages);
+    expect(first).toContain("越宽越要问");
+    expect(first).toContain("默认要问");
+    expect(first).not.toContain("能 0 就 0");
+  });
+
   it("没有 ask_user 能力时零调用跳过，不给无人值守任务增加隐藏等待", async () => {
     const model = new FakeModelClient([]);
     const outcome = await runClarificationGate(baseConfig, model, "原任务");

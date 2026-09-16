@@ -33,7 +33,7 @@ export function paintHomeSpend(el, face) {
   const text = el.querySelector("[data-spend-text]") ?? el;
   text.textContent = face.chipText;
   el.setAttribute("title", face.chipTitle);
-  el.setAttribute("aria-label", `花费：${face.chipTitle}`);
+  el.setAttribute("aria-label", face.chipAria || `花费：${face.chipTitle}`);
   el.hidden = false;
   return face;
 }
@@ -407,7 +407,7 @@ export function initCommandCenterView(host = {}, env = {}) {
   const spendTodayMoney = doc.createElement("span");
   spendTodayMoney.className = "cc-stat-num";
   spendTodayMoney.setAttribute("data-spend-today-money", "");
-  spendTodayMoney.textContent = "今日还没花费";
+  spendTodayMoney.textContent = "本机花费";
   const spendTodayLabel = doc.createElement("span");
   spendTodayLabel.className = "cc-stat-label";
   spendTodayLabel.textContent = "今日花费";
@@ -658,7 +658,7 @@ export function initCommandCenterView(host = {}, env = {}) {
     spendUsed.textContent = face.todayUsed;
     spendRun.textContent = face.thisRunText ?? "";
     spendRun.hidden = !face.thisRunText;
-    spend.setAttribute("aria-label", face.chipTitle);
+    spend.setAttribute("aria-label", face.chipAria || face.chipTitle);
     paintHomeSpend(doc.getElementById("home-spend"), face);
 
     /** @type {Record<string, (card:any) => HTMLElement>} */

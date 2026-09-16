@@ -87,13 +87,35 @@ export function formatThisRunSpend(cost) {
   return "这次未计价";
 }
 
+/** 芯片口径：GET /api/usage 读的是本机全局台账，不是当前工作目录这一圈。 */
+export const SPEND_SCOPE_NOTE = "全部工作目录";
+
 /**
  * 首页 / 看板用的花费脸：今日 $（或未计价）+ 今日已用 N 次 + 可选本次。
  * 没有次数配额，不写「还剩几次」。
+ * usage 还没到时不写「今日还没花费」——那是台账空，不是「还在加载」。
  * @param {{ usage?: unknown, runCost?: { usd?: number|null }|null, now?: number }} [input]
  */
 export function deriveSpendFace(input = {}) {
   const now = Number(input.now) || Date.now();
+  const usageReady = input.usage != null && typeof input.usage === "object";
+  if (!usageReady) {
+    const thisRunText = formatThisRunSpend(input.runCost ?? null);
+    return {
+      todayDay: formatLocalDay(new Date(now)),
+      todayUsd: null,
+      todayRuns: 0,
+      todayUnpriced: 0,
+      todayMoney: "本机花费",
+      todayUsed: "本机台账加载中",
+      todayLine: "本机花费",
+      thisRunText,
+      chipText: thisRunText ? `${thisRunText} · 本机花费` : "本机花费",
+      chipTitle: "本机今日花费（全部工作目录）还在加载",
+      chipAria: "本机今日花费（全部工作目录）还在加载",
+      usageReady: false,
+    };
+  }
   const today = todayUsageOf(input.usage, now);
   const todayMoney =
     today.usd == null
@@ -106,7 +128,15 @@ export function deriveSpendFace(input = {}) {
   const thisRunText = formatThisRunSpend(input.runCost ?? null);
   const todayLine = [todayMoney, unpriced].filter(Boolean).join(" · ");
   const chipText = thisRunText ? `${thisRunText} · ${todayMoney}` : todayMoney;
-  const chipTitle = [thisRunText, todayMoney, todayUsed, unpriced].filter(Boolean).join(" · ");
+  const ariaMoney = today.usd == null
+    ? (today.runs === 0 ? "还没花费" : "未计价")
+    : formatUsd(today.usd);
+  const chipAria = [`本机今日 ${ariaMoney}（${SPEND_SCOPE_NOTE}）`, todayUsed, unpriced]
+    .filter(Boolean)
+    .join(" · ");
+  const chipTitle = [thisRunText, todayMoney, todayUsed, unpriced, `本机${SPEND_SCOPE_NOTE}`]
+    .filter(Boolean)
+    .join(" · ");
   return {
     todayDay: today.day,
     todayUsd: today.usd,
@@ -118,6 +148,8 @@ export function deriveSpendFace(input = {}) {
     thisRunText,
     chipText,
     chipTitle,
+    chipAria,
+    usageReady: true,
   };
 }
 

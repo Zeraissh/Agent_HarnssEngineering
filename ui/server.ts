@@ -87,6 +87,7 @@ import {
   type MetricRole,
 } from "../src/metrics.js";
 import {
+  buildPriceTable,
   computeCost,
   loadPriceTable,
   lookupModelPrice,
@@ -94,6 +95,20 @@ import {
   type CostResult,
   type PriceTable,
 } from "../src/pricing.js";
+import {
+  applyVendorPreset,
+  inferVendorHint,
+  publicVendorCatalog,
+  vendorById,
+  vendorLabel,
+} from "../src/vendor-catalog.js";
+import {
+  applyLitellmPrices,
+  fetchLitellmCatalog,
+  PRICE_CACHE_FILENAME,
+  readPriceCacheMeta,
+  serializePriceCache,
+} from "../src/price-refresh.js";
 import {
   createFallbackClientIfConfigured,
   createRoleFallbackClient,
@@ -1615,6 +1630,13 @@ export interface UiServerOptions {
    * 显式传路径可在测试里验证持久化与重装配。
    */
   modelStoreFile?: string | null;
+  /**
+   * 价表刷新缓存（.agent-price-cache.json）。缺省：真实宿主工作目录；
+   * 注入 modelClient 的宿主缺省 null（仪器纪律同 modelStoreFile）。
+   */
+  priceCacheFile?: string | null;
+  /** 测试注入：拉 LiteLLM 价表。不传则用全局 fetch。 */
+  priceFetch?: typeof fetch;
   /** 「同步到 .env」的落点。缺省真实宿主 `<cwd>/.env`；注入宿主缺省不写。 */
   envFile?: string | null;
   /** mcp.json 落点。缺省 `AGENT_MCP_CONFIG` 或 `<workdir>/mcp.json`。测试应显式传入，避免改仓库文件。 */
@@ -2744,6 +2766,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     : realHost
       ? join(resolve(options.workdir ?? process.cwd()), MODEL_STORE_FILENAME)
       : null;
+  const priceCacheFile = options.priceCacheFile !== undefined
+    ? options.priceCacheFile
+    : realHost && !options.modelClient
+      ? join(resolve(options.workdir ?? process.cwd()), PRICE_CACHE_FILENAME)
+      : null;
+  const priceFetch = options.priceFetch ?? fetch;
   const envFile = options.envFile !== undefined
     ? options.envFile
     : realHost
@@ -3644,8 +3672,16 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    */
   let priceTableError: string | null = null;
   let priceTable: PriceTable | null = null;
+  let priceRefreshedAt: string | null = null;
   try {
-    priceTable = loadPriceTable(process.env, (p) => readFileSync(p, "utf8"));
+    priceTable = loadPriceTable(process.env, (p) => readFileSync(p, "utf8"), { cachePath: priceCacheFile });
+    if (priceCacheFile && priceTable.source === "builtin+cache") {
+      try {
+        priceRefreshedAt = readPriceCacheMeta(readFileSync(priceCacheFile, "utf8")).refreshedAt;
+      } catch {
+        priceRefreshedAt = null;
+      }
+    }
   } catch (error) {
     priceTableError = (error as Error).message;
     if (realHost) operationalLog("error", "price_table_load_failed", { error: priceTableError });
@@ -3670,18 +3706,42 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
    * 没配独立角色模型时该角色就跑在执行者客户端上——报执行者的模型才是实话
    * （同 run_config 报"本 run 实际用了什么"而不是"配了什么"的口径）。
    */
-  function endpointOfRole(role: (typeof TOKEN_ROLES)[number]): { model: string; provider: string } {
-    const executor = { model: executorModelName, provider: resolved.provider as string };
+  function endpointOfRole(role: (typeof TOKEN_ROLES)[number]): {
+    model: string;
+    provider: string;
+    vendor: string | null;
+  } {
+    const executor = {
+      model: executorModelName,
+      provider: resolved.provider as string,
+      vendor: inferVendorHint(executorIdentity.baseURL, executorModelName),
+    };
     if (role === "verification") {
       return verifierRole
-        ? { model: verifierRole.name, provider: verifierRole.provider.provider }
+        ? {
+            model: verifierRole.name,
+            provider: verifierRole.provider.provider,
+            vendor: inferVendorHint(verifierRole.baseURL, verifierRole.name),
+          }
         : executor;
     }
     if (role === "planner") {
-      return plannerRole ? { model: plannerRole.name, provider: plannerRole.provider.provider } : executor;
+      return plannerRole
+        ? {
+            model: plannerRole.name,
+            provider: plannerRole.provider.provider,
+            vendor: inferVendorHint(plannerRole.baseURL, plannerRole.name),
+          }
+        : executor;
     }
     if (role === "vision") {
-      return visionRole ? { model: visionRole.name, provider: visionRole.provider.provider } : executor;
+      return visionRole
+        ? {
+            model: visionRole.name,
+            provider: visionRole.provider.provider,
+            vendor: inferVendorHint(visionRole.baseURL, visionRole.name),
+          }
+        : executor;
     }
     return executor;
   }
@@ -3705,8 +3765,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 
     // OBS-02 成本归属：与 token 走同一个入口，两条曲线口径天然一致。
     // 单价未登记的量走另一条计数器——**绝不按 0 计入成本曲线**。
-    const { model, provider } = endpointOfRole(role);
-    const cost = computeCost(u, lookupModelPrice(priceTable, provider, model));
+    const { model, provider, vendor } = endpointOfRole(role);
+    const cost = computeCost(u, lookupModelPrice(priceTable, provider, model, vendor));
     if (cost.usd !== null) {
       costUsdTotal.inc({ role, provider, model }, cost.usd);
     } else if (cost.unpricedTokens > 0) {
@@ -8461,6 +8521,76 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     };
   }
 
+  function persistLibrary(store: ModelStore): { ok: true } | { ok: false; status: number; error: string } {
+    if (modelStoreFile) {
+      try {
+        saveModelStore(modelStoreFile, store);
+      } catch (error) {
+        return {
+          ok: false,
+          status: 500,
+          error: `模型库写盘失败：${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+    }
+    modelStoreState = { store, source: modelStoreFile ? "store" : "env" };
+    try {
+      if (!options.modelClient) {
+        const entry = roleEntryOf(store, "executor");
+        assembleExecutor(entry);
+        probeExecutorEndpoint(entry);
+      }
+      visionProbe = null;
+      assembleRoles();
+      probeVisionEndpoint();
+      probeExecutorVision();
+    } catch (error) {
+      return {
+        ok: false,
+        status: 500,
+        error: `模型装配失败：${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+    return { ok: true };
+  }
+
+  function newVendorModelId(): string {
+    for (let i = 0; i < 8; i += 1) {
+      const id = `m-${randomUUID().replace(/-/g, "").slice(0, 16)}`;
+      if (!modelStoreState.store.models.some((m) => m.id === id)) return id;
+    }
+    return `m-${randomUUID().replace(/-/g, "")}`;
+  }
+
+  function pricingPublicView(): Record<string, unknown> {
+    const listed = new Map<string, Record<string, unknown>>();
+    if (priceTable) {
+      for (const price of priceTable.byKey.values()) {
+        const key = `${(price.vendor ?? "*").toLowerCase()}/${price.model.toLowerCase()}`;
+        if (listed.has(key)) continue;
+        listed.set(key, {
+          vendor: price.vendor ?? null,
+          vendorLabel: vendorLabel(price.vendor ?? "") || null,
+          model: price.model,
+          priced: true,
+          inputPer1M: price.inputPer1M,
+          outputPer1M: price.outputPer1M,
+          cacheReadPer1M: price.cacheReadPer1M,
+          cacheWritePer1M: price.cacheWritePer1M,
+          source: price.source,
+          asOf: price.asOf,
+        });
+      }
+    }
+    return {
+      source: priceTable?.source ?? null,
+      error: priceTableError,
+      refreshedAt: priceRefreshedAt,
+      override: Boolean(process.env.AGENT_PRICE_TABLE?.trim()),
+      entries: [...listed.values()].sort((a, b) => String(a.model).localeCompare(String(b.model))),
+    };
+  }
+
   function availablePacksView(): Array<Record<string, unknown>> {
     return allPacks().map((p) => ({
       name: p.name,
@@ -9004,6 +9134,10 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     | { type: "modelsRolesPatch" }
     | { type: "modelsTest" }
     | { type: "modelsSyncEnv" }
+    | { type: "vendorsGet" }
+    | { type: "vendorsEnable" }
+    | { type: "pricingGet" }
+    | { type: "pricingRefresh" }
     | { type: "usageGet" }
     | { type: "mcpGet" }
     | { type: "mcpPut" }
@@ -9119,6 +9253,18 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
     }
     if (method === "POST" && url === "/api/models/sync-env") {
       return { type: "modelsSyncEnv" };
+    }
+    if (method === "GET" && url === "/api/vendors") {
+      return { type: "vendorsGet" };
+    }
+    if (method === "POST" && url === "/api/vendors") {
+      return { type: "vendorsEnable" };
+    }
+    if (method === "GET" && url === "/api/pricing") {
+      return { type: "pricingGet" };
+    }
+    if (method === "POST" && url === "/api/pricing/refresh") {
+      return { type: "pricingRefresh" };
     }
     if (method === "GET" && url === "/api/usage") {
       return { type: "usageGet" };
@@ -10355,6 +10501,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         "modelsPut",
         "modelsRolesPatch",
         "modelsTest",
+        "vendorsEnable",
+        "pricingRefresh",
         "workdirAdd",
         "designDraftsWorkdir",
         "workdirRemove",
@@ -10433,33 +10581,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         if (!result.ok) {
           return json(res, 400, { error: result.errors[0], errors: result.errors });
         }
-        if (modelStoreFile) {
-          try {
-            saveModelStore(modelStoreFile, result.store);
-          } catch (error) {
-            return json(res, 500, {
-              error: `模型库写盘失败：${error instanceof Error ? error.message : String(error)}`,
-            });
-          }
-        }
-        modelStoreState = { store: result.store, source: modelStoreFile ? "store" : "env" };
-        try {
-          // 注入 modelClient 的宿主锁定执行者（假模型语义由注入方掌控）；
-          // 角色（verifier/planner/vision）始终可重装配。
-          if (!options.modelClient) {
-            const entry = roleEntryOf(result.store, "executor");
-            assembleExecutor(entry);
-            probeExecutorEndpoint(entry);
-          }
-          visionProbe = null;
-          assembleRoles();
-          probeVisionEndpoint();
-          probeExecutorVision();
-        } catch (error) {
-          return json(res, 500, {
-            error: `模型装配失败：${error instanceof Error ? error.message : String(error)}`,
-          });
-        }
+        const persisted = persistLibrary(result.store);
+        if (!persisted.ok) return json(res, persisted.status, { error: persisted.error });
         if (realHost) {
           operationalLog("info", "models_updated", {
             source: modelStoreState.source,
@@ -10512,31 +10635,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           return badRequest(res, "executor 不能为空");
         }
         const nextStore = { ...modelStoreState.store, roles: nextRoles };
-        if (modelStoreFile) {
-          try {
-            saveModelStore(modelStoreFile, nextStore);
-          } catch (error) {
-            return json(res, 500, {
-              error: `模型库写盘失败：${error instanceof Error ? error.message : String(error)}`,
-            });
-          }
-        }
-        modelStoreState = { store: nextStore, source: modelStoreFile ? "store" : "env" };
-        try {
-          if (!options.modelClient) {
-            const entry = roleEntryOf(nextStore, "executor");
-            assembleExecutor(entry);
-            probeExecutorEndpoint(entry);
-          }
-          visionProbe = null;
-          assembleRoles();
-          probeVisionEndpoint();
-          probeExecutorVision();
-        } catch (error) {
-          return json(res, 500, {
-            error: `模型装配失败：${error instanceof Error ? error.message : String(error)}`,
-          });
-        }
+        const persisted = persistLibrary(nextStore);
+        if (!persisted.ok) return json(res, persisted.status, { error: persisted.error });
         if (realHost) {
           const plan = processContextPlan();
           operationalLog("info", "models_roles_updated", {
@@ -10619,6 +10719,107 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         await writeFile(envFile, synced.text, "utf8");
         if (realHost) operationalLog("info", "env_synced", { file: envFile, changed: synced.changed });
         return json(res, 200, { ok: true, file: envFile, changed: synced.changed });
+      }
+
+      case "vendorsGet":
+        return json(res, 200, { vendors: publicVendorCatalog(modelStoreState.store) });
+
+      case "vendorsEnable": {
+        let body: string;
+        try {
+          body = await readBody(req, requestBodyMaxBytes);
+        } catch (error) {
+          return requestBodyFailure(res, error);
+        }
+        let parsed: { vendorId?: unknown; apiKey?: unknown };
+        try {
+          parsed = JSON.parse(body) as { vendorId?: unknown; apiKey?: unknown };
+        } catch {
+          return badRequest(res, "Invalid JSON body");
+        }
+        const vendor = typeof parsed.vendorId === "string" ? vendorById(parsed.vendorId) : null;
+        if (!vendor) return badRequest(res, "vendorId 必须是已登记厂家（deepseek / kimi / anthropic / openai）");
+        const apiKey = parsed.apiKey === undefined ? undefined : String(parsed.apiKey);
+        const applied = applyVendorPreset(modelStoreState.store, vendor, apiKey, newVendorModelId);
+        const result = validateModelConfig(
+          {
+            models: applied.store.models.map((m) => ({
+              id: m.id,
+              label: m.label,
+              provider: m.provider,
+              model: m.model,
+              baseUrl: m.baseUrl,
+              apiKey: m.apiKey,
+            })),
+            roles: applied.store.roles,
+          },
+          modelStoreState.store,
+        );
+        if (!result.ok) {
+          return json(res, 400, { error: result.errors[0], errors: result.errors });
+        }
+        const persisted = persistLibrary(result.store);
+        if (!persisted.ok) return json(res, persisted.status, { error: persisted.error });
+        if (realHost) {
+          operationalLog("info", "vendor_enabled", {
+            vendor: vendor.id,
+            added: applied.added,
+            updated: applied.updated,
+          });
+        }
+        return json(res, 200, {
+          ok: true,
+          added: applied.added,
+          updated: applied.updated,
+          vendors: publicVendorCatalog(modelStoreState.store),
+          ...modelsApiPayload(),
+        });
+      }
+
+      case "pricingGet":
+        return json(res, 200, pricingPublicView());
+
+      case "pricingRefresh": {
+        if (process.env.AGENT_PRICE_TABLE?.trim()) {
+          return json(res, 409, {
+            error: "已配置 AGENT_PRICE_TABLE，刷新不会改运维覆盖表。改文件或去掉该变量后再刷。",
+          });
+        }
+        let catalog: unknown;
+        try {
+          catalog = await fetchLitellmCatalog(priceFetch);
+        } catch (error) {
+          return json(res, 502, {
+            error: `价表源拉不到：${error instanceof Error ? error.message : String(error)}`,
+          });
+        }
+        const asOf = new Date().toISOString().slice(0, 10);
+        const applied = applyLitellmPrices(catalog, asOf);
+        const refreshedAt = new Date().toISOString();
+        if (priceCacheFile) {
+          try {
+            await writeFile(priceCacheFile, serializePriceCache(applied.prices, refreshedAt), "utf8");
+          } catch (error) {
+            return json(res, 500, {
+              error: `价表缓存写盘失败：${error instanceof Error ? error.message : String(error)}`,
+            });
+          }
+        }
+        priceTable = buildPriceTable(applied.prices, priceCacheFile, "builtin+cache");
+        priceTableError = null;
+        priceRefreshedAt = refreshedAt;
+        if (realHost) {
+          operationalLog("info", "price_table_refreshed", {
+            matched: applied.matched.length,
+            missing: applied.missing.length,
+          });
+        }
+        return json(res, 200, {
+          ok: true,
+          matched: applied.matched,
+          missing: applied.missing,
+          ...pricingPublicView(),
+        });
       }
 
       case "usageGet": {

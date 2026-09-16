@@ -314,6 +314,13 @@ describe("工具描述把「何时调用」写死在触发条件与时机上", (
     expect(desc).toContain("开工之前");
   });
 
+  it("题数随任务变：写严才 0 题，一句话宽更要先问", () => {
+    expect(desc).toContain("题数随任务变");
+    expect(desc).toContain("0 题");
+    expect(desc).toContain("一句话很宽更要先问");
+    expect(desc).toContain("凑到 3 题");
+  });
+
   it("配额与批量写进描述——模型要知道分几次问只会更快用光", () => {
     const d = createAskUserTool({ ask: async () => null, maxRounds: 2 }).description;
     expect(d).toContain("打断次数");

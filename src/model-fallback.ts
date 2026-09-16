@@ -28,6 +28,7 @@ import {
   type EndpointIdentity,
   type ModelProviderKind,
 } from "./model-capability.js";
+import { inferVendorHint } from "./vendor-catalog.js";
 import { isTransientApiError } from "./model-client.js";
 import {
   buildPriceTable,
@@ -266,7 +267,7 @@ export function orderEndpointsForRouting(
 function unitPriceRank(ep: FallbackEndpoint, table: PriceTable): number {
   const provider = ep.identity?.provider;
   const model = ep.identity?.model ?? ep.name;
-  const price = lookupModelPrice(table, provider, model);
+  const price = lookupModelPrice(table, provider, model, inferVendorHint(ep.identity?.baseURL, model));
   if (!price) return Number.POSITIVE_INFINITY;
   return price.inputPer1M + price.outputPer1M;
 }

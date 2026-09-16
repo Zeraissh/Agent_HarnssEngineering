@@ -15,14 +15,23 @@
  *
  * **单价会变，代码不会天天发版**：`AGENT_PRICE_TABLE` 指向一份 JSON，
  * 运维不发版就能改价。内置表只是"开箱有个数"，每条都带 `source` 与 `asOf`，
- * 过期与否一眼可查。
+ * 过期与否一眼可查。`POST /api/pricing/refresh` 只按厂家别名改缓存，
+ * 配了覆盖表时刷新拒绝——覆盖表是运维的权威。
+ *
+ * **厂家优先于模型名**：同一模型名在官方与转售端点上价不同。查价顺序是
+ * vendor/model → provider/model → 通配星号/模型名。硅基流动 / OpenRouter
+ * 等已知转售端点记 vendor=unlisted，不退回官方同名价。
  */
+
+import { vendorPriceRows } from "./vendor-catalog.js";
 
 export type TokenKindPrice = "inputPer1M" | "outputPer1M" | "cacheReadPer1M" | "cacheWritePer1M";
 
 export interface ModelPrice {
   /** wire 协议限定；`*` = 不限定（内置表一律如此，见文件头） */
   provider: string;
+  /** 厂家（deepseek / kimi / anthropic / openai）。有则按厂家+模型优先。 */
+  vendor?: string;
   model: string;
   inputPer1M: number;
   outputPer1M: number;
@@ -95,12 +104,7 @@ function deepseek(model: string, input: number, output: number, cacheRead: numbe
   };
 }
 
-/**
- * 内置单价表。**只登记有公开列价可引的模型**——本仓真正跑过的那几个
- * （deepseek 三件套 + claude 家族），其余一律未登记。
- * 宁可少登记也不猜：漏一个只是界面上一句"单价未登记"，猜错一个是一个假账。
- */
-export const BUILTIN_PRICE_TABLE: readonly ModelPrice[] = [
+const BUILTIN_CORE: readonly ModelPrice[] = [
   // Anthropic —— 官方 prompt caching 文档的价目表
   anthropic("claude-opus-5", 5, 25, 0.5, 6.25),
   anthropic("claude-opus-4-8", 5, 25, 0.5, 6.25),
@@ -123,10 +127,33 @@ export const BUILTIN_PRICE_TABLE: readonly ModelPrice[] = [
   deepseek("deepseek-v4-flash-vision-exp", 0.14, 0.28, 0.0028),
 ];
 
+const BUILTIN_CORE_MODELS = new Set(BUILTIN_CORE.map((p) => p.model));
+
+/**
+ * 内置单价表。**只登记有公开列价可引的模型**——漏一个只是「单价未登记」，
+ * 猜错一个是假账。厂家预设里已列价的（Kimi K3、GPT-4.1 等）并进来。
+ */
+export const BUILTIN_PRICE_TABLE: readonly ModelPrice[] = [
+  ...BUILTIN_CORE,
+  ...vendorPriceRows()
+    .filter((row) => !BUILTIN_CORE_MODELS.has(row.model))
+    .map((row) => ({
+      provider: row.provider,
+      vendor: row.vendor,
+      model: row.model,
+      inputPer1M: row.inputPer1M,
+      outputPer1M: row.outputPer1M,
+      cacheReadPer1M: row.cacheReadPer1M,
+      cacheWritePer1M: row.cacheWritePer1M,
+      source: row.source,
+      asOf: row.asOf,
+    })),
+];
+
 export interface PriceTable {
-  /** 键 `provider/model`，全小写 */
+  /** 键 `provider/model` 或 `vendor/model`，全小写 */
   readonly byKey: ReadonlyMap<string, ModelPrice>;
-  readonly source: "builtin" | "builtin+override";
+  readonly source: "builtin" | "builtin+override" | "builtin+cache";
   readonly overridePath: string | null;
   readonly entries: number;
 }
@@ -152,11 +179,13 @@ export function parsePriceEntry(raw: unknown, index: number): ModelPrice {
   const model = typeof o.model === "string" ? o.model.trim() : "";
   if (!model) throw new Error(`价表第 ${index} 条缺 model`);
   const provider = typeof o.provider === "string" && o.provider.trim() ? o.provider.trim() : "*";
+  const vendor = typeof o.vendor === "string" && o.vendor.trim() ? o.vendor.trim() : undefined;
   const out: Record<string, unknown> = {
     provider,
     model,
     source: typeof o.source === "string" && o.source.trim() ? o.source.trim() : "AGENT_PRICE_TABLE",
     asOf: typeof o.asOf === "string" && o.asOf.trim() ? o.asOf.trim() : "unknown",
+    ...(vendor ? { vendor } : {}),
     ...(typeof o.note === "string" ? { note: o.note } : {}),
   };
   for (const field of NUMERIC_FIELDS) {
@@ -186,17 +215,23 @@ export function parsePriceTableJson(text: string): ModelPrice[] {
   return rows.map((row, i) => parsePriceEntry(row, i));
 }
 
+function indexPrice(byKey: Map<string, ModelPrice>, p: ModelPrice): void {
+  byKey.set(priceKey(p.provider, p.model), p);
+  if (p.vendor) byKey.set(priceKey(p.vendor, p.model), p);
+}
+
 export function buildPriceTable(
   overrides: readonly ModelPrice[] = [],
   overridePath: string | null = null,
+  source?: PriceTable["source"],
 ): PriceTable {
   const byKey = new Map<string, ModelPrice>();
-  for (const p of BUILTIN_PRICE_TABLE) byKey.set(priceKey(p.provider, p.model), p);
-  // 覆盖在后：同键直接顶掉内置（运维改价的唯一手段）
-  for (const p of overrides) byKey.set(priceKey(p.provider, p.model), p);
+  for (const p of BUILTIN_PRICE_TABLE) indexPrice(byKey, p);
+  // 覆盖在后：同键直接顶掉内置（运维改价 / 刷新缓存）
+  for (const p of overrides) indexPrice(byKey, p);
   return {
     byKey,
-    source: overrides.length > 0 ? "builtin+override" : "builtin",
+    source: source ?? (overrides.length > 0 ? "builtin+override" : "builtin"),
     overridePath,
     entries: byKey.size,
   };
@@ -210,29 +245,47 @@ export function buildPriceTable(
 export function loadPriceTable(
   env: NodeJS.ProcessEnv,
   readFileSync: (p: string) => string,
+  opts?: { cachePath?: string | null },
 ): PriceTable {
   const path = env.AGENT_PRICE_TABLE?.trim();
-  if (!path) return buildPriceTable();
-  let text: string;
-  try {
-    text = readFileSync(path);
-  } catch (err) {
-    throw new Error(`AGENT_PRICE_TABLE 读不到：${path}（${(err as Error).message}）`);
+  if (path) {
+    let text: string;
+    try {
+      text = readFileSync(path);
+    } catch (err) {
+      throw new Error(`AGENT_PRICE_TABLE 读不到：${path}（${(err as Error).message}）`);
+    }
+    return buildPriceTable(parsePriceTableJson(text), path, "builtin+override");
   }
-  return buildPriceTable(parsePriceTableJson(text), path);
+  const cache = opts?.cachePath?.trim();
+  if (cache) {
+    try {
+      return buildPriceTable(parsePriceTableJson(readFileSync(cache)), cache, "builtin+cache");
+    } catch {
+      // 缓存缺失或损坏：退回内置。覆盖表失败才 fail-closed。
+      return buildPriceTable();
+    }
+  }
+  return buildPriceTable();
 }
 
 /**
- * 先查 `provider/model`，再退到通配 provider（`"*"`）下的同名模型。
- * 查不到返回 null——**不做前缀 / 模糊匹配**：`claude-opus-4-8-20260528` 猜成
- * `claude-opus-4-8` 这次恰好对，下一个带日期后缀却换了价的模型就悄悄记错账。
+ * 先查 vendor/model，再 provider/model，再通配星号/模型名。
+ * vendor=unlisted（已知转售）直接 null——不拿官方同名价冒充。
+ * 查不到返回 null——不做前缀 / 模糊匹配。
  */
 export function lookupModelPrice(
   table: PriceTable | null,
   provider: string | null | undefined,
   model: string | null | undefined,
+  vendor?: string | null,
 ): ModelPrice | null {
   if (!table || !model) return null;
+  if (vendor === "unlisted") return null;
+  if (vendor) {
+    const byVendor = table.byKey.get(priceKey(vendor, model));
+    if (byVendor) return byVendor;
+  }
   if (provider) {
     const exact = table.byKey.get(priceKey(provider, model));
     if (exact) return exact;

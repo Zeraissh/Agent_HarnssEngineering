@@ -16,6 +16,8 @@ import {
   SETTINGS_SECTIONS,
   MODEL_ROLE_META,
   parseModelsPayload,
+  parseVendorsPayload,
+  parsePricingPayload,
   newModelId,
   modelOptionLabel,
   executorModelOptionLabel,
@@ -394,5 +396,66 @@ describe("模型分组视图行为", () => {
     expect(document.getElementById("settings-models-status").textContent).toMatch(/\.env|已更新/);
     expect(document.getElementById("settings-mcp")).toBeTruthy();
     expect(document.getElementById("settings-mcp-list")?.textContent).toContain("demo");
+  });
+
+  it("厂家卡片：接入只 POST /api/vendors，Key 不进 GET 回放", async () => {
+    const record = { vendorBodies: [] };
+    const fetchImpl = vi.fn(async (url, opts = {}) => {
+      if (url === "/api/vendors" && opts.method === "POST") {
+        record.vendorBodies.push(JSON.parse(opts.body));
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            ...SERVER_PAYLOAD,
+            added: 3,
+            updated: 0,
+            vendors: [{ id: "kimi", label: "Kimi / Moonshot", connected: true, models: [{ model: "kimi-k3", priced: true }] }],
+          }),
+        };
+      }
+      if (url === "/api/vendors") {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            vendors: [{
+              id: "kimi",
+              label: "Kimi / Moonshot",
+              hint: "国内站",
+              envKey: "ANTHROPIC_API_KEY",
+              connected: false,
+              models: [{ model: "kimi-k3", label: "Kimi K3", priced: true }],
+            }],
+          }),
+        };
+      }
+      if (url === "/api/pricing") {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            source: "builtin",
+            entries: [{ vendor: "kimi", vendorLabel: "Kimi / Moonshot", model: "kimi-k3", inputPer1M: 3, outputPer1M: 15 }],
+          }),
+        };
+      }
+      return { ok: true, status: 200, json: async () => SERVER_PAYLOAD };
+    });
+    const host = makeHost();
+    const api = initSettingsView(host, makeEnv(fetchImpl));
+    await openAndSettle(api);
+    expect(document.getElementById("settings-vendors").textContent).toContain("Kimi");
+    expect(document.getElementById("settings-pricing-list").textContent).toContain("kimi-k3");
+    const key = document.getElementById("settings-vendor-key-kimi");
+    key.value = "sk-should-not-echo";
+    document.querySelector("[data-vendor-enable='kimi']").click();
+    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(record.vendorBodies[0]).toEqual({ vendorId: "kimi", apiKey: "sk-should-not-echo" });
+    expect(document.getElementById("settings-vendors-status").textContent).toContain("新增 3");
+    expect(host.onModelsSaved).toHaveBeenCalled();
+    expect(parseVendorsPayload({ vendors: [{ id: "kimi", connected: true }] })[0].connected).toBe(true);
+    expect(parsePricingPayload({ source: "builtin", entries: [] }).source).toBe("builtin");
   });
 });

@@ -43,6 +43,10 @@ describe("OBS-02 · 单价表", () => {
     // provider 是 wire 协议不是厂商：deepseek 走哪条协议都查得到同一个价
     expect(lookupModelPrice(table, "anthropic", "deepseek-v4-pro")?.outputPer1M).toBe(0.87);
     expect(lookupModelPrice(table, "openai", "deepseek-v4-pro")?.outputPer1M).toBe(0.87);
+    expect(lookupModelPrice(table, "anthropic", "kimi-k3")?.inputPer1M).toBe(3);
+    expect(lookupModelPrice(table, "anthropic", "kimi-k3", "kimi")?.outputPer1M).toBe(15);
+    expect(lookupModelPrice(table, "anthropic", "kimi-k3", "unlisted")).toBeNull();
+    expect(lookupModelPrice(table, "openai", "gpt-4.1-mini")?.inputPer1M).toBe(0.4);
   });
 
   /**
